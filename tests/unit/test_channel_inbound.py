@@ -675,7 +675,7 @@ async def test_channel_inbound_dispatches_approve_before_submit_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_channel_inbound_formats_matrix_system_message_as_preformatted_text() -> None:
+async def test_channel_inbound_keeps_matrix_system_message_in_thread() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
     turn_scheduler = MagicMock()
@@ -704,6 +704,7 @@ async def test_channel_inbound_formats_matrix_system_message_as_preformatted_tex
         sender_id="@filip:fpy.cz",
         chat_id="!room:fpy.cz",
         content="/build",
+        thread_id="$thread-root",
         timestamp=__import__("datetime").datetime.now(__import__("datetime").UTC),
     )
     config = ChannelAccountConfig(
@@ -722,6 +723,45 @@ async def test_channel_inbound_formats_matrix_system_message_as_preformatted_tex
     outbound = adapter.send_message.await_args.args[0]
     assert outbound.content == "```text\nMode: build\nExecutor: maitrea\n```"
     assert outbound.reply_to_id == "msg-1"
+    assert outbound.thread_id == "$thread-root"
+
+
+@pytest.mark.asyncio
+async def test_channel_inbound_keeps_error_message_in_thread() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    pipeline = InboundPipeline(
+        session_factory=MagicMock(),
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="acct-1",
+        message_id="msg-1",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        content="hello",
+        thread_id="$thread-root",
+        timestamp=datetime.now(UTC),
+    )
+    config = ChannelAccountConfig(
+        account_id="acct-1",
+        channel_type="matrix",
+        display_name="Matrix",
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    await pipeline._send_error(message, config, "The request failed.")
+
+    adapter.send_message.assert_awaited_once()
+    outbound = adapter.send_message.await_args.args[0]
+    assert outbound.content == "The request failed."
+    assert outbound.reply_to_id == "msg-1"
+    assert outbound.thread_id == "$thread-root"
 
 
 @pytest.mark.asyncio
@@ -1869,6 +1909,73 @@ async def test_channel_inbound_routes_voice_audio_to_central_turn_transcription(
 
 
 @pytest.mark.asyncio
+async def test_channel_inbound_sanitizes_voice_attachment_filename(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    adapter = _FakeAdapter()
+    adapter.download_attachment = AsyncMock(
+        return_value=(b"audio-bytes", "audio/ogg", "Voice message.ogg")
+    )
+    manager = _FakeManager(adapter)
+    manager._artifact_store.generate_id.return_value = "att-1"
+    manager._artifact_store.async_save = AsyncMock()
+    manager._artifact_store.async_get_public_url = AsyncMock(
+        return_value="https://example.test/att-1"
+    )
+    create_record = AsyncMock()
+    monkeypatch.setattr("cognis.store.queries.create_artifact_record", create_record)
+
+    pipeline = InboundPipeline(
+        session_factory=lambda: _Session(),
+        turn_scheduler=MagicMock(),
+        session_manager=MagicMock(),
+        pairing_service=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+    message = InboundMessage(
+        channel_type="matrix",
+        account_id="matrix-1",
+        message_id="msg-1",
+        sender_id="@filip:fpy.cz",
+        chat_id="!room:fpy.cz",
+        content="",
+        media=[
+            MediaAttachment(
+                url="mxc://fpy.cz/media",
+                mime_type="audio/ogg",
+                filename="Voice message.ogg",
+            )
+        ],
+        timestamp=datetime.now(UTC),
+        platform_data={"voice_input": True},
+    )
+
+    attachments, failed_count = await pipeline._normalize_media_attachments(  # noqa: SLF001
+        message=message,
+        conversation_id="conv-1",
+        user_email="user@example.com",
+    )
+
+    assert failed_count == 0
+    assert attachments[0].filename == "Voice_message.ogg"
+    assert manager._artifact_store.async_save.await_args.args[2] == "Voice_message.ogg"
+    assert create_record.await_args.kwargs["filename"] == "Voice_message.ogg"
+
+
+@pytest.mark.asyncio
 async def test_channel_inbound_does_not_call_stt_before_turn_admission() -> None:
     adapter = _FakeAdapter()
     manager = _FakeManager(adapter)
@@ -2077,7 +2184,7 @@ async def test_executor_channel_fetch_media_normalizes_voice_audio(
         assert kwargs["supported_mime_types"] == ["audio/wav"]
         return b"wav-bytes", "audio/wav", "voice-input.wav"
 
-    monkeypatch.setattr("cognis.channels.inbound._prepare_audio_for_stt", fake_prepare)
+    monkeypatch.setattr("cognis.executor.audio_preprocessing.prepare_audio_for_stt", fake_prepare)
     handler = ChannelHandler()
     handler._adapters["acct-1"] = _Adapter()  # noqa: SLF001
 
@@ -2444,6 +2551,76 @@ def test_channel_turn_observer_absorbs_latest_reply_anchor() -> None:
 
     assert active.absorb_queued_observer(queued) is True
     assert active._reply_to_id == "msg-3"
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_sends_each_system_notice_id_once() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    observer = ChannelTurnObserver(
+        channel_type="matrix",
+        account_id="acct-1",
+        chat_id="!room:example.com",
+        conversation_id="conv-1",
+        turn_scheduler=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+
+    await observer.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+    await observer.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+    await observer.on_system_message("conv-1", "Another.", notice_id="turn-paused:turn-2")
+
+    assert adapter.send_message.await_count == 2
+    first = adapter.send_message.await_args_list[0].args[0]
+    assert first.platform_data["idempotency_key"] == "turn-paused:turn-1"
+
+
+@pytest.mark.asyncio
+async def test_channel_turn_observer_retries_failed_system_notice_delivery() -> None:
+    adapter = _FakeAdapter()
+    adapter.send_message = AsyncMock(side_effect=[RuntimeError("temporary"), "message-1"])
+    manager = _FakeManager(adapter)
+    observer = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+
+    await observer.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+    await observer.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+
+    assert adapter.send_message.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_absorbed_channel_observer_keeps_sent_system_notice_ids() -> None:
+    adapter = _FakeAdapter()
+    manager = _FakeManager(adapter)
+    active = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+    queued = ChannelTurnObserver(
+        channel_type="signal",
+        account_id="acct-1",
+        chat_id="chat-1",
+        conversation_id="conv-1",
+        turn_scheduler=MagicMock(),
+        channel_manager_ref=lambda: manager,
+    )
+    await queued.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+
+    assert active.absorb_queued_observer(queued) is True
+    await active.on_system_message("conv-1", "Paused.", notice_id="turn-paused:turn-1")
+
+    adapter.send_message.assert_awaited_once()
 
 
 @pytest.mark.asyncio

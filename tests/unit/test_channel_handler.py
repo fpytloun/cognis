@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from cognis.channels.signal_failures import SignalDeliveryFailure
 from cognis.executor.channel_handler import ChannelHandler
 from cognis.models.channel import (
     ChannelCapabilities,
@@ -45,6 +47,20 @@ class FakeAdapter:
     async def send_message(self, message: OutboundMessage) -> str:
         self.sent.append(message)
         return "platform-123"
+
+
+class StructuredFailureAdapter(FakeAdapter):
+    async def send_message(self, message: OutboundMessage) -> str:
+        del message
+        raise SignalDeliveryFailure(
+            {
+                "provider": "signal-cli",
+                "classification": "rate_limit",
+                "provider_code": -5,
+                "retry_after_seconds": 3,
+                "challenge": False,
+            }
+        )
 
 
 @pytest.mark.asyncio
@@ -135,7 +151,33 @@ async def test_send_delegates_to_adapter(monkeypatch: pytest.MonkeyPatch) -> Non
 async def test_send_unknown_account_returns_error() -> None:
     handler = ChannelHandler()
     result = await handler.send("missing", {"content": "hello"})
-    assert "error" in result
+    assert result == {
+        "error": {
+            "code": "account_not_found",
+            "retryable": False,
+            "side_effect_certainty": "none",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_returns_sanitized_structured_signal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = StructuredFailureAdapter()
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u"}, {})
+
+    result = await handler.send(
+        "acct-1",
+        {"channel_type": "signal", "chat_id": "+420", "content": "hello"},
+    )
+
+    assert result["error"]["classification"] == "rate_limit"
+    assert result["error"]["retry_after_seconds"] == 3.0
+    assert result["error"]["retry_scheduled"] is False
+    assert "chat_id" not in str(result["error"])
 
 
 @pytest.mark.asyncio
@@ -345,6 +387,96 @@ async def test_inbound_message_sends_notification(monkeypatch: pytest.MonkeyPatc
 
     assert ws.messages[0]["method"] == "channel.message"
     assert ws.messages[0]["params"]["account_id"] == "acct-1"
+
+
+@pytest.mark.asyncio
+async def test_inbound_message_uses_serialized_notification_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+
+    async def send(payload: str) -> None:
+        sent.append(json.loads(payload))
+
+    handler.set_notification_sender(send)
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u@example.com"}, {})
+
+    assert adapter.on_message is not None
+    await adapter.on_message(
+        InboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            message_id="m1",
+            sender_id="sender",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(UTC),
+        )
+    )
+
+    assert sent[0]["method"] == "channel.message"
+
+
+@pytest.mark.asyncio
+async def test_inbound_message_is_buffered_until_reconnect_callbacks_are_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = FakeAdapter()
+    sent: list[dict[str, Any]] = []
+    monkeypatch.setattr("cognis.executor.channel_handler._create_adapter", lambda _: adapter)
+    handler = ChannelHandler()
+    handler.pause_notifications()
+    await handler.start("acct-1", "signal", {"agent_id": "a", "user_email": "u@example.com"}, {})
+
+    assert adapter.on_message is not None
+    await adapter.on_message(
+        InboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            message_id="m1",
+            sender_id="sender",
+            chat_id="chat",
+            content="hello",
+            timestamp=datetime.now(UTC),
+        )
+    )
+    assert sent == []
+
+    async def send(payload: str) -> None:
+        sent.append(json.loads(payload))
+
+    await handler.activate_notification_sender("acct-1", send)
+    assert sent[0]["method"] == "channel.message"
+
+
+@pytest.mark.asyncio
+async def test_inbound_message_is_buffered_after_transport_send_failure() -> None:
+    handler = ChannelHandler()
+    delivered: list[dict[str, Any]] = []
+
+    async def fail_send(_: str) -> None:
+        raise ConnectionError("transport closed")
+
+    handler.set_notification_sender(fail_send)
+    message = InboundMessage(
+        channel_type="signal",
+        account_id="acct-1",
+        message_id="m1",
+        sender_id="sender",
+        chat_id="chat",
+        content="hello",
+        timestamp=datetime.now(UTC),
+    )
+    await handler._send_channel_message("acct-1", message)
+
+    async def send(payload: str) -> None:
+        delivered.append(json.loads(payload))
+
+    await handler.activate_notification_sender("acct-1", send)
+    assert delivered[0]["method"] == "channel.message"
 
 
 @pytest.mark.asyncio

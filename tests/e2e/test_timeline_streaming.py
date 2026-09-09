@@ -28,6 +28,7 @@ import pytest
 
 from tests.e2e.conftest import (
     CANONICAL_CAPTURE_DIR,
+    E2E_AGENT_ID,
     GOLDEN_DIR,
     E2EStack,
     _assert_reset_recovery_snapshot,
@@ -159,11 +160,23 @@ def test_scenario_stream_invariants(
 
     # Inject the scenario
     inject_scenario(e2e_stack.mock_llm_url, scenario_id)
+    # Mock LLM turn indices count assistant messages in the conversation.
+    # Each independent script must start with empty history.
+    response = e2e_stack.post(
+        "/api/v1/conversations",
+        json={
+            "agent_id": E2E_AGENT_ID,
+            "title": f"E2E {scenario_id}",
+            "context": {"type": "web", "ref": None, "platform_data": {}, "memory_labels": {}},
+        },
+    )
+    assert response.status_code == 200, response.text
+    conversation_id = response.json()["conversation_id"]
 
     # Send trigger message and capture events
     events = capture_ws_events(
         e2e_stack,
-        e2e_stack.e2e_conversation_id,
+        conversation_id,
         trigger,
         timeout=90,
     )
@@ -183,20 +196,25 @@ def test_scenario_stream_invariants(
     if canonical_path:
         print(f"Promoted canonical capture: {canonical_path}")
 
-    # Assert message_complete was received
-    assert any(e.get("type") == "message_complete" for e in events), (
-        f"No message_complete event received for scenario {scenario_id!r}"
+    # Require post-admission realtime delivery and authoritative settled output.
+    assert any(e.get("type") == "turn_completed" for e in events), (
+        f"No completed turn observed for scenario {scenario_id!r}"
     )
 
     chat_v2_frames = [event for event in events if event.get("type") == "chat_v2_frame"]
     assert chat_v2_frames, f"No ChatV2 frames captured for scenario {scenario_id!r}"
-    expected_scope_key = f"conversation:{e2e_stack.e2e_conversation_id}"
-    cursor = chat_v2_frames[0]["cursor_before"]
-    for frame in chat_v2_frames:
+    expected_scope_key = f"conversation:{conversation_id}"
+    cursor = None
+    for frame in events:
+        if frame.get("type") == "snapshot":
+            cursor = frame["cursor"]
+            continue
+        if frame.get("type") != "chat_v2_frame":
+            continue
         assert frame["scope"]["key"] == expected_scope_key
         assert frame["scope"]["kind"] == "conversation"
-        assert frame["scope"]["conversation_id"] == e2e_stack.e2e_conversation_id
-        assert frame["conversation_id"] == e2e_stack.e2e_conversation_id
+        assert frame["scope"]["conversation_id"] == conversation_id
+        assert frame["conversation_id"] == conversation_id
         assert frame["cursor_before"] == cursor
         cursor = frame["cursor_after"]
 

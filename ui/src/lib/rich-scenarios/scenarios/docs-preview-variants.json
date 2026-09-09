@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "id": "docs-preview-variants",
+  "title": "Documentation preview variants",
+  "description": "Focused canonical variants used by Rich Deliverable documentation.",
+  "group": "documentation",
+  "sort_key": 9000,
+  "content": "Rich Deliverable documentation preview variants.",
+  "visibility": ["docs"],
+  "payload": {
+    "metadata": {},
+    "blocks": [
+      {
+        "type": "section_header",
+        "eyebrow": "Fleet",
+        "title": "Capacity",
+        "subtitle": "Current allocation and operational headroom",
+        "status": "Attention",
+        "tone": "warning"
+      },
+      {
+        "type": "card",
+        "variant": "visual",
+        "icon": "activity",
+        "eyebrow": "Image-forward",
+        "title": "Visual card with media",
+        "summary": "The image becomes a full-bleed background with a legibility gradient behind the title and summary.",
+        "media": {
+          "artifact_id": "fixture-docs-card-visual",
+          "href": "/docs/rich-deliverables/pulse-editorial-river.jpg",
+          "alt": "Mist over a river beneath the Czech Central Highlands at sunrise",
+          "credit": "Generated editorial fixture image",
+          "aspect_ratio": "16 / 7",
+          "focal_point": "50% 50%"
+        }
+      },
+      {
+        "type": "chart",
+        "title": "Zoomies by weekday",
+        "description": "Late-evening laps are the preferred form of cardio.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "series": [{"id": "zoomies", "label": "Zoomie intensity", "points": [{"x": "Mon", "y": 2}, {"x": "Tue", "y": 5}, {"x": "Wed", "y": 3}, {"x": "Thu", "y": 7}]}],
+        "x_axis": {"type": "category", "label": "Weekday"},
+        "y_axis": {"type": "linear", "label": "Laps", "min": 0, "max": 8},
+        "legend_position": "none",
+        "palette_token": "warm"
+      },
+      {
+        "type": "chart",
+        "title": "Most contested sleeping surfaces",
+        "description": "A laptop keyboard performs unexpectedly well.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "bar",
+        "series": [{"id": "claims", "label": "Cat claims", "points": [{"x": "Keyboard", "y": 9}, {"x": "Sunny chair", "y": 7}, {"x": "Laundry", "y": 6}, {"x": "Human lap", "y": 8}]}],
+        "x_axis": {"type": "category", "label": "Surface"},
+        "y_axis": {"type": "linear", "label": "Claims", "min": 0, "max": 10},
+        "legend_position": "none",
+        "palette_token": "cool"
+      },
+      {
+        "type": "chart",
+        "title": "Preferred afternoon activities",
+        "description": "A donut makes the nap majority unambiguous.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "donut",
+        "series": [{"id": "activities", "label": "Minutes", "points": [{"x": "Nap", "y": 64}, {"x": "Birdwatch", "y": 16}, {"x": "Snack", "y": 12}, {"x": "Mischief", "y": 8}]}],
+        "x_axis": {"type": "category", "label": "Activity"},
+        "y_axis": {"type": "linear", "label": "Share"},
+        "legend_position": "right",
+        "palette_token": "categorical"
+      },
+      {
+        "type": "chart",
+        "title": "Treat negotiation outcomes",
+        "description": "Two cats, one cupboard, several strong opinions.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "stacked_bar",
+        "series": [
+          {"id": "muchi", "label": "Muchi", "points": [{"x": "Morning", "y": 3}, {"x": "Afternoon", "y": 1}, {"x": "Evening", "y": 4}]},
+          {"id": "guest-cat", "label": "Guest cat", "points": [{"x": "Morning", "y": 1}, {"x": "Afternoon", "y": 2}, {"x": "Evening", "y": 1}]}
+        ],
+        "x_axis": {"type": "category", "label": "Time"},
+        "y_axis": {"type": "linear", "label": "Successful negotiations", "min": 0, "max": 6},
+        "legend_position": "bottom",
+        "palette_token": "categorical"
+      },
+      {
+        "type": "markdown",
+        "content": "### Release checks\n\n- Keep the canonical payload readable.\n- Preserve nested list markers:\n  1. Validate the web renderer.\n  2. Validate static HTML.\n- [x] Record deterministic evidence.\n- [ ] Review the final screenshots."
+      },
+      {
+        "type": "dashboard",
+        "eyebrow": "Operations",
+        "title": "Native dashboard metrics",
+        "description": "The dashboard owns its metric layout without a wrapping grid.",
+        "status": "Healthy",
+        "tone": "success",
+        "metrics": [
+          {"label": "Availability", "value": "99.96%", "delta": "+0.03 pp", "tone": "success", "sparkline": [99.91, 99.93, 99.94, 99.96]},
+          {"label": "Latency", "value": "4.2s", "delta": "-0.6s", "tone": "success", "sparkline": [5.3, 4.9, 4.5, 4.2]},
+          {"label": "Open incidents", "value": "1", "delta": "-2", "tone": "warning", "sparkline": [3, 2, 2, 1]}
+        ]
+      }
+    ],
+    "assets": [],
+    "sources": [],
+    "datasets": [],
+    "exports": []
+  }
+}

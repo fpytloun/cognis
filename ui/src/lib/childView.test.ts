@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { WorkstreamRef } from '$lib/chat-v2/types';
-import type { Conversation } from '$lib/types/api';
+import type { BackgroundWorkItem, Conversation } from '$lib/types/api';
 import {
   canonicalChildView, childViewForWorkstream, childViewScope,
-  controllerRootConversationId, eventNeedsTreeRefresh, parentChildView,
+  controllerRootConversationId, enrichChildWorkstream, eventNeedsTreeRefresh,
+  fallbackWorkstream, parentChildView,
 } from './childView';
 
 function node(overrides: Partial<WorkstreamRef>): WorkstreamRef {
@@ -58,6 +59,14 @@ describe('child view navigation', () => {
       type: 'chat_v2_frame',
       ops: [{ item: { kind: 'tool_result', tool_name: 'agent_conversation_create' } }],
     })).toBe(true);
+    expect(eventNeedsTreeRefresh({
+      type: 'chat_v2_frame',
+      ops: [{ item: { kind: 'tool_result', tool_name: 'bash' } }],
+    })).toBe(false);
+    expect(eventNeedsTreeRefresh({
+      type: 'chat_v2_frame',
+      ops: [{ item: { kind: 'tool_call', tool_name: 'bash' } }],
+    })).toBe(false);
     expect(eventNeedsTreeRefresh({ type: 'chat_v2_frame', ops: [] })).toBe(false);
   });
 
@@ -75,5 +84,60 @@ describe('child view navigation', () => {
     const closedView = null;
     expect(closedView).toBeNull();
     expect(inspector).toEqual({ open: true, tab: 'work' });
+  });
+
+  it('derives delegate and managed fallbacks from projected work without using ID prefixes', () => {
+    const work: BackgroundWorkItem[] = [
+      {
+        kind: 'delegated_session', work_id: 'delegate-work', controller_conversation_id: 'root',
+        session_id: 'plain-session', title: 'Delegate work', agent_id: 'worker',
+        status: 'running', todos: [],
+      },
+      {
+        kind: 'managed_conversation', work_id: 'managed-work', controller_conversation_id: 'root',
+        target_conversation_id: 'target-conversation', session_id: 'another-session',
+        title: 'Managed work', agent_id: 'manager', status: 'queued', todos: [],
+      },
+    ];
+    const delegate = fallbackWorkstream('plain-session', 'root', work);
+    const managed = fallbackWorkstream('another-session', 'root', work);
+    const bare = fallbackWorkstream('managed-looking-id', 'root');
+
+    expect(childViewForWorkstream(delegate, 'root').kind).toBe('delegate');
+    expect(childViewForWorkstream(managed, 'root')).toMatchObject({
+      kind: 'managed',
+      conversationId: 'target-conversation',
+    });
+    expect(childViewForWorkstream(bare, 'root').kind).toBe('delegate');
+  });
+
+  it('enriches presentation from a late overview without changing the selected scope', () => {
+    const selected = node({
+      key: 'fallback:session',
+      kind: 'managed',
+      conversation_id: 'selected-conversation',
+      session_id: 'selected-session',
+      event_store_session_id: 'selected-session',
+      title: 'Initial title',
+    });
+    const enriched = enrichChildWorkstream(selected, node({
+      key: 'overview-key',
+      kind: 'delegate',
+      conversation_id: 'different-conversation',
+      session_id: 'different-session',
+      event_store_session_id: 'different-session',
+      title: 'Enriched title',
+      status: 'completed',
+    }));
+
+    expect(enriched).toMatchObject({
+      key: 'fallback:session',
+      kind: 'managed',
+      conversation_id: 'selected-conversation',
+      session_id: 'selected-session',
+      event_store_session_id: 'selected-session',
+      title: 'Enriched title',
+      status: 'completed',
+    });
   });
 });

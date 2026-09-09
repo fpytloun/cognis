@@ -96,6 +96,13 @@ podDisruptionBudget:
   enabled: false
   minAvailable: 1
 
+trustedEvidence:
+  enabled: false
+  ownerAllowlistSecret: ""
+  ownerAllowlistSecretKey: trusted-evidence-owner-allowlist
+  maxAttempts: 8
+  maxAgeSeconds: 3600
+
 networkPolicy:
   enabled: false
   ingressNamespaceSelector: {}

@@ -22,6 +22,18 @@ Depending on what the agent is doing, the conversation can display:
 - queued messages when you send another message during an active turn
 - reconnection status for the WebSocket session
 
+## Runtime selection
+
+`/model`, `/thinking`, and `/fast` select session overrides for the next message.
+`/profile` selects an agent profile and clears those overrides.
+Session details and `/info` show the selected values separately from the last model call.
+
+Cognis stores these selections in its database. They survive controller restarts
+and compaction. A session reset or renewal clears the overrides.
+
+Chat command retries return the original selection result without applying the
+change again. Timeline feedback can arrive later if Intaris is unavailable.
+
 ## Queued messages
 
 If you send a message while the agent is still processing the previous turn,

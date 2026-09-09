@@ -40,11 +40,15 @@ function cachePreferences(value: UserPreferences, userEmail?: string | null): vo
 }
 
 const store = writable<UserPreferences>(structuredClone(DEFAULT_USER_PREFERENCES));
+const readyStore = writable(false);
 let loadPromise: Promise<UserPreferences> | null = null;
 let loadedUserEmail: string | null = null;
 
 export const userPreferences = {
   subscribe: store.subscribe
+};
+export const userPreferencesReady = {
+  subscribe: readyStore.subscribe,
 };
 
 export async function loadUserPreferences(userEmail?: string | null): Promise<UserPreferences> {
@@ -53,6 +57,7 @@ export async function loadUserPreferences(userEmail?: string | null): Promise<Us
     loadedUserEmail = normalizedEmail;
     store.set(readCachedPreferences(normalizedEmail));
     loadPromise = null;
+    readyStore.set(false);
   }
   if (loadPromise) {
     return loadPromise;
@@ -62,10 +67,12 @@ export async function loadUserPreferences(userEmail?: string | null): Promise<Us
       const normalized = normalizeUserPreferences(value);
       store.set(normalized);
       cachePreferences(normalized, normalizedEmail);
+      readyStore.set(true);
       return normalized;
     })
     .catch((error: unknown) => {
       reportError('Unable to load user preferences', error);
+      readyStore.set(true);
       return readCachedPreferences(normalizedEmail);
     })
     .finally(() => {

@@ -109,7 +109,12 @@ async def _resolve_tts_ttl_days(session: Any) -> int:
     """Read ``tts.cache_ttl_days`` setting with sane defaults."""
     raw = await get_setting_value(session, "tts.cache_ttl_days", _DEFAULT_TTS_TTL_DAYS)
     try:
-        days = int(raw) if raw is not None else _DEFAULT_TTS_TTL_DAYS
+        if raw is None:
+            days = _DEFAULT_TTS_TTL_DAYS
+        elif isinstance(raw, (str, int)):
+            days = int(raw)
+        else:
+            return _DEFAULT_TTS_TTL_DAYS
     except (TypeError, ValueError):
         return _DEFAULT_TTS_TTL_DAYS
     return max(1, days)

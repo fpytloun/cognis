@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="900" viewBox="0 0 800 900" role="img" aria-labelledby="title desc">
+  <title id="title">Nordhaven 430 refrigerator illustration</title>
+  <desc id="desc">A tall graphite refrigerator with a separate freezer door and a small energy label.</desc>
+  <rect width="800" height="900" fill="#edf0ed"/>
+  <rect x="230" y="80" width="340" height="720" rx="24" fill="#44525a"/>
+  <rect x="251" y="105" width="298" height="425" rx="14" fill="#5c6c75"/>
+  <rect x="251" y="553" width="298" height="224" rx="14" fill="#52616a"/>
+  <path d="M520 160V460M520 598V725" stroke="#d8e1df" stroke-width="12" stroke-linecap="round"/>
+  <rect x="75" y="145" width="112" height="168" rx="12" fill="#fff"/>
+  <text x="103" y="195" fill="#35553c" font-family="sans-serif" font-size="42" font-weight="700">B</text>
+  <text x="90" y="245" fill="#53636a" font-family="sans-serif" font-size="22">171 kWh</text>
+  <text x="86" y="278" fill="#53636a" font-family="sans-serif" font-size="22">38 dB</text>
+  <text x="400" y="855" text-anchor="middle" fill="#52616a" font-family="sans-serif" font-size="30">Nordhaven 430</text>
+</svg>

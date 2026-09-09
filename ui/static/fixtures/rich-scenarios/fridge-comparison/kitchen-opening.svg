@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Measured kitchen opening for refrigerator selection</title>
+  <desc id="desc">An illustrated kitchen cabinet opening with width, height, and depth guide lines.</desc>
+  <rect width="1600" height="900" fill="#dbe5df"/>
+  <rect x="150" y="105" width="1300" height="690" rx="28" fill="#a9bcae"/>
+  <rect x="440" y="170" width="720" height="580" rx="14" fill="#eff2eb"/>
+  <rect x="485" y="210" width="630" height="500" rx="10" fill="#617169"/>
+  <path d="M485 115V170M1115 115V170M485 140H1115M395 210H485M395 710H485M420 210V710M1135 750H1210M1135 710H1210M1173 710V750" stroke="#315845" stroke-width="14" stroke-linecap="round"/>
+  <text x="800" y="128" text-anchor="middle" fill="#315845" font-family="sans-serif" font-size="42" font-weight="700">610 mm opening width</text>
+  <text x="385" y="478" text-anchor="middle" fill="#315845" font-family="sans-serif" font-size="34" font-weight="700" transform="rotate(-90 385 478)">1,900 mm height</text>
+  <text x="1175" y="810" text-anchor="middle" fill="#315845" font-family="sans-serif" font-size="34" font-weight="700">660 mm depth limit</text>
+</svg>

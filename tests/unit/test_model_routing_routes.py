@@ -53,6 +53,18 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _seed_user(app: object, email: str, role: str) -> None:
+    async with app.state.session_factory() as session:
+        await create_user(
+            session,
+            email=email,
+            name=email.split("@")[0].title(),
+            password_hash=app.state.password_hasher.hash("password123"),
+            role=role,
+        )
+        await session.commit()
+
+
 def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -317,6 +329,13 @@ def test_executor_provider_requires_explicit_executor_target(
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
                 await create_executor(
                     session,
                     executor_id="maitrea",
@@ -354,6 +373,7 @@ def test_admin_provider_create_defaults_to_user_owned(monkeypatch: object, tmp_p
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
         headers = _auth_headers(app, email="admin@example.com", role="admin")
+        client.portal.call(_seed_user, app, "admin@example.com", "admin")
 
         response = client.post(
             "/api/v1/llm-providers",
@@ -382,6 +402,7 @@ def test_admin_provider_create_can_explicitly_create_shared_system_provider(
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
         headers = _auth_headers(app, email="admin@example.com", role="admin")
+        client.portal.call(_seed_user, app, "admin@example.com", "admin")
 
         response = client.post(
             "/api/v1/llm-providers",

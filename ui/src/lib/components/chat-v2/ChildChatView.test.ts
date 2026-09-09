@@ -78,4 +78,132 @@ describe('ChildChatView', () => {
     await fireEvent.click(screen.getByRole('button', { name: /Ongoing work/ }));
     expect(screen.getAllByText('Inspect child output').length).toBeGreaterThan(0);
   });
+
+  it('forwards runtime activity and clears it on unmount', async () => {
+    const onRuntimeActiveChange = vi.fn();
+    const { unmount } = render(ChildChatView, {
+      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      node: { ...node, status: 'active', activity_state: 'active' },
+      preferences: DEFAULT_USER_PREFERENCES,
+      inspectorOpen: true,
+      timelineApi: {
+        snapshot: vi.fn().mockResolvedValue({
+          schema_version: 2, projection_version: 'test',
+          scope: { key: 'session:session-child', kind: 'session', session_id: 'session-child', conversation_id: 'root' },
+          conversation: { conversation_id: 'root' },
+          timeline: { items: [], has_more_before: false, before_cursor: null },
+          state: { state_version: 1, snapshot_generated_at: '', capabilities: [], active_turn: {}, pending: {}, active_session: {} },
+          queue: { messages: [], queued_count: 0 },
+          runtime: { has_active_turn: true, active_turn: { turn_id: 'turn-1' }, volatile_items: [], cycle_states: [] },
+          cursor: 'cursor-active', server_time: '',
+        } as unknown as ChatSnapshot),
+        sync: vi.fn(),
+        timeline: vi.fn(),
+      },
+      timelineRealtime: {
+        subscribe: () => () => {},
+        acquireChatV2: vi.fn(),
+        updateChatV2Cursor: vi.fn(),
+        releaseChatV2: vi.fn(),
+      },
+      onBack: vi.fn(),
+      onClose: vi.fn(),
+      onToggleInspector: vi.fn(),
+      onViewSession: vi.fn(),
+      onRuntimeActiveChange,
+    });
+    await waitFor(() => expect(onRuntimeActiveChange).toHaveBeenCalledWith(true));
+    unmount();
+    expect(onRuntimeActiveChange).toHaveBeenLastCalledWith(false);
+  });
+
+  it.each([
+    ['running', 'Running'],
+    ['queued', 'Queued'],
+    ['waiting', 'Waiting'],
+    ['recovering', 'Recovering'],
+    ['idle', 'Idle'],
+    ['completed', 'Completed'],
+  ] as const)('uses canonical %s state instead of old session completion', (executionState, label) => {
+    render(ChildChatView, {
+      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      node: { ...node, execution_state: executionState },
+      preferences: DEFAULT_USER_PREFERENCES,
+      inspectorOpen: true,
+      timelineApi: { snapshot: vi.fn(() => new Promise<ChatSnapshot>(() => {})), sync: vi.fn(), timeline: vi.fn() },
+      timelineRealtime: {
+        subscribe: () => () => {},
+        acquireChatV2: vi.fn(), updateChatV2Cursor: vi.fn(), releaseChatV2: vi.fn(),
+      },
+      onBack: vi.fn(), onClose: vi.fn(), onToggleInspector: vi.fn(), onViewSession: vi.fn(),
+    });
+    const header = screen.getByTestId('child-header');
+    expect(header).toHaveTextContent(label);
+    expect(header).not.toHaveTextContent('Closed');
+    expect(header.textContent?.includes('Following latest'))
+      .toBe(['running', 'queued', 'waiting', 'recovering'].includes(executionState));
+  });
+
+  it('renders terminated as closed without live-follow state', () => {
+    render(ChildChatView, {
+      view: { kind: 'delegate', sessionId: 'session-child', controllerRootConversationId: 'root', nodeKey: 'child' },
+      node: { ...node, status: 'terminated', activity_state: 'ongoing' },
+      preferences: DEFAULT_USER_PREFERENCES,
+      inspectorOpen: true,
+      onBack: vi.fn(),
+      onClose: vi.fn(),
+      onToggleInspector: vi.fn(),
+      onViewSession: vi.fn(),
+    });
+    expect(screen.getByText('Closed')).toBeTruthy();
+    expect(screen.queryByText('Running')).toBeNull();
+    expect(screen.queryByText('Following latest')).toBeNull();
+  });
+
+  it('renders a managed new-window link without changing existing child controls', async () => {
+    const onViewSession = vi.fn();
+    render(ChildChatView, {
+      view: {
+        kind: 'managed',
+        conversationId: 'managed/conversation',
+        sessionId: 'session-child',
+        controllerRootConversationId: 'root',
+        nodeKey: 'child',
+      },
+      node: { ...node, kind: 'managed', conversation_id: 'managed/conversation' },
+      preferences: DEFAULT_USER_PREFERENCES,
+      inspectorOpen: true,
+      onBack: vi.fn(),
+      onClose: vi.fn(),
+      onToggleInspector: vi.fn(),
+      onViewSession,
+    });
+    const link = screen.getByRole('link', { name: 'Open Child session in new window' });
+    expect(link).toHaveAttribute('href', '/chat/managed%2Fconversation');
+    expect(link).toHaveAttribute('target', '_blank');
+    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    await fireEvent.click(link);
+    expect(onViewSession).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Collapse conversation inspector' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Close child conversation' })).toBeTruthy();
+  });
+
+  it('does not render a new-window link for a delegate child', () => {
+    render(ChildChatView, {
+      view: {
+        kind: 'delegate',
+        sessionId: 'session-child',
+        controllerRootConversationId: 'root',
+        nodeKey: 'child',
+      },
+      node,
+      preferences: DEFAULT_USER_PREFERENCES,
+      inspectorOpen: false,
+      onBack: vi.fn(),
+      onClose: vi.fn(),
+      onToggleInspector: vi.fn(),
+      onViewSession: vi.fn(),
+    });
+    expect(screen.queryByRole('link', { name: 'Open Child session in new window' })).toBeNull();
+  });
 });

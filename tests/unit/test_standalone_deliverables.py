@@ -43,6 +43,75 @@ def _manifest(directory: Path) -> StandaloneAssetManifest:
     )
 
 
+def test_static_renderer_preserves_dashboard_primitives_and_accessible_progress() -> None:
+    document = rendering.render_standalone_html(
+        _row(
+            rich_payload={
+                "metadata": {
+                    "presentation": "dashboard",
+                    "canvas": "wide",
+                    "density": "compact",
+                },
+                "blocks": [
+                    {
+                        "type": "section_header",
+                        "eyebrow": "Fleet",
+                        "title": "Capacity",
+                        "subtitle": "Current allocation",
+                        "status": "Attention",
+                        "tone": "warning",
+                    },
+                    {
+                        "type": "grid",
+                        "layout": "split-2-1",
+                        "blocks": [
+                            {
+                                "type": "metric",
+                                "label": "Used",
+                                "value": "72%",
+                                "surface": "raised",
+                                "span": 2,
+                                "progress": {"value": 72, "max": 100, "label": "Capacity"},
+                            }
+                        ],
+                    },
+                    {
+                        "type": "table",
+                        "rows": [
+                            {
+                                "state": {
+                                    "type": "badge",
+                                    "value": "Healthy",
+                                    "tone": "positive",
+                                },
+                                "used": {
+                                    "type": "progress",
+                                    "value": 7,
+                                    "max": 10,
+                                    "label": "Usage",
+                                },
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+    )
+    soup = BeautifulSoup(document, "html.parser")
+
+    assert soup.body["class"] == ["presentation-dashboard"]
+    assert soup.body["data-rich-canvas"] == "wide"
+    assert soup.body["data-rich-density"] == "compact"
+    assert soup.select_one('.block-presentation[data-layout="split-2-1"] > .block-grid') is not None
+    assert (
+        soup.select_one('.block-presentation[data-surface="raised"][data-span="2"] > .block-metric')
+        is not None
+    )
+    assert "Capacity: 72 of 100" in soup.get_text(" ", strip=True)
+    assert "Healthy (positive)" in soup.get_text(" ", strip=True)
+    assert "Usage: 7 of 10" in soup.get_text(" ", strip=True)
+
+
 def test_standalone_shell_uses_escaped_inert_payload_external_assets_and_semantic_fallback(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

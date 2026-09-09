@@ -40,6 +40,7 @@ class TaskExecutionClaim:
 
     task_id: str
     agent_id: str
+    attempt_number: int
     task_lease: Lease
     global_capacity_lease: Lease | None
     agent_capacity_lease: Lease | None
@@ -191,7 +192,14 @@ class TaskExecutionStore:
             task_id = task.task_id
             agent_id = task.agent_id
             await session.commit()
-            return TaskExecutionClaim(task_id, agent_id, task_lease, global_lease, agent_lease)
+            return TaskExecutionClaim(
+                task_id,
+                agent_id,
+                int(task.attempt_number or 1),
+                task_lease,
+                global_lease,
+                agent_lease,
+            )
 
     async def claim_paused(self, task_id: str) -> TaskExecutionClaim | None:
         """Claim one paused task without changing its durable paused state."""
@@ -247,7 +255,12 @@ class TaskExecutionStore:
             claimed_agent_id = task.agent_id
             await session.commit()
             return TaskExecutionClaim(
-                claimed_task_id, claimed_agent_id, task_lease, global_lease, agent_lease
+                claimed_task_id,
+                claimed_agent_id,
+                int(task.attempt_number or 1),
+                task_lease,
+                global_lease,
+                agent_lease,
             )
 
     async def _acquire_capacity(
@@ -268,8 +281,26 @@ class TaskExecutionStore:
                 return lease
         return None
 
-    async def renew(self, claim: TaskExecutionClaim) -> TaskExecutionClaim | None:
+    async def renew(
+        self,
+        claim: TaskExecutionClaim,
+        *,
+        terminal_status: str | None = None,
+    ) -> TaskExecutionClaim | None:
         async with self._session_factory() as session:
+            allowed_statuses = ["running", "paused"]
+            if terminal_status is not None:
+                allowed_statuses.append(terminal_status)
+            task_is_current = await session.scalar(
+                select(Task.task_id).where(
+                    Task.task_id == claim.task_id,
+                    Task.attempt_number == claim.attempt_number,
+                    Task.status.in_(allowed_statuses),
+                )
+            )
+            if task_is_current is None:
+                await session.rollback()
+                return None
             renewed: list[Lease] = []
             for lease in claim.leases:
                 now = database_now_expression(session)
@@ -304,6 +335,7 @@ class TaskExecutionStore:
         return TaskExecutionClaim(
             claim.task_id,
             claim.agent_id,
+            claim.attempt_number,
             renewed[0],
             renewed[1] if claim.global_capacity_lease is not None else None,
             renewed[2] if claim.agent_capacity_lease is not None else None,
@@ -338,7 +370,14 @@ class TaskExecutionStore:
                     await session.rollback()
                     return None
             await session.commit()
-        return TaskExecutionClaim(claim.task_id, claim.agent_id, claim.task_lease, None, None)
+        return TaskExecutionClaim(
+            claim.task_id,
+            claim.agent_id,
+            claim.attempt_number,
+            claim.task_lease,
+            None,
+            None,
+        )
 
     async def reacquire_capacity(self, claim: TaskExecutionClaim) -> TaskExecutionClaim | None:
         """Atomically reacquire both capacity slots under the retained task fence."""
@@ -372,6 +411,7 @@ class TaskExecutionStore:
         return TaskExecutionClaim(
             claim.task_id,
             claim.agent_id,
+            claim.attempt_number,
             claim.task_lease,
             global_lease,
             agent_lease,
@@ -409,6 +449,16 @@ class TaskExecutionStore:
                 )
             await session.commit()
 
+    async def invalidate_task_lease(self, session: AsyncSession, task_id: str) -> None:
+        """Expire the task lease so another controller observes a durable mutation now."""
+
+        now = database_now_expression(session)
+        await session.execute(
+            update(CoordinationLeaseRow)
+            .where(CoordinationLeaseRow.resource_key == task_lease_key(task_id))
+            .values(lease_expires_at=now, updated_at=now)
+        )
+
 
 class TaskExecutionFence:
     """Renewable task ownership fence shared across workflow boundaries."""
@@ -425,6 +475,7 @@ class TaskExecutionFence:
         self._lost = asyncio.Event()
         self._renew_task: asyncio.Task[None] | None = None
         self._claim_lock = asyncio.Lock()
+        self._terminal_status: str | None = None
 
     def start(self) -> None:
         self._renew_task = asyncio.create_task(
@@ -436,7 +487,10 @@ class TaskExecutionFence:
             await asyncio.sleep(TASK_LEASE_RENEW_SECONDS)
             try:
                 async with self._claim_lock:
-                    renewed = await self.store.renew(self.claim)
+                    renewed = await self.store.renew(
+                        self.claim,
+                        terminal_status=self._terminal_status,
+                    )
                     if renewed is not None:
                         self.claim = renewed
             except asyncio.CancelledError:
@@ -456,6 +510,21 @@ class TaskExecutionFence:
                 await self.assert_current(owned_session)
             return
         if self._lost.is_set():
+            raise StaleTaskExecutionOwner(self.claim.task_id)
+        allowed_statuses = ["running", "paused"]
+        if self._terminal_status is not None:
+            allowed_statuses.append(self._terminal_status)
+        task_stmt = select(Task.task_id).where(
+            Task.task_id == self.claim.task_id,
+            Task.attempt_number == self.claim.attempt_number,
+            Task.status.in_(allowed_statuses),
+        )
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            task_stmt = task_stmt.with_for_update()
+        task_is_current = await session.scalar(task_stmt)
+        if task_is_current is None:
+            self._lost.set()
+            self.cancel_event.set()
             raise StaleTaskExecutionOwner(self.claim.task_id)
         now = database_now_expression(session)
         for lease in self.claim.leases:
@@ -479,6 +548,11 @@ class TaskExecutionFence:
 
     async def checkpoint(self, _name: str, **_metadata: Any) -> None:
         await self.assert_current()
+
+    def mark_terminal(self, status: str) -> None:
+        """Permit post-commit cleanup and delivery for this exact terminal winner."""
+
+        self._terminal_status = status
 
     async def suspend_capacity(self) -> None:
         """Release capacity for an interactive pause without dropping task ownership."""

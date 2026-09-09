@@ -3573,6 +3573,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     executor = _Executor()
     runtime_updates = []
     scheduled = []
+    credential_reloads = []
     inject_late_generation = False
 
     async def fake_list_executors(
@@ -3603,6 +3604,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
         lambda _app, executor_id: scheduled.append(executor_id),
     )
+    monkeypatch.setattr(
+        "cognis.api.mcp_reconfigure.schedule_mcp_credential_reload",
+        lambda _app, executor_id, server_id: credential_reloads.append((executor_id, server_id)),
+    )
 
     app = SimpleNamespace(
         state=SimpleNamespace(
@@ -3624,6 +3629,18 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     assert session.committed is True
     assert scheduled == ["olorin"]
     assert result == ["olorin"]
+
+    desired_before_refresh = executor.desired_config_version
+    result = await schedule_mcp_server_executor_reconfigure_for_app(
+        app,
+        server_id="mcp-1",
+        reason="mcp_oauth_refresh_succeeded",
+    )
+
+    assert result == ["olorin"]
+    assert executor.desired_config_version == desired_before_refresh
+    assert runtime_updates == [("olorin", "reconfiguring")]
+    assert credential_reloads == [("olorin", "mcp-1")]
 
     runtime_updates.clear()
     scheduled.clear()

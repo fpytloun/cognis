@@ -146,6 +146,7 @@
       api={controller.api}
       realtime={controller.realtime}
       preferences={fixturePreferences}
+      autoBackfill={false}
       {activityStatus}
       stepRun={currentStepRun}
       emptyLabel="No scoped events."
@@ -153,10 +154,10 @@
   </div>
   <section class="mt-4 grid gap-3 md:grid-cols-2" data-testid="concurrent-timelines">
     <div class="h-48 overflow-hidden rounded-xl border border-slate-800" data-testid="concurrent-parent">
-      <ScopedChatV2Timeline scope={fixtureScopes.parent} api={controller.api} realtime={controller.realtime} compact emptyLabel="No parent events." />
+      <ScopedChatV2Timeline scope={fixtureScopes.parent} api={controller.api} realtime={controller.realtime} autoBackfill={false} compact emptyLabel="No parent events." />
     </div>
     <div class="h-48 overflow-hidden rounded-xl border border-slate-800" data-testid="concurrent-child">
-      <ScopedChatV2Timeline scope={fixtureScopes.child} api={controller.api} realtime={controller.realtime} compact emptyLabel="No child events." />
+      <ScopedChatV2Timeline scope={fixtureScopes.child} api={controller.api} realtime={controller.realtime} autoBackfill={false} compact emptyLabel="No child events." />
     </div>
   </section>
   <output data-testid="active-subscriptions">{controller.activeSubscriptions.join(',')}</output>

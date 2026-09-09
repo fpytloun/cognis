@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from cognis.core.executor_availability import is_executor_type_available
 from cognis.core.executor_policy import ExecutorPolicy, is_executor_row_usable
 from cognis.logging import get_logger
 from cognis.models.tool import ToolDefinition
@@ -88,9 +89,11 @@ def select_executor_for_agent(
 
     def _usable(executor: Any) -> bool:
         return (
-            is_executor_row_usable(executor, policy, owner_email=owner_email)
+            is_executor_type_available(getattr(executor, "executor_type", ""))
+            and is_executor_row_usable(executor, policy, owner_email=owner_email)
             if policy is not None
-            else getattr(executor, "status", None) == "active"
+            else is_executor_type_available(getattr(executor, "executor_type", ""))
+            and getattr(executor, "status", None) == "active"
             and (
                 owner_email is None
                 or getattr(executor, "owner_email", None) == owner_email

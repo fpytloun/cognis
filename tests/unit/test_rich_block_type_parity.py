@@ -39,10 +39,10 @@ _UI_RICH_DELIVERABLE_TS = (
 
 def _ts_supported_block_types() -> set[str]:
     source = _UI_RICH_DELIVERABLE_TS.read_text(encoding="utf-8")
-    match = re.search(
-        r"SUPPORTED_RICH_BLOCK_TYPES\s*=\s*new Set\(\[(.*?)\]\)", source, re.DOTALL
+    match = re.search(r"SUPPORTED_RICH_BLOCK_TYPES\s*=\s*new Set\(\[(.*?)\]\)", source, re.DOTALL)
+    assert match is not None, (
+        "SUPPORTED_RICH_BLOCK_TYPES Set literal not found in rich-deliverable.ts"
     )
-    assert match is not None, "SUPPORTED_RICH_BLOCK_TYPES Set literal not found in rich-deliverable.ts"
     body = match.group(1)
     return set(re.findall(r"'([a-z_]+)'", body))
 
@@ -83,10 +83,15 @@ def _block_for(block_type: str) -> dict[str, object]:
     if block_type in {"tabs", "accordion", "modal"}:
         return {
             **base,
-            "items": [{"type": "markdown", "title": f"{block_type} item", "content": f"{block_type} item"}],
+            "items": [
+                {"type": "markdown", "title": f"{block_type} item", "content": f"{block_type} item"}
+            ],
         }
     if block_type == "gallery":
-        return {**base, "items": [{"url": "https://example.com/image.png", "caption": "Gallery item"}]}
+        return {
+            **base,
+            "items": [{"url": "https://example.com/image.png", "caption": "Gallery item"}],
+        }
     if block_type == "callout":
         return {**base, "tone": "success"}
     if block_type == "action":
@@ -100,7 +105,12 @@ def _block_for(block_type: str) -> dict[str, object]:
     if block_type == "quote":
         return {**base, "quote": "quoted text", "byline": "Author"}
     if block_type == "figure":
-        return {**base, "url": "https://example.com/image.png", "alt": "Example image", "caption": "Caption"}
+        return {
+            **base,
+            "url": "https://example.com/image.png",
+            "alt": "Example image",
+            "caption": "Caption",
+        }
     if block_type in {"table", "comparison_matrix", "decision_matrix"}:
         return {**base, "columns": ["name", "score"], "rows": [{"name": "A", "score": 1}]}
     if block_type == "research_answer":
@@ -110,7 +120,12 @@ def _block_for(block_type: str) -> dict[str, object]:
             "sources": [{"id": "s1", "title": "Source"}],
         }
     if block_type in {"evidence_report", "claim_cards"}:
-        return {**base, "claims": [{"title": "Claim", "confidence": "high", "evidence": [{"text": "Evidence"}]}]}
+        return {
+            **base,
+            "claims": [
+                {"title": "Claim", "confidence": "high", "evidence": [{"text": "Evidence"}]}
+            ],
+        }
     if block_type == "chart":
         return {**base, "rows": [{"label": "A", "value": 1}]}
     if block_type == "mermaid":
@@ -120,7 +135,13 @@ def _block_for(block_type: str) -> dict[str, object]:
     if block_type == "source_list":
         return {**base, "sources": [{"title": "Source", "url": "https://example.com"}]}
     if block_type == "day_agenda":
-        return {**base, "date": "2026-01-01", "timezone": "UTC", "now": "2026-01-01T08:00:00+00:00", "items": []}
+        return {
+            **base,
+            "date": "2026-01-01",
+            "timezone": "UTC",
+            "now": "2026-01-01T08:00:00+00:00",
+            "items": [],
+        }
     if block_type in {"incident_timeline", "incident_checklist", "checklist"}:
         return {**base, "items": [{"title": "Step", "status": "done"}]}
     if block_type == "code":
@@ -128,7 +149,9 @@ def _block_for(block_type: str) -> dict[str, object]:
     return base
 
 
-_DELIVERABLES_MODULE = Path(__file__).resolve().parents[2] / "cognis" / "rendering" / "deliverables.py"
+_DELIVERABLES_MODULE = (
+    Path(__file__).resolve().parents[2] / "cognis" / "rendering" / "deliverables.py"
+)
 
 
 def _render_block_dispatch_source() -> str:

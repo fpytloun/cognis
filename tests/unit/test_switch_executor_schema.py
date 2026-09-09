@@ -224,7 +224,7 @@ def test_switch_executor_hidden_for_delegated_child_session() -> None:
     assert _switch_tool(schemas) is None
 
 
-def test_child_executor_install_can_remain_session_local() -> None:
+def test_child_executor_install_rejects_non_websocket_target() -> None:
     loop = _make_loop()
     ctx = SimpleNamespace(
         active_executor_id="exec-a",
@@ -238,7 +238,7 @@ def test_child_executor_install_can_remain_session_local() -> None:
     )
 
     assert ok is False
-    assert ctx.active_executor_id == "exec-b"
+    assert ctx.active_executor_id == "exec-a"
     assert ctx.conversation.active_executor_id == "exec-a"
 
 

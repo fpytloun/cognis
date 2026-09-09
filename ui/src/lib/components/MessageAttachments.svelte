@@ -1,8 +1,11 @@
 <script lang="ts">
   import Download from 'lucide-svelte/icons/download';
+  import Eye from 'lucide-svelte/icons/eye';
   import FileText from 'lucide-svelte/icons/file-text';
 
   import { api } from '$lib/api/client';
+  import { previewKind } from '$lib/attachments/preview';
+  import AttachmentPreviewModal from '$lib/components/AttachmentPreviewModal.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import type { AttachmentRef } from '$lib/types/api';
 
@@ -24,6 +27,9 @@
   let { attachments } = $props<{ attachments: AttachmentRef[] }>();
 
   let lightboxIndex = $state<number | null>(null);
+  let previewAttachment = $state<AttachmentRef | null>(null);
+  let previewMediaUrl = $state<string | null>(null);
+  let previewRequest = 0;
   let resolvedUrls = $state<Record<string, string>>({});
 
   function urlKey(attachment: AttachmentRef, mode: 'download' | 'view'): string {
@@ -73,7 +79,10 @@
   $effect(() => {
     for (const attachment of attachments) {
       if (attachment.url || resolvedUrls[urlKey(attachment, 'download')]) continue;
-      if (typeof attachment.mime_type === 'string' && attachment.mime_type.startsWith('image/')) {
+      if (
+        typeof attachment.mime_type === 'string'
+        && (attachment.mime_type.startsWith('image/') || attachment.mime_type.startsWith('audio/'))
+      ) {
         void resolveAttachmentUrl(attachment, 'download');
       }
     }
@@ -121,6 +130,22 @@
     if (url) window.open(url, '_blank', 'noopener,noreferrer');
   }
 
+  async function openPreview(attachment: AttachmentRef): Promise<void> {
+    const request = ++previewRequest;
+    const kind = previewKind(attachment);
+    if (kind === 'html') {
+      await openViewAttachment(new MouseEvent('click'), attachment);
+      return;
+    }
+    if (kind === 'video') {
+      previewMediaUrl = await resolveAttachmentUrl(attachment, 'download');
+      if (request !== previewRequest) return;
+    } else {
+      previewMediaUrl = null;
+    }
+    previewAttachment = attachment;
+  }
+
   function formatBytes(value: number | null | undefined): string {
     if (typeof value !== 'number' || value <= 0) return '';
     if (value < 1024) return `${value} B`;
@@ -154,6 +179,7 @@
   <div class="mt-3 space-y-1.5">
     {#each otherAttachments as attachment (attachment.artifact_id)}
       {@const sizeText = formatBytes(attachment.size_bytes)}
+      {@const kind = previewKind(attachment)}
       <div class="flex items-center gap-3 rounded-xl border border-slate-800/60 bg-slate-950/40 px-3 py-2">
         <span class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-800/60 text-slate-300">
           <FileText class="h-4 w-4" />
@@ -176,6 +202,24 @@
             {attachment.mime_type ?? 'file'}{sizeText ? ` · ${sizeText}` : ''}
           </p>
         </div>
+        {#if attachment.mime_type?.startsWith('audio/')}
+          {@const audioUrl = resolvedUrl(attachment, 'download')}
+          {#if audioUrl}
+            <audio class="h-9 max-w-48" src={audioUrl} controls preload="none"></audio>
+          {:else}
+            <button type="button" onclick={() => { void resolveAttachmentUrl(attachment, 'download'); }} class="text-xs text-sky-300">Load player</button>
+          {/if}
+        {/if}
+        {#if kind}
+          <button
+            type="button"
+            onclick={() => { void openPreview(attachment); }}
+            aria-label={`Preview ${attachment.filename}`}
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-800/60 hover:text-slate-100"
+          >
+            <Eye class="h-4 w-4" />
+          </button>
+        {/if}
         {#if resolvedUrl(attachment, 'download')}
           <a
             href={resolvedUrl(attachment, 'download') ?? ''}
@@ -200,6 +244,16 @@
       </div>
     {/each}
   </div>
+{/if}
+
+{#if previewAttachment && previewKind(previewAttachment) !== 'html'}
+  <AttachmentPreviewModal
+    attachment={previewAttachment}
+    kind={previewKind(previewAttachment) === 'video' ? 'video' : 'text'}
+    mediaUrl={previewMediaUrl}
+    onClose={() => { previewRequest += 1; previewAttachment = null; previewMediaUrl = null; }}
+    onDownload={() => { if (previewAttachment) void openDownloadAttachment(previewAttachment); }}
+  />
 {/if}
 
 {#if lightboxIndex !== null && imageAttachments[lightboxIndex]}

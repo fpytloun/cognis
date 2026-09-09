@@ -74,17 +74,19 @@ async function loadTheme(page: Page, html: string, mode: 'light' | 'dark' | 'sys
     document.documentElement.style.background = dark ? '#020617' : '#f5f7fa';
     document.body.style.cssText = `transition:none;background:${dark ? '#020617' : '#f5f7fa'};color:${dark ? '#e5f4ff' : '#18212f'}`;
   }, mode === 'system-dark' ? 'system' : mode);
-  await page.setContent(html, { waitUntil: 'load' });
+  // Load an actual document: setContent leaves the previous Svelte app's
+  // running scripts in the same window and can contaminate theme state.
+  await page.route('**/standalone-accessibility-fixture', (route) =>
+    route.fulfill({ contentType: 'text/html', body: html }));
+  await page.goto('/standalone-accessibility-fixture', { waitUntil: 'load' });
   await expect(page.locator('html')).toHaveAttribute(
     'data-resolved-theme',
-    mode === 'light' ? 'light' : 'dark',
+    'dark',
   );
-  await expect(page.locator('html')).toHaveAttribute(
-    'data-theme',
-    mode === 'system-dark' ? 'system' : mode,
-  );
+  // standalone.ts intentionally ignores historical per-document preferences.
+  await expect(page.locator('html')).toHaveCSS('color-scheme', 'dark');
   await expect.poll(() => page.locator('.document').evaluate((element) => getComputedStyle(element).backgroundColor))
-    .toBe(mode === 'light' ? 'rgb(255, 255, 255)' : 'rgb(8, 21, 37)');
+    .toBe('rgb(8, 21, 37)');
 }
 
 async function expectWcagTextContrast(page: Page) {
@@ -142,17 +144,14 @@ test.describe('standalone generated HTML dark accessibility', () => {
 
   for (const fixtureName of ['pulse', 'research'] as const) {
     for (const mode of ['light', 'dark', 'system-dark'] as const) {
-      test(`${fixtureName} passes contrast in ${mode}`, async ({ page }) => {
+      test(`${fixtureName} preserves dark contrast despite legacy ${mode} preference`, async ({ page }) => {
         await page.setViewportSize({ width: 1440, height: 1000 });
         await loadTheme(page, fixtures[fixtureName], mode);
         await expect(page.locator('.document')).toBeVisible();
         await expectWcagTextContrast(page);
 
-        const action = page.getByRole('button', { name: /Theme:/ });
-        const base = await action.evaluate((element) => getComputedStyle(element).borderColor);
-        await action.hover();
-        await expect.poll(() => action.evaluate((element) => getComputedStyle(element).borderColor))
-          .not.toBe(base);
+        await expect(page.getByRole('button', { name: /Theme:/ })).toHaveCount(0);
+        const action = page.getByRole('link', { name: 'Download PDF' });
         await action.focus();
         await expect(action).toBeFocused();
         expect(await action.evaluate((element) => getComputedStyle(element).outlineStyle)).not.toBe('none');
@@ -203,7 +202,7 @@ test.describe('standalone generated HTML dark accessibility', () => {
     const trigger = actions.getByRole('button', { name: 'Open table of contents' });
     await expect(trigger).toBeVisible();
     await expect(actions.getByRole('link', { name: 'Download PDF' })).toBeVisible();
-    await expect(actions.getByRole('button', { name: /Theme:/ })).toBeVisible();
+    await expect(actions.getByRole('button', { name: /Theme:/ })).toHaveCount(0);
     await trigger.focus();
     await trigger.click();
 

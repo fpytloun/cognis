@@ -13,6 +13,9 @@ cognis.db
 cognis/ui_dist
 dist
 dist-executor
+tests
+Dockerfile.mock-llm
+compose*.yml
 ui/.svelte-kit
 ui/build
 ui/standalone-build

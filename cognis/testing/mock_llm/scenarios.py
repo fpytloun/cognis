@@ -45,6 +45,7 @@ from typing import Any
 
 try:
     import yaml
+
     _YAML_AVAILABLE = True
 except ImportError:
     _YAML_AVAILABLE = False
@@ -159,7 +160,7 @@ class ScenarioCatalog:
         with self._lock:
             self._history.append({"request": request, "scenario_id": scenario_id})
             if len(self._history) > self._max_history:
-                self._history = self._history[-self._max_history:]
+                self._history = self._history[-self._max_history :]
 
     def get_history(self, limit: int = 10) -> list[dict[str, Any]]:
         with self._lock:
@@ -174,6 +175,7 @@ class ScenarioCatalog:
 # Scenario rendering — convert a scenario step into SSE chunks
 # ---------------------------------------------------------------------------
 
+
 def _turn_ends_with_tool_call(turn: dict[str, Any]) -> bool:
     """Return True if the turn's last non-empty step is a tool_call.
 
@@ -184,7 +186,7 @@ def _turn_ends_with_tool_call(turn: dict[str, Any]) -> bool:
     steps = [s for s in turn.get("steps", []) if s.get("type")]
     if not steps:
         return False
-    return steps[-1].get("type") == "tool_call"
+    return bool(steps[-1].get("type") == "tool_call")
 
 
 def render_chat_completion_stream(
@@ -243,11 +245,13 @@ def render_chat_completion_stream(
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": chunk_text},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": chunk_text},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
                 chunks.append(f"data: {json.dumps(delta)}")
 
@@ -258,22 +262,26 @@ def render_chat_completion_stream(
             content = step.get("content", "")
             # Split into ~20-char chunks to simulate token-by-token streaming
             chunk_size = 20
-            content_chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)] or [""]
+            content_chunks = [
+                content[i : i + chunk_size] for i in range(0, len(content), chunk_size)
+            ] or [""]
             for chunk_text in content_chunks:
                 delta = {
                     "id": request_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {
-                            "role": "assistant",
-                            "content": "",
-                            "reasoning_content": chunk_text,
-                        },
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": "",
+                                "reasoning_content": chunk_text,
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
                 }
                 chunks.append(f"data: {json.dumps(delta)}")
 
@@ -286,29 +294,34 @@ def render_chat_completion_stream(
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "index": tool_call_index,
-                            "id": call_id,
-                            "type": "function",
-                            "function": {
-                                "name": name,
-                                "arguments": json.dumps(arguments),
-                            },
-                        }],
-                    },
-                    "finish_reason": None,
-                }],
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "index": tool_call_index,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": json.dumps(arguments),
+                                    },
+                                }
+                            ],
+                        },
+                        "finish_reason": None,
+                    }
+                ],
             }
             chunks.append(f"data: {json.dumps(delta)}")
             tool_call_index += 1
 
     # Final stop/tool_calls chunk — correct finish_reason drives agent loop behaviour
     import time as _time
+
     stop_delta = {
         "id": request_id,
         "object": "chat.completion.chunk",
@@ -349,18 +362,21 @@ def get_step_delays(scenario: dict[str, Any], turn_index: int = 0) -> list[float
 def build_default_response(model: str = "mock-model") -> dict[str, Any]:
     """Return a minimal non-streaming chat completion for unknown scenarios."""
     import time
+
     return {
         "id": "chatcmpl-mock-default",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "Mock response — no scenario matched.",
-            },
-            "finish_reason": "stop",
-        }],
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Mock response — no scenario matched.",
+                },
+                "finish_reason": "stop",
+            }
+        ],
         "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
     }

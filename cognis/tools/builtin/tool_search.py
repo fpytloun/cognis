@@ -18,6 +18,7 @@ from cognis.models.tool import (
     tool_capabilities,
     tool_profile_group,
 )
+from cognis.tools.introspection import tool_operation_index
 
 _CLAUDE_MCP_PREFIX = "mcp__cognis__"
 _TOKEN_PATTERN = re.compile(r"[a-z0-9_]+")
@@ -70,7 +71,9 @@ DESCRIBE_TOOL_TOOL = ToolDefinition(
         "calling an unfamiliar tool or a complex mutation to inspect authoritative operations, "
         "mutation kind, omitted/null/array/concurrency semantics, dynamic options, examples, side "
         "effects, and schema version/hash. Accepts callable names and stable tool IDs returned by "
-        "search_tools. It never reveals tools outside the caller's effective authorization scope."
+        "search_tools. For a multi-operation tool, pass the exact operation name from search_tools "
+        "to avoid loading the full schema union. It never reveals tools outside the caller's "
+        "effective authorization scope."
     ),
     parameters={
         "type": "object",
@@ -79,7 +82,15 @@ DESCRIBE_TOOL_TOOL = ToolDefinition(
                 "type": "string",
                 "minLength": 1,
                 "description": "Callable name or stable tool ID from the current session inventory.",
-            }
+            },
+            "operation": {
+                "type": "string",
+                "minLength": 1,
+                "description": (
+                    "Optional exact case-sensitive operation name. Use this for multi-operation "
+                    "tools to return only that operation's authoritative schema."
+                ),
+            },
         },
         "required": ["tool"],
         "additionalProperties": False,
@@ -117,6 +128,52 @@ VALIDATE_TOOL_CALL_TOOL = ToolDefinition(
     category="system",
     read_only=True,
 )
+
+CALL_TOOL_TOOL = ToolDefinition(
+    name="call_tool",
+    description=(
+        "Call one currently authorized tool from the live session inventory without exposing its "
+        "schema. Use a stable tool ID returned by search_tools when available. The target receives "
+        "the same validation, policy, approval, and execution behavior as a direct tool call."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "tool": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Stable tool ID or current callable name.",
+            },
+            "arguments": {
+                "type": "object",
+                "description": "Complete arguments for the target tool.",
+            },
+        },
+        "required": ["tool", "arguments"],
+        "additionalProperties": False,
+    },
+    source=ToolSource(type="builtin"),
+    category="system",
+    read_only=False,
+)
+
+
+def resolve_inventory_tool(
+    tools: list[ToolDefinition],
+    identifier: str,
+) -> ToolDefinition | None:
+    """Resolve an authorized inventory tool by stable ID, then unique callable name."""
+
+    normalized = identifier.strip()
+    if not normalized:
+        return None
+    stable_matches = [tool for tool in tools if stable_tool_id(tool) == normalized]
+    if len(stable_matches) == 1:
+        return stable_matches[0]
+    name_matches = [tool for tool in tools if tool.name == normalized]
+    if len(name_matches) == 1:
+        return name_matches[0]
+    return None
 
 
 def search_inventory(
@@ -213,19 +270,7 @@ def search_inventory(
         )
         if score <= 0:
             continue
-        handle = {
-            "tool_id": stable_tool_id(tool),
-            "name": display_name,
-            "callable_name": tool.name,
-            "scope": "session",
-            "category": tool.category,
-            "profile_group": profile_group,
-            "source": tool.source.model_dump(mode="json"),
-            "capabilities": sorted(str(capability) for capability in tool_capabilities(tool)),
-            "read_only": tool.read_only,
-            "confidence": round(score, 3),
-            "permission_scope": "current_session_effective_inventory",
-        }
+        handle = _tool_handle(tool, display_name, profile_group, confidence=round(score, 3))
         matches.append(
             (
                 score,
@@ -237,6 +282,7 @@ def search_inventory(
                     "profile_group": profile_group,
                     "source": tool.source.model_dump(mode="json"),
                     "handle": handle,
+                    **tool_operation_index(tool),
                 },
             )
         )
@@ -353,6 +399,7 @@ def _select_inventory(
                 "already_visible": already_visible,
                 "source": tool.source.model_dump(mode="json"),
                 "handle": _tool_handle(tool, display_name, profile_group, confidence=100.0),
+                **tool_operation_index(tool),
             }
         )
 

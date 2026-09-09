@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -73,6 +74,148 @@ async def test_warmer_preserves_request_arriving_during_active_refresh() -> None
     await warmer.stop()
 
     assert calls == 2
+
+
+@pytest.mark.anyio
+async def test_warmer_debounces_burst_and_reads_latest_context() -> None:
+    warmed_generations: list[int] = []
+    current_generation = 1
+    completed = asyncio.Event()
+
+    async def warm(_conversation_id: str):
+        warmed_generations.append(current_generation)
+        completed.set()
+        return "succeeded", None
+
+    warmer = ChatSnapshotWarmer(
+        warm,
+        worker_count=1,
+        debounce_seconds=0.03,
+        max_debounce_seconds=0.1,
+    )
+    await warmer.start()
+    assert warmer.enqueue("conversation-a")
+    current_generation = 2
+    assert warmer.enqueue("conversation-a")
+    current_generation = 3
+    assert warmer.enqueue("conversation-a")
+    await asyncio.sleep(0.01)
+    assert warmed_generations == []
+
+    await asyncio.wait_for(completed.wait(), timeout=0.2)
+    await warmer.stop()
+
+    assert warmed_generations == [3]
+
+
+@pytest.mark.anyio
+async def test_warmer_bounds_continuous_debounce_by_maximum_delay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 0.0
+    completed = asyncio.Event()
+    outcomes: list[str] = []
+
+    async def warm(_conversation_id: str):
+        completed.set()
+        return "succeeded", None
+
+    monkeypatch.setattr(
+        "cognis.api.chat_v2.snapshot_warmer.SNAPSHOT_CACHE_METRICS.warm_event",
+        outcomes.append,
+    )
+    warmer = ChatSnapshotWarmer(
+        warm,
+        worker_count=1,
+        clock=lambda: now,
+        debounce_seconds=2,
+        max_debounce_seconds=3,
+    )
+    await warmer.start()
+    assert warmer.enqueue("conversation-a")
+    for timestamp in (1.0, 2.0, 3.0):
+        now = timestamp
+        assert warmer.enqueue("conversation-a")
+        await asyncio.sleep(0)
+
+    await asyncio.wait_for(completed.wait(), timeout=0.2)
+    await warmer.stop()
+
+    assert outcomes.count("max_delay") == 1
+
+
+@pytest.mark.anyio
+async def test_warmer_shutdown_bypasses_debounce_and_drains_promptly() -> None:
+    warmed: list[str] = []
+
+    async def warm(conversation_id: str):
+        warmed.append(conversation_id)
+        return "succeeded", None
+
+    warmer = ChatSnapshotWarmer(
+        warm,
+        worker_count=1,
+        debounce_seconds=10,
+        max_debounce_seconds=20,
+    )
+    await warmer.start()
+    assert warmer.enqueue("conversation-a")
+
+    started = monotonic()
+    await warmer.stop(drain_timeout_seconds=0.2)
+
+    assert monotonic() - started < 0.2
+    assert warmed == ["conversation-a"]
+    assert warmer.pending_count == 0
+
+
+@pytest.mark.anyio
+async def test_warmer_continues_when_metrics_backend_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenMetric:
+        def labels(self, **_labels):
+            raise RuntimeError("metrics unavailable")
+
+        def set(self, _value):
+            raise RuntimeError("metrics unavailable")
+
+        def observe(self, _value):
+            raise RuntimeError("metrics unavailable")
+
+    broken = BrokenMetric()
+    monkeypatch.setattr(
+        "cognis.api.chat_v2.snapshot_metrics.WARM_EVENTS",
+        broken,
+    )
+    monkeypatch.setattr(
+        "cognis.api.chat_v2.snapshot_metrics.WARMER_PENDING",
+        broken,
+    )
+    monkeypatch.setattr(
+        "cognis.api.chat_v2.snapshot_metrics.WARMER_ACTIVE",
+        broken,
+    )
+    monkeypatch.setattr(
+        "cognis.api.chat_v2.snapshot_metrics.WARM_LAG",
+        broken,
+    )
+    completed = asyncio.Event()
+
+    async def warm(_conversation_id: str):
+        completed.set()
+        return "succeeded", None
+
+    warmer = ChatSnapshotWarmer(
+        warm,
+        worker_count=1,
+        debounce_seconds=0,
+        max_debounce_seconds=0,
+    )
+    await warmer.start()
+    assert warmer.enqueue("conversation-a")
+    await asyncio.wait_for(completed.wait(), timeout=0.2)
+    await warmer.stop()
 
 
 @pytest.mark.anyio

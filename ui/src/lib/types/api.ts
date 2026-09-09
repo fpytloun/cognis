@@ -37,9 +37,11 @@ export type UserThemePreference = 'system' | 'dark' | 'light';
 export interface UserDisplayPreferences {
   theme: UserThemePreference;
   language: string;
+  dashboard_workspace_windows: boolean;
 }
 
 export interface UserChatPreferences {
+  enter_to_send: boolean;
   show_thinking_blocks: boolean;
   group_tool_calls: boolean;
   keep_assistant_messages_separate: boolean;
@@ -59,12 +61,31 @@ export interface TokenResponse {
 }
 
 export interface AuthSessionResponse {
+  status: 'authenticated';
   user: UserSummary;
   expires_at: string;
   token?: string | null;
   refresh_token?: string | null;
   expires_in?: number | null;
+  recovery_codes?: string[] | null;
 }
+
+export interface MfaChallengeResponse {
+  status: 'mfa_required' | 'mfa_setup_required';
+  method: 'totp';
+  challenge_token: string;
+  expires_in: number;
+}
+
+export interface MfaSetupResponse {
+  status: 'mfa_setup';
+  method: 'totp';
+  challenge_token: string;
+  secret: string;
+  provisioning_uri: string;
+}
+
+export type AuthLoginResponse = AuthSessionResponse | MfaChallengeResponse;
 
 export interface ExchangeTokenResponse {
   token: string;
@@ -121,6 +142,54 @@ export interface CursorPage<T> {
   has_more: boolean;
 }
 
+export type DashboardIssueSeverity = 'critical' | 'warning' | 'info';
+
+export type DashboardIssueKind =
+  | 'executor_unavailable'
+  | 'executor_degraded'
+  | 'executor_config_not_converged'
+  | 'tool_observation_missing'
+  | 'tool_observation_stale'
+  | 'mcp_auth_fault'
+  | 'mcp_runtime_fault'
+  | 'schedule_failed'
+  | 'schedule_auto_disabled'
+  | 'provider_unavailable'
+  | 'getting_started';
+
+export interface DashboardIssueResource {
+  type: 'executor' | 'mcp_server' | 'schedule' | 'provider' | 'setup';
+  id: string;
+  label: string;
+}
+
+export interface DashboardIssue {
+  id: string;
+  severity: DashboardIssueSeverity;
+  kind: DashboardIssueKind;
+  title: string;
+  detail: string;
+  resource: DashboardIssueResource;
+  observed_at: string | null;
+  action_url: string;
+  action_label?: string;
+  dismiss_token?: string | null;
+}
+
+export interface DashboardIssuesSummary {
+  total: number;
+  critical: number;
+  warning: number;
+  info: number;
+  truncated: boolean;
+}
+
+export interface DashboardIssuesResponse {
+  generated_at: string;
+  issues: DashboardIssue[];
+  summary: DashboardIssuesSummary;
+}
+
 export interface ConversationContext {
   type: string;
   ref: string | null;
@@ -163,8 +232,28 @@ export interface ConversationPendingSummary {
   label?: string | null;
   message?: string | null;
   options?: unknown[];
+  questions?: QuestionSetQuestion[];
+  context?: Record<string, unknown> | null;
   metadata?: Record<string, unknown>;
   created_at?: string | null;
+  // Safe managed-child origin metadata. Present when the notification's
+  // conversation is a managed-conversation target; used only to label an
+  // acknowledgement and, when an origin conversation id is present, to
+  // offer navigation back to it. Never carries internal session ids.
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
+  // Safe escalation-approval fields. Present when notification_type is
+  // "escalation"; nullable/optional so other pending summary uses
+  // (question, credential_request, auth_challenge) are unaffected.
+  session_id?: string | null;
+  call_id?: string | null;
+  tool_call_id?: string | null;
+  tool_name?: string | null;
+  arguments_display?: Record<string, unknown> | null;
+  risk?: string | null;
+  reasoning?: string | null;
+  timeout_seconds?: number | null;
 }
 
 export interface ConversationPendingState {
@@ -237,6 +326,7 @@ export interface Conversation {
     active_turn_chat_mode: ChatMode | null;
     active_turn_chat_mode_source: ChatModeSource | null;
     pending_notification_types: string[];
+    attention_actions?: AttentionActionSummary[];
     starred_at: string | null;
     status: string;
     last_message_at: string | null;
@@ -292,11 +382,14 @@ export interface BackgroundWorkTodo {
 }
 
 export interface BackgroundWorkItem {
-  kind: 'managed_conversation' | 'delegated_session';
+  kind: 'managed_conversation' | 'delegated_session' | 'background_command';
   work_id: string;
   controller_conversation_id: string;
+  controller_session_id?: string | null;
   target_conversation_id?: string | null;
   session_id?: string | null;
+  parent_session_id?: string | null;
+  executor_id?: string | null;
   title: string;
   agent_id: string;
   agent_profile_id?: string | null;
@@ -320,8 +413,11 @@ export interface SidebarProjection {
   context_types: string[];
   removed_conversation_ids?: string[];
   full_resync_required?: boolean;
+  is_delta?: boolean;
   sync_timestamp?: string | null;
-  background_work: BackgroundWorkProjection;
+  sidebar_revision?: string | null;
+  background_work?: BackgroundWorkProjection | null;
+  background_work_changed?: boolean;
 }
 
 export interface ConversationOpenRequest {
@@ -644,12 +740,18 @@ export interface ConversationFlatSearchResponse {
 
 export interface Session {
   session_id: string;
+  activity_scope_id: string;
   conversation_id: string;
   parent_session_id: string | null;
   previous_session_id: string | null;
   user_email: string;
   agent_id: string;
   agent_profile_id?: string | null;
+  model_override?: string | null;
+  model_override_provider_id?: string | null;
+  reasoning_effort_override?: string | null;
+  fast_mode_override?: boolean | null;
+  runtime_override_revision?: number;
   delegation_mode: string | null;
   delegation_task: string | null;
   status: string;
@@ -680,6 +782,20 @@ export interface IntarisSessionDetail {
   context_usage?: ContextUsage | null;
   token_usage?: TokenUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;
+  runtime_selection?: RuntimeSelection | null;
+}
+
+export interface RuntimeSelection {
+  revision: number;
+  profile_id: string;
+  profile_source: string;
+  model: string | null;
+  provider_id: string | null;
+  model_source: string;
+  reasoning_effort: string | null;
+  reasoning_effort_source: string;
+  fast_mode: boolean | null;
+  fast_mode_source: string;
 }
 
 export interface AgentRuntimeProfile {
@@ -1440,6 +1556,8 @@ export interface ExecutorStatus {
   active_executors: number;
   capabilities: Record<string, unknown>;
   native_tools: string[];
+  /** Optional for compatibility with controllers predating package availability reporting. */
+  available_executor_types?: string[];
 }
 
 export interface ResourceSnapshotFreshness {
@@ -1504,10 +1622,46 @@ export interface ExecutorResourceSnapshot {
   runtime: ExecutorRuntimeResourceSnapshot | null;
 }
 
+export type RuntimeCapabilityState = 'ready' | 'installable' | 'unavailable' | 'unknown';
+
+export interface RuntimeCapabilityStatus {
+  state: RuntimeCapabilityState;
+  reason_code: string;
+  message: string;
+  version?: string | null;
+}
+
+export interface BrowserCapabilityReport {
+  runtimes: Record<string, RuntimeCapabilityStatus>;
+  engines: Record<string, RuntimeCapabilityStatus>;
+  channels: Record<string, RuntimeCapabilityStatus>;
+}
+
+export interface RuntimeCapabilityReport {
+  schema_version: 1;
+  observed_at: string;
+  executor_version: string;
+  image_variant?: 'minimal' | 'general' | 'development' | null;
+  desired_tools: string[];
+  observed_tools: string[];
+  supported_tools: string[];
+  supported_components: string[];
+  components: Record<string, RuntimeCapabilityStatus>;
+  browser: BrowserCapabilityReport;
+  officecli: RuntimeCapabilityStatus;
+  mcp_launch: RuntimeCapabilityStatus;
+  git: RuntimeCapabilityStatus;
+  node: RuntimeCapabilityStatus;
+  uv: RuntimeCapabilityStatus;
+  lsp: RuntimeCapabilityStatus;
+}
+
 export interface ExecutorConfig {
   executor_id: string;
   name: string;
   executor_type: string;
+  available: boolean;
+  unavailable_reason: string | null;
   labels: Record<string, string>;
   enabled_tools: string[];
   enabled_tool_groups: string[];
@@ -1524,7 +1678,8 @@ export interface ExecutorConfig {
   runtime_metadata: ExecutorRuntimeMetadata;
   resource_snapshot: ExecutorResourceSnapshot | null;
   last_observed_at: string | null;
-  observed_tools?: ToolDefinitionSummary[];
+  observed_tools?: Array<Record<string, unknown>>;
+  observed_capabilities?: RuntimeCapabilityReport | null;
   is_default: boolean;
   shared: boolean;
   owner_email: string | null;
@@ -2260,7 +2415,20 @@ export interface TaskBoardItem {
   completed_at: string | null;
   updated_at: string | null;
   result_summary: string | null;
-  progress?: TaskProgressProjection | null;
+  attention_type?: string | null;
+  attention_actions?: AttentionActionSummary[];
+  progress_summary?: TaskBoardProgressSummary | null;
+}
+
+export interface TaskBoardProgressSummary {
+  todo_total: number;
+  todo_completed: number;
+  todo_in_progress: number;
+  current_step_name: string | null;
+  current_step_status: string | null;
+  changed_files: number;
+  additions: number;
+  deletions: number;
 }
 
 export interface TaskBoardDoneGroup {
@@ -2532,6 +2700,8 @@ export interface Schedule {
   enabled: boolean;
   max_concurrent_runs: number;
   delete_after_run: boolean;
+  retry_failed_tasks: boolean;
+  fail_paused_task_on_next_fire: boolean;
   completion_mode_family: 'default' | 'direct';
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
@@ -2889,6 +3059,9 @@ export interface Escalation {
   risk: string | null;
   timeout_seconds?: number;
   received_at?: number;
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
 }
 
 export interface Notification {
@@ -2904,6 +3077,88 @@ export interface Notification {
   resolution: Record<string, unknown> | null;
   created_at: string | null;
   resolved_at: string | null;
+}
+
+export type AttentionActionKind =
+  | 'escalation'
+  | 'gate'
+  | 'step_question'
+  | 'credential_request'
+  | 'auth_challenge'
+  | 'oauth_authorization'
+  | 'unsupported';
+
+export interface AttentionActionSource {
+  notification_id: string;
+  conversation_id: string;
+  managed_origin_conversation_id: string | null;
+  task_id: string | null;
+  step_name: string | null;
+  step_run_id: string | null;
+  session_id: string | null;
+}
+
+export interface AttentionActionSummary {
+  action_id: string;
+  kind: AttentionActionKind;
+  status: string;
+  availability: 'actionable' | 'read_only' | 'resolving' | 'recovery_required' | 'unsupported' | 'expired' | 'resolved';
+  title: string;
+  source: AttentionActionSource;
+  can_resolve: boolean;
+  has_action_form?: boolean;
+  expires_at: string | null;
+  revision: number;
+  convergence_id: string;
+}
+
+export interface AttentionActionChoice {
+  action: string;
+  label: string;
+  intent: 'primary' | 'secondary' | 'danger';
+  input: 'none' | 'note' | 'feedback' | 'structured' | 'credential' | 'auth_fields';
+}
+
+export interface AttentionActionDisplay {
+  message: string | null;
+  tool_name: string | null;
+  arguments_display: Record<string, unknown> | null;
+  reasoning: string | null;
+  risk: string | null;
+  questions: QuestionSetQuestion[];
+  required_fields: string[];
+  credential_id: string | null;
+  credential_kind: string | null;
+  credential_label: string | null;
+  credential_scope: string | null;
+  authorization_url: string | null;
+  user_code: string | null;
+  callback_mode: string | null;
+  executor_name: string | null;
+}
+
+export interface AttentionActionDetail extends AttentionActionSummary {
+  display: AttentionActionDisplay;
+  allowed_actions: AttentionActionChoice[];
+}
+
+export interface AttentionActionResolvePayload {
+  expected_revision: number;
+  submission_id: string;
+  action: string;
+  note?: string;
+  feedback?: string;
+  answers?: QuestionSetAnswer[];
+  response_fields?: Record<string, string>;
+  credential?: CredentialUpsertPayload;
+}
+
+export interface AttentionActionResolveResponse {
+  action_id: string;
+  status: string;
+  decision: string | null;
+  revision: number;
+  convergence_id: string;
 }
 
 export interface VapidPublicKeyResponse {
@@ -2970,6 +3225,11 @@ export interface WebSocketChunkGapEvent {
 }
 
 export interface ContextUsage {
+  runtime_metadata_revision?: number;
+  turn_id?: string | null;
+  runtime_selection_revision?: number | null;
+  measured_at?: string | null;
+  measurement_source?: 'projected_prompt' | string | null;
   prompt_tokens: number;
   max_context_tokens: number;
   max_input_tokens?: number;
@@ -3083,6 +3343,7 @@ export interface WebSocketTurnSettledEvent {
   conversation_id?: string;
   session_id?: string;
   message_id?: string;
+  turn_id?: string | null;
   queued_count?: number;
   completed_at?: string | null;
   chat_mode?: ChatMode;
@@ -3206,6 +3467,9 @@ export interface WebSocketWorkflowQuestionEvent {
   step_name?: string;
   questions?: QuestionSetQuestion[];
   context?: Record<string, unknown>;
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
 }
 
 export interface WebSocketWorkflowGateResolvedEvent {
@@ -3234,6 +3498,9 @@ export interface WebSocketAuthChallengeEvent {
   metadata?: Record<string, unknown>;
   required_fields?: unknown[];
   expires_at?: string;
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
 }
 
 export interface WebSocketAuthChallengeResolvedEvent {
@@ -3268,6 +3535,7 @@ export interface WebSocketWorkflowCompletedEvent {
   type: 'workflow_completed';
   conversation_id?: string;
   task_id: string;
+  turn_id?: string | null;
   result?: string;
 }
 
@@ -3275,6 +3543,7 @@ export interface WebSocketWorkflowFailedEvent {
   type: 'workflow_failed';
   conversation_id?: string;
   task_id: string;
+  turn_id?: string | null;
   reason?: string;
 }
 
@@ -3282,6 +3551,7 @@ export interface WebSocketWorkflowCancelledEvent {
   type: 'workflow_cancelled';
   conversation_id?: string;
   task_id: string;
+  turn_id?: string | null;
   reason?: string;
 }
 
@@ -3289,6 +3559,7 @@ export interface WebSocketTaskPausedEvent {
   type: 'task_paused';
   conversation_id?: string;
   task_id: string;
+  turn_id?: string | null;
 }
 
 export interface WebSocketQueuedEvent {
@@ -3312,6 +3583,8 @@ export interface QueuedMessage {
   attachments: AttachmentRef[];
   created_at?: string | null;
   updated_at?: string | null;
+  status?: 'queued' | 'recoverable' | 'committing';
+  cancel_requested?: boolean;
   position: number;
 }
 
@@ -3343,11 +3616,13 @@ export interface WebSocketScopeInvalidatedEvent {
     | 'task_progress_changed'
     | 'notification_state_changed'
     | 'executor_state_changed'
-    | 'sidebar_changed';
+    | 'sidebar_changed'
+    | 'schedule_action_changed';
   revision: string;
   conversation_id?: string;
   session_id?: string;
   task_id?: string;
+  schedule_id?: string;
   step_run_id?: string;
 }
 
@@ -3382,6 +3657,7 @@ export interface WebSocketConversationUpdatedEvent {
   last_read_at?: string | null;
   last_message_at?: string | null;
   updated_at?: string | null;
+  turn_id?: string | null;
   created_conversation_id?: string;
 }
 
@@ -3566,6 +3842,9 @@ export interface WebSocketEscalationEvent {
   risk: string | null;
   reasoning: string | null;
   timeout_seconds: number;
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
 }
 
 export interface WebSocketEscalationResolvedEvent {
@@ -3690,13 +3969,13 @@ export interface WebSocketMcpOAuthStatusChangedEvent {
 }
 
 /**
- * Lightweight sidebar upsert sent to owner connections when a conversation is
- * created. Newer servers include the sidebar row; clients can fall back to a
- * full sidebar reload when the row is absent.
+ * Canonical sidebar row sent to owner connections after sidebar-visible
+ * lifecycle or metadata changes.
  */
 export interface WebSocketSidebarConversationUpsertEvent {
   type: 'sidebar_conversation_upsert';
   conversation_id: string;
+  revision?: string;
   conversation?: Conversation;
 }
 

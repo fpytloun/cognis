@@ -23,6 +23,7 @@ from prometheus_client import Counter, Gauge, Histogram
 from pydantic import Field, ValidationError, model_validator
 
 from cognis.api.chat_v2.schemas import (
+    BoundaryReceipt,
     RuntimeActiveTurn,
     StrictModel,
     TimelineItem,
@@ -44,6 +45,7 @@ ACTIVE_TTL_SECONDS = 600
 TERMINAL_TTL_SECONDS = 120
 RUNTIME_MAX_AGE_SECONDS = 30
 PROGRESS_PUBLISH_TIMEOUT_SECONDS = 0.5
+PROGRESS_RETRY_WINDOW_SECONDS = 2.0
 FUTURE_SKEW_SECONDS = 5
 DEFAULT_QUEUE_MAX_ITEMS = 256
 DEFAULT_QUEUE_MAX_BYTES = 8 * MAX_PAYLOAD_BYTES
@@ -460,6 +462,21 @@ class _BoundedRelayQueue:
             _drop("queue_full")
             return False
         removed = self._coalesce(item)
+        receipts = _relay_boundary_receipts(item.envelope)
+        for queued in removed:
+            receipts.extend(_relay_boundary_receipts(queued.envelope))
+        if receipts:
+            deduplicated = {(receipt.session_id, receipt.seq): receipt for receipt in receipts}
+            context_usage = dict(item.envelope.context_usage or {})
+            context_usage["__boundary_receipts"] = [
+                receipt.model_dump(mode="json") for receipt in deduplicated.values()
+            ]
+            envelope = item.envelope.model_copy(update={"context_usage": context_usage})
+            item = _QueuedEnvelope(
+                envelope=envelope,
+                payload=envelope.raw_encoded(),
+                cumulative_boundary=True,
+            )
         removed_ids = {id(queued) for queued in removed}
         survivors = [queued for queued in self.items if id(queued) not in removed_ids]
         survivor_bytes = sum(len(queued.payload) for queued in survivors)
@@ -563,6 +580,15 @@ class _BoundedRelayQueue:
         return not self.items
 
 
+def _relay_boundary_receipts(
+    envelope: ChatV2RuntimeRelayEnvelope,
+) -> list[BoundaryReceipt]:
+    raw = (envelope.context_usage or {}).get("__boundary_receipts")
+    if not isinstance(raw, list):
+        return []
+    return [BoundaryReceipt.model_validate(item) for item in raw]
+
+
 DurableValidator = Callable[[ChatV2RuntimeRelayEnvelope], Awaitable[AdmissionDecision | bool]]
 ApplyCallback = Callable[[ChatV2RuntimeRelayEnvelope], Awaitable[None]]
 SubscriberCallback = Callable[[str], bool]
@@ -658,8 +684,14 @@ class ChatV2RuntimeRedisRelay:
         volatile_items: list[TimelineItem] | None = None,
         context_usage: Mapping[str, Any] | None = None,
         last_generation: GenerationPerformanceSnapshot | None = None,
+        boundary_receipts: list[BoundaryReceipt] | None = None,
         event_id: str | None = None,
     ) -> ChatV2RuntimeRelayEnvelope:
+        relay_context_usage = dict(context_usage or {})
+        if boundary_receipts:
+            relay_context_usage["__boundary_receipts"] = [
+                item.model_dump(mode="json") for item in boundary_receipts
+            ]
         return ChatV2RuntimeRelayEnvelope(
             kind=kind,
             event_id=event_id or secrets.token_urlsafe(18),
@@ -678,7 +710,7 @@ class ChatV2RuntimeRedisRelay:
             has_active_turn=has_active_turn,
             active_turn=active_turn,
             volatile_items=volatile_items or [],
-            context_usage=dict(context_usage) if context_usage is not None else None,
+            context_usage=relay_context_usage or None,
             last_generation=last_generation,
         )
 
@@ -784,11 +816,18 @@ class ChatV2RuntimeRedisRelay:
                         break
                     started_at = asyncio.get_running_loop().time()
                     try:
-                        attempt_timeout = (
-                            min(remaining, PROGRESS_PUBLISH_TIMEOUT_SECONDS)
-                            if queued.is_progress
-                            else remaining
-                        )
+                        if queued.is_progress:
+                            progress_remaining = PROGRESS_RETRY_WINDOW_SECONDS - age
+                            if progress_remaining <= 0:
+                                _drop("publish_failed")
+                                break
+                            attempt_timeout = min(
+                                remaining,
+                                progress_remaining,
+                                PROGRESS_PUBLISH_TIMEOUT_SECONDS,
+                            )
+                        else:
+                            attempt_timeout = remaining
                         result = await asyncio.wait_for(
                             self.redis_service.eval(
                                 ADMIT_AND_PUBLISH_LUA,
@@ -814,18 +853,20 @@ class ChatV2RuntimeRedisRelay:
                         _drop("wrong_fence")
                         break
                     _METRICS.publish_error()
-                    if queued.is_progress:
-                        # Progress is cumulative and a newer frame replaces it.
-                        # Do not block unrelated conversations behind one
-                        # unavailable Redis publish for up to 30 seconds.
-                        _drop("publish_failed")
-                        break
                     age = (datetime.now(UTC) - queued.envelope.generated_at).total_seconds()
                     remaining = RUNTIME_MAX_AGE_SECONDS - age
                     if remaining <= 0:
                         _drop("stale")
                         break
-                    await asyncio.sleep(min(retry_delay, remaining))
+                    retry_remaining = (
+                        min(remaining, PROGRESS_RETRY_WINDOW_SECONDS - age)
+                        if queued.is_progress
+                        else remaining
+                    )
+                    if retry_remaining <= 0:
+                        _drop("publish_failed" if queued.is_progress else "stale")
+                        break
+                    await asyncio.sleep(min(retry_delay, retry_remaining))
                     retry_delay = min(retry_delay * 2, self._reconnect_max)
             finally:
                 self._publisher_idle.set()

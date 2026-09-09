@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from datetime import UTC, datetime
 
@@ -288,6 +289,175 @@ async def test_send_message_sends_channel_send_rpc() -> None:
     )
     assert result == "discord-1"
     assert conn.calls[0][0] == "channel.send"
+    assert conn.calls[0][2] == 35.0
+
+
+@pytest.mark.asyncio
+async def test_send_message_accepts_success_after_inner_runtime_deadline() -> None:
+    scale = 0.02
+
+    async def provider_ack() -> dict:
+        await asyncio.sleep(28 * scale)
+        return {"status": "sent", "platform_message_id": "signal-delayed"}
+
+    async def executor_response() -> dict:
+        result = await asyncio.wait_for(provider_ack(), timeout=30 * scale)
+        await asyncio.sleep(4 * scale)
+        return result
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(executor_response(), timeout=30 * scale)
+
+    class DelayedConnection(FakeConnection):
+        async def rpc_call(self, method: str, params: dict, timeout: float | None = None) -> dict:
+            self.calls.append((method, params, timeout))
+            assert timeout is not None and timeout > 30.0
+            return await asyncio.wait_for(executor_response(), timeout=timeout * scale)
+
+    proxy = RemoteChannelAdapterProxy(
+        connection=DelayedConnection(),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    result = await proxy.send_message(
+        OutboundMessage(
+            channel_type="signal",
+            account_id="acct-1",
+            chat_id="chat-1",
+            content="hello",
+        )
+    )
+    assert result == "signal-delayed"
+
+
+@pytest.mark.asyncio
+async def test_send_message_propagates_remote_failure() -> None:
+    conn = FakeConnection(error=RuntimeError("remote send failed"))
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+
+    with pytest.raises(RuntimeError, match="remote send failed"):
+        await proxy.send_message(
+            OutboundMessage(
+                channel_type="signal",
+                account_id="acct-1",
+                chat_id="chat-1",
+                content="hello",
+            )
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"error": "No adapter"},
+        {"error": {"code": "account_not_found", "retryable": False}},
+        {"status": "error"},
+        "invalid",
+    ],
+)
+async def test_send_message_rejects_all_error_and_invalid_envelopes(result) -> None:
+    proxy = RemoteChannelAdapterProxy(
+        connection=FakeConnection(result),
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+    with pytest.raises(RuntimeError):
+        await proxy.send_message(
+            OutboundMessage(
+                channel_type="signal",
+                account_id="acct-1",
+                chat_id="chat-1",
+                content="hello",
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_send_message_preserves_sanitized_signal_failure() -> None:
+    conn = FakeConnection(
+        {
+            "error": {
+                "provider": "signal-cli",
+                "classification": "rate_limit",
+                "provider_code": -5,
+                "retry_after_seconds": 4,
+                "challenge": True,
+                "next_step": (
+                    "Complete the Signal challenge or account action out of band, then reconcile "
+                    "delivery before any manual resend."
+                ),
+                "retry_scheduled": False,
+                "side_effect_certainty": "uncertain",
+            }
+        }
+    )
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await proxy.send_message(
+            OutboundMessage(
+                channel_type="signal",
+                account_id="acct-1",
+                chat_id="chat-1",
+                content="hello",
+            )
+        )
+
+    assert exc_info.value.metadata["classification"] == "rate_limit"
+    assert exc_info.value.metadata["retry_after_seconds"] == 4.0
+    assert exc_info.value.metadata["retry_scheduled"] is False
+
+
+@pytest.mark.asyncio
+async def test_send_message_discards_untrusted_signal_next_step() -> None:
+    conn = FakeConnection(
+        {
+            "error": {
+                "provider": "signal-cli",
+                "classification": "rate_limit",
+                "provider_code": -5,
+                "retry_after_seconds": 4,
+                "challenge": False,
+                "next_step": "send secret-marker-remote-payload immediately",
+                "retry_scheduled": False,
+                "side_effect_certainty": "uncertain",
+            }
+        }
+    )
+    proxy = RemoteChannelAdapterProxy(
+        connection=conn,
+        channel_type="signal",
+        capabilities=ChannelCapabilities(),
+        account_id="acct-1",
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await proxy.send_message(
+            OutboundMessage(
+                channel_type="signal",
+                account_id="acct-1",
+                chat_id="chat-1",
+                content="hello",
+            )
+        )
+
+    assert "secret-marker-remote-payload" not in str(exc_info.value)
+    assert exc_info.value.metadata["next_step"] == (
+        "Do not resend automatically. Reconcile Signal delivery externally before any manual resend."
+    )
 
 
 @pytest.mark.asyncio

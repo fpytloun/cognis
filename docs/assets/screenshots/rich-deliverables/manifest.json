@@ -1,0 +1,446 @@
+{
+  "schema_version": 1,
+  "previews": [
+    {
+      "id": "hero",
+      "scenario_id": "every-block-reference",
+      "block_type": "hero",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "hero.png"
+    },
+    {
+      "id": "section",
+      "scenario_id": "every-block-reference",
+      "block_type": "section",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "section.png"
+    },
+    {
+      "id": "stack",
+      "scenario_id": "every-block-reference",
+      "block_type": "stack",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "stack.png"
+    },
+    {
+      "id": "columns",
+      "scenario_id": "every-block-reference",
+      "block_type": "columns",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "columns.png"
+    },
+    {
+      "id": "grid",
+      "scenario_id": "every-block-reference",
+      "block_type": "grid",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "grid.png"
+    },
+    {
+      "id": "tabs",
+      "scenario_id": "every-block-reference",
+      "block_type": "tabs",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "tabs.png"
+    },
+    {
+      "id": "accordion",
+      "scenario_id": "every-block-reference",
+      "block_type": "accordion",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "accordion.png"
+    },
+    {
+      "id": "modal",
+      "scenario_id": "every-block-reference",
+      "block_type": "modal",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "modal.png"
+    },
+    {
+      "id": "markdown",
+      "scenario_id": "every-block-reference",
+      "block_type": "markdown",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "markdown.png"
+    },
+    {
+      "id": "callout",
+      "scenario_id": "every-block-reference",
+      "block_type": "callout",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "callout.png"
+    },
+    {
+      "id": "card",
+      "scenario_id": "every-block-reference",
+      "block_type": "card",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "card.png"
+    },
+    {
+      "id": "card_grid",
+      "scenario_id": "every-block-reference",
+      "block_type": "card_grid",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "card_grid.png"
+    },
+    {
+      "id": "dashboard",
+      "scenario_id": "every-block-reference",
+      "block_type": "dashboard",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "dashboard.png"
+    },
+    {
+      "id": "status",
+      "scenario_id": "every-block-reference",
+      "block_type": "status",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "status.png"
+    },
+    {
+      "id": "status_grid",
+      "scenario_id": "every-block-reference",
+      "block_type": "status_grid",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "status_grid.png"
+    },
+    {
+      "id": "action",
+      "scenario_id": "every-block-reference",
+      "block_type": "action",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "action.png"
+    },
+    {
+      "id": "metric",
+      "scenario_id": "every-block-reference",
+      "block_type": "metric",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "metric.png"
+    },
+    {
+      "id": "kv",
+      "scenario_id": "every-block-reference",
+      "block_type": "kv",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "kv.png"
+    },
+    {
+      "id": "key_value",
+      "scenario_id": "every-block-reference",
+      "block_type": "key_value",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "key_value.png"
+    },
+    {
+      "id": "timeline",
+      "scenario_id": "every-block-reference",
+      "block_type": "timeline",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "timeline.png"
+    },
+    {
+      "id": "steps",
+      "scenario_id": "every-block-reference",
+      "block_type": "steps",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "steps.png"
+    },
+    {
+      "id": "day_agenda",
+      "scenario_id": "every-block-reference",
+      "block_type": "day_agenda",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "day_agenda.png"
+    },
+    {
+      "id": "incident_timeline",
+      "scenario_id": "every-block-reference",
+      "block_type": "incident_timeline",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "incident_timeline.png"
+    },
+    {
+      "id": "incident_checklist",
+      "scenario_id": "every-block-reference",
+      "block_type": "incident_checklist",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "incident_checklist.png"
+    },
+    {
+      "id": "checklist",
+      "scenario_id": "every-block-reference",
+      "block_type": "checklist",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "checklist.png"
+    },
+    {
+      "id": "quote",
+      "scenario_id": "every-block-reference",
+      "block_type": "quote",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "quote.png"
+    },
+    {
+      "id": "divider",
+      "scenario_id": "every-block-reference",
+      "block_type": "divider",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "divider.png"
+    },
+    {
+      "id": "figure",
+      "scenario_id": "every-block-reference",
+      "block_type": "figure",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "figure.png"
+    },
+    {
+      "id": "gallery",
+      "scenario_id": "every-block-reference",
+      "block_type": "gallery",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "gallery.png"
+    },
+    {
+      "id": "table",
+      "scenario_id": "every-block-reference",
+      "block_type": "table",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "table.png"
+    },
+    {
+      "id": "comparison_matrix",
+      "scenario_id": "every-block-reference",
+      "block_type": "comparison_matrix",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "comparison_matrix.png"
+    },
+    {
+      "id": "decision_matrix",
+      "scenario_id": "every-block-reference",
+      "block_type": "decision_matrix",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "decision_matrix.png"
+    },
+    {
+      "id": "research_answer",
+      "scenario_id": "every-block-reference",
+      "block_type": "research_answer",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "research_answer.png"
+    },
+    {
+      "id": "evidence_report",
+      "scenario_id": "every-block-reference",
+      "block_type": "evidence_report",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "evidence_report.png"
+    },
+    {
+      "id": "claim_cards",
+      "scenario_id": "every-block-reference",
+      "block_type": "claim_cards",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "claim_cards.png"
+    },
+    {
+      "id": "chart",
+      "scenario_id": "every-block-reference",
+      "block_type": "chart",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "chart.png"
+    },
+    {
+      "id": "mermaid",
+      "scenario_id": "every-block-reference",
+      "block_type": "mermaid",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "mermaid.png"
+    },
+    {
+      "id": "link",
+      "scenario_id": "every-block-reference",
+      "block_type": "link",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "link.png"
+    },
+    {
+      "id": "link_preview",
+      "scenario_id": "every-block-reference",
+      "block_type": "link_preview",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "link_preview.png"
+    },
+    {
+      "id": "source_list",
+      "scenario_id": "every-block-reference",
+      "block_type": "source_list",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "source_list.png"
+    },
+    {
+      "id": "code",
+      "scenario_id": "every-block-reference",
+      "block_type": "code",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "data",
+      "filename": "code.png"
+    },
+    {
+      "id": "section_header",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "section_header",
+      "occurrence": 0,
+      "variant": null,
+      "guide": "layout",
+      "filename": "section_header.png"
+    },
+    {
+      "id": "card-visual",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "card",
+      "occurrence": 0,
+      "variant": "visual",
+      "guide": "layout",
+      "filename": "card-visual.png"
+    },
+    {
+      "id": "chart-line",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "chart",
+      "occurrence": 0,
+      "variant": "line",
+      "guide": "data",
+      "filename": "chart-line.png"
+    },
+    {
+      "id": "chart-bar",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "chart",
+      "occurrence": 1,
+      "variant": "bar",
+      "guide": "data",
+      "filename": "chart-bar.png"
+    },
+    {
+      "id": "chart-donut",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "chart",
+      "occurrence": 2,
+      "variant": "donut",
+      "guide": "data",
+      "filename": "chart-donut.png"
+    },
+    {
+      "id": "chart-stacked_bar",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "chart",
+      "occurrence": 3,
+      "variant": "stacked_bar",
+      "guide": "data",
+      "filename": "chart-stacked_bar.png"
+    },
+    {
+      "id": "markdown-list-markers",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "markdown",
+      "occurrence": 0,
+      "variant": "list-markers",
+      "guide": "layout",
+      "filename": "markdown-list-markers.png"
+    },
+    {
+      "id": "dashboard-native-metrics",
+      "scenario_id": "docs-preview-variants",
+      "block_type": "dashboard",
+      "occurrence": 0,
+      "variant": "native-metrics",
+      "guide": "data",
+      "filename": "dashboard-native-metrics.png"
+    }
+  ]
+}

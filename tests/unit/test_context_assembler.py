@@ -18,6 +18,7 @@ from cognis.core.context import (
     _build_web_topic_context_info,
     _find_cache_breakpoint,
     _is_protected_context_message,
+    _limit_history_native_attachment_replay,
     _load_project_instructions,
     events_to_messages,
 )
@@ -34,6 +35,7 @@ from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
     build_prefix_message_events,
 )
+from cognis.core.memory_aliases import MemoryAliasState
 from cognis.core.message_markers import (
     AUDIT_METADATA,
     IMMUTABLE_PREFIX,
@@ -48,6 +50,7 @@ from cognis.core.prompts import (
     build_system_instructions,
 )
 from cognis.core.runtime import ExecutorEnvironmentSnapshot
+from cognis.core.session_cache import CachedEvent
 from cognis.core.step_profiles import (
     resolve_step_profile,
     step_profile_allows_tool,
@@ -105,6 +108,7 @@ class _SessionCache:
         self.last_repair_attempt_at: float | None = None
         self.mark_prefix_repair_calls = 0
         self.project_contexts: dict[str, ProjectContextEntry] = {}
+        self.memory_aliases = MemoryAliasState()
 
     async def refresh(self, session: SessionModel) -> object:
         del session
@@ -122,6 +126,10 @@ class _SessionCache:
     def get_entry(self, session_id: str) -> object | None:
         del session_id
         return self.entry
+
+    def get_memory_aliases(self, session_id: str) -> MemoryAliasState:
+        del session_id
+        return self.memory_aliases
 
     def get_intention(self, session_id: str) -> str | None:
         del session_id
@@ -283,7 +291,12 @@ class _Guardrails:
         return type(
             "IntarisSession",
             (),
-            {"intention": "fresh intention", "title": None, "updated_at": None},
+            {
+                "intention": "fresh intention",
+                "title": None,
+                "updated_at": None,
+                "status": "active",
+            },
         )()
 
     async def record_events(self, **kwargs: object) -> object:
@@ -310,6 +323,7 @@ class _TitleGuardrails(_Guardrails):
             (),
             {
                 "intention": "child intention",
+                "status": "active",
                 "title": "Child task title",
                 "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
             },
@@ -710,7 +724,7 @@ def test_build_channel_context_info_includes_final_only_delivery_guidance() -> N
     assert "Assistant delivery mode:" in content
     assert "- Mode: final_only." in content
     assert "only the final assistant message" in content
-    assert "Intermediate assistant messages" in content
+    assert "Do not write intermediate assistant messages" in content
     assert "self-contained enough for the request" in content
     assert "Do not replay routine progress or filler" in content
 
@@ -939,7 +953,7 @@ async def test_context_assembler_model_override_does_not_inherit_agent_provider(
         memory=_Memory(),
         guardrails=_Guardrails(),
         llm=llm,
-        session_cache=_SessionCache(model_override="claude-sonnet-5"),
+        session_cache=_SessionCache(model_override="stale-cache-model"),
         session_manager=_SessionManager(),
         max_context_tokens=4096,
         compaction_threshold=0.85,
@@ -949,7 +963,7 @@ async def test_context_assembler_model_override_does_not_inherit_agent_provider(
     )
 
     await assembler.assemble(
-        session=_session(),
+        session=_session().model_copy(update={"model_override": "claude-sonnet-5"}),
         conversation=_conversation(),
         agent=agent,
         user_message="please help",
@@ -1081,6 +1095,271 @@ async def test_context_assembler_skips_disabled_artifact_urls_from_history() -> 
     serialized = json.dumps(result.messages)
     assert blocked_url not in serialized
     assert "report.pdf" in serialized
+
+
+def test_history_native_attachment_replay_keeps_newest_images_within_budget() -> None:
+    events: list[dict[str, object]] = []
+    for index in range(40):
+        events.extend(
+            [
+                {
+                    "type": "user_message",
+                    "data": {
+                        "content": f"Image {index}",
+                        "attachments": [
+                            {
+                                "artifact_id": f"img_{index}",
+                                "kind": "image",
+                                "mime_type": "image/png",
+                                "filename": f"image-{index}.png",
+                                "url": f"https://cognis.example/artifacts/img_{index}",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant_message",
+                    "data": {"content": f"Response {index}"},
+                },
+            ]
+        )
+
+    bounded, replay_positions = _limit_history_native_attachment_replay(events)
+
+    assert replay_positions == {(index, 0) for index in range(64, 80, 2)}
+    serialized = json.dumps(bounded)
+    assert "https://cognis.example/artifacts/img_39" in serialized
+    assert "https://cognis.example/artifacts/img_32" in serialized
+    assert "https://cognis.example/artifacts/img_31" not in serialized
+    assert '"artifact_id": "img_0"' in serialized
+    assert '"filename": "image-0.png"' in serialized
+
+
+def test_history_native_attachment_replay_budgets_repeated_artifact_ids_by_position() -> None:
+    attachments = [
+        {
+            "artifact_id": "img_repeated",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": f"copy-{index}.png",
+            "url": f"https://cognis.example/artifacts/img_repeated?copy={index}",
+        }
+        for index in range(10)
+    ]
+    events = [
+        {
+            "type": "user_message",
+            "data": {"content": "Repeated image", "attachments": attachments},
+        }
+    ]
+
+    bounded, replay_positions = _limit_history_native_attachment_replay(events)
+
+    assert replay_positions == {(0, index) for index in range(2, 10)}
+    bounded_attachments = bounded[0]["data"]["attachments"]
+    assert "url" not in bounded_attachments[0]
+    assert "url" not in bounded_attachments[1]
+    assert bounded_attachments[2]["url"].endswith("copy=2")
+    assert bounded_attachments[9]["url"].endswith("copy=9")
+
+
+def test_history_native_attachment_replay_partially_selects_oversized_newest_event() -> None:
+    old_event = {
+        "type": "user_message",
+        "data": {
+            "content": "Old image",
+            "attachments": [
+                {
+                    "artifact_id": "img_old",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "old.png",
+                    "url": "https://cognis.example/artifacts/img_old",
+                }
+            ],
+        },
+    }
+    newest_attachments = [
+        {
+            "artifact_id": f"img_new_{index}",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": f"new-{index}.png",
+            "url": f"https://cognis.example/artifacts/img_new_{index}",
+        }
+        for index in range(10)
+    ]
+    events = [
+        old_event,
+        {
+            "type": "user_message",
+            "data": {"content": "Newest images", "attachments": newest_attachments},
+        },
+    ]
+
+    bounded, replay_positions = _limit_history_native_attachment_replay(events)
+
+    assert replay_positions == {(1, index) for index in range(2, 10)}
+    assert "url" not in bounded[0]["data"]["attachments"][0]
+    assert "url" not in bounded[1]["data"]["attachments"][1]
+    assert bounded[1]["data"]["attachments"][2]["url"].endswith("img_new_2")
+    assert bounded[1]["data"]["attachments"][9]["url"].endswith("img_new_9")
+
+
+def test_history_native_attachment_replay_preserves_cached_event_provenance() -> None:
+    event = CachedEvent(
+        seq=7,
+        type="user_message",
+        data={
+            "content": "Historic image",
+            "attachments": [
+                {
+                    "artifact_id": "img_old",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "old.png",
+                    "url": "https://cognis.example/artifacts/img_old",
+                }
+            ],
+        },
+        source="intaris",
+        ts="2026-08-09T18:00:00Z",
+    )
+
+    bounded, replay_positions = _limit_history_native_attachment_replay(
+        [
+            event,
+            {
+                "type": "user_message",
+                "data": {
+                    "content": "New image",
+                    "attachments": [
+                        {
+                            "artifact_id": "img_new",
+                            "kind": "image",
+                            "mime_type": "image/png",
+                            "filename": "new.png",
+                            "url": "https://cognis.example/artifacts/img_new",
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+
+    assert replay_positions == {(0, 0), (1, 0)}
+    assert isinstance(bounded[0], CachedEvent)
+    assert bounded[0].seq == 7
+    assert bounded[0].source == "intaris"
+    assert bounded[0].ts == "2026-08-09T18:00:00Z"
+    assert bounded[0].data["attachments"][0]["url"].endswith("img_old")
+
+
+def test_history_native_attachment_replay_preserves_newest_file_turn() -> None:
+    events = [
+        {
+            "type": "user_message",
+            "data": {
+                "content": "Old file",
+                "attachments": [
+                    {
+                        "artifact_id": "doc_old",
+                        "kind": "pdf",
+                        "mime_type": "application/pdf",
+                        "filename": "old.pdf",
+                        "url": "https://cognis.example/artifacts/doc_old",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "user_message",
+            "data": {
+                "content": "New file",
+                "attachments": [
+                    {
+                        "artifact_id": "doc_new",
+                        "kind": "pdf",
+                        "mime_type": "application/pdf",
+                        "filename": "new.pdf",
+                        "url": "https://cognis.example/artifacts/doc_new",
+                    }
+                ],
+            },
+        },
+    ]
+
+    bounded, replay_positions = _limit_history_native_attachment_replay(events)
+
+    assert replay_positions == set()
+    assert "url" not in bounded[0]["data"]["attachments"][0]
+    assert bounded[1]["data"]["attachments"][0]["url"].endswith("doc_new")
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_prioritizes_current_attachments_over_bounded_history() -> None:
+    cache = _SessionCache()
+    cache.history_events = []
+    for index in range(5):
+        cache.history_events.extend(
+            [
+                {
+                    "type": "user_message",
+                    "data": {
+                        "content": f"Image {index}",
+                        "attachments": [
+                            {
+                                "artifact_id": f"img_{index}",
+                                "kind": "image",
+                                "mime_type": "image/png",
+                                "filename": f"image-{index}.png",
+                                "size_bytes": 10 * 1024 * 1024,
+                                "url": f"https://cognis.example/artifacts/img_{index}",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "assistant_message",
+                    "data": {"content": f"Response {index}"},
+                },
+            ]
+        )
+    current_url = "https://cognis.example/artifacts/img_current"
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_VisionLLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=20000,
+        compaction_threshold=0.85,
+    )
+
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="Newest image",
+        user_attachments=[
+            {
+                "artifact_id": "img_current",
+                "kind": "image",
+                "mime_type": "image/png",
+                "filename": "current.png",
+                "url": current_url,
+            }
+        ],
+        tool_definitions=[],
+    )
+
+    serialized = json.dumps(result.messages)
+    assert current_url in serialized
+    assert "https://cognis.example/artifacts/img_4" in serialized
+    assert "https://cognis.example/artifacts/img_2" in serialized
+    assert "https://cognis.example/artifacts/img_1" not in serialized
+    assert "artifact_id=img_0" in serialized
+    assert "removed from native model input" not in serialized
 
 
 @pytest.mark.asyncio
@@ -1551,9 +1830,70 @@ async def test_context_assembler_degrades_on_mnemory_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_context_assembler_audits_recalled_memories_as_replayable_developer_context() -> None:
+async def test_optional_recall_timeout_does_not_limit_core_identity_bootstrap() -> None:
+    class _SlowOptionalRecallMemory(_Memory):
+        def __init__(self) -> None:
+            super().__init__()
+            self.recall_cancelled = asyncio.Event()
+
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            await asyncio.sleep(0.05)
+            return await super().load_session_identity(**kwargs)
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            del kwargs
+            try:
+                await asyncio.sleep(60)
+            finally:
+                self.recall_cancelled.set()
+            return {"search_results": []}
+
+    memory = _SlowOptionalRecallMemory()
     assembler = ContextAssembler(
-        memory=_Memory(),
+        memory=memory,
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(cold=True),
+        session_manager=_SessionManager(),
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+        optional_recall_timeout_seconds=0.01,
+    )
+
+    result = await assembler.assemble(
+        session=_session(mnemory_session_id=None),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="bounded optional recall",
+        tool_definitions=[],
+    )
+
+    assert memory.identity_calls
+    assert memory.recall_cancelled.is_set()
+    assert result.degraded is True
+    assert result.system_notices == [
+        "Optional memory recall timed out for this turn; continuing without recalled memories."
+    ]
+    assert "prefers Python" in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_context_assembler_audits_recalled_memories_as_replayable_developer_context() -> None:
+    class _MemoryWithRecord(_Memory):
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            result = await super().recall(**kwargs)
+            result["search_results"] = [
+                {
+                    "id": "01234567-89ab-4def-8123-456789abcdef",
+                    "memory": "Uses pytest",
+                    "score": 0.9,
+                    "metadata": {},
+                }
+            ]
+            return result
+
+    assembler = ContextAssembler(
+        memory=_MemoryWithRecord(),
         guardrails=_Guardrails(),
         llm=_LLM(),
         session_cache=_SessionCache(),
@@ -1580,7 +1920,19 @@ async def test_context_assembler_audits_recalled_memories_as_replayable_develope
         "visibility": "agent_context",
         "model_role": "system",
         "trust": "untrusted",
+        "memory_aliases": {
+            "version": 1,
+            "bindings": [
+                {
+                    "alias": "m1",
+                    "memory_id": "01234567-89ab-4def-8123-456789abcdef",
+                    "revision": audit["metadata"]["memory_aliases"]["bindings"][0]["revision"],
+                }
+            ],
+            "invalidated": [],
+        },
     }
+    assert "[m1]" in audit["content"]
 
 
 def test_events_to_messages_replays_only_marked_developer_context_injections() -> None:

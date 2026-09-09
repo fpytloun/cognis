@@ -168,8 +168,9 @@ WorkingDirectory=/opt/cognis
 ExecStart=/usr/bin/uv run cognis-controller serve
 ```
 
-For executor units, use `uvx cognis-executor` for PyPI installs. From a local
-git checkout, replace it with `uv run cognis-executor` and set
+For executor units, use `uvx --from 'cognis-executor[full]' cognis-executor` for
+PyPI installs. From a local git checkout, replace it with `uv run
+cognis-executor` and set
 `WorkingDirectory` for uv project resolution. The executor runtime itself
 switches to `COGNIS_EXECUTOR_WORKDIR` or the service user's home directory
 before running tools.

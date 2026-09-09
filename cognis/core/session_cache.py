@@ -15,7 +15,9 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import hashlib
 import json
+import secrets
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from time import monotonic
@@ -29,6 +31,7 @@ from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
     sort_prefix_entries,
 )
+from cognis.core.memory_aliases import MEMORY_ALIASES_METADATA, MemoryAliasState
 from cognis.core.project_context import (
     PROJECT_CONTEXT_STATUS_LOADED,
     ProjectContextEntry,
@@ -125,6 +128,7 @@ class CachedSessionState:
     session_id: str
     intaris_session_id: str
     events: list[CachedEvent] = field(default_factory=list)
+    event_seqs: set[int] = field(default_factory=set)
     events_since_compaction_memo: dict[
         tuple[int, int, int, tuple[str, ...] | None], list[CachedEvent]
     ] = field(default_factory=dict)
@@ -138,6 +142,7 @@ class CachedSessionState:
     initialized: bool = False
     canonical_stale: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    redis_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     prefix_entries: list[ImmutablePrefixEntry] = field(default_factory=list)
     context_snapshot_seq: int = 0
     context_snapshot_source: str | None = None
@@ -157,6 +162,7 @@ class CachedSessionState:
     last_llm_usage: dict[str, int] = field(default_factory=dict)
     last_generation_performance: dict[str, Any] | None = None
     context_metadata: dict[str, Any] = field(default_factory=dict)
+    runtime_metadata_revision: int = 0
     context_reserve_clamp_warned: bool = False
     # Per-session overrides (ephemeral, set via /model, /thinking, and /fast commands)
     model_override: str | None = None
@@ -184,17 +190,27 @@ class CachedSessionState:
     discovered_tool_handles: dict[str, DiscoveredToolHandle] = field(default_factory=dict)
     project_metadata_contexts: dict[str, ProjectMetadataEntry] = field(default_factory=dict)
     project_contexts: dict[str, ProjectContextEntry] = field(default_factory=dict)
+    memory_aliases: MemoryAliasState = field(default_factory=MemoryAliasState)
+    redis_generation: str = ""
+    projection_revision: int = 0
+    redis_projection_revision: int = -1
+    redis_chain_depth: int = 0
+    redis_checkpoint_at: float = 0.0
+    redis_persisted_seq: int = 0
+    redis_event_head: str = ""
 
 
 # ---------------------------------------------------------------------------
 # Redis L2 serialization helpers
 # ---------------------------------------------------------------------------
 
-_REDIS_KEY_PREFIX = "cognis:session-cache:v2:"
+_REDIS_KEY_PREFIX = "cognis:session-cache:v3:"
+_LEGACY_REDIS_KEY_PREFIX = "cognis:session-cache:v2:"
+_RUNTIME_REDIS_KEY_PREFIX = "cognis:session-runtime:v1:"
 _REDIS_DEFAULT_TTL = 3600  # 1 hour
 
 
-def _serialize_entry(entry: CachedSessionState) -> str:
+def _serialize_entry(entry: CachedSessionState, *, include_events: bool = True) -> str:
     """Serialize the Redis-storable subset of a cache entry to JSON."""
     return json.dumps(
         {
@@ -209,7 +225,9 @@ def _serialize_entry(entry: CachedSessionState) -> str:
                     "ts": e.ts,
                 }
                 for e in entry.events
-            ],
+            ]
+            if include_events
+            else [],
             "last_event_seq": entry.last_event_seq,
             "last_compaction_seq": entry.last_compaction_seq,
             "last_compaction_summary": entry.last_compaction_summary,
@@ -243,6 +261,7 @@ def _serialize_entry(entry: CachedSessionState) -> str:
             "last_llm_usage": entry.last_llm_usage,
             "last_generation_performance": entry.last_generation_performance,
             "context_metadata": entry.context_metadata,
+            "runtime_metadata_revision": entry.runtime_metadata_revision,
             "context_reserve_clamp_warned": entry.context_reserve_clamp_warned,
             "model_override": entry.model_override,
             "model_override_provider_id": entry.model_override_provider_id,
@@ -293,8 +312,37 @@ def _serialize_entry(entry: CachedSessionState) -> str:
                     key=lambda item: (item.seq, item.project_id),
                 )
             ],
+            "memory_aliases": entry.memory_aliases.snapshot(),
         },
         separators=(",", ":"),
+    )
+
+
+def _redis_generation(intaris_session_id: str) -> str:
+    return hashlib.sha256(intaris_session_id.encode()).hexdigest()[:32]
+
+
+def _serialize_cached_event(event: CachedEvent) -> bytes:
+    return json.dumps(
+        {
+            "seq": event.seq,
+            "type": event.type,
+            "data": event.data,
+            "source": event.source,
+            "ts": event.ts,
+        },
+        separators=(",", ":"),
+    ).encode()
+
+
+def _deserialize_cached_event(raw: bytes) -> CachedEvent:
+    event = json.loads(raw.decode("utf-8"))
+    return CachedEvent(
+        seq=int(event["seq"]),
+        type=str(event["type"]),
+        data=dict(event.get("data") or {}),
+        source=event.get("source"),
+        ts=event.get("ts"),
     )
 
 
@@ -350,6 +398,7 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             if isinstance(data.get("context_metadata"), dict)
             else {}
         ),
+        runtime_metadata_revision=int(data.get("runtime_metadata_revision") or 0),
         fast_mode_override=(
             data["fast_mode_override"] if isinstance(data.get("fast_mode_override"), bool) else None
         ),
@@ -447,17 +496,19 @@ def _deserialize_entry(raw: str) -> CachedSessionState:
             )
             if entry.project_id
         },
+        memory_aliases=MemoryAliasState(),
     )
+    entry.memory_aliases.apply(data.get("memory_aliases"))
     for raw_event in data.get("events", []):
-        entry.events.append(
-            CachedEvent(
-                seq=raw_event["seq"],
-                type=raw_event["type"],
-                data=raw_event.get("data", {}),
-                source=raw_event.get("source"),
-                ts=raw_event.get("ts"),
-            )
+        cached_event = CachedEvent(
+            seq=raw_event["seq"],
+            type=raw_event["type"],
+            data=raw_event.get("data", {}),
+            source=raw_event.get("source"),
+            ts=raw_event.get("ts"),
         )
+        entry.events.append(cached_event)
+        entry.event_seqs.add(cached_event.seq)
     return entry
 
 
@@ -539,6 +590,7 @@ class SessionCache:
         self.max_entries = max_entries
         self._entries: dict[str, CachedSessionState] = {}
         self._entries_lock = asyncio.Lock()
+        self._hydration_tasks: dict[str, asyncio.Task[CachedSessionState]] = {}
         self._local_eviction_tasks: dict[str, asyncio.Task[None]] = {}
         self._conversation_owner_by_id: dict[str, str] = {}
         self._active_thinking: dict[str, ActiveThinkingState] = {}
@@ -587,6 +639,13 @@ class SessionCache:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._local_eviction_tasks.clear()
+        hydration_tasks = list(self._hydration_tasks.values())
+        for hydration_task in hydration_tasks:
+            hydration_task.cancel()
+        for hydration_task in hydration_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await hydration_task
+        self._hydration_tasks.clear()
         if self._owns_redis_service and self._redis_service is not None:
             await self._redis_service.aclose()
             self._redis_service = None
@@ -790,31 +849,255 @@ class SessionCache:
         try:
             raw = await self._redis_service.get(f"{_REDIS_KEY_PREFIX}{session_id}")
             if raw is None:
+                # Rolling upgrades can still leave a v2 snapshot. The first
+                # successful v3 write migrates it; remove this fallback after
+                # every supported deployment has written v3 session entries.
+                raw = await self._redis_service.get(f"{_LEGACY_REDIS_KEY_PREFIX}{session_id}")
+                if raw is not None:
+                    entry = _deserialize_entry(raw.decode("utf-8"))
+                    REDIS_HITS.inc()
+                    return entry
                 if self._redis_service.configured and not self._redis_service.available:
                     REDIS_ERRORS.inc()
                 else:
                     REDIS_MISSES.inc()
                 return None
+            metadata = json.loads(raw.decode("utf-8"))
+            if not isinstance(metadata, dict) or metadata.get("schema_version") != 3:
+                raise ValueError("invalid Redis session cache metadata")
+            generation = str(metadata.get("generation") or "")
+            last_seq = int(metadata.get("last_event_seq", 0) or 0)
+            event_head = str(metadata.pop("event_head", "") or "")
+            loaded_event_head = event_head
+            metadata.pop("schema_version", None)
+            metadata.pop("generation", None)
+            events: list[CachedEvent] = []
+            chunks: list[list[CachedEvent]] = []
+            seen_heads: set[str] = set()
+            while event_head:
+                if event_head in seen_heads or len(seen_heads) >= 32:
+                    raise ValueError("invalid Redis session cache event chain")
+                seen_heads.add(event_head)
+                chunk_raw = await self._redis_service.get(event_head)
+                if chunk_raw is None:
+                    raise ValueError("incomplete Redis session cache event generation")
+                chunk = json.loads(chunk_raw.decode("utf-8"))
+                if not isinstance(chunk, dict) or not isinstance(chunk.get("events"), list):
+                    raise ValueError("invalid Redis session cache event chunk")
+                chunks.append(
+                    [
+                        _deserialize_cached_event(
+                            json.dumps(raw_event, separators=(",", ":")).encode()
+                        )
+                        for raw_event in chunk["events"]
+                        if isinstance(raw_event, dict)
+                    ]
+                )
+                event_head = str(chunk.get("previous") or "")
+            for chunk_events in reversed(chunks):
+                events.extend(chunk_events)
+            metadata["events"] = [
+                {
+                    "seq": event.seq,
+                    "type": event.type,
+                    "data": event.data,
+                    "source": event.source,
+                    "ts": event.ts,
+                }
+                for event in events
+            ]
             REDIS_HITS.inc()
-            return _deserialize_entry(raw.decode("utf-8"))
+            entry = _deserialize_entry(json.dumps(metadata))
+            entry.redis_generation = generation
+            entry.redis_projection_revision = entry.projection_revision
+            entry.redis_chain_depth = len(seen_heads)
+            # Hydration cannot establish ancestor TTLs. Checkpoint on the first write.
+            entry.redis_checkpoint_at = 0.0
+            entry.redis_persisted_seq = last_seq
+            entry.redis_event_head = loaded_event_head
+            return entry
         except Exception:
             REDIS_ERRORS.inc()
             logger.warning("session_cache: Redis L2 read failed")
             return None
 
-    async def _redis_set(self, entry: CachedSessionState) -> None:
-        """Write-through to Redis L2."""
-        if self._redis_service is None:
+    async def _redis_set(
+        self,
+        entry: CachedSessionState,
+        *,
+        events: list[CachedEvent] | None = None,
+    ) -> None:
+        """Persist bounded metadata plus immutable event values to Redis L2."""
+        if self._redis_service is None or not entry.initialized or entry.canonical_stale:
             return
         try:
-            await self._redis_service.set(
-                f"{_REDIS_KEY_PREFIX}{entry.session_id}",
-                _serialize_entry(entry).encode("utf-8"),
-                ttl_seconds=self._redis_ttl,
-            )
+            async with entry.redis_lock:
+                expected_generation = entry.redis_generation
+                checkpoint = (
+                    entry.redis_projection_revision != entry.projection_revision
+                    or entry.redis_chain_depth >= 32
+                    or monotonic() - entry.redis_checkpoint_at >= self._redis_ttl / 2
+                )
+                projection_revision = entry.projection_revision
+                generation = secrets.token_hex(16) if checkpoint else expected_generation
+                persisted_seq = entry.redis_persisted_seq
+                expected_head = entry.redis_event_head
+                pending_by_seq = {
+                    event.seq: event
+                    for event in (
+                        list(entry.events)
+                        if checkpoint
+                        else [event for event in entry.events if event.seq > persisted_seq]
+                    )
+                }
+                pending_events = [pending_by_seq[seq] for seq in sorted(pending_by_seq)]
+                persisted_watermark = entry.last_event_seq
+                event_head = "" if checkpoint else expected_head
+                if pending_events or checkpoint:
+                    chunk_payload = {
+                        "previous": event_head,
+                        "events": [
+                            json.loads(_serialize_cached_event(event).decode("utf-8"))
+                            for event in pending_events
+                        ],
+                    }
+                    chunk_digest = hashlib.sha256(
+                        json.dumps(chunk_payload, separators=(",", ":")).encode()
+                    ).hexdigest()[:24]
+                    event_head = (
+                        f"{_REDIS_KEY_PREFIX}{entry.session_id}:{generation}:chunk:{chunk_digest}"
+                    )
+                    chunk_payload_bytes = json.dumps(chunk_payload, separators=(",", ":")).encode()
+                else:
+                    chunk_payload_bytes = None
+                metadata = json.loads(_serialize_entry(entry, include_events=False))
+                metadata.update(
+                    {
+                        "schema_version": 3,
+                        "generation": generation,
+                        "event_head": event_head,
+                    }
+                )
+                metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode()
+                if chunk_payload_bytes is not None:
+                    chunk_written = await self._redis_service.set(
+                        event_head,
+                        chunk_payload_bytes,
+                        ttl_seconds=self._redis_ttl,
+                    )
+                    if not chunk_written:
+                        return
+                written = await self._redis_service.eval(
+                    (
+                        "local current = redis.call('GET', KEYS[1]); "
+                        "if current then "
+                        "local decoded = cjson.decode(current); "
+                        "if decoded.generation ~= ARGV[1] then return 0 end; "
+                        "local current_seq = tonumber(decoded.last_event_seq or 0); "
+                        "if current_seq > tonumber(ARGV[2]) then return 0 end; "
+                        "if (decoded.event_head or '') ~= ARGV[3] then return 0 end; "
+                        "elseif ARGV[1] ~= '' then return 0; end; "
+                        "redis.call('SET', KEYS[1], ARGV[4], 'EX', ARGV[5]); "
+                        "return 1"
+                    ),
+                    keys=(f"{_REDIS_KEY_PREFIX}{entry.session_id}",),
+                    args=(
+                        expected_generation,
+                        persisted_watermark,
+                        expected_head,
+                        metadata_bytes,
+                        self._redis_ttl
+                        if checkpoint
+                        else max(
+                            1, int(self._redis_ttl - (monotonic() - entry.redis_checkpoint_at))
+                        ),
+                    ),
+                )
+                if written == 1:
+                    entry.redis_generation = generation
+                    entry.redis_persisted_seq = persisted_watermark
+                    entry.redis_event_head = event_head
+                    entry.redis_projection_revision = projection_revision
+                    entry.redis_chain_depth = (
+                        1
+                        if checkpoint
+                        else (
+                            entry.redis_chain_depth + (1 if chunk_payload_bytes is not None else 0)
+                        )
+                    )
+                    if checkpoint:
+                        entry.redis_checkpoint_at = monotonic()
         except Exception:
             REDIS_ERRORS.inc()
             logger.warning("session_cache: Redis L2 write failed")
+
+    async def _redis_get_runtime_metadata(self, session_id: str) -> dict[str, Any] | None:
+        """Read the compact cross-worker runtime diagnostics payload."""
+
+        if self._redis_service is None:
+            return None
+        try:
+            raw = await self._redis_service.get(f"{_RUNTIME_REDIS_KEY_PREFIX}{session_id}")
+            if raw is None:
+                return None
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            REDIS_ERRORS.inc()
+            logger.warning("session_cache: Redis runtime metadata read failed")
+            return None
+
+    async def _redis_set_runtime_metadata(self, entry: CachedSessionState) -> int | None:
+        """Atomically write compact runtime diagnostics in Redis revision order."""
+
+        if self._redis_service is None:
+            return None
+        counter_key = f"{_RUNTIME_REDIS_KEY_PREFIX}{entry.session_id}:revision"
+        payload_key = f"{_RUNTIME_REDIS_KEY_PREFIX}{entry.session_id}"
+        try:
+            revision = await self._redis_service.eval(
+                (
+                    "local value = redis.call('INCR', KEYS[1]); "
+                    "redis.call('EXPIRE', KEYS[1], ARGV[1]); "
+                    "return value"
+                ),
+                keys=(counter_key,),
+                args=(self._redis_ttl,),
+            )
+            if not isinstance(revision, int):
+                return None
+            payload = {
+                "revision": revision,
+                "last_prompt_tokens": entry.last_prompt_tokens,
+                "max_context_tokens": entry.max_context_tokens,
+                "max_input_tokens": entry.max_input_tokens,
+                "available_prompt_tokens": entry.available_prompt_tokens,
+                "context_model": entry.context_model,
+                "context_provider_id": entry.context_provider_id,
+                "reserve_output_tokens": entry.reserve_output_tokens,
+                "effective_reserve_output_tokens": entry.effective_reserve_output_tokens,
+                "last_llm_usage": dict(entry.last_llm_usage),
+                "last_generation_performance": entry.last_generation_performance,
+                "context_metadata": dict(entry.context_metadata),
+            }
+            written = await self._redis_service.eval(
+                (
+                    "local current = redis.call('GET', KEYS[1]); "
+                    "if current then "
+                    "local decoded = cjson.decode(current); "
+                    "if tonumber(decoded.revision or 0) >= tonumber(ARGV[1]) then return 0 end; "
+                    "end; "
+                    "redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3]); "
+                    "return 1"
+                ),
+                keys=(payload_key,),
+                args=(revision, json.dumps(payload).encode("utf-8"), self._redis_ttl),
+            )
+            return revision if written == 1 else None
+        except Exception:
+            REDIS_ERRORS.inc()
+            logger.warning("session_cache: Redis runtime metadata write failed")
+            return None
 
     async def _redis_delete(self, session_id: str) -> None:
         """Delete from Redis L2."""
@@ -822,6 +1105,7 @@ class SessionCache:
             return
         try:
             await self._redis_service.delete(f"{_REDIS_KEY_PREFIX}{session_id}")
+            await self._redis_service.delete(f"{_LEGACY_REDIS_KEY_PREFIX}{session_id}")
         except Exception:
             REDIS_ERRORS.inc()
 
@@ -833,9 +1117,12 @@ class SessionCache:
         """Load or incrementally refresh a cache entry from Intaris."""
 
         entry = await self._ensure_entry(session)
+        redis_events_to_write: list[CachedEvent] | None = None
+        cache_changed = False
         async with entry.lock:
             if not entry.initialized:
                 await self._cold_load(entry, session)
+                cache_changed = True
                 logger.debug(
                     "cache: cold load complete",
                     extra={
@@ -855,6 +1142,11 @@ class SessionCache:
                     after_seq=entry.last_event_seq,
                     allow_missing_stream=True,
                 )
+                fetched_seqs = {
+                    int(raw_event.get("seq") or 0)
+                    for raw_event in event_read.events
+                    if isinstance(raw_event, dict) and int(raw_event.get("seq") or 0) > 0
+                }
                 if getattr(event_read, "missing_stream_fallback_used", False):
                     logger.warning(
                         "cache: warm refresh fell back to missing Intaris stream",
@@ -867,6 +1159,10 @@ class SessionCache:
                         },
                     )
                 self._apply_intaris_events(entry, event_read.events)
+                cache_changed = bool(event_read.events)
+                redis_events_to_write = [
+                    event for event in entry.events if event.seq in fetched_seqs
+                ]
                 force_prefix_rebuild = not entry.prefix_entries
                 if force_prefix_rebuild:
                     logger.info(
@@ -906,6 +1202,8 @@ class SessionCache:
                         )
                     self._replace_from_intaris_events(entry, full_read.events)
                     entry.last_event_seq = max(entry.last_event_seq, full_read.last_seq)
+                    redis_events_to_write = None
+                    cache_changed = True
                 entry.last_event_seq = max(entry.last_event_seq, event_read.last_seq)
                 logger.debug(
                     "cache: warm refresh complete",
@@ -922,7 +1220,8 @@ class SessionCache:
                 )
             entry.canonical_stale = False
             entry.touched_at = monotonic()
-        await self._redis_set(entry)
+        if cache_changed:
+            await self._redis_set(entry, events=redis_events_to_write)
         return entry
 
     async def append_recorded_events(
@@ -937,7 +1236,8 @@ class SessionCache:
         needs_gap_backfill = False
         async with entry.lock:
             was_initialized = entry.initialized
-            existing_seqs = {item.seq for item in entry.events}
+            existing_seqs = entry.event_seqs
+            pre_append_tail_seq = entry.events[-1].seq if entry.events else 0
             # Gap detection: a seq jump means another writer recorded events
             # this cache has not fetched (e.g. a concurrent direct write into
             # the same session). Blindly advancing last_event_seq past the gap
@@ -987,7 +1287,8 @@ class SessionCache:
                 )
             else:
                 entry.last_event_seq = max(entry.last_event_seq, append_result.last_seq)
-            self._ensure_events_seq_ordered(entry)
+            if recorded_events and recorded_events[0].seq < pre_append_tail_seq:
+                entry.events.sort(key=lambda item: item.seq)
             # If the first event seen by a fresh in-memory cache has a sequence greater than
             # one, the controller restarted and recorded a new event before hydrating old
             # history. Keep the entry cold so the next refresh performs a full Intaris load.
@@ -1014,21 +1315,8 @@ class SessionCache:
                     },
                 )
                 entry.canonical_stale = True
-        await self._redis_set(entry)
+        await self._redis_set(entry, events=recorded_events)
         return entry
-
-    @staticmethod
-    def _ensure_events_seq_ordered(entry: CachedSessionState) -> None:
-        """Keep the cached event list ordered by seq.
-
-        Concurrent writers (turn flushes vs. delegation/task direct writes)
-        can land cache appends out of seq order. The cached list is consumed
-        in list order by context assembly and compaction, so out-of-order
-        entries produce wrong grouping in the LLM context.
-        """
-        events = entry.events
-        if any(events[i].seq > events[i + 1].seq for i in range(len(events) - 1)):
-            events.sort(key=lambda item: item.seq)
 
     async def seed_events(
         self,
@@ -1067,6 +1355,7 @@ class SessionCache:
             entry.last_compaction_summary = summary
             entry.last_compaction_seq = compaction_seq
             entry.events = [event for event in entry.events if event.seq > compaction_seq]
+            entry.projection_revision += 1
             entry.events_since_compaction_memo.clear()
             entry.last_event_seq = max(entry.last_event_seq, compaction_seq)
             entry.touched_at = monotonic()
@@ -1179,6 +1468,60 @@ class SessionCache:
             entry.touched_at = monotonic()
         return entry
 
+    def get_memory_aliases(self, session_id: str) -> MemoryAliasState | None:
+        """Return replay-derived memory aliases for one current session."""
+
+        entry = self.get_entry(session_id)
+        return entry.memory_aliases if entry is not None else None
+
+    async def ensure_runtime_metadata(self, session: SessionModel) -> None:
+        """Hydrate cached runtime diagnostics from Redis without an Intaris refresh."""
+
+        entry = await self._ensure_entry(session)
+        payload = await self._redis_get_runtime_metadata(session.session_id)
+        if payload is None:
+            return
+        revision = int(payload.get("revision") or 0)
+        async with entry.lock:
+            if revision <= entry.runtime_metadata_revision:
+                return
+            entry.last_prompt_tokens = int(payload.get("last_prompt_tokens") or 0)
+            entry.max_context_tokens = int(payload.get("max_context_tokens") or 0)
+            entry.max_input_tokens = int(payload.get("max_input_tokens") or 0)
+            entry.available_prompt_tokens = int(payload.get("available_prompt_tokens") or 0)
+            entry.context_model = str(payload.get("context_model") or "")
+            entry.context_provider_id = payload.get("context_provider_id")
+            entry.reserve_output_tokens = int(payload.get("reserve_output_tokens") or 0)
+            entry.effective_reserve_output_tokens = int(
+                payload.get("effective_reserve_output_tokens") or 0
+            )
+            entry.last_llm_usage = {
+                str(key): int(value)
+                for key, value in (payload.get("last_llm_usage") or {}).items()
+                if isinstance(key, str) and isinstance(value, int | float)
+            }
+            entry.last_generation_performance = (
+                dict(payload["last_generation_performance"])
+                if isinstance(payload.get("last_generation_performance"), dict)
+                else None
+            )
+            entry.context_metadata = (
+                dict(payload["context_metadata"])
+                if isinstance(payload.get("context_metadata"), dict)
+                else {}
+            )
+            entry.runtime_metadata_revision = revision
+
+    async def persist_runtime_metadata(self, session_id: str) -> None:
+        """Write the latest context and generation diagnostics through to Redis."""
+
+        entry = self.get_entry(session_id)
+        if entry is None:
+            return
+        revision = await self._redis_set_runtime_metadata(entry)
+        if revision is not None:
+            entry.runtime_metadata_revision = max(entry.runtime_metadata_revision, revision)
+
     def get_intention(self, session_id: str) -> str | None:
         """Get the cached intention for a session."""
 
@@ -1205,6 +1548,8 @@ class SessionCache:
         effective_reserve_output_tokens: int | None = None,
         compaction_threshold: float | None = None,
         projection_policy: dict[str, Any] | None = None,
+        turn_id: str | None = None,
+        runtime_selection_revision: int | None = None,
     ) -> None:
         """Store the latest prompt-usage snapshot for a session."""
 
@@ -1227,6 +1572,10 @@ class SessionCache:
                 "agent_profile_synthetic": (
                     bool(agent_profile_synthetic) if agent_profile_synthetic is not None else None
                 ),
+                "turn_id": turn_id,
+                "runtime_selection_revision": runtime_selection_revision,
+                "measured_at": datetime.now(UTC).isoformat(),
+                "measurement_source": "projected_prompt",
             }
             for key, value in runtime_metadata.items():
                 if value is None:
@@ -1258,6 +1607,7 @@ class SessionCache:
                 0, entry.max_context_tokens - entry.effective_reserve_output_tokens
             )
         return {
+            "runtime_metadata_revision": entry.runtime_metadata_revision,
             "prompt_tokens": entry.last_prompt_tokens,
             "max_context_tokens": entry.max_context_tokens,
             "max_input_tokens": entry.max_input_tokens,
@@ -1282,6 +1632,10 @@ class SessionCache:
             "loop_pressure_threshold": int(effective_prompt_budget * LOOP_PRESSURE_THRESHOLD_RATIO),
             "compaction_threshold": entry.context_metadata.get("compaction_threshold"),
             "projection_policy": entry.context_metadata.get("projection_policy"),
+            "turn_id": entry.context_metadata.get("turn_id"),
+            "runtime_selection_revision": entry.context_metadata.get("runtime_selection_revision"),
+            "measured_at": entry.context_metadata.get("measured_at"),
+            "measurement_source": entry.context_metadata.get("measurement_source"),
             "last_llm_usage": dict(entry.last_llm_usage),
         }
 
@@ -1815,48 +2169,70 @@ class SessionCache:
     # ------------------------------------------------------------------
 
     async def _ensure_entry(self, session: SessionModel) -> CachedSessionState:
+        expected_intaris_session_id = session.intaris_session_id or session.session_id
         async with self._entries_lock:
             entry = self._entries.get(session.session_id)
-            if entry is None:
-                CACHE_MISSES.inc()
-                # Evict before inserting any new entry (Redis-hit or fresh)
-                await self._evict_oldest_unlocked()
-                # Try Redis L2 before creating a blank entry
-                redis_entry = await self._redis_get(session.session_id)
-                if redis_entry is not None:
-                    entry = redis_entry
-                    entry.intaris_session_id = session.intaris_session_id or session.session_id
-                    logger.debug(
-                        "cache: hydrated from Redis L2",
-                        extra={
-                            "extra_data": {
-                                "session_id": session.session_id,
-                                "event_count": len(entry.events),
-                                "initialized": entry.initialized,
-                                "prefix_entry_count": len(entry.prefix_entries),
-                                "context_snapshot_seq": entry.context_snapshot_seq,
-                            }
-                        },
-                    )
-                else:
-                    entry = CachedSessionState(
-                        session_id=session.session_id,
-                        intaris_session_id=session.intaris_session_id or session.session_id,
-                    )
-                    logger.debug(
-                        "cache: entry created",
-                        extra={
-                            "extra_data": {
-                                "session_id": session.session_id,
-                                "intaris_session_id": entry.intaris_session_id,
-                            }
-                        },
-                    )
-                self._entries[session.session_id] = entry
-                CACHE_SIZE.set(len(self._entries))
-            else:
+            if entry is not None:
                 CACHE_HITS.inc()
-                entry.intaris_session_id = session.intaris_session_id or session.session_id
+                entry.intaris_session_id = expected_intaris_session_id
+                entry.touched_at = monotonic()
+                return entry
+            CACHE_MISSES.inc()
+            hydration_task = self._hydration_tasks.get(session.session_id)
+            if hydration_task is None:
+                hydration_task = asyncio.create_task(self._hydrate_entry(session))
+                self._hydration_tasks[session.session_id] = hydration_task
+
+                def discard_hydration(completed: asyncio.Task[CachedSessionState]) -> None:
+                    if self._hydration_tasks.get(session.session_id) is completed:
+                        self._hydration_tasks.pop(session.session_id, None)
+
+                hydration_task.add_done_callback(discard_hydration)
+
+        return await asyncio.shield(hydration_task)
+
+    async def _hydrate_entry(self, session: SessionModel) -> CachedSessionState:
+        expected_intaris_session_id = session.intaris_session_id or session.session_id
+        redis_entry = await self._redis_get(session.session_id)
+        async with self._entries_lock:
+            entry = self._entries.get(session.session_id)
+            if entry is not None:
+                entry.touched_at = monotonic()
+                return entry
+            await self._evict_oldest_unlocked()
+            if (
+                redis_entry is not None
+                and redis_entry.intaris_session_id == expected_intaris_session_id
+            ):
+                entry = redis_entry
+                logger.debug(
+                    "cache: hydrated from Redis L2",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "event_count": len(entry.events),
+                            "initialized": entry.initialized,
+                            "prefix_entry_count": len(entry.prefix_entries),
+                            "context_snapshot_seq": entry.context_snapshot_seq,
+                        }
+                    },
+                )
+            else:
+                entry = CachedSessionState(
+                    session_id=session.session_id,
+                    intaris_session_id=expected_intaris_session_id,
+                )
+                logger.debug(
+                    "cache: entry created",
+                    extra={
+                        "extra_data": {
+                            "session_id": session.session_id,
+                            "intaris_session_id": entry.intaris_session_id,
+                        }
+                    },
+                )
+            self._entries[session.session_id] = entry
+            CACHE_SIZE.set(len(self._entries))
             entry.touched_at = monotonic()
             return entry
 
@@ -1894,6 +2270,8 @@ class SessionCache:
         frozen_project_contexts = dict(entry.project_contexts)
         frozen_project_metadata_contexts = dict(entry.project_metadata_contexts)
         entry.events = []
+        entry.projection_revision += 1
+        entry.event_seqs.clear()
         entry.events_since_compaction_memo.clear()
         entry.last_event_seq = 0
         entry.last_compaction_seq = 0
@@ -1904,6 +2282,7 @@ class SessionCache:
         entry.memory_policy_fingerprint = None
         entry.memory_policy_mode = None
         entry.prefix_repair_needed = False
+        entry.memory_aliases = MemoryAliasState()
         entry.discovered_tool_handles = {}
         entry.project_contexts = {}
         entry.project_metadata_contexts = {}
@@ -1913,8 +2292,8 @@ class SessionCache:
             if current is None or project_context.seq >= current.seq:
                 entry.project_contexts[project_root] = project_context
         for project_id, project_metadata in frozen_project_metadata_contexts.items():
-            current = entry.project_metadata_contexts.get(project_id)
-            if current is None or project_metadata.seq >= current.seq:
+            metadata_current = entry.project_metadata_contexts.get(project_id)
+            if metadata_current is None or project_metadata.seq >= metadata_current.seq:
                 entry.project_metadata_contexts[project_id] = project_metadata
         self._rebuild_prefix_from_raw_events(entry, raw_events)
 
@@ -1924,8 +2303,8 @@ class SessionCache:
         # Seq dedup: after a gap-deferred append the warm refresh re-fetches
         # events that are already cached (see append_recorded_events). Skip
         # them so the backfill only inserts the missing seqs.
-        existing_seqs = {item.seq for item in entry.events}
-        applied = False
+        existing_seqs = entry.event_seqs
+        appended_out_of_order = False
         for raw_event in sorted(raw_events, key=lambda item: int(item.get("seq", 0))):
             seq = int(raw_event.get("seq", 0))
             if seq in existing_seqs:
@@ -1938,11 +2317,14 @@ class SessionCache:
                 source=raw_event.get("source"),
                 ts=raw_event.get("ts"),
             )
+            previous_tail_seq = entry.events[-1].seq if entry.events else 0
+            previous_length = len(entry.events)
             self._apply_cached_event(entry, cached_event)
+            if len(entry.events) > previous_length and seq < previous_tail_seq:
+                appended_out_of_order = True
             existing_seqs.add(seq)
-            applied = True
-        if applied:
-            self._ensure_events_seq_ordered(entry)
+        if appended_out_of_order:
+            entry.events.sort(key=lambda item: item.seq)
         entry.initialized = True
 
     def _rebuild_prefix_from_cached_events(
@@ -2174,6 +2556,19 @@ class SessionCache:
             )
 
     def _apply_cached_event(self, entry: CachedSessionState, event: CachedEvent) -> None:
+        entry.event_seqs.add(event.seq)
+        alias_delta = event.data.get(MEMORY_ALIASES_METADATA)
+        if alias_delta is not None and not entry.memory_aliases.apply(alias_delta):
+            logger.warning(
+                "session_cache: rejected invalid memory alias metadata",
+                extra={
+                    "extra_data": {
+                        "session_id": entry.session_id,
+                        "event_seq": event.seq,
+                        "event_type": event.type,
+                    }
+                },
+            )
         loaded_skill_id = self._loaded_skill_id_from_event(event)
         if loaded_skill_id is not None:
             superseded_event_seqs = {
@@ -2188,6 +2583,7 @@ class SessionCache:
             ]
             entry.events_since_compaction_memo.clear()
             if superseded_event_seqs:
+                entry.projection_revision += 1
                 entry.prefix_entries = [
                     item for item in entry.prefix_entries if item.seq not in superseded_event_seqs
                 ]
@@ -2223,6 +2619,7 @@ class SessionCache:
             entry.last_compaction_summary = summary if isinstance(summary, str) else None
             entry.last_compaction_seq = event.seq
             entry.events = [existing for existing in entry.events if existing.seq > event.seq]
+            entry.projection_revision += 1
             entry.events_since_compaction_memo.clear()
         elif event.type == "tool_discovery" or (
             event.type == "lifecycle" and event.data.get("event") == "tool_discovery"

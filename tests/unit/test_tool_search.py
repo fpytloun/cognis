@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+from jsonschema import Draft7Validator
+
 from cognis.core.tool_retrieval import retrieve_relevant_skills, retrieve_relevant_tools
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
-from cognis.models.tool import ToolSource
-from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
+from cognis.models.tool import (
+    NativeToolOperation,
+    ToolMutationKind,
+    ToolSource,
+    declared_default_semantics,
+)
+from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
+from cognis.tools.builtin.tool_search import (
+    CALL_TOOL_TOOL,
+    DESCRIBE_TOOL_TOOL,
+    SEARCH_TOOLS_TOOL,
+    resolve_inventory_tool,
+    search_inventory,
+)
 
 
 def _tool(name: str, description: str, category: str) -> ToolDefinition:
@@ -50,6 +64,59 @@ def test_search_inventory_returns_ranked_permission_filtered_matches() -> None:
     assert matches[0]["handle"]["callable_name"] == "read"
     assert matches[0]["handle"]["scope"] == "session"
     assert matches[0]["handle"]["permission_scope"] == "current_session_effective_inventory"
+    assert matches[0]["operation_count"] == 1
+    assert "operations" not in matches[0]
+
+
+def test_search_inventory_adds_compact_multi_operation_index() -> None:
+    matches = search_inventory([MANAGE_AGENTS_TOOL], "manage agents", limit=5)
+
+    assert len(matches) == 1
+    result = matches[0]
+    assert result["operation_count"] == len(MANAGE_AGENTS_TOOL.descriptor.operations)
+    assert result["operations"] == [
+        {
+            "operation": operation.operation,
+            "summary": operation.summary,
+            "mutation_kind": operation.mutation_kind.value,
+        }
+        for operation in MANAGE_AGENTS_TOOL.descriptor.operations[:25]
+    ]
+    assert all("input_schema" not in operation for operation in result["operations"])
+    assert result["operations_truncated"] is True
+
+
+def test_search_inventory_caps_operation_index_at_25() -> None:
+    operations = [
+        NativeToolOperation(
+            operation=f"read_{index:02d}",
+            summary=f"Read item {index}.",
+            mutation_kind=ToolMutationKind.READ,
+            input_schema={
+                "type": "object",
+                "properties": {"action": {"const": f"read_{index:02d}"}},
+                "required": ["action"],
+            },
+            semantics=declared_default_semantics(ToolMutationKind.READ),
+        )
+        for index in range(26)
+    ]
+    tool = ToolDefinition(
+        name="large_reader",
+        description="Read many item types.",
+        parameters={},
+        source=ToolSource(type="builtin"),
+        category="system",
+        read_only=True,
+        native_operations=operations,
+    )
+
+    result = search_inventory([tool], "many item types", limit=5)[0]
+
+    assert result["operation_count"] == 26
+    assert len(result["operations"]) == 25
+    assert result["operations_truncated"] is True
+    assert result["operations"][-1]["operation"] == "read_24"
 
 
 def test_search_inventory_limits_results() -> None:
@@ -58,6 +125,30 @@ def test_search_inventory_limits_results() -> None:
     matches = search_inventory(tools, "search", limit=50)
 
     assert len(matches) == 20
+
+
+def test_call_tool_definition_uses_closed_envelope_schema() -> None:
+    assert CALL_TOOL_TOOL.parameters["required"] == ["tool", "arguments"]
+    assert CALL_TOOL_TOOL.parameters["additionalProperties"] is False
+    assert CALL_TOOL_TOOL.parameters["properties"]["arguments"]["type"] == "object"
+
+
+def test_describe_tool_operation_selector_rejects_empty_string() -> None:
+    validator = Draft7Validator(DESCRIBE_TOOL_TOOL.parameters)
+
+    errors = list(validator.iter_errors({"tool": "manage_agents", "operation": ""}))
+
+    assert DESCRIBE_TOOL_TOOL.parameters["properties"]["operation"]["minLength"] == 1
+    assert len(errors) == 1
+    assert errors[0].validator == "minLength"
+
+
+def test_resolve_inventory_tool_prefers_stable_id_and_requires_unique_name() -> None:
+    first = _mcp_tool("shared_name", "search_messages", server_id="gmail")
+    second = _mcp_tool("shared_name", "search_messages", server_id="archive")
+
+    assert resolve_inventory_tool([first, second], "mcp:gmail:search_messages") is first
+    assert resolve_inventory_tool([first, second], "shared_name") is None
 
 
 def test_search_inventory_omits_already_visible_tools() -> None:

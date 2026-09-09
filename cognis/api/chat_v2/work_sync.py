@@ -417,6 +417,12 @@ async def build_work_evidence_backfill_response(
             for index, frontier in enumerate(start_frontiers)
         ]
         budget.truncated = budget.truncated or watermark_truncated
+    resolved_frontiers = [int(frontier) for frontier in start_frontiers if frontier is not None]
+    if len(resolved_frontiers) != len(start_frontiers):
+        raise ChatV2SyncError(
+            "event_store_paging_failed",
+            "Work evidence scan could not resolve all initial frontiers",
+        )
     streams = [
         _StreamScan(
             ref=ref,
@@ -424,7 +430,7 @@ async def build_work_evidence_backfill_response(
             frontier=frontier,
             request_start_frontier=int(frontier),
         )
-        for ref, frontier in zip(session_refs, start_frontiers, strict=True)
+        for ref, frontier in zip(session_refs, resolved_frontiers, strict=True)
     ]
     evidence: list[TimelineItem] = []
     evidence_ids: set[str] = set()
@@ -540,7 +546,7 @@ async def build_work_evidence_backfill_response(
     if budget.truncated and page_frontiers is None:
         page_frontiers = [int(stream.frontier or 0) for stream in streams]
     made_progress = page_frontiers is not None and any(
-        frontier < start for frontier, start in zip(page_frontiers, start_frontiers, strict=True)
+        frontier < start for frontier, start in zip(page_frontiers, resolved_frontiers, strict=True)
     )
     exhausted = all(stream.exhausted and not stream.buffer for stream in streams)
     if budget.truncated and not evidence and not made_progress and not exhausted:
@@ -569,6 +575,17 @@ async def build_work_evidence_backfill_response(
         or budget.truncated
         or any(stream.buffer or stream.bounded or not stream.exhausted for stream in streams)
     )
+    if has_more_before and page_frontiers is None:
+        candidate_frontiers = [int(stream.frontier or 0) for stream in streams]
+        if not any(
+            frontier < start
+            for frontier, start in zip(candidate_frontiers, resolved_frontiers, strict=True)
+        ):
+            raise ChatV2SyncError(
+                "event_store_paging_failed",
+                "Event store reported older Work events without advancing the cursor",
+            )
+        page_frontiers = candidate_frontiers
     selected = sorted(evidence[:validated_limit], key=lambda item: item.sort_key)
     response = TimelineBackfillResponse(
         projection_version=current_projection_version(),

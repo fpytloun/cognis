@@ -81,6 +81,59 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(store.visibleItems.map((item) => item.id)).toContain('message:live');
   });
 
+  it('accepts the populated canonical bootstrap after a pre-bootstrap reset', () => {
+    const store = new ChatV2Store();
+    const watermark = store.refreshWatermark();
+
+    // A legacy session_reset can arrive after the cold request captures its
+    // watermark but before the populated snapshot resolves.
+    store.reset();
+
+    expect(store.replaceFromSnapshotForCanonicalBootstrap(
+      snapshot([message()]),
+      watermark,
+      true,
+    )).toBe(true);
+    expect(store.snapshot.conversationId).toBe('conv-1');
+    expect(store.visibleItems.map((item) => item.id)).toEqual(['message:1']);
+  });
+
+  it('preserves an optimistic admission created during canonical bootstrap', () => {
+    const store = new ChatV2Store();
+    const watermark = store.refreshWatermark();
+    store.reset();
+    store.addOptimisticUser({
+      clientMessageId: 'client-during-bootstrap',
+      content: 'message sent during bootstrap',
+      createdAt: '2025-01-01T00:00:02Z',
+    });
+
+    expect(store.replaceFromSnapshotForCanonicalBootstrap(
+      snapshot([message()]),
+      watermark,
+      true,
+    )).toBe(true);
+    expect(store.snapshot.conversationId).toBe('conv-1');
+    expect(store.visibleItems.map((item) => item.id)).toEqual([
+      'message:1',
+      'local-user:client-during-bootstrap',
+    ]);
+  });
+
+  it('keeps watermark protection after canonical bootstrap completes', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([message()]));
+    const watermark = store.refreshWatermark();
+    store.reset();
+
+    expect(store.replaceFromSnapshotForCanonicalBootstrap(
+      snapshot([message({ content: 'stale' })]),
+      watermark,
+      false,
+    )).toBe(false);
+    expect(store.visibleItems).toEqual([]);
+  });
+
   it('rejects a delayed snapshot after a queue deletion and falls back to sync', async () => {
     const store = new ChatV2Store();
     const queuedSnapshot = snapshot([message()]);
@@ -106,6 +159,7 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
       probe: () => probe,
       applyIfUnchanged: (candidate, watermark) =>
         store.replaceFromSnapshotIfUnchanged(candidate, watermark),
+      snapshot: vi.fn(async () => undefined),
       sync
     });
     const deletion: QueueMutationResponse = {
@@ -140,6 +194,7 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
       probe: () => probe,
       applyIfUnchanged: (candidate, watermark) =>
         store.replaceFromSnapshotIfUnchanged(candidate, watermark),
+      snapshot: vi.fn(async () => undefined),
       sync
     });
     const older = message({
@@ -167,6 +222,25 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(store.snapshot.hasMoreBefore).toBe(true);
   });
 
+  it('returns backfill admission and preserves current cursor on projection drift', () => {
+    const store = new ChatV2Store();
+    const current = snapshot([message()]);
+    current.timeline = { items: current.timeline.items, has_more_before: true, before_cursor: 'current-before' };
+    store.replaceFromSnapshot(current);
+    const admitted = store.applyBackfill({
+      schema_version: 2,
+      projection_version: 'newer-projection',
+      conversation_id: 'conv-1',
+      items: [message({ id: 'message:old', content: 'stale older' })],
+      has_more_before: false,
+      before_cursor: null,
+      server_time: '2026-01-01T00:00:02Z'
+    });
+    expect(admitted).toBe(false);
+    expect(store.snapshot.beforeCursor).toBe('current-before');
+    expect(store.visibleItems.some((item) => item.id === 'message:old')).toBe(false);
+  });
+
   it('does not advance the mutation revision for rejected duplicate optimistic mutations', () => {
     const store = new ChatV2Store();
     const input = {
@@ -180,6 +254,23 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     store.addOptimisticUser(input);
 
     expect(store.refreshWatermark()).toEqual(watermark);
+  });
+
+  it('rejects a snapshot that started before an optimistic admission', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([]));
+    const watermark = store.refreshWatermark();
+
+    store.addOptimisticUser({
+      content: 'visible immediately',
+      clientMessageId: 'client-admission',
+      createdAt: '2026-01-01T00:00:01Z',
+    });
+
+    expect(store.replaceFromSnapshotIfUnchanged(snapshot([]), watermark)).toBe(false);
+    expect(store.visibleItems).toHaveLength(1);
+    expect(store.visibleItems[0]?.kind === 'message' ? store.visibleItems[0].content : null)
+      .toBe('visible immediately');
   });
 
   it('serializeState returns a plain, non-proxy deep copy that survives structuredClone', () => {
@@ -221,6 +312,39 @@ describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
     expect(store.visibleItems.map((item) => item.id)).toEqual(['message:1']);
     // The restored state must be independent of the cached entry.
     expect(() => structuredClone(store.serializeState())).not.toThrow();
+  });
+
+  it('restores queued local admission placement without a visibility gap', () => {
+    const store = new ChatV2Store();
+    store.replaceFromSnapshot(snapshot([]));
+    store.addOptimisticUser({
+      content: 'queued locally',
+      clientMessageId: 'client-queue',
+      createdAt: '2026-01-01T00:00:01Z',
+    });
+    store.applySend({
+      status: 'queued',
+      client_txn_id: 'txn-queue',
+      client_message_id: 'client-queue',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-1',
+      cursor: null,
+      server_time: '2026-01-01T00:00:02Z',
+    });
+    const serialized = store.serializeState();
+
+    store.reset();
+    store.restoreState(serialized);
+
+    expect(store.visibleItems).toEqual([]);
+    expect(store.visibleQueue.messages).toEqual([
+      expect.objectContaining({
+        queue_id: 'queue-1',
+        client_message_id: 'client-queue',
+        content: 'queued locally',
+      }),
+    ]);
   });
 
   it('can serialize a cache-safe state without live runtime overlay', () => {

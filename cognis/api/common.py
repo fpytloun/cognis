@@ -13,7 +13,7 @@ from typing import Any, cast
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from cognis.api.middleware import AuthenticatedUser
+from cognis.api.authentication import AuthenticatedUser
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.ownership import normalize_executor_scope
 from cognis.store.queries import get_active_agent_grant, get_active_project_grant

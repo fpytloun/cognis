@@ -11,12 +11,19 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy import event as sa_event
+from sqlalchemy import select
 
 from cognis.api.app import create_app
+from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.middleware import AuthenticatedUser
-from cognis.api.models import TaskCreateRequest
+from cognis.api.models import TaskCommentCreateRequest, TaskCreateRequest
 from cognis.api.routes.sessions import _token_usage_for_session
-from cognis.api.routes.tasks import _continuation_context_event, task_create
+from cognis.api.routes.tasks import (
+    _continuation_context_event,
+    _task_board_progress_summaries,
+    _task_final_deliverable_content,
+    task_create,
+)
 from cognis.api.websocket import (
     AuthenticatedWebSocket,
     WebSocketConnectionManager,
@@ -35,10 +42,17 @@ from cognis.models.session import (
     IntarisSessionSummaryRecord,
 )
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
-from cognis.models.workflow import WorkflowState
-from cognis.store.models import NotificationRow
+from cognis.models.workflow import StepDefinition, Workflow, WorkflowState
+from cognis.store.models import (
+    Agent,
+    NotificationRow,
+    StepRun,
+    WorkCurrentFileRow,
+    WorkSessionProjectionRow,
+)
 from cognis.store.queries import (
     create_agent,
+    create_agent_grant,
     create_artifact_record,
     create_conversation,
     create_deliverable,
@@ -50,15 +64,21 @@ from cognis.store.queries import (
     create_step_run,
     create_task,
     create_user,
+    delete_system_agent_override,
     get_conversation,
     get_managed_conversation_link_for_target,
     get_task,
     get_user_ui_state_value,
+    list_step_runs_for_task,
+    list_task_comments,
+    revoke_agent_grant,
     set_session_intaris_session_id,
     set_session_status,
     touch_conversation,
+    update_agent_grant,
     update_conversation_active_session,
     update_managed_conversation_link,
+    upsert_system_agent_override,
 )
 
 
@@ -110,6 +130,19 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
 
 def test_viewer_cannot_create_task(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="viewer@example.com",
+                    name="Viewer",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="viewer",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
         response = client.post(
             "/api/v1/tasks",
             headers=_auth_headers(client.app, email="viewer@example.com", role="viewer"),
@@ -962,6 +995,66 @@ def test_session_intaris_detail_falls_back_without_summary(
         assert body["summary"] is None
 
 
+def test_session_local_detail_is_owner_scoped_and_does_not_call_intaris(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                for email in ("owner@example.com", "viewer@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email,
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                await create_agent(
+                    session,
+                    agent_id="owner-agent",
+                    owner_email="owner@example.com",
+                    name="Owner agent",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="owner-agent",
+                    context_type="web",
+                )
+                row = await create_session(
+                    session,
+                    conversation_id=conversation.conversation_id,
+                    user_email="owner@example.com",
+                    agent_id="owner-agent",
+                    delegation_mode="delegate",
+                    delegation_task="Nested review",
+                )
+                await session.commit()
+                return row.session_id
+
+        session_id = asyncio.run(_seed())
+        get_session = AsyncMock(side_effect=AssertionError("local detail called Intaris"))
+        app.state.providers.guardrails.get_session = get_session
+
+        owned = client.get(
+            f"/api/v1/sessions/{session_id}",
+            headers=_auth_headers(app, email="owner@example.com"),
+        )
+        denied = client.get(
+            f"/api/v1/sessions/{session_id}",
+            headers=_auth_headers(app, email="viewer@example.com"),
+        )
+
+        assert owned.status_code == 200
+        assert owned.json()["delegation_task"] == "Nested review"
+        assert denied.status_code == 403
+        get_session.assert_not_awaited()
+
+
 def test_batch_submit_returns_per_item_results(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
@@ -1000,6 +1093,25 @@ def test_batch_submit_returns_per_item_results(monkeypatch: object, tmp_path: Pa
                 return task_one.task_id, task_two.task_id
 
         task_one, task_two = asyncio.run(_seed())
+        submitted_task_ids: list[str] = []
+
+        async def _batch_submit(task_ids: list[str]) -> dict[str, object]:
+            submitted_task_ids.extend(task_ids)
+            results = [
+                {
+                    "task_id": task_id,
+                    "status": "submitted" if task_id != "missing-task" else "error",
+                    "error": None if task_id != "missing-task" else "Task not found",
+                }
+                for task_id in task_ids
+            ]
+            return {
+                "results": results,
+                "succeeded": sum(item["status"] == "submitted" for item in results),
+                "failed": sum(item["status"] == "error" for item in results),
+            }
+
+        monkeypatch.setattr(app.state.task_queue, "batch_submit", _batch_submit)  # type: ignore[attr-defined]
         response = client.post(
             "/api/v1/tasks/batch-submit",
             headers=_auth_headers(app, email="user@example.com"),
@@ -1009,6 +1121,8 @@ def test_batch_submit_returns_per_item_results(monkeypatch: object, tmp_path: Pa
         body = response.json()
         assert body["succeeded"] == 2
         assert body["failed"] == 1
+        assert submitted_task_ids == [task_one, task_two, "missing-task"]
+        assert [item["task_id"] for item in body["results"]] == submitted_task_ids
         assert any(
             item["task_id"] == "missing-task" and item["status"] == "error"
             for item in body["results"]
@@ -1174,6 +1288,267 @@ def test_task_board_limits_columns_and_pages_independently(
         )
         assert next_page.status_code == 200
         assert [item["task_id"] for item in next_page.json()["items"]] == ["board-queued-2"]
+
+        filtered = client.get(
+            "/api/v1/tasks/board",
+            params={"limit": 1, "q": "board-done-0"},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert filtered.status_code == 200
+        assert filtered.json()["columns"]["queued"]["items"] == []
+        assert [item["task_id"] for item in filtered.json()["columns"]["done"]["items"]] == [
+            "board-done-0"
+        ]
+
+        oversized_query = client.get(
+            "/api/v1/tasks/board",
+            params={"q": "x" * 201},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert oversized_query.status_code == 422
+
+
+def test_task_board_progress_summary_is_optional_owned_and_bounded(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                for email in ("user@example.com", "other@example.com"):
+                    await create_user(
+                        session,
+                        email=email,
+                        name=email,
+                        password_hash=app.state.password_hasher.hash("password123"),
+                        role="user",
+                    )
+                    await create_agent(
+                        session,
+                        agent_id=f"agent-{email}",
+                        owner_email=email,
+                        name=email,
+                        status="active",
+                    )
+                now = datetime.now(UTC)
+                for index in range(6):
+                    task = await create_task(
+                        session,
+                        created_by="user@example.com",
+                        agent_id="agent-user@example.com",
+                        title=f"Running {index}",
+                        status="running",
+                        task_id=f"progress-task-{index}",
+                    )
+                    task.updated_at = now - timedelta(minutes=index)
+                    run = await create_step_run(
+                        session,
+                        task_id=task.task_id,
+                        step_name=f"step-{index}",
+                        step_type="run",
+                        agent_id=task.agent_id,
+                        status="running",
+                    )
+                    run.todos = [
+                        {"content": "Done", "status": "completed"},
+                        {"content": "Now", "status": "in_progress"},
+                        {"content": "Later", "status": "pending"},
+                    ]
+                    if index == 0:
+                        conversation = await create_conversation(
+                            session,
+                            user_email="user@example.com",
+                            agent_id=task.agent_id,
+                            context_type="web",
+                            conversation_id="progress-conversation",
+                        )
+                        session_row = await create_session(
+                            session,
+                            conversation_id=conversation.conversation_id,
+                            user_email="user@example.com",
+                            agent_id=task.agent_id,
+                            session_id="progress-session",
+                        )
+                        run.session_id = session_row.session_id
+                        session.add(
+                            WorkSessionProjectionRow(
+                                projection_id="progress-projection",
+                                owner_email="user@example.com",
+                                session_id=session_row.session_id,
+                                source_session_id="source-progress",
+                                materializer_version=WORK_MATERIALIZER_VERSION,
+                                state="caught_up",
+                                additions=31,
+                                deletions=9,
+                            )
+                        )
+                        for file_index in range(4):
+                            session.add(
+                                WorkCurrentFileRow(
+                                    current_file_id=f"progress-file-{file_index}",
+                                    owner_email="user@example.com",
+                                    session_id=session_row.session_id,
+                                    materializer_version=WORK_MATERIALIZER_VERSION,
+                                    file_projector_version="file-v1",
+                                    path_generation_id=f"generation-{file_index}",
+                                    source_store="intaris",
+                                    source_session_id="source-progress",
+                                    source_seq=file_index + 1,
+                                    source_item_id=f"item-{file_index}",
+                                    path=f"/repo/file-{file_index}.py",
+                                    path_id=f"path-{file_index}",
+                                    state="modified",
+                                )
+                            )
+                foreign = await create_task(
+                    session,
+                    created_by="other@example.com",
+                    agent_id="agent-other@example.com",
+                    title="Foreign running",
+                    status="running",
+                    task_id="foreign-progress-task",
+                )
+                await create_step_run(
+                    session,
+                    task_id=foreign.task_id,
+                    step_name="foreign",
+                    step_type="run",
+                    agent_id=foreign.agent_id,
+                    status="running",
+                )
+                await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="agent-user@example.com",
+                    title="Waiting for gate",
+                    status="paused",
+                    task_id="waiting-gate-task",
+                    workflow_state={
+                        "status": "paused",
+                        "pending_pause_type": "gate",
+                        "pending_pause_payload": {"pause_id": "gate-1"},
+                    },
+                )
+                await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="agent-user@example.com",
+                    title="Paused without action",
+                    status="paused",
+                    task_id="ordinary-paused-task",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+
+        default_response = client.get(
+            "/api/v1/tasks/board?limit=10",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert default_response.status_code == 200
+        default_running = default_response.json()["columns"]["running"]["items"]
+        assert len(default_running) == 6
+        assert all(item["progress_summary"] is None for item in default_running)
+        paused_items = default_response.json()["columns"]["paused"]["items"]
+        assert {item["task_id"]: item["attention_type"] for item in paused_items} == {
+            "ordinary-paused-task": None,
+            "waiting-gate-task": "gate",
+        }
+        attention_response = client.get(
+            "/api/v1/tasks/board?limit=5&attention_only=true",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert attention_response.status_code == 200
+        assert [
+            item["task_id"] for item in attention_response.json()["columns"]["paused"]["items"]
+        ] == ["waiting-gate-task"]
+
+        enriched_response = client.get(
+            "/api/v1/tasks/board?limit=10&include_progress_summary=true&progress_limit=5",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert enriched_response.status_code == 200
+        enriched_running = enriched_response.json()["columns"]["running"]["items"]
+        assert [item["task_id"] for item in enriched_running] == [
+            f"progress-task-{index}" for index in range(6)
+        ]
+        assert all(item["task_id"] != "foreign-progress-task" for item in enriched_running)
+        for index, item in enumerate(enriched_running):
+            summary = item["progress_summary"]
+            if index == 5:
+                assert summary is None
+                continue
+            assert summary == {
+                "todo_total": 3,
+                "todo_completed": 1,
+                "todo_in_progress": 1,
+                "current_step_name": f"step-{index}",
+                "current_step_status": "running",
+                "changed_files": 4 if index == 0 else 0,
+                "additions": 31 if index == 0 else 0,
+                "deletions": 9 if index == 0 else 0,
+            }
+
+        invalid_limit = client.get(
+            "/api/v1/tasks/board?include_progress_summary=true&progress_limit=6",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert invalid_limit.status_code == 422
+
+
+def test_task_board_progress_summary_batches_step_and_diff_queries() -> None:
+    step_run = SimpleNamespace(
+        task_id="task-1",
+        step_run_id="step-run-1",
+        step_name="implement",
+        status="running",
+        superseded_by_step_run_id=None,
+        todos=[
+            {"content": "Done", "status": "completed"},
+            {"content": "Now", "status": "in_progress"},
+        ],
+    )
+    step_result = SimpleNamespace(
+        scalars=lambda: SimpleNamespace(all=lambda: [step_run]),
+    )
+    diff_result = SimpleNamespace(
+        all=lambda: [
+            SimpleNamespace(
+                task_id="task-1",
+                changed_files=4,
+                additions=31,
+                deletions=9,
+            )
+        ],
+    )
+    session = SimpleNamespace(execute=AsyncMock(side_effect=[step_result, diff_result]))
+
+    summaries = asyncio.run(
+        _task_board_progress_summaries(
+            session,
+            owner_email="user@example.com",
+            task_ids=["task-1"],
+        )
+    )
+
+    assert session.execute.await_count == 2
+    step_statement = str(session.execute.await_args_list[0].args[0])
+    assert "step_runs.todos" in step_statement
+    assert "step_runs.output" not in step_statement
+    assert "step_runs.evaluation" not in step_statement
+    assert "step_runs.runtime_info" not in step_statement
+    assert summaries["task-1"].model_dump() == {
+        "todo_total": 2,
+        "todo_completed": 1,
+        "todo_in_progress": 1,
+        "current_step_name": "implement",
+        "current_step_status": "running",
+        "changed_files": 4,
+        "additions": 31,
+        "deletions": 9,
+    }
 
 
 def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
@@ -1365,6 +1740,13 @@ def test_task_mutation_rejects_non_owner(monkeypatch: object, tmp_path: Path) ->
                     session,
                     email="owner@example.com",
                     name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_user(
+                    session,
+                    email="attacker@example.com",
+                    name="Attacker",
                     password_hash=app.state.password_hasher.hash("password123"),
                     role="user",
                 )
@@ -2163,7 +2545,7 @@ def test_websocket_escalation_resolve_tolerates_same_decision_duplicate() -> Non
     assert manager.messages == []
 
 
-def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
+def test_websocket_direct_chat_step_response_uses_persisted_questions_without_local_pause(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -2224,6 +2606,7 @@ def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
             )
         )
         app.state.pause_waiter.clear(notification.notification_id)
+        app.state.notification_service._record_user_interaction = AsyncMock()
 
         class _Manager:
             def __init__(self) -> None:
@@ -2259,7 +2642,10 @@ def test_websocket_direct_chat_step_response_conflicts_without_live_pause(
                 },
             )
         )
-        assert manager.errors[-1]["code"] == "conflict"
+        assert manager.errors == []
+        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        assert resolved is not None
+        assert resolved.status == "resolved"
 
 
 def test_websocket_step_response_rejects_mismatched_task_and_notification(
@@ -2689,6 +3075,91 @@ def test_conversation_list_paginates_before_attention_hydration(
         ]
         assert second_body["has_more"] is False
         assert hydration_batch_sizes == [2, 1]
+
+
+def test_conversation_list_filters_titles_before_pagination(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> list[str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                base = datetime(2026, 5, 7, 12, 0, tzinfo=UTC)
+                matching_ids: list[str] = []
+                for index, title in enumerate(
+                    [
+                        "Recent unrelated",
+                        "Needle first",
+                        "Older unrelated",
+                        "needle second",
+                        None,
+                        "   ",
+                    ]
+                ):
+                    conversation = await create_conversation(
+                        session,
+                        user_email="user@example.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                        title=title,
+                    )
+                    conversation.last_message_at = base - timedelta(minutes=index)
+                    if title and "needle" in title.lower():
+                        matching_ids.append(conversation.conversation_id)
+                await session.commit()
+                return matching_ids
+
+        matching_ids = asyncio.run(_seed())
+        first_response = client.get(
+            "/api/v1/conversations",
+            params={"limit": 1, "q": " NEEDLE "},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert first_response.status_code == 200
+        first_body = first_response.json()
+        assert [item["conversation_id"] for item in first_body["items"]] == [matching_ids[0]]
+        assert first_body["has_more"] is True
+
+        second_response = client.get(
+            "/api/v1/conversations",
+            params={"limit": 1, "q": "needle", "cursor": first_body["cursor"]},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert second_response.status_code == 200
+        second_body = second_response.json()
+        assert [item["conversation_id"] for item in second_body["items"]] == [matching_ids[1]]
+        assert second_body["has_more"] is False
+
+        stale_cursor_response = client.get(
+            "/api/v1/conversations",
+            params={"limit": 1, "q": "unrelated", "cursor": first_body["cursor"]},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert stale_cursor_response.status_code == 400
+        assert stale_cursor_response.json()["error"]["code"] == "invalid_cursor"
+
+        untitled_response = client.get(
+            "/api/v1/conversations",
+            params={"q": "untitled conversation"},
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert untitled_response.status_code == 200
+        assert [item["title"] for item in untitled_response.json()["items"]] == [None, "   "]
 
 
 def test_conversation_list_ignores_metadata_updated_at_for_activity_ordering(
@@ -3462,13 +3933,13 @@ def test_conversation_sidebar_task_filter_isolated_and_paginated(
         ] == [normal_id]
 
 
-def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombstones(
+def test_conversation_sidebar_legacy_delta_request_returns_filtered_full_reconciliation(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        async def _seed() -> tuple[str, str, str, datetime]:
+        async def _seed() -> tuple[str, str, str, str, datetime]:
             async with app.state.session_factory() as session:
                 await create_user(
                     session,
@@ -3477,7 +3948,7 @@ def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombston
                     password_hash=app.state.password_hasher.hash("password123"),
                     role="user",
                 )
-                await create_agent(
+                agent = await create_agent(
                     session,
                     agent_id="agent-1",
                     owner_email="user@example.com",
@@ -3485,6 +3956,8 @@ def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombston
                     status="active",
                 )
                 since = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+                agent.created_at = since - timedelta(seconds=1)
+                agent.updated_at = since - timedelta(seconds=1)
                 unchanged = await create_conversation(
                     session,
                     user_email="user@example.com",
@@ -3521,14 +3994,14 @@ def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombston
                 deleted.status = "deleted"
                 await session.commit()
                 return (
+                    unchanged.conversation_id,
                     changed.conversation_id,
                     archived.conversation_id,
                     deleted.conversation_id,
                     since,
                 )
 
-        changed_id, archived_id, deleted_id, since = asyncio.run(_seed())
-
+        unchanged_id, changed_id, archived_id, deleted_id, since = asyncio.run(_seed())
         response = client.get(
             f"/api/v1/conversations/sidebar?context_type=web&changed_since={quote(since.isoformat())}",
             headers=_auth_headers(app, email="user@example.com"),
@@ -3536,12 +4009,26 @@ def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombston
 
         assert response.status_code == 200
         body = response.json()
-        assert [item["conversation_id"] for item in body["conversations"]["items"]] == [changed_id]
-        assert body["removed_conversation_ids"] == [archived_id, deleted_id]
-        assert body["agents"] == []
-        assert body["context_types"] == []
+        assert {item["conversation_id"] for item in body["conversations"]["items"]} == {
+            unchanged_id,
+            changed_id,
+        }
+        assert archived_id not in {
+            item["conversation_id"] for item in body["conversations"]["items"]
+        }
+        assert deleted_id not in {
+            item["conversation_id"] for item in body["conversations"]["items"]
+        }
+        assert body["removed_conversation_ids"] == []
+        assert body["agents"]
+        assert body["context_types"] == ["web"]
+        assert body["is_delta"] is False
         assert body["full_resync_required"] is False
         assert isinstance(body["sync_timestamp"], str)
+        assert isinstance(body["sidebar_revision"], str)
+        assert body["background_work_changed"] is True
+        assert body["background_work"] is not None
+        assert body["background_work"]["active_count"] == 0
 
         all_response = client.get(
             f"/api/v1/conversations/sidebar?context_type=web&status=all&changed_since={quote(since.isoformat())}",
@@ -3550,10 +4037,211 @@ def test_conversation_sidebar_projection_delta_returns_changed_rows_and_tombston
         assert all_response.status_code == 200
         all_body = all_response.json()
         assert {item["conversation_id"] for item in all_body["conversations"]["items"]} == {
+            unchanged_id,
             changed_id,
             archived_id,
         }
-        assert all_body["removed_conversation_ids"] == [deleted_id]
+        assert deleted_id not in {
+            item["conversation_id"] for item in all_body["conversations"]["items"]
+        }
+        assert all_body["removed_conversation_ids"] == []
+        assert all_body["is_delta"] is False
+
+
+def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> tuple[str, str]:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                own_agent = await create_agent(
+                    session,
+                    agent_id="agent-own",
+                    owner_email="user@example.com",
+                    name="Own agent",
+                    status="active",
+                )
+                shared_agent = await create_agent(
+                    session,
+                    agent_id="agent-shared",
+                    owner_email="owner@example.com",
+                    name="Shared agent",
+                    status="active",
+                )
+                grant = await create_agent_grant(
+                    session,
+                    agent_id=shared_agent.agent_id,
+                    grantee_user_email="user@example.com",
+                    executor_scope="owner_executor",
+                    granted_by="owner@example.com",
+                )
+                await upsert_system_agent_override(
+                    session,
+                    owner_email="user@example.com",
+                    agent_id="system:explore",
+                    disabled=True,
+                )
+                await session.commit()
+                return own_agent.agent_id, grant.grant_id
+
+        own_agent_id, grant_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+
+        baseline = client.get("/api/v1/conversations/sidebar", headers=headers).json()
+        baseline_timestamp = datetime.fromisoformat(baseline["sync_timestamp"])
+
+        async def _update_agent() -> None:
+            async with app.state.session_factory() as session:
+                agent = await session.get(Agent, own_agent_id)
+                assert agent is not None
+                agent.name = "Updated agent"
+                agent.updated_at = baseline_timestamp + timedelta(microseconds=1)
+                await session.commit()
+
+        asyncio.run(_update_agent())
+        agent_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": baseline["sync_timestamp"],
+                "sidebar_revision": baseline["sidebar_revision"],
+            },
+            headers=headers,
+        )
+        assert agent_delta.status_code == 200
+        agent_body = agent_delta.json()
+        assert agent_body["is_delta"] is False
+        assert agent_body["full_resync_required"] is False
+        assert (
+            next(item for item in agent_body["agents"] if item["agent_id"] == own_agent_id)["name"]
+            == "Updated agent"
+        )
+
+        after_agent = client.get("/api/v1/conversations/sidebar", headers=headers).json()
+
+        async def _patch_grant() -> None:
+            async with app.state.session_factory() as session:
+                grant = await update_agent_grant(
+                    session,
+                    grant_id,
+                    executor_scope="grantee_executor",
+                    grantee_overrides={"execution": {"executor_id": "executor-1"}},
+                )
+                assert grant is not None
+                await session.commit()
+
+        asyncio.run(_patch_grant())
+        patch_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": after_agent["sync_timestamp"],
+                "sidebar_revision": after_agent["sidebar_revision"],
+            },
+            headers=headers,
+        )
+        assert patch_delta.status_code == 200
+        patch_body = patch_delta.json()
+        assert patch_body["is_delta"] is False
+        assert patch_body["full_resync_required"] is False
+        assert any(item["agent_id"] == "agent-shared" for item in patch_body["agents"])
+
+        after_patch = client.get("/api/v1/conversations/sidebar", headers=headers).json()
+        after_patch_timestamp = datetime.fromisoformat(after_patch["sync_timestamp"])
+
+        async def _revoke_grant() -> None:
+            async with app.state.session_factory() as session:
+                grant = await revoke_agent_grant(session, grant_id)
+                assert grant is not None
+                grant.revoked_at = after_patch_timestamp + timedelta(microseconds=1)
+                await session.commit()
+
+        asyncio.run(_revoke_grant())
+        grant_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": after_patch["sync_timestamp"],
+                "sidebar_revision": after_patch["sidebar_revision"],
+            },
+            headers=headers,
+        )
+        assert grant_delta.status_code == 200
+        grant_body = grant_delta.json()
+        assert grant_body["is_delta"] is False
+        assert grant_body["full_resync_required"] is False
+        assert not any(item["agent_id"] == "agent-shared" for item in grant_body["agents"])
+
+        after_grant = client.get("/api/v1/conversations/sidebar", headers=headers).json()
+        after_grant_timestamp = datetime.fromisoformat(after_grant["sync_timestamp"])
+
+        async def _create_new_context_type() -> None:
+            async with app.state.session_factory() as session:
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id=own_agent_id,
+                    context_type="matrix",
+                    title="Matrix conversation",
+                )
+                conversation.created_at = after_grant_timestamp + timedelta(microseconds=1)
+                conversation.updated_at = conversation.created_at
+                await session.commit()
+
+        asyncio.run(_create_new_context_type())
+        context_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": after_grant["sync_timestamp"],
+                "sidebar_revision": after_grant["sidebar_revision"],
+            },
+            headers=headers,
+        )
+        assert context_delta.status_code == 200
+        context_body = context_delta.json()
+        assert context_body["is_delta"] is False
+        assert context_body["context_types"] == ["matrix"]
+        assert context_body["full_resync_required"] is False
+
+        after_context = client.get("/api/v1/conversations/sidebar", headers=headers).json()
+
+        async def _reset_override() -> None:
+            async with app.state.session_factory() as session:
+                deleted = await delete_system_agent_override(
+                    session,
+                    owner_email="user@example.com",
+                    agent_id="system:explore",
+                )
+                assert deleted is True
+                await session.commit()
+
+        asyncio.run(_reset_override())
+        override_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": after_context["sync_timestamp"],
+                "sidebar_revision": after_context["sidebar_revision"],
+            },
+            headers=headers,
+        )
+        assert override_delta.status_code == 200
+        override_body = override_delta.json()
+        assert override_body["is_delta"] is False
+        assert override_body["full_resync_required"] is False
+        assert any(item["agent_id"] == "system:explore" for item in override_body["agents"])
 
 
 def test_conversation_sidebar_projection_query_count_is_bounded(
@@ -3562,7 +4250,8 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        async def _seed() -> None:
+        async def _seed() -> list[str]:
+            active_conversation_ids: list[str] = []
             async with app.state.session_factory() as session:
                 await create_user(
                     session,
@@ -3591,16 +4280,58 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
                         title_source="agent_direct",
                     )
                 for index in range(24):
-                    await create_conversation(
+                    conversation = await create_conversation(
                         session,
                         user_email="user@example.com",
                         agent_id=f"agent-{index % 12}",
                         context_type="web" if index % 2 == 0 else "signal",
                         title=f"Conversation {index}",
                     )
+                    session_row = await create_session(
+                        session,
+                        conversation.conversation_id,
+                        "user@example.com",
+                        f"agent-{index % 12}",
+                    )
+                    await update_conversation_active_session(
+                        session,
+                        conversation.conversation_id,
+                        session_row.session_id,
+                    )
+                    task = await create_task(
+                        session,
+                        created_by="user@example.com",
+                        agent_id=f"agent-{index % 12}",
+                        title=f"Task {index}",
+                        status="running",
+                    )
+                    await create_step_run(
+                        session,
+                        task_id=task.task_id,
+                        step_name="work",
+                        step_type="agent",
+                        agent_id=f"agent-{index % 12}",
+                        conversation_id=conversation.conversation_id,
+                        status="running",
+                        started_at=datetime.now(UTC),
+                    )
+                    active_conversation_ids.append(conversation.conversation_id)
                 await session.commit()
+            return active_conversation_ids
 
-        asyncio.run(_seed())
+        active_conversation_ids = asyncio.run(_seed())
+
+        async def _running_states(conversation_ids: list[str], *, session=None):
+            assert session is not None
+            return {
+                conversation_id: {"turn_id": f"turn-{conversation_id}"}
+                for conversation_id in conversation_ids
+                if conversation_id in active_conversation_ids
+            }
+
+        app.state.turn_scheduler.durable_running_turn_states = AsyncMock(
+            side_effect=_running_states
+        )
         statements: list[str] = []
 
         def _count_statement(
@@ -3630,7 +4361,7 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
         body = response.json()
         assert len(body["conversations"]["items"]) == 12
         assert len(body["agent_direct_chats"]) == 12
-        assert len(statements) <= 25
+        assert len(statements) <= 30
 
 
 def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_path: Path) -> None:
@@ -4610,4 +5341,201 @@ def test_task_continuation_context_is_not_intention_eligible() -> None:
         "content_type": "text",
         "source": "task_chat_context",
         "intention_eligible": False,
+        "prompt_visibility": "model_only",
+        "prompt_provenance": {
+            "kind": "internal_workflow_prompt",
+            "source": "task_chat_context",
+        },
     }
+
+
+@pytest.mark.parametrize("intent", ["record_only", "context_only", "answer_pause"])
+def test_non_revision_comment_intents_do_not_require_expected_attempt(intent: str) -> None:
+    payload = TaskCommentCreateRequest(body="Comment", intent=intent)
+
+    assert payload.expected_attempt is None
+
+
+def test_request_revision_comment_requires_expected_attempt() -> None:
+    with pytest.raises(ValueError, match="expected_attempt is required"):
+        TaskCommentCreateRequest(body="Revise", intent="request_revision")
+
+
+def test_task_revision_comment_attempt_cas_has_no_stale_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workflow = Workflow(
+        workflow_id="wf-comment-revision",
+        name="Comment revision",
+        steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(name="build", type="run"),
+            StepDefinition(name="review", type="run"),
+        ],
+    )
+    state = WorkflowState(
+        current_step_index=2,
+        status="completed",
+        step_outputs={
+            "plan": {"summary": "plan"},
+            "build": {"summary": "build"},
+            "review": {"summary": "review"},
+        },
+        effective_workflow_definition=workflow.model_dump(mode="json"),
+    )
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> str:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                task = await create_task(
+                    session,
+                    task_id="task-comment-revision",
+                    created_by="owner@example.com",
+                    agent_id="agent-1",
+                    title="Comment revision",
+                    status="completed",
+                    workflow_id=workflow.workflow_id,
+                    workflow_state=state.model_dump(mode="json"),
+                )
+                task.attempt_number = 2
+                for name in ("plan", "build", "review"):
+                    await create_step_run(
+                        session,
+                        task_id=task.task_id,
+                        step_name=name,
+                        step_type="run",
+                        agent_id="agent-1",
+                        step_run_id=f"sr-comment-{name}",
+                        status="approved",
+                        attempt_number=2,
+                    )
+                await session.commit()
+                return task.task_id
+
+        task_id = asyncio.run(_seed())
+        headers = _auth_headers(client.app, email="owner@example.com")
+        client.app.state.task_queue._execution_store.claim_existing = AsyncMock(  # noqa: SLF001
+            return_value=None
+        )
+
+        missing = client.post(
+            f"/api/v1/tasks/{task_id}/comments",
+            headers=headers,
+            json={
+                "body": "Missing attempt",
+                "intent": "request_revision",
+                "target_step": "build",
+            },
+        )
+        assert missing.status_code == 422
+
+        stale = client.post(
+            f"/api/v1/tasks/{task_id}/comments",
+            headers=headers,
+            json={
+                "body": "Stale revision",
+                "intent": "request_revision",
+                "target_step": "build",
+                "expected_attempt": 1,
+            },
+        )
+        assert stale.status_code == 409
+
+        async def _verify_stale() -> None:
+            async with client.app.state.session_factory() as session:
+                task = await get_task(session, task_id)
+                comments = await list_task_comments(session, task_id)
+                step_runs = await list_step_runs_for_task(session, task_id)
+            assert task is not None and task.attempt_number == 2
+            assert comments == []
+            assert {row.status for row in step_runs} == {"approved"}
+
+        asyncio.run(_verify_stale())
+
+        current = client.post(
+            f"/api/v1/tasks/{task_id}/comments",
+            headers=headers,
+            json={
+                "body": "Current revision",
+                "intent": "request_revision",
+                "target_step": "build",
+                "expected_attempt": 2,
+            },
+        )
+        assert current.status_code == 201
+        response = current.json()
+        assert response["attempt_number"] == 2
+        assert response["applied"] is True
+        assert response["metadata"]["action_result"]["new_attempt"] == 3
+        assert response["metadata"]["action_result"] == {
+            "new_attempt": 3,
+            "target_step": "build",
+            "superseded_count": 2,
+            "relaunched": False,
+        }
+
+        async def _verify_current() -> None:
+            async with client.app.state.session_factory() as session:
+                task = await get_task(session, task_id)
+                comments = await list_task_comments(session, task_id)
+                step_runs = list(
+                    await session.scalars(select(StepRun).where(StepRun.task_id == task_id))
+                )
+            assert task is not None and task.attempt_number == 3
+            assert len(comments) == 1
+            assert comments[0].body == "Current revision"
+            by_step = {row.step_name: row.status for row in step_runs}
+            assert by_step == {
+                "plan": "approved",
+                "build": "superseded",
+                "review": "superseded",
+            }
+
+        asyncio.run(_verify_current())
+
+
+@pytest.mark.asyncio
+async def test_task_chat_omits_superseded_deliverable_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _get_step_run(_session: object, _step_run_id: str) -> SimpleNamespace:
+        return SimpleNamespace(task_id="task-1", attempt_number=1)
+
+    monkeypatch.setattr("cognis.api.routes.tasks.get_step_run", _get_step_run)
+    task = SimpleNamespace(
+        task_id="task-1",
+        attempt_number=2,
+        result_data={},
+    )
+    old_deliverable = SimpleNamespace(
+        deliverable_id="dlv-old",
+        step_run_id="sr-old",
+        attempt_number=1,
+        status="approved",
+        title="Old result",
+    )
+
+    content, deliverable_id = await _task_final_deliverable_content(
+        object(),
+        task,
+        {"sr-old": [old_deliverable]},
+    )
+
+    assert content == ""
+    assert deliverable_id is None

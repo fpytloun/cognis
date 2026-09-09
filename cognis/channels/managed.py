@@ -9,21 +9,29 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy import delete, exists, or_, select, true, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.channels.constants import MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS
+from cognis.channels.constants import (
+    EXPLICIT_CHANNEL_DELIVERY_SOURCES,
+    MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS,
+)
+from cognis.channels.delivery_state import managed_delivery_outcome_uncertain
 from cognis.channels.group_context import (
     GROUP_CONTEXT_MAX_BYTES,
     GROUP_CONTEXT_RESERVATION_SECONDS,
     GroupContextPolicy,
 )
 from cognis.channels.route_admission import (
+    ChannelRouteBlocker,
+    active_channel_tool_delivery_blocker,
     active_channel_tool_delivery_id,
     active_managed_binding_id,
+    channel_route_blockers,
     lock_channel_route,
 )
 from cognis.core.agent_profiles import normalize_agent_profile_id, resolve_agent_profile
@@ -161,6 +169,34 @@ class ManagedInboundAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class ManagedChannelRecoveryResult:
+    """Bounded result for an expired managed-channel route release."""
+
+    status: str
+    conversation_id: str | None = None
+    owner_epoch: int | None = None
+    prior_state: str | None = None
+    binding_state: str | None = None
+    expires_at: datetime | None = None
+    outcome_uncertain: bool = False
+    route_reserved: bool = False
+    audit: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OneShotRouteRecoveryResult:
+    """Bounded result for releasing one uncertain one-shot route blocker."""
+
+    status: str
+    delivery_id: str | None = None
+    delivery_status: str | None = None
+    outcome_uncertain: bool = False
+    route_reserved: bool = False
+    audit: dict[str, Any] | None = None
+    remaining_blockers: tuple[ChannelRouteBlocker, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class GroupContextReservation:
     token: str | None
     contextual_messages: list[dict[str, Any]]
@@ -169,6 +205,11 @@ class GroupContextReservation:
 
 class GroupContextReservationConflict(RuntimeError):
     """The exact group-context reservation is no longer admissible."""
+
+
+class _ActiveOneShotRouteError(RuntimeError):
+    def __init__(self, blocker: ChannelRouteBlocker) -> None:
+        self.blocker = blocker
 
 
 async def _persist_managed_delivery_failure_notification(
@@ -318,21 +359,24 @@ class ManagedChannelService:
                 return binding.binding_id, binding.version
             if link.turn_state != "idle" or link.active_turn_id is not None:
                 return None
-            claimed = await session.execute(
-                update(ManagedConversationLink)
-                .where(
-                    ManagedConversationLink.link_id == link_id,
-                    ManagedConversationLink.owner_epoch == owner_epoch,
-                    ManagedConversationLink.conversation_state == "open",
-                    ManagedConversationLink.turn_state == "idle",
-                    ManagedConversationLink.active_turn_id.is_(None),
-                )
-                .values(
-                    turn_state="running",
-                    active_turn_id=turn_id,
-                    updated_at=datetime.now(UTC),
-                )
-                .execution_options(synchronize_session=False)
+            claimed = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(ManagedConversationLink)
+                    .where(
+                        ManagedConversationLink.link_id == link_id,
+                        ManagedConversationLink.owner_epoch == owner_epoch,
+                        ManagedConversationLink.conversation_state == "open",
+                        ManagedConversationLink.turn_state == "idle",
+                        ManagedConversationLink.active_turn_id.is_(None),
+                    )
+                    .values(
+                        turn_state="running",
+                        active_turn_id=turn_id,
+                        updated_at=datetime.now(UTC),
+                    )
+                    .execution_options(synchronize_session=False)
+                ),
             )
             if claimed.rowcount != 1:
                 await session.rollback()
@@ -818,7 +862,7 @@ class ManagedChannelService:
                     & (ChannelInboundLedgerRow.message_id > previous_primary.message_id)
                 )
                 if previous_primary is not None
-                else True
+                else true()
             )
             candidates = list(
                 (
@@ -973,19 +1017,22 @@ class ManagedChannelService:
     async def purge_expired_group_context(self, *, now: datetime | None = None) -> int:
         current = now or datetime.now(UTC)
         async with self._session_factory() as session:
-            result = await session.execute(
-                delete(ChannelInboundLedgerRow).where(
-                    ChannelInboundLedgerRow.binding_id.is_(None),
-                    ChannelInboundLedgerRow.retain_until.is_not(None),
-                    ChannelInboundLedgerRow.retain_until <= current,
-                    ~exists(
-                        select(1).where(
-                            ChannelContextConsumptionRow.inbound_id
-                            == ChannelInboundLedgerRow.inbound_id,
-                            ChannelContextConsumptionRow.state == "reserved",
-                        )
-                    ),
-                )
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    delete(ChannelInboundLedgerRow).where(
+                        ChannelInboundLedgerRow.binding_id.is_(None),
+                        ChannelInboundLedgerRow.retain_until.is_not(None),
+                        ChannelInboundLedgerRow.retain_until <= current,
+                        ~exists(
+                            select(1).where(
+                                ChannelContextConsumptionRow.inbound_id
+                                == ChannelInboundLedgerRow.inbound_id,
+                                ChannelContextConsumptionRow.state == "reserved",
+                            )
+                        ),
+                    )
+                ),
             )
             await session.commit()
             return int(result.rowcount or 0)
@@ -1067,7 +1114,7 @@ class ManagedChannelService:
                     completed = completed_link is not None
             await session.commit()
         if delivery_id is not None and self._delivery_service is not None:
-            await self._delivery_service.deliver_managed_channel_final(delivery_id)
+            self._delivery_service.wake_pending_deliveries()
         if delivery_id is None and not completed:
             await self.submit_next_held(binding_id)
 
@@ -1202,8 +1249,9 @@ class ManagedChannelService:
             ):
                 return False
             now = datetime.now(UTC)
+            completed_send_attempt = outbox.status == "sending"
             outbox.status = outbox_status
-            if outbox_status == "suppressed":
+            if outbox_status == "suppressed" or completed_send_attempt:
                 outbox.attempt_count += 1
             outbox.lease_token = None
             outbox.lease_expires_at = None
@@ -1215,6 +1263,32 @@ class ManagedChannelService:
             link.turn_state = "idle"
             link.active_turn_id = None
             link.last_error = reason
+            control_metadata = (
+                dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
+            )
+            control_metadata["channel_delivery_failure"] = {
+                "delivery_id": delivery_id,
+                "binding_state": "delivery_failed",
+                "delivery_status": outbox_status,
+                "outcome_uncertain": outbox_status == "uncertain",
+                "expires_at": _as_utc(binding.expires_at).isoformat(),
+                "recovery_action": "agent_conversation_recover_channel",
+                "recovery_eligible_at": _as_utc(binding.expires_at).isoformat(),
+                "automatic_retry": False,
+                "resend_guidance": (
+                    (
+                        "The managed delivery outcome remains uncertain. Reconcile externally "
+                        "before resending because a one-shot idempotency key cannot deduplicate "
+                        "this delivery."
+                    )
+                    if outbox_status == "uncertain"
+                    else (
+                        "The managed delivery failed without an uncertain external outcome. "
+                        "Recovery does not resend it; any later send is a separate delivery."
+                    )
+                ),
+            }
+            link.control_metadata = control_metadata
             link.updated_at = now
             await _persist_managed_delivery_failure_notification(
                 session,
@@ -1510,6 +1584,7 @@ class ManagedChannelService:
                 conversation_id,
                 inbound.content,
                 user_email=inbound.user_email,
+                admission_origin=None,
                 intention_eligible=False,
                 attachments=list((inbound.platform_data or {}).get("safe_attachments") or []),
                 user_message_metadata=message_metadata(
@@ -1845,6 +1920,13 @@ class ManagedChannelService:
                         .where(
                             ManagedChannelBinding.active_route_key.is_not(None),
                             ManagedChannelBinding.expires_at <= current,
+                            ManagedChannelBinding.state.notin_(
+                                {"delivery_pending", "delivery_sent"}
+                            ),
+                        )
+                        .order_by(
+                            ManagedChannelBinding.expires_at.asc(),
+                            ManagedChannelBinding.binding_id.asc(),
                         )
                         .limit(limit)
                     )
@@ -1852,8 +1934,6 @@ class ManagedChannelService:
                 .scalars()
                 .all()
             )
-            from cognis.store.queries import persist_managed_terminal_notification
-
             expired = 0
             for binding_id in binding_ids:
                 joined = await _binding_with_link(session, binding_id, lock=True)
@@ -1864,24 +1944,244 @@ class ManagedChannelService:
                     binding.active_route_key is None
                     or _as_utc(binding.expires_at) > current
                     or _delivery_lease_active(binding, current)
-                    or binding.state in {"delivery_pending", "delivery_sent", "delivery_failed"}
+                    or binding.state in {"delivery_pending", "delivery_sent"}
                 ):
                     continue
-                _release_binding(
+                audit = await _expire_binding(
+                    session,
                     binding,
                     link,
-                    state="expired",
-                    reason="binding_expired",
                     now=current,
+                    actor={"type": "maintenance", "action": "expire"},
                 )
-                await persist_managed_terminal_notification(
-                    session,
-                    link=link,
-                    status="expired",
-                )
-                expired += 1
+                if audit is not None:
+                    expired += 1
             await session.commit()
         return expired
+
+    async def recover_expired_delivery_failure(
+        self,
+        *,
+        target_conversation_id: str,
+        user_email: str,
+        expected_owner_epoch: int,
+        actor_agent_id: str,
+        actor_conversation_id: str,
+        actor_session_id: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> ManagedChannelRecoveryResult:
+        """Release one expired failed route without retrying its delivery."""
+
+        current = now or datetime.now(UTC)
+        async with self._session_factory() as session:
+            binding = await queries.get_managed_channel_binding_for_target(
+                session,
+                target_conversation_id,
+                for_update=True,
+            )
+            if binding is None:
+                return ManagedChannelRecoveryResult(status="not_found")
+            link = await queries.get_managed_conversation_link(
+                session,
+                binding.link_id,
+                user_email=user_email,
+                for_update=True,
+            )
+            if link is None or link.kind != "channel":
+                return ManagedChannelRecoveryResult(status="not_found")
+            metadata = (
+                dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
+            )
+            previous_audit = metadata.get("channel_route_release")
+            if link.owner_epoch != expected_owner_epoch:
+                return ManagedChannelRecoveryResult(
+                    status="conflict",
+                    conversation_id=link.target_conversation_id,
+                    owner_epoch=link.owner_epoch,
+                    prior_state=binding.state,
+                    binding_state=binding.state,
+                    expires_at=_as_utc(binding.expires_at),
+                    outcome_uncertain=await managed_delivery_outcome_uncertain(session, binding),
+                    route_reserved=binding.active_route_key is not None,
+                )
+            if (
+                binding.active_route_key is None
+                and binding.state == "expired"
+                and isinstance(previous_audit, dict)
+            ):
+                return ManagedChannelRecoveryResult(
+                    status="already_released",
+                    conversation_id=link.target_conversation_id,
+                    owner_epoch=link.owner_epoch,
+                    prior_state=str(previous_audit.get("prior_state") or ""),
+                    binding_state=binding.state,
+                    expires_at=_as_utc(binding.expires_at),
+                    outcome_uncertain=bool(previous_audit.get("outcome_uncertain")),
+                    route_reserved=False,
+                    audit=previous_audit,
+                )
+            if (
+                binding.state != "delivery_failed"
+                or binding.active_route_key is None
+                or _as_utc(binding.expires_at) > current
+                or _delivery_lease_active(binding, current)
+            ):
+                return ManagedChannelRecoveryResult(
+                    status="not_eligible",
+                    conversation_id=link.target_conversation_id,
+                    owner_epoch=link.owner_epoch,
+                    prior_state=binding.state,
+                    binding_state=binding.state,
+                    expires_at=_as_utc(binding.expires_at),
+                    outcome_uncertain=await managed_delivery_outcome_uncertain(session, binding),
+                    route_reserved=binding.active_route_key is not None,
+                )
+            audit = await _expire_binding(
+                session,
+                binding,
+                link,
+                now=current,
+                actor={
+                    "type": "agent",
+                    "action": "release_expired",
+                    "agent_id": actor_agent_id,
+                    "conversation_id": actor_conversation_id,
+                    "session_id": actor_session_id,
+                    "reason": reason,
+                },
+            )
+            if audit is None:
+                conflict_conversation_id = link.target_conversation_id
+                conflict_owner_epoch = link.owner_epoch
+                conflict_state = binding.state
+                conflict_expires_at = _as_utc(binding.expires_at)
+                conflict_outcome_uncertain = await managed_delivery_outcome_uncertain(
+                    session, binding
+                )
+                conflict_route_reserved = binding.active_route_key is not None
+                await session.rollback()
+                return ManagedChannelRecoveryResult(
+                    status="conflict",
+                    conversation_id=conflict_conversation_id,
+                    owner_epoch=conflict_owner_epoch,
+                    prior_state=conflict_state,
+                    binding_state=conflict_state,
+                    expires_at=conflict_expires_at,
+                    outcome_uncertain=conflict_outcome_uncertain,
+                    route_reserved=conflict_route_reserved,
+                )
+            await session.commit()
+            return ManagedChannelRecoveryResult(
+                status="released",
+                conversation_id=link.target_conversation_id,
+                owner_epoch=link.owner_epoch,
+                prior_state=str(audit["prior_state"]),
+                binding_state=binding.state,
+                expires_at=_as_utc(binding.expires_at),
+                outcome_uncertain=bool(audit["outcome_uncertain"]),
+                route_reserved=False,
+                audit=audit,
+            )
+
+    async def recover_uncertain_one_shot_route(
+        self,
+        *,
+        delivery_id: str,
+        user_email: str,
+        actor_agent_id: str,
+        actor_conversation_id: str,
+        actor_session_id: str,
+        reason: str,
+        now: datetime | None = None,
+    ) -> OneShotRouteRecoveryResult:
+        """Release one uncertain one-shot route without changing its delivery outcome."""
+
+        current = now or datetime.now(UTC)
+        async with self._session_factory() as session:
+            initial = await session.get(ChannelDeliveryOutboxRow, delivery_id)
+            if initial is None or initial.user_email != user_email:
+                return OneShotRouteRecoveryResult(status="not_found")
+            account_id = initial.account_id
+            await session.rollback()
+            async with session.begin():
+                await lock_channel_route(session, account_id)
+                row = await session.get(
+                    ChannelDeliveryOutboxRow,
+                    delivery_id,
+                    with_for_update=True,
+                )
+                if row is None or row.user_email != user_email:
+                    return OneShotRouteRecoveryResult(status="not_found")
+
+                async def result_snapshot(
+                    status: str, audit: dict[str, Any] | None = None
+                ) -> OneShotRouteRecoveryResult:
+                    blockers = await channel_route_blockers(
+                        session,
+                        user_email=user_email,
+                        account_id=account_id,
+                        chat_id=row.chat_id,
+                        thread_id=row.thread_id,
+                    )
+                    return OneShotRouteRecoveryResult(
+                        status=status,
+                        delivery_id=row.delivery_id,
+                        delivery_status=row.status,
+                        outcome_uncertain=row.status == "uncertain",
+                        route_reserved=bool(blockers),
+                        remaining_blockers=blockers,
+                        audit=audit,
+                    )
+
+                if row.route_released_at is not None:
+                    return await result_snapshot("already_released", row.route_release_audit)
+                if (
+                    row.source_type not in EXPLICIT_CHANNEL_DELIVERY_SOURCES
+                    or row.status != "uncertain"
+                    or row.lease_token is not None
+                ):
+                    return await result_snapshot("not_eligible")
+                audit = {
+                    "type": "agent",
+                    "action": "release_uncertain_one_shot_route",
+                    "agent_id": actor_agent_id,
+                    "conversation_id": actor_conversation_id,
+                    "session_id": actor_session_id,
+                    "reason": reason,
+                    "occurred_at": current.isoformat(),
+                    "delivery_status": row.status,
+                    "original_error": row.last_error,
+                    "delivery_retried": False,
+                    "held_messages_replayed": False,
+                }
+                released = cast(
+                    CursorResult[Any],
+                    await session.execute(
+                        update(ChannelDeliveryOutboxRow)
+                        .where(
+                            ChannelDeliveryOutboxRow.delivery_id == delivery_id,
+                            ChannelDeliveryOutboxRow.user_email == user_email,
+                            ChannelDeliveryOutboxRow.status == "uncertain",
+                            ChannelDeliveryOutboxRow.route_released_at.is_(None),
+                            ChannelDeliveryOutboxRow.lease_token.is_(None),
+                        )
+                        .values(
+                            route_released_at=current,
+                            route_release_audit=audit,
+                            updated_at=current,
+                        )
+                        .execution_options(synchronize_session=False)
+                    ),
+                )
+                if released.rowcount != 1:
+                    await session.refresh(row)
+                    return await result_snapshot(
+                        "already_released" if row.route_released_at is not None else "conflict",
+                        row.route_release_audit,
+                    )
+                result = await result_snapshot("released", audit)
+            return result
 
 
 async def _binding_with_link(
@@ -1904,7 +2204,7 @@ async def _binding_with_link(
         )
         .where(ManagedChannelBinding.binding_id == binding_id)
     )
-    return result.one_or_none()
+    return result.tuples().one_or_none()
 
 
 async def _active_binding_for_message_route(
@@ -1934,7 +2234,7 @@ async def _active_binding_for_message_route(
     )
     if lock:
         statement = statement.with_for_update()
-    return (await session.execute(statement)).one_or_none()
+    return (await session.execute(statement)).tuples().one_or_none()
 
 
 async def _binding_with_link_id(
@@ -1953,7 +2253,7 @@ async def _binding_with_link_id(
     )
     if lock:
         query = query.with_for_update()
-    return (await session.execute(query)).one_or_none()
+    return (await session.execute(query)).tuples().one_or_none()
 
 
 def _release_binding(
@@ -1977,6 +2277,76 @@ def _release_binding(
     link.last_error = reason if state in {"failed", "expired", "cancelled"} else None
     link.completed_at = now
     link.updated_at = now
+
+
+async def _expire_binding(
+    session: AsyncSession,
+    binding: ManagedChannelBinding,
+    link: ManagedConversationLink,
+    *,
+    now: datetime,
+    actor: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Expire and audit one locked route without replaying input or delivery."""
+
+    prior_state = binding.state
+    prior_error = binding.last_error
+    outcome_uncertain = await managed_delivery_outcome_uncertain(session, binding)
+    audit = {
+        **actor,
+        "occurred_at": now.isoformat(),
+        "owner_epoch": link.owner_epoch,
+        "prior_state": prior_state,
+        "prior_error": prior_error,
+        "outcome_uncertain": outcome_uncertain,
+        "delivery_retried": False,
+        "held_messages_replayed": False,
+    }
+    metadata = dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
+    metadata["channel_route_release"] = audit
+    result = cast(
+        CursorResult[Any],
+        await session.execute(
+            update(ManagedChannelBinding)
+            .where(
+                ManagedChannelBinding.binding_id == binding.binding_id,
+                ManagedChannelBinding.version == binding.version,
+                ManagedChannelBinding.state == prior_state,
+                ManagedChannelBinding.active_route_key == binding.active_route_key,
+                ManagedChannelBinding.expires_at <= now,
+            )
+            .values(
+                state="expired",
+                active_route_key=None,
+                version=ManagedChannelBinding.version + 1,
+                terminal_at=now,
+                last_error=prior_error if prior_state == "delivery_failed" else None,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        ),
+    )
+    if result.rowcount != 1:
+        return None
+    await session.refresh(binding)
+    link.control_metadata = metadata
+    link.conversation_state = "expired"
+    link.turn_state = "expired"
+    link.active_turn_id = None
+    link.notify_on_completion = False
+    link.last_error = (
+        prior_error or "managed_channel_delivery_failed"
+        if prior_state == "delivery_failed"
+        else "binding_expired"
+    )
+    link.completed_at = now
+    link.updated_at = now
+    await queries.persist_managed_terminal_notification(
+        session,
+        link=link,
+        status="expired",
+    )
+    return audit
 
 
 async def managed_delivery_fence_valid(
@@ -2086,10 +2456,17 @@ async def create_managed_channel_conversation(
     from cognis.core.managed_conversations import new_managed_turn_id
     from cognis.store import queries
 
-    def error(message: str, code: str | None = None) -> ToolResult:
+    def error(
+        message: str,
+        code: str | None = None,
+        *,
+        details: dict[str, Any] | None = None,
+    ) -> ToolResult:
         payload = {"status": "error", "message": message}
         if code:
             payload["code"] = code
+        if details:
+            payload.update(details)
         return ToolResult(output=json.dumps(payload), is_error=True)
 
     user_email = ctx.session.user_email
@@ -2173,7 +2550,12 @@ async def create_managed_channel_conversation(
     except ValueError as exc:
         return error(str(exc))
     target_authorized_ids = set(authorized_tool_ids(target_agent))
-    available: dict[str, str] = {}
+    core_ids = [
+        "builtin:agent_conversation_send_controller",
+        "builtin:agent_conversation_complete",
+    ]
+    available: dict[str, str] = {tool_id: tool_id for tool_id in core_ids}
+    available.update({tool_id.rsplit(":", 1)[-1]: tool_id for tool_id in core_ids})
     if ctx.tool_registry is not None:
         for registered in ctx.tool_registry.items():
             definition = registered.definition
@@ -2184,16 +2566,12 @@ async def create_managed_channel_conversation(
     allowed: list[str] = []
     for raw in raw_allowed:
         value = str(raw).strip()
-        tool_id = available.get(value)
-        if not value or tool_id is None:
+        resolved_tool_id = available.get(value)
+        if not value or resolved_tool_id is None:
             return error(f"Tool is not currently available: {value}")
-        if tool_id not in allowed:
-            allowed.append(tool_id)
-    core_ids = [
-        "builtin:agent_conversation_send_controller",
-        "builtin:agent_conversation_complete",
-    ]
-    effective_ids = [*allowed, *core_ids]
+        if resolved_tool_id not in allowed:
+            allowed.append(resolved_tool_id)
+    effective_ids = list(dict.fromkeys([*allowed, *core_ids]))
     policy_snapshot = {
         "tool_ids": effective_ids,
         "explicit_tool_allowlist": effective_ids,
@@ -2264,7 +2642,7 @@ async def create_managed_channel_conversation(
         try:
             async with db.begin():
                 await lock_channel_route(db, target.account_id)
-                pending_one_shot = await active_channel_tool_delivery_id(
+                pending_one_shot = await active_channel_tool_delivery_blocker(
                     db,
                     user_email=user_email,
                     account_id=target.account_id,
@@ -2272,7 +2650,7 @@ async def create_managed_channel_conversation(
                     thread_id=target.thread_id,
                 )
                 if pending_one_shot is not None:
-                    raise IntegrityError("active one-shot route", None, None)
+                    raise _ActiveOneShotRouteError(pending_one_shot)
                 link = await queries.create_managed_conversation_link(
                     db,
                     user_email=user_email,
@@ -2320,11 +2698,54 @@ async def create_managed_channel_conversation(
                         "channel_transcript_ref": transcript_ref,
                     },
                 )
+        except _ActiveOneShotRouteError as exc:
+            await loop.session_manager.soft_delete_conversation(conversation.conversation_id)
+            blocker = exc.blocker
+            return error(
+                "This channel target has an active one-shot delivery.",
+                code="channel_delivery_route_active",
+                details={
+                    "blocker_type": blocker.blocker_type,
+                    "blocker_id": blocker.blocker_id,
+                    "blocker_status": blocker.status,
+                    "recovery_tool": blocker.recovery_tool,
+                    "recovery_guidance": (
+                        "Reconcile the external outcome, then call "
+                        "agent_conversation_recover_channel with delivery_id and a reason. "
+                        "The action will not resend this delivery."
+                        if blocker.recovery_tool
+                        else "Wait for the active delivery to settle."
+                    ),
+                },
+            )
         except IntegrityError:
             await loop.session_manager.soft_delete_conversation(conversation.conversation_id)
+            async with loop.session_manager.session_factory() as conflict_db:
+                active_binding = await active_managed_binding_id(
+                    conflict_db,
+                    user_email=user_email,
+                    account_id=target.account_id,
+                    chat_id=target.chat_id,
+                    thread_id=target.thread_id,
+                )
+            if active_binding is None:
+                return error(
+                    "The managed channel route could not be reserved.",
+                    code="managed_channel_route_conflict",
+                )
             return error(
                 "This channel target already has an active managed binding.",
                 code="managed_channel_route_active",
+                details={
+                    "blocker_type": "managed_binding",
+                    "blocker_id": active_binding,
+                    "blocker_status": "active",
+                    "recovery_tool": None,
+                    "recovery_guidance": (
+                        "Continue or close the existing managed conversation. "
+                        "Cross-controller close remains ownership checked."
+                    ),
+                },
             )
     service = getattr(loop.providers, "managed_channel_service", None)
     if service is None:
@@ -2355,6 +2776,7 @@ async def create_managed_channel_conversation(
         conversation.conversation_id,
         initial_message,
         user_email=user_email,
+        admission_origin=None,
         attachments=[item.model_dump(mode="json") for item in private_attachments],
         intention_eligible=True,
         user_message_metadata={

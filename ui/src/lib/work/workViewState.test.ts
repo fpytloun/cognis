@@ -5,6 +5,7 @@ import {
   clearWorkViewStates,
   clearWorkResponseCache,
   getWorkResponseCache,
+  invalidateAllWorkScopes,
   invalidateWorkFromSocket,
   invalidateWorkScope,
   restoreWorkViewState,
@@ -42,6 +43,7 @@ describe('workViewState', () => {
     expect(listener).toHaveBeenCalledOnce();
     expect((listener.mock.calls[0][0] as CustomEvent).detail).toEqual({
       scopeKey: 'conversation:conversation-a',
+      overviewAdvanced: true,
     });
     window.removeEventListener('cognis:work-invalidated', listener);
   });
@@ -57,6 +59,7 @@ describe('workViewState', () => {
       scopeKey: 'conversation:conversation-a',
       workRevision: 2,
       graphRevision: 3,
+      overviewAdvanced: true,
     });
     window.removeEventListener('cognis:work-invalidated', listener);
   });
@@ -73,6 +76,68 @@ describe('workViewState', () => {
     expect((listener.mock.calls[0][0] as CustomEvent).detail).toEqual({
       scopeKey: 'conversation:conversation-a',
       workRevision: 42,
+      overviewAdvanced: true,
+    });
+    window.removeEventListener('cognis:work-invalidated', listener);
+  });
+
+  it('maps owner-wide Work invalidation to every visible scope', () => {
+    const listener = vi.fn();
+    window.addEventListener('cognis:work-invalidated', listener);
+    invalidateWorkFromSocket({
+      type: 'work_invalidated',
+      reason: 'work_invalidated',
+      revision: '43',
+      work_scope_key: '*',
+    });
+    expect((listener.mock.calls[0][0] as CustomEvent).detail).toEqual({
+      scopeKey: '',
+      workRevision: 43,
+      reconnect: false,
+    });
+    window.removeEventListener('cognis:work-invalidated', listener);
+  });
+
+  it('rejects duplicate and out-of-order owner-wide revisions', () => {
+    clearWorkViewStates();
+    const listener = vi.fn();
+    window.addEventListener('cognis:work-invalidated', listener);
+    for (const revision of ['43', '43', '42', '44']) {
+      invalidateWorkFromSocket({
+        type: 'work_invalidated',
+        reason: 'work_invalidated',
+        revision,
+        work_scope_key: '*',
+      });
+    }
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect((listener.mock.calls[1][0] as CustomEvent).detail.workRevision).toBe(44);
+    listener.mockClear();
+    for (let index = 0; index < 30; index += 1) {
+      invalidateWorkScope(`conversation:eviction-${index}`, { workRevision: 100 + index });
+    }
+    invalidateWorkFromSocket({
+      type: 'work_invalidated',
+      reason: 'work_invalidated',
+      revision: '43',
+      work_scope_key: '*',
+    });
+    expect(listener).toHaveBeenCalledTimes(30);
+    window.removeEventListener('cognis:work-invalidated', listener);
+  });
+
+  it('clears known Work responses and broadcasts a reconnect invalidation', () => {
+    const scope = conversationTimelineScope('conversation-reconnect');
+    setWorkResponseCache(scope, 'files', 'stale');
+    const listener = vi.fn();
+    window.addEventListener('cognis:work-invalidated', listener);
+
+    invalidateAllWorkScopes();
+
+    expect(getWorkResponseCache(scope, 'files')).toBeNull();
+    expect((listener.mock.calls.at(-1)?.[0] as CustomEvent).detail).toEqual({
+      scopeKey: '',
+      reconnect: true,
     });
     window.removeEventListener('cognis:work-invalidated', listener);
   });
@@ -113,6 +178,30 @@ describe('workViewState', () => {
     clearWorkResponseCache(first.key);
     expect(getWorkResponseCache(first, 'files')).toBeNull();
     expect(getWorkResponseCache(second, 'files')).toBe('files-b');
+  });
+
+  it('isolates cached responses by complete time-range query identity', () => {
+    const scope = conversationTimelineScope('cache-ranges');
+    const lastHour = { from: '2026-08-16T07:00:00Z', to: '2026-08-16T08:00:00Z', admittedRevision: 4 };
+    const allTime = { from: null, to: null, admittedRevision: 4 };
+    setWorkResponseCache(scope, 'files', 'hour', null, lastHour);
+    setWorkResponseCache(scope, 'files', 'all', null, allTime);
+    expect(getWorkResponseCache(scope, 'files', null, lastHour)).toBe('hour');
+    expect(getWorkResponseCache(scope, 'files', null, allTime)).toBe('all');
+  });
+
+  it('does not restore a response admitted before a newer invalidation revision', () => {
+    const scope = conversationTimelineScope('cache-revision-race');
+    const query = { from: null, to: null, admittedRevision: 4 };
+    setWorkResponseCache(scope, 'files', 'revision-4', null, query);
+    expect(getWorkResponseCache(scope, 'files', null, query)).toBe('revision-4');
+    invalidateWorkScope(scope.key, { workRevision: 5 });
+    expect(getWorkResponseCache(scope, 'files', null, query)).toBeNull();
+    setWorkResponseCache(scope, 'files', 'late-revision-4', null, query);
+    expect(getWorkResponseCache(scope, 'files', null, query)).toBeNull();
+    const current = { ...query, admittedRevision: 5 };
+    setWorkResponseCache(scope, 'files', 'revision-5', null, current);
+    expect(getWorkResponseCache(scope, 'files', null, current)).toBe('revision-5');
   });
 
   it('isolates response and UI state by exact session and clears all variants by scope', () => {

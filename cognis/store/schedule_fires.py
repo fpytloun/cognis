@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -18,6 +18,7 @@ from cognis.store.models import (
     Schedule,
     ScheduleCatchupStateRow,
     ScheduleFireRow,
+    StepRun,
     Task,
 )
 
@@ -36,6 +37,37 @@ def schedule_fire_id(schedule_id: str, scheduled_fire_at: datetime) -> str:
     normalized = _utc_iso(scheduled_fire_at)
     digest = hashlib.sha256(f"{schedule_id}\0{normalized}".encode()).hexdigest()[:32]
     return f"sfire_{digest}"
+
+
+async def get_task_schedule_trigger_context(
+    session: AsyncSession,
+    task_id: str,
+) -> dict[str, str] | None:
+    """Return immutable trigger metadata for a scheduler-created task."""
+
+    row = (
+        await session.execute(
+            select(ScheduleFireRow)
+            .where(ScheduleFireRow.task_id == task_id)
+            .order_by(ScheduleFireRow.created_at.asc())
+            .limit(1)
+        )
+    ).one_or_none()
+    if row is None:
+        return None
+    fire = row[0]
+    if fire.schedule_timezone is None:
+        raise RuntimeError(
+            f"Schedule fire '{fire.fire_id}' has no timezone snapshot; "
+            "migration 146 insertion trigger is missing or failed"
+        )
+    return {
+        "type": "schedule",
+        "fire_id": str(fire.fire_id),
+        "schedule_id": str(fire.schedule_id),
+        "scheduled_fire_at": _utc_iso(fire.scheduled_fire_at),
+        "timezone": fire.schedule_timezone,
+    }
 
 
 def schedule_task_id(schedule_id: str, scheduled_fire_at: datetime) -> str:
@@ -65,6 +97,7 @@ class ScheduleFireClaim:
     status: str
     should_dispatch: bool
     schedule: Any
+    replaced_paused_task_ids: tuple[str, ...] = ()
 
 
 class ScheduleFireStore:
@@ -79,6 +112,7 @@ class ScheduleFireStore:
         schedule_id: str,
         scheduled_fire_at: datetime,
         lease: Lease,
+        max_consecutive_errors: int = 5,
     ) -> ScheduleFireClaim | None:
         async with self._session_factory() as session:
             if not await self._lock_lease(session, lease):
@@ -108,6 +142,7 @@ class ScheduleFireStore:
                     schedule_id=schedule_id,
                     fire_kind="recurring",
                     scheduled_fire_at=scheduled_fire_at,
+                    schedule_timezone=schedule.timezone,
                     task_id=None,
                     status="claimed",
                     attempt_count=0,
@@ -162,6 +197,64 @@ class ScheduleFireStore:
                     schedule,
                 )
 
+            replaced_paused_task_ids: tuple[str, ...] = ()
+            if bool(getattr(schedule, "fail_paused_task_on_next_fire", True)):
+                paused_tasks = list(
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(
+                                Task.source_type == "scheduler",
+                                Task.source_ref == schedule_id,
+                                Task.status == "paused",
+                            )
+                            .order_by(Task.created_at.asc(), Task.task_id.asc())
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                if paused_tasks:
+                    reason = "Replaced at the next scheduled firing while still paused."
+                    now_value = datetime.now(UTC)
+                    paused_ids = [task.task_id for task in paused_tasks]
+                    for paused_task in paused_tasks:
+                        paused_task.status = "failed"
+                        paused_task.completed_at = now_value
+                        paused_task.result_summary = reason
+                        state = dict(paused_task.workflow_state or {})
+                        state["status"] = "failed"
+                        state["current_step_status"] = None
+                        paused_task.workflow_state = state
+                    await session.execute(
+                        update(StepRun)
+                        .where(
+                            StepRun.task_id.in_(paused_ids),
+                            StepRun.status.in_(["pending", "running", "evaluating", "paused"]),
+                        )
+                        .values(status="failed", completed_at=now_value, updated_at=now_value)
+                    )
+                    await session.execute(
+                        update(ScheduleFireRow)
+                        .where(
+                            ScheduleFireRow.task_id.in_(paused_ids),
+                            or_(
+                                ScheduleFireRow.last_error.is_(None),
+                                ~ScheduleFireRow.last_error.like("terminal:%"),
+                            ),
+                        )
+                        .values(status="failed", last_error="terminal:failed", updated_at=now_value)
+                    )
+                    errors = int(schedule.consecutive_errors or 0) + len(paused_ids)
+                    schedule.consecutive_errors = errors
+                    schedule.last_run_status = "failed"
+                    schedule.last_terminal_task_id = paused_ids[-1]
+                    if errors >= max_consecutive_errors:
+                        schedule.enabled = False
+                        schedule.next_fire_at = None
+                        schedule.disabled_reason = f"auto_consecutive_failures:{errors}"
+                    replaced_paused_task_ids = tuple(paused_ids)
+
             active = int(
                 await session.scalar(
                     select(func.count(Task.task_id)).where(
@@ -184,6 +277,7 @@ class ScheduleFireStore:
                     "skipped",
                     False,
                     schedule,
+                    replaced_paused_task_ids,
                 )
 
             fire.status = "claimed"
@@ -199,6 +293,7 @@ class ScheduleFireStore:
                 "claimed",
                 True,
                 schedule,
+                replaced_paused_task_ids,
             )
 
     async def claim_manual(
@@ -217,7 +312,12 @@ class ScheduleFireStore:
             if dialect == "postgresql":
                 schedule_stmt = schedule_stmt.with_for_update()
             schedule = (await session.execute(schedule_stmt)).scalar_one_or_none()
-            if schedule is None or not schedule.enabled:
+            recovery_allowed = (
+                schedule is not None
+                and schedule.schedule_type != "one_shot"
+                and str(schedule.disabled_reason or "").startswith("auto_consecutive_failures:")
+            )
+            if schedule is None or (not schedule.enabled and not recovery_allowed):
                 await session.rollback()
                 return None
 
@@ -292,6 +392,7 @@ class ScheduleFireStore:
                 schedule_id=schedule_id,
                 fire_kind="manual",
                 scheduled_fire_at=scheduled_fire_at,
+                schedule_timezone=schedule.timezone,
                 task_id=None,
                 status="claimed",
                 attempt_count=0,
@@ -353,6 +454,164 @@ class ScheduleFireStore:
                 )
             )
             return fire_id is not None
+
+    async def project_manual_terminal_result(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        completed_at: datetime,
+        max_consecutive_errors: int,
+        recovery_next_fire_at: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Project one manual task result atomically without changing recurring cadence."""
+        if status not in {"completed", "failed", "cancelled"}:
+            return None
+        async with self._session_factory() as session:
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            fire_stmt = select(ScheduleFireRow).where(
+                ScheduleFireRow.task_id == task_id,
+                ScheduleFireRow.fire_kind == "manual",
+            )
+            if dialect == "postgresql":
+                fire_stmt = fire_stmt.with_for_update()
+            fire = (await session.execute(fire_stmt)).scalar_one_or_none()
+            if fire is None or str(fire.last_error or "").startswith("terminal:"):
+                await session.rollback()
+                return None
+
+            schedule_stmt = select(Schedule).where(Schedule.schedule_id == fire.schedule_id)
+            if dialect == "postgresql":
+                schedule_stmt = schedule_stmt.with_for_update()
+            schedule = (await session.execute(schedule_stmt)).scalar_one_or_none()
+            if schedule is None:
+                await session.rollback()
+                return None
+
+            fire.status = "dispatched" if status == "completed" else "failed"
+            fire.last_error = f"terminal:{status}"
+            fire.updated_at = database_now_expression(session)
+            schedule.last_fired_at = completed_at
+            schedule.last_terminal_task_id = task_id
+            disabled = False
+            auto_disabled_state = str(schedule.disabled_reason or "").startswith(
+                "auto_consecutive_failures:"
+            )
+            if status == "completed":
+                schedule.last_run_status = "success"
+                schedule.consecutive_errors = 0
+            elif status == "cancelled":
+                schedule.last_run_status = "cancelled"
+                schedule.consecutive_errors = 0
+            else:
+                errors = int(schedule.consecutive_errors or 0) + 1
+                was_enabled = bool(schedule.enabled)
+                auto_disable_eligible = was_enabled or auto_disabled_state
+                disabled = errors >= max_consecutive_errors and auto_disable_eligible
+                schedule.last_run_status = "failed"
+                schedule.consecutive_errors = errors
+                if disabled:
+                    schedule.enabled = False
+                    schedule.next_fire_at = None
+                    schedule.disabled_reason = f"auto_consecutive_failures:{errors}"
+                    auto_disabled_state = True
+                    disabled = was_enabled
+            schedule.updated_at = database_now_expression(session)
+            await session.commit()
+            return {
+                "schedule_id": schedule.schedule_id,
+                "errors": int(schedule.consecutive_errors or 0),
+                "disabled": disabled,
+                "auto_disabled": disabled,
+                "auto_disabled_state": auto_disabled_state,
+                "current_enabled": bool(schedule.enabled),
+                "disabled_reason": schedule.disabled_reason,
+                "re_enabled": False,
+                "created_by": schedule.created_by,
+                "agent_id": schedule.agent_id,
+                "schedule_name": schedule.name,
+            }
+
+    async def project_recurring_terminal_result(
+        self,
+        *,
+        task_id: str,
+        status: str,
+        next_fire_at: datetime | None,
+        max_consecutive_errors: int,
+    ) -> dict[str, Any] | None:
+        """Project one recurring task result exactly once."""
+        if status not in {"completed", "failed", "cancelled"}:
+            return None
+        async with self._session_factory() as session:
+            fire = (
+                await session.execute(
+                    select(ScheduleFireRow).where(
+                        ScheduleFireRow.task_id == task_id,
+                        ScheduleFireRow.fire_kind == "recurring",
+                    )
+                )
+            ).scalar_one_or_none()
+            if fire is None:
+                return None
+            dialect = session.bind.dialect.name if session.bind is not None else ""
+            schedule_stmt = select(Schedule).where(Schedule.schedule_id == fire.schedule_id)
+            if dialect == "postgresql":
+                schedule_stmt = schedule_stmt.with_for_update()
+            schedule = (await session.execute(schedule_stmt)).scalar_one_or_none()
+            if schedule is None:
+                return None
+            fire_stmt = select(ScheduleFireRow).where(ScheduleFireRow.fire_id == fire.fire_id)
+            if dialect == "postgresql":
+                fire_stmt = fire_stmt.with_for_update()
+            fire = (await session.execute(fire_stmt)).scalar_one()
+            if str(fire.last_error or "").startswith("terminal:"):
+                await session.rollback()
+                return None
+
+            fire.last_error = f"terminal:{status}"
+            fire.status = "dispatched" if status in {"completed", "cancelled"} else "failed"
+            fire.updated_at = database_now_expression(session)
+            schedule.last_terminal_task_id = task_id
+            disabled = False
+            auto_disabled_state = str(schedule.disabled_reason or "").startswith(
+                "auto_consecutive_failures:"
+            )
+            if status == "failed":
+                errors = int(schedule.consecutive_errors or 0) + 1
+                was_enabled = bool(schedule.enabled)
+                auto_disable_eligible = was_enabled or auto_disabled_state
+                disabled = errors >= max_consecutive_errors and auto_disable_eligible
+                schedule.last_run_status = "failed"
+                schedule.consecutive_errors = errors
+                if disabled:
+                    schedule.enabled = False
+                    schedule.next_fire_at = None
+                    schedule.disabled_reason = f"auto_consecutive_failures:{errors}"
+                    auto_disabled_state = True
+                    disabled = was_enabled
+                elif schedule.enabled:
+                    schedule.next_fire_at = next_fire_at
+            else:
+                errors = 0
+                schedule.last_run_status = "success" if status == "completed" else "cancelled"
+                schedule.consecutive_errors = 0
+                if schedule.enabled:
+                    schedule.disabled_reason = None
+            schedule.updated_at = database_now_expression(session)
+            await session.commit()
+            return {
+                "schedule_id": schedule.schedule_id,
+                "errors": errors,
+                "disabled": disabled,
+                "auto_disabled": disabled,
+                "auto_disabled_state": auto_disabled_state,
+                "current_enabled": bool(schedule.enabled),
+                "disabled_reason": schedule.disabled_reason,
+                "created_by": schedule.created_by,
+                "agent_id": schedule.agent_id,
+                "schedule_name": schedule.name,
+            }
 
     async def link_manual_task(
         self,
@@ -445,9 +704,25 @@ class ScheduleFireStore:
                     updated_at=now,
                 )
             )
+            fire_error: str | None = None
             if not getattr(result, "rowcount", 0):
-                await session.rollback()
-                return False
+                terminal_fire = (
+                    await session.execute(
+                        select(
+                            ScheduleFireRow.task_id,
+                            ScheduleFireRow.last_error,
+                        ).where(
+                            ScheduleFireRow.fire_id == claim.fire_id,
+                            ScheduleFireRow.task_id == claim.task_id,
+                            ScheduleFireRow.last_error.like("terminal:%"),
+                        )
+                    )
+                ).one_or_none()
+                terminal_task_id = terminal_fire[0] if terminal_fire is not None else None
+                fire_error = terminal_fire[1] if terminal_fire is not None else None
+                if terminal_task_id != claim.task_id:
+                    await session.rollback()
+                    return False
 
             schedule_stmt = select(Schedule).where(Schedule.schedule_id == claim.schedule_id)
             if session.bind is not None and session.bind.dialect.name == "postgresql":
@@ -459,7 +734,8 @@ class ScheduleFireStore:
                 else:
                     schedule.last_fired_at = claim.scheduled_fire_at
                     schedule.next_fire_at = None
-                    schedule.last_run_status = one_shot_status
+                    if not str(fire_error or "").startswith("terminal:"):
+                        schedule.last_run_status = one_shot_status
                     schedule.updated_at = now
             await session.commit()
             return True
@@ -494,6 +770,7 @@ class ScheduleFireStore:
                 "last_fired_at": claim.scheduled_fire_at,
                 "next_fire_at": next_fire_at,
                 "last_run_status": "failed",
+                "last_terminal_task_id": None,
                 "consecutive_errors": consecutive_errors,
                 "disabled_reason": disabled_reason,
                 "updated_at": database_now_expression(session),

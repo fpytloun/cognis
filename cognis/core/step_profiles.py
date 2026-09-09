@@ -209,7 +209,11 @@ class StepProfileRegistry:
         self._custom = _normalize_custom_profiles(raw_custom)
 
     def list_definitions(self) -> list[StepProfileDefinition]:
-        seeded = [self.get_definition(profile_id) for profile_id in STEP_PROFILES]
+        seeded = [
+            definition
+            for profile_id in STEP_PROFILES
+            if (definition := self.get_definition(profile_id)) is not None
+        ]
         return [*seeded, *[self._custom[key] for key in sorted(self._custom)]]
 
     def get_definition(self, profile_id: str) -> StepProfileDefinition | None:

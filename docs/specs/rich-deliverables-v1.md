@@ -1,14 +1,17 @@
 # Rich Deliverables v2
 
-`write_deliverable` accepts `format: "rich"` in addition to `markdown`, `plain`, and `html`.
-`content` remains required and is the canonical fallback for model-visible summaries,
-channels, compaction, notifications, accessibility, copy/export seams, and clients that
-do not support rich rendering.
+`write_deliverable` uses `action: "rich"` for generic Rich authoring,
+`action: "rich:dashboard"` for the native dashboard presentation, and
+`action: "rich:pulse"` for Pulse. Each action accepts exactly one canonical
+source: inline `payload` or immutable `payload_artifact`. The controller
+normalizes the payload and derives canonical Markdown for model-visible
+summaries, channels, compaction, notifications, accessibility, and exports.
 
 Rich payloads use a renderer-neutral, block-composed shape:
 
 ```json
 {
+  "title": "Summary",
   "blocks": [{ "type": "section", "title": "Summary", "blocks": [] }],
   "assets": [],
   "sources": [],
@@ -18,14 +21,20 @@ Rich payloads use a renderer-neutral, block-composed shape:
 }
 ```
 
+The top-level `title` is optional for persisted compatibility. New authoring
+schemas require it. Metadata can include the portable `canvas` (`standard` or
+`wide`) and `density` (`compact` or `comfortable`) hints.
+
 There is no primary `kind` or `template_hint`. Canonical writes reject unsupported block
-types and invalid child containers before persistence. The required fallback `content`
-remains the compatibility surface for clients that cannot interpret a valid rich payload.
+types and invalid child containers before persistence. The persisted `content`
+field remains the compatibility surface for clients that cannot interpret a
+valid rich payload. Authors do not supply it for Rich.
 
 Supported v2 block types:
 
 - layout: `section`, `stack`, `columns`, `grid`, `tabs`, `accordion`, `modal`
 - content: `markdown`, `callout`, `card`, `card_grid`
+- headings: `hero`, `section_header`
 - media: `figure`, `gallery`
 - data: `table`, `comparison_matrix`, `chart`, `day_agenda`
 - diagrams/web: `mermaid`, `link`, `link_preview`, `source_list`
@@ -216,6 +225,23 @@ renderer-neutral `variant`, `dek`, `summary`, `href`, `source_ids`/`citations`,
 scalar `icon`, and `tone` fields. Unknown icon names are data, not executable
 markup; renderers must fall back to text or omit them. Arbitrary block HTML, SVG,
 CSS, and inline style are rejected.
+
+Every block can include `surface` (`plain`, `subtle`, `outlined`, `raised`, or
+`accent`) and an integer `span` from 1 through 4. A `grid` can include `layout`
+as `auto`, `equal`, `split-2-1`, or `split-1-2`. Renderers keep source order
+when they cannot preserve the requested layout.
+
+`section_header` contains non-empty `eyebrow`, `title`, and `subtitle` fields.
+It can also include scalar `status` and semantic `tone` fields.
+
+A metric can include `progress` with numeric `value`, positive numeric `max`,
+and an optional `label`. The value must be between zero and the maximum.
+
+Table cells can remain scalars. A typed cell contains `type` (`text`, `number`,
+`code`, `badge`, or `progress`) and a canonical scalar `value`. It can also
+contain `label`, semantic `tone`, `emphasis` (`normal`, `strong`, or `muted`),
+and `align` (`start`, `center`, or `end`). A progress cell also requires a
+positive numeric `max`. All projections preserve the canonical value.
 
 Authored block media uses a saved Cognis artifact-compatible image ref:
 
@@ -533,5 +559,5 @@ Authoring rules:
   `Sledovat`, `Dnešní kurz`, then a compact source list.
 
 The full static Czech fixture, including local SVG and chart datasets, lives in
-`ui/src/lib/components/rich/daily-pulse.fixture.ts`. Its values are test-only and
+`ui/src/lib/rich-scenarios/scenarios/daily-pulse-v2.json`. Its values are test-only and
 must never be copied into production briefs as current claims.

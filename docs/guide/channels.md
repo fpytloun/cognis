@@ -27,6 +27,28 @@ Channel support in Cognis is real, but not every adapter is documented to the sa
 
 For a first external integration, start with Signal or BlueBubbles if those fit your deployment.
 
+## Model-stream recovery
+
+Recoverable model-stream failures first use retries within the current turn.
+After those retries, Cognis can continue from saved state in up to three successor turns.
+Other automatic continuation reasons share this limit.
+Long provider retry delays keep their durable delayed-retry behavior.
+
+The scheduler delivers committed pending text from the logical request when it ends, including when the continuation limit is exhausted.
+Intaris owns the text and source references.
+The channel outbox owns terminal delivery and external-send reconciliation.
+Physical predecessor completion does not deliver a terminal response.
+
+Immediate partial sends record source ranges before the external send.
+Sent or uncertain ranges are not automatically replayed.
+If a source-reference append fails, Cognis blocks that send rather than guessing.
+New turns require a tracking marker on every execution attempt.
+
+Legacy predecessor turns without source tracking cannot distinguish delivered text from pending text.
+Cognis excludes their text from crash reconstruction.
+Legacy non-durable observers preserve only locally known pending text.
+These safeguards do not guarantee exactly-once external delivery.
+
 ## Creating a channel account
 
 Open `Channels` and start in the `Accounts` view. The page is organized around three workflows:

@@ -31,6 +31,19 @@ const VIEWPORT = '[data-testid="timeline-viewport"]';
 const SCROLL_TO_BOTTOM = '[data-testid="timeline-viewport-scroll-to-bottom"]';
 const SCROLL_TO_ACTIVE_START = '[data-testid="timeline-viewport-scroll-to-active-start"]';
 
+async function openLongRichDeliverable(page: import('@playwright/test').Page) {
+  const toolStatus = page.getByRole('button', { name: /Using tools/ });
+  if (await toolStatus.getAttribute('aria-expanded') !== 'true') await toolStatus.click();
+  await expect(toolStatus).not.toContainText('failed');
+  await page.getByRole('button', { name: 'View deliverable' }).click();
+  const preview = page.getByTitle('Deliverable preview');
+  await expect(preview).toBeVisible();
+  const frame = page.frameLocator('iframe[title="Deliverable preview"]');
+  const deliverable = frame.getByTestId('rich-deliverable');
+  await expect(deliverable).toBeVisible();
+  return { deliverable, frame };
+}
+
 test.beforeEach(async ({ page }) => {
   await login(page);
   await openOrCreateConversation(page);
@@ -222,37 +235,20 @@ test('long-rich-deliverable: mobile message controls open and restore the TOC dr
   await injectScenario('long-rich-deliverable');
   await sendMessage(page, 'scenario:long-rich-deliverable');
   await waitForTurnComplete(page, 90_000);
-
-  const viewport = page.locator(VIEWPORT);
-  await expect(viewport.locator('[data-has-contextual-toc="true"]')).toBeVisible();
-  await expect(viewport.getByTestId('rich-deliverable-toc')).toHaveCount(1);
-  await expect(viewport.getByRole('button', { name: 'Open table of contents' })).toHaveCount(1);
-  await expect(viewport.getByText('Contents', { exact: true })).toBeHidden();
-  await viewport.evaluate((element) => {
-    const node = element as HTMLElement;
-    node.scrollTop = Math.max(0, node.scrollHeight - node.clientHeight - 120);
-    node.dispatchEvent(new Event('scroll', { bubbles: true }));
-  });
-
-  const tocTrigger = viewport.locator('[data-has-contextual-toc="true"]').last().locator('..').getByRole('button', { name: 'Open table of contents' });
-  const messageControls = page.getByRole('navigation', { name: 'Message navigation' });
+  const { deliverable, frame } = await openLongRichDeliverable(page);
+  const tocTrigger = deliverable.getByRole('button', { name: 'Open table of contents' });
   await expect(tocTrigger).toBeVisible();
-  await expect(messageControls).toBeVisible();
-  await expect(messageControls.getByRole('button')).toHaveCount(2);
-  await expect(
-    tocTrigger,
-  ).toBeVisible();
   await tocTrigger.focus();
   await tocTrigger.click();
-  const toc = page.locator('nav[aria-label="Table of contents"][role="dialog"]');
+  const toc = frame.locator('nav[aria-label="Table of contents"][role="dialog"]');
   await expect(toc).toBeVisible();
   await expect(toc.getByRole('button', { name: 'Section 1', exact: true })).toBeVisible();
   await expect(toc.getByRole('button', { name: 'Section 10', exact: true })).toBeVisible();
-  await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
   await expect(toc.getByRole('button', { name: 'Close table of contents' })).toBeFocused();
-  await expect(messageControls).toBeHidden();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth))
-    .toBeLessThanOrEqual(390);
+  expect(await frame.locator('html').evaluate(
+    (element) => element.scrollWidth <= element.clientWidth,
+  )).toBe(true);
 
   const screenshotPath = testInfo.outputPath('chat-rich-toc-drawer-mobile-390.png');
   await page.screenshot({ path: screenshotPath, fullPage: true });
@@ -261,26 +257,25 @@ test('long-rich-deliverable: mobile message controls open and restore the TOC dr
     contentType: 'image/png',
   });
 
-  await page.getByTestId('rich-toc-backdrop').click({ position: { x: 8, y: 8 } });
+  await frame.getByTestId('rich-toc-backdrop').click({ position: { x: 8, y: 8 } });
   await expect(toc).toHaveCount(0);
   await expect(tocTrigger).toBeFocused();
 
   await tocTrigger.click();
   await expect(toc).toBeVisible();
-  await page.keyboard.press('Escape');
+  await frame.locator('body').press('Escape');
   await expect(toc).toHaveCount(0);
   await expect(tocTrigger).toBeFocused();
 });
 
 test('long-rich-deliverable: desktop keeps a compact sticky TOC without overflow', async ({ page }) => {
   test.setTimeout(120_000);
-  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.setViewportSize({ width: 1600, height: 1000 });
   await injectScenario('long-rich-deliverable');
   await sendMessage(page, 'scenario:long-rich-deliverable');
   await waitForTurnComplete(page, 90_000);
 
-  const viewport = page.locator(VIEWPORT);
-  const deliverable = page.locator('[data-kind="assistant_deliverable"]').last();
+  const { deliverable, frame } = await openLongRichDeliverable(page);
   const toc = deliverable.getByRole('navigation', { name: 'Table of contents' });
   await expect(toc).toBeVisible();
   await expect(toc.getByRole('button', { name: 'Section 1', exact: true })).toBeVisible();
@@ -288,55 +283,49 @@ test('long-rich-deliverable: desktop keeps a compact sticky TOC without overflow
 
   await toc.getByRole('button', { name: 'Section 6', exact: true }).click();
   await expect(deliverable.getByRole('heading', { name: 'Section 6' })).toBeFocused();
-  expect(await viewport.evaluate((element) => {
-    const node = element as HTMLElement;
-    return node.scrollWidth <= node.clientWidth;
-  })).toBe(true);
-  expect(await page.evaluate(() => document.documentElement.scrollWidth))
-    .toBeLessThanOrEqual(1440);
+  expect(await frame.locator('html').evaluate(
+    (element) => element.scrollWidth <= element.clientWidth,
+  )).toBe(true);
 });
 
-test('long-rich-deliverable: contextual TOC navigation reopens and closes on breakpoint change', async ({ page }) => {
+test('long-rich-deliverable: preview TOC navigation remains usable across host breakpoints', async ({ page }) => {
   test.setTimeout(120_000);
   await page.setViewportSize({ width: 390, height: 844 });
   await injectScenario('long-rich-deliverable');
   await sendMessage(page, 'scenario:long-rich-deliverable');
   await waitForTurnComplete(page, 90_000);
 
-  const deliverable = page.locator('[data-kind="assistant_deliverable"]').last();
-  await deliverable.evaluate((element) => element.scrollIntoView({ block: 'center' }));
-  const viewport = page.locator(VIEWPORT);
-  await viewport.evaluate(async (element) => {
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-    const node = element as HTMLElement;
-    node.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 }));
-    node.scrollTop = Math.max(0, node.scrollTop - 24);
-    node.dispatchEvent(new Event('scroll', { bubbles: true }));
-  });
+  const { deliverable, frame } = await openLongRichDeliverable(page);
   const tocTrigger = deliverable.getByRole('button', { name: 'Open table of contents' });
   await expect(tocTrigger).toBeVisible();
 
   await tocTrigger.click();
-  await page.getByTestId('rich-deliverable-toc').getByRole('button', { name: 'Section 3' }).click();
-  await expect(page.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
-  await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await frame.getByTestId('rich-deliverable-toc').getByRole('button', { name: 'Section 3' }).click();
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
+  await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
   await expect(deliverable.getByRole('heading', { name: 'Section 3' })).toBeFocused();
 
   await expect(tocTrigger).toBeVisible();
   await tocTrigger.click();
-  await page.getByTestId('rich-deliverable-toc').getByRole('button', { name: 'Section 6' }).click();
-  await expect(page.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
-  await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await frame.getByTestId('rich-deliverable-toc').getByRole('button', { name: 'Section 6' }).click();
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
+  await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
   await expect(deliverable.getByRole('heading', { name: 'Section 6' })).toBeFocused();
 
   await expect(tocTrigger).toBeVisible();
   await tocTrigger.click();
-  await expect(page.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
   await page.setViewportSize({ width: 1024, height: 844 });
-  await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(1);
-  await expect(page.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
+  await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  // The preview iframe keeps its bounded reading width, so its own responsive
+  // TOC remains a drawer when only the host viewport crosses a breakpoint.
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
-  await expect(page.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await expect(frame.getByTestId('rich-deliverable-toc')).toHaveCount(1);
+  await frame.getByRole('dialog', { name: 'Table of contents' })
+    .getByRole('button', { name: 'Close table of contents' }).click();
+  await expect(frame.getByRole('dialog', { name: 'Table of contents' })).toHaveCount(0);
+  await expect(tocTrigger).toBeFocused();
 });
 
 test('grouped-navigation: targets the exact long assistant among tools and siblings', async ({ page }) => {

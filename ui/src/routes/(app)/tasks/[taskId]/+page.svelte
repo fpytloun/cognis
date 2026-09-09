@@ -19,6 +19,7 @@ import Target from 'lucide-svelte/icons/target';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
@@ -776,18 +777,6 @@ import Target from 'lucide-svelte/icons/target';
       })
       .filter((todo): todo is { content: string; status: string; priority: string } => todo !== null)
       .filter((todo: { content: string; status: string; priority: string }) => !['completed', 'cancelled'].includes(todo.status));
-  }
-
-  /**
-   * Tiny coloured dot that carries the todo's status on its own, so
-   * the row can collapse to a single line of text without a bordered
-   * pill. Matches the chat-side compact rendering.
-   */
-  function todoStatusDot(status: string): string {
-    if (status === 'in_progress') return 'bg-sky-400';
-    if (status === 'completed') return 'bg-emerald-400';
-    if (status === 'cancelled') return 'bg-slate-600';
-    return 'bg-sky-400';
   }
 
   function todoPriorityClass(priority: string): string {
@@ -1796,9 +1785,9 @@ import Target from 'lucide-svelte/icons/target';
             <p class="text-sm uppercase tracking-[0.25em] text-slate-400">Task Cockpit</p>
             <h1 class="mt-1 break-words text-2xl font-semibold text-white" title={task.title}>{task.title}</h1>
             {#if task.expected_output}
-              <p class="mt-2 max-w-3xl text-sm leading-6 text-slate-300" data-testid="task-cockpit-objective">
-                {task.expected_output}
-              </p>
+              <div class="prose prose-sm prose-invert mt-2 max-w-3xl text-slate-300" data-testid="task-cockpit-objective">
+                {@html renderMarkdown(task.expected_output)}
+              </div>
             {/if}
             <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-slate-400">
               <span>Owner agent</span>
@@ -1969,10 +1958,16 @@ import Target from 'lucide-svelte/icons/target';
             </div>
         </Card>
 
-        <details id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
-          <summary class="cursor-pointer text-sm font-medium text-white">Task context and notes</summary>
+        <details open={revisionTargetSeed !== null} id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-slate-800 bg-slate-950/40 p-4">
+          <summary class="cursor-pointer text-sm font-medium text-white">Collaboration, revisions, and notes</summary>
           <div class="mt-4">
-            <TaskComments bind:this={commentsRef} task={task} notesOnly onSubmitted={handleCommentSubmitted} />
+            <TaskComments
+              bind:this={commentsRef}
+              task={task}
+              stepOptions={revisionStepOptions}
+              initialTargetStep={revisionTargetSeed ?? selectedStepGroup?.stepName ?? ''}
+              onSubmitted={handleCommentSubmitted}
+            />
           </div>
         </details>
 
@@ -2002,7 +1997,11 @@ import Target from 'lucide-svelte/icons/target';
         {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest}
           <Card class="border-rose-500/30 bg-rose-500/5 p-4">
             <p class="text-xs font-semibold uppercase tracking-[0.25em] text-rose-300">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
-            <p class="mt-2 text-sm text-slate-200">{task.result_summary || task.applied_completion_reason || 'The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.'}</p>
+            {#if task.result_summary || task.applied_completion_reason}
+              <div class="prose prose-sm prose-invert mt-2 max-w-none text-slate-200">{@html renderMarkdown(task.result_summary || task.applied_completion_reason || '')}</div>
+            {:else}
+              <p class="mt-2 text-sm text-slate-200">The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.</p>
+            {/if}
           </Card>
         {/if}
         </div>
@@ -2288,11 +2287,7 @@ import Target from 'lucide-svelte/icons/target';
                         <ul class="divide-y divide-slate-800/40">
                           {#each todos as todo}
                             <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
-                              <span
-                                class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
-                                aria-label={todo.status.replace('_', ' ')}
-                                title={todo.status.replace('_', ' ')}
-                              ></span>
+                              <TodoStatusDot status={todo.status} />
                               <span class="min-w-0 flex-1 truncate">{todo.content}</span>
                               {#if todo.priority !== 'medium'}
                                 <span class={`shrink-0 text-xs ${todoPriorityClass(todo.priority)}`}>{todo.priority}</span>
@@ -2397,7 +2392,11 @@ import Target from 'lucide-svelte/icons/target';
           <div class="mt-4 space-y-4 text-sm text-slate-300">
             <div class="rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
               <p class="text-xs uppercase tracking-[0.25em] text-slate-500">Result</p>
-               <p class="mt-3 leading-6 text-slate-300">{task.result_summary ?? 'No final result is available for this task state.'}</p>
+              {#if task.result_summary}
+                <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(task.result_summary)}</div>
+              {:else}
+                <p class="mt-3 leading-6 text-slate-300">No final result is available for this task state.</p>
+              {/if}
               {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
                 <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
                   {#if finalTaskResultTitle(task)}
@@ -2569,9 +2568,13 @@ import Target from 'lucide-svelte/icons/target';
         <Card class="p-5">
           <p class="text-xs uppercase tracking-[0.25em] text-slate-400">Result</p>
           {#if task.applied_completion_reason}
-            <p class="mt-3 text-xs leading-5 text-slate-500">{task.applied_completion_reason}</p>
+            <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-500">{@html renderMarkdown(task.applied_completion_reason)}</div>
           {/if}
-           <p class="mt-3 text-sm leading-6 text-slate-300">{task.result_summary ?? 'No final result is available for this task state.'}</p>
+          {#if task.result_summary}
+            <div class="prose prose-sm prose-invert mt-3 max-w-none text-slate-300">{@html renderMarkdown(task.result_summary)}</div>
+          {:else}
+            <p class="mt-3 text-sm leading-6 text-slate-300">No final result is available for this task state.</p>
+          {/if}
           {#if finalTaskResultTitle(task) || finalTaskResultFormat(task)}
             <div class="mt-4 flex flex-wrap gap-2 text-xs text-slate-400">
               {#if finalTaskResultTitle(task)}

@@ -206,6 +206,8 @@ def test_events_last_n_and_last_seq_shape(
     assert response.status_code == 200
     data = response.json()
     assert data["last_seq"] >= 3
+    assert data["first_available_seq"] == 1
+    assert data["history_gap"] is None
     assert data["has_more"] in {True, False}
     assert [event["type"] for event in data["events"]] == [
         "assistant_message",
@@ -247,6 +249,44 @@ def test_filtered_empty_read_still_reports_real_last_seq(
     data = response.json()
     assert data["events"] == []
     assert data["last_seq"] >= 1
+    assert data["first_available_seq"] == 1
+    assert data["history_gap"] is None
+
+
+def test_never_used_stream_reports_known_empty_availability(
+    http_client: httpx.Client,
+    intaris_url: str,
+    make_service_jwt: Callable[..., str],
+    contract_agent_id: str,
+    unique_session_id: Callable[[str], str],
+) -> None:
+    session_id = unique_session_id("intaris-never-used-events")
+    token = make_service_jwt("intaris", agent_id=contract_agent_id)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Agent-Id": contract_agent_id,
+    }
+    http_client.post(
+        f"{intaris_url}/api/v1/intention",
+        headers=headers,
+        json={"session_id": session_id, "intention": "Empty events contract"},
+    ).raise_for_status()
+
+    response = http_client.get(
+        f"{intaris_url}/api/v1/session/{session_id}/events",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["last_seq"] == 1
+    assert data["first_available_seq"] == 1
+    assert data["history_gap"] is None
+    assert data["has_more"] is False
+    assert len(data["events"]) == 1
+    assert data["events"][0]["seq"] == 1
+    assert data["events"][0]["type"] == "lifecycle"
+    assert data["events"][0]["data"]["event"] == "session_created"
 
 
 def test_event_idempotency_key_replay_returns_success_without_duplicate_append(

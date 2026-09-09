@@ -89,7 +89,7 @@
 <div
   use:portal
   class="fixed inset-0 z-[90] isolate flex items-center justify-center px-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]"
-  style="padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + 1rem); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + env(safe-area-inset-bottom) + 1rem);"
+  style="padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + 1rem); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + 1rem);"
   role="presentation"
 >
   <button

@@ -64,6 +64,7 @@ def test_real_scoped_tool_output_routes_authorize_and_page_exactly(
         app = cast(Any, client.app)
         guardrails = _GuardrailsEventProvider()
         app.state.providers.guardrails = guardrails
+        app.state.intaris_event_store._guardrails = guardrails
 
         async def _seed() -> None:
             async with app.state.session_factory() as db:
@@ -308,14 +309,17 @@ def test_real_scoped_tool_output_routes_authorize_and_page_exactly(
             expected = "\n".join(
                 f"{index}: {tree['prefix']}-line-{index}" for index in range(1, 1002)
             )
-            for recovery_path, original_path in zip(
+            for unauthorized_status, recovery_path, original_path in zip(
+                (404, 403, 403),
                 scope_paths(tree, tree["recovery"]),
                 scope_paths(tree, tree["original"]),
                 strict=True,
             ):
                 for path in (recovery_path, original_path):
                     assert_exact_two_page_output(path, tree["owner"], expected)
-                    assert client.get(path, headers=tree["other"]).status_code == 403
+                    assert (
+                        client.get(path, headers=tree["other"]).status_code == unauthorized_status
+                    )
                     assert (
                         client.get(f"{path}?limit=1001", headers=tree["owner"]).status_code == 422
                     )
@@ -335,8 +339,12 @@ def test_real_scoped_tool_output_routes_authorize_and_page_exactly(
                 if source is target:
                     continue
                 for id_form in ("original", "recovery"):
-                    for mismatched in scope_paths(target, source[id_form]):
-                        expected_status = 403 if source["owner"] is not target["owner"] else 404
+                    for scope_index, mismatched in enumerate(scope_paths(target, source[id_form])):
+                        expected_status = (
+                            (404, 403, 403)[scope_index]
+                            if source["owner"] is not target["owner"]
+                            else 404
+                        )
                         assert (
                             client.get(mismatched, headers=source["owner"]).status_code
                             == expected_status

@@ -7,7 +7,6 @@ RUN pip install --no-cache-dir starlette uvicorn pyyaml
 
 # Copy only the testing module
 COPY cognis/testing/ /app/cognis/testing/
-COPY cognis/__init__.py /app/cognis/__init__.py
 
 # Expose port
 EXPOSE 8090

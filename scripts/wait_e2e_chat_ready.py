@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
 import sys
@@ -24,11 +25,11 @@ ADMIN_PASSWORD = (
     or "cognis-local-admin"
 )
 TIMEOUT_SECONDS = float(os.environ.get("COGNIS_E2E_CHAT_READY_TIMEOUT", "60"))
+COOKIE_JAR = http.cookiejar.CookieJar()
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(COOKIE_JAR))
 
 
-def _request(
-    path: str, *, method: str = "GET", token: str | None = None, body: dict[str, Any] | None = None
-) -> Any:
+def _request(path: str, *, method: str = "GET", body: dict[str, Any] | None = None) -> Any:
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
@@ -37,10 +38,9 @@ def _request(
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
-            **({"Authorization": f"Bearer {token}"} if token else {}),
         },
     )
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with OPENER.open(request, timeout=15) as response:
         payload = response.read()
     if not payload:
         return None
@@ -48,16 +48,14 @@ def _request(
 
 
 def _try_ready() -> bool:
-    login = _request(
+    _request(
         "/api/auth/login",
         method="POST",
         body={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
     )
-    token = login["token"]
     conversation = _request(
         "/api/v1/conversations",
         method="POST",
-        token=token,
         body={
             "agent_id": "e2e-test-agent",
             "title": "E2E Chat v2 readiness",
@@ -72,7 +70,6 @@ def _try_ready() -> bool:
     result = _request(
         f"/api/v1/chat/v2/conversations/{conversation_id}/messages/{client_message_id}",
         method="PUT",
-        token=token,
         body={
             "client_message_id": client_message_id,
             "content": "E2E readiness probe",
@@ -85,9 +82,14 @@ def _try_ready() -> bool:
 
     turn_deadline = time.monotonic() + 30
     while time.monotonic() < turn_deadline:
-        snapshot = _request(
-            f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot", token=token
-        )
+        try:
+            snapshot = _request(f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot")
+        except urllib.error.HTTPError as error:
+            if error.code != 503:
+                raise
+            error.read()
+            time.sleep(1)
+            continue
         runtime = snapshot.get("runtime") if isinstance(snapshot, dict) else {}
         if isinstance(runtime, dict) and not runtime.get("has_active_turn", True):
             return True

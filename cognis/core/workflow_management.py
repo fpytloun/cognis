@@ -216,10 +216,12 @@ async def list_workflows_for_user(
 ) -> list[Any]:
     """List workflows visible to the user."""
 
-    return await workflow_registry.list_all(
-        owner_email=owner_email,
-        include_disabled=True,
-        include_ephemeral=include_ephemeral,
+    return list(
+        await workflow_registry.list_all(
+            owner_email=owner_email,
+            include_disabled=True,
+            include_ephemeral=include_ephemeral,
+        )
     )
 
 

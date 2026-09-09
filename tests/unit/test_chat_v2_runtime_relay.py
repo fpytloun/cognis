@@ -535,6 +535,27 @@ def test_runtime_boundary_cannot_coalesce_queued_terminal() -> None:
     ]
 
 
+def test_terminal_coalescing_preserves_boundary_receipts() -> None:
+    relay = _relay()
+    receipt = {
+        "session_id": "session-1",
+        "seq": 42,
+        "queue_id": "queue-1",
+        "client_message_id": "client-1",
+    }
+    boundary = _envelope(revision=1).model_copy(
+        update={"context_usage": {"__boundary_receipts": [receipt]}}
+    )
+
+    assert relay.enqueue(boundary, cumulative_boundary=True)
+    assert relay.enqueue(_envelope(kind=RelayKind.TERMINAL, revision=2))
+
+    queued = list(relay._queue.items)  # noqa: SLF001
+    assert len(queued) == 1
+    assert queued[0].envelope.kind == RelayKind.TERMINAL
+    assert queued[0].envelope.context_usage == {"__boundary_receipts": [receipt]}
+
+
 def test_newer_terminal_supersedes_terminal_only_within_exact_generation() -> None:
     relay = _relay()
     assert relay.enqueue(_envelope(kind=RelayKind.TERMINAL, revision=1))
@@ -850,7 +871,7 @@ async def test_boundary_publish_failure_retries_in_place_and_ttls_are_selected()
 
 
 @pytest.mark.asyncio
-async def test_progress_publish_failure_does_not_block_next_conversation() -> None:
+async def test_progress_publish_failure_retries_before_next_conversation() -> None:
     redis = _FakeRedis()
     redis.eval_results = [RuntimeError("redis down"), 1]
     relay = _relay(redis)
@@ -870,15 +891,30 @@ async def test_progress_publish_failure_does_not_block_next_conversation() -> No
     relay._stop.set()  # noqa: SLF001
     await asyncio.wait_for(publisher, timeout=1)
 
-    assert len(redis.eval_calls) == 2
-    published = ChatV2RuntimeRelayEnvelope.decode(redis.eval_calls[1][2][0])
+    assert len(redis.eval_calls) == 3
+    retried = ChatV2RuntimeRelayEnvelope.decode(redis.eval_calls[1][2][0])
+    published = ChatV2RuntimeRelayEnvelope.decode(redis.eval_calls[2][2][0])
+    assert retried.conversation_id == first.conversation_id
     assert published.conversation_id == "conversation-other@example.com"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancellation_delay", [0, 0.04])
 async def test_blocked_progress_publish_is_time_bounded(
     monkeypatch: pytest.MonkeyPatch,
+    cancellation_delay: float,
 ) -> None:
+    generated_at = datetime.now(UTC)
+
+    class _AdmissionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return generated_at
+
+    # Keep retry eligibility independent of host scheduling. asyncio's real
+    # monotonic clock still bounds the blocked Redis call and the drain.
+    monkeypatch.setattr(relay_module, "datetime", _AdmissionClock)
+
     class _BlockedOnceRedis(_FakeRedis):
         def __init__(self) -> None:
             super().__init__()
@@ -894,13 +930,18 @@ async def test_blocked_progress_publish_is_time_bounded(
             self.eval_calls.append((script, keys, args))
             self.calls += 1
             if self.calls == 1:
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(cancellation_delay)
+                    raise
             return 1
 
     monkeypatch.setattr(relay_module, "PROGRESS_PUBLISH_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(relay_module, "PROGRESS_RETRY_WINDOW_SECONDS", 0.03)
     redis = _BlockedOnceRedis()
     relay = _relay(redis)
-    first = _envelope()
+    first = _envelope(generated_at=generated_at)
     relay.enqueue(first)
     relay.enqueue(
         first.model_copy(
@@ -917,7 +958,7 @@ async def test_blocked_progress_publish_is_time_bounded(
     relay._stop.set()  # noqa: SLF001
     await asyncio.wait_for(publisher, timeout=1)
 
-    assert redis.calls == 2
+    assert redis.calls == 3
 
 
 @pytest.mark.asyncio

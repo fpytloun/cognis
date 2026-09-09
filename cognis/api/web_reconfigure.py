@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -21,7 +21,7 @@ _WEB_SETTINGS_ADVISORY_LOCK_ID = 0x434F474E49535745
 
 
 @asynccontextmanager
-async def web_settings_distributed_lock(session_factory: Any):
+async def web_settings_distributed_lock(session_factory: Any) -> AsyncIterator[None]:
     """Hold one PostgreSQL advisory lock across web settings and secret mutations."""
 
     async with session_factory() as lock_session:
@@ -134,13 +134,13 @@ async def finalize_web_executor_reconfigure_for_app(
 
 
 async def run_web_mutation_cancellation_safe[T](
-    operation: Callable[[], Awaitable[T]],
+    operation: Callable[[], Coroutine[Any, Any, T]],
     *,
     reason: str,
 ) -> T:
     """Finish a runtime-affecting web mutation before propagating caller cancellation."""
 
-    task = asyncio.create_task(operation(), name=f"web-mutation:{reason}")
+    task: asyncio.Task[T] = asyncio.create_task(operation(), name=f"web-mutation:{reason}")
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:

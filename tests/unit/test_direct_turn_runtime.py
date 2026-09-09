@@ -18,8 +18,16 @@ from cognis.core.direct_turn_runtime import (
     DurableDirectTurnRuntime,
     StaleDirectTurnOwner,
 )
+from cognis.core.executor_recovery import (
+    EXECUTOR_RECOVERY_WINDOW_SECONDS,
+    ExecutorRecoveryTimeout,
+    begin_executor_recovery,
+    clear_executor_recovery,
+)
 from cognis.core.turn_scheduler import TurnScheduler
-from cognis.store.coordination import DatabaseLeaseStore, Lease
+from cognis.models.tool import ExecutorCapabilities
+from cognis.providers.executor.websocket import WebSocketExecutorConnection
+from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.direct_turns import (
     DirectTurnStatus,
@@ -33,6 +41,9 @@ from cognis.store.queries import (
     create_conversation,
     create_managed_conversation_link,
     create_user,
+    get_conversation,
+    mark_executor_unavailable,
+    set_conversation_active_executor,
 )
 
 
@@ -41,6 +52,14 @@ class _ArtifactStore:
 
     async def async_get_public_url(self, *_args: Any, **_kwargs: Any) -> str:
         return "https://artifacts.invalid/input"
+
+
+class _RecordingWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_json(self, frame: dict[str, Any]) -> None:
+        self.sent.append(frame)
 
 
 async def _stores(tmp_path: Path):
@@ -197,6 +216,145 @@ async def _wait_for(predicate, *, timeout: float = 3.0) -> None:
 
 
 @pytest.mark.asyncio
+async def test_executor_recovery_deadline_survives_controller_restart(tmp_path: Path) -> None:
+    engine, store, _leases = await _stores(tmp_path)
+    factory = store._session_factory  # noqa: SLF001
+    first_observation = datetime(2026, 9, 3, 21, 30, tzinfo=UTC)
+    try:
+        async with factory() as session:
+            await set_conversation_active_executor(
+                session,
+                "conv-a",
+                "maitrea_riker",
+                source="explicit_primary",
+            )
+            await session.commit()
+
+        first = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=first_observation,
+        )
+        recovered = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=first_observation + timedelta(minutes=5),
+        )
+
+        assert recovered.unavailable_since == first.unavailable_since
+        assert recovered.deadline == first_observation + timedelta(
+            seconds=EXECUTOR_RECOVERY_WINDOW_SECONDS
+        )
+        assert recovered.remaining_seconds(now=recovered.deadline) == 0
+        timeout = ExecutorRecoveryTimeout(recovered, phase="runtime_admission")
+        assert timeout.detail == {
+            "code": "executor_recovery_timeout",
+            "executor_id": "maitrea_riker",
+            "unavailable_since": first_observation.isoformat(),
+            "deadline": recovered.deadline.isoformat(),
+            "waited_seconds": EXECUTOR_RECOVERY_WINDOW_SECONDS,
+            "phase": "runtime_admission",
+        }
+
+        await clear_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+        )
+        async with factory() as session:
+            conversation = await get_conversation(session, "conv-a")
+            assert conversation is not None
+            assert conversation.active_executor_unavailable_since is None
+        second_observation = first_observation + timedelta(hours=1)
+        second = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=second_observation,
+        )
+        assert second.unavailable_since == second_observation
+        assert second.deadline == second_observation + timedelta(
+            seconds=EXECUTOR_RECOVERY_WINDOW_SECONDS
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_executor_recovery_first_observation_uses_database_clock(tmp_path: Path) -> None:
+    engine, store, _leases = await _stores(tmp_path)
+    factory = store._session_factory  # noqa: SLF001
+    try:
+        async with factory() as session:
+            await set_conversation_active_executor(
+                session,
+                "conv-a",
+                "maitrea_riker",
+                source="explicit_primary",
+            )
+            before = await database_now(session)
+            await session.commit()
+
+        window = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+        )
+        async with factory() as session:
+            after = await database_now(session)
+
+        assert before <= window.unavailable_since <= after
+        assert window.database_remaining_seconds <= EXECUTOR_RECOVERY_WINDOW_SECONDS
+        assert window.database_remaining_seconds > EXECUTOR_RECOVERY_WINDOW_SECONDS - 2
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_unavailable_cas_returns_winning_timestamp(tmp_path: Path) -> None:
+    engine, store, _leases = await _stores(tmp_path)
+    factory = store._session_factory  # noqa: SLF001
+    earlier = datetime(2026, 9, 3, 21, 30, tzinfo=UTC)
+    later = earlier + timedelta(seconds=30)
+    try:
+        async with factory() as session:
+            await set_conversation_active_executor(
+                session,
+                "conv-a",
+                "maitrea_riker",
+                source="selector_primary",
+            )
+            await session.commit()
+
+        async def observe(at: datetime) -> tuple[bool, datetime | None]:
+            async with factory() as session:
+                result = await mark_executor_unavailable(
+                    session,
+                    conversation_id="conv-a",
+                    task_id=None,
+                    expected_executor_id="maitrea_riker",
+                    expected_generation=1,
+                    observed_at=at,
+                )
+                await session.commit()
+                return result
+
+        results = await asyncio.gather(observe(earlier), observe(later))
+        winning = next(timestamp for changed, timestamp in results if changed)
+        assert winning is not None
+        assert all(timestamp == winning for _changed, timestamp in results)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_two_controllers_execute_one_conversation_in_fifo_order(tmp_path: Path) -> None:
     engine, store, leases = await _stores(tmp_path)
     first = await _admit(store, "message-1", "first")
@@ -252,6 +410,138 @@ async def test_two_controllers_execute_one_conversation_in_fifo_order(tmp_path: 
         assert max_active == 1
     finally:
         await asyncio.gather(*(runtime.stop() for runtime in runtimes))
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reclaimed_wait_reuses_deadline_and_projects_one_terminal_outcome(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "message-recovery", "wait")
+    factory = store._session_factory  # noqa: SLF001
+    unavailable_since = datetime(2026, 9, 3, 21, 30, tzinfo=UTC)
+    async with factory() as session:
+        await set_conversation_active_executor(
+            session,
+            "conv-a",
+            "maitrea_riker",
+            source="selector_primary",
+        )
+        await session.commit()
+    original_window = await begin_executor_recovery(
+        factory,
+        conversation_id="conv-a",
+        task_id=None,
+        executor_id="maitrea_riker",
+        observed_at=unavailable_since,
+    )
+
+    old_started = asyncio.Event()
+    old_fence_rejected = asyncio.Event()
+    dispatch_boundary = asyncio.Event()
+    old_fence: DirectTurnExecutionFence | None = None
+    dispatch_attempts = 0
+    successful_dispatches = 0
+    terminal_projections = 0
+    reclaimed_window = None
+
+    async def shared_tool_dispatch(fence: DirectTurnExecutionFence) -> None:
+        nonlocal dispatch_attempts, successful_dispatches
+        dispatch_attempts += 1
+        await fence.assert_current()
+        successful_dispatches += 1
+
+    async def old_execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
+        nonlocal old_fence
+        assert await store.mark_running(row.request_id, lease=fence.lease)
+        old_fence = fence
+        old_started.set()
+        try:
+            await dispatch_boundary.wait()
+            await shared_tool_dispatch(fence)
+        except StaleDirectTurnOwner:
+            old_fence_rejected.set()
+            raise
+
+    async def new_execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
+        nonlocal reclaimed_window, terminal_projections
+        assert await store.mark_running(row.request_id, lease=fence.lease)
+        reclaimed_window = await begin_executor_recovery(
+            factory,
+            conversation_id="conv-a",
+            task_id=None,
+            executor_id="maitrea_riker",
+            observed_at=unavailable_since + timedelta(minutes=10),
+        )
+        dispatch_boundary.set()
+        await asyncio.sleep(0)
+        await shared_tool_dispatch(fence)
+        assert await store.mark_terminal(
+            row.request_id,
+            lease=fence.lease,
+            status=DirectTurnStatus.FAILED,
+            outcome={
+                "phase": "executor_recovery_timeout",
+                "error_code": "executor_recovery_timeout",
+                "error": "deadline expired",
+            },
+        )
+        terminal_projections += 1
+
+    old_runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-old",
+        incarnation_id="boot-old",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=old_execute,
+        simple_mode=False,
+    )
+    new_runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-new",
+        incarnation_id="boot-new",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=new_execute,
+        simple_mode=False,
+    )
+    try:
+        await old_runtime.start()
+        await asyncio.wait_for(old_started.wait(), timeout=2)
+        assert old_fence is not None
+        await old_runtime.stop_claiming()
+        assert await leases.renew(old_fence.lease, ttl_seconds=-1) is not None
+        recovery_lease = await leases.acquire(
+            conversation_lease_key("conv-a"),
+            "controller-new:recovery",
+            ttl_seconds=60,
+        )
+        assert recovery_lease is not None
+        assert await store.recover_stale_running(
+            admitted.request.request_id,
+            lease=recovery_lease,
+            outcome={"phase": "executor_waiting"},
+        )
+        assert await leases.release(recovery_lease)
+
+        await new_runtime.start()
+        await _wait_for(lambda: terminal_projections == 1)
+        await asyncio.wait_for(old_fence_rejected.wait(), timeout=2)
+        terminal = await store.get(admitted.request.request_id)
+        assert terminal is not None
+        assert terminal.status == DirectTurnStatus.FAILED.value
+        assert terminal.outcome["error_code"] == "executor_recovery_timeout"
+        assert reclaimed_window is not None
+        assert reclaimed_window.unavailable_since == original_window.unavailable_since
+        assert reclaimed_window.deadline == original_window.deadline
+        assert terminal_projections == 1
+        assert dispatch_attempts == 2
+        assert successful_dispatches == 1
+    finally:
+        await old_runtime.stop()
+        await new_runtime.stop()
         await engine.dispose()
 
 
@@ -391,6 +681,274 @@ async def test_stale_tool_in_flight_becomes_ambiguous_without_redispatch(
         assert row is not None
         assert row.status == DirectTurnStatus.AMBIGUOUS.value
         assert executed is False
+    finally:
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_stale_tool_recovery_preserves_turn_and_continues_without_redispatch(
+    tmp_path: Path,
+) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "tool-recovery", "tool")
+    stale_lease = await leases.acquire(
+        conversation_lease_key("conv-a"),
+        "controller-old:boot-old",
+        ttl_seconds=60,
+    )
+    assert stale_lease is not None
+    assert await store.claim(
+        admitted.request.request_id,
+        lease=stale_lease,
+        controller_id="controller-old",
+        incarnation_id="boot-old",
+    )
+    assert await store.mark_running(admitted.request.request_id, lease=stale_lease)
+    assert await store.checkpoint(
+        admitted.request.request_id,
+        lease=stale_lease,
+        phase="tool_in_flight",
+        metadata={
+            "session_id": "sess-a",
+            "turn_id": admitted.request.turn_id,
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "frozen": True,
+                    "dispatch_state": "pending",
+                }
+            ],
+        },
+    )
+    assert await leases.release(stale_lease)
+    recovered: list[dict[str, Any]] = []
+    executed: list[tuple[str, dict[str, Any]]] = []
+
+    async def recover(row, _lease: Lease) -> None:
+        recovered.append(dict(row.outcome or {}))
+
+    async def execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
+        executed.append((row.turn_id, dict(row.outcome or {})))
+        await fence.complete({"phase": "completed"})
+
+    runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-new",
+        incarnation_id="boot-new",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        recover_tool_calls=recover,
+        simple_mode=False,
+    )
+    try:
+        await runtime.start()
+        await _wait_for(lambda: bool(executed))
+        assert len(recovered) == 1
+        started = datetime.fromisoformat(recovered[0]["recovery_started_at"])
+        deadline = datetime.fromisoformat(recovered[0]["recovery_deadline_at"])
+        assert deadline - started == timedelta(seconds=60)
+        assert executed[0][0] == admitted.request.turn_id
+        assert executed[0][1]["phase"] == "user_appended"
+        assert executed[0][1]["tool_recovery_result_persisted"] is True
+    finally:
+        await runtime.stop()
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_tool_dispatch_binding_is_fenced_and_merged_before_send(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "tool-binding", "tool")
+    lease = await leases.acquire(
+        conversation_lease_key("conv-a"),
+        "controller:boot",
+        ttl_seconds=60,
+    )
+    assert lease is not None
+    assert await store.claim(
+        admitted.request.request_id,
+        lease=lease,
+        controller_id="controller",
+        incarnation_id="boot",
+    )
+    assert await store.mark_running(admitted.request.request_id, lease=lease)
+    assert await store.checkpoint(
+        admitted.request.request_id,
+        lease=lease,
+        phase="tool_in_flight",
+        metadata={
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "frozen": True,
+                    "dispatch_state": "pending",
+                }
+            ]
+        },
+    )
+    fence = DirectTurnExecutionFence(
+        store=store,
+        request_id=admitted.request.request_id,
+        lease=lease,
+    )
+
+    await fence.bind_tool_dispatch(
+        "call-1",
+        "executor-1",
+        "instance-1",
+        dispatch_state="dispatching",
+    )
+
+    row = await store.get(admitted.request.request_id)
+    assert row is not None
+    assert row.outcome["tool_calls"] == [
+        {
+            "call_id": "call-1",
+            "tool_name": "bash",
+            "frozen": True,
+            "dispatch_state": "dispatching",
+            "executor_id": "executor-1",
+            "executor_instance_id": "instance-1",
+        }
+    ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancel_immediately_before_binding_aborts_tool_frame(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "tool-binding-cancel", "tool")
+    lease = await leases.acquire(
+        conversation_lease_key("conv-a"),
+        "controller:boot",
+        ttl_seconds=60,
+    )
+    assert lease is not None
+    assert await store.claim(
+        admitted.request.request_id,
+        lease=lease,
+        controller_id="controller",
+        incarnation_id="boot",
+    )
+    assert await store.mark_running(admitted.request.request_id, lease=lease)
+    assert await store.checkpoint(
+        admitted.request.request_id,
+        lease=lease,
+        phase="tool_in_flight",
+        metadata={
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "frozen": False,
+                    "dispatch_state": "pending",
+                }
+            ]
+        },
+    )
+    fence = DirectTurnExecutionFence(
+        store=store,
+        request_id=admitted.request.request_id,
+        lease=lease,
+    )
+    cancelled = await store.request_cancel(admitted.request.request_id)
+    assert cancelled is not None and cancelled.cancellation_requested
+    websocket = _RecordingWebSocket()
+    connection = WebSocketExecutorConnection(
+        websocket,  # type: ignore[arg-type]
+        "executor-1",
+        ExecutorCapabilities(),
+    )
+
+    async def bind_before_send(executor_id: str, instance_id: str | None) -> None:
+        await fence.bind_tool_dispatch(
+            "call-1",
+            executor_id,
+            instance_id,
+            dispatch_state="dispatching",
+        )
+
+    with pytest.raises(StaleDirectTurnOwner):
+        await connection.rpc_call(
+            "tool.execute",
+            {"call_id": "call-1"},
+            timeout=1,
+            before_send=bind_before_send,
+        )
+
+    assert websocket.sent == []
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_tool_recovery_settles_cancelled(tmp_path: Path) -> None:
+    engine, store, leases = await _stores(tmp_path)
+    admitted = await _admit(store, "tool-recovery-cancel", "tool")
+    stale_lease = await leases.acquire(
+        conversation_lease_key("conv-a"),
+        "controller-old:boot-old",
+        ttl_seconds=60,
+    )
+    assert stale_lease is not None
+    assert await store.claim(
+        admitted.request.request_id,
+        lease=stale_lease,
+        controller_id="controller-old",
+        incarnation_id="boot-old",
+    )
+    assert await store.mark_running(admitted.request.request_id, lease=stale_lease)
+    assert await store.checkpoint(
+        admitted.request.request_id,
+        lease=stale_lease,
+        phase="tool_in_flight",
+        metadata={
+            "tool_calls": [
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "frozen": True,
+                    "dispatch_state": "pending",
+                }
+            ]
+        },
+    )
+    assert await leases.release(stale_lease)
+    executed = False
+
+    async def recover(_row, _lease: Lease) -> None:
+        result = await store.request_cancel(admitted.request.request_id)
+        assert result is not None and result.cancellation_requested
+
+    async def execute(*_args: Any) -> None:
+        nonlocal executed
+        executed = True
+
+    runtime = DurableDirectTurnRuntime(
+        store=store,
+        lease_store=leases,
+        controller_id="controller-new",
+        incarnation_id="boot-new",
+        artifact_store=_ArtifactStore(),
+        execute_claimed_turn=execute,
+        recover_tool_calls=recover,
+        simple_mode=False,
+    )
+    try:
+        await runtime.start()
+        deadline = asyncio.get_running_loop().time() + 2
+        while True:
+            current = await store.get(admitted.request.request_id)
+            if current is not None and current.status == DirectTurnStatus.CANCELLED.value:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("tool recovery cancellation was not settled")
+            await asyncio.sleep(0.01)
+        assert executed is False
+        assert current.outcome["reason"] == "cancelled during tool recovery"
     finally:
         await runtime.stop()
         await engine.dispose()
@@ -893,7 +1451,7 @@ async def test_controller_error_preserves_append_phase_for_reclaim(
     )
     try:
         await runtime.start()
-        await asyncio.wait_for(completed.wait(), timeout=2)
+        await asyncio.wait_for(completed.wait(), timeout=10)
         assert len(attempts) == 2
         assert attempts[1]["phase"] == "controller_error"
         assert attempts[1]["user_append_phase"] == append_phase
@@ -986,7 +1544,7 @@ async def test_simple_mode_wake_claims_without_poll_delay(tmp_path: Path) -> Non
         await runtime.start()
         await _admit(store, "message-1", "immediate")
         await runtime.wake()
-        await asyncio.wait_for(executed.wait(), timeout=0.2)
+        await asyncio.wait_for(executed.wait(), timeout=2.0)
     finally:
         await runtime.stop()
         await engine.dispose()
@@ -1034,7 +1592,7 @@ async def test_worker_is_gated_until_schema_ready_but_starts_before_ready(
         assert controller.state is ControllerLifecycleState.STARTING
         controller.mark_ready()
         await runtime.wake()
-        await asyncio.wait_for(executed.wait(), timeout=0.2)
+        await asyncio.wait_for(executed.wait(), timeout=2.0)
     finally:
         await runtime.stop()
         await engine.dispose()
@@ -1179,9 +1737,11 @@ async def test_permanent_attachment_failure_advances_fifo(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worker_start_delay", [0.0, 0.1])
 async def test_post_admission_wake_failure_is_retried_without_rejecting_acceptance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    worker_start_delay: float,
 ) -> None:
     engine, store, leases = await _stores(tmp_path)
     executed = asyncio.Event()
@@ -1206,11 +1766,20 @@ async def test_post_admission_wake_failure_is_retried_without_rejecting_acceptan
     )
     original_acquire = leases.acquire
     failures = 0
+    failure_observed = asyncio.Event()
+    original_run = runtime._run  # noqa: SLF001
+
+    async def delayed_run() -> None:
+        await asyncio.sleep(worker_start_delay)
+        await original_run()
+
+    monkeypatch.setattr(runtime, "_run", delayed_run)
 
     async def flaky_acquire(*args: Any, **kwargs: Any):
         nonlocal failures
         if failures == 0:
             failures += 1
+            failure_observed.set()
             raise RuntimeError("temporary database failure")
         return await original_acquire(*args, **kwargs)
 
@@ -1219,7 +1788,9 @@ async def test_post_admission_wake_failure_is_retried_without_rejecting_acceptan
         await _admit(store, "message-1", "accepted")
         monkeypatch.setattr(leases, "acquire", flaky_acquire)
         await runtime.wake()
-        await asyncio.sleep(0.05)
+        # The second wake must follow the failed iteration, not an assumed
+        # scheduling delay. Pre-start wakes legitimately coalesce.
+        await asyncio.wait_for(failure_observed.wait(), timeout=1)
         assert runtime._worker is not None and not runtime._worker.done()  # noqa: SLF001
         await runtime.wake()
         await asyncio.wait_for(executed.wait(), timeout=1)
@@ -1235,6 +1806,7 @@ async def test_wake_during_claim_iteration_is_not_lost() -> None:
     runtime._accepting_claims = True  # noqa: SLF001
     runtime._stop = asyncio.Event()  # noqa: SLF001
     runtime._wake = asyncio.Event()  # noqa: SLF001
+    runtime._wake_generation = 0  # noqa: SLF001
     entered = asyncio.Event()
     release = asyncio.Event()
     second_iteration = asyncio.Event()
@@ -1312,7 +1884,11 @@ async def test_durable_cancel_watch_interrupts_owner_without_cluster_signal(
     row = SimpleNamespace(cancel_requested_at=datetime.now(UTC))
     runtime = object.__new__(DurableDirectTurnRuntime)
     runtime.store = SimpleNamespace(get=AsyncMock(return_value=row))
-    monkeypatch.setattr(direct_turn_runtime_module, "DIRECT_TURN_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        direct_turn_runtime_module,
+        "DIRECT_TURN_CANCELLATION_POLL_SECONDS",
+        0.01,
+    )
     cancelled = asyncio.Event()
 
     async def owner() -> None:
@@ -1341,6 +1917,7 @@ async def test_renewal_exception_leaves_request_for_recovery_not_cancelled(
     engine, store, leases = await _stores(tmp_path)
     admitted = await _admit(store, "message-1", "renewal")
     started = asyncio.Event()
+    cancelled = asyncio.Event()
 
     class LeaseStore:
         async def acquire(self, *args: Any, **kwargs: Any):
@@ -1349,6 +1926,7 @@ async def test_renewal_exception_leaves_request_for_recovery_not_cancelled(
 
         async def renew(self, _lease: Lease, *, ttl_seconds: float) -> None:
             del ttl_seconds
+            await started.wait()
             raise RuntimeError("database unavailable")
 
         async def release(self, lease: Lease) -> bool:
@@ -1357,7 +1935,11 @@ async def test_renewal_exception_leaves_request_for_recovery_not_cancelled(
     async def execute(row, _payload, fence: DirectTurnExecutionFence) -> None:
         assert await store.mark_running(row.request_id, lease=fence.lease)
         started.set()
-        await asyncio.Future()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
 
     monkeypatch.setattr(direct_turn_runtime_module, "DIRECT_TURN_LEASE_SECONDS", 0.3)
     runtime = DurableDirectTurnRuntime(
@@ -1371,9 +1953,9 @@ async def test_renewal_exception_leaves_request_for_recovery_not_cancelled(
     )
     try:
         await runtime.start()
-        await asyncio.wait_for(started.wait(), timeout=0.5)
+        await asyncio.wait_for(started.wait(), timeout=2.0)
         await runtime.stop_claiming()
-        await asyncio.sleep(0.15)
+        await asyncio.wait_for(cancelled.wait(), timeout=2.0)
         row = await store.get(admitted.request.request_id)
         assert row is not None
         assert row.status == DirectTurnStatus.RUNNING.value

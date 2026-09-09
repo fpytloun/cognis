@@ -15,6 +15,7 @@ export default defineConfig({
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,  // Sequential — shared compose stack
+  workers: 1,
   retries: 1,
   reporter: [['html', { open: 'never' }], ['list']],
 

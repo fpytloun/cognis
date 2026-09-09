@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { portal } from '$lib/actions/portal';
 
   import { api } from '$lib/api/client';
   import type { Deliverable, StepRun } from '$lib/types/api';
@@ -40,8 +41,12 @@
     return typeof val === 'string' ? val : '';
   }
 
-  function latestDeliverable(stepRun: StepRun) {
-    return stepRun.deliverables[0] ?? null;
+  function stepDeliverables(stepRun: StepRun): Deliverable[] {
+    return Array.isArray(stepRun.deliverables) ? stepRun.deliverables : [];
+  }
+
+  function latestDeliverable(stepRun: StepRun): Deliverable | null {
+    return stepDeliverables(stepRun)[0] ?? null;
   }
 
   function renderDeliverableContent(deliverable: Deliverable | null): string {
@@ -128,6 +133,7 @@
     if (!isTopOverlay(overlayId)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
+      event.stopImmediatePropagation();
       onclose();
       return;
     }
@@ -147,6 +153,7 @@
   }
 
   const summary = $derived(stepOutputSummary(stepRun));
+  const deliverables = $derived(stepDeliverables(stepRun));
   const latestDeliverableVersion = $derived(hydratedDeliverable ?? latestDeliverable(stepRun));
   const deliverableHtml = $derived(renderDeliverableContent(latestDeliverableVersion));
   const reasoningContent = $derived(stepReasoningContent(stepRun, latestDeliverableVersion));
@@ -157,6 +164,7 @@
   const feedback = $derived(stepEvalFeedback(stepRun));
 
   onMount(() => {
+    let mounted = true;
     const handle = registerOverlay({ kind: 'blocking', blocksChrome: true });
     overlayId = handle.id;
     previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -170,17 +178,21 @@
       void api.deliverables
         .getForStepRun(stepRun.step_run_id, projectedDeliverable.deliverable_id)
         .then((deliverable: Deliverable) => {
+          if (!mounted) return;
           hydratedDeliverable = deliverable;
           deliverableLoadError = '';
         })
         .catch(() => {
+          if (!mounted) return;
           deliverableLoadError = 'Full deliverable content could not be loaded.';
         })
         .finally(() => {
+          if (!mounted) return;
           loadingDeliverable = false;
         });
     }
     return () => {
+      mounted = false;
       handle.unregister();
       overlayId = null;
       document.removeEventListener('keydown', trapFocus);
@@ -195,8 +207,11 @@
   scrolling internally.
 -->
 <div
+  use:portal
   class="app-viewport-overlay app-safe-fullscreen z-[95] items-stretch justify-center overflow-y-auto overscroll-contain bg-slate-950/85 backdrop-blur sm:items-center"
   role="presentation"
+  data-testid="step-output-overlay"
+  data-overlay-id={overlayId}
 >
   <button class="absolute inset-0" onclick={onclose} type="button" aria-label="Close full output"></button>
   <div
@@ -205,7 +220,8 @@
     role="dialog"
     aria-modal="true"
     data-blocking-overlay
-    aria-labelledby="step-output-title"
+    aria-label={`Step output: ${stepRun.step_name}`}
+    data-testid="step-output-panel"
   >
     <div class="shrink-0 border-b border-slate-800 px-5 py-4 sm:px-6">
       <div class="flex items-start justify-between gap-4">
@@ -236,7 +252,7 @@
         </section>
       {/if}
 
-      {#if stepRun.deliverables.length > 0}
+      {#if deliverables.length > 0}
         <section class="rounded-3xl border border-sky-500/20 bg-sky-500/5 p-4 sm:p-5">
           <div class="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -246,7 +262,7 @@
               {/if}
             </div>
             <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide text-slate-300">
-              {#each stepRun.deliverables as deliverable}
+              {#each deliverables as deliverable}
                 <span class={`rounded-full border px-2.5 py-1 ${deliverable.status === 'delivered' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : deliverable.status === 'approved' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : deliverable.status === 'rejected' ? 'border-sky-500/30 bg-sky-500/10 text-sky-200' : 'border-slate-700 bg-slate-900/80 text-slate-300'}`}>
                   v{deliverable.version} {deliverable.status}
                 </span>

@@ -1,0 +1,395 @@
+{
+  "schema_version": 1,
+  "id": "capacity-dashboard",
+  "title": "Capacity dashboard",
+  "description": "A flat, editorial, technical operations dashboard: identity header, compact progress metrics, status chips, a dense typed recommendation table, a 7-day traffic comparison, and an asymmetric scaling/action summary.",
+  "group": "dashboard",
+  "sort_key": 1300,
+  "content": "A capacity and scaling snapshot for a fictional Orchid database cluster, with sizing metrics, index recommendations, traffic comparison, and next actions.",
+  "payload": {
+    "title": "Capacity dashboard",
+    "metadata": {
+      "presentation": "dashboard",
+      "canvas": "wide",
+      "density": "compact"
+    },
+    "blocks": [
+      {
+        "type": "section_header",
+        "eyebrow": "Aster platform",
+        "title": "Capacity snapshot — Orchid cluster",
+        "subtitle": "Health, sizing, index recommendations, and scaling picture for the primary and staging Orchid clusters.",
+        "status": "Idle · 0 open alerts",
+        "tone": "positive"
+      },
+      {
+        "type": "markdown",
+        "role": "metadata",
+        "content": "`orchid-primary` · A20 tier · 2 vCPU / 4 GB · OrchidDB 9.1.4 · replica set · 3 nodes · region **West-2** · org **aster-v1** · 2026-08-19 · read-only telemetry API · values = last / 24h peak"
+      },
+      {
+        "type": "grid",
+        "layout": "equal",
+        "blocks": [
+          {
+            "type": "metric",
+            "label": "Disk used",
+            "value": "61%",
+            "tone": "warning",
+            "description": "38.4 GB of 63 GB · 24.6 GB free · autoscale on",
+            "progress": {
+              "value": 61,
+              "max": 100,
+              "label": "38.4 / 63 GB"
+            }
+          },
+          {
+            "type": "metric",
+            "label": "CPU (normalized)",
+            "value": "~14%",
+            "tone": "success",
+            "description": "user 6.1 + kernel 2.4 · peak 9",
+            "progress": {
+              "value": 14,
+              "max": 100,
+              "label": "peak 9%"
+            }
+          },
+          {
+            "type": "metric",
+            "label": "Orchid cache",
+            "value": "44%",
+            "tone": "info",
+            "description": "0.71 GB of ~1.6 GB · RSS 1.12 GB",
+            "progress": {
+              "value": 44,
+              "max": 100,
+              "label": "0.71 / 1.6 GB"
+            }
+          },
+          {
+            "type": "metric",
+            "label": "Data (logical)",
+            "value": "104 GB",
+            "tone": "neutral",
+            "description": "34.1 GB on disk (~3× compression) · idx 0.61 GB",
+            "progress": {
+              "value": 104,
+              "max": 160,
+              "label": "104 / 160 GB provisioned"
+            }
+          }
+        ]
+      },
+      {
+        "type": "markdown",
+        "role": "status",
+        "content": "**9 suggested indexes** · drop-index: none · schema anti-patterns: none"
+      },
+      {
+        "type": "table",
+        "title": "Open recommendations — performance advisor",
+        "description": "All rows are collection scans; the scanned → returned gap is wasted work that evicts cache on every call.",
+        "columns": [
+          {
+            "key": "collection",
+            "label": "Collection · suggested index"
+          },
+          {
+            "key": "seen",
+            "label": "Times seen",
+            "align": "right"
+          },
+          {
+            "key": "latency",
+            "label": "Worst latency",
+            "align": "right"
+          },
+          {
+            "key": "scan_ratio",
+            "label": "Scanned → returned"
+          },
+          {
+            "key": "impact",
+            "label": "Why it hurts"
+          }
+        ],
+        "rows": [
+          {
+            "collection": {
+              "type": "code",
+              "value": "event_log{OpStatus:1}"
+            },
+            "seen": {
+              "type": "number",
+              "value": 1
+            },
+            "latency": {
+              "type": "text",
+              "value": 118,
+              "label": "~118 s",
+              "tone": "critical",
+              "emphasis": "strong"
+            },
+            "scan_ratio": {
+              "type": "badge",
+              "value": "critical",
+              "label": "1.08M → 0",
+              "tone": "critical"
+            },
+            "impact": "Full collection scan, ~2 min, returns nothing."
+          },
+          {
+            "collection": {
+              "type": "code",
+              "value": "event_log{OpTimestamp:-1}"
+            },
+            "seen": {
+              "type": "number",
+              "value": 3
+            },
+            "latency": {
+              "type": "text",
+              "value": 104,
+              "label": "~104 s",
+              "tone": "critical",
+              "emphasis": "strong"
+            },
+            "scan_ratio": {
+              "type": "badge",
+              "value": "critical",
+              "label": "1.02M → 480",
+              "tone": "critical"
+            },
+            "impact": "Unindexed sort/scan, ~2 min each."
+          },
+          {
+            "collection": {
+              "type": "code",
+              "value": "module_state{SN:1}"
+            },
+            "seen": {
+              "type": "number",
+              "value": 41
+            },
+            "latency": {
+              "type": "text",
+              "value": 0.6,
+              "label": "~0.6 s"
+            },
+            "scan_ratio": {
+              "type": "badge",
+              "value": "high",
+              "label": "58k → 1",
+              "tone": "warning"
+            },
+            "impact": "Frequent; 58k scanned per single hit."
+          },
+          {
+            "collection": {
+              "type": "code",
+              "value": "device_metrics{SN:1}"
+            },
+            "seen": {
+              "type": "number",
+              "value": 3
+            },
+            "latency": {
+              "type": "text",
+              "value": 4,
+              "label": "~4 s"
+            },
+            "scan_ratio": {
+              "type": "badge",
+              "value": "priority",
+              "label": "#1 priority",
+              "tone": "warning"
+            },
+            "impact": "Highest-weighted collection — scans the 84 GB collection."
+          },
+          {
+            "collection": {
+              "type": "code",
+              "value": "orchid.slot_control{Key,Timestamp}"
+            },
+            "seen": {
+              "type": "number",
+              "value": 54
+            },
+            "latency": {
+              "type": "text",
+              "value": 0.2,
+              "label": "~0.2 s"
+            },
+            "scan_ratio": {
+              "type": "badge",
+              "value": "moderate",
+              "label": "88k → 1",
+              "tone": "info"
+            },
+            "impact": "Most frequent; 88k scanned per hit."
+          }
+        ]
+      },
+      {
+        "type": "table",
+        "title": "Traffic — last 7 days",
+        "description": "Counts are the primary node totals over 7 days. Commands dominate because drivers route find/aggregate and monitoring through the command path.",
+        "columns": [
+          {
+            "key": "metric",
+            "label": "Metric (7-day, primary node)"
+          },
+          {
+            "key": "primary",
+            "label": "Primary · orchid-primary",
+            "align": "right"
+          },
+          {
+            "key": "staging",
+            "label": "Staging",
+            "align": "right"
+          }
+        ],
+        "rows": [
+          {
+            "metric": {
+              "type": "text",
+              "value": "Operations",
+              "emphasis": "strong"
+            },
+            "primary": {
+              "type": "number",
+              "value": 24100000,
+              "label": "24.1 M (~40/s)"
+            },
+            "staging": {
+              "type": "number",
+              "value": 11200000,
+              "label": "11.2 M"
+            }
+          },
+          {
+            "metric": "— commands (find/aggregate + monitoring)",
+            "primary": {
+              "type": "number",
+              "value": 22300000,
+              "label": "22.3 M"
+            },
+            "staging": "—"
+          },
+          {
+            "metric": "— query / getMore",
+            "primary": {
+              "type": "number",
+              "value": 1400000,
+              "label": "0.62 M / 0.98 M"
+            },
+            "staging": "—"
+          },
+          {
+            "metric": "— writes (ins / upd / del)",
+            "primary": {
+              "type": "number",
+              "value": 570000,
+              "label": "0.27 M / 0.14 M / 0.06 M"
+            },
+            "staging": "—"
+          },
+          {
+            "metric": {
+              "type": "text",
+              "value": "Network out",
+              "emphasis": "strong"
+            },
+            "primary": {
+              "type": "number",
+              "value": 118,
+              "label": "118 GB (peak 0.94 MB/s)"
+            },
+            "staging": {
+              "type": "number",
+              "value": 26,
+              "label": "26 GB"
+            }
+          },
+          {
+            "metric": "Network in",
+            "primary": {
+              "type": "number",
+              "value": 8.1,
+              "label": "8.1 GB"
+            },
+            "staging": {
+              "type": "number",
+              "value": 3.2,
+              "label": "3.2 GB"
+            }
+          }
+        ]
+      },
+      {
+        "type": "grid",
+        "layout": "equal",
+        "columns": 3,
+        "blocks": [
+          {
+            "type": "table",
+            "span": 2,
+            "title": "Scaling as data grows",
+            "columns": [
+              {
+                "key": "trigger",
+                "label": "Trigger"
+              },
+              {
+                "key": "action",
+                "label": "Action"
+              }
+            ],
+            "rows": [
+              {
+                "trigger": {
+                  "type": "text",
+                  "value": "Disk keeps filling",
+                  "label": "Disk keeps filling",
+                  "emphasis": "strong"
+                },
+                "action": "Disk autoscaling handles headroom; add a TTL or online archive on the largest collections to slow growth and cost."
+              },
+              {
+                "trigger": {
+                  "type": "text",
+                  "value": "CPU sustains above 60%",
+                  "label": "CPU sustains above 60%",
+                  "emphasis": "strong"
+                },
+                "action": "Add the missing indexes first (below); re-evaluate the tier only if load stays high after that."
+              },
+              {
+                "trigger": {
+                  "type": "text",
+                  "value": "Cache pressure rises",
+                  "label": "Cache pressure rises",
+                  "emphasis": "strong"
+                },
+                "action": "Eliminate collection scans (below) before increasing cache size — scans evict the cache on every call."
+              }
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "status",
+            "tone": "warning",
+            "title": "Act now",
+            "content": "No firing alerts — three items still warrant action:\n\n1. **Add the missing indexes** above.\n   - `event_log` scans cost ~2 min each.\n   - `module_state`/`slot_control` run 40–60× scans to return a single document.\n2. **Confirm TTL policy** on `event_log` before the next growth review.\n3. **Re-check the A20 tier** only after the index fixes land, not before."
+          }
+        ]
+      }
+    ],
+    "sources": [],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

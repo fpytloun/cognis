@@ -50,8 +50,8 @@
     return group.items;
   }
 
-  function entryAssistantMatchesSelection(entry: ActivitySegmentEntry): boolean {
-    return entry.kind === 'assistant' && entry.item.id === searchSelectedId;
+  function entryMessageMatchesSelection(entry: ActivitySegmentEntry): boolean {
+    return entry.kind !== 'tool_group' && entry.item.id === searchSelectedId;
   }
 
   function toolMatchesSelection(item: ToolCallTimelineItem): boolean {
@@ -62,7 +62,7 @@
   const selectedChildVisible = $derived.by(() =>
       searchSelectedId !== null
       && (
-      row.entries.some(entryAssistantMatchesSelection)
+       row.entries.some(entryMessageMatchesSelection)
       || tools.some(toolMatchesSelection)
     )
   );
@@ -167,10 +167,13 @@
 
   {#if expanded}
     <div class="mx-3 mb-2 space-y-10 overflow-hidden rounded-lg border border-slate-700/60 bg-slate-950/20 px-2 py-2">
-      {#each row.entries as entry (entry.kind === 'assistant' ? `message:assistant:${entry.item.id}` : entry.group.id)}
-        {#if entry.kind === 'assistant'}
+      {#each row.entries as entry (entry.kind === 'tool_group' ? entry.group.id : `message:${entry.kind}:${entry.item.id}`)}
+        {#if entry.kind !== 'tool_group'}
           {@const assistantSearchMatched = searchMatchedIds.has(entry.item.id)}
-          <div data-kind="activity_segment_assistant" data-message-id={entry.item.id}>
+          <div
+            data-kind={entry.kind === 'assistant' ? 'activity_segment_assistant' : 'activity_segment_recovery_notice'}
+            data-message-id={entry.item.id}
+          >
             <ChatV2TimelineItemRenderer
               item={entry.item}
               {agent}

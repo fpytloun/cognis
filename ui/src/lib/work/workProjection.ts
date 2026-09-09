@@ -7,6 +7,26 @@ import type {
 
 export const WORK_PAGE_CACHE_LIMIT = 4;
 
+export function retainExactWorkSummary(
+  latest: WorkProjectionResponse,
+  retained: WorkProjectionResponse | null | undefined,
+): WorkProjectionResponse {
+  if (latest.detail !== 'lightweight' || retained?.detail !== 'full') return latest;
+  return { ...latest, summary: retained.summary };
+}
+
+export function applyExactWorkSummary(
+  current: WorkProjectionResponse,
+  exact: WorkProjectionResponse,
+): WorkProjectionResponse {
+  if (
+    exact.detail !== 'full'
+    || current.work_revision == null
+    || exact.work_revision !== current.work_revision
+  ) return current;
+  return { ...current, detail: 'full', summary: exact.summary };
+}
+
 export interface AccumulatedWorkState {
   projection: WorkProjectionResponse;
   beforeCursor: string | null;
@@ -14,6 +34,8 @@ export interface AccumulatedWorkState {
   exhausted: boolean;
   loadedPages: number;
   rootsByRelative: Record<string, RootCandidate[]>;
+  olderPages: WorkProjectionResponse[];
+  removedCallIds: string[];
 }
 
 function newestFirst<T extends { sort_key?: string }>(items: T[]): T[] {
@@ -99,6 +121,8 @@ export function createAccumulatedWorkState(page: WorkProjectionResponse): Accumu
     exhausted: !page.has_more_before || !page.before_cursor,
     loadedPages: 1,
     rootsByRelative: collectPageRootCandidates(projection),
+    olderPages: [],
+    removedCallIds: page.removed_call_ids ?? [],
   };
 }
 
@@ -106,7 +130,15 @@ export function appendOlderWorkPage(
   state: AccumulatedWorkState,
   page: WorkProjectionResponse,
 ): AccumulatedWorkState {
-  const projection = mergeWorkProjections(state.projection, page, false);
+  const removedCallIds = [...new Set([
+    ...state.removedCallIds,
+    ...(page.removed_call_ids ?? []),
+  ])];
+  const projection = {
+    ...mergeWorkProjections(state.projection, page, false),
+    graph_fingerprint: state.projection.graph_fingerprint ?? page.graph_fingerprint,
+  };
+  projection.commands = projection.commands.filter((item) => !removedCallIds.includes(item.call_id));
   return {
     projection,
     beforeCursor: page.has_more_before ? page.before_cursor ?? null : null,
@@ -114,20 +146,55 @@ export function appendOlderWorkPage(
     exhausted: !page.has_more_before || !page.before_cursor,
     loadedPages: state.loadedPages + 1,
     rootsByRelative: collectPageRootCandidates(projection),
+    olderPages: [...state.olderPages, page],
+    removedCallIds,
   };
 }
 
 export function refreshNewestWorkPage(
   state: AccumulatedWorkState,
   page: WorkProjectionResponse,
+  options: { replaceCumulativeFiles?: boolean } = {},
 ): AccumulatedWorkState {
+  if (page.materialization?.state && page.materialization.state !== 'live') {
+    const projection = mergeWorkProjections(state.projection, page);
+    projection.summary = {
+      ...page.summary,
+      mutations: Math.max(state.projection.summary.mutations, page.summary.mutations),
+      commands: Math.max(state.projection.summary.commands, page.summary.commands),
+      changed_files: Math.max(state.projection.summary.changed_files, page.summary.changed_files),
+      artifacts: Math.max(state.projection.summary.artifacts, page.summary.artifacts),
+      deliverables: Math.max(state.projection.summary.deliverables ?? 0, page.summary.deliverables ?? 0),
+      additions: Math.max(state.projection.summary.additions ?? 0, page.summary.additions ?? 0),
+      deletions: Math.max(state.projection.summary.deletions ?? 0, page.summary.deletions ?? 0),
+    };
+    return {
+      ...state,
+      projection,
+      rootsByRelative: collectPageRootCandidates(projection),
+    };
+  }
   if (
     state.projection.graph_fingerprint
     && page.graph_fingerprint
     && state.projection.graph_fingerprint !== page.graph_fingerprint
   ) return createAccumulatedWorkState(page);
-  const onlyNewestLoaded = state.loadedPages === 1;
-  const projection = mergeWorkProjections(state.projection, page);
+  const onlyNewestLoaded = state.loadedPages === 1 || options.replaceCumulativeFiles === true;
+  let refreshed = createAccumulatedWorkState(page);
+  for (const older of state.olderPages) refreshed = appendOlderWorkPage(refreshed, older);
+  const presentCallIds = new Set(page.commands.map((item) => item.call_id));
+  const removedCallIds = [...new Set([
+    ...state.removedCallIds.filter((callId) => !presentCallIds.has(callId)),
+    ...(page.removed_call_ids ?? []),
+  ])];
+  const merged = {
+    ...refreshed.projection,
+    commands: refreshed.projection.commands.filter((item) => !removedCallIds.includes(item.call_id)),
+    removed_call_ids: removedCallIds,
+  };
+  const projection = options.replaceCumulativeFiles
+    ? { ...merged, mutations: newestFirst(page.mutations) }
+    : merged;
   return {
     projection,
     beforeCursor: onlyNewestLoaded
@@ -137,8 +204,10 @@ export function refreshNewestWorkPage(
     exhausted: onlyNewestLoaded
       ? (!page.has_more_before || !page.before_cursor)
       : state.exhausted,
-    loadedPages: state.loadedPages,
+    loadedPages: options.replaceCumulativeFiles ? 1 : state.loadedPages,
     rootsByRelative: collectPageRootCandidates(projection),
+    olderPages: options.replaceCumulativeFiles ? [] : state.olderPages,
+    removedCallIds,
   };
 }
 

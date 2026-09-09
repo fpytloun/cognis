@@ -21,7 +21,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import httpx
@@ -128,6 +128,8 @@ class OAuthClientRegistration:
 @dataclass(frozen=True)
 class TokenInjectionResult:
     headers: dict[str, str]
+    token_id: str | None = None
+    token_version: int | None = None
     authorization_required: bool = False
     reason: str | None = None
     authorization_url: str | None = None
@@ -335,6 +337,7 @@ def _safe_url(url: str, *, allow_http_localhost: bool = True) -> str:
             except OSError as exc:
                 raise MCPOAuthError("OAuth endpoint host could not be resolved") from exc
     else:
+        assert ip is not None
         resolved_ips = [ip]
     if any(
         not candidate.is_loopback
@@ -608,7 +611,7 @@ class MCPOAuthService:
             raise MCPOAuthError("OAuth executor returned an invalid loopback redirect URI")
         if parsed.path != _EXECUTOR_LOOPBACK_CALLBACK_PATH:
             raise MCPOAuthError("OAuth executor returned an invalid callback path")
-        return result
+        return cast(dict[str, Any], result)
 
     async def _stop_executor_loopback_listener(
         self,
@@ -2777,13 +2780,12 @@ class MCPOAuthService:
                     name=f"mcp-oauth-refresh-{server.server_id}",
                 )
                 self._refresh_tasks[key] = task
-                task.add_done_callback(
-                    lambda completed, refresh_key=key: (
-                        self._refresh_tasks.pop(refresh_key, None)
-                        if self._refresh_tasks.get(refresh_key) is completed
-                        else None
-                    )
-                )
+
+                def _remove_refresh_task(completed: asyncio.Future[bool]) -> None:
+                    if self._refresh_tasks.get(key) is completed:
+                        self._refresh_tasks.pop(key, None)
+
+                task.add_done_callback(_remove_refresh_task)
         try:
             return await asyncio.shield(task)
         finally:
@@ -3305,9 +3307,32 @@ class MCPOAuthService:
         injected["Authorization"] = f"Bearer {access_token}"
         return TokenInjectionResult(
             headers=injected,
+            token_id=row.token_id,
+            token_version=int(getattr(row, "version", 0) or 0),
             scopes=row.scopes or [],
             resource=getattr(row, "resource", resource),
         )
+
+    async def credential_revision_for_server_id(
+        self,
+        *,
+        user_email: str,
+        server_id: str,
+    ) -> dict[str, str | int] | None:
+        """Return the current non-secret token revision for one MCP server."""
+
+        async with self._session_factory() as session:
+            row = await get_mcp_oauth_token_for_server(
+                session,
+                user_email=user_email,
+                mcp_server_id=server_id,
+            )
+        if row is None or row.status != "active":
+            return None
+        return {
+            "token_id": row.token_id,
+            "token_version": int(getattr(row, "version", 0) or 0),
+        }
 
 
 def _safe_datetime(value: Any) -> datetime | None:

@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "id": "newsletter-digest",
+  "title": "Weekly newsletter digest",
+  "description": "A cited multi-story digest using progressive disclosure, a closing callout, and a numbered source list.",
+  "group": "publication",
+  "sort_key": 800,
+  "content": "Weekly digest fallback covering agent tooling, model releases, and infra notes.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Weekly digest",
+      "subtitle": "A newsletter-style composition for scanning several short, cited stories at once.",
+      "badges": [
+        "5 stories",
+        "Cited",
+        "This week"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Issue 42",
+        "title": "Agent tooling consolidates around policy-scoped access",
+        "subtitle": "This week: managed tool policies gain traction, two model releases, and an infra postmortem worth reading."
+      },
+      {
+        "type": "card_grid",
+        "blocks": [
+          {
+            "type": "card",
+            "variant": "editorial",
+            "eyebrow": "Agent tooling",
+            "title": "Policy-scoped tool access becomes the default pattern",
+            "summary": "Vendors converge on deferred, audited tool grants instead of blanket access.",
+            "citations": [
+              "tool-policy"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "editorial",
+            "eyebrow": "Models",
+            "title": "Two mid-size model releases target agentic workloads",
+            "summary": "Both emphasize long-context tool use over raw benchmark scores.",
+            "citations": [
+              "model-release"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "editorial",
+            "eyebrow": "Infra",
+            "title": "A widely read postmortem on event-schema drift",
+            "summary": "The root cause was an app-specific event shape leaking into a generic store.",
+            "citations": [
+              "postmortem"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "accordion",
+        "title": "More this week",
+        "items": [
+          {
+            "type": "card",
+            "variant": "editorial",
+            "title": "Editor tooling adds inline diagnostics for agent-authored code",
+            "summary": "LSP-backed diagnostics now surface directly after file edits.",
+            "citations": [
+              "editor-tooling"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "editorial",
+            "title": "A survey of renderer-neutral document formats",
+            "summary": "Block-composed payloads continue to outpace ad hoc HTML for durability.",
+            "citations": [
+              "renderer-survey"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "callout",
+        "tone": "neutral",
+        "title": "Worth your time",
+        "content": "If you read one thing this week, read the postmortem — schema drift between app-specific and generic event stores is an easy trap."
+      },
+      {
+        "type": "source_list",
+        "title": "Sources"
+      }
+    ],
+    "sources": [
+      {
+        "id": "tool-policy",
+        "title": "Policy-scoped agent tool access",
+        "url": "https://cognis.local/notes/tool-policy",
+        "publisher": "Cognis",
+        "date": "2026-07-06"
+      },
+      {
+        "id": "model-release",
+        "title": "Two new agentic model releases",
+        "url": "https://example.org/models/agentic-release",
+        "publisher": "Model Weekly",
+        "date": "2026-07-08"
+      },
+      {
+        "id": "postmortem",
+        "title": "Event-schema drift postmortem",
+        "url": "https://cognis.local/postmortems/event-schema-drift",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      },
+      {
+        "id": "editor-tooling",
+        "title": "Inline diagnostics for agent-authored code",
+        "url": "https://example.org/editors/inline-diagnostics",
+        "publisher": "Editor Weekly",
+        "date": "2026-07-10"
+      },
+      {
+        "id": "renderer-survey",
+        "title": "A survey of renderer-neutral document formats",
+        "url": "https://example.org/docs/renderer-survey",
+        "publisher": "Docs Weekly",
+        "date": "2026-07-11"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

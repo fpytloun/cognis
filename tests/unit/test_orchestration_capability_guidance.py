@@ -202,12 +202,12 @@ def test_delegate_guidance_reuses_existing_child_context() -> None:
     assert "before creating a fresh child" in description.lower()
     assert "follow_up_subsession" in description
     assert "fork_subsession" in description
-    assert "same problem" in description
-    assert "they do not change specialist" in description
+    assert "same bounded problem" in description
+    assert "Follow-up and fork preserve" in description
     assert "start fresh with the appropriate specialist" in description.lower()
 
 
-def test_capability_guidance_prioritizes_follow_up_for_terminal_delegates() -> None:
+def test_capability_guidance_starts_review_fresh_and_reuses_only_useful_reviewer_context() -> None:
     guidance = _guidance(
         ConversationContext(type="web"),
         OrchestrationMode.FULL,
@@ -215,9 +215,91 @@ def test_capability_guidance_prioritizes_follow_up_for_terminal_delegates() -> N
     )
 
     assert guidance is not None
-    assert "terminal delegate result supplies a session_id" in guidance
-    assert "follow_up_subsession instead of creating a fresh delegate" in guidance
-    assert "fork_subsession only for an independent branch" in guidance
+    assert "Start an initial independent review fresh" in guidance
+    assert "follow_up_subsession for re-review only" in guidance
+    assert "retained investigative context" in guidance
+    assert "otherwise start fresh" in guidance
+    assert "Fork only an independent branch requiring inherited context" in guidance
+
+
+def test_capability_guidance_compacts_child_context_and_review_contracts() -> None:
+    guidance = _guidance(
+        ConversationContext(type="web"),
+        OrchestrationMode.FULL,
+        {"delegate", "follow_up_subsession", "fork_subsession"},
+    )
+
+    assert guidance is not None
+    assert "same bounded problem" in guidance
+    assert "retained context is materially useful" in guidance
+    assert "send the context delta only" in guidance
+    assert "fresh isolated child" in guidance
+    assert "independent workstream" in guidance
+    assert "compact contract with exact references" in guidance
+    assert "never pass the parent transcript" in guidance
+    assert "ordinary handoff, correction, or review" in guidance
+    assert "implementation reasoning transcript" in guidance
+    assert "compact evidence" in guidance
+    assert "Detailed logs remain inspectable" in guidance
+
+
+def test_delegate_only_guidance_does_not_claim_hidden_continuation_or_fork_tools() -> None:
+    guidance = _guidance(
+        ConversationContext(type="web"),
+        OrchestrationMode.FULL,
+        {"delegate"},
+    )
+
+    assert guidance is not None
+    assert "same bounded problem" not in guidance
+    assert "follow_up_subsession" not in guidance
+    assert "Fork only" not in guidance
+
+
+def test_managed_create_only_guidance_does_not_claim_hidden_continuation_or_fork_tools() -> None:
+    guidance = _guidance(
+        ConversationContext(type="web"),
+        OrchestrationMode.FULL,
+        {"agent_conversation_create"},
+    )
+
+    assert guidance is not None
+    assert "same bounded problem" not in guidance
+    assert "agent_conversation_send" not in guidance
+    assert "Fork only" not in guidance
+
+
+def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routing() -> None:
+    tools = {
+        tool.name: tool
+        for tool in orchestration_tools(
+            OrchestrationMode.FULL,
+            expose_managed_conversation_wait_option=False,
+        )
+    }
+    create = tools["agent_conversation_create"].description
+    send = tools["agent_conversation_send"].description
+    fork = tools["agent_conversation_fork"].description
+
+    for phrase in (
+        "Working mode: execute",
+        "Working mode: coordinate",
+        "objective",
+        "exact references",
+        "scope and non-goals",
+        "acceptance and verification",
+        "return status and evidence",
+    ):
+        assert phrase in create
+    assert "initial independent review in a fresh conversation" in send
+    assert "re-review only when" in send
+    assert "Create a fresh isolated child when compatibility or useful context is absent" in send
+    assert "independent branch requiring inherited context" in fork
+    assert "initial independent review fresh" in fork
+    assert "ordinary handoff" in fork
+    assert "fork for re-review" not in fork
+    assert "this fork for re-review" not in fork
+    assert "re-review fresh with a compact review contract" in fork
 
 
 def test_managed_guidance_uses_future_compatible_nested_wording() -> None:

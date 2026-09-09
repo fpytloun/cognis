@@ -1,5 +1,6 @@
 import json
 from types import SimpleNamespace
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -46,15 +47,23 @@ def _provider(*, endpoint: str = "https://api.anthropic.com", protocol: str = "a
 
 
 @pytest.mark.asyncio
-async def test_native_anthropic_client_uses_resolved_request_timeout() -> None:
-    provider_impl = LiteLLMProvider.__new__(LiteLLMProvider)
+async def test_native_anthropic_client_uses_resolved_request_timeout_and_reuses_pool() -> None:
+    provider_impl = LiteLLMProvider(cast(Any, None))
     client, credential_ref = await provider_impl._native_anthropic_client(
         _provider(),
         {"api_key": "test-key", "timeout": 7.5},
     )
+    second_client, _credential_ref = await provider_impl._native_anthropic_client(
+        _provider(),
+        {"api_key": "updated-key", "timeout": 7.5},
+    )
 
     assert client._timeout == 7.5
     assert credential_ref == "$credential:anthropic-api-key"
+    assert client._http_client is second_client._http_client
+    assert client._close_http_client is False
+    await provider_impl.aclose()
+    assert client._http_client.is_closed
 
 
 def test_official_api_key_provider_auto_uses_native_messages() -> None:
@@ -586,7 +595,8 @@ def test_frozen_native_chain_rejects_provider_thinking_and_bundle_corruption() -
         )
 
 
-def test_executor_uses_exact_controller_supplied_native_chain() -> None:
+@pytest.mark.asyncio
+async def test_executor_uses_exact_controller_supplied_native_chain_and_reuses_pool() -> None:
     provider = _provider()
     provider.location = "executor"
     context, bundle = build_native_chain(
@@ -625,13 +635,17 @@ def test_executor_uses_exact_controller_supplied_native_chain() -> None:
         provider_id="anthropic",
         backend_metadata={"anthropic_native": {"config": provider.config}},
     )
-    client, restored_context, payload, restored_bundle = (
-        AnthropicMessagesExecutorBackend()._prepared(request)
-    )
+    backend = AnthropicMessagesExecutorBackend()
+    client, restored_context, payload, restored_bundle = backend._prepared(request)
+    second_client, *_rest = backend._prepared(request)
     assert client._timeout == 9.5
+    assert client._http_client is second_client._http_client
+    assert client._close_http_client is False
     assert restored_context == context
     assert restored_bundle.fingerprint == bundle.fingerprint
     assert payload["max_tokens"] == 3456
+    await backend.close()
+    assert client._http_client.is_closed
 
 
 @pytest.mark.asyncio

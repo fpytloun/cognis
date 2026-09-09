@@ -1,4 +1,12 @@
-import type { ExecutorConfig, ExecutorMCPServerRuntimeStatus, ExecutorRuntimeIssue } from '$lib/types/api';
+import type {
+  ExecutorConfig,
+  ExecutorMCPServerRuntimeStatus,
+  ExecutorRuntimeIssue,
+  ExecutorStatus,
+  RuntimeCapabilityReport,
+  RuntimeCapabilityState,
+  RuntimeCapabilityStatus
+} from '$lib/types/api';
 
 export interface ExecutorDegradedIssue {
   source: string;
@@ -6,12 +14,160 @@ export interface ExecutorDegradedIssue {
   detail: string | null;
 }
 
-export type ExecutorHealthState = 'healthy' | 'pressure' | 'critical' | 'offline' | 'stale' | 'unknown';
+export type ExecutorHealthState = 'healthy' | 'pressure' | 'critical' | 'offline' | 'stale' | 'unavailable' | 'unknown';
 
 export interface ExecutorHealth {
   state: ExecutorHealthState;
   label: string;
   detail: string;
+}
+
+export interface CapabilityFreshness {
+  state: 'fresh' | 'stale' | 'unknown';
+  ageSeconds: number | null;
+  label: string;
+}
+
+export interface ToolSelectionGuard {
+  blocked: boolean;
+  configured: boolean;
+  portable: boolean;
+  state: RuntimeCapabilityState | null;
+  reason: string | null;
+}
+
+const CAPABILITY_STALE_AFTER_SECONDS = 24 * 60 * 60;
+const TOOL_COMPONENTS: Record<string, string> = {
+  browser: 'browser',
+  channel: 'channels',
+  channels: 'channels',
+  document: 'documents',
+  documents: 'documents',
+  inference: 'inference',
+  lsp: 'lsp',
+  mcp: 'mcp',
+  officecli: 'officecli',
+  web: 'web'
+};
+
+const LOCAL_EXECUTOR_TYPES = ['in_process', 'subprocess'] as const;
+const KNOWN_EXECUTOR_TYPES = ['websocket', 'subprocess', 'in_process'] as const;
+
+export function isLocalExecutorType(executorType: string): boolean {
+  return (LOCAL_EXECUTOR_TYPES as readonly string[]).includes(executorType);
+}
+
+/**
+ * Return the creatable executor types without guessing package availability.
+ * An absent status field means an older controller, so retain the previous UI.
+ */
+export function executorTypeChoices(
+  status: Pick<ExecutorStatus, 'available_executor_types'> | null | undefined,
+  isAdmin: boolean
+): string[] {
+  const available = status?.available_executor_types;
+  const types = available === undefined
+    ? [...KNOWN_EXECUTOR_TYPES]
+    : available.filter((type): type is (typeof KNOWN_EXECUTOR_TYPES)[number] =>
+      (KNOWN_EXECUTOR_TYPES as readonly string[]).includes(type)
+    );
+  return isAdmin ? types : types.filter((type) => type === 'websocket');
+}
+
+export function localExecutorTypesUnavailable(
+  status: Pick<ExecutorStatus, 'available_executor_types'> | null | undefined
+): boolean {
+  return status?.available_executor_types !== undefined
+    && !status.available_executor_types.some(isLocalExecutorType);
+}
+
+export function executorUnavailable(
+  executor: Pick<ExecutorConfig, 'executor_type' | 'available'>
+): boolean {
+  return isLocalExecutorType(executor.executor_type) && executor.available === false;
+}
+
+export function capabilityStatusLabel(state: RuntimeCapabilityState): string {
+  return state === 'ready'
+    ? 'Ready'
+    : state === 'installable'
+      ? 'Installable'
+      : state === 'unavailable'
+        ? 'Unavailable'
+        : 'Unknown';
+}
+
+export function capabilityStatusTone(state: RuntimeCapabilityState): string {
+  return state === 'ready'
+    ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+    : state === 'installable'
+      ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+      : state === 'unavailable'
+        ? 'border-rose-500/30 bg-rose-500/10 text-rose-200'
+        : 'border-slate-700 bg-slate-900/70 text-slate-300';
+}
+
+export function executorCapabilityFreshness(
+  report: RuntimeCapabilityReport | null | undefined,
+  now = Date.now(),
+  staleAfterSeconds = CAPABILITY_STALE_AFTER_SECONDS
+): CapabilityFreshness {
+  if (!report) return { state: 'unknown', ageSeconds: null, label: 'Not observed' };
+  const observedAt = Date.parse(report.observed_at);
+  if (!Number.isFinite(observedAt) || observedAt > now) {
+    return { state: 'unknown', ageSeconds: null, label: 'Observation time unknown' };
+  }
+  const ageSeconds = Math.floor((now - observedAt) / 1000);
+  if (ageSeconds > staleAfterSeconds) {
+    return { state: 'stale', ageSeconds, label: `Observed ${formatDuration(ageSeconds)} ago` };
+  }
+  return { state: 'fresh', ageSeconds, label: `Observed ${formatDuration(ageSeconds)} ago` };
+}
+
+function capabilityStatusForTool(
+  report: RuntimeCapabilityReport,
+  toolName: string,
+  category?: string
+): RuntimeCapabilityStatus | null {
+  const direct = report.components[toolName];
+  if (direct) return direct;
+  const componentName = category ? TOOL_COMPONENTS[category.toLowerCase()] : undefined;
+  return componentName ? report.components[componentName] ?? null : null;
+}
+
+export function executorToolSelectionGuard(
+  executor: Pick<
+    ExecutorConfig,
+    'enabled_tools' | 'enabled_tool_groups' | 'observed_capabilities' | 'runtime_state' | 'runtime_metadata'
+  >,
+  toolName: string,
+  category?: string
+): ToolSelectionGuard {
+  const portable = toolName === '*' || Boolean(category && executor.enabled_tool_groups.includes(category));
+  const configured = portable || executor.enabled_tools.includes(toolName);
+  const report = executor.observed_capabilities;
+  if (
+    configured
+    || portable
+    || !report
+    || executor.runtime_state === 'offline'
+    || executor.runtime_metadata?.legacy_metadata
+  ) {
+    return { blocked: false, configured, portable, state: null, reason: null };
+  }
+
+  const status = capabilityStatusForTool(report, toolName, category);
+  const blocked = status?.state === 'unavailable' || status?.state === 'installable';
+  if (!blocked && report.supported_tools.includes(toolName)) {
+    return { blocked: false, configured, portable, state: null, reason: null };
+  }
+  return {
+    blocked,
+    configured,
+    portable,
+    state: blocked ? status.state : null,
+    reason: blocked ? status.message : null
+  };
 }
 
 export function providerInferenceExecutors(
@@ -55,6 +211,13 @@ interface PressureSignal {
 }
 
 export function executorHealth(executor: ExecutorConfig): ExecutorHealth {
+  if (executorUnavailable(executor)) {
+    return {
+      state: 'unavailable',
+      label: 'Unavailable',
+      detail: executor.unavailable_reason || 'This local executor is unavailable on the current controller.'
+    };
+  }
   if (executor.status !== 'active') {
     return { state: 'unknown', label: 'Disabled', detail: 'This executor is not enabled.' };
   }
@@ -156,11 +319,12 @@ export function executorPressureSignals(executor: ExecutorConfig): PressureSigna
 export function executorRuntimeBadgeStatus(executor: ExecutorConfig): 'healthy' | 'degraded' | 'unhealthy' {
   const state = executorHealth(executor).state;
   if (state === 'healthy') return 'healthy';
-  if (state === 'critical' || state === 'offline') return 'unhealthy';
+  if (state === 'critical' || state === 'offline' || state === 'unavailable') return 'unhealthy';
   return 'degraded';
 }
 
 export function executorRuntimeLabel(executor: ExecutorConfig): string {
+  if (executorUnavailable(executor)) return 'unavailable';
   if (executor.status !== 'active') return 'disabled';
   if (executor.runtime_state === 'active') return 'connected';
   if (executor.runtime_state === 'degraded') return 'degraded';

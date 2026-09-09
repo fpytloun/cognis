@@ -1,18 +1,19 @@
 <script lang="ts">
-  import ArrowUp from 'lucide-svelte/icons/arrow-up';
-  import { onDestroy } from 'svelte';
-
+  import { keyboardAvoidance } from '$lib/actions/keyboard-avoidance';
+  import ChatV2Composer from '$lib/components/chat-v2/ChatV2Composer.svelte';
   import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
-  import Button from '$lib/components/ui/Button.svelte';
+  import { api } from '$lib/api/client';
   import { chatV2Api } from '$lib/chat-v2/api';
   import { conversationTimelineScope } from '$lib/chat-v2/types';
-  import type { Agent, TaskControlChatResponse } from '$lib/types/api';
+  import { handleClipboardFilePaste } from '$lib/clipboard';
+  import type { Agent, AttachmentRef, TaskControlChatResponse } from '$lib/types/api';
   import type { SendMessageV2Response } from '$lib/chat-v2/types';
 
   interface ScopedTimelineController {
     stageOptimisticMessage(input: {
       scopeKey: string;
       content: string;
+      attachments?: AttachmentRef[];
       clientMessageId: string;
     }): boolean;
     reconcileMessageAdmission(input: {
@@ -41,23 +42,30 @@
   let sending = $state(false);
   let error = $state('');
   let timeline = $state<ScopedTimelineController | null>(null);
+  let attachments = $state<AttachmentRef[]>([]);
+  let uploading = $state(false);
+  let runtimeActive = $state(false);
+  let stopping = $state(false);
   let sendGeneration = 0;
   let activeConversationId = '';
   const scope = $derived(conversationTimelineScope(chat.conversation_id));
+  const draftKey = $derived(`cognis:chat-v2-draft:${chat.conversation_id}`);
 
   $effect(() => {
     const conversationId = chat.conversation_id;
     if (conversationId === activeConversationId) return;
     activeConversationId = conversationId;
     sendGeneration += 1;
-    message = '';
+    message = typeof localStorage === 'undefined' ? '' : localStorage.getItem(`cognis:chat-v2-draft:${conversationId}`) ?? '';
+    attachments = [];
+    uploading = false;
     sending = false;
     error = '';
   });
 
   async function send(): Promise<void> {
     const content = message.trim();
-    if (!content || sending) return;
+    if ((!content && attachments.length === 0) || sending || uploading) return;
     const conversationId = chat.conversation_id;
     const scopeKey = scope.key;
     const generation = ++sendGeneration;
@@ -65,18 +73,21 @@
     const clientMessageId = crypto.randomUUID();
     sending = true;
     error = '';
-    timeline?.stageOptimisticMessage({ scopeKey, content, clientMessageId });
+    const sentAttachments = [...attachments];
+    timeline?.stageOptimisticMessage({ scopeKey, content, attachments: sentAttachments, clientMessageId });
     try {
       const response = await chatV2Api.sendMessage(conversationId, clientTxnId, {
         content,
         client_message_id: clientMessageId,
-        attachments: [],
+        attachments: sentAttachments,
         chat_mode: 'default'
       });
       if (generation !== sendGeneration || conversationId !== chat.conversation_id) return;
       await timeline?.reconcileMessageAdmission({ scopeKey, response });
       if (generation !== sendGeneration || conversationId !== chat.conversation_id) return;
       message = '';
+      attachments = [];
+      if (typeof localStorage !== 'undefined') localStorage.removeItem(draftKey);
       await onSent?.();
     } catch (caught) {
       if (generation !== sendGeneration || conversationId !== chat.conversation_id) return;
@@ -89,44 +100,92 @@
     }
   }
 
-  function handleKeydown(event: KeyboardEvent): void {
-    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
-      event.preventDefault();
-      void send();
+  function updateDraft(): void {
+    if (typeof localStorage === 'undefined') return;
+    if (message) localStorage.setItem(draftKey, message);
+    else localStorage.removeItem(draftKey);
+  }
+
+  async function uploadFiles(files: File[]): Promise<void> {
+    if (files.length === 0 || uploading) return;
+    const conversationId = chat.conversation_id;
+    const generation = sendGeneration;
+    uploading = true;
+    error = '';
+    try {
+      const uploaded = await Promise.all(files.map((file) => api.artifacts.upload(file)));
+      if (conversationId !== chat.conversation_id || generation !== sendGeneration) return;
+      attachments = [...attachments, ...uploaded];
+    } catch (caught) {
+      if (conversationId !== chat.conversation_id || generation !== sendGeneration) return;
+      error = caught instanceof Error ? caught.message : 'Could not upload the attachment.';
+    } finally {
+      if (conversationId === chat.conversation_id && generation === sendGeneration) uploading = false;
     }
   }
 
-  onDestroy(() => onRuntimeActiveChange?.(false));
+  async function handlePaste(event: ClipboardEvent): Promise<void> {
+    await handleClipboardFilePaste(event, uploadFiles);
+  }
+
+  async function stop(): Promise<void> {
+    if (!runtimeActive || stopping) return;
+    stopping = true;
+    error = '';
+    try {
+      await chatV2Api.cancelTurn(chat.conversation_id, { client_txn_id: crypto.randomUUID() });
+    } catch (caught) {
+      error = caught instanceof Error ? caught.message : 'Could not stop the active turn.';
+    } finally {
+      stopping = false;
+    }
+  }
+
+  function setRuntimeActive(active: boolean): void {
+    runtimeActive = active;
+    onRuntimeActiveChange?.(active);
+  }
 </script>
 
-<section class="flex h-full min-h-0 flex-col" aria-label="Task control chat" data-testid="task-control-native-chat">
-  <ScopedChatV2Timeline bind:this={timeline} {scope} {agent} compact emptyLabel="Start a task-control conversation." {onRuntimeActiveChange} />
+<section class="app-keyboard-avoiding-chat flex h-full min-h-0 flex-col" aria-label="Task control chat" data-testid="task-control-native-chat" use:keyboardAvoidance>
+  <ScopedChatV2Timeline bind:this={timeline} {scope} {agent} compact emptyLabel="Start a task-control conversation." onRuntimeActiveChange={setRuntimeActive} />
   <div class="task-control-composer shrink-0 border-t border-slate-800 bg-slate-950/95 px-3 pt-3">
     {#if error}<p class="mb-2 text-xs text-rose-300" role="alert">{error}</p>{/if}
-    <div class="flex items-end gap-2 rounded-2xl border border-slate-700 bg-slate-900 p-2 focus-within:border-sky-400">
-      <textarea
+    {#key chat.conversation_id}
+      {@const recorderConversationId = chat.conversation_id}
+      <ChatV2Composer
         bind:value={message}
-        class="max-h-36 min-h-11 flex-1 resize-none bg-transparent px-2 py-2 text-sm text-slate-100 outline-none placeholder:text-slate-500"
-        rows="1"
+        bind:attachments
+        conversationId={chat.conversation_id}
         placeholder="Message the task agent"
-        aria-label="Task control message"
-        data-testid="task-control-composer"
-        onkeydown={handleKeydown}
-      ></textarea>
-      <Button
-        class="h-10 w-10 shrink-0 rounded-xl p-0"
-        aria-label="Send task control message"
-        disabled={sending || !message.trim()}
-        onclick={() => void send()}
-      >
-        <ArrowUp class="h-4 w-4" />
-      </Button>
-    </div>
+        ariaLabel="Task control message"
+        textareaTestId="task-control-composer"
+        sendAriaLabel="Send task control message"
+        stopAriaLabel="Stop active turn"
+        busy={sending}
+        {uploading}
+        active={runtimeActive}
+        {stopping}
+        compact
+        allowQueue
+        onSend={send}
+        onStop={stop}
+        onFiles={uploadFiles}
+        onPaste={handlePaste}
+        onInput={updateDraft}
+        onRecorded={(attachment: AttachmentRef) => {
+          if (recorderConversationId !== chat.conversation_id) {
+            attachments = attachments.filter((item) => item.artifact_id !== attachment.artifact_id);
+          }
+        }}
+        onSendRecorded={() => { if (recorderConversationId === chat.conversation_id) void send(); }}
+      />
+    {/key}
   </div>
 </section>
 
 <style>
   .task-control-composer {
-    padding-bottom: max(0.75rem, env(safe-area-inset-bottom));
+    padding-bottom: var(--app-bottom-control-inset);
   }
 </style>

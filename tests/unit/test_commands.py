@@ -64,6 +64,20 @@ class _NotificationService:
         del user_email, conversation_id
         return list(self.pending_notifications)
 
+    async def find_oldest_pending_escalation(
+        self, *, user_email: str, conversation_id: str
+    ) -> object | None:
+        del user_email
+        return next(
+            (
+                item
+                for item in self.pending_notifications
+                if getattr(item, "conversation_id", None) == conversation_id
+                and getattr(item, "notification_type", None) == "escalation"
+            ),
+            None,
+        )
+
 
 class _TurnScheduler:
     def __init__(self, *, cancelled: bool) -> None:
@@ -80,8 +94,14 @@ class _TurnScheduler:
         return self.cancelled
 
     async def submit_turn(
-        self, conversation_id: str, content: str, *, user_email: str
+        self,
+        conversation_id: str,
+        content: str,
+        *,
+        user_email: str,
+        admission_origin: str | None = None,
     ) -> object | None:
+        assert admission_origin is None
         self.submitted.append((conversation_id, content, user_email))
         return self.submit_error
 
@@ -562,6 +582,47 @@ async def test_approve_deny_prefix_requires_command_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_approve_resolves_durable_escalation_without_local_waiter() -> None:
+    notifications = _NotificationService()
+    notifications.pending_notifications.append(
+        SimpleNamespace(
+            notification_id="audit-call-1",
+            notification_type="escalation",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            payload={
+                "call_id": "audit-call-1",
+                "tool_call_id": "tool-call-1",
+                "tool_name": "bash",
+            },
+        )
+    )
+    dispatcher = CommandDispatcher(
+        session_factory=_SessionFactory(),
+        session_manager=_SessionManager(),
+        session_cache=_SessionCache(),
+        compaction_strategy=_CompactionStrategy(),
+        providers=SimpleNamespace(),
+        pause_waiter=PauseWaiter(),
+        notification_service=notifications,
+    )
+    conversation = _conversation()
+    conversation.conversation_id = "conv-1"
+
+    result = await dispatcher.dispatch(
+        "/approve safe to run",
+        conversation=conversation,
+        session=_session(),
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "system_message"
+    assert notifications.calls == [("audit-call-1", "approve", {"note": "safe to run"})]
+
+
+@pytest.mark.asyncio
 async def test_slash_suggestions_include_command_and_dynamic_model_options() -> None:
     dispatcher = CommandDispatcher(
         session_factory=_SessionFactory(),
@@ -603,7 +664,7 @@ async def test_slash_suggestions_include_command_and_dynamic_model_options() -> 
 async def test_model_command_uses_provider_qualified_references() -> None:
     cache = _SessionCache(usage={"model": "gpt-5", "provider_id": "openai"})
     dispatcher = CommandDispatcher(
-        session_factory=_SessionFactory(),
+        session_factory=None,
         session_manager=_SessionManager(),
         session_cache=cache,
         compaction_strategy=_CompactionStrategy(),
@@ -1120,6 +1181,76 @@ async def test_manual_zero_turn_compaction_does_not_rotate() -> None:
     assert result.type == "system_message"
     assert result.text == "Not enough conversation history to compact."
     rotate_session.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_manual_compact_publishes_first_class_runtime_lifecycle() -> None:
+    strategy = _CompactionStrategy()
+    strategy.compact = AsyncMock(
+        return_value=SimpleNamespace(
+            compacted=True,
+            method="llm",
+            summary="Compacted history",
+            turns_compacted=4,
+            preserved_tail_events=[],
+        )
+    )
+    old_session = _session()
+    new_session = old_session.model_copy(update={"session_id": "session-new"})
+    session_cache = _SessionCache()
+    session_cache.refresh = AsyncMock()
+    agent_loop = _LockingAgentLoop()
+    agent_loop.event_bus = SimpleNamespace(publish=AsyncMock())
+    scheduler = _TurnScheduler(cancelled=False)
+    scheduler._agent_loop = agent_loop
+    rotate_session = AsyncMock(return_value=new_session)
+    dispatcher = CommandDispatcher(
+        session_factory=None,
+        session_manager=SimpleNamespace(rotate_session=rotate_session),
+        session_cache=session_cache,
+        compaction_strategy=strategy,
+        providers=SimpleNamespace(
+            llm=SimpleNamespace(
+                resolve_model_target=AsyncMock(
+                    return_value=("default-model", SimpleNamespace(provider_id="default"))
+                )
+            )
+        ),
+        pause_waiter=PauseWaiter(),
+        notification_service=_NotificationService(),
+        turn_scheduler=scheduler,
+    )
+
+    result = await dispatcher.dispatch(
+        "/compact",
+        conversation=_conversation(),
+        session=old_session,
+        agent=_agent(),
+        user_email="user@example.com",
+    )
+
+    assert result is not None
+    assert result.type == "session_compacted"
+    published = [call.args[0] for call in agent_loop.event_bus.publish.await_args_list]
+    assert [event.type.value for event in published] == [
+        "session_compaction_started",
+        "session_compacted",
+    ]
+    assert published[0].data["session_id"] == old_session.session_id
+    assert published[1].data["previous_session_id"] == old_session.session_id
+    assert published[1].data["session_id"] == new_session.session_id
+    marker_data = rotate_session.await_args.kwargs["compaction_summary_event_data"]
+    assert marker_data == {
+        "method": "llm",
+        "turns_compacted": 4,
+        "trigger": "manual",
+        "status": "compacted",
+        "tokens_before": None,
+        "tokens_after": None,
+        "reason": None,
+        "compaction_id": marker_data["compaction_id"],
+    }
+    assert marker_data["compaction_id"].startswith("compact_")
 
 
 @pytest.mark.asyncio
@@ -3040,6 +3171,9 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
         agent_id="agent-1",
         status="idle",
         previous_session_id="sess-0",
+        model_override="gpt-6-astra",
+        model_override_provider_id="codex",
+        runtime_override_revision=1,
     )
     child = SessionModel(
         session_id="sess-child-1",
@@ -3126,7 +3260,6 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
         pause_waiter=PauseWaiter(),
         notification_service=_NotificationService(),
     )
-
     result = await dispatcher.dispatch(
         "/info",
         conversation=_conversation(),
@@ -3139,7 +3272,8 @@ async def test_info_renders_runtime_intaris_and_subsession_metadata(
     assert result is not None
     assert result.type == "system_message"
     assert result.text is not None
-    assert "Model: gpt-5.4" in result.text
+    assert "Selected model: codex/gpt-6-astra (session override)" in result.text
+    assert "Last context model: gpt-5.4" in result.text
     assert "Model context window: 1,048,576 tokens" in result.text
     assert (
         "LLM diagnostics: provider reported hosted instruction drift "

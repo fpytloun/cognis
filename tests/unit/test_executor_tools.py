@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from cognis.models.tool import ExecutorHandle
+from cognis.models.tool import ExecutorHandle, ToolResult
 from cognis.tools.executor import filesystem as filesystem_module
 from cognis.tools.executor.definitions import (
     ALL_EXECUTOR_TOOLS,
@@ -70,7 +70,11 @@ class TestDefinitions:
     """Test tool definition registry."""
 
     def test_executor_tool_definitions_returns_all(self) -> None:
-        defs = executor_tool_definitions()
+        from cognis.executor.tool_definitions_runtime import (
+            executor_tool_definitions as runtime_executor_tool_definitions,
+        )
+
+        defs = runtime_executor_tool_definitions()
         # Web tools are dynamic, but the static executor registry now also
         # includes browser and document tools.
         assert len(defs) >= 11
@@ -2089,6 +2093,25 @@ class TestGlobTool:
         assert "No files found" in result.output
 
     @pytest.mark.asyncio()
+    async def test_glob_python_fallback_runs_in_worker_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        to_thread = AsyncMock(return_value=ToolResult(output="worker result"))
+        monkeypatch.setattr(search_module, "_FD_PATH", None)
+        monkeypatch.setattr(search_module.asyncio, "to_thread", to_thread)
+
+        result = await handle_glob({"pattern": "*.py", "path": str(tmp_path)}, _DUMMY_CONTEXT)
+
+        assert result.output == "worker result"
+        to_thread.assert_awaited_once_with(
+            search_module._glob_with_python_sync,
+            tmp_path,
+            "*.py",
+        )
+
+    @pytest.mark.asyncio()
     async def test_glob_defaults_to_home_when_path_omitted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2155,6 +2178,31 @@ class TestGrepTool:
         )
         assert not result.is_error
         assert "No matches" in result.output
+
+    @pytest.mark.asyncio()
+    async def test_grep_python_fallback_runs_in_worker_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from cognis.tools.executor import search as search_module
+
+        to_thread = AsyncMock(return_value=ToolResult(output="worker result"))
+        monkeypatch.setattr(search_module, "_RG_PATH", None)
+        monkeypatch.setattr(search_module.asyncio, "to_thread", to_thread)
+
+        result = await handle_grep(
+            {"pattern": "needle", "path": str(tmp_path)},
+            _DUMMY_CONTEXT,
+        )
+
+        assert result.output == "worker result"
+        await_args = to_thread.await_args
+        assert await_args is not None
+        assert await_args.args[:4] == (
+            search_module._grep_with_python_sync,
+            tmp_path,
+            "needle",
+            [],
+        )
 
     @pytest.mark.asyncio()
     async def test_grep_defaults_to_home_when_path_omitted(
@@ -2865,6 +2913,7 @@ class TestBashTool:
             executor_handle=ExecutorHandle(executor_id="exec-a", executor_type="in_process"),
             runtime_metadata={
                 "runtime_access": {
+                    "user_email": "user@example.com",
                     "conversation_id": "conv-1",
                     "session_id": "sess-1",
                     "agent_id": "agent-1",
@@ -2894,6 +2943,7 @@ class TestBashTool:
         assert status["description"] == "Run slow regression tests"
         assert status["executor_id"] == "exec-a"
         assert status["executor_type"] == "in_process"
+        assert status["user_email"] == "user@example.com"
         assert status["conversation_id"] == "conv-1"
         assert isinstance(status["pid"], int)
 

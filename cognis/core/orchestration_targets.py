@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from cognis.core.agent_profiles import agent_profile_options
 from cognis.models.agent import AgentDefinition
@@ -169,4 +169,4 @@ class OrchestrationTargetService:
                 code=code,
                 message=f"Agent '{normalized}' is no longer an eligible {mode.value} target.",
             )
-        return target
+        return cast(AgentDefinition, target)

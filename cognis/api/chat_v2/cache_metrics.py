@@ -37,6 +37,7 @@ RefreshTier = Literal["local", "redis"]
 InvalidationSource = Literal[
     "append",
     "cluster_signal",
+    "explicit_refresh",
     "generation_change",
     "local_eviction",
 ]
@@ -76,7 +77,7 @@ _COMPRESSION_OUTCOMES = frozenset(
 )
 _REFRESH_TIERS = frozenset({"local", "redis"})
 _INVALIDATION_SOURCES = frozenset(
-    {"append", "cluster_signal", "generation_change", "local_eviction"}
+    {"append", "cluster_signal", "explicit_refresh", "generation_change", "local_eviction"}
 )
 _BYPASS_REASONS = frozenset(
     {

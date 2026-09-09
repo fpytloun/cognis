@@ -39,9 +39,22 @@ uv pip install -e ".[dev]"
 uv run cognis-controller serve
 ```
 
+The published `cognis-controller` package is remote-WebSocket-only. If the
+controller must run local in-process or subprocess tools, install the executor
+package as well:
+
+```bash
+pip install "cognis-controller" "cognis-executor[full]"
+```
+
+There is no `local-executors` extra. The official controller image intentionally
+contains no local executor runtime, so it must connect an external or sidecar
+executor. Persisted local executor rows are shown as unavailable until that
+package/process is installed and connected.
+
 ## Docker controller
 
-Run Cognis with a persistent data volume:
+Run the remote-only controller with a persistent data volume:
 
 ```bash
 docker run -d \
@@ -130,6 +143,11 @@ Put Cognis behind a reverse proxy for public deployments. The proxy should suppo
 - request body limits appropriate for artifacts and uploads
 - long-lived WebSocket timeouts
 
+Set `COGNIS_TRUSTED_PROXY_CIDRS` to the comma-separated CIDRs of the immediate
+reverse proxies. Cognis uses this setting for forwarded schemes, Secure cookies,
+and WebSocket origin checks. Trusted proxies must replace untrusted
+`X-Forwarded-Proto` values and sanitize all forwarded headers.
+
 Remote executors should connect to `wss://<host>/api/executor/ws`.
 
 ## Kubernetes and high availability
@@ -165,6 +183,135 @@ Compression uses a bounded versioned wire format and a hard 16 MiB
 decompressed-value limit. Disabling Redis retains the configured local L1
 policy; Redis and codec failures remain cache misses rather than readiness or
 request failures.
+
+### Trusted Mnemory evidence rollout
+
+Trusted evidence is disabled by default. Enable it only after Cognis and
+Mnemory contract versions are deployed together:
+
+```text
+COGNIS_TRUSTED_EVIDENCE_ENABLED=false
+COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST=
+COGNIS_TRUSTED_EVIDENCE_MAX_ATTEMPTS=8
+COGNIS_TRUSTED_EVIDENCE_MAX_AGE_SECONDS=3600
+```
+
+Evidence requires both `COGNIS_TRUSTED_EVIDENCE_ENABLED=true` and an effective
+agent owner in `COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST`. The allowlist is a
+comma-separated list of owner email identifiers. Cognis trims and lowercases
+each entry; an empty list selects nobody, and an empty entry between commas is
+invalid. This list selects agent owners, not authenticated users. For example:
+
+```text
+# Initial rollout: no evidence markers, rows, or JWTs.
+COGNIS_TRUSTED_EVIDENCE_ENABLED=false
+COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST=
+
+# Canary one owner after both service contracts are deployed.
+COGNIS_TRUSTED_EVIDENCE_ENABLED=true
+COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST=owner@example.com
+```
+
+The feature flag and owner allowlist control new evidence admission only.
+Cognis stores each admission decision with the durable direct turn. The first
+request for an idempotency key owns this decision.
+
+A positive decision is also stored in the Intaris event marker and evidence
+queue row. A queue worker uses this frozen decision after an authoritative
+event reread. Its current feature flag and allowlist do not revoke the row.
+Missing, malformed, negative, or unsupported admission data never creates
+evidence.
+
+Removing an owner stops new evidence admission for that owner. New-code workers
+can still complete previously admitted rows. They reread the exact event and
+make sure that the session, conversation, agent, user, owner, marker, and hashes
+still match. A policy-fingerprint difference creates a warning and metric. It
+does not change readiness or reject a valid admitted row.
+
+Use two rolling updates for the first activation:
+
+1. Deploy the rolling-safe Cognis binary to all replicas with evidence disabled.
+2. Make sure that all old binaries are gone.
+3. Add the optional allowlist Secret reference and enable one canary owner.
+4. Roll the two controller replicas one at a time.
+5. Make sure that one ready Service endpoint remains during the complete update.
+6. Make sure that both replicas report no active policy mismatch after the update.
+
+Do not mix an old binary with active evidence admission. An old worker does not
+understand the frozen admission decision. For configuration rollback, disable
+new admission with another rolling update. Keep the rolling-safe binary until
+all admitted rows are terminal.
+
+For Helm deployments, configure the optional Secret reference without putting
+owner identifiers in values files:
+
+```yaml
+trustedEvidence:
+  enabled: true
+  ownerAllowlistSecret: cognis-policy
+  ownerAllowlistSecretKey: trusted-evidence-owner-allowlist
+  maxAttempts: 8
+  maxAgeSeconds: 3600
+```
+
+The referenced Secret must contain one comma-separated owner allowlist value.
+The empty default selects no owners.
+
+The controller writes only a versioned marker to the durable user event. The
+remember queue rereads the exact Intaris event, derives a fresh 60-second
+evidence JWT, and sends it only to `/api/evidence/remember/v1`. Queue payloads
+contain assertions and hashes, not message content or tokens.
+
+The copied Mnemory golden contract fixture is from
+`mnemory/tests/contract/fixtures/evidence_remember_v1.json` at server commit
+`3dda2c0494783b7e9a36e15094460513b150b343`; its SHA-256 is
+`5e734a5597c40c0b7116b98253525774ef55d283c2cf9412896977ad3be8e407`.
+
+Retry is bounded by both maximum attempts and maximum age. Accepted, replayed,
+recovered, skipped, rejected, conflict, abandoned, and unavailable outcomes
+are terminal for evidence. Ordinary user and assistant memory rows run only
+after evidence reaches a terminal state, including abandoned or unavailable.
+Evidence dispatch lease expiry returns to pending; ordinary ambiguous remember
+behavior is unchanged.
+
+The lifecycle is append → marker → deterministic evidence row → exact reread →
+fresh JWT dispatch → retained terminal ledger → dependent ordinary rows. The
+agent loop coordinates this sequence; marker, hash, reconstruction, and queue
+policy live in focused core modules.
+
+Roll out Mnemory first. Then roll out the rolling-safe Cognis binary with the
+flag disabled. Enable the canary only after all Cognis replicas use this binary.
+
+### External rolling-update watchdog
+
+Run the watchdog on Maitrea. Do not run it in a Cognis controller pod. Start it
+before the Argo sync that changes the controller configuration:
+
+```bash
+python3 scripts/watch_statefulset_rollout.py \
+  --namespace "$NAMESPACE" \
+  --statefulset "$STATEFULSET" \
+  --service "$SERVICE" \
+  --health-url "$HEALTH_URL" \
+  --target-image "$TARGET_IMAGE" \
+  --application "$ARGO_APPLICATION" \
+  --rollback-revision "$ROLLBACK_REVISION"
+```
+
+Set each variable from the approved deployment revision. Set
+`ROLLBACK_REVISION` to the immutable previous healthy Git revision. The
+watchdog passes these values as separate `kubectl` arguments.
+
+The watchdog rolls back after three consecutive unsafe samples. Unsafe samples
+include more than one unavailable controller, no ready Service endpoint, HTTP
+503, another non-success status, and read failures. It also rolls back on
+timeout. After rollback, make sure that one endpoint stayed ready and both
+controller replicas are ready.
+
+The HA chart uses two replicas, a StatefulSet rolling update, and a PDB with
+`minAvailable: 1`. The StatefulSet controller replaces one ordinal at a time.
+The external watchdog verifies availability during the update because the PDB
+does not control normal StatefulSet replacement order.
 
 ## Multi-user hardening
 

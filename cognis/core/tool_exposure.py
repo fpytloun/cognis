@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from cognis.core.tool_deferral import deferred_builtin_family_names
 from cognis.models.config import ModelInfo
 from cognis.models.tool import (
     ToolDefinition,
     stable_tool_id,
     tool_input_schema,
     tool_profile_group,
+    tool_provider_exposure_schema,
 )
-from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
+from cognis.tools.builtin.orchestration import is_task_tool
+from cognis.tools.builtin.tool_search import CALL_TOOL_TOOL, DESCRIBE_TOOL_TOOL, SEARCH_TOOLS_TOOL
 
 _VISIBLE_TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_VISIBLE_TOOL_NAME_LENGTH = 64
@@ -27,6 +32,9 @@ _JSON_SCHEMA_METADATA_KEYS = frozenset({"$schema", "$id", "$comment"})
 _ARGUMENT_ALIAS_ANY_PROPERTY = "*"
 _ARGUMENT_ALIAS_REF = "$cognis_ref"
 _ARGUMENT_ALIAS_REF_DEFINITIONS = "$cognis_refs"
+_MAX_DIRECT_SCHEMA_BYTES = 8 * 1024
+_REPORTED_OVERSIZED_DIRECT_SCHEMAS: set[tuple[str, int]] = set()
+logger = logging.getLogger(__name__)
 _JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS = frozenset(
     {
         "allOf",
@@ -82,6 +90,25 @@ class ToolDiscoveryMode(StrEnum):
     CONTROLLER_SEARCH = "controller_search"
     ANTHROPIC_NATIVE_SEARCH = "anthropic_native_search"
     NONE = "none"
+
+
+def _source_count_bucket(tool: ToolDefinition) -> str:
+    if tool.source.type in {"builtin", "executor", "local_mcp", "intaris_mcp"}:
+        return tool.source.type
+    return "skill_other"
+
+
+def _source_counts(tools: list[ToolDefinition]) -> dict[str, int]:
+    counts = {
+        "builtin": 0,
+        "executor": 0,
+        "local_mcp": 0,
+        "intaris_mcp": 0,
+        "skill_other": 0,
+    }
+    for tool in tools:
+        counts[_source_count_bucket(tool)] += 1
+    return counts
 
 
 class EditToolMode(StrEnum):
@@ -148,7 +175,9 @@ def detect_edit_tool_family(model_id: str | None) -> EditToolFamily:
         return EditToolFamily.GEMINI
     if normalized.startswith("groq/"):
         return EditToolFamily.GROQ
-    if ("gpt-5" in normalized or "codex" in normalized) and "gpt-oss" not in normalized:
+    if (
+        "gpt-5" in normalized or "gpt-6" in normalized or "codex" in normalized
+    ) and "gpt-oss" not in normalized:
         return EditToolFamily.GPT5
     if any(token in normalized for token in _OPEN_SOURCE_MODEL_TOKENS):
         return EditToolFamily.OPEN_SOURCE
@@ -166,12 +195,14 @@ def preferred_edit_tool_mode(model_id: str | None) -> EditToolMode:
 def filter_edit_tools_for_model(
     tools: list[ToolDefinition], model_id: str | None
 ) -> list[ToolDefinition]:
-    """Drop mutually-exclusive edit tools when both surfaces are available."""
+    """Expose only the preferred editing surface for the model family."""
 
-    tool_names = {tool.name for tool in tools}
+    tool_names = {tool.name for tool in tools if is_file_edit_tool(tool)}
     has_patch = bool(tool_names & _APPLY_PATCH_TOOL_NAMES)
     has_exact = bool(tool_names & _EXACT_TOOL_NAMES)
-    if not (has_patch and has_exact):
+    if not (has_patch and has_exact) and (
+        detect_edit_tool_family(model_id) not in {EditToolFamily.GPT5, EditToolFamily.ANTHROPIC}
+    ):
         return tools
 
     preferred = preferred_edit_tool_mode(model_id)
@@ -180,10 +211,17 @@ def filter_edit_tools_for_model(
     )
     filtered: list[ToolDefinition] = []
     for tool in tools:
-        if tool.name in _APPLY_PATCH_TOOL_NAMES | _EXACT_TOOL_NAMES and tool.name not in keep_names:
+        if is_file_edit_tool(tool) and tool.name not in keep_names:
             continue
         filtered.append(tool)
     return filtered
+
+
+def is_file_edit_tool(tool: ToolDefinition) -> bool:
+    """Identify Cognis editors without matching external tools by name alone."""
+    return tool.source.type in {"builtin", "executor"} and tool.name in (
+        _APPLY_PATCH_TOOL_NAMES | _EXACT_TOOL_NAMES
+    )
 
 
 def _normalize_model_name(model_id: str | None) -> str:
@@ -224,18 +262,39 @@ def prepare_tool_exposure(
     - ``search_tools`` is included whenever hidden tools remain
     - remaining slots go to policy-visible non-MCP tools first, then MCP
     """
-    controller_tool_schemas_with_search = list(controller_tool_schemas)
+    validate_direct_schema_sizes(inventory_tools)
+    controller_tool_schemas_with_search = [
+        {
+            **schema,
+            "function": dict(schema["function"])
+            if isinstance(schema.get("function"), dict)
+            else {},
+        }
+        for schema in controller_tool_schemas
+    ]
     controller_tool_schemas_without_search = [
         schema
         for schema in controller_tool_schemas_with_search
         if schema.get("function", {}).get("name") != SEARCH_TOOLS_TOOL.name
+    ]
+    discovery_kernel_names = {
+        SEARCH_TOOLS_TOOL.name,
+        DESCRIBE_TOOL_TOOL.name,
+        CALL_TOOL_TOOL.name,
+    }
+    controller_tool_schemas_without_discovery_kernel = [
+        schema
+        for schema in controller_tool_schemas_with_search
+        if schema.get("function", {}).get("name") not in discovery_kernel_names
     ]
     request_kwargs: dict[str, Any] = {}
 
     effective_model_id = getattr(model_info, "model_id", None)
     edit_tool_family = detect_edit_tool_family(effective_model_id)
     edit_tool_mode = preferred_edit_tool_mode(effective_model_id)
-    sorted_inventory = sorted(inventory_tools, key=_tool_sort_key)
+    sorted_inventory = sorted(
+        filter_edit_tools_for_model(inventory_tools, effective_model_id), key=_tool_sort_key
+    )
 
     # Resolve policy-visible set.
     visible_defaults: set[str] = (
@@ -243,6 +302,9 @@ def prepare_tool_exposure(
         if default_visible_tool_ids is not None
         else {stable_tool_id(tool) for tool in sorted_inventory if not _is_deferred_tool(tool)}
     )
+    visible_defaults = visible_defaults | {
+        stable_tool_id(tool) for tool in sorted_inventory if is_file_edit_tool(tool)
+    }
 
     # Build the three logical sets.
     policy_visible_tools = [
@@ -251,6 +313,19 @@ def prepare_tool_exposure(
     hidden_searchable_tools = [
         tool for tool in sorted_inventory if stable_tool_id(tool) not in visible_defaults
     ]
+    deferred_names = _deferred_integration_names(
+        [tool for tool in hidden_searchable_tools if stable_tool_id(tool) not in promoted_tool_ids]
+    )
+    if deferred_names:
+        for schema in controller_tool_schemas_with_search:
+            function = schema.get("function")
+            if not isinstance(function, dict) or function.get("name") != SEARCH_TOOLS_TOOL.name:
+                continue
+            function["description"] = (
+                f"{function.get('description', '').rstrip()} "
+                "Use search_tools to find other authorized operations in these deferred "
+                f"capabilities: {', '.join(deferred_names)}."
+            )
 
     # Promoted tools must be actually visible next turn regardless of policy
     # status.  A tool can be in ``visible_defaults`` (policy-visible) yet still
@@ -261,11 +336,6 @@ def prepare_tool_exposure(
     promoted_visible = [
         tool for tool in sorted_inventory if stable_tool_id(tool) in promoted_tool_ids
     ]
-    policy_visible_tools = filter_edit_tools_for_model(policy_visible_tools, effective_model_id)
-    hidden_searchable_tools = filter_edit_tools_for_model(
-        hidden_searchable_tools, effective_model_id
-    )
-    promoted_visible = filter_edit_tools_for_model(promoted_visible, effective_model_id)
 
     # search_tools lives in the controller schemas, not the inventory.
     search_tool_schema_present = any(
@@ -323,8 +393,8 @@ def prepare_tool_exposure(
     use_openai_controller_search_fallback = bool(
         use_responses_api and discovery_enabled and search_tool_schema_present and has_hidden
     )
-    if use_anthropic_defer or not allow_tool_search:
-        filtered_controller_tool_schemas = controller_tool_schemas_without_search
+    if use_anthropic_defer or not allow_tool_search or not has_hidden:
+        filtered_controller_tool_schemas = controller_tool_schemas_without_discovery_kernel
     elif not use_responses_api or use_openai_controller_search_fallback:
         filtered_controller_tool_schemas = controller_tool_schemas_with_search
     else:
@@ -357,7 +427,6 @@ def prepare_tool_exposure(
             if stable_tool_id(tool) not in promoted_tool_ids
         ]
         visible_tools = policy_visible_tools + promoted_non_policy + remaining_hidden
-        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(
             visible_tools,
             alias_map,
@@ -380,7 +449,6 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=has_hidden,
         )
-        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
 
@@ -393,7 +461,6 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=False,
         )
-        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
         request_kwargs = {"tool_choice": "auto", "parallel_tool_calls": True}
 
@@ -406,7 +473,6 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=has_hidden,
         )
-        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
     else:
@@ -418,7 +484,6 @@ def prepare_tool_exposure(
             available_slots=available_slots,
             has_hidden=False,
         )
-        visible_tools = filter_edit_tools_for_model(visible_tools, effective_model_id)
         tool_schemas = _build_inventory_schemas(visible_tools, alias_map)
 
     native_apply_patch_exposed = False
@@ -439,11 +504,24 @@ def prepare_tool_exposure(
         native_apply_patch_exposed = True
 
     visible_tool_ids = {stable_tool_id(tool) for tool in visible_tools}
-    hidden_searchable_tool_ids = {
-        stable_tool_id(tool)
-        for tool in hidden_searchable_tools
-        if stable_tool_id(tool) not in visible_tool_ids
-    }
+    if use_anthropic_defer:
+        hidden_searchable_tool_ids = set(deferred_tool_ids)
+    else:
+        hidden_searchable_tool_ids = {
+            stable_tool_id(tool)
+            for tool in sorted_inventory
+            if stable_tool_id(tool) not in visible_tool_ids
+        }
+    semantically_hidden_ids = hidden_searchable_tool_ids
+    semantically_hidden_tools = [
+        tool for tool in sorted_inventory if stable_tool_id(tool) in semantically_hidden_ids
+    ]
+    semantically_visible_tools = [
+        tool
+        for tool in sorted_inventory
+        if stable_tool_id(tool) in visible_tool_ids
+        and stable_tool_id(tool) not in semantically_hidden_ids
+    ]
     promoted_inventory_ids = {stable_tool_id(tool) for tool in promoted_visible}
     promoted_visible_ids = visible_tool_ids & promoted_inventory_ids
     native_server_tool_schemas: list[dict[str, Any]] = []
@@ -495,6 +573,8 @@ def prepare_tool_exposure(
             # here indicates slot-cap pressure.
             "promoted_visible_count": len(promoted_visible_ids),
             "visible_tool_count": len(visible_tools),
+            "visible_source_counts": _source_counts(semantically_visible_tools),
+            "hidden_source_counts": _source_counts(semantically_hidden_tools),
             "max_tools": max_tools,
             "edit_tool_family": str(edit_tool_family),
             "edit_tool_mode": str(edit_tool_mode),
@@ -504,10 +584,94 @@ def prepare_tool_exposure(
             "argument_alias_tool_count": len(argument_alias_map),
             "native_anthropic_search_requested": native_anthropic_search_requested,
             "native_anthropic_search_enabled": use_anthropic_defer,
+            "exposure_manifest": _build_exposure_manifest(
+                inventory_tools=sorted_inventory,
+                controller_schemas=filtered_controller_tool_schemas,
+                visible_tool_ids=visible_tool_ids,
+                hidden_tool_ids=hidden_searchable_tool_ids,
+                promoted_tool_ids=promoted_visible_ids,
+            ),
             "native_anthropic_search_reason": native_anthropic_search_reason,
             "native_anthropic_tool_count": native_anthropic_tool_count,
         },
     )
+
+
+def _deferred_integration_names(tools: list[ToolDefinition]) -> list[str]:
+    family_names: dict[str, str] = {
+        name.casefold(): name for name in deferred_builtin_family_names(tool.name for tool in tools)
+    }
+    if any(is_task_tool(tool.name) for tool in tools):
+        family_names["task management"] = "task management"
+    integration_names: dict[str, str] = {}
+    for tool in tools:
+        if tool.source.type not in {"local_mcp", "intaris_mcp"}:
+            continue
+        name = str(tool.source.server_name or tool.source.server_id or "").strip()
+        if name:
+            integration_names.setdefault(name.casefold(), name)
+    for family_key in family_names:
+        integration_names.pop(family_key, None)
+    remaining_slots = max(0, 20 - len(family_names))
+    names = [
+        *family_names.values(),
+        *sorted(integration_names.values(), key=str.casefold)[:remaining_slots],
+    ]
+    return sorted(names, key=str.casefold)
+
+
+def _schema_bytes(schema: dict[str, Any]) -> int:
+    return len(json.dumps(schema, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _build_exposure_manifest(
+    *,
+    inventory_tools: list[ToolDefinition],
+    controller_schemas: list[dict[str, Any]],
+    visible_tool_ids: set[str],
+    hidden_tool_ids: set[str],
+    promoted_tool_ids: set[str],
+) -> list[dict[str, Any]]:
+    manifest: list[dict[str, Any]] = []
+    for tool in inventory_tools:
+        tool_id = stable_tool_id(tool)
+        if tool_id in promoted_tool_ids:
+            reason = "promoted"
+        elif tool_id in hidden_tool_ids:
+            reason = "deferred"
+        elif tool_id in visible_tool_ids:
+            reason = "policy_visible"
+        else:
+            reason = "provider_cap_hidden"
+        manifest.append(
+            {
+                "tool_id": tool_id,
+                "name": tool.name,
+                "source": tool.source.type,
+                "exposure_reason": reason,
+                "schema_bytes": _schema_bytes(tool_provider_exposure_schema(tool)),
+                "active_skill_id": tool.source.skill_id,
+            }
+        )
+    for schema in controller_schemas:
+        function = schema.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        parameters = function.get("parameters")
+        if not isinstance(name, str) or not isinstance(parameters, dict):
+            continue
+        manifest.append(
+            {
+                "tool_id": f"builtin:{name}",
+                "name": name,
+                "source": "controller",
+                "exposure_reason": "controller_direct",
+                "schema_bytes": _schema_bytes(parameters),
+                "active_skill_id": None,
+            }
+        )
+    return manifest
 
 
 def _select_fallback_visible_tools(
@@ -520,10 +684,11 @@ def _select_fallback_visible_tools(
     """Select the actual visible tool set under a controller-search fallback cap.
 
     Priority order (highest first):
-    1. Critical helpers (``skill_load``, ``read_tool_output*``)
-    2. Promoted tools (explicitly surfaced by search or skill activation)
-    3. Non-MCP policy-visible tools (builtins, executor tools)
-    4. MCP policy-visible tools
+    1. Authorized model-selected file editors (required direct tools)
+    2. Critical helpers (``skill_load``, ``read_tool_output*``)
+    3. Promoted tools (explicitly surfaced by search or skill activation)
+    4. Non-MCP policy-visible tools (builtins, executor tools)
+    5. MCP policy-visible tools
 
     ``search_tools`` is handled by the controller schema layer, not here.
     The slot budget passed in already excludes the controller schema count.
@@ -531,12 +696,21 @@ def _select_fallback_visible_tools(
     if available_slots is None:
         return _unique_tools(policy_visible_tools + promoted_tools)
 
-    critical = [t for t in policy_visible_tools if _is_critical_generic_tool(t)]
+    editors = [t for t in policy_visible_tools if is_file_edit_tool(t)]
+    if len(editors) > available_slots:
+        raise ValueError("Tool slot limit cannot fit the authorized editing surface")
+    editor_ids = {stable_tool_id(t) for t in editors}
+    critical = [
+        t
+        for t in policy_visible_tools
+        if _is_critical_generic_tool(t) and stable_tool_id(t) not in editor_ids
+    ]
+    promoted_tools = [t for t in promoted_tools if stable_tool_id(t) not in editor_ids]
     promoted_set = {stable_tool_id(t) for t in promoted_tools}
     non_critical_policy = [
         t
         for t in policy_visible_tools
-        if not _is_critical_generic_tool(t) and stable_tool_id(t) not in promoted_set
+        if not _is_critical_generic_tool(t) and stable_tool_id(t) not in promoted_set | editor_ids
     ]
     non_mcp_policy = [t for t in non_critical_policy if not _is_mcp_tool(t)]
     mcp_policy = [t for t in non_critical_policy if _is_mcp_tool(t)]
@@ -544,7 +718,7 @@ def _select_fallback_visible_tools(
     # Reserve one slot for search_tools when hidden tools remain.
     search_reserve = 1 if has_hidden else 0
 
-    visible: list[ToolDefinition] = []
+    visible: list[ToolDefinition] = list(editors)
 
     for tool in critical:
         if len(visible) >= available_slots:
@@ -590,13 +764,49 @@ def _build_inventory_schemas(
         function_schema: dict[str, Any] = {
             "name": visible_name,
             "description": tool.description,
-            "parameters": _strip_schema_metadata(tool_input_schema(tool)),
+            "parameters": _strip_schema_metadata(tool_provider_exposure_schema(tool)),
             "x-stable-tool-id": stable_tool_id(tool),
         }
         if stable_tool_id(tool) in deferred_tool_ids:
             function_schema["defer_loading"] = True
         schemas.append({"type": "function", "function": function_schema})
     return schemas
+
+
+def validate_direct_schema_sizes(tools: list[ToolDefinition]) -> None:
+    """Warn once for oversized direct schemas without compact exposure metadata.
+
+    Schema size is a provider-payload optimization concern. It must not block a
+    turn because the authoritative schema remains valid for execution.
+    """
+
+    for tool in tools:
+        if tool.source.type not in {"builtin", "controller"}:
+            continue
+        schema_bytes = len(
+            json.dumps(
+                tool_provider_exposure_schema(tool),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if (
+            schema_bytes > _MAX_DIRECT_SCHEMA_BYTES
+            and tool.provider_exposure_schema is None
+            and not tool.provider_exposure_waiver
+        ):
+            warning_key = (stable_tool_id(tool), schema_bytes)
+            if warning_key not in _REPORTED_OVERSIZED_DIRECT_SCHEMAS:
+                _REPORTED_OVERSIZED_DIRECT_SCHEMAS.add(warning_key)
+                logger.warning(
+                    "Oversized direct tool schema has no provider exposure metadata",
+                    extra={
+                        "tool_id": stable_tool_id(tool),
+                        "tool_name": tool.name,
+                        "schema_bytes": schema_bytes,
+                        "schema_limit_bytes": _MAX_DIRECT_SCHEMA_BYTES,
+                    },
+                )
 
 
 def _mark_anthropic_cache_breakpoint(

@@ -1,12 +1,41 @@
 <script lang="ts">
+  import { goto } from '$app/navigation';
+  import { page } from '$app/state';
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
-  import { richDeliverableDataScenario } from '$lib/components/rich/rich-deliverable-data.fixture';
-  import { dailyPulseScenario } from '$lib/components/rich/daily-pulse.fixture';
-  import { richDeliverableVisualScenarios } from '$lib/components/rich/rich-deliverable.fixture';
+  import {
+    defaultRichScenarioId,
+    getRichScenario,
+    requireRichScenario,
+    richGalleryScenarios,
+  } from '$lib/rich-scenarios/registry';
 
-  const scenarios = [...richDeliverableVisualScenarios, dailyPulseScenario, richDeliverableDataScenario];
-  let selectedIndex = 0;
-  $: scenario = scenarios[selectedIndex] ?? scenarios[0];
+  const allowedWidths = new Set(['390', '768', '1280', '1440']);
+  const allowedThemes = new Set(['light', 'dark', 'system']);
+  const allowedSurfaces = new Set(['embedded', 'standalone']);
+  let requestedScenarioId = $derived(page.url.searchParams.get('scenario') ?? defaultRichScenarioId);
+  let scenario = $derived(getRichScenario(requestedScenarioId) ?? requireRichScenario(defaultRichScenarioId));
+  let width = $derived(allowedWidths.has(page.url.searchParams.get('width') ?? '')
+    ? page.url.searchParams.get('width')! : '1280');
+  let theme = $derived(allowedThemes.has(page.url.searchParams.get('theme') ?? '')
+    ? page.url.searchParams.get('theme')! : 'system');
+  let surface = $derived((allowedSurfaces.has(page.url.searchParams.get('surface') ?? '')
+    ? page.url.searchParams.get('surface') : 'embedded') as 'embedded' | 'standalone');
+
+  $effect(() => {
+    const previousTheme = document.documentElement.dataset.resolvedTheme;
+    if (theme === 'system') delete document.documentElement.dataset.resolvedTheme;
+    else document.documentElement.dataset.resolvedTheme = theme;
+    return () => {
+      if (previousTheme === undefined) delete document.documentElement.dataset.resolvedTheme;
+      else document.documentElement.dataset.resolvedTheme = previousTheme;
+    };
+  });
+
+  function selectScenario(id: string) {
+    const url = new URL(page.url);
+    url.searchParams.set('scenario', id);
+    void goto(`${url.pathname}${url.search}`, { keepFocus: true, noScroll: true });
+  }
 </script>
 
 <svelte:head>
@@ -21,13 +50,14 @@
       <p>Real-world fixture scenarios for browser-polishing the renderer beyond Markdown.</p>
     </div>
     <div class="fixture-tabs" role="tablist" aria-label="Rich deliverable scenarios">
-      {#each scenarios as item, index}
+      {#each richGalleryScenarios as item}
         <button
           type="button"
           role="tab"
-          aria-selected={index === selectedIndex}
-          class:active={index === selectedIndex}
-          on:click={() => selectedIndex = index}
+          aria-selected={item.id === scenario.id}
+          class:active={item.id === scenario.id}
+          data-scenario-id={item.id}
+          onclick={() => selectScenario(item.id)}
         >
           {item.title}
         </button>
@@ -35,7 +65,15 @@
     </div>
   </section>
 
-  <section class="fixture-shell" data-testid="rich-deliverable-fixture" data-scenario={scenario.id}>
+  <section
+    class="fixture-shell"
+    data-testid="rich-deliverable-fixture"
+    data-scenario={scenario.id}
+    data-theme={theme}
+    data-width={width}
+    data-surface={surface}
+    style={`--fixture-review-width: ${width}px`}
+  >
     <div class="scenario-meta">
       <span>{scenario.id}</span>
       <p>{scenario.description}</p>
@@ -46,8 +84,8 @@
         content={scenario.content}
          payload={scenario.payload}
          instanceId={`fixture-${scenario.id}`}
-         standaloneUrl={`/rich-deliverable-fixture#${scenario.id}`}
-         surface="embedded"
+         standaloneUrl={`/rich-deliverable-fixture?scenario=${encodeURIComponent(scenario.id)}&theme=${theme}&width=${width}&surface=standalone`}
+         {surface}
       />
     {/key}
   </section>
@@ -58,8 +96,10 @@
     width: 100%;
     min-width: 0;
     max-width: 100%;
+    height: 100%;
     min-height: 100%;
-    overflow: visible;
+    overflow-y: auto;
+    overscroll-behavior: contain;
     background:
       radial-gradient(circle at 12% 0%, rgb(56 189 248 / 0.18), transparent 28rem),
       radial-gradient(circle at 88% 10%, rgb(16 185 129 / 0.13), transparent 26rem),
@@ -80,9 +120,17 @@
     }
   }
 
-  .fixture-hero,
-  .fixture-shell {
+  .fixture-hero {
     width: min(100%, 86rem);
+    min-width: 0;
+    max-width: 100%;
+    margin: 0 auto;
+  }
+
+  /* This QA harness acts as a wide-capable host, while embedded chat lanes
+     remain responsible for constraining their own renderers. */
+  .fixture-shell {
+    width: min(100%, var(--fixture-review-width, 100rem));
     min-width: 0;
     max-width: 100%;
     margin: 0 auto;

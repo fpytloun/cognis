@@ -26,6 +26,7 @@ from cognis.channels.adapters.signal_cli_runtime import (
     SignalCliRuntimeError,
 )
 from cognis.channels.protocol import NonRetryableChannelError
+from cognis.channels.signal_failures import SignalDeliveryFailure, sanitize_signal_failure
 from cognis.models.channel import (
     ChannelAccountConfig,
     InboundMessage,
@@ -438,7 +439,7 @@ class TestSignalCliRuntime:
         runtime._stderr_task = asyncio.create_task(runtime._drain_stderr())
 
         try:
-            with pytest.raises(SignalCliRuntimeError, match="Unknown account"):
+            with pytest.raises(SignalCliRuntimeError, match="signal-cli error -1"):
                 await runtime.request("version", timeout=2.0)
         finally:
             runtime._running = False
@@ -854,6 +855,69 @@ class TestDirectParamNormalization:
 
 
 class TestDirectSendBehavior:
+    def test_rate_limit_failure_is_sanitized(self) -> None:
+        metadata = sanitize_signal_failure(
+            rpc_code=-5,
+            error_data={
+                "response": {
+                    "results": [
+                        {
+                            "type": "RATE_LIMIT_FAILURE",
+                            "token": "secret-token",
+                            "retryAfterSeconds": 12,
+                        }
+                    ]
+                }
+            },
+        )
+        failure = SignalDeliveryFailure(metadata)
+        assert failure.safe_metadata() == {
+            "provider": "signal-cli",
+            "classification": "rate_limit",
+            "provider_code": -5,
+            "retry_after_seconds": 12.0,
+            "challenge": True,
+            "next_step": (
+                "Complete the Signal challenge or account action out of band, then reconcile "
+                "delivery before any manual resend."
+            ),
+            "retry_scheduled": False,
+            "side_effect_certainty": "uncertain",
+        }
+        assert "secret-token" not in str(failure)
+        assert "+420" not in str(failure)
+
+    @pytest.mark.parametrize(
+        "error_data",
+        [None, {"response": {"results": [{"type": "RATE_LIMIT_FAILURE"}]}}],
+    )
+    def test_rate_limit_without_delay_remains_uncertain(self, error_data: object) -> None:
+        metadata = sanitize_signal_failure(rpc_code=-5, error_data=error_data)
+        assert metadata["classification"] == "rate_limit"
+        assert metadata["retry_after_seconds"] is None
+        assert metadata["retry_scheduled"] is False
+
+    def test_challenge_requires_nonempty_token_and_uses_largest_valid_delay(self) -> None:
+        metadata = sanitize_signal_failure(
+            error_data={
+                "results": [
+                    {"type": "RATE_LIMIT_FAILURE", "token": None, "retryAfterSeconds": 2},
+                    {"type": "RATE_LIMIT_FAILURE", "token": "", "retryAfterSeconds": 9},
+                    {"type": "RATE_LIMIT_FAILURE", "token": "challenge", "retryAfterSeconds": 4},
+                    {"type": "RATE_LIMIT_FAILURE", "retryAfterSeconds": 10**10000},
+                ]
+            }
+        )
+        assert metadata["challenge"] is True
+        assert metadata["retry_after_seconds"] == 9.0
+        assert "challenge" in str(metadata["next_step"]).lower()
+
+    def test_rate_limit_without_nonempty_token_is_not_challenge(self) -> None:
+        metadata = sanitize_signal_failure(
+            error_data={"results": [{"type": "RATE_LIMIT_FAILURE", "token": None}]}
+        )
+        assert metadata["challenge"] is False
+
     @pytest.mark.asyncio
     async def test_direct_send_ignores_reply_without_quote_author(self) -> None:
         adapter = SignalAdapter()
@@ -1232,7 +1296,7 @@ class TestRestSendBehavior:
         assert adapter._send_rest.await_count == 1
 
     @pytest.mark.asyncio
-    async def test_send_message_keeps_media_chunk_id_when_later_chunk_has_no_id(self) -> None:
+    async def test_send_message_stops_after_later_chunk_has_no_id(self) -> None:
         adapter = SignalAdapter()
         adapter._signal_config = _SignalConfig({}, {"account_number": "+1"})
         adapter._account_number = "+1"
@@ -1251,8 +1315,50 @@ class TestRestSendBehavior:
 
         result = await adapter.send_message(message)
 
-        assert result == "media-id"
-        assert adapter._send_rest.await_count >= 2
+        assert result is None
+        assert adapter._send_rest.await_count == 2
+
+
+class TestDirectNormalResults:
+    @pytest.mark.asyncio
+    async def test_mixed_normal_result_is_failure_and_stops_later_chunks(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+        runtime = MagicMock()
+        runtime.is_running = True
+        runtime.single_account_mode = True
+        runtime.request = AsyncMock(
+            side_effect=[
+                {"timestamp": 1, "results": [{"type": "SUCCESS"}]},
+                {
+                    "timestamp": 2,
+                    "results": [
+                        {"type": "SUCCESS"},
+                        {"type": "RATE_LIMIT_FAILURE", "retryAfterSeconds": 6},
+                    ],
+                },
+                {"timestamp": 3, "results": [{"type": "SUCCESS"}]},
+            ]
+        )
+        adapter._runtime = runtime
+        adapter.capabilities.max_message_length = 5
+
+        with pytest.raises(SignalDeliveryFailure) as exc_info:
+            await adapter.send_message(
+                OutboundMessage(
+                    channel_type="signal",
+                    account_id="acct-1",
+                    chat_id="+420111222333",
+                    content="one two three four",
+                )
+            )
+
+        assert exc_info.value.metadata["classification"] == "rate_limit"
+        assert runtime.request.await_count == 2
 
 
 class TestDirectPreviewBehavior:
@@ -1295,6 +1401,48 @@ class TestDirectPreviewBehavior:
 
 
 class TestDirectRuntimeFatalFailures:
+    @pytest.mark.asyncio
+    async def test_direct_send_raises_sanitized_structured_failure(self) -> None:
+        adapter = SignalAdapter()
+        adapter._signal_config = _SignalConfig(
+            {"transport": "direct_jsonrpc"},
+            {"account_number": "+1"},
+        )
+        adapter._account_number = "+1"
+        runtime = MagicMock()
+        runtime.request = AsyncMock(
+            side_effect=SignalCliRuntimeError(
+                "signal-cli error -5",
+                rpc_code=-5,
+                error_data={
+                    "response": {
+                        "results": [
+                            {
+                                "type": "RATE_LIMIT_FAILURE",
+                                "token": "secret-token",
+                                "retryAfterSeconds": 8,
+                            }
+                        ]
+                    }
+                },
+            )
+        )
+        adapter._runtime = runtime
+
+        with pytest.raises(SignalDeliveryFailure) as exc_info:
+            await adapter._send_direct(
+                OutboundMessage(
+                    channel_type="signal",
+                    account_id="acct-1",
+                    chat_id="+420111222333",
+                    content="hello",
+                )
+            )
+
+        assert exc_info.value.metadata["classification"] == "rate_limit"
+        assert exc_info.value.metadata["retry_after_seconds"] == 8.0
+        assert "secret-token" not in str(exc_info.value)
+
     @pytest.mark.asyncio
     async def test_run_direct_raises_non_retryable_on_unregistered_user(self) -> None:
         adapter = SignalAdapter()

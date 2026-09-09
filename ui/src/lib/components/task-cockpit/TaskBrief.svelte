@@ -2,6 +2,7 @@
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import type { TaskDetail } from '$lib/types/api';
   import { formatAbsoluteTime } from '$lib/time';
+  import { renderMarkdown } from '$lib/markdown';
 
   let {
     task,
@@ -21,11 +22,19 @@
   <div class="mt-4 grid gap-5 lg:grid-cols-2">
     <div>
       <h2 class="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">Input and context</h2>
-      <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-200">{task.description || 'No additional description was provided.'}</p>
+      {#if task.description}
+        <div class="prose prose-sm prose-invert mt-2 max-w-none text-slate-200">{@html renderMarkdown(task.description)}</div>
+      {:else}
+        <p class="mt-2 text-sm leading-6 text-slate-200">No additional description was provided.</p>
+      {/if}
     </div>
     <div>
       <h2 class="text-xs font-medium uppercase tracking-[0.2em] text-slate-500">Expected output</h2>
-      <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-slate-200">{task.expected_output || 'No explicit output contract was provided.'}</p>
+      {#if task.expected_output}
+        <div class="prose prose-sm prose-invert mt-2 max-w-none text-slate-200">{@html renderMarkdown(task.expected_output)}</div>
+      {:else}
+        <p class="mt-2 text-sm leading-6 text-slate-200">No explicit output contract was provided.</p>
+      {/if}
     </div>
   </div>
   <div class="mt-5 grid gap-3 border-t border-slate-800 pt-4 text-xs sm:grid-cols-2 lg:grid-cols-4">

@@ -5,6 +5,7 @@
   import { onMount } from 'svelte';
 
   import PwaBanner from '$lib/components/PwaBanner.svelte';
+  import { installSelectionCopy } from '$lib/selection-copy';
   import { registerServiceWorker } from '$lib/stores/pwa';
   // Subscribe so visualViewport-backed CSS vars are published as soon as
   // the shell mounts.
@@ -15,9 +16,13 @@
   onMount(() => {
     (window as Window & { __cognisStartupRecoverySuccess?: () => void }).__cognisStartupRecoverySuccess?.();
     void registerServiceWorker();
+    const uninstallSelectionCopy = installSelectionCopy();
     // Keep subscription alive.
     const unsub = viewportMetrics.subscribe(() => {});
-    return () => unsub();
+    return () => {
+      uninstallSelectionCopy();
+      unsub();
+    };
   });
 </script>
 

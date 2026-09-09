@@ -13,7 +13,7 @@
    *   a drag handle and swipe-to-dismiss.
    * - On desktop or when `side="center"`, renders as a centered dialog.
    * - Traps focus, restores focus on close, closes on Escape, locks body scroll.
-   * - Respects safe-area-inset-bottom.
+   * - Uses ordinary bottom padding; Cognis renders through the iOS bottom safe area.
    *
    * Props:
    *   open        required - visibility state (one-way; emit onClose to close)
@@ -203,11 +203,11 @@
         className
       )}
       style={side === 'bottom'
-        ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: calc(env(safe-area-inset-bottom) + 0.75rem);`
+        ? `max-height: ${maxHeight}; transform: translateY(${dragOffsetY}px); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'}; padding-bottom: var(--app-bottom-control-inset);`
         : side === 'right'
-        ? `padding-top: calc(0.75rem + max(0px, calc(env(safe-area-inset-top) - var(--app-shell-top-offset, 0px)))); padding-bottom: max(0.75rem, calc(env(safe-area-inset-bottom) - var(--app-shell-bottom-offset, 0px))); padding-right: env(safe-area-inset-right);`
+        ? `padding-top: calc(0.75rem + max(0px, calc(env(safe-area-inset-top) - var(--app-shell-top-offset, 0px)))); padding-bottom: var(--app-bottom-control-inset); padding-right: env(safe-area-inset-right);`
         : side === 'left'
-        ? `padding-top: calc(0.75rem + max(0px, calc(env(safe-area-inset-top) - var(--app-shell-top-offset, 0px)))); padding-bottom: max(0.75rem, calc(env(safe-area-inset-bottom) - var(--app-shell-bottom-offset, 0px))); padding-left: env(safe-area-inset-left);`
+        ? `padding-top: calc(0.75rem + max(0px, calc(env(safe-area-inset-top) - var(--app-shell-top-offset, 0px)))); padding-bottom: var(--app-bottom-control-inset); padding-left: env(safe-area-inset-left);`
         : undefined}
       in:fly={{
         x: side === 'right' ? 64 : side === 'left' ? -64 : 0,
@@ -229,12 +229,12 @@
       {/if}
 
       {#if header}
-        <div class="shrink-0 border-b border-slate-800/80 px-5 py-4">
+        <div class="shrink-0 border-b border-slate-800/80 bg-slate-950 px-5 py-4" data-testid="sheet-header-surface">
           {@render header()}
         </div>
       {/if}
 
-      <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 pb-5 pt-4">
+      <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain bg-slate-950 px-5 pb-5 pt-4" data-testid="sheet-content-surface">
         {@render children()}
       </div>
     </div>

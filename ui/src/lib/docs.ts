@@ -82,6 +82,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/rich-deliverable-blocks-data.md': '/docs/rich-deliverable-blocks-data',
   'docs/guide/channels.md': '/docs/channels',
   'docs/guide/executors.md': '/docs/executors',
+  'docs/guide/macos-executor.md': '/docs/macos-executor',
   'docs/guide/deployment.md': '/docs/deployment',
   'docs/guide/high-availability.md': '/docs/high-availability',
   'docs/guide/ha-e2e.md': '/docs/ha-e2e',

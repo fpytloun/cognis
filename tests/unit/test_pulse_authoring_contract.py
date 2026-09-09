@@ -20,7 +20,6 @@ from cognis.models.deliverable import (
     PULSE_V1_DAILY_SKELETON,
     RICH_DELIVERABLE_MAX_BLOCKS,
     RichPayloadValidationError,
-    normalize_required_rich_payload,
     normalize_rich_payload,
     pulse_quality_metadata,
     rich_render_metadata,
@@ -162,13 +161,15 @@ class _ReplayAuthoringAgent:
         ]
         return {
             "action": "rich:pulse",
-            "content": (
-                "Priorita: prověřit nepoužívané OAuth klienty. "
-                "Todoist byl vynechán kvůli výpadku executor infrastruktury."
-            ),
-            "format": "rich",
-            "title": "Ranní pulse",
-            "rich": payload,
+            "payload": {
+                **payload,
+                "title": "Ranní pulse",
+                "metadata": {
+                    key: value
+                    for key, value in payload["metadata"].items()
+                    if key != "presentation"
+                },
+            },
         }
 
 
@@ -228,7 +229,9 @@ async def test_agent_authored_pulse_v2_accepts_production_collector_replay() -> 
         arguments,
         None,
     )
-    payload, warnings = normalize_rich_payload(arguments["rich"])
+    authored_payload = deepcopy(arguments["payload"])
+    authored_payload["metadata"]["presentation"] = "pulse"
+    payload, warnings = normalize_rich_payload(authored_payload)
 
     assert validated["valid"] is True, validated["errors"]
     assert warnings == []
@@ -262,10 +265,9 @@ async def test_agent_authored_pulse_v2_accepts_production_collector_replay() -> 
 
 def test_agent_authored_acceptance_validates_explicit_generic_fallback() -> None:
     arguments = {
-        "action": "write_deliverable",
-        "content": "Zdrojová data nestačila pro Pulse; zde je přístupný souhrn.",
-        "format": "rich",
-        "rich": {
+        "action": "rich",
+        "payload": {
+            "title": "Degraded daily brief",
             "blocks": [
                 {
                     "type": "research_answer",
@@ -287,10 +289,11 @@ def test_agent_authored_acceptance_validates_explicit_generic_fallback() -> None
         "write_deliverable",
         arguments,
     )
-    payload, warnings = normalize_rich_payload(arguments["rich"])
+    authored_payload = deepcopy(arguments["payload"])
+    payload, warnings = normalize_rich_payload(authored_payload)
 
     assert validated["valid"] is True
-    assert validated["operation"] == "write_deliverable"
+    assert validated["operation"] == "rich"
     assert warnings == []
     assert payload is not None
     assert payload["metadata"] == {}
@@ -307,11 +310,16 @@ def test_descriptor_example_and_live_validator_use_the_same_pulse_contract() -> 
         described["descriptor"]["extensions"]["presentation_contracts"]["rich:pulse"]
         == PULSE_PRESENTATION_DESCRIPTOR
     )
-    assert example["rich"] == PULSE_DAILY_SKELETON
+    expected_payload = deepcopy(PULSE_DAILY_SKELETON)
+    expected_payload["metadata"].pop("presentation")
+    expected_payload["title"] = "Daily pulse"
+    assert example["payload"] == expected_payload
     validated = validate_available_tool_call([WRITE_DELIVERABLE_TOOL], "write_deliverable", example)
     assert validated["valid"] is True
     assert validated["operation"] == "rich:pulse"
-    payload, _warnings = normalize_rich_payload(example["rich"])
+    normalized_input = deepcopy(example["payload"])
+    normalized_input["metadata"]["presentation"] = "pulse"
+    payload, _warnings = normalize_rich_payload(normalized_input)
     assert payload is not None
     metadata = rich_render_metadata(payload)
     assert metadata["pulse_schema"] == "cognis.rich.pulse.v2"
@@ -414,8 +422,9 @@ async def test_registered_write_deliverable_examples_pass_domain_audit() -> None
 
 
 def test_generic_operation_cannot_claim_pulse_presentation() -> None:
-    arguments = _fixture("daily_write_arguments.json")
-    arguments["action"] = "write_deliverable"
+    payload = deepcopy(PULSE_DAILY_SKELETON)
+    payload["title"] = "Daily pulse"
+    arguments = {"action": "rich", "payload": payload}
 
     validated = validate_available_tool_call(
         [WRITE_DELIVERABLE_TOOL],
@@ -424,29 +433,31 @@ def test_generic_operation_cannot_claim_pulse_presentation() -> None:
     )
 
     assert validated["valid"] is False
-    assert validated["operation"] == "write_deliverable"
+    assert validated["operation"] == "rich"
 
 
 @pytest.mark.asyncio
 async def test_validate_tool_call_reports_the_same_pulse_issue_paths_as_write() -> None:
     arguments = {
         "action": "rich:pulse",
-        "content": "Accessible fallback.",
-        "format": "rich",
-        "rich": deepcopy(PULSE_DAILY_SKELETON),
+        "payload": deepcopy(PULSE_DAILY_SKELETON),
     }
-    arguments["rich"]["blocks"].pop()
+    arguments["payload"]["title"] = "Daily pulse"
+    arguments["payload"]["metadata"].pop("presentation")
+    arguments["payload"]["blocks"].pop()
 
     validated = await validate_available_tool_call_with_context(
         [WRITE_DELIVERABLE_TOOL], "write_deliverable", arguments, None
     )
     with pytest.raises(RichPayloadValidationError) as exc_info:
-        normalize_rich_payload(arguments["rich"])
+        invalid = deepcopy(arguments["payload"])
+        invalid["metadata"]["presentation"] = "pulse"
+        normalize_rich_payload(invalid)
 
     assert validated["valid"] is False
     assert validated["operation"] == "rich:pulse"
     assert {(error["code"], error["path"]) for error in validated["errors"]} == {
-        (issue["reason"], f"$.rich{issue['path'][1:]}") for issue in exc_info.value.issues
+        (issue["reason"], f"$.payload{issue['path'][1:]}") for issue in exc_info.value.issues
     }
 
 
@@ -454,10 +465,10 @@ async def test_validate_tool_call_reports_the_same_pulse_issue_paths_as_write() 
 async def test_daily_brief_v12_is_not_silently_upgraded_to_v13_contract() -> None:
     arguments = {
         "action": "rich:pulse",
-        "content": "Accessible fallback.",
-        "format": "rich",
-        "rich": deepcopy(PULSE_DAILY_SKELETON),
+        "payload": deepcopy(PULSE_DAILY_SKELETON),
     }
+    arguments["payload"]["title"] = "Daily pulse"
+    arguments["payload"]["metadata"].pop("presentation")
     v12 = await validate_available_tool_call_with_context(
         [WRITE_DELIVERABLE_TOOL],
         "write_deliverable",
@@ -782,7 +793,6 @@ def test_non_scalar_pulse_metadata_returns_structured_rejection(path: str, value
 
 def test_generic_descriptor_rejects_whitespace_only_fallback_before_write() -> None:
     arguments = {
-        "action": "write_deliverable",
         "content": "  \n",
     }
 
@@ -796,11 +806,7 @@ def test_generic_descriptor_rejects_whitespace_only_fallback_before_write() -> N
 
 @pytest.mark.asyncio
 async def test_validate_tool_call_rejects_missing_rich_payload_like_persistence() -> None:
-    arguments = {
-        "action": "write_deliverable",
-        "content": "Fallback",
-        "format": "rich",
-    }
+    arguments = {"action": "rich"}
 
     validated = await validate_available_tool_call_with_context(
         [WRITE_DELIVERABLE_TOOL],
@@ -808,25 +814,21 @@ async def test_validate_tool_call_rejects_missing_rich_payload_like_persistence(
         arguments,
         None,
     )
-    with pytest.raises(RichPayloadValidationError) as exc_info:
-        normalize_required_rich_payload(None)
-
     assert validated["valid"] is False
-    assert exc_info.value.reason == "missing_rich_payload"
-    assert validated["errors"] == [
-        {
-            "code": exc_info.value.reason,
-            "path": "$.rich",
-            "message": (
-                f"At $.rich, expected {exc_info.value.expected}. Correct that path and retry "
-                "write_deliverable with format='rich'."
-            ),
-        }
-    ]
+    assert any("payload" in str(error) for error in validated["errors"])
 
 
 def test_generic_and_pulse_write_schemas_accept_canonical_chart_examples() -> None:
-    generic, pulse = WRITE_DELIVERABLE_TOOL.native_operations
+    generic = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.native_operations
+        if operation.operation == "rich"
+    )
+    pulse = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.native_operations
+        if operation.operation == "rich:pulse"
+    )
 
     assert (
         validate_available_tool_call(
@@ -874,12 +876,10 @@ def test_generic_write_schema_enforces_range_y_semantics(
     y: object,
 ) -> None:
     operation = next(
-        item
-        for item in WRITE_DELIVERABLE_TOOL.native_operations
-        if item.operation == "write_deliverable"
+        item for item in WRITE_DELIVERABLE_TOOL.native_operations if item.operation == "rich"
     )
     arguments = deepcopy(operation.examples[0])
-    chart = arguments["rich"]["blocks"][0]
+    chart = arguments["payload"]["blocks"][0]
     chart["chart_type"] = chart_type
     chart["series"][0]["points"][0]["y"] = y
 
@@ -898,14 +898,12 @@ async def test_native_chart_validation_returns_structured_migration_retry_issue(
     legacy_field: str,
 ) -> None:
     operation = next(
-        item
-        for item in WRITE_DELIVERABLE_TOOL.native_operations
-        if item.operation == "write_deliverable"
+        item for item in WRITE_DELIVERABLE_TOOL.native_operations if item.operation == "rich"
     )
-    chart = deepcopy(operation.examples[0]["rich"]["blocks"][0])
+    chart = deepcopy(operation.examples[0]["payload"]["blocks"][0])
     chart[legacy_field] = [] if legacy_field == "data" else "legacy"
     arguments = deepcopy(operation.examples[0])
-    arguments["rich"]["blocks"] = [chart]
+    arguments["payload"]["blocks"] = [chart]
 
     validated = await validate_available_tool_call_with_context(
         [WRITE_DELIVERABLE_TOOL],
@@ -918,12 +916,12 @@ async def test_native_chart_validation_returns_structured_migration_retry_issue(
     assert validated["errors"] == [
         {
             "code": "legacy_chart_field",
-            "path": f"$.rich.blocks[0].{legacy_field}",
+            "path": f"$.payload.blocks[0].{legacy_field}",
             "message": (
-                f"At $.rich.blocks[0].{legacy_field}, expected remove this legacy field and "
+                f"At $.payload.blocks[0].{legacy_field}, expected remove this legacy field and "
                 "migrate to cognis.chart.v1 using spec_version, chart_type, "
                 "series[].points[].x/y, x_axis, and y_axis. Correct that path and retry "
-                "write_deliverable with format='rich'."
+                "the Rich write_deliverable action."
             ),
         }
     ]
@@ -932,14 +930,12 @@ async def test_native_chart_validation_returns_structured_migration_retry_issue(
 @pytest.mark.asyncio
 async def test_native_chart_validation_reports_deeply_nested_retry_path() -> None:
     operation = next(
-        item
-        for item in WRITE_DELIVERABLE_TOOL.native_operations
-        if item.operation == "write_deliverable"
+        item for item in WRITE_DELIVERABLE_TOOL.native_operations if item.operation == "rich"
     )
-    chart = deepcopy(operation.examples[0]["rich"]["blocks"][0])
+    chart = deepcopy(operation.examples[0]["payload"]["blocks"][0])
     chart["x_key"] = "label"
     arguments = deepcopy(operation.examples[0])
-    arguments["rich"]["blocks"] = [
+    arguments["payload"]["blocks"] = [
         {
             "type": "section",
             "blocks": [
@@ -960,20 +956,18 @@ async def test_native_chart_validation_reports_deeply_nested_retry_path() -> Non
 
     assert validated["valid"] is False
     assert validated["errors"][0]["path"] == (
-        "$.rich.blocks[0].blocks[0].children[0].blocks[0].x_key"
+        "$.payload.blocks[0].blocks[0].children[0].blocks[0].x_key"
     )
 
 
 @pytest.mark.asyncio
 async def test_native_chart_retry_preserves_unrelated_schema_errors() -> None:
     operation = next(
-        item
-        for item in WRITE_DELIVERABLE_TOOL.native_operations
-        if item.operation == "write_deliverable"
+        item for item in WRITE_DELIVERABLE_TOOL.native_operations if item.operation == "rich"
     )
     arguments = deepcopy(operation.examples[0])
-    arguments.pop("content")
-    arguments["rich"]["blocks"][0]["data"] = []
+    arguments["payload"]["blocks"][0]["data"] = []
+    arguments["unexpected"] = True
 
     validated = await validate_available_tool_call_with_context(
         [WRITE_DELIVERABLE_TOOL],
@@ -984,20 +978,29 @@ async def test_native_chart_retry_preserves_unrelated_schema_errors() -> None:
 
     assert validated["valid"] is False
     assert validated["errors"][0]["code"] == "legacy_chart_field"
-    assert any("content" in error for error in validated["schema_errors"])
+    assert any("unexpected" in error for error in validated["schema_errors"])
 
 
 def test_generic_and_pulse_schemas_preserve_typeless_gallery_item_shorthand() -> None:
-    generic, pulse = WRITE_DELIVERABLE_TOOL.native_operations
+    generic = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.native_operations
+        if operation.operation == "rich"
+    )
+    pulse = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.native_operations
+        if operation.operation == "rich:pulse"
+    )
     generic_arguments = deepcopy(generic.examples[0])
-    generic_arguments["rich"]["blocks"] = [
+    generic_arguments["payload"]["blocks"] = [
         {
             "type": "gallery",
             "items": [{"url": "https://images.example.org/chart.png", "caption": "Chart"}],
         }
     ]
     pulse_arguments = deepcopy(pulse.examples[0])
-    pulse_arguments["rich"]["blocks"][4]["blocks"].append(
+    pulse_arguments["payload"]["blocks"][4]["blocks"].append(
         {
             "type": "gallery",
             "items": [{"url": "https://images.example.org/news.png", "caption": "News"}],
@@ -1013,8 +1016,7 @@ def test_generic_and_pulse_schemas_preserve_typeless_gallery_item_shorthand() ->
 
 
 def test_schema_invalid_pulse_rejects_with_live_repair_contract() -> None:
-    arguments = _fixture("daily_write_arguments.json")
-    arguments.pop("rich")
+    arguments = {"action": "rich:pulse"}
 
     validated = validate_available_tool_call(
         [WRITE_DELIVERABLE_TOOL],

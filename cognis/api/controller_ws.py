@@ -18,7 +18,7 @@ from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.logging import get_logger
 from cognis.models.tool import ToolCall
 from cognis.providers.executor.delivery import ExecutorDeliveryError
-from cognis.providers.executor.websocket import ExecutorRPCError
+from cognis.providers.executor.websocket import EXECUTOR_BRIDGE_FAILURES, ExecutorRPCError
 
 logger = get_logger(__name__)
 
@@ -26,6 +26,7 @@ BRIDGE_MAX_FRAME_BYTES = 1024 * 1024
 BRIDGE_MAX_CALLS = 32
 BRIDGE_SEND_TIMEOUT_SECONDS = 10.0
 BRIDGE_MAX_TIMEOUT_SECONDS = 600.0
+BRIDGE_MAX_TOOL_TIMEOUT_SECONDS = 3605.0
 BRIDGE_FIRST_FRAME_TIMEOUT_SECONDS = 5.0
 BRIDGE_PROTOCOL_VERSION = 1
 BRIDGE_CAPABILITIES = ("result_chunks_v1",)
@@ -39,11 +40,43 @@ class _BridgeProtocolError(ValueError):
     pass
 
 
+def _bridge_failure_log_data(
+    *,
+    executor_id: str,
+    bridge_call_id: str,
+    requester_owner_id: str,
+    operation: str,
+    delivery_state: str,
+    reason: str,
+    code: str | None = None,
+    executor_instance_id: str | None = None,
+) -> dict[str, Any]:
+    """Build redaction-safe log fields for one failed bridged operation.
+
+    Tool arguments and results are never included; only identities, the
+    operation name, and bounded error categories are recorded so operators
+    can attribute bridge failures without leaking session content.
+    """
+
+    return {
+        "executor_id": executor_id,
+        "bridge_call_id": bridge_call_id,
+        "requester_owner_id": requester_owner_id,
+        "operation": operation,
+        "delivery_state": delivery_state,
+        "code": code,
+        "reason": reason,
+        "executor_instance_id": executor_instance_id,
+    }
+
+
 @dataclass(slots=True)
 class _BridgeCall:
     task: asyncio.Task[None]
     executor_call_id: str | None = None
     inference_request_id: str | None = None
+    accepted: bool = False
+    executor_instance_id: str | None = None
 
 
 def _bounded_frame(value: Any) -> dict[str, Any]:
@@ -75,6 +108,11 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
     connection: Any | None = None
     tearing_down = False
     negotiated_chunks = False
+    # Pre-bound so open-phase rejections can still be attributed in logs.
+    executor_id = ""
+    requester_owner_id = ""
+    target_owner_id = ""
+    target_epoch = 0
 
     async def send(frame: dict[str, Any]) -> None:
         _bounded_frame(frame)
@@ -135,7 +173,21 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 "protocol_version": BRIDGE_PROTOCOL_VERSION,
                 "capabilities": list(BRIDGE_CAPABILITIES),
                 "negotiated_capabilities": (["result_chunks_v1"] if negotiated_chunks else []),
+                "executor_instance_id": getattr(connection, "executor_instance_id", None),
             }
+        )
+        logger.info(
+            "controller bridge: opened",
+            extra={
+                "extra_data": {
+                    "executor_id": executor_id,
+                    "requester_owner_id": requester_owner_id,
+                    "owner_id": owner.owner_id,
+                    "epoch": owner.epoch,
+                    "executor_instance_id": getattr(connection, "executor_instance_id", None),
+                    "result_chunks": negotiated_chunks,
+                }
+            },
         )
 
         async def send_result(call_id: str, result: Any) -> None:
@@ -199,11 +251,76 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
         async def run_call(frame: dict[str, Any]) -> None:
             bridge_call_id = str(frame["call_id"])
             accepted = False
+            raw_operation = str(frame.get("operation") or "")
+            operation = (
+                raw_operation if raw_operation in {"rpc", "tool", "inference"} else "unknown"
+            )
 
-            async def on_sent() -> None:
+            def record_failure(
+                *,
+                delivery_state: str,
+                reason: str,
+                code: str | None = None,
+                executor_instance_id: str | None = None,
+            ) -> None:
+                """Log and count one bridged operation failure.
+
+                Every error frame the bridge emits passes through here so an
+                operator can always attribute a forwarded tool failure to a
+                concrete cause instead of the generic delivery message the
+                requesting controller surfaces to the agent loop. ``reason`` is
+                a bounded category safe for metric labels and logs.
+                """
+
+                EXECUTOR_BRIDGE_FAILURES.labels(
+                    operation=operation or "unknown",
+                    delivery_state=delivery_state,
+                    reason=reason,
+                ).inc()
+                logger.warning(
+                    "controller bridge: forwarded operation failed",
+                    extra={
+                        "extra_data": _bridge_failure_log_data(
+                            executor_id=executor_id,
+                            bridge_call_id=bridge_call_id,
+                            requester_owner_id=requester_owner_id,
+                            operation=operation,
+                            delivery_state=delivery_state,
+                            reason=reason,
+                            code=code,
+                            executor_instance_id=executor_instance_id,
+                        )
+                    },
+                )
+
+            async def on_sent(*accepting_identity: Any) -> None:
                 nonlocal accepted
                 accepted = True
-                await send({"type": "accepted", "call_id": bridge_call_id})
+                call = calls[bridge_call_id]
+                call.accepted = True
+                if (
+                    len(accepting_identity) >= 2
+                    and isinstance(accepting_identity[1], str)
+                    and accepting_identity[1]
+                ):
+                    call.executor_instance_id = accepting_identity[1]
+                else:
+                    call.executor_instance_id = getattr(connection, "executor_instance_id", None)
+                try:
+                    await send({"type": "accepted", "call_id": bridge_call_id})
+                except Exception:
+                    # Acceptance is a physical-dispatch fact. A failed bridge
+                    # notification must detach delivery, not cancel execution.
+                    logger.debug(
+                        "controller bridge: acceptance notification detached",
+                        extra={
+                            "extra_data": {
+                                "executor_id": executor_id,
+                                "bridge_call_id": bridge_call_id,
+                                "executor_instance_id": call.executor_instance_id,
+                            }
+                        },
+                    )
 
             try:
                 current = app.state.providers.executor.websocket.get_local_connection(executor_id)
@@ -212,13 +329,17 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     or not await app.state.executor_connection_ownership.is_current(owner)
                 ):
                     raise PermissionError("Bridge owner changed before physical send")
-                operation = str(frame.get("operation") or "")
                 payload = frame.get("payload")
                 if not isinstance(payload, dict):
                     raise ValueError("Bridge call payload must be an object")
+                requested_timeout = max(float(frame.get("timeout_seconds") or 300.0), 0.1)
                 timeout = min(
-                    max(float(frame.get("timeout_seconds") or 300.0), 0.1),
-                    BRIDGE_MAX_TIMEOUT_SECONDS,
+                    requested_timeout,
+                    (
+                        BRIDGE_MAX_TOOL_TIMEOUT_SECONDS
+                        if operation == "tool"
+                        else BRIDGE_MAX_TIMEOUT_SECONDS
+                    ),
                 )
                 if operation == "rpc":
                     method = str(payload.get("method") or "")
@@ -302,16 +423,32 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     raise ValueError("Unsupported bridge operation")
             except asyncio.CancelledError:
                 if accepted and not tearing_down:
+                    record_failure(
+                        delivery_state="accepted_unknown",
+                        reason="cancelled_after_acceptance",
+                        executor_instance_id=getattr(connection, "executor_instance_id", None),
+                    )
                     await send(
                         {
                             "type": "error",
                             "call_id": bridge_call_id,
                             "delivery_state": "accepted_unknown",
                             "message": "Forwarded call cancelled after acceptance",
+                            # Carry the accepting process identity so the
+                            # requesting controller can reconcile instead of
+                            # declaring the outcome unknowable.
+                            "executor_instance_id": getattr(
+                                connection, "executor_instance_id", None
+                            ),
                         }
                     )
                 raise
             except ExecutorRPCError as exc:
+                record_failure(
+                    delivery_state="terminal",
+                    reason="executor_rpc_error",
+                    code=str(exc.code),
+                )
                 await send(
                     {
                         "type": "error",
@@ -323,6 +460,12 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 )
             except ExecutorDeliveryError as exc:
                 connection_owner = getattr(connection, "connection_owner", None)
+                record_failure(
+                    delivery_state=exc.delivery_state.value,
+                    reason="executor_delivery_error",
+                    code=exc.code,
+                    executor_instance_id=getattr(connection, "executor_instance_id", None),
+                )
                 await send(
                     {
                         "type": "error",
@@ -336,9 +479,17 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                         "epoch": exc.epoch or getattr(connection_owner, "epoch", None),
                         "same_executor_only": exc.same_executor_only,
                         "retry_after": exc.retry_after,
+                        # Let the requesting controller reconcile the outcome
+                        # with the same executor process after a reconnect.
+                        "executor_instance_id": getattr(connection, "executor_instance_id", None),
                     }
                 )
             except _BridgeProtocolError as exc:
+                record_failure(
+                    delivery_state="terminal",
+                    reason="protocol_error",
+                    code="protocol_error",
+                )
                 await send(
                     {
                         "type": "error",
@@ -349,12 +500,25 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     }
                 )
             except Exception as exc:
+                record_failure(
+                    delivery_state="accepted_unknown" if accepted else "not_sent",
+                    reason="bridge_local_error",
+                    executor_instance_id=(
+                        getattr(connection, "executor_instance_id", None) if accepted else None
+                    ),
+                )
                 await send(
                     {
                         "type": "error",
                         "call_id": bridge_call_id,
                         "delivery_state": "accepted_unknown" if accepted else "not_sent",
                         "message": str(exc)[:500],
+                        # Only an accepted call reached the executor, so only
+                        # then is the accepting process identity meaningful for
+                        # outcome reconciliation.
+                        "executor_instance_id": (
+                            getattr(connection, "executor_instance_id", None) if accepted else None
+                        ),
                     }
                 )
             finally:
@@ -373,6 +537,7 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                             "type": "error",
                             "call_id": call_id,
                             "delivery_state": "not_sent",
+                            "code": "executor_bridge_capacity",
                             "message": "Bridge call limit exceeded",
                         }
                     )
@@ -393,21 +558,48 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     except Exception as exc:
-        logger.warning("controller executor bridge rejected", exc_info=True)
+        logger.warning(
+            "controller executor bridge rejected",
+            extra={
+                "extra_data": {
+                    "executor_id": executor_id,
+                    "requester_owner_id": requester_owner_id,
+                    "target_owner_id": target_owner_id,
+                    "target_epoch": target_epoch,
+                    "reason": type(exc).__name__,
+                }
+            },
+            exc_info=True,
+        )
         with contextlib.suppress(Exception):
             await send({"type": "error", "delivery_state": "not_sent", "message": str(exc)[:500]})
     finally:
         tearing_down = True
         active_calls = tuple(calls.values())
+        if active_calls:
+            logger.warning(
+                "controller bridge: closing with in-flight forwarded calls",
+                extra={
+                    "extra_data": {
+                        "executor_id": executor_id,
+                        "requester_owner_id": requester_owner_id,
+                        "in_flight_calls": len(active_calls),
+                        "executor_instance_id": getattr(connection, "executor_instance_id", None),
+                    }
+                },
+            )
+        provider = app.state.providers.executor.websocket
+        detached_tool_calls = tuple(
+            call for call in active_calls if call.accepted and call.executor_call_id
+        )
         for call in active_calls:
-            call.task.cancel()
+            if call in detached_tool_calls:
+                provider.track_detached_tool_call(call.task)
+            else:
+                call.task.cancel()
         cancellation_tasks: list[asyncio.Task[Any]] = []
         if connection is not None:
             for call in active_calls:
-                if call.executor_call_id:
-                    cancellation_tasks.append(
-                        asyncio.create_task(connection.cancel_call(call.executor_call_id))
-                    )
                 if call.inference_request_id:
                     cancellation_tasks.append(
                         asyncio.create_task(connection.cancel_inference(call.inference_request_id))
@@ -420,8 +612,9 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 for task in cancellation_tasks:
                     task.cancel()
                 await asyncio.gather(*cancellation_tasks, return_exceptions=True)
-        if active_calls:
-            call_tasks = tuple(call.task for call in active_calls)
+        cancelled_calls = tuple(call for call in active_calls if call not in detached_tool_calls)
+        if cancelled_calls:
+            call_tasks = tuple(call.task for call in cancelled_calls)
             try:
                 async with asyncio.timeout(1.0):
                     await asyncio.gather(*call_tasks, return_exceptions=True)

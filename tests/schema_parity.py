@@ -34,7 +34,10 @@ def _expected_index_signatures(
 ) -> set[tuple[tuple[str, ...], bool, bool]]:
     return {
         (
-            tuple(column.name for column in index.columns),
+            tuple(
+                str(getattr(expression, "name", None) or expression).split()[0]
+                for expression in index.expressions
+            ),
             bool(index.unique),
             index.dialect_options[dialect_name].get("where") is not None,
         )

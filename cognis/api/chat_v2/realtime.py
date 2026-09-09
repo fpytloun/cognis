@@ -16,6 +16,7 @@ from cognis.api.chat_v2.item_keys import (
     thinking_item_id,
 )
 from cognis.api.chat_v2.schemas import (
+    BoundaryReceipt,
     ChatRealtimeFrame,
     CompactionTimelineItem,
     FileDiffRef,
@@ -62,6 +63,7 @@ def runtime_overlay_from_items(
     volatile_items: Sequence[TimelineItem],
     context_usage: Mapping[str, Any] | None = None,
     last_generation: Mapping[str, Any] | None = None,
+    boundary_receipts: Sequence[Mapping[str, Any]] | None = None,
     generated_at: str | None = None,
 ) -> RuntimeOverlaySnapshot:
     """Build a strict Chat v2 runtime overlay from native TimelineItem models."""
@@ -86,6 +88,9 @@ def runtime_overlay_from_items(
             if last_generation is not None
             else None
         ),
+        boundary_receipts=[
+            BoundaryReceipt.model_validate(item) for item in (boundary_receipts or [])
+        ],
     )
 
 
@@ -128,7 +133,7 @@ def compaction_runtime_item(
     if session_id is None:
         return None
     previous_session_id = _str(event_data.get("previous_session_id"))
-    source_session_id = previous_session_id or session_id
+    source_session_id = _str(event_data.get("compaction_id")) or previous_session_id or session_id
     timestamp = datetime.now(UTC).isoformat()
     return CompactionTimelineItem(
         id=f"compaction:{source_session_id}",
@@ -162,7 +167,9 @@ def compaction_runtime_item(
         method=_str(event_data.get("method")) or "pending",
         turns_compacted=max(0, _int(event_data.get("turns_compacted")) or 0),
         trigger=_str(event_data.get("trigger")),
-        reason=_str(event_data.get("reason")),
+        reason=_str(event_data.get("fallback_reason")) or _str(event_data.get("reason")),
+        previous_usage_percentage=_float(event_data.get("previous_usage_percentage")),
+        effective_usage_percentage=_float(event_data.get("effective_usage_percentage")),
         hard_pressure_exceeded=bool(event_data.get("hard_pressure_exceeded", False)),
         used_timeout_fallback=bool(event_data.get("used_timeout_fallback", False)),
     )
@@ -322,14 +329,22 @@ def system_message_runtime_item(
 ) -> MessageTimelineItem:
     """Build a live system notice with the canonical projector identity."""
 
-    return MessageTimelineItem(
-        id=f"system:{notice_id}",
-        kind="message",
-        sort_key=runtime_timeline_sort_key(
+    sort_key = (
+        pre_turn_runtime_timeline_sort_key(
+            kind_rank=KIND_RANK["system_message"],
+            local=0,
+        )
+        if notice_kind == "turn_initiated"
+        else runtime_timeline_sort_key(
             phase=0,
             kind_rank=KIND_RANK["system_message"],
             local=0,
-        ),
+        )
+    )
+    return MessageTimelineItem(
+        id=f"system:{notice_id}",
+        kind="message",
+        sort_key=sort_key,
         source_refs=[
             SourceRef(
                 store="runtime",
@@ -410,6 +425,17 @@ def tool_result_runtime_item(
     presentation: dict[str, Any] | None = None,
 ) -> ToolCallTimelineItem:
     presentation = presentation or {}
+    pending_approval = bool(evaluation and evaluation.get("phase") == "waiting_for_approval")
+    denied = bool(evaluation and evaluation.get("resolution") == "deny")
+    status: Literal["waiting", "denied", "failed", "complete"] = (
+        "waiting"
+        if pending_approval
+        else "denied"
+        if denied
+        else "failed"
+        if is_error
+        else "complete"
+    )
     return ToolCallTimelineItem(
         id=f"tool:{call_id}",
         kind="tool_call",
@@ -423,7 +449,7 @@ def tool_result_runtime_item(
         ],
         created_at=timestamp,
         updated_at=timestamp,
-        status="failed" if is_error else "complete",
+        status=status,
         stable=False,
         call_id=call_id,
         tool_name=tool_name,
@@ -731,6 +757,10 @@ def _str(value: Any) -> str | None:
 
 def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _float(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 def _phase(value: Any) -> int | None:

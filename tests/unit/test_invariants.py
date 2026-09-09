@@ -8,7 +8,14 @@ import pytest
 
 from cognis.core.invariants import check_invariants, reconcile_invariants
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Agent, Base, Conversation, ManagedConversationLink, User
+from cognis.store.models import (
+    Agent,
+    Base,
+    Conversation,
+    DirectTurnRequestRow,
+    ManagedConversationLink,
+    User,
+)
 from cognis.store.queries import (
     add_task_dependency,
     create_step_run,
@@ -142,6 +149,104 @@ async def test_reconcile_invariants_interrupts_restart_stale_managed_turn(
         assert row.turn_state == "interrupted"
         assert row.active_turn_id == "turn_lost"
         assert row.notify_on_completion is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_restart_reconcile_preserves_managed_turn_with_durable_request(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            session.add_all(
+                [
+                    Conversation(
+                        conversation_id="controller-durable",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    ),
+                    Conversation(
+                        conversation_id="target-durable",
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="agent_work",
+                    ),
+                ]
+            )
+            await session.flush()
+            session.add_all(
+                [
+                    ManagedConversationLink(
+                        link_id="mconv_durable",
+                        user_email="user@test.com",
+                        controller_agent_id="agent-1",
+                        controller_conversation_id="controller-durable",
+                        target_agent_id="agent-1",
+                        target_conversation_id="target-durable",
+                        conversation_state="open",
+                        turn_state="running",
+                        active_turn_id="turn-durable",
+                        notify_on_completion=False,
+                        handoff_state="pending",
+                        handoff_target_turn_id="turn-durable",
+                        handoff_controller_session_id="controller-session",
+                        handoff_controller_turn_id="controller-turn",
+                        handoff_tool_call_id="call-wait",
+                    ),
+                    DirectTurnRequestRow(
+                        request_id="dtr-durable",
+                        turn_id="turn-durable",
+                        conversation_id="target-durable",
+                        session_id="target-session",
+                        agent_id="agent-1",
+                        user_id="user@test.com",
+                        idempotency_scope="target-durable",
+                        idempotency_key="durable",
+                        admission_hash="admission",
+                        payload_hash="payload",
+                        payload={},
+                        status="recoverable",
+                    ),
+                ]
+            )
+            await session.commit()
+
+        async with factory() as session:
+            reports = await reconcile_invariants(
+                session,
+                recover_restart_stale_managed_turns=True,
+            )
+            row = await session.get(ManagedConversationLink, "mconv_durable")
+        report = next(
+            item for item in reports if item.category == "managed_conversation_terminal_state"
+        )
+        assert report.reconciled_count == 0
+        assert row is not None
+        assert row.turn_state == "running"
+        assert row.active_turn_id == "turn-durable"
+        assert row.notify_on_completion is False
+        assert row.handoff_state == "pending"
+
+        async with factory() as session:
+            direct = await session.get(DirectTurnRequestRow, 1)
+            assert direct is not None
+            direct.status = "completed"
+            await session.commit()
+        async with factory() as session:
+            reports = await reconcile_invariants(
+                session,
+                recover_restart_stale_managed_turns=True,
+            )
+            row = await session.get(ManagedConversationLink, "mconv_durable")
+        report = next(
+            item for item in reports if item.category == "managed_conversation_terminal_state"
+        )
+        assert report.reconciled_count == 1
+        assert row is not None
+        assert row.turn_state == "interrupted"
     finally:
         await engine.dispose()
 

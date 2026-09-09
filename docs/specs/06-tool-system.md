@@ -125,15 +125,14 @@ effective assignable inventory; unavailable tools and partially unavailable
 groups fail closed, preventing a restricted primary agent from expanding
 privileges.
 
-`write_deliverable` declares `write_deliverable` and `rich:pulse` as explicit
-`NativeToolOperation` entries under `cognis.tool.v2`, selected by the required
-`action` discriminator. Both operations reference the serializable
-`write_deliverable.rich` domain validator; the Pulse operation additionally
-publishes its schema, example, rejection catalog, retry guidance, and valid
-daily skeleton. `describe_tool`, `validate_tool_call`, write normalization, and
-persistence therefore use the same contract. Unknown presentations and invalid
-Pulse composition are rejected before persistence. Generic fallback requires a
-new payload with `action="write_deliverable"` and no Pulse metadata.
+`write_deliverable` declares text, generic Rich, dashboard, and Pulse
+`NativeToolOperation` entries under `cognis.tool.v2`. The text operation is the
+default when `action` is absent. Rich actions use the serializable
+`write_deliverable.rich` domain validator. Dashboard and Pulse also publish
+their schema, example, rejection catalog, retry guidance, and valid skeleton.
+`describe_tool`, `validate_tool_call`, write normalization, and persistence
+therefore use the same contract. Unknown presentations and invalid registered
+compositions are rejected before persistence.
 
 For `write_deliverable`, the registered validator also receives the immutable
 loaded-skill snapshot, successful tool evidence, materialized artifact

@@ -495,10 +495,17 @@ async def resolve_tool_classifications(
         )
     if queue is not None:
         overridden_ids = {str(getattr(row, "tool_id", "")) for row in override_rows}
-        await queue.enqueue_tools(
-            [tool for tool in dynamic_tools if stable_tool_id(tool) not in overridden_ids],
-            owner_email=owner_email,
-        )
+        try:
+            await queue.enqueue_tools(
+                [tool for tool in dynamic_tools if stable_tool_id(tool) not in overridden_ids],
+                owner_email=owner_email,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to enqueue optional tool classifications",
+                exc_info=True,
+                extra={"extra_data": {"scope_key": scope_key}},
+            )
     return apply_persisted_classifications(classified, rows, override_rows)
 
 
@@ -815,22 +822,25 @@ async def _classify_with_llm(
     for item in tool_payloads:
         if not isinstance(item, dict):
             continue
-        tool_id = item.get("tool_id")
-        if not isinstance(tool_id, str):
+        raw_tool_id = item.get("tool_id")
+        if not isinstance(raw_tool_id, str):
             continue
+        tool_id = raw_tool_id
         seen_ids.add(tool_id)
-        normalized = {
-            "profile_group": str(
-                item.get("profile_group") or item.get("category") or "development"
-            ).strip()
-            or "development",
-            "capabilities": _normalize_capabilities(item.get("capabilities")),
+        profile_group = (
+            str(item.get("profile_group") or item.get("category") or "development").strip()
+            or "development"
+        )
+        capabilities = _normalize_capabilities(item.get("capabilities"))
+        normalized: dict[str, Any] = {
+            "profile_group": profile_group,
+            "capabilities": capabilities,
             "confidence": float(item.get("confidence") or 0.75),
         }
         error = _validate_profile_group(
             next((tool for candidate_id, tool, _key in uncached if candidate_id == tool_id), None),
-            str(normalized["profile_group"]),
-            normalized["capabilities"],
+            profile_group,
+            capabilities,
         )
         if error is not None:
             if (
@@ -842,11 +852,11 @@ async def _classify_with_llm(
                     extra={"extra_data": {"tool_id": tool_id, "prior_reason": error}},
                 )
                 results_by_id[tool_id] = normalized
-                cache_key = next(
+                matched_cache_key = next(
                     (key for candidate_id, _tool, key in uncached if candidate_id == tool_id), None
                 )
-                if cache_key is not None:
-                    to_cache[cache_key] = normalized
+                if matched_cache_key is not None:
+                    to_cache[matched_cache_key] = normalized
                 continue
             logger.warning(
                 "Rejected LLM tool classification",
@@ -855,11 +865,11 @@ async def _classify_with_llm(
             rejected[tool_id] = error
             continue
         results_by_id[tool_id] = normalized
-        cache_key = next(
+        matched_cache_key = next(
             (key for candidate_id, _tool, key in uncached if candidate_id == tool_id), None
         )
-        if cache_key is not None:
-            to_cache[cache_key] = normalized
+        if matched_cache_key is not None:
+            to_cache[matched_cache_key] = normalized
     if to_cache:
         async with _CACHE_LOCK:
             _CLASSIFICATION_CACHE.update(to_cache)

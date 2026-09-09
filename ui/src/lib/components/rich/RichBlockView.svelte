@@ -26,6 +26,7 @@
   import EvidenceReportBlock from './blocks/EvidenceReportBlock.svelte';
   import ResearchAnswerBlock from './blocks/ResearchAnswerBlock.svelte';
   import SectionBlock from './blocks/SectionBlock.svelte';
+  import SectionHeaderBlock from './blocks/SectionHeaderBlock.svelte';
   import SourceListBlock from './blocks/SourceListBlock.svelte';
   import TableBlock from './blocks/TableBlock.svelte';
   import TimelineBlock from './blocks/TimelineBlock.svelte';
@@ -42,6 +43,8 @@
   <HeroBlock {block} {sources} {mediaUrlFor} />
 {:else if type === 'section' || type === 'stack'}
   <SectionBlock {block} {sources} {type} {mediaUrlFor} />
+{:else if type === 'section_header'}
+  <SectionHeaderBlock {block} />
 {:else if type === 'columns' || type === 'grid' || type === 'card_grid'}
   <GridBlock {block} {sources} {type} {mediaUrlFor} />
 {:else if type === 'tabs' || type === 'accordion'}

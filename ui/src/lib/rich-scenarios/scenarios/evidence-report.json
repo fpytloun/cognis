@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "id": "evidence-report",
+  "title": "Evidence-heavy source report",
+  "description": "A report that emphasizes references, links, and auditability.",
+  "group": "research",
+  "sort_key": 600,
+  "content": "Evidence report fallback content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Evidence report",
+      "subtitle": "Designed for audit trails, source checking, and shareable research summaries.",
+      "badges": [
+        "Citations",
+        "Audit trail",
+        "External links"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Evidence",
+        "title": "Every high-confidence claim needs a visible source trail",
+        "subtitle": "Rich deliverables should make source confidence and provenance visible without forcing users into raw/debug."
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "link_preview",
+            "site": "OpenAI Docs",
+            "title": "Structured Outputs",
+            "url": "https://platform.openai.com/docs/guides/structured-outputs",
+            "description": "Reference for schema-constrained model outputs and tool result structures."
+          },
+          {
+            "type": "link_preview",
+            "site": "Cognis Design Note",
+            "title": "Rich Deliverables and Micro Apps",
+            "url": "https://cognis.local/notes/rich-deliverables",
+            "description": "Internal product direction for block-composed, renderer-neutral outputs."
+          }
+        ]
+      },
+      {
+        "type": "callout",
+        "tone": "warning",
+        "title": "Audit rule",
+        "content": "If the output makes a load-bearing claim, the rich renderer should make the supporting source easy to inspect."
+      },
+      {
+        "type": "source_list",
+        "title": "Evidence index"
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

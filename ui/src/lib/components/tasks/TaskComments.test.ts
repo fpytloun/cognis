@@ -25,6 +25,7 @@ function task(status: string): TaskDetail {
     task_id: 'task-39',
     status,
     workflow_id: 'workflow-39',
+    attempt_number: 4,
     pending_pause: status === 'paused' ? {
       pause_type: 'step_input',
       task_id: 'task-39',
@@ -58,5 +59,41 @@ describe('TaskComments collaboration intents', () => {
   it('exposes answer pause only when the existing pause contract applies', async () => {
     render(TaskComments, { task: task('paused'), stepOptions: [{ name: 'verify', label: 'Verify result' }] });
     await waitFor(() => expect(screen.getByRole('radio', { name: 'Answer pause' })).toBeEnabled());
+  });
+
+  it('submits an authoritative revision with the expected attempt and target step', async () => {
+    addComment.mockResolvedValue({
+      comment_id: 'comment-1',
+      task_id: 'task-39',
+      author_email: 'owner@example.com',
+      body: 'Correct the output.',
+      intent: 'request_revision',
+      noop: false,
+      target_step: 'verify',
+      confidence: null,
+      applied: true,
+      attempt_number: 4,
+      metadata: { action_result: { new_attempt: 5 } },
+      created_at: '2026-08-09T00:00:00Z',
+      updated_at: null,
+    });
+    render(TaskComments, {
+      task: task('completed'),
+      stepOptions: [{ name: 'verify', label: 'Verify result' }],
+      initialTargetStep: 'verify',
+    });
+
+    await fireEvent.click(screen.getByRole('radio', { name: 'Revise result' }));
+    await fireEvent.input(screen.getByLabelText('Comment body'), { target: { value: 'Correct the output.' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Revise result' }));
+
+    await waitFor(() => expect(addComment).toHaveBeenCalledWith('task-39', {
+      body: 'Correct the output.',
+      intent: 'request_revision',
+      noop: false,
+      target_step: 'verify',
+      expected_attempt: 4,
+    }));
+    expect(await screen.findByText('opened attempt #5')).toBeInTheDocument();
   });
 });

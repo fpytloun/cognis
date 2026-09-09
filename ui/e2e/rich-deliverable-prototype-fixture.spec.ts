@@ -3,7 +3,13 @@ import { expect, test } from '@playwright/test';
 for (const colorScheme of ['light', 'dark'] as const) {
   test(`renders the production-shaped rich deliverable prototype in ${colorScheme} mode`, async ({ page }) => {
     await page.emulateMedia({ colorScheme });
+    await page.addInitScript((theme) => {
+      localStorage.setItem('theme', theme);
+    }, colorScheme);
     await page.goto('/rich-deliverable-prototype-fixture');
+    await page.evaluate((theme) => {
+      document.documentElement.dataset.resolvedTheme = theme;
+    }, colorScheme);
 
     const fixture = page.getByTestId('rich-deliverable-prototype-fixture');
     await expect(fixture).toBeVisible();

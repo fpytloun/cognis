@@ -21,9 +21,13 @@ class CustomBuildHook(BuildHookInterface):
     PLUGIN_NAME = "custom"
 
     def initialize(self, version: str, build_data: dict[str, object]) -> None:
-        del version, build_data
+        del version
         self._maybe_build_ui()
         self._stage_built_assets()
+        if self.target_name == "sdist" and PACKAGE_UI_DIR.exists():
+            force_include = build_data.setdefault("force_include", {})
+            if isinstance(force_include, dict):
+                force_include[str(PACKAGE_UI_DIR)] = "cognis/ui_dist"
 
     def _maybe_build_ui(self) -> None:
         if os.environ.get("COGNIS_SKIP_UI_BUILD") == "1":
@@ -41,15 +45,17 @@ class CustomBuildHook(BuildHookInterface):
         subprocess.run([npm, "run", "build:standalone"], cwd=UI_DIR, check=True)
 
     def _stage_built_assets(self) -> None:
-        if PACKAGE_UI_DIR.exists():
-            shutil.rmtree(PACKAGE_UI_DIR)
-
         if not UI_BUILD_DIR.exists():
+            if PACKAGE_UI_DIR.exists():
+                self._warn("Reusing UI assets already staged in the source distribution.")
+                return
             self._warn(
                 "No built UI assets found; packaged wheel will not include bundled UI files."
             )
             return
 
+        if PACKAGE_UI_DIR.exists():
+            shutil.rmtree(PACKAGE_UI_DIR)
         shutil.copytree(UI_BUILD_DIR, PACKAGE_UI_DIR)
         if STANDALONE_UI_BUILD_DIR.exists():
             shutil.copytree(STANDALONE_UI_BUILD_DIR, PACKAGE_UI_DIR / "standalone")

@@ -80,7 +80,7 @@ _REMOTE_ARTIFACT_MAX_REDIRECTS = 5
 
 def _is_expired_artifact_row(row: object, *, now: datetime | None = None) -> bool:
     expires_at = getattr(row, "expires_at", None)
-    if expires_at is None:
+    if not isinstance(expires_at, datetime):
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
@@ -1860,7 +1860,7 @@ async def _fetch_remote_artifact_candidate(url: str) -> ToolResult:
         current_url, pinned_ip = _resolve_remote_artifact_url(url)
         for _hop in range(_REMOTE_ARTIFACT_MAX_REDIRECTS + 1):
             transport = httpx.AsyncHTTPTransport(retries=0)
-            transport._pool._network_backend = _PinnedNetworkBackend(  # type: ignore[attr-defined]
+            transport._pool._network_backend = _PinnedNetworkBackend(
                 host=urlparse(current_url).hostname or "",
                 ip_address=pinned_ip,
             )

@@ -1,0 +1,11 @@
+{
+  "tool_free_scenarios": [
+    "long-streaming-response",
+    "multiphase-thinking-tool-assistant",
+    "rapid-tokens",
+    "refresh-mid-and-post-turn",
+    "single-phase-stream",
+    "thinking-multiblock",
+    "thinking-multiblock-complete"
+  ]
+}

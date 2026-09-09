@@ -7,7 +7,7 @@ import contextlib
 import uuid
 from datetime import UTC, datetime, timedelta
 from time import monotonic
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, Request
 from pydantic import ValidationError
@@ -18,6 +18,7 @@ from cognis.api.common import (
     check_agent_access,
     require_current_user,
 )
+from cognis.api.mcp_policy import canonicalize_mcp_headers, invalid_mcp_config_reason
 from cognis.api.mcp_reconfigure import schedule_mcp_server_executor_reconfigure_for_app
 from cognis.api.models import (
     EffectiveToolItemResponse,
@@ -52,22 +53,27 @@ from cognis.api.tool_inventory import (
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
+from cognis.core.executor_availability import available_executor_types
 from cognis.core.executor_policy import is_executor_row_usable, load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
+from cognis.mcp_runtime import (
+    MCPClient,
+    build_mcp_client,
+    mcp_tools_to_definitions,
+)
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.tool import (
     AUTO_PROFILE_GROUPS,
     MCP_SERVER_IDS_KEY,
     ExecutorConfig,
     MCPServerConfig,
+    NativeToolDefinition,
     ToolCapability,
+    ToolDefinition,
     ToolSource,
     effective_mcp_auth_config,
     stable_tool_id,
     tool_display_name,
-)
-from cognis.models.tool import (
-    NativeToolDefinition as ToolDefinition,
 )
 from cognis.ownership import is_shared_owner_email
 from cognis.runtime_context import RuntimeAccessContext
@@ -95,13 +101,6 @@ from cognis.tools.builtin.workflow import (
 )
 from cognis.tools.classification import resolve_tool_classifications
 from cognis.tools.executor.definitions import executor_tool_definitions
-from cognis.tools.mcp import (
-    MCPClient,
-    build_mcp_client,
-    canonicalize_mcp_headers,
-    invalid_mcp_config_reason,
-    mcp_tools_to_definitions,
-)
 
 router = APIRouter(tags=["tools"])
 
@@ -111,7 +110,10 @@ def _utcnow() -> datetime:
 
 
 def _coerce_positive_int(value: object, default: int) -> int:
+    parsed: int
     try:
+        if not isinstance(value, str | bytes | bytearray | int | float):
+            return max(1, default)
         parsed = int(value)
     except (TypeError, ValueError):
         parsed = default
@@ -137,7 +139,7 @@ def _controller_catalog_tools() -> list[ToolDefinition]:
     """
 
     return [
-        ToolDefinition(
+        NativeToolDefinition(
             name=STEP_REQUEST_QUESTIONS_TOOL.name,
             description=STEP_REQUEST_QUESTIONS_TOOL.description,
             parameters=STEP_REQUEST_QUESTIONS_TOOL.parameters,
@@ -154,7 +156,7 @@ def _controller_catalog_tools() -> list[ToolDefinition]:
                 "direct_chat": "request_user_input",
             },
         ),
-        ToolDefinition(
+        NativeToolDefinition(
             name=STEP_TODO_WRITE_TOOL.name,
             description=STEP_TODO_WRITE_TOOL.description,
             parameters=STEP_TODO_WRITE_TOOL.parameters,
@@ -171,7 +173,7 @@ def _controller_catalog_tools() -> list[ToolDefinition]:
                 "direct_chat": "todo_write",
             },
         ),
-        ToolDefinition(
+        NativeToolDefinition(
             name=STEP_TODO_LIST_TOOL.name,
             description=STEP_TODO_LIST_TOOL.description,
             parameters=STEP_TODO_LIST_TOOL.parameters,
@@ -293,8 +295,9 @@ async def list_observed_local_mcp_tools(request: Request) -> list[ToolResponse]:
 async def list_executor_tools(request: Request) -> list[ToolResponse]:
     """List executor-native tools with their definitions."""
     require_current_user(request)
+    executor_tools: list[ToolDefinition] = list(executor_tool_definitions())
     tools = await resolve_tool_classifications(
-        executor_tool_definitions(),
+        executor_tools,
         session_factory=request.app.state.session_factory,
         owner_email=None,
         queue=getattr(request.app.state, "tool_classification_queue", None),
@@ -380,6 +383,7 @@ async def executor_status(request: Request) -> ExecutorStatusResponse:
             "native_tools_count": len(native_tool_names),
         },
         native_tools=native_tool_names,
+        available_executor_types=available_executor_types(),
     )
 
 
@@ -405,7 +409,8 @@ async def _get_classification_row_for_tool(
     tool_id: str,
 ) -> ToolClassificationRow | None:
     async with request.app.state.session_factory() as session:
-        return (
+        return cast(
+            ToolClassificationRow | None,
             (
                 await session.execute(
                     select(ToolClassificationRow).where(
@@ -415,7 +420,7 @@ async def _get_classification_row_for_tool(
                 )
             )
             .scalars()
-            .first()
+            .first(),
         )
 
 

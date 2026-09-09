@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -11,12 +12,14 @@ from uuid import uuid4
 
 from prometheus_client import Counter, Histogram
 
+from cognis.api.mcp_policy import invalid_mcp_config_reason
 from cognis.api.tool_inventory import (
     build_intaris_tool_definition,
     extract_intaris_aggregated_raw_tool_name,
     extract_intaris_aggregated_server_name,
 )
 from cognis.core.daily_brief_contract import daily_brief_contract_version
+from cognis.core.executor_availability import is_executor_type_available
 from cognis.core.executor_pin_lifecycle import (
     ensure_active_executor_pin,
     load_executor_pin_lifecycle_settings,
@@ -27,18 +30,26 @@ from cognis.core.executor_policy import (
     is_executor_type_allowed,
     load_executor_policy,
 )
+from cognis.core.executor_recovery import (
+    EXECUTOR_RECOVERY_WINDOW_SECONDS,
+    ExecutorRecoveryTimeout,
+    begin_executor_recovery,
+)
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.core.runtime import (
+    ExecutorEnvironmentSnapshot,
     ResolvedStepRuntime,
     TransientExecutorUnavailable,
     build_local_executor_environment,
     environment_from_metadata,
 )
 from cognis.logging import get_logger
+from cognis.mcp_runtime import disambiguate_mcp_tool_name_collisions
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
     ExecutorConfig,
+    MCPAuthConfig,
     MCPServerConfig,
     ToolDefinition,
     ToolSource,
@@ -83,8 +94,7 @@ from cognis.tools.builtin.task_continuation import (
 )
 from cognis.tools.builtin.tool_output import tool_output_tools
 from cognis.tools.builtin.workflow import workflow_tools
-from cognis.tools.executor.definitions import executor_tool_definitions, executor_tool_handlers
-from cognis.tools.mcp import disambiguate_mcp_tool_name_collisions, invalid_mcp_config_reason
+from cognis.tools.executor.definitions import executor_tool_definitions
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skills import (
     attached_skill_tool_ids,
@@ -545,21 +555,21 @@ async def _resolve_eligible_executor_config(
                     active_executor_id=executor_id,
                     source=source,
                 )
-                authoritative = await get_task(session, task_id)
-                executor_id = str(getattr(authoritative, "active_executor_id", None) or executor_id)
+                task_row = await get_task(session, task_id)
+                executor_id = str(getattr(task_row, "active_executor_id", None) or executor_id)
             elif isinstance(conversation_id, str) and conversation_id:
                 initialized = await initialize_conversation_active_executor(
                     session, conversation_id, executor_id, source=source
                 )
                 if initialized is not True:
-                    authoritative = await get_conversation(session, conversation_id)
+                    conversation_row = await get_conversation(session, conversation_id)
                     executor_id = str(
-                        getattr(authoritative, "active_executor_id", None) or executor_id
+                        getattr(conversation_row, "active_executor_id", None) or executor_id
                     )
             elif isinstance(task_id, str) and task_id:
                 await initialize_task_active_executor(session, task_id, executor_id, source=source)
-                authoritative = await get_task(session, task_id)
-                executor_id = str(getattr(authoritative, "active_executor_id", None) or executor_id)
+                task_row = await get_task(session, task_id)
+                executor_id = str(getattr(task_row, "active_executor_id", None) or executor_id)
             commit = getattr(session, "commit", None)
             if callable(commit):
                 await commit()
@@ -594,7 +604,7 @@ async def _resolve_eligible_executor_config(
             persisted_pin = (
                 await get_task(session, task_id)
                 if task_id
-                else await get_conversation(session, conversation_id)
+                else await get_conversation(session, str(conversation_id))
             )
             conversation_active_executor_source = getattr(
                 persisted_pin, "active_executor_source", None
@@ -638,7 +648,7 @@ async def _resolve_eligible_executor_config(
                     active_executor_source=conversation_active_executor_source,
                     execution=execution,
                     ws_provider=getattr(getattr(providers, "executor", None), "websocket", None),
-                    retry_seconds=settings["retry_seconds"],
+                    retry_seconds=EXECUTOR_RECOVERY_WINDOW_SECONDS,
                     retry_interval_seconds=settings["retry_interval_seconds"],
                     notice_dispatcher=getattr(providers, "executor_pin_notice_dispatcher", None),
                     canonicalization_session=session,
@@ -861,7 +871,8 @@ def static_tool_definitions(*, knowledgebase_enabled: bool = False) -> list[Tool
     """
     from cognis.tools.executor.web.definitions import web_tool_definitions
 
-    # Include all web tools for discovery (as if all backends were available)
+    # Schemas are portable. Remote executors can provide their handlers even
+    # when this controller does not have the local executor distribution.
     all_web = web_tool_definitions(["direct", "tavily", "brave"], default_backend="direct")
     from cognis.tools.builtin.schedule import schedule_tools
     from cognis.tools.executor.definitions import OFFICE_EXECUTOR_TOOLS
@@ -1196,7 +1207,14 @@ def _build_handler_map(
         handlers.update(build_knowledgebase_tool_handlers(knowledgebase_service))
     handlers.update(build_task_continuation_tool_handlers(session_factory))
     handlers.update(build_datetime_tool_handlers())
-    handlers.update(executor_tool_handlers())
+    if is_executor_type_available("in_process"):
+        try:
+            from cognis.executor.tool_definitions_runtime import executor_tool_handlers
+        except ModuleNotFoundError as exc:
+            if exc.name != "cognis.executor.tool_definitions_runtime":
+                raise
+        else:
+            handlers.update(executor_tool_handlers())
     return handlers
 
 
@@ -1216,7 +1234,11 @@ def build_registry_with_handlers(
         handler = None
         if tool.source.type in ("builtin", "executor"):
             handler = handler_map.get(tool.name)
-        elif tool.source.type == "skill" and getattr(tool, "execution_metadata", None):
+        elif (
+            tool.source.type == "skill"
+            and getattr(tool, "execution_metadata", None)
+            and is_executor_type_available("in_process")
+        ):
             # Build skill handler dynamically from execution metadata
             from cognis.providers.executor.in_process import _build_skill_handler
 
@@ -1266,13 +1288,16 @@ async def build_shared_runtime(
     session_factory = getattr(providers, "_session_factory", None)
     if session_factory is not None:
         policy = await load_executor_policy(session_factory)
-        if not policy.allow_in_process:
-            logger.info("Shared in-process executor disabled by policy; using static-only template")
+        if not policy.allow_in_process or not is_executor_type_available("in_process"):
+            logger.info(
+                "Shared in-process executor disabled by policy or unavailable; "
+                "using static-only template"
+            )
             return ResolvedStepRuntime(
                 tool_registry=build_static_registry(knowledgebase_enabled=knowledgebase_enabled),
                 executor_connection=None,
                 cleanup=noop_cleanup,
-                executor_environment=build_local_executor_environment(
+                executor_environment=ExecutorEnvironmentSnapshot.unavailable(
                     executor_type="in_process",
                     source="shared_runtime_disabled",
                 ),
@@ -1329,6 +1354,8 @@ def build_step_runtime_factory(
         access_context: RuntimeAccessContext | None = None,
         conversation_id: str | None = None,
         task_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        execution_fence: Any | None = None,
         _executor_pin_fallback_notice: dict[str, Any] | None = None,
         _executor_pin_fallback_retried: bool = False,
     ) -> ResolvedStepRuntime:
@@ -1406,19 +1433,59 @@ def build_step_runtime_factory(
                     exc_info=True,
                 )
 
-        executor_config = await _resolve_eligible_executor_config(
-            providers,
-            executor_agent,
-            user_email,
-            policy,
-            conversation_active_executor_id=conversation_active_executor_id,
-            conversation_active_executor_expires_at=conversation_active_executor_expires_at,
-            conversation_active_executor_generation=conversation_active_executor_generation,
-            conversation_active_executor_unavailable_since=conversation_active_executor_unavailable_since,
-            conversation_active_executor_source=conversation_active_executor_source,
-            conversation_id=conversation_id,
-            task_id=task_id,
-        )
+        try:
+            executor_config = await _resolve_eligible_executor_config(
+                providers,
+                executor_agent,
+                user_email,
+                policy,
+                conversation_active_executor_id=conversation_active_executor_id,
+                conversation_active_executor_expires_at=conversation_active_executor_expires_at,
+                conversation_active_executor_generation=conversation_active_executor_generation,
+                conversation_active_executor_unavailable_since=conversation_active_executor_unavailable_since,
+                conversation_active_executor_source=conversation_active_executor_source,
+                conversation_id=conversation_id,
+                task_id=task_id,
+            )
+        except TransientExecutorUnavailable as exc:
+            recovery_ws_provider = getattr(getattr(providers, "executor", None), "websocket", None)
+            if (
+                recovery_ws_provider is None
+                or session_factory is None
+                or not exc.executor_id
+                or not (conversation_id or task_id)
+            ):
+                raise
+            window = await begin_executor_recovery(
+                session_factory,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                executor_id=exc.executor_id,
+            )
+            connection = (
+                await recovery_ws_provider.wait_for_connection(
+                    exc.executor_id,
+                    timeout=window.remaining_seconds(),
+                    cancel_event=cancel_event,
+                    execution_fence=execution_fence,
+                )
+                if window.remaining_seconds() > 0
+                else None
+            )
+            if connection is None:
+                raise ExecutorRecoveryTimeout(window, phase="runtime_admission") from exc
+            return await factory(
+                agent,
+                user_email,
+                executor_agent=executor_agent,
+                access_context=access_context,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                cancel_event=cancel_event,
+                execution_fence=execution_fence,
+                _executor_pin_fallback_notice=_executor_pin_fallback_notice,
+                _executor_pin_fallback_retried=_executor_pin_fallback_retried,
+            )
         _executor_pin_fallback_notice = None
 
         # Stage 36: resolve the agent's full executor pool (primary + additional)
@@ -1931,12 +1998,44 @@ def build_step_runtime_factory(
                         exc_info=True,
                     )
                     raise RuntimeError(message) from exc
-            message = f"Selected executor '{executor_id}' is not connected or not ready"
-            _raise_transient_executor_unavailable(
-                message,
-                executor_config=executor_config,
-                selection_source=selection_source,
-                hard_bound=hard_bound_executor,
+            if session_factory is None or not (conversation_id or task_id):
+                message = f"Selected executor '{executor_id}' is not connected or not ready"
+                _raise_transient_executor_unavailable(
+                    message,
+                    executor_config=executor_config,
+                    selection_source=selection_source,
+                    hard_bound=hard_bound_executor,
+                )
+            window = await begin_executor_recovery(
+                session_factory,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                executor_id=executor_id,
+            )
+            remaining = window.remaining_seconds()
+            connection = (
+                await ws_provider.wait_for_connection(
+                    executor_id,
+                    timeout=remaining,
+                    cancel_event=cancel_event,
+                    execution_fence=execution_fence,
+                )
+                if remaining > 0
+                else None
+            )
+            if connection is None:
+                raise ExecutorRecoveryTimeout(window, phase="runtime_admission")
+            return await factory(
+                agent,
+                user_email,
+                executor_agent=executor_agent,
+                access_context=access_context,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                cancel_event=cancel_event,
+                execution_fence=execution_fence,
+                _executor_pin_fallback_notice=_executor_pin_fallback_notice,
+                _executor_pin_fallback_retried=_executor_pin_fallback_retried,
             )
 
         raise RuntimeError(f"Executor type '{resolved_type}' is not supported for agent execution")
@@ -2359,7 +2458,7 @@ async def _resolve_executor_mcp_servers(
                     )
                     continue
                 headers = result.headers
-                auth_config = {"type": "static_headers"}
+                auth_config = MCPAuthConfig(type="static_headers")
             servers.append(
                 MCPServerConfig(
                     server_id=row.server_id,
@@ -2724,9 +2823,9 @@ async def _resolve_intaris_mcp_tools(
             continue
         server_name = _extract_intaris_aggregated_server_name(row)
         raw_tool_name = _extract_intaris_aggregated_raw_tool_name(row)
-        if server_name in allowed_names:
+        if server_name is not None and server_name in allowed_names:
             seen_servers.add(server_name)
-        if server_name in allowed_names and not raw_tool_name:
+        if server_name is not None and server_name in allowed_names and not raw_tool_name:
             malformed_servers.add(server_name)
         if not server_name or not raw_tool_name:
             INTARIS_MCP_SKIPPED_ROWS.inc()

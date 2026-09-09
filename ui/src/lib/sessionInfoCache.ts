@@ -1,4 +1,8 @@
-import type { ContextUsage, GenerationPerformanceSnapshot } from '$lib/types/api';
+import type {
+  ContextUsage,
+  GenerationPerformanceSnapshot,
+  RuntimeSelection
+} from '$lib/types/api';
 
 const MAX_ENTRIES = 16;
 const MAX_PER_CONVERSATION = 8;
@@ -16,6 +20,25 @@ export interface SessionInfoData {
   escalated_count: number;
   context_usage?: ContextUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;
+  runtime_selection?: RuntimeSelection | null;
+}
+
+export function mergeRuntimeSelection(
+  current: SessionInfoData,
+  incoming: RuntimeSelection
+): SessionInfoData {
+  const selected = newestRuntimeSelection(current.runtime_selection, incoming);
+  if (selected === current.runtime_selection) {
+    return current;
+  }
+  return { ...current, runtime_selection: selected };
+}
+
+export function newestRuntimeSelection(
+  current: RuntimeSelection | null | undefined,
+  incoming: RuntimeSelection
+): RuntimeSelection {
+  return current && current.revision > incoming.revision ? current : incoming;
 }
 
 type Entry = {

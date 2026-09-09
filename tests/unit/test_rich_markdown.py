@@ -88,6 +88,61 @@ def test_signal_like_markdown_projection_preserves_full_document_and_links() -> 
     assert "Fallback must not replace" not in rendered
 
 
+def test_markdown_projects_section_headers_progress_and_typed_cells() -> None:
+    rendered = "\n".join(
+        _project(
+            {
+                "blocks": [
+                    {
+                        "type": "section_header",
+                        "eyebrow": "Fleet",
+                        "title": "Capacity",
+                        "subtitle": "Current allocation",
+                        "status": "Attention",
+                        "tone": "warning",
+                    },
+                    {
+                        "type": "metric",
+                        "label": "Used",
+                        "value": "72%",
+                        "progress": {"value": 72, "max": 100, "label": "Capacity"},
+                    },
+                    {
+                        "type": "table",
+                        "rows": [
+                            {
+                                "service": {"type": "code", "value": "api"},
+                                "state": {
+                                    "type": "badge",
+                                    "value": "critical",
+                                    "label": "1.08M → 0",
+                                    "tone": "critical",
+                                },
+                                "latency": {"type": "text", "value": 118, "label": "~118 s"},
+                                "used": {
+                                    "type": "progress",
+                                    "value": 7,
+                                    "max": 10,
+                                    "label": "Usage",
+                                },
+                            }
+                        ],
+                    },
+                ]
+            }
+        )
+    )
+
+    assert "_Fleet_" in rendered
+    assert "Status: Attention (warning)" in rendered
+    assert "Capacity: 72 of 100" in rendered
+    assert "`api`" in rendered
+    assert "1.08M → 0 (critical)" in rendered
+    assert "~118 s" in rendered
+    assert "~118 s: 118" not in rendered
+    assert "Usage: 7 of 10" in rendered
+
+
 def test_canonical_markdown_preserves_link_targets_and_markup() -> None:
     chunks = _project(
         {

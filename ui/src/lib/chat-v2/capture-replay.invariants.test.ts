@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readdirSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 import {
   applyRealtimeFrame,
@@ -60,6 +60,7 @@ function replayCapture(path: string): void {
   const seenStatuses = new Set<string>();
   let reconnectIndex = -1;
   let lastCursor: string | null = null;
+  let checkingSettledReconnect = false;
 
   for (const [index, record] of records.entries()) {
     const payload = record.payload;
@@ -74,6 +75,9 @@ function replayCapture(path: string): void {
     if (record.type === 'reconnect') {
       expect(record.payload.cursor, `${path}:${index}: reconnect cursor`).toBe(lastCursor);
       reconnectIndex = index;
+      // This scenario reconnects after turn completion. Live task captures
+      // can reconnect during active work and have a different contract.
+      checkingSettledReconnect = path.includes('promoted-reconnect-');
     } else if (record.type === 'snapshot') {
       state = applySnapshot(record.payload, state);
       lastCursor = record.payload.cursor;
@@ -83,6 +87,7 @@ function replayCapture(path: string): void {
       }
     } else if (record.type === 'sync') {
       const sync = record.payload;
+      if (sync.reset_required) checkingSettledReconnect = false;
       const result = applySyncResponse(state, sync);
       expect(['applied', 'duplicate', 'reset_required'], `${path}: ${result.outcome}`).toContain(result.outcome);
       if (lastCursor && sync.cursor_before !== lastCursor && !sync.reset_required) {
@@ -107,6 +112,12 @@ function replayCapture(path: string): void {
       }
     }
     const visible = visibleTimelineItems(state);
+    if (checkingSettledReconnect) {
+      expect(
+        visible.filter((item) => item.status === 'running' || item.status === 'pending'),
+        `${path}:${index}: settled reconnect must not retain streaming items before recovery`
+      ).toEqual([]);
+    }
     orderByStep.push(visible.map((item) => item.id));
     expect(new Set(visible.map((item) => item.id)).size).toBe(visible.length);
     expect(visible.map((item) => item.sort_key)).toEqual(
@@ -122,20 +133,35 @@ function replayCapture(path: string): void {
   expect(scopes.size, path).toBe(1);
   expect(state.syncStatus).toBe('ready');
   expect(orderByStep.at(-1)?.length).toBeGreaterThan(0);
-  expect([...seenKinds], path).toEqual(expect.arrayContaining(['message', 'tool_call']));
-  expect(seenStatuses, path).toContain('complete');
+  // This baseline's YAML defines text only. All other captures retain the
+  // tool lifecycle requirement; missing tools cannot silently opt out.
+  const contracts = JSON.parse(readFileSync(
+    resolve(__dirname, '../../../../tests/e2e/scenarios/replay-contracts.json'), 'utf8'
+  )) as { tool_free_scenarios: string[] };
+  const scenarioId = basename(path).replace(/^promoted-/, '').replace(/\.jsonl$/, '');
+  const textOnly = contracts.tool_free_scenarios.includes(scenarioId);
+  expect([...seenKinds], path).toEqual(expect.arrayContaining(
+    textOnly ? ['message'] : ['message', 'tool_call']
+  ));
   const assistant = state.timelineItems.find(
     (item): item is MessageTimelineItem => item.kind === 'message' && item.role === 'assistant'
   );
   expect(assistant?.content.trim(), `${path}: assistant/completion`).toBeTruthy();
+  expect(assistant?.stable, `${path}: canonical assistant completion`).toBe(true);
   const tool = state.timelineItems.find((item) => item.kind === 'tool_call');
-  expect(tool?.status, `${path}: tool result`).toBe('complete');
-  expect(tool?.result_preview, `${path}: tool result`).toBeTruthy();
+  if (textOnly) {
+    expect(seenKinds.has('tool_call'), `${path}: text-only scenario`).toBe(false);
+    expect(tool).toBeUndefined();
+  } else {
+    expect(seenStatuses, path).toContain('complete');
+    expect(tool?.status, `${path}: tool result`).toBe('complete');
+    expect(tool?.result_preview, `${path}: tool result`).toBeTruthy();
+  }
   expect(visibleTimelineItems(state).some((item) => item.status === 'running')).toBe(false);
   const resetIndices = records.flatMap((record, index) => (
     record.type === 'sync' && record.payload.reset_required ? [index] : []
   ));
-  if (path.includes('promoted-live-')) {
+  if (path.includes('promoted-live-') || path.includes('promoted-reconnect-')) {
     expect(resetIndices.length, `${path}: reset sequence`).toBeGreaterThan(0);
     expect(reconnectIndex, `${path}: reconnect sequence`).toBeGreaterThan(0);
   }

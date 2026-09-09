@@ -59,7 +59,13 @@ def _call(
     )
 
 
-def _project(items, definitions, *, complete_files: bool = False):
+def _project(
+    items,
+    definitions,
+    *,
+    complete_files: bool = False,
+    canonical_deliverable_ids: frozenset[str] | None = None,
+):
     return build_work_projection(
         scope=TimelineScope(
             key="conversation:conversation-1",
@@ -73,7 +79,76 @@ def _project(items, definitions, *, complete_files: bool = False):
         before_cursor=None,
         server_time="2026-01-01T00:00:10Z",
         complete_files=complete_files,
+        canonical_deliverable_ids=canonical_deliverable_ids,
     )
+
+
+def test_recent_projection_can_preserve_cross_session_chronology() -> None:
+    newer = _call("bash", seq=1, arguments={"command": "newer"})
+    older = _call("bash", seq=9, arguments={"command": "older"})
+
+    projection = build_work_projection(
+        scope=TimelineScope(
+            key="conversation:conversation-1",
+            kind="conversation",
+            conversation_id="conversation-1",
+        ),
+        projection_version="chat-v2-test",
+        items=[newer, older],
+        tool_definitions={"bash": _tool("bash", read_only=False, category="shell")},
+        has_more_before=False,
+        before_cursor=None,
+        server_time="2026-01-01T00:00:10Z",
+        newest_first=True,
+        preserve_input_order=True,
+    )
+
+    assert [command.id for command in projection.commands] == [newer.id, older.id]
+
+
+def test_complete_files_projects_internal_current_file_snapshot_items() -> None:
+    projection = _project(
+        [
+            _call(
+                "files",
+                seq=1,
+                diffs=[
+                    FileDiffRef(
+                        path="/srv/repo/migration-job.yml",
+                        diff="",
+                        path_id="root:migration-job.yml",
+                        path_generation_id="generation-1",
+                        additions=1,
+                        deletions=1,
+                    ),
+                    FileDiffRef(
+                        path="/srv/repo/statefulset.yml",
+                        diff="",
+                        path_id="root:statefulset.yml",
+                        path_generation_id="generation-2",
+                        additions=1,
+                        deletions=1,
+                    ),
+                ],
+            )
+        ],
+        [],
+        complete_files=True,
+    )
+
+    assert len(projection.mutations) == 1
+    assert projection.mutations[0].file_diffs == []
+    assert [stat.path for stat in projection.mutations[0].file_stats] == [
+        "repo/migration-job.yml",
+        "repo/statefulset.yml",
+    ]
+    assert [stat.path_generation_id for stat in projection.mutations[0].file_stats] == [
+        "generation-1",
+        "generation-2",
+    ]
+    assert projection.summary.changed_files == 2
+    assert projection.summary.additions == 2
+    assert projection.summary.deletions == 2
 
 
 def test_projects_only_server_classified_mutations_and_redacts_arguments() -> None:
@@ -254,6 +329,27 @@ def test_latest_deliverable_is_authoritative_and_order_is_stable() -> None:
     assert projection.summary.artifacts == 1
 
 
+def test_event_only_deliverable_is_display_only_and_not_final() -> None:
+    event_only = AssistantDeliverableTimelineItem(
+        id="deliverable:legacy",
+        deliverable_id="legacy",
+        format="markdown",
+        content="historical preview",
+        sort_key="0001",
+        source_refs=[_source(1)],
+    )
+
+    projection = _project(
+        [event_only],
+        [],
+        canonical_deliverable_ids=frozenset(),
+    )
+
+    assert projection.final_deliverable is None
+    assert projection.deliverables[0].display_only is True
+    assert projection.deliverables[0].recoverable is False
+
+
 def test_diff_stats_are_exact_before_file_and_content_preview_bounds() -> None:
     large_diff = "\n".join(["+before-bound"] * 10_001 + ["-after-bound"] * 7_003)
     diffs = [
@@ -270,6 +366,7 @@ def test_diff_stats_are_exact_before_file_and_content_preview_bounds() -> None:
     assert event.diffs_truncated is True
     assert event.file_diffs[0].diff.endswith("… diff content truncated …")
     assert event.file_diffs[0].content_truncated is True
+    assert event.file_diffs[0].preview_omission_reason == "projection_budget"
     assert event.file_diffs[0].additions == 10_001
     assert event.file_diffs[0].deletions == 7_003
     assert event.total_file_count == 25
@@ -484,6 +581,8 @@ def test_projects_all_deliverables_and_aggregate_diff_stats() -> None:
                     FileDiffRef(
                         path="/home/user/repo/src/app.py",
                         diff="--- a/src/app.py\n+++ b/src/app.py\n-old\n+new\n+extra",
+                        path_generation_id="path-generation-1",
+                        source_item_id="tool-item-1",
                     )
                 ],
             ),
@@ -500,6 +599,8 @@ def test_projects_all_deliverables_and_aggregate_diff_stats() -> None:
     assert projection.summary.additions == 2
     assert projection.summary.deletions == 1
     assert projection.mutations[0].file_diffs[0].path == "repo/src/app.py"
+    assert projection.mutations[0].file_diffs[0].path_generation_id == "path-generation-1"
+    assert projection.mutations[0].file_diffs[0].source_item_id == "tool-item-1"
 
 
 def test_recursive_redaction_runs_before_bounds_and_covers_json_text() -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from cognis.core.runtime_selection import RuntimeSelectionPlan
+
 
 async def persist_agent_profile_switch(
     *,
@@ -13,40 +15,25 @@ async def persist_agent_profile_switch(
     session: Any,
     profile_id: str,
     persist_conversation: bool,
+    runtime_plan: RuntimeSelectionPlan | None = None,
 ) -> None:
     """Persist a validated profile selection and clear inference overrides."""
 
-    from cognis.store.queries import (
-        set_conversation_agent_profile_id,
-        set_session_agent_profile_id,
+    from cognis.core.runtime_selection import persist_runtime_selection
+
+    await persist_runtime_selection(
+        session_factory=session_factory,
+        session_cache=session_cache,
+        conversation=conversation,
+        session=session,
+        profile_id=profile_id,
+        clear_overrides=True,
+        persist_conversation_profile=persist_conversation,
+        require_active_session=persist_conversation,
+        runtime_plan=runtime_plan,
     )
-
-    async with session_factory() as db_session:
-        try:
-            if persist_conversation:
-                await set_conversation_agent_profile_id(
-                    db_session,
-                    conversation.conversation_id,
-                    profile_id,
-                )
-            await set_session_agent_profile_id(
-                db_session,
-                session.session_id,
-                profile_id,
-            )
-            await db_session.commit()
-        except Exception:
-            await db_session.rollback()
-            raise
-
-    if persist_conversation:
-        conversation.agent_profile_id = profile_id
-    session.agent_profile_id = profile_id
-    session_cache.set_model_override(session.session_id, None)
-    session_cache.set_reasoning_effort_override(session.session_id, None)
-    set_fast_mode_override = getattr(session_cache, "set_fast_mode_override", None)
-    if callable(set_fast_mode_override):
-        set_fast_mode_override(session.session_id, None)
+    if runtime_plan is not None:
+        return
     update_tool_runtime_info = getattr(session_cache, "update_tool_runtime_info", None)
     if callable(update_tool_runtime_info):
         update_tool_runtime_info(session.session_id, None)

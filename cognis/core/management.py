@@ -132,12 +132,17 @@ async def resolve_task_pause_action(
     task_queue: Any,
     session_factory: Any,
     user_email: str,
+    notification_id: str | None = None,
+    expected_revision: int | None = None,
+    submission_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve a paused task gate using the shared API/tool semantics."""
 
     pause = task_pending_pause_response(pause_waiter, task)
     if pause is None or pause.pause_type != "gate":
         raise ValueError("No pending gate for task")
+    if notification_id is not None and pause.pause_id != notification_id:
+        raise ValueError("The gate notification does not match the current task pause")
 
     if requested_action == "retry":
         decision = _pause_retry_action(pause)
@@ -150,15 +155,29 @@ async def resolve_task_pause_action(
 
     resolved = False
     if notification_service is not None:
-        notif = await notification_service.find_by_task(
-            task.task_id, notification_type="gate", status="pending"
+        notif = (
+            await notification_service.get(notification_id)
+            if notification_id is not None
+            else await notification_service.find_by_task(
+                task.task_id, notification_type="gate", status="pending"
+            )
         )
         if notif is not None:
+            if (
+                notif.notification_type != "gate"
+                or notif.task_id != task.task_id
+                or (notif.step_name and pause.step_name and notif.step_name != pause.step_name)
+            ):
+                raise ValueError("The gate notification does not match the current task pause")
+            resolution_data = {"note": note}
+            if submission_id is not None:
+                resolution_data["submission_id"] = submission_id
             resolved = await notification_service.resolve(
                 notif.notification_id,
                 decision,
-                {"note": note},
+                resolution_data,
                 user_email=user_email,
+                expected_revision=expected_revision,
             )
             if not resolved:
                 raise RuntimeError("Gate has already been resolved")
@@ -210,28 +229,52 @@ async def respond_task_input(
     task_queue: Any,
     session_factory: Any,
     user_email: str,
+    notification_id: str | None = None,
+    expected_revision: int | None = None,
+    submission_id: str | None = None,
 ) -> dict[str, Any]:
     """Answer a paused step question and resume the task when needed."""
 
     pending_pause = task_pending_pause_response(pause_waiter, task)
     if pending_pause is None or pending_pause.pause_type not in {"step_input", "step_question"}:
         raise ValueError("No pending step question for task")
+    if notification_id is not None and pending_pause.pause_id != notification_id:
+        raise ValueError("The question notification does not match the current task pause")
     questions = pending_pause.questions or []
-    normalized_reply = validate_reply_for_questions(reply, questions)
+    normalized_questions = [question.model_dump(mode="json") for question in questions]
+    normalized_reply = validate_reply_for_questions(reply, normalized_questions)
 
     resolved = False
     if notification_service is not None:
-        notif = await notification_service.find_by_task(
-            task.task_id,
-            notification_type="step_question",
-            status="pending",
+        notif = (
+            await notification_service.get(notification_id)
+            if notification_id is not None
+            else await notification_service.find_by_task(
+                task.task_id,
+                notification_type="step_question",
+                status="pending",
+            )
         )
         if notif is not None:
+            if (
+                notif.notification_type != "step_question"
+                or notif.task_id != task.task_id
+                or (
+                    notif.step_name
+                    and pending_pause.step_name
+                    and notif.step_name != pending_pause.step_name
+                )
+            ):
+                raise ValueError("The question notification does not match the current task pause")
+            resolution_data = dict(normalized_reply)
+            if submission_id is not None:
+                resolution_data["submission_id"] = submission_id
             resolved = await notification_service.resolve(
                 notif.notification_id,
                 "continue",
-                normalized_reply,
+                resolution_data,
                 user_email=user_email,
+                expected_revision=expected_revision,
             )
             if not resolved:
                 raise RuntimeError("Step question has already been resolved")

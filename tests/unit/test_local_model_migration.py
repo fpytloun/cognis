@@ -18,6 +18,7 @@ from sqlalchemy import BigInteger, create_engine, inspect
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateTable
 
+from cognis.store.migrations.versioning import ALEMBIC_VERSION_NUM_LENGTH
 from cognis.store.models import (
     LocalModelDeployment,
     LocalModelOperation,
@@ -64,7 +65,7 @@ def test_local_model_migration_upgrade_and_downgrade_sqlite(tmp_path: Path) -> N
     config.set_main_option("sqlalchemy.url", database_url)
 
     with _preserve_logging_state():
-        command.upgrade(config, "head")
+        command.upgrade(config, "092_local_model_byte_bigint")
 
     sync_engine = create_engine(f"sqlite:///{database_path}")
     try:
@@ -131,16 +132,16 @@ def test_local_model_migration_upgrade_and_downgrade_sqlite(tmp_path: Path) -> N
         sync_engine.dispose()
 
     with _preserve_logging_state():
-        command.upgrade(config, "head")
+        command.upgrade(config, "092_local_model_byte_bigint")
 
 
 def test_local_model_migration_is_the_single_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["120_schedule_fire_kinds"]
-    assert script.get_revision("120_schedule_fire_kinds").down_revision == (
-        "119_work_scope_revisions"
+    assert script.get_heads() == ["148_channel_delivery_route_release"]
+    assert script.get_revision("144_work_v8_projection_repair").down_revision == (
+        "143_schedule_terminal_task_correlation"
     )
     assert script.get_revision("119_work_scope_revisions").down_revision == (
         "118_channel_delivery_receipts"
@@ -197,7 +198,7 @@ def test_local_model_migration_is_the_single_head() -> None:
     assert script.get_revision("087_local_model_foundation").down_revision == (
         "086_channel_delivery_attachments"
     )
-    assert all(len(revision) <= 32 for revision in script.get_heads())
+    assert all(len(revision) < ALEMBIC_VERSION_NUM_LENGTH for revision in script.get_heads())
 
 
 def test_local_model_capacity_generation_compiles_as_postgresql_bigint() -> None:
@@ -244,8 +245,8 @@ def test_local_model_byte_counter_upgrade_from_previous_sqlite_schema(tmp_path: 
         sync_engine.dispose()
 
     with _preserve_logging_state():
-        command.upgrade(config, "head")
-        command.upgrade(config, "head")
+        command.upgrade(config, "092_local_model_byte_bigint")
+        command.upgrade(config, "092_local_model_byte_bigint")
     sync_engine = create_engine(f"sqlite:///{database_path}")
     try:
         inspector = inspect(sync_engine)
@@ -276,7 +277,7 @@ def test_local_model_byte_counter_downgrade_refuses_oversized_values(
     config = Config("cognis/store/migrations/alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite+aiosqlite:///{database_path}")
     with _preserve_logging_state():
-        command.upgrade(config, "head")
+        command.upgrade(config, "092_local_model_byte_bigint")
 
     sync_engine = create_engine(f"sqlite:///{database_path}")
     try:

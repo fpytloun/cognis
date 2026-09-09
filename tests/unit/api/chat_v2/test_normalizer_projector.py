@@ -10,6 +10,10 @@ from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.item_keys import assistant_message_item_id
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
+from cognis.api.chat_v2.realtime import (
+    compaction_runtime_item,
+    tool_result_runtime_item,
+)
 from cognis.api.chat_v2.schemas import (
     ArtifactTimelineItem,
     AssistantDeliverableTimelineItem,
@@ -30,7 +34,111 @@ from cognis.api.chat_v2.schemas import (
     UserInteractionTimelineItem,
 )
 
+
+def test_terminal_compaction_lifecycle_projects_with_occurrence_identity() -> None:
+    normalization = normalize_session_events(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=7,
+                type="lifecycle",
+                data={
+                    "event": "session_compaction_finished",
+                    "compaction_id": "compact-1",
+                    "session_id": "sess-1",
+                    "status": "skipped",
+                    "trigger": "pre_turn_auto",
+                    "reason": "context_compaction_threshold",
+                    "fallback_reason": "no_compactable_history",
+                },
+            )
+        ]
+    )
+
+    item = project_timeline(normalization.events).timeline.items[0]
+    assert isinstance(item, CompactionTimelineItem)
+    assert item.id == "compaction:compact-1"
+    assert item.status == "skipped"
+    assert item.summary_preview == "no_compactable_history"
+    assert item.reason == "no_compactable_history"
+
+
+def test_session_recovery_lifecycle_projects_as_notice() -> None:
+    normalization = normalize_session_events(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=3,
+                type="lifecycle",
+                data={
+                    "event": "session_recovered",
+                    "notice_id": "session-recovered:sess-1:controller_restart",
+                    "title": "Controller restarted",
+                    "message": "Saved work is preserved.",
+                },
+            )
+        ]
+    )
+
+    item = project_timeline(normalization.events).timeline.items[0]
+    assert isinstance(item, NoticeTimelineItem)
+    assert item.title == "Controller restarted"
+
+
+def test_runtime_compaction_uses_canonical_id() -> None:
+    compaction = compaction_runtime_item(
+        {
+            "session_id": "sess-1",
+            "compaction_id": "compact-1",
+            "status": "running",
+        }
+    )
+    assert compaction is not None
+    assert compaction.id == "compaction:compact-1"
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def test_escalation_runtime_waiting_and_denial_have_distinct_statuses() -> None:
+    waiting = tool_result_runtime_item(
+        session_id="sess-1",
+        call_id="tool-call-1",
+        tool_name="bash",
+        result="Waiting for user approval...",
+        is_error=False,
+        duration_ms=None,
+        evaluation={"phase": "waiting_for_approval"},
+        attachments=None,
+        file_diffs=None,
+        turn_id="turn-1",
+        assistant_phase_index=0,
+        turn_cycle_index=0,
+        timestamp="2026-08-17T15:00:00Z",
+    )
+    denied = tool_result_runtime_item(
+        session_id="sess-1",
+        call_id="tool-call-1",
+        tool_name="bash",
+        result="User denied the tool call. Too risky",
+        is_error=True,
+        duration_ms=None,
+        evaluation={"resolution": "deny", "note": "Too risky"},
+        attachments=None,
+        file_diffs=None,
+        turn_id="turn-1",
+        assistant_phase_index=0,
+        turn_cycle_index=0,
+        timestamp="2026-08-17T15:00:01Z",
+    )
+
+    assert waiting.id == denied.id == "tool:tool-call-1"
+    assert waiting.status == "waiting"
+    assert waiting.is_error is False
+    assert denied.status == "denied"
+    assert denied.is_error is True
 
 
 @pytest.mark.parametrize(
@@ -76,6 +184,131 @@ def test_side_lane_can_be_included_when_requested() -> None:
 
     assert normalization.skipped_count == 0
     assert [item.id for item in projection.timeline.items] == ["user:side_1"]
+
+
+def test_model_only_workflow_prompt_is_hidden_but_literal_user_xml_is_visible() -> None:
+    wrapper = (
+        '<workflow_prompt_block kind="user_task_contract" lifetime="workflow" '
+        'source="task" trust="user">\nliteral\n</workflow_prompt_block>'
+    )
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess",
+            seq=1,
+            type="user_message",
+            prompt_visibility="model_only",
+            data={
+                "content": wrapper,
+                "prompt_visibility": "model_only",
+                "prompt_provenance": {
+                    "kind": "internal_workflow_prompt",
+                    "task_id": "task-1",
+                },
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess",
+            seq=2,
+            type="user_message",
+            data={"content": wrapper, "client_message_id": "literal-user"},
+        ),
+    ]
+
+    result = normalize_session_events(raw_events)
+
+    assert result.skipped_count == 1
+    assert [event.data["content"] for event in result.events] == [wrapper]
+
+
+def test_model_only_workflow_prompt_exposes_only_its_user_visible_revision() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess",
+            seq=1,
+            type="user_message",
+            prompt_visibility="model_only",
+            data={
+                "content": "internal workflow prompt",
+                "user_visible_content": "Keep the API compatible.",
+                "prompt_provenance": {
+                    "kind": "internal_workflow_prompt",
+                    "task_id": "task-1",
+                    "step_run_id": "step-2",
+                },
+            },
+        )
+    ]
+
+    normalization = normalize_session_events(raw_events)
+    projection = project_timeline(normalization.events)
+
+    assert normalization.skipped_count == 0
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, MessageTimelineItem)
+    assert item.role == "user"
+    assert item.content == "Keep the API compatible."
+
+
+def test_legacy_model_only_delegation_input_is_visible() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_delegate",
+            seq=1,
+            type="user_message",
+            prompt_visibility="model_only",
+            data={
+                "content": "Research replacement adapters",
+                "source": "delegation_input",
+                "prompt_visibility": "model_only",
+                "prompt_provenance": {"kind": "internal_workflow_prompt"},
+            },
+        )
+    ]
+
+    normalization = normalize_session_events(raw_events)
+    projection = project_timeline(normalization.events)
+
+    assert normalization.skipped_count == 0
+    assert len(projection.timeline.items) == 1
+    item = projection.timeline.items[0]
+    assert isinstance(item, MessageTimelineItem)
+    assert item.role == "user"
+    assert item.content == "Research replacement adapters"
+
+
+def test_internal_workflow_envelope_stays_hidden_when_mislabeled_as_delegation_input() -> None:
+    wrapper = (
+        '<workflow_prompt_block kind="user_task_contract" lifetime="workflow" '
+        'source="task" trust="user">\ninternal\n</workflow_prompt_block>'
+    )
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_delegate",
+            seq=1,
+            type="user_message",
+            prompt_visibility="model_only",
+            data={
+                "content": wrapper,
+                "source": "delegation_input",
+                "prompt_visibility": "model_only",
+                "prompt_provenance": {
+                    "kind": "internal_workflow_prompt",
+                    "task_id": "task-1",
+                },
+            },
+        )
+    ]
+
+    normalization = normalize_session_events(raw_events)
+
+    assert normalization.skipped_count == 1
+    assert normalization.events == []
 
 
 def test_legacy_attachment_without_kind_does_not_break_projection() -> None:
@@ -138,6 +371,7 @@ def test_turn_error_lifecycle_projects_as_error() -> None:
                 "event": "turn_error",
                 "turn_id": "turn_failed",
                 "message": "Executor unavailable",
+                "error_detail": "Connection refused by executor.",
                 "code": "executor_unavailable",
                 "recoverable": True,
             },
@@ -151,6 +385,7 @@ def test_turn_error_lifecycle_projects_as_error() -> None:
     assert len(projection.timeline.items) == 1
     assert projection.timeline.items[0].kind == "error"
     assert projection.timeline.items[0].error_code == "executor_unavailable"
+    assert projection.timeline.items[0].error_detail == "Connection refused by executor."
     assert projection.timeline.items[0].recoverable is True
 
 
@@ -312,7 +547,7 @@ def test_lifecycle_and_system_events_are_hidden_from_chat_timeline() -> None:
     assert system_item.follow_up_session_id == "sess_follow"
 
 
-def test_turn_initiated_system_notice_is_transient_not_canonical_history() -> None:
+def test_turn_initiated_system_notice_precedes_follow_up_activity_in_canonical_history() -> None:
     raw_events = [
         RawSessionEvent(
             store_id="intaris",
@@ -332,7 +567,11 @@ def test_turn_initiated_system_notice_is_transient_not_canonical_history() -> No
             session_id="sess_follow_up",
             seq=2,
             type="assistant_message",
-            data={"message_id": "msg_1", "content": "Current result."},
+            data={
+                "message_id": "msg_1",
+                "turn_id": "turn_fup_1",
+                "content": "Current result.",
+            },
         ),
     ]
 
@@ -341,7 +580,53 @@ def test_turn_initiated_system_notice_is_transient_not_canonical_history() -> No
     assert [
         (item.kind, getattr(item, "role", None), getattr(item, "content", None))
         for item in projection.timeline.items
-    ] == [("message", "assistant", "Current result.")]
+    ] == [
+        ("message", "system", "Turn initiated by other: Agent work finished."),
+        ("message", "assistant", "Current result."),
+    ]
+    assert projection.timeline.items[0].id == "system:turn-init:fup_1"
+    assert projection.timeline.items[0].sort_key < projection.timeline.items[1].sort_key
+
+
+def test_turn_initiated_system_notice_precedes_follow_up_failure() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_follow_up",
+            seq=1,
+            type="system_message",
+            data={
+                "notice_id": "turn-init:fup_failed",
+                "kind": "turn_initiated",
+                "scope": "turn",
+                "turn_id": "turn_failed",
+                "content": "Turn initiated by task failure.",
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_follow_up",
+            seq=2,
+            type="lifecycle",
+            data={
+                "event": "turn_error",
+                "turn_id": "turn_failed",
+                "error_id": "follow-up-error",
+                "title": "Follow-up turn failed",
+                "message": "The follow-up turn did not complete.",
+                "error_code": "turn_failed",
+                "recoverable": False,
+            },
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+
+    assert [item.id for item in projection.timeline.items] == [
+        "system:turn-init:fup_failed",
+        "error:follow-up-error",
+    ]
+    assert projection.timeline.items[0].sort_key < projection.timeline.items[1].sort_key
 
 
 def test_lifecycle_compaction_start_notice_is_hidden() -> None:
@@ -1415,6 +1700,43 @@ def test_tool_call_projects_structured_arguments() -> None:
         # a stale repr(dict) string can never leak into the UI on a merge that
         # drops the structured dict.
         assert item.arguments_preview is None
+
+
+def test_deferred_bridge_projects_canonical_tool_identity_and_arguments() -> None:
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_tool",
+            seq=1,
+            type="tool_call",
+            data={
+                "call_id": "call_1",
+                "name": "get_task",
+                "canonical_name": "get_task",
+                "visible_name": "call_tool",
+                "arguments": {"task_id": "task_sched_123"},
+                "visible_arguments": {
+                    "tool": "builtin:get_task",
+                    "arguments": {"task_id": "task_sched_123"},
+                },
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_tool",
+            seq=2,
+            type="tool_result",
+            data={"call_id": "call_1", "result": '{"status":"completed"}'},
+        ),
+    ]
+
+    projection = project_timeline(normalize_session_events(raw_events).events)
+    item = projection.timeline.items[0]
+
+    assert isinstance(item, ToolCallTimelineItem)
+    assert item.tool_name == "get_task"
+    assert item.display_name is None
+    assert item.arguments == {"task_id": "task_sched_123"}
 
 
 def test_tool_call_preview_fallback_without_structured_arguments() -> None:

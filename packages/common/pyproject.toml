@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cognis-common"
+version = "0.14.0"
+description = "Shared contracts and portable runtimes for Cognis"
+readme = "README.md"
+license = { text = "TBD" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Filip Pytloun", email = "filip@pytloun.cz" },
+]
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "google-auth[requests]>=2.0.0",
+    "httpx>=0.27.0",
+    "jsonschema>=4.26.0",
+    "Markdown>=3.7",
+    "mcp>=1.28,<2",
+    "pydantic>=2.0.0",
+    "prometheus-client>=0.20.0",
+    "websockets>=14.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cognis"]

@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cognis import __version__
-from cognis.api.app import _drain_turn_scheduler, create_app
+from cognis.api.app import _begin_application_drain, _drain_turn_scheduler, create_app
 from cognis.api.routes.system import _redis_diagnostics, livez, pwa_reset, readyz
 from cognis.core.controller_runtime import ControllerLifecycleState, ControllerRuntime
 
@@ -115,6 +115,41 @@ async def test_shutdown_drain_interrupts_and_settles_after_timeout() -> None:
     scheduler.interrupt_active_turns_and_wait.assert_awaited_once_with(
         reason="controller_restart", timeout_seconds=2
     )
+
+
+@pytest.mark.asyncio
+async def test_begin_application_drain_continues_after_directory_failure() -> None:
+    order: list[str] = []
+    controller_runtime = SimpleNamespace(begin_draining=lambda: order.append("runtime_readiness"))
+
+    async def record(stage: str, *, fail: bool = False) -> None:
+        order.append(stage)
+        if fail:
+            raise RuntimeError(f"{stage} failed")
+
+    turn_scheduler = SimpleNamespace(
+        begin_drain=lambda: record("turn_admission"),
+        stop_follow_up_recovery=lambda: record("follow_up_recovery"),
+    )
+    controller_directory = SimpleNamespace(
+        begin_draining=lambda: record("directory_readiness", fail=True)
+    )
+    scheduler = SimpleNamespace(stop=lambda: record("scheduler"))
+
+    await _begin_application_drain(
+        controller_runtime=controller_runtime,
+        turn_scheduler=turn_scheduler,
+        controller_directory=controller_directory,
+        scheduler=scheduler,
+    )
+
+    assert order == [
+        "runtime_readiness",
+        "turn_admission",
+        "directory_readiness",
+        "scheduler",
+        "follow_up_recovery",
+    ]
 
 
 def test_pwa_reset_route_is_public_and_uncached(

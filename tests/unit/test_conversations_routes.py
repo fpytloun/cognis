@@ -5,9 +5,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, call
+from unittest.mock import ANY, AsyncMock, call
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 import cognis.api.routes.conversations as conversations_routes
 from cognis.api.app import create_app
@@ -15,6 +16,7 @@ from cognis.api.routes.conversations import (
     _CHAT_LAST_OPENED_GLOBAL_STATE_KEY,
     _remember_chat_last_opened,
 )
+from cognis.store.models import DirectTurnRequestRow
 from cognis.store.queries import (
     create_agent,
     create_conversation,
@@ -72,6 +74,142 @@ def _assert_sidebar_upsert_call(
         {"type": "sidebar_conversation_upsert", "conversation_id": conversation_id},
     )
     assert kwargs == {"include_subscribers": True}
+
+
+def test_active_background_shells_filters_by_owner() -> None:
+    matching = {
+        "shell_id": "shell_owned",
+        "user_email": "user@example.com",
+        "conversation_id": "conv_owned",
+    }
+    other = {
+        "shell_id": "shell_other",
+        "user_email": "other@example.com",
+        "conversation_id": "conv_other",
+    }
+    connection = SimpleNamespace(
+        background_shell_status=AsyncMock(
+            return_value={
+                "shells": [
+                    matching,
+                    {**matching, "executor_id": "spoofed"},
+                    other,
+                ]
+            }
+        )
+    )
+    executor = SimpleNamespace(
+        list_active=AsyncMock(
+            return_value=[
+                SimpleNamespace(executor_id="exec-a"),
+                SimpleNamespace(executor_id="exec-a"),
+            ]
+        ),
+        get_executor=AsyncMock(return_value=connection),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(providers=SimpleNamespace(executor=executor)))
+    )
+
+    result = asyncio.run(
+        conversations_routes._active_background_shells(
+            cast(Any, request),
+            user_email="user@example.com",
+        )
+    )
+
+    assert result == [{**matching, "executor_id": "exec-a"}]
+    connection.background_shell_status.assert_awaited_once_with(include_completed=False)
+
+
+def test_sidebar_projects_active_background_command(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def _seed() -> tuple[str, str]:
+            await _seed_user_and_agent(app)
+            async with app.state.session_factory() as session:
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Controller",
+                )
+                conversation.active_executor_id = "exec-a"
+                await create_user(
+                    session,
+                    email="other@example.com",
+                    name="Other",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                other_conversation = await create_conversation(
+                    session,
+                    user_email="other@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Other controller",
+                )
+                await session.commit()
+                return conversation.conversation_id, other_conversation.conversation_id
+
+        conversation_id, other_conversation_id = asyncio.run(_seed())
+
+        async def _background_shells(request: object, *, user_email: str):
+            assert user_email == "user@example.com"
+            return [
+                {
+                    "shell_id": "shell_active",
+                    "executor_id": "exec-a",
+                    "user_email": user_email,
+                    "conversation_id": conversation_id,
+                    "session_id": "sess_parent",
+                    "agent_id": "agent-chat",
+                    "description": "Run integration tests",
+                    "status": "running",
+                    "created_at": 1_750_000_000.0,
+                    "last_activity_at": 1_750_000_005.0,
+                },
+                {
+                    "shell_id": "shell_spoofed",
+                    "executor_id": "exec-a",
+                    "user_email": user_email,
+                    "conversation_id": other_conversation_id,
+                    "agent_id": "agent-chat",
+                    "description": "Spoofed command",
+                    "status": "running",
+                    "created_at": float("nan"),
+                },
+            ]
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            conversations_routes,
+            "_active_background_shells",
+            _background_shells,
+        )
+        response = client.get(
+            "/api/v1/conversations/sidebar",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        background_work = response.json()["background_work"]
+        assert background_work["active_count"] == 1
+        item = background_work["items"][0]
+        assert item["kind"] == "background_command"
+        assert item["work_id"] == "shell_active"
+        assert item["controller_conversation_id"] == conversation_id
+        assert item["controller_session_id"] == "sess_parent"
+        assert item["executor_id"] == "exec-a"
+        assert item["title"] == "Run integration tests"
+        assert item["agent_id"] == "agent-chat"
+        assert item["status"] == "running"
+        assert conversations_routes._background_shell_timestamp(float("nan")) is None
+        assert conversations_routes._background_shell_timestamp(float("inf")) is None
 
 
 def test_mark_read_emits_user_wide_unread_clear_once(
@@ -222,23 +360,41 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                     target_session_id=None,
                     title="Managed target",
                 )
+                session.add(
+                    DirectTurnRequestRow(
+                        request_id="dtr_sidebar",
+                        turn_id="turn_live",
+                        conversation_id=target.conversation_id,
+                        session_id=None,
+                        agent_id="agent-chat",
+                        user_id="user@example.com",
+                        idempotency_scope="sidebar-test",
+                        idempotency_key="sidebar-test",
+                        admission_hash="admission",
+                        payload_hash="payload",
+                        payload={},
+                        status="running",
+                    )
+                )
                 await session.commit()
                 return controller.conversation_id, target.conversation_id, link.link_id
 
         controller_id, target_id, link_id = asyncio.run(_seed())
         scheduler_durable_running = app.state.turn_scheduler.durable_running_turn_state
         scheduler_durable_running_many = app.state.turn_scheduler.durable_running_turn_states
+        target_running = True
 
-        async def _durable_running_turn_state(conversation_id: str):
-            if conversation_id == target_id:
+        async def _durable_running_turn_state(conversation_id: str, *, session=None):
+            if conversation_id == target_id and target_running:
                 return {"turn_id": "turn_live"}
-            return await scheduler_durable_running(conversation_id)
+            return await scheduler_durable_running(conversation_id, session=session)
 
         app.state.turn_scheduler.durable_running_turn_state = _durable_running_turn_state
 
-        async def _durable_running_turn_states(conversation_ids: list[str]):
-            states = await scheduler_durable_running_many(conversation_ids)
-            if target_id in conversation_ids:
+        async def _durable_running_turn_states(conversation_ids: list[str], *, session=None):
+            assert session is not None
+            states = await scheduler_durable_running_many(conversation_ids, session=session)
+            if target_id in conversation_ids and target_running:
                 states[target_id] = {"turn_id": "turn_live"}
             return states
 
@@ -249,7 +405,8 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         )
 
         assert response.status_code == 200
-        background_work = response.json()["background_work"]
+        initial_body = response.json()
+        background_work = initial_body["background_work"]
         assert background_work["active_count"] == 2
         assert background_work["truncated"] is False
         assert {
@@ -262,7 +419,67 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         managed = next(
             item for item in background_work["items"] if item["kind"] == "managed_conversation"
         )
+        delegated = next(
+            item for item in background_work["items"] if item["kind"] == "delegated_session"
+        )
         assert managed["target_conversation_id"] == target_id
+        assert managed["controller_session_id"] == "sess_parent"
+        assert managed["parent_session_id"] is None
+        assert delegated["parent_session_id"] == "sess_parent"
+        assert delegated["controller_session_id"] is None
+
+        unchanged_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": initial_body["sync_timestamp"],
+                "sidebar_revision": initial_body["sidebar_revision"],
+            },
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert unchanged_delta.status_code == 200
+        assert unchanged_delta.json()["is_delta"] is True
+        assert unchanged_delta.json()["background_work_changed"] is True
+        assert unchanged_delta.json()["background_work"] is not None
+
+        async def _settle_durable_turn() -> None:
+            async with app.state.session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(DirectTurnRequestRow).where(
+                            DirectTurnRequestRow.request_id == "dtr_sidebar"
+                        )
+                    )
+                ).scalar_one()
+                row.status = "completed"
+                row.updated_at = datetime.now(UTC)
+                await session.commit()
+
+        asyncio.run(_settle_durable_turn())
+        target_running = False
+        scheduler_delta = client.get(
+            "/api/v1/conversations/sidebar",
+            params={
+                "changed_since": initial_body["sync_timestamp"],
+                "sidebar_revision": initial_body["sidebar_revision"],
+            },
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert scheduler_delta.status_code == 200
+        scheduler_body = scheduler_delta.json()
+        assert scheduler_body["is_delta"] is False
+        target_sidebar_row = next(
+            item
+            for item in scheduler_body["conversations"]["items"]
+            if item["conversation_id"] == target_id
+        )
+        assert target_sidebar_row["has_active_turn"] is False
+        assert scheduler_body["background_work_changed"] is True
+        scheduler_managed = next(
+            item
+            for item in scheduler_body["background_work"]["items"]
+            if item["kind"] == "managed_conversation"
+        )
+        assert scheduler_managed["status"] == "active"
 
         async def _leave_stale_running_state() -> None:
             async with app.state.session_factory() as session:
@@ -279,9 +496,11 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         app.state.turn_scheduler.durable_running_turn_states = scheduler_durable_running_many
         idle_response = client.get(
             "/api/v1/conversations/sidebar",
+            params={"changed_since": initial_body["sync_timestamp"]},
             headers=_auth_headers(app, email="user@example.com"),
         )
         assert idle_response.status_code == 200
+        assert idle_response.json()["background_work_changed"] is True
         idle_background_work = idle_response.json()["background_work"]
         assert idle_background_work["active_count"] == 1
         idle_managed = next(
@@ -410,11 +629,19 @@ def test_delete_and_purge_conversation_emit_sidebar_removal(
         assert send_to_user.await_args_list == [
             call(
                 "user@example.com",
-                {"type": "sidebar_conversation_removed", "conversation_id": soft_deleted_id},
+                {
+                    "type": "sidebar_conversation_removed",
+                    "conversation_id": soft_deleted_id,
+                    "revision": ANY,
+                },
             ),
             call(
                 "user@example.com",
-                {"type": "sidebar_conversation_removed", "conversation_id": purged_id},
+                {
+                    "type": "sidebar_conversation_removed",
+                    "conversation_id": purged_id,
+                    "revision": ANY,
+                },
             ),
         ]
 
@@ -764,7 +991,7 @@ def test_slash_command_suggestions_route_returns_dispatcher_items(
                     "insert_text": "/skill cognis-coding",
                     "suffix": "none",
                     "badges": ["loaded"],
-                }
+                },
             ]
         }
         assert dispatcher.calls[0]["command_input"] == "/skill cog"
@@ -823,6 +1050,76 @@ def test_conversation_detail_can_skip_legacy_state_snapshot(
         assert payload["conversation_id"] == conversation_id
         assert payload["conversation_state"] is None
         snapshot_for_conversation.assert_not_awaited()
+
+
+def test_conversation_detail_attention_summary_is_opt_in_and_payload_free(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = cast(Any, client.app)
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-chat",
+                    owner_email="user@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="user@example.com",
+                    agent_id="agent-chat",
+                    context_type="web",
+                    title="Attention detail",
+                )
+                await session.commit()
+            await app.state.notification_service.create(
+                notification_type="escalation",
+                user_email="user@example.com",
+                conversation_id=conversation.conversation_id,
+                notification_id="detail-attention",
+                payload={
+                    "tool_name": "deploy",
+                    "arguments_display": {"token": "must-not-leak"},
+                    "reasoning": "must-not-leak",
+                },
+            )
+            return conversation.conversation_id
+
+        conversation_id = asyncio.run(_seed())
+        headers = _auth_headers(app, email="user@example.com")
+        default_response = client.get(
+            f"/api/v1/conversations/{conversation_id}",
+            params={"include_state": "false"},
+            headers=headers,
+        )
+        projected_response = client.get(
+            f"/api/v1/conversations/{conversation_id}",
+            params={
+                "include_state": "false",
+                "include_attention_actions": "true",
+            },
+            headers=headers,
+        )
+
+        assert default_response.status_code == 200
+        assert default_response.json()["attention_actions"] == []
+        assert projected_response.status_code == 200
+        summaries = projected_response.json()["attention_actions"]
+        assert len(summaries) == 1
+        assert summaries[0]["action_id"] == "detail-attention"
+        assert "payload" not in summaries[0]
+        assert "must-not-leak" not in projected_response.text
 
 
 def test_conversation_open_can_skip_legacy_state_snapshot(

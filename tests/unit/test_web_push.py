@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -238,3 +241,135 @@ def test_schedule_error_event_payload_does_not_require_conversation_id() -> None
     assert payload["user_email"] == "user@example.com"
     assert payload["kind"] == "schedule"
     assert payload["tag"] == "schedule:sched_1"
+    assert payload["url"] == "/schedules/sched_1"
+
+
+def test_turn_completed_payload_correlates_push_with_observed_completion(
+    monkeypatch: object,
+) -> None:
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    def _session_factory() -> _Session:
+        return _Session()
+
+    conversation = SimpleNamespace(
+        conversation_id="conversation-a",
+        agent_id="agent-a",
+        context_type="web",
+        user_email="user@example.com",
+        title="Notification race",
+    )
+
+    async def _get_conversation(_session: object, _conversation_id: str) -> object:
+        return conversation
+
+    async def _get_agent(_session: object, _agent_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cognis.core.web_push.get_conversation",
+        _get_conversation,
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "cognis.core.web_push.get_agent",
+        _get_agent,
+    )
+    service = WebPushService(
+        session_factory=_session_factory,  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=False,
+            public_key="",
+            private_key="",
+            subject="mailto:test@example.com",
+            reason="disabled",
+        ),
+    )
+    completed_at = "2026-08-26T21:00:00+00:00"
+
+    payload = asyncio.run(
+        service._event_payload(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.TURN_COMPLETED,
+                data={
+                    "conversation_id": "conversation-a",
+                    "completed_at": completed_at,
+                },
+                timestamp=datetime(2026, 8, 26, 21, 0, 1, tzinfo=UTC),
+            )
+        )
+    )
+
+    assert payload is not None
+    assert payload["conversation_id"] == "conversation-a"
+    assert payload["occurred_at"] == completed_at
+
+
+def test_send_to_user_serializes_completion_timestamp() -> None:
+    captured: dict[str, object] = {}
+
+    class _Scalars:
+        def all(self) -> list[object]:
+            return [object()]
+
+    class _Result:
+        def scalars(self) -> _Scalars:
+            return _Scalars()
+
+    class _Session:
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def execute(self, _statement: object) -> _Result:
+            return _Result()
+
+    def _session_factory() -> _Session:
+        return _Session()
+
+    service = WebPushService(
+        session_factory=_session_factory,  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        config=WebPushRuntimeConfig(
+            enabled=True,
+            public_key="public-key",
+            private_key="private-key",
+            subject="mailto:test@example.com",
+        ),
+    )
+
+    async def _send_one(_row: object, payload: str) -> str:
+        captured["payload"] = json.loads(payload)
+        return "sent"
+
+    service._send_one = _send_one  # type: ignore[method-assign]
+    result = asyncio.run(
+        service.send_to_user(
+            user_email="user@example.com",
+            title="Cognis",
+            body="New reply",
+            url="/chat/conversation-a",
+            tag="conversation-a",
+            kind="message",
+            conversation_id="conversation-a",
+            occurred_at="2026-08-26T21:00:00+00:00",
+        )
+    )
+
+    assert result == {"sent_to": 1, "errors": 0}
+    assert captured["payload"] == {
+        "title": "Cognis",
+        "body": "New reply",
+        "url": "/chat/conversation-a",
+        "tag": "conversation-a",
+        "kind": "message",
+        "conversation_id": "conversation-a",
+        "occurred_at": "2026-08-26T21:00:00+00:00",
+    }

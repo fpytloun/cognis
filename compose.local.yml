@@ -36,6 +36,12 @@ services:
       EMBED_DIMS: ${MNEMORY_EMBED_DIMS:-1536}
       MNEMORY_JWKS_URL: http://cognis:8080/.well-known/jwks.json
       EXCHANGE_COOKIE_SECURE: "false"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     ports:
       - "${MNEMORY_PORT:-8050}:8050"
       - "${MNEMORY_MGMT_PORT:-9090}:9090"
@@ -124,7 +130,8 @@ services:
       dockerfile: Dockerfile
     depends_on:
       cognis:
-        condition: service_started
+        # Both processes bootstrap the shared database; serialize startup.
+        condition: service_healthy
       mnemory:
         condition: service_started
       intaris:
@@ -153,6 +160,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.executor
+      target: general
     depends_on:
       cognis:
         condition: service_started

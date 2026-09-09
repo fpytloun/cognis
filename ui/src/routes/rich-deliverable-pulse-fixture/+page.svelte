@@ -1,6 +1,8 @@
 <script lang="ts">
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
-  import { dailyPulseScenario } from '$lib/components/rich/daily-pulse.fixture';
+  import { requireRichScenario } from '$lib/rich-scenarios/registry';
+
+  const dailyPulseScenario = requireRichScenario('daily-pulse-v2');
 </script>
 
 <main data-testid="rich-deliverable-pulse-fixture">

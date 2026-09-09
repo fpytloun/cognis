@@ -57,5 +57,55 @@ npx playwright test e2e/rich-deliverable-doc-assets.spec.ts --project=chromium
 The test verifies fixture coverage for every supported block type and writes
 the documentation images only when `UPDATE_RICH_DOC_ASSETS=1` is set.
 
+Canonical scenarios live in `ui/src/lib/rich-scenarios/scenarios/`. The web
+fixture, Python projection tests, static renderer tests, and documentation
+previews read these files. Add one JSON file to extend the gallery. Do not edit
+a central scenario index.
+
+Use stable scenario links for visual review:
+
+```text
+/rich-deliverable-fixture?scenario=research-answer&theme=dark&width=1280&surface=embedded
+```
+
+Canonical fixtures represent stored renderer input. Thus,
+`metadata.presentation` can occur in a fixture. Rich authoring actions still
+select the presentation and do not accept a separately authored presentation.
+
+Generate all scenario screenshots or one group with:
+
+```bash
+cd ui
+npm run screenshot:rich-gallery -- --group=dashboard --themes=light,dark --widths=390,1280
+```
+
+The command writes screenshots, a manifest, and contact sheets under
+`ui/review-artifacts/rich-scenario-gallery/` by default. Playwright does not
+clear this ignored review directory between test runs.
+
+## Cross-domain scenario portfolio
+
+The scenario gallery includes complete examples that use the same generic
+blocks as authored deliverables. Maps are not part of this portfolio.
+
+| Scenario | Composition focus |
+|---|---|
+| `weekend-schedule` | Two-day agenda, constraints, reservations, costs, and fallback plans |
+| `fridge-comparison` | Hard fit gates, product media, decision criteria, and installation cost |
+| `solar-infographic` | Image-led science narrative, comparisons, chart, timeline, and sources |
+| `educational-cheatsheet` | Dense visual reference, examples, common mistakes, and glossary |
+| `book-spoilers` | Editorial summary with explicit interactive and static spoiler handling |
+| `wearable-recovery` | Synthetic wearable metrics, trends, personal baselines, and data coverage |
+| `menstrual-cycle` | Synthetic cycle patterns, estimated ranges, uncertainty, and safety context |
+| `data-projections` | Observed baseline, forecast range, scenarios, assumptions, and decision |
+| `illustrated-recipe` | Step-associated media, ingredients, timing, failures, and food safety |
+| `weekly-meal-plan` | Seven-day schedule, recipe media, batch preparation, reuse, and shopping |
+
+Use the stable scenario URL to inspect one example:
+
+```text
+/rich-deliverable-fixture?scenario=illustrated-recipe&theme=light&width=1280&surface=embedded
+```
+
 - [Layout and narrative blocks](rich-deliverable-blocks-layout.md)
 - [Data, evidence, and utility blocks](rich-deliverable-blocks-data.md)

@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.0] - 2026-09-09
+
+### Added
+
+- Added focused child-session diagnostics, bounded nested-session discovery, and improved scoped Work activity inspection.
+- Added richer executor capability reporting and safer targeted-executor path routing.
+
+### Changed
+
+- Improved managed channel lifecycle controls, delivery recovery, and route occupancy diagnostics.
+- Improved compact dashboard chat windows, conversation inspector state, and rich deliverable navigation across responsive layouts.
+- Improved Work projection seeding, materialization recovery, and browser release coverage.
+
+### Fixed
+
+- Fixed managed channel recovery and delivery ordering across controller and remote executors.
+- Fixed stale focused-session identity, nested overview synchronization, compact outbox drains, and historical runtime attribution.
+- Fixed rich deliverable SVG identifier collisions while preserving internal Mermaid references.
+- Fixed browser regressions in mobile controls, Task Cockpit navigation, standalone deliverables, file history, rotation, and Work refresh behavior.
+
 ## [0.13.0] - 2026-08-09
 
 ### Added

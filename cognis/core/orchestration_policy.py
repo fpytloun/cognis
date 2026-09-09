@@ -99,7 +99,7 @@ def orchestration_surface_policy(
             allow_managed_conversation_wait_false=False,
             expose_managed_conversation_wait_option=False,
             managed_conversation_wait_default=True,
-            expose_task_tools=False,
+            expose_task_tools=True,
             expose_workflow_tools=False,
             expose_compose_workflow_tool=False,
         )
@@ -164,6 +164,10 @@ def build_orchestration_capability_guidance(
     has_managed = bool(
         {"agent_conversation_create", "agent_conversation_send"} & visible_tool_names
     )
+    has_delegate_follow_up = "follow_up_subsession" in visible_tool_names
+    has_managed_send = "agent_conversation_send" in visible_tool_names
+    has_continuation = has_delegate_follow_up or has_managed_send
+    has_fork = bool({"fork_subsession", "agent_conversation_fork"} & visible_tool_names)
     has_create_task = "create_task" in visible_tool_names
     has_workflows = bool({"create_workflow", "compose_and_run_workflow"} & visible_tool_names)
     if not any((has_delegate, has_managed, has_create_task, has_workflows)):
@@ -181,6 +185,40 @@ def build_orchestration_capability_guidance(
         "- Use only actions exposed by the current tool schemas.",
         "- Implement straightforward work you own directly.",
     ]
+    if has_delegate or has_managed:
+        lines.extend(
+            [
+                "- Create a fresh isolated child for a materially different role, "
+                "responsibility, tool or authority scope, or independent workstream. "
+                "Use a compact contract with exact references; never pass the parent "
+                "transcript.",
+                "- Child results return compact evidence: status, results/findings, "
+                "changed references, verification, risks, and questions. Detailed "
+                "logs remain inspectable outside the parent's active context.",
+            ]
+        )
+    if has_continuation:
+        lines.extend(
+            [
+                "- Continue a child only for the same bounded problem with compatible "
+                "role, responsibilities, tools, authority, and output contract, and "
+                "only when retained context is materially useful; send the context "
+                "delta only.",
+                "- Start an initial independent review in a fresh child. For re-review, "
+                "preserve the reviewer role, criteria, findings, and dispositions and "
+                "continue only when retained investigative context is materially useful; "
+                "otherwise start fresh.",
+                "- Reviewer contracts include the objective, criteria, exact diff or "
+                "artifact, verification evidence, and relevant invariants, never an "
+                "implementation reasoning transcript.",
+            ]
+        )
+    if has_fork:
+        lines.append(
+            "- Fork only an independent branch requiring inherited context, not an "
+            "initial review, ordinary handoff, correction, or review; use a fresh "
+            "child when compatible retained context is absent."
+        )
     if orchestration_mode is OrchestrationMode.DELEGATE_SYNC_ONLY:
         if has_delegate:
             lines.append(
@@ -229,11 +267,19 @@ def build_orchestration_capability_guidance(
             "- Specialist delegation is available for bounded exploration, research, or "
             f"review with secondary/system agents ({mode})."
         )
-    if "follow_up_subsession" in visible_tool_names:
+    if has_delegate_follow_up:
         lines.append(
-            "- When a terminal delegate result supplies a session_id, continue the same "
-            "problem with follow_up_subsession instead of creating a fresh delegate. "
-            "Use fork_subsession only for an independent branch."
+            "- Start an initial independent review fresh. When a terminal delegate result "
+            "supplies a session_id, use follow_up_subsession for re-review only when the "
+            "reviewer role, criteria, findings, dispositions, and retained investigative "
+            "context remain compatible and materially useful; otherwise start fresh."
+        )
+    if has_managed_send:
+        lines.append(
+            "- Start an initial independent review fresh. Use agent_conversation_send for "
+            "re-review only when the reviewer role, criteria, findings, dispositions, "
+            "and retained investigative context remain compatible and materially useful; "
+            "otherwise create a fresh conversation."
         )
     if has_create_task:
         lines.append(

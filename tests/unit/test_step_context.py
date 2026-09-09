@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from cognis.core.context import _native_attachment_blocks, events_to_messages
+from cognis.core.tool_result_settlement import CanonicalToolHistoryError
 from cognis.models.workflow import (
     StepDefinition,
     StepInputConfig,
@@ -780,7 +781,15 @@ def test_events_to_messages_replays_historic_user_image_natively() -> None:
     assert "Attachments: xray.png" in content[0]["text"]
     assert content[1] == {
         "type": "image_url",
-        "image_url": {"url": "https://cognis.example.com/artifacts/img_1/xray.png"},
+        "image_url": {
+            "url": "https://cognis.example.com/artifacts/img_1/xray.png",
+            "cognis_artifact": {
+                "artifact_id": "img_1",
+                "filename": "xray.png",
+                "mime_type": "image/png",
+                "size_bytes": 123,
+            },
+        },
     }
 
 
@@ -929,3 +938,169 @@ def test_events_to_messages_ignores_late_tool_result_after_placeholder_repair() 
     assert messages[1]["role"] == "tool"
     assert "late result" not in [message.get("content") for message in messages]
     assert messages[2] == {"role": "assistant", "content": "moving on"}
+
+
+def test_events_to_messages_deduplicates_identical_repaired_tool_call() -> None:
+    call = {
+        "type": "tool_call",
+        "data": {"name": "search", "call_id": "c1", "arguments": '{"query":"x"}'},
+    }
+    events = [
+        call,
+        {"type": call["type"], "data": dict(call["data"])},
+        {"type": "tool_result", "data": {"call_id": "c1", "result": "ok"}},
+    ]
+
+    messages = events_to_messages(events)
+
+    assert len(messages) == 2
+    assert [item["id"] for item in messages[0]["tool_calls"]] == ["c1"]
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[1]["content"] == "ok"
+
+
+def test_events_to_messages_rejects_conflicting_duplicate_tool_calls() -> None:
+    events = [
+        {
+            "type": "tool_call",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c1", "arguments": "{}"},
+        },
+        {
+            "type": "tool_call",
+            "data": {
+                "turn_id": "t1",
+                "name": "search",
+                "call_id": "c1",
+                "arguments": '{"query":"different"}',
+            },
+        },
+    ]
+
+    with pytest.raises(CanonicalToolHistoryError, match="conflicting duplicate"):
+        events_to_messages(events)
+
+
+def test_events_to_messages_pairs_orphan_result_with_later_repaired_call() -> None:
+    events = [
+        {
+            "type": "tool_result",
+            "data": {"name": "search", "call_id": "c1", "result": "recovered output"},
+        },
+        {
+            "type": "tool_call",
+            "data": {"name": "search", "call_id": "c1", "arguments": '{"query":"x"}'},
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert len(messages) == 2
+    assert [item["id"] for item in messages[0]["tool_calls"]] == ["c1"]
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[1]["content"] == "recovered output"
+
+
+def test_events_to_messages_preserves_parallel_repaired_tool_batch() -> None:
+    events = [
+        {
+            "type": "tool_result",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c1", "result": "one"},
+        },
+        {
+            "type": "tool_result",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c2", "result": "two"},
+        },
+        {
+            "type": "tool_call",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c1", "arguments": "{}"},
+        },
+        {
+            "type": "tool_call",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c2", "arguments": "{}"},
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert [item["id"] for item in messages[0]["tool_calls"]] == ["c1", "c2"]
+    assert [message["tool_call_id"] for message in messages[1:]] == ["c1", "c2"]
+
+
+def test_events_to_messages_deduplicates_orphan_results_before_repaired_call() -> None:
+    result = {
+        "type": "tool_result",
+        "data": {
+            "turn_id": "t1",
+            "name": "search",
+            "call_id": "c1",
+            "result": "recovered output",
+        },
+    }
+    events = [
+        result,
+        {"type": result["type"], "data": dict(result["data"])},
+        {
+            "type": "tool_call",
+            "data": {
+                "turn_id": "t1",
+                "name": "search",
+                "call_id": "c1",
+                "arguments": "{}",
+            },
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert [item["id"] for item in messages[0]["tool_calls"]] == ["c1"]
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[1]["content"] == "recovered output"
+
+
+def test_events_to_messages_rejects_conflicting_duplicate_orphan_results() -> None:
+    result = {
+        "type": "tool_result",
+        "data": {
+            "turn_id": "t1",
+            "name": "search",
+            "call_id": "c1",
+            "result": "recovered output",
+        },
+    }
+    events = [
+        result,
+        {"type": result["type"], "data": {**result["data"], "result": "different output"}},
+        {
+            "type": "tool_call",
+            "data": {
+                "turn_id": "t1",
+                "name": "search",
+                "call_id": "c1",
+                "arguments": "{}",
+            },
+        },
+    ]
+
+    with pytest.raises(CanonicalToolHistoryError, match="conflicting duplicate"):
+        events_to_messages(events)
+
+
+def test_events_to_messages_does_not_pair_orphan_result_across_turns() -> None:
+    events = [
+        {
+            "type": "tool_result",
+            "data": {"turn_id": "t1", "name": "search", "call_id": "c1", "result": "old"},
+        },
+        {"type": "user_message", "data": {"turn_id": "t2", "content": "next"}},
+        {
+            "type": "tool_call",
+            "data": {"turn_id": "t2", "name": "search", "call_id": "c1", "arguments": "{}"},
+        },
+    ]
+
+    messages = events_to_messages(events)
+
+    assert messages[0] == {"role": "user", "content": "next", "_turn_boundary": True}
+    assert messages[1]["role"] == "assistant"
+    assert messages[2]["tool_call_id"] == "c1"
+    assert "interrupted" in messages[2]["content"].lower()

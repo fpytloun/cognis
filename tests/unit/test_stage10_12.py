@@ -62,6 +62,7 @@ def test_change_password_and_api_key_last_used(monkeypatch: object, tmp_path: Pa
             json={"email": "admin@example.com", "password": "new-password"},
         )
         assert login.status_code == 200
+        headers = {}
 
         created = client.post(
             "/api/v1/auth/api-keys",

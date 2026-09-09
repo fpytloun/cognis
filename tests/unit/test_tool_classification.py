@@ -7,10 +7,14 @@ from typing import Any
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import DBAPIError
 
 from cognis.api.serializers import tool_to_response
 from cognis.bootstrap import run_schema_bootstrap
-from cognis.core.tool_classification_queue import ToolClassificationQueue
+from cognis.core.tool_classification_queue import (
+    ToolClassificationQueue,
+    _is_retryable_write_conflict,
+)
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolCapability, ToolSource, stable_tool_id
 from cognis.store.database import create_engine, create_session_factory
@@ -37,6 +41,14 @@ def _dynamic_tool() -> ToolDefinition:
         category="mcp",
         read_only=True,
     )
+
+
+def test_tool_classification_retries_postgres_deadlocks() -> None:
+    class DeadlockDetectedError(Exception):
+        sqlstate = "40P01"
+
+    error = DBAPIError("INSERT", {}, DeadlockDetectedError(), False)
+    assert _is_retryable_write_conflict(error) is True
 
 
 def _dynamic_tool_named(name: str, raw_name: str) -> ToolDefinition:
@@ -95,6 +107,12 @@ class _RecordingQueue:
 
     async def enqueue_tools(self, tools: list[ToolDefinition], *, owner_email: str | None) -> None:
         self.calls.append(([stable_tool_id(tool) for tool in tools], owner_email))
+
+
+class _FailingQueue:
+    async def enqueue_tools(self, tools: list[ToolDefinition], *, owner_email: str | None) -> None:
+        del tools, owner_email
+        raise RuntimeError("classification queue unavailable")
 
 
 class _FakeLLM:
@@ -368,6 +386,65 @@ async def test_resolve_tool_classifications_marks_dynamic_tools_pending_and_enqu
     assert queue.calls == [(["mcp:github:search/issues"], None)]
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_resolve_tool_classifications_keeps_optional_enqueue_failure_non_fatal(
+    tmp_path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classification-nonfatal.db")
+    await run_schema_bootstrap(engine)
+    session_factory = create_session_factory(engine)
+
+    resolved = await resolve_tool_classifications(
+        [_dynamic_tool()],
+        session_factory=session_factory,
+        owner_email=None,
+        queue=_FailingQueue(),
+    )
+
+    assert resolved[0].classification_status == "pending"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_tools_uses_one_deterministic_order(monkeypatch) -> None:
+    queue = ToolClassificationQueue(session_factory=None, llm_provider=_FakeLLM())
+    observed: list[list[str]] = []
+
+    async def record(tools, *, owner_email):
+        del owner_email
+        observed.append([stable_tool_id(tool) for tool in tools])
+
+    monkeypatch.setattr(queue, "_enqueue_tools_once", record)
+    first = _dynamic_tool_named("mcp_github__zeta", "zeta")
+    second = _dynamic_tool_named("mcp_github__alpha", "alpha")
+
+    await queue.enqueue_tools([first, second, first], owner_email=None)
+
+    assert observed == [["mcp:github:alpha", "mcp:github:zeta"]]
+
+
+@pytest.mark.asyncio
+async def test_enqueue_tools_retries_a_deadlock_once(monkeypatch) -> None:
+    queue = ToolClassificationQueue(session_factory=None, llm_provider=_FakeLLM())
+    attempts = 0
+
+    class DeadlockDetectedError(Exception):
+        sqlstate = "40P01"
+
+    async def enqueue_once(tools, *, owner_email):
+        nonlocal attempts
+        del tools, owner_email
+        attempts += 1
+        if attempts == 1:
+            raise DBAPIError("INSERT", {}, DeadlockDetectedError(), False)
+
+    monkeypatch.setattr(queue, "_enqueue_tools_once", enqueue_once)
+    await queue.enqueue_tools([_dynamic_tool()], owner_email=None)
+
+    assert attempts == 2
+    assert queue._wake_generation == 1
 
 
 @pytest.mark.asyncio

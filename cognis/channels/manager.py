@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import UTC, datetime
 from time import monotonic
@@ -446,21 +447,26 @@ class ChannelManager:
             if (adapter := self.get_adapter(account_id)) is not None
         ]
         if not adapters:
-            return ProviderHealth(status="healthy", detail="No channel accounts configured")
+            return ProviderHealth(
+                name="channels",
+                status="healthy",
+                detail="No channel accounts configured",
+            )
 
-        connected = sum(
-            1 for a in adapters if (await a.get_status()).status == ChannelStatus.CONNECTED
-        )
+        statuses = [await adapter.get_status() for adapter in adapters]
+        connected = sum(status.status == ChannelStatus.CONNECTED for status in statuses)
         total = len(adapters)
 
         if connected == total:
-            return ProviderHealth(status="healthy")
+            return ProviderHealth(name="channels", status="healthy")
         if connected > 0:
             return ProviderHealth(
+                name="channels",
                 status="degraded",
                 detail=f"{connected}/{total} accounts connected",
             )
         return ProviderHealth(
+            name="channels",
             status="unhealthy",
             detail="No channel accounts connected",
         )
@@ -510,8 +516,9 @@ class ChannelManager:
             return None
 
         # Delegate to adapter-specific webhook handling
-        if hasattr(adapter, "handle_webhook_payload"):
-            return await adapter.handle_webhook_payload(body)  # type: ignore[attr-defined]
+        handler = getattr(adapter, "handle_webhook_payload", None)
+        if callable(handler):
+            return cast(dict[str, Any] | None, await handler(body))
         return None
 
     # ------------------------------------------------------------------
@@ -618,7 +625,7 @@ class ChannelManager:
             from cognis.models.channel import InboundMessage
 
             msg = InboundMessage(**message_data)
-            await on_message(
+            await cast(Callable[..., Any], on_message)(
                 msg,
                 executor_connection_owner=connection_owner,
             )

@@ -118,6 +118,13 @@ class EncryptedDBCredentialsProvider:
                 )
             )
             row = result.scalar_one_or_none()
+            idempotency_key = (metadata or {}).get("idempotency_key")
+            if (
+                row is not None
+                and isinstance(idempotency_key, str)
+                and (row.metadata_json or {}).get("idempotency_key") == idempotency_key
+            ):
+                return self._row_to_record(row, field_names=self._safe_field_names(row))
             encrypted_payload = self._encrypt_payload(payload)
             if row is None:
                 row = CredentialRow(
@@ -241,9 +248,9 @@ class EncryptedDBCredentialsProvider:
             kind = row.kind
             payload = self._decrypt_payload(row.encrypted_payload)
         if kind == "totp_seed" and field == "otp":
-            value = _generate_totp(payload)
+            resolved_value: Any = _generate_totp(payload)
         else:
-            value = payload if field is None else payload.get(field)
+            resolved_value = payload if field is None else payload.get(field)
         if (
             field is not None
             and field not in payload
@@ -255,7 +262,11 @@ class EncryptedDBCredentialsProvider:
                 credential_id=credential_id,
                 field=field,
             )
-        return CredentialResolution(credential_id=credential_id, field=field, value=value)
+        return CredentialResolution(
+            credential_id=credential_id,
+            field=field,
+            value=resolved_value,
+        )
 
     async def health(self) -> ProviderHealth:
         return ProviderHealth(name="credentials", status="healthy")

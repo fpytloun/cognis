@@ -1,22 +1,31 @@
 <script lang="ts">
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronRight from 'lucide-svelte/icons/chevron-right';
+  import ExternalLink from 'lucide-svelte/icons/external-link';
   import type { WorkCategory, WorkstreamRef } from '$lib/chat-v2/types';
   import {
     compareWorkstreamActivity,
     automaticExpandedWorkstreamKeys,
+    focusedAncestorWorkstreamKeys,
     hasFileChanges,
+    HIDE_CLOSED_STORAGE_KEY,
     HIDE_READ_ONLY_STORAGE_KEY,
+    nodeMatchesFocus,
     visibleWorkstreamKeys,
   } from '$lib/activityTreeState';
   import DiffStat from './DiffStat.svelte';
   import ActivityAvatar from './ActivityAvatar.svelte';
+  import WorkstreamIdentityPopover from './WorkstreamIdentityPopover.svelte';
+  import WorkstreamTodoProgress from './WorkstreamTodoProgress.svelte';
+  import { displaySessionStatus, isEffectiveSessionRunning } from '$lib/session-status';
+  import WorkstreamExecutionStatus from './WorkstreamExecutionStatus.svelte';
   type AgentMeta = { agent_id: string; display_name?: string | null; name?: string | null; avatar_url?: string | null };
   type GuideContinuations = boolean[];
-  let { nodes = [], agents = [], focusedSessionId = null, collapsed = false, onViewWork, onViewSession }: {
+  let { nodes = [], agents = [], focusedSessionId = null, runtimeActiveSessionIds = [], collapsed = false, onViewWork, onViewSession }: {
     nodes?: WorkstreamRef[];
     agents?: AgentMeta[];
     focusedSessionId?: string | null;
+    runtimeActiveSessionIds?: string[];
     collapsed?: boolean;
     onViewWork?: (sessionId: string, category?: WorkCategory) => void;
     onViewSession?: (sessionId: string, node?: WorkstreamRef) => void;
@@ -32,17 +41,32 @@
     return node.agent_avatar_url ?? agentMeta(node)?.avatar_url ?? null;
   }
   function displayStatus(node: WorkstreamRef): string {
-    if (node.activity_state === 'ongoing') return 'Running';
-    if (node.activity_state === 'active') return 'Active';
-    if (node.status === 'failed') return 'Failed';
-    if (node.status === 'cancelled') return 'Cancelled';
-    return 'Closed';
+    return displaySessionStatus(
+      node.status,
+      node.activity_state,
+      runtimeActiveSessionIds.includes(node.session_id),
+      node.execution_state,
+    );
+  }
+  function nodeIsActive(node: WorkstreamRef): boolean {
+    return isEffectiveSessionRunning(
+      node.status,
+      node.activity_state,
+      runtimeActiveSessionIds.includes(node.session_id),
+      node.execution_state,
+    );
   }
   let expanded = $state<Set<string>>(new Set());
   let manuallyCollapsed = $state<Set<string>>(new Set());
   let hideReadOnly = $state(false);
-  const automaticExpanded = $derived(automaticExpandedWorkstreamKeys(nodes));
-  const visibleKeys = $derived(visibleWorkstreamKeys(nodes, focusedSessionId, hideReadOnly));
+  let hideClosed = $state(false);
+  const automaticExpanded = $derived(automaticExpandedWorkstreamKeys(nodes, runtimeActiveSessionIds));
+  const focusedAncestors = $derived(focusedAncestorWorkstreamKeys(nodes, focusedSessionId));
+  const visibleKeys = $derived(visibleWorkstreamKeys(nodes, focusedSessionId, {
+    hideReadOnly,
+    hideClosed,
+    runtimeActiveSessionIds,
+  }));
   const children = $derived.by(() => {
     const result = new Map<string | null, WorkstreamRef[]>();
     for (const node of nodes) {
@@ -55,9 +79,16 @@
   $effect(() => {
     if (typeof localStorage === 'undefined') return;
     hideReadOnly = localStorage.getItem(HIDE_READ_ONLY_STORAGE_KEY) === 'true';
+    hideClosed = localStorage.getItem(HIDE_CLOSED_STORAGE_KEY) === 'true';
   });
   function isOpen(key: string): boolean {
-    return !collapsed && !manuallyCollapsed.has(key) && (expanded.has(key) || automaticExpanded.has(key));
+    // An ancestor path to an active descendant must stay open even if the
+    // user manually collapsed it earlier; the manual preference is retained
+    // in `manuallyCollapsed` and takes effect again once no active
+    // descendant remains (i.e. once `automaticExpanded` no longer includes
+    // this key).
+    if (automaticExpanded.has(key) || focusedAncestors.has(key)) return true;
+    return !collapsed && !manuallyCollapsed.has(key) && expanded.has(key);
   }
   function toggle(key: string): void {
     const next = new Set(expanded);
@@ -78,19 +109,48 @@
       localStorage.setItem(HIDE_READ_ONLY_STORAGE_KEY, String(hideReadOnly));
     }
   }
+  function toggleClosed(): void {
+    hideClosed = !hideClosed;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(HIDE_CLOSED_STORAGE_KEY, String(hideClosed));
+    }
+  }
+  /**
+   * Scrolls the focused/selected row into view once it mounts or becomes
+   * focused (e.g. after topology refresh reveals it), without moving
+   * keyboard focus so it never interrupts what the user is doing.
+   */
+  function scrollIntoViewWhenFocused(node: HTMLElement, isFocused: boolean) {
+    let announced = false;
+    const run = (value: boolean): void => {
+      if (!value || announced || typeof node.scrollIntoView !== 'function') return;
+      announced = true;
+      node.scrollIntoView({ block: 'nearest' });
+    };
+    run(isFocused);
+    return {
+      update(value: boolean) {
+        if (!value) announced = false;
+        run(value);
+      },
+    };
+  }
 </script>
 {#snippet branch(parent: string | null, depth: number, ancestorContinuations: GuideContinuations)}
   {#each (children.get(parent) ?? []) as node, index (node.key)}
     {@const descendants = children.get(node.key) ?? []}
     {@const open = isOpen(node.key)}
     {@const summary = node.summary}
+    {@const running = displayStatus(node) === 'Running'}
     {@const lastChild = index === (children.get(parent)?.length ?? 0) - 1}
+    {@const focused = nodeMatchesFocus(node, focusedSessionId)}
     <li class="min-w-0" data-testid={`activity-node-${node.key}`}>
       <div
-        class={`activity-tree-node relative min-w-0 rounded-lg border px-2 py-2 text-xs ${node.session_id === focusedSessionId ? 'border-sky-400/60 bg-sky-500/10 text-sky-100 shadow-[inset_0_0_0_1px_rgb(56_189_248_/_0.12)]' : 'border-transparent text-slate-400'}`}
+        class={`activity-tree-node relative min-w-0 rounded-lg border px-2 py-2 text-xs ${focused ? 'border-sky-400/60 bg-sky-500/10 text-sky-100 shadow-[inset_0_0_0_1px_rgb(56_189_248_/_0.12)]' : 'border-transparent text-slate-400'}`}
         class:activity-tree-root={depth === 0}
         style={`--tree-depth:${depth}`}
         data-testid="activity-tree-row"
+        use:scrollIntoViewWhenFocused={focused}
       >
         <div class="activity-tree-guides" aria-hidden="true">
           {#each ancestorContinuations as continues, guideDepth}
@@ -111,15 +171,25 @@
               </button>
             {:else}<span class="activity-tree-caret block shrink-0" aria-hidden="true"></span>{/if}
             <button type="button" class="scrollbar-hidden-x block min-w-0 flex-1 text-left font-medium text-slate-100" onclick={() => onViewSession?.(node.session_id, node)} aria-label={`View session ${node.title}`}>{node.title}</button>
+            {#if node.key !== node.root_key && (node.kind === 'managed' || node.kind === 'managed_agent') && node.conversation_id}
+              <a
+                class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-slate-500 transition hover:bg-slate-800 hover:text-sky-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400/60"
+                href={`/chat/${encodeURIComponent(node.conversation_id)}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                aria-label={`Open ${node.title} in new window`}
+                onclick={(event) => event.stopPropagation()}
+              ><ExternalLink class="h-3.5 w-3.5" /></a>
+            {/if}
           </div>
           <div class="activity-tree-metadata-row mt-1 flex min-w-0 items-center gap-1.5">
             <span class="activity-tree-caret shrink-0" aria-hidden="true"></span>
-            <ActivityAvatar name={agentName(node)} avatarUrl={avatarUrl(node)} turnInProgress={node.activity_state === 'ongoing'} class="h-6 w-6 shrink-0" />
-            <span class="scrollbar-hidden-x min-w-0 text-slate-200">{agentName(node)}</span>
-            {#if node.agent_profile_id}<span class="scrollbar-hidden-x min-w-0">· {node.agent_profile_id}</span>{/if}
-            <span class="shrink-0">{displayStatus(node)}</span>
+            <WorkstreamIdentityPopover node={node} name={agentName(node)} avatarUrl={avatarUrl(node)} {running} />
+            <WorkstreamExecutionStatus label={displayStatus(node)} active={nodeIsActive(node)} />
             <div class="activity-tree-trailing ml-auto flex shrink-0 items-center gap-1.5">
-              <span class="rounded bg-slate-800 px-1.5 py-0.5 text-[10px]">{node.key === node.root_key ? 'main' : node.kind}</span>
+              {#if node.todo_progress && node.todo_progress.total > 0}
+                <WorkstreamTodoProgress progress={node.todo_progress} />
+              {/if}
               {#if summary && hasFileChanges(node)}
                 <button type="button" class="rounded border border-slate-700 px-1.5 py-0.5 text-sky-200" onclick={() => onViewWork?.(node.session_id, 'files')} aria-label={`View Work for ${node.title}`}><DiffStat files={summary.changed_files} additions={summary.additions} deletions={summary.deletions} compact /></button>
               {/if}
@@ -137,9 +207,13 @@
     </li>
   {/each}
 {/snippet}
-<div class="mb-2 flex justify-end">
+<div class="mb-2 flex justify-end gap-3">
   <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
-    <input type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-400" checked={hideReadOnly} onchange={toggleReadOnly} />
+    <input type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-400" checked={hideClosed} onchange={toggleClosed} data-testid="activity-tree-hide-closed" />
+    Hide closed
+  </label>
+  <label class="inline-flex cursor-pointer items-center gap-2 text-xs text-slate-400">
+    <input type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-900 text-sky-400" checked={hideReadOnly} onchange={toggleReadOnly} data-testid="activity-tree-hide-read-only" />
     Hide read-only
   </label>
 </div>

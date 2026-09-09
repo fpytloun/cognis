@@ -6,6 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from cognis.core.context_projection import (
+    PressureMode,
     ProjectionPolicy,
     ProjectionPressureMode,
     default_token_estimate,
@@ -25,7 +26,7 @@ def prune_tool_outputs(
     min_index_to_modify: int = 0,
     arg_clear_threshold: int = _ARG_CLEAR_THRESHOLD,
     token_counter: Callable[[str], int] | None = None,
-    pressure_mode: ProjectionPressureMode = "normal",
+    pressure_mode: PressureMode | ProjectionPressureMode = "normal",
     policy: ProjectionPolicy | None = None,
     recovery_result_call_ids: set[str] | None = None,
     recovery_pin_budget_tokens: int | None = None,

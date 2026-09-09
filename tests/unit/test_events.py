@@ -121,3 +121,29 @@ async def test_event_bus_auto_removes_repeatedly_failing_handler() -> None:
 
     assert len(good_received) == 6
     assert bus.handler_count(EventType.TASK_CREATED) == 1
+
+
+@pytest.mark.asyncio
+async def test_event_bus_keeps_resilient_handler_after_repeated_failures() -> None:
+    bus = EventBus()
+    fail = True
+    received: list[Event] = []
+
+    async def infrastructure_handler(event: Event) -> None:
+        if fail:
+            raise RuntimeError("dependency unavailable")
+        received.append(event)
+
+    bus.subscribe_all(infrastructure_handler, resilient=True)
+    for _ in range(5):
+        await bus.publish(Event(type=EventType.TASK_CREATED, data={}))
+
+    fail = False
+    recovered = Event(type=EventType.TASK_CREATED, data={"state": "recovered"})
+    await bus.publish(recovered)
+
+    assert received == [recovered]
+    assert bus.handler_count() == 1
+
+    bus.unsubscribe_all(infrastructure_handler)
+    assert bus.handler_count() == 0

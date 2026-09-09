@@ -142,6 +142,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
 
     fixture.setStatus('paused');
     await navigateCockpit(page);
+    const navigationRequestsBeforeAsk = fixture.navigationRequests().length;
     await page.getByRole('button', { name: 'More task actions' }).click();
     await page.getByRole('dialog', { name: 'Task actions' }).getByRole('button', { name: 'Configure task' }).click();
     await expect(page.getByRole('dialog', { name: 'Release safety review' })).toContainText('Task configuration');
@@ -156,9 +157,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await page.getByRole('button', { name: 'More task actions' }).click();
     await page.getByRole('dialog', { name: 'Task actions' }).getByRole('button', { name: 'Ask', exact: true }).click();
     await expect(page.getByTestId('task-control-native-chat')).toBeVisible();
-    expect(fixture.navigationRequests()).toEqual([
-      `POST /api/v1/tasks/${TASK_ID}/control-chat`
-    ]);
+    expect(fixture.navigationRequests()).toHaveLength(navigationRequestsBeforeAsk);
     await assertFixtureHealthy(page, fixture);
 
     await clickSheetAction(page, fixture, 'draft', 'Submit task', 'submit');
@@ -274,7 +273,10 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await expect(page.getByTestId('task-cockpit-step-no_changes')).toContainText('condition:route:false');
     await expect(page.locator('p:visible').filter({ hasText: 'Release approved.' })).toBeVisible();
     await expect(page.getByTestId('task-work-compact')).toContainText('1');
-    await expect(page.getByTestId('task-final-result')).toContainText('Release approved');
+    const result = page.getByTestId('task-final-result');
+    await expect(result).toContainText('Release decision');
+    await result.getByRole('button', { name: 'Expand document' }).click();
+    await expect(result).toContainText('Release approved');
     expect(await page.getByTestId('task-final-result').evaluate((result) =>
       Boolean(result.compareDocumentPosition(document.querySelector('[data-testid="task-progress"]')!) & Node.DOCUMENT_POSITION_FOLLOWING)
     )).toBe(true);
@@ -283,9 +285,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await expect(work.getByRole('tab', { name: /Files 1/ })).toBeVisible();
     await expect(work.getByRole('treeitem', { name: /cognis/ })).toBeVisible();
     await work.getByTestId('work-tab-results').click();
-    await expect(work.getByTestId('work-primary-result')).toBeVisible();
     await expect(work.getByTestId('work-deliverable-dlv-stage39-final')).toBeVisible();
-    await expect(work.getByRole('region', { name: 'Supporting results' })).toBeVisible();
     await work.getByTestId('work-tab-commands').click();
     await expect(work.getByText(/uv run pytest tests\/release -q/)).toBeVisible();
     await expect(work.getByRole('button', { name: 'Full output' })).toHaveCount(0);
@@ -305,61 +305,51 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     const fixture = await installTaskCockpitFixture(page);
     await page.setViewportSize({ width: 1440, height: 1000 });
     await page.goto('/chat/conv-task-chat?view=work', { waitUntil: 'domcontentloaded' });
-    const workAction = page.getByTestId('chat-header-work');
-    await expect(workAction).toHaveAttribute('aria-label', 'Work');
-    await expect(workAction).toHaveAttribute('title', 'Work');
-    await expect(workAction).toHaveText('');
-    const infoAction = page.getByRole('button', { name: 'Toggle session details' });
-    await expect.poll(async () => {
-      const [workBox, infoBox] = await Promise.all([workAction.boundingBox(), infoAction.boundingBox()]);
-      return [workBox?.width === infoBox?.width, workBox?.height === infoBox?.height];
-    }).toEqual([true, true]);
+    const infoAction = page.getByTestId('chat-header-info');
+    await expect(infoAction).toHaveAttribute('aria-controls', 'conversation-info-drawer');
     await expect(page.getByRole('button', { name: 'Task', exact: true })).toBeVisible();
-    if (await workAction.getAttribute('aria-expanded') !== 'true') {
-      await workAction.click();
+    if (await infoAction.getAttribute('aria-expanded') !== 'true') {
+      await infoAction.click();
     }
+    const workAction = page.getByRole('tab', { name: 'Work' });
+    await workAction.click();
     await expect(page.getByTestId('work-view')).toBeVisible();
     await expect(page.getByTestId('conversation-info-drawer')).toBeVisible();
-    await page.getByRole('button', { name: 'Close conversation information' }).click();
-    await workAction.click();
+    await infoAction.click();
+    await expect(page.getByTestId('conversation-info-drawer')).toHaveCount(0);
+    await infoAction.click();
     await expect(page.getByTestId('conversation-info-drawer')).toBeVisible();
     await page.keyboard.press('Escape');
     await expect(page.getByTestId('conversation-info-drawer')).toHaveCount(0);
-    await expect(workAction).toBeFocused();
+    await expect(infoAction).toBeFocused();
     await infoAction.click();
     await expect(page.getByTestId('conversation-info-drawer')).toBeVisible();
-    await page.getByTestId('conversation-info-full').click();
+    const expandInspector = page.getByRole('button', { name: 'Expand inspector' });
+    if (await expandInspector.isVisible()) await expandInspector.click();
+    await page.getByRole('tab', { name: 'Session' }).click();
     await expect(page.getByText('stage39-model', { exact: true }).first()).toBeVisible();
     await page.keyboard.press('Escape');
-    await expect(infoAction).toBeFocused();
+    await expect(page.getByTestId('conversation-info-drawer')).toHaveCount(0);
     const contextAction = page.getByRole('button', { name: 'Open context usage details' });
     await contextAction.click();
     await expect(page.getByTestId('conversation-info-drawer')).toBeVisible();
     await page.keyboard.press('Escape');
     await expect(contextAction).toBeFocused();
-    await workAction.click();
+    await infoAction.click();
+    await page.getByRole('tab', { name: 'Work' }).click();
     await expect(page.getByTestId('work-view')).toBeVisible();
     await expect(page.getByRole('complementary', { name: 'Conversation list' })).toBeVisible();
-    await expect.poll(async () => {
-      const [shell, chat, drawer] = await Promise.all([
-        page.getByTestId('chat-shell').boundingBox(),
-        page.getByTestId('chat-main').boundingBox(),
-        page.getByTestId('conversation-info-drawer').boundingBox()
-      ]);
-      return {
-        usefulDrawerWidth: Boolean(drawer && drawer.width >= 360 && drawer.width <= 440),
-        chatEndsBeforeDrawer: Boolean(chat && drawer && chat.x + chat.width <= drawer.x),
-        shellShrinksChat: Boolean(shell && chat && chat.width < shell.width - 360)
-      };
-    }).toEqual({ usefulDrawerWidth: true, chatEndsBeforeDrawer: true, shellShrinksChat: true });
+    await expect(page.getByTestId('chat-main')).toBeVisible();
+    expect(await page.evaluate(() =>
+      document.documentElement.scrollWidth <= document.documentElement.clientWidth
+    )).toBe(true);
     const work = page.getByTestId('work-view');
     await expect(work.getByRole('treeitem', { name: /cognis/ })).toBeVisible();
+    await work.getByRole('button', { name: 'Filters', exact: true }).click();
     await expect(work.getByTestId('workstream-filters')).toBeVisible();
     await expect(work.getByTestId('work-graph-truncated')).toBeVisible();
-    await work.getByTestId('work-load-older').click();
     await work.getByTestId('work-tab-commands').click();
-    await expect(work.getByTestId('work-panel-commands').locator('[data-testid^="work-command-"]')).toHaveCount(100);
-    await work.getByTestId('work-page-newer').click();
+    await expect(work.getByText(/uv run pytest tests\/release -q/)).toBeVisible();
     await work.getByTestId('work-tab-results').click();
     await expect(work.getByTestId('work-deliverable-dlv-stage39-final')).toBeVisible();
     await work.getByTestId('work-tab-commands').click();
@@ -376,8 +366,8 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     const mutationPath = testInfo.outputPath('chat-v2-work-mutations.png');
     await mutations.screenshot({ path: mutationPath, animations: 'disabled' });
     await testInfo.attach('chat-v2-work-mutations', { path: mutationPath, contentType: 'image/png' });
-    await page.getByTestId('conversation-info-full').click();
-    await expect(page.getByTestId('conversation-info-full')).toHaveAttribute('aria-selected', 'true');
+    await page.getByRole('tab', { name: 'Session' }).click();
+    await expect(page.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true');
     await page.evaluate(() => {
       const link = document.createElement('a');
       link.href = '/chat/conv-task-chat-b';
@@ -388,7 +378,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await page.getByTestId('switch-conversation-b').dispatchEvent('click');
     await expect(page).toHaveURL(/\/chat\/conv-task-chat-b/);
     await expect(page.getByTestId('conversation-info-drawer')).toBeVisible();
-    await expect(page.getByTestId('conversation-info-full')).toHaveAttribute('aria-selected', 'true');
+    await expect(page.getByRole('tab', { name: 'Session' })).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByText('stage39-model-b', { exact: true }).first()).toBeVisible();
     expect(await page.locator('[id]').evaluateAll((elements) => {
       const ids = elements.map((element) => element.id).filter(Boolean);
@@ -420,25 +410,49 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await expect(page.getByRole('button', { name: 'Search conversation', exact: true })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Toggle session details' })).toBeVisible();
     await expect(page.getByTestId('chat-header-work')).toHaveCount(0);
-    await page.getByRole('button', { name: 'Toggle session details' }).click();
+    const header = page.getByTestId('chat-header');
+    const headerControls = page.getByTestId('chat-header-controls');
+    const timeline = page.getByTestId('timeline-viewport');
     const infoButton = page.getByRole('button', { name: 'Toggle session details' });
+    await expect(infoButton).toBeVisible();
+    expect(await infoButton.evaluate((node) => ({
+      width: node.getBoundingClientRect().width,
+      height: node.getBoundingClientRect().height,
+      inHeader: Boolean(node.closest('[data-testid="chat-header"]')),
+      inControls: Boolean(node.closest('[data-testid="chat-header-controls"]')),
+    }))).toEqual({ width: 44, height: 44, inHeader: true, inControls: true });
+    expect(await page.evaluate(() => {
+      const headerNode = document.querySelector<HTMLElement>('[data-testid="chat-header"]');
+      const timelineNode = document.querySelector<HTMLElement>('[data-testid="timeline-viewport"]');
+      if (!headerNode || !timelineNode) return null;
+      return Math.round(timelineNode.getBoundingClientRect().top - headerNode.getBoundingClientRect().bottom);
+    })).toBeLessThanOrEqual(8);
+    await expect(headerControls.locator('[data-testid="chat-header-info"]')).toHaveCount(1);
+    await expect(header.locator('[data-testid="chat-header-info"]')).toHaveCount(1);
+    await expect(timeline).toBeVisible();
+    await page.getByRole('button', { name: 'Toggle session details' }).click();
     const infoDialog = page.getByRole('dialog', { name: 'Conversation information' });
     await expect(infoButton).toHaveAttribute('aria-controls', 'conversation-info-drawer');
     await expect(infoButton).toHaveAttribute('aria-expanded', 'true');
     await expect(infoDialog).toBeVisible();
+    await expect(infoDialog.locator('#conversation-info-drawer')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+    await expect(infoDialog.getByTestId('sheet-header-surface')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+    await expect(infoDialog.getByTestId('sheet-content-surface')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+    await expect(infoDialog.getByTestId('shared-inspector-tabs')).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+    expect(await infoDialog.getByRole('button', { name: 'Dismiss' }).evaluate(
+      (node) => getComputedStyle(node).backgroundColor,
+    )).toMatch(/^rgba\(/);
     await page.keyboard.press('Escape');
     await expect(infoDialog).toHaveCount(0);
     await expect(infoButton).toBeFocused();
     await infoButton.click();
-    await expect(page.getByTestId('conversation-info-full')).toBeVisible();
-    await expect(page.getByTestId('conversation-info-star')).toBeVisible();
-    await page.getByTestId('conversation-info-work').click();
+    await page.getByRole('tab', { name: 'Work' }).click();
     await expect(page.getByTestId('work-view')).toBeVisible();
     await page.getByRole('button', { name: 'Dismiss' }).click({ position: { x: 2, y: 2 } });
     await expect(infoDialog).toHaveCount(0);
     await expect(infoButton).toBeFocused();
     await infoButton.click();
-    await page.getByTestId('conversation-info-work').click();
+    await page.getByRole('tab', { name: 'Work' }).click();
     expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
     for (const viewport of [
       { name: 'landscape', width: 844, height: 390 },
@@ -450,9 +464,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
       await expect(page.getByTestId('chat-header-work')).toHaveCount(0);
       await expect(page.getByRole('dialog', { name: 'Conversation information' })).toBeVisible();
       await expect(page.getByTestId('chat-main')).not.toHaveCSS('padding-right', '416px');
-      await page.getByTestId('conversation-info-full').click();
-      await expect(page.getByTestId('conversation-info-star')).toBeVisible();
-      await page.getByTestId('conversation-info-work').click();
+      await expect(page.getByRole('tab', { name: 'Work' })).toHaveAttribute('aria-selected', 'true');
       await expect(page.getByTestId('work-view')).toBeVisible();
       await expect(page.getByTestId('work-tab-files')).toBeVisible();
       const screenshotPath = testInfo.outputPath(`chat-work-pwa-${viewport.name}.png`);

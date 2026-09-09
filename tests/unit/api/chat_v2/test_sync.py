@@ -19,6 +19,7 @@ from cognis.api.chat_v2.schemas import (
     ConversationSummary,
     MessageTimelineItem,
     TimelineScope,
+    TimelineWindow,
     ToolCallTimelineItem,
     UpsertTimelineItemOp,
 )
@@ -337,7 +338,7 @@ def test_latest_window_sparse_lineage_expands_in_batches_and_caps_concurrency() 
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=refs,
             event_store=store,
-            limit=20,
+            initial_read_window=20,
         )
     )
 
@@ -390,7 +391,7 @@ def test_latest_window_equal_timestamps_preserves_lineage_seq_event_id_order() -
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=refs,
             event_store=store,
-            limit=5,
+            initial_read_window=5,
         )
     )
 
@@ -442,7 +443,7 @@ def test_latest_window_matches_eager_reference_for_randomized_lineages(seed: int
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=refs,
             event_store=adaptive_store,
-            limit=limit,
+            initial_read_window=limit,
         )
     )
 
@@ -471,7 +472,7 @@ def test_latest_window_exact_session_boundary_sets_has_more_before() -> None:
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=refs,
             event_store=store,
-            limit=4,
+            initial_read_window=4,
         )
     )
 
@@ -502,7 +503,7 @@ def test_latest_window_records_window_metrics_only_for_snapshot(
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=_lineage(),
             event_store=store,
-            limit=1,
+            initial_read_window=1,
         )
     )
     assert metrics.windows == []
@@ -511,7 +512,7 @@ def test_latest_window_records_window_metrics_only_for_snapshot(
         sync_module._read_latest_window(  # noqa: SLF001
             session_refs=_lineage(),
             event_store=store,
-            limit=1,
+            initial_read_window=1,
             record_metrics=True,
         )
     )
@@ -574,6 +575,320 @@ def test_adaptive_snapshot_before_cursor_backfills_without_gap(
     assert [item.id for item in page.items] == ["user:1-1", "user:1-2"]
     assert page.has_more_before is True
     assert page.before_cursor
+
+
+def test_child_snapshot_reads_newest_200_events_and_backfills_complete_history() -> None:
+    events = [
+        _event(
+            seq,
+            "user_message",
+            {"content": f"message {seq}", "client_message_id": f"message-{seq}"},
+        )
+        for seq in range(1, 806)
+    ]
+    store = FakeEventStore({"intaris_1": events})
+    scope = TimelineScope(
+        key="session:sess_1",
+        kind="session",
+        conversation_id="conv_1",
+        session_id="sess_1",
+    )
+
+    snapshot = _run(
+        build_chat_snapshot(
+            scope=scope,
+            conversation=None,
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            initial_read_window=200,
+            now=NOW,
+        )
+    )
+
+    assert len(snapshot.timeline.items) == 200
+    assert snapshot.timeline.items[0].id == "user:message-606"
+    assert snapshot.timeline.items[-1].id == "user:message-805"
+    assert snapshot.timeline.has_more_before is True
+    assert snapshot.timeline.before_cursor
+    assert store.calls[0]["limit"] == 200
+
+    pages = [list(snapshot.timeline.items)]
+    before = snapshot.timeline.before_cursor
+    while before is not None:
+        page = _run(
+            build_timeline_backfill_response(
+                scope=scope,
+                before=before,
+                session_refs=_lineage(),
+                event_store=store,
+                cursor_secret=SECRET,
+                limit=200,
+                now=NOW,
+            )
+        )
+        pages.append(list(page.items))
+        before = page.before_cursor
+
+    chronological = [item for page in reversed(pages) for item in page]
+    assert [item.id for item in chronological] == [f"user:message-{seq}" for seq in range(1, 806)]
+    assert len({item.id for item in chronological}) == 805
+
+
+def test_filtered_snapshot_and_backfill_pages_advance_raw_event_cursors() -> None:
+    events = [
+        _event(
+            seq,
+            "user_message" if seq <= 2 else "reasoning",
+            (
+                {"content": f"message {seq}", "client_message_id": f"message-{seq}"}
+                if seq <= 2
+                else {"content": f"private {seq}"}
+            ),
+        )
+        for seq in range(1, 9)
+    ]
+    store = FakeEventStore({"intaris_1": events})
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            initial_read_window=2,
+            now=NOW,
+        )
+    )
+
+    assert snapshot.timeline.items == []
+    assert snapshot.timeline.has_more_before is True
+    assert snapshot.timeline.before_cursor is not None
+    first_cursor = validate_cursor(
+        snapshot.timeline.before_cursor,
+        SECRET,
+        scope_key="conversation:conv_1",
+        projection_version=PROJECTION_VERSION,
+        now=NOW,
+    )
+    assert first_cursor.session_watermarks[0].last_seq == 7
+
+    empty_page = _run(
+        build_timeline_backfill_response(
+            before=snapshot.timeline.before_cursor,
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            limit=2,
+            now=NOW,
+        )
+    )
+    assert empty_page.items == []
+    assert empty_page.has_more_before is True
+    assert empty_page.before_cursor is not None
+    assert empty_page.before_cursor != snapshot.timeline.before_cursor
+    second_cursor = validate_cursor(
+        empty_page.before_cursor,
+        SECRET,
+        scope_key="conversation:conv_1",
+        projection_version=PROJECTION_VERSION,
+        now=NOW,
+    )
+    assert second_cursor.session_watermarks[0].last_seq == 5
+
+    before = empty_page.before_cursor
+    projected: list[MessageTimelineItem] = []
+    seen_cursors = {snapshot.timeline.before_cursor, empty_page.before_cursor}
+    while before is not None:
+        page = _run(
+            build_timeline_backfill_response(
+                before=before,
+                session_refs=_lineage(),
+                event_store=store,
+                cursor_secret=SECRET,
+                limit=2,
+                now=NOW,
+            )
+        )
+        projected.extend(item for item in page.items if isinstance(item, MessageTimelineItem))
+        if page.before_cursor is not None:
+            assert page.before_cursor not in seen_cursors
+            seen_cursors.add(page.before_cursor)
+        before = page.before_cursor
+
+    assert [item.id for item in projected] == ["user:message-1", "user:message-2"]
+
+
+def test_filtered_multi_session_pages_cross_lineage_without_gaps() -> None:
+    refs = _many_lineage(2)
+    store = FakeEventStore(
+        {
+            "intaris_0": [
+                _event_for(
+                    "intaris_0",
+                    seq,
+                    "user_message" if seq == 1 else "reasoning",
+                    (
+                        {"content": "oldest visible", "client_message_id": "oldest-visible"}
+                        if seq == 1
+                        else {"content": f"private parent {seq}"}
+                    ),
+                )
+                for seq in range(1, 5)
+            ],
+            "intaris_1": [
+                _event_for(
+                    "intaris_1",
+                    seq,
+                    "reasoning",
+                    {"content": f"private child {seq}"},
+                )
+                for seq in range(1, 3)
+            ],
+        }
+    )
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            initial_read_window=2,
+            now=NOW,
+        )
+    )
+    assert snapshot.timeline.items == []
+    assert snapshot.timeline.before_cursor is not None
+
+    first_page = _run(
+        build_timeline_backfill_response(
+            before=snapshot.timeline.before_cursor,
+            session_refs=refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            limit=2,
+            now=NOW,
+        )
+    )
+    assert first_page.items == []
+    assert first_page.before_cursor is not None
+    assert first_page.before_cursor != snapshot.timeline.before_cursor
+
+    final_page = _run(
+        build_timeline_backfill_response(
+            before=first_page.before_cursor,
+            session_refs=refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            limit=2,
+            now=NOW,
+        )
+    )
+    assert [item.id for item in final_page.items] == ["user:oldest-visible"]
+    assert final_page.has_more_before is False
+    assert final_page.before_cursor is None
+
+
+def test_filtered_snapshot_cache_preserves_raw_event_cursor() -> None:
+    sync_module.clear_chat_v2_read_caches()
+    store = FakeEventStore(
+        {
+            "intaris_1": [
+                _event(seq, "reasoning", {"content": f"private {seq}"}) for seq in range(1, 4)
+            ]
+        }
+    )
+    kwargs = {
+        "conversation": _conversation(),
+        "session_refs": _lineage(),
+        "event_store": store,
+        "cursor_secret": SECRET,
+        "initial_read_window": 2,
+        "now": NOW,
+    }
+
+    first = _run(build_chat_snapshot(**kwargs))
+    second = _run(build_chat_snapshot(**kwargs))
+
+    assert first.timeline.items == second.timeline.items == []
+    assert first.timeline.has_more_before is second.timeline.has_more_before is True
+    assert first.timeline.before_cursor == second.timeline.before_cursor
+    assert first.timeline.before_cursor is not None
+    assert len(store.calls) == 1
+    sync_module.clear_chat_v2_read_caches()
+
+
+def test_projection_cache_invalidation_is_scoped() -> None:
+    sync_module.clear_chat_v2_read_caches()
+    shared = (
+        (("intaris", "session-a", 1, None),),
+        (("intaris", "session-a", 1),),
+        200,
+        "none",
+    )
+    first = ("conversation:conv-a", *shared)
+    second = ("conversation:conv-b", *shared)
+    value = (TimelineWindow(items=[], has_more_before=False), False, None)
+    sync_module._SNAPSHOT_PROJECTION_CACHE[first] = value
+    sync_module._SNAPSHOT_PROJECTION_CACHE[second] = value
+
+    sync_module.invalidate_chat_v2_snapshot_projection("conversation:conv-a")
+
+    assert first not in sync_module._SNAPSHOT_PROJECTION_CACHE
+    assert second in sync_module._SNAPSHOT_PROJECTION_CACHE
+    sync_module.clear_chat_v2_read_caches()
+
+
+def test_snapshot_cursor_uses_raw_frontier_before_post_processing() -> None:
+    store = FakeEventStore(
+        {
+            "intaris_1": [
+                _event(1, "user_message", {"client_message_id": "visible"}),
+                _event(2, "reasoning", {"content": "filtered"}),
+                _event(3, "reasoning", {"content": "filtered"}),
+            ]
+        }
+    )
+
+    async def drop_latest(events: list[RawSessionEvent]) -> list[RawSessionEvent]:
+        return [event for event in events if event.seq != 2]
+
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            initial_read_window=2,
+            event_post_processor=drop_latest,
+            now=NOW,
+        )
+    )
+
+    assert snapshot.timeline.items == []
+    assert snapshot.timeline.before_cursor is not None
+    cursor = validate_cursor(
+        snapshot.timeline.before_cursor,
+        SECRET,
+        scope_key="conversation:conv_1",
+        projection_version=PROJECTION_VERSION,
+        now=NOW,
+    )
+    assert cursor.session_watermarks[0].last_seq == 2
+
+    page = _run(
+        build_timeline_backfill_response(
+            before=snapshot.timeline.before_cursor,
+            session_refs=_lineage(),
+            event_store=store,
+            cursor_secret=SECRET,
+            limit=2,
+            event_post_processor=drop_latest,
+            now=NOW,
+        )
+    )
+    assert [item.id for item in page.items] == ["user:visible"]
 
 
 def test_adaptive_snapshot_hydrates_pairing_across_window_boundary(
@@ -1363,27 +1678,37 @@ def test_conversation_and_queue_conversion() -> None:
             "project_id": None,
             "status": "active",
             "active_session_id": "sess_1",
+            "created_at": NOW - timedelta(seconds=1),
             "last_message_at": NOW,
             "last_read_at": None,
         },
     )()
 
     conversation = conversation_summary_from_row(row)
+    assert conversation.has_message_history is True
     queue = queue_state_from_messages(
         [
             {
                 "queue_id": "q1",
                 "client_message_id": "c1",
-                "content": "queued",
+                "content": "",
+                "kind": "automatic_continuation",
+                "continuation_reason": "tool_call_ceiling_reached",
                 "attachments": [],
                 "position": 1,
+                "status": "committing",
             }
         ]
     )
 
-    assert conversation == _conversation(title="Chat")
+    assert conversation == _conversation(title="Chat").model_copy(
+        update={"has_message_history": True}
+    )
     assert queue.queued_count == 1
     assert queue.messages[0].queue_id == "q1"
+    assert queue.messages[0].kind == "automatic_continuation"
+    assert queue.messages[0].continuation_reason == "tool_call_ceiling_reached"
+    assert queue.messages[0].status == "committing"
 
 
 def test_sync_hydrates_tool_call_for_out_of_window_tool_result() -> None:
@@ -1701,6 +2026,234 @@ def test_parallel_backfill_pages_by_global_event_time_without_skip_or_duplicate(
     ]
     assert len(seen) == len(set(seen))
     assert store.max_concurrent_reads == 2
+
+
+def _page_complete_history(
+    *,
+    scope: TimelineScope,
+    refs: list[ConversationSessionRef],
+    store: FakeEventStore,
+    snapshot_limit: int,
+    page_limit: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[Any]:
+    monkeypatch.setattr(sync_module, "SNAPSHOT_WINDOW_EVENT_LIMIT", snapshot_limit)
+    snapshot = _run(
+        build_chat_snapshot(
+            scope=scope,
+            conversation=None,
+            session_refs=refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+    pages: list[list[Any]] = [list(snapshot.timeline.items)]
+    cycle_pages = [list(snapshot.timeline.cycle_states)]
+    has_more = snapshot.timeline.has_more_before
+    cursor = snapshot.timeline.before_cursor
+    seen_cursors: set[str] = set()
+    while has_more:
+        assert cursor is not None
+        assert cursor not in seen_cursors
+        seen_cursors.add(cursor)
+        page = _run(
+            build_timeline_backfill_response(
+                scope=scope,
+                before=cursor,
+                session_refs=refs,
+                event_store=store,
+                cursor_secret=SECRET,
+                limit=page_limit,
+                now=NOW,
+            )
+        )
+        pages.append(list(page.items))
+        cycle_pages.append(list(page.cycle_states))
+        has_more = page.has_more_before
+        cursor = page.before_cursor
+        assert len(pages) < 50
+
+    assert cursor is None
+    chronological = [item for page in reversed(pages) for item in page]
+    assert len({item.id for item in chronological}) == len(chronological)
+    assert [item.sort_key for item in chronological] == sorted(
+        item.sort_key for item in chronological
+    )
+    for cycle_states in cycle_pages:
+        assert len({state.cycle_id for state in cycle_states}) == len(cycle_states)
+    assert len(pages) > 3
+    return chronological
+
+
+@pytest.mark.parametrize("status", ["active", "completed", "terminated"])
+def test_long_direct_delegate_history_pages_to_oldest_events(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    refs = [
+        ConversationSessionRef(
+            session_id="delegate",
+            event_store_session_id="delegate-store",
+            role="session",
+            ordinal=0,
+            status=status,
+        )
+    ]
+    events = [
+        _event_for(
+            "delegate-store",
+            1,
+            "user_message",
+            {"content": "oldest user", "client_message_id": "oldest-user"},
+        ),
+        _event_for(
+            "delegate-store",
+            2,
+            "assistant_message",
+            {"content": "oldest assistant", "message_id": "oldest-assistant"},
+        ),
+        _event_for(
+            "delegate-store",
+            3,
+            "tool_call",
+            {"call_id": "oldest-tool", "name": "read", "arguments": {"path": "/tmp/a"}},
+        ),
+        _event_for(
+            "delegate-store",
+            4,
+            "tool_result",
+            {"call_id": "oldest-tool", "result": "content"},
+        ),
+        *[
+            _event_for(
+                "delegate-store",
+                seq,
+                "user_message",
+                {"content": f"later {seq}", "client_message_id": f"later-{seq}"},
+            )
+            for seq in range(5, 17)
+        ],
+    ]
+
+    items = _page_complete_history(
+        scope=TimelineScope(
+            key="session:delegate",
+            kind="session",
+            conversation_id="conversation-root",
+            session_id="delegate",
+        ),
+        refs=refs,
+        store=FakeEventStore({"delegate-store": events}),
+        snapshot_limit=4,
+        page_limit=4,
+        monkeypatch=monkeypatch,
+    )
+
+    by_id = {item.id: item for item in items}
+    assert "user:oldest-user" in by_id
+    assert "message:oldest-assistant" in by_id
+    assert "tool:oldest-tool" in by_id
+
+
+def test_compacted_delegate_successor_scope_pages_complete_logical_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refs = [
+        ConversationSessionRef(
+            session_id="delegate-original",
+            event_store_session_id="delegate-original-store",
+            role="session",
+            ordinal=0,
+            status="completed",
+            completion_reason="compacted",
+        ),
+        ConversationSessionRef(
+            session_id="delegate-successor",
+            event_store_session_id="delegate-successor-store",
+            role="session",
+            ordinal=1,
+            status="completed",
+        ),
+    ]
+    events_by_session = {
+        ref.event_store_session_id: [
+            _event_for(
+                ref.event_store_session_id,
+                seq,
+                "user_message",
+                {
+                    "content": f"{ref.session_id}-{seq}",
+                    "client_message_id": f"{ref.session_id}-{seq}",
+                },
+            )
+            for seq in range(1, 9)
+        ]
+        for ref in refs
+    }
+
+    items = _page_complete_history(
+        scope=TimelineScope(
+            key="session:delegate-successor",
+            kind="session",
+            conversation_id="conversation-root",
+            session_id="delegate-successor",
+        ),
+        refs=refs,
+        store=FakeEventStore(events_by_session),
+        snapshot_limit=3,
+        page_limit=3,
+        monkeypatch=monkeypatch,
+    )
+
+    assert [item.id for item in items] == [
+        *[f"user:delegate-original-{seq}" for seq in range(1, 9)],
+        *[f"user:delegate-successor-{seq}" for seq in range(1, 9)],
+    ]
+
+
+def test_authorized_managed_target_conversation_pages_complete_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refs = [
+        ConversationSessionRef(
+            session_id="managed-target",
+            event_store_session_id="managed-target-store",
+            role="root",
+            ordinal=0,
+            status="completed",
+        )
+    ]
+    items = _page_complete_history(
+        scope=TimelineScope(
+            key="conversation:managed-target",
+            kind="conversation",
+            conversation_id="managed-target",
+            session_id="managed-target",
+        ),
+        refs=refs,
+        store=FakeEventStore(
+            {
+                "managed-target-store": [
+                    _event_for(
+                        "managed-target-store",
+                        seq,
+                        "user_message",
+                        {
+                            "content": f"managed-{seq}",
+                            "client_message_id": f"managed-{seq}",
+                        },
+                    )
+                    for seq in range(1, 13)
+                ]
+            }
+        ),
+        snapshot_limit=3,
+        page_limit=3,
+        monkeypatch=monkeypatch,
+    )
+
+    assert [item.id for item in items] == [f"user:managed-{seq}" for seq in range(1, 13)]
 
 
 def test_composite_work_cursor_is_compact_at_128_streams_and_rejects_graph_change() -> None:

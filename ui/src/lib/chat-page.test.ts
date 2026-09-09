@@ -4,10 +4,25 @@ import {
   buildConversationUrl,
   CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX,
   cloneSidebarProjection,
+  mergeSidebarBackgroundWork,
+  canShowConversationLifecycleActions,
   conversationInspectorFits,
   conversationActivityValue,
   conversationInitialLoadPolicy,
   conversationPendingSnapshotFlags,
+  canonicalStateCanSettleDirectQuestion,
+  directQuestionFromPendingSummary,
+  sanitizeManagedQuestionOrigin,
+  buildDirectQuestionAck,
+  directQuestionAckMessage,
+  directQuestionAckManagedLabel,
+  directQuestionAckOriginConversationId,
+  shouldRestoreDirectQuestionOnSubmitFailure,
+  escalationSubmittingLabel,
+  escalationFromPendingSummary,
+  managedEscalationPending,
+  managedInteractionVisibleInScope,
+  mergeHydratedEscalation,
   conversationMatchesSidebarProjectionFilter,
   isTaskControlConversationSummary,
   shouldInsertDirectlyLoadedConversation,
@@ -19,6 +34,8 @@ import {
   conversationStatusFilterForConversation,
   conversationTurnModeTone,
   conversationUpdatedRowPatch,
+  orderedConversationUpdatedRowPatch,
+  chatV2RuntimeConversationPatch,
   hasUnreadFromConversationTimestamps,
   DEFAULT_INITIAL_TIMELINE_LIMIT,
   DIRECT_CHAT_INITIAL_SESSION_LIMIT,
@@ -27,16 +44,22 @@ import {
   getNextHistoryAfterSeq,
   getConversationRetryScope,
   groupConversationsByActivity,
+  initialConversationFiltersOpen,
   isNearScrollBottom,
   isForeignSessionTimelineEvent,
   isMissingSessionError,
   isLastOpenedConversationStorageKey,
+  SidebarRevisionAdmission,
+  SerialInvalidationCoalescer,
+  reconcileRenderedOverviewSources,
   dedupeLastOpenedConversationEntries,
   lastOpenedConversationEntry,
   lastOpenedConversationStorageKey,
+  mergeAuthoritativeSidebarConversation,
   mergeConversationPreservingActivity,
   mergeConversationRowPatch,
   mergeSidebarConversationRows,
+  mobileConversationStatusLabel,
   removeSidebarConversationRow,
   normalizeChatModeTone,
   nextChatAutoScrollState,
@@ -58,6 +81,7 @@ import {
   isCurrentConversationLoad,
   startCachedTimelineRefresh,
   refreshCachedTimeline,
+  snapshotNeedsHistoryRecovery,
   nextControllerRecoveryDelayMs,
   shouldContinueControllerRecovery,
   parseConversationStatusFilter,
@@ -68,6 +92,12 @@ import {
   shouldRecoverChatV2ForInvalidation,
   shouldSnapshotAfterChatV2Sync,
   ChatV2CanonicalRecoveryCoalescer,
+  beginCanonicalTimelineAuthority,
+  acceptCanonicalTimelineBase,
+  canonicalTimelineBaseIsAccepted,
+  transitionCanonicalTimelineAuthority,
+  canonicalTimelineAuthorityIsReady,
+  backfillInitialVisibleHistory,
   shouldApplyLegacyLifecycleFrame,
   resolveTurnActivityAuthority,
   applyRuntimeAuthoritySequence,
@@ -80,6 +110,8 @@ import {
   anchoredScrollTop,
   timelineWindowEnd,
   timelineWindowSize,
+  shouldRebaseLiveTailWindow,
+  reconcileLiveTailWindow,
   timelineWindowHasHiddenTail,
   shouldAutoLoadOlderForViewport,
   expandWindowUp,
@@ -94,11 +126,13 @@ import {
   TIMELINE_WINDOW_MAX_ROWS,
   shouldAttemptStaleRuntimeRefresh,
   shouldApplyPendingNotificationRefresh,
+  shouldApplyPendingNotificationConsumerRefresh,
   shouldApplySidebarProjectionRefresh,
   shouldDebounceConversationViewRefresh,
   shouldDebounceSidebarResync,
   shouldRecoverMissingConversationRow,
   shouldResetPendingDirectQuestionForm,
+  shouldApplyChatMutationResponse,
   shouldApplyChatSendFailureSideEffects,
   shouldApplyChatV2Recovery,
   shouldClearRecoverableRetry,
@@ -121,9 +155,47 @@ import {
   applyCachedQueueToProjection,
   resolveOlderMessagesCursorAfterSnapshot,
 } from '$lib/chat-page';
-import { conversationTimelineScope } from '$lib/chat-v2/types';
+import { conversationTimelineScope, type TimelineScope } from '$lib/chat-v2/types';
 import { emptyChatV2State } from '$lib/chat-v2/sync-engine';
 import type { Conversation, SidebarProjection } from '$lib/types/api';
+
+describe('conversation lifecycle action eligibility', () => {
+  const scope = (kind: TimelineScope['kind']): TimelineScope => ({
+    key: `${kind}:target`,
+    kind,
+    conversation_id: 'conversation-1',
+    session_id: kind === 'session' ? 'session-1' : undefined,
+    step_run_id: kind === 'task_step' ? 'run-1' : undefined,
+  });
+
+  it('allows only an eligible root conversation scope', () => {
+    expect(canShowConversationLifecycleActions(scope('conversation'), 'conversation-1', false, false, false)).toBe(true);
+    expect(canShowConversationLifecycleActions(scope('session'), 'conversation-1', false, false, false)).toBe(false);
+    expect(canShowConversationLifecycleActions(scope('task_step'), 'conversation-1', false, false, false)).toBe(false);
+  });
+
+  it('keeps managed child conversation scopes ineligible for root handlers', () => {
+    const managedChild: TimelineScope = {
+      key: 'conversation:managed-child',
+      kind: 'conversation',
+      conversation_id: 'managed-child',
+    };
+    expect(
+      canShowConversationLifecycleActions(
+        managedChild,
+        'conversation-1',
+        true,
+        false,
+        false,
+      ),
+    ).toBe(false);
+  });
+
+  it('keeps task-control and agent-direct root conversations ineligible', () => {
+    expect(canShowConversationLifecycleActions(scope('conversation'), 'conversation-1', false, true, false)).toBe(false);
+    expect(canShowConversationLifecycleActions(scope('conversation'), 'conversation-1', false, false, true)).toBe(false);
+  });
+});
 
 describe('recoverable turn retry state', () => {
   it('clears a stale retry affordance after the server rejects retry eligibility', () => {
@@ -134,10 +206,21 @@ describe('recoverable turn retry state', () => {
 });
 
 describe('chat page helpers', () => {
+  it('starts conversation filters collapsed on mobile and expanded on desktop', () => {
+    expect(initialConversationFiltersOpen(390)).toBe(false);
+    expect(initialConversationFiltersOpen(1023)).toBe(false);
+    expect(initialConversationFiltersOpen(1024)).toBe(true);
+  });
   it('pins the inspector from available width without a browser or PWA mode exception', () => {
-    expect(conversationInspectorFits(911)).toBe(false);
-    expect(conversationInspectorFits(912)).toBe(true);
+    expect(conversationInspectorFits(811)).toBe(false);
+    expect(conversationInspectorFits(812)).toBe(true);
     expect(conversationInspectorFits(1600)).toBe(true);
+  });
+
+  it('prioritizes pending input and active turns in the compact header status', () => {
+    expect(mobileConversationStatusLabel('active', false, false)).toBe('active');
+    expect(mobileConversationStatusLabel('active', true, false)).toBe('Running');
+    expect(mobileConversationStatusLabel('active', true, true)).toBe('Waiting for input');
   });
 
   it('keeps canonical runtime authoritative over reordered legacy lifecycle frames', () => {
@@ -415,6 +498,15 @@ describe('chat page helpers', () => {
       hasMoreBefore: false,
       resetLineage: true,
     })).toEqual({ olderMessagesCursor: null, hasOlderMessages: false });
+
+    // Malformed or legacy metadata must not expose an unusable older-history
+    // state to the route. A cursor is required before backfill can start.
+    expect(resolveOlderMessagesCursorAfterSnapshot({
+      currentCursor: null,
+      beforeCursor: null,
+      hasMoreBefore: true,
+      resetLineage: false,
+    })).toEqual({ olderMessagesCursor: null, hasOlderMessages: false });
   });
 
   it('treats runtime snapshots older than the active view as stale', () => {
@@ -460,6 +552,12 @@ describe('chat page helpers', () => {
     expect(shouldApplyChatSendFailureSideEffects('conv-source', 'conv-source')).toBe(true);
     expect(shouldApplyChatSendFailureSideEffects('conv-source', 'conv-target')).toBe(false);
     expect(shouldApplyChatSendFailureSideEffects('', 'conv-target')).toBe(false);
+  });
+
+  it('applies a queue mutation only while its conversation owns route and store', () => {
+    expect(shouldApplyChatMutationResponse('conv-source', 'conv-source', 'conv-source')).toBe(true);
+    expect(shouldApplyChatMutationResponse('conv-source', 'conv-target', 'conv-target')).toBe(false);
+    expect(shouldApplyChatMutationResponse('conv-source', 'conv-source', 'conv-target')).toBe(false);
   });
 
   it('settles never-ending subload promises as rejected timeout results', async () => {
@@ -574,6 +672,9 @@ describe('chat page helpers', () => {
       has_active_turn: false,
       active_session_status: 'completed',
       pending_notification_types: [],
+      last_message_at: '2026-01-01T00:05:00.000Z',
+      last_read_at: '2026-01-01T00:05:00.000Z',
+      has_unread: false,
     } as never;
     const incoming = {
       conversation_id: 'conv-a',
@@ -581,6 +682,9 @@ describe('chat page helpers', () => {
       has_active_turn: true,
       active_session_status: 'running',
       pending_notification_types: ['step_question'],
+      last_message_at: '2026-01-01T00:05:00.000Z',
+      last_read_at: '2026-01-01T00:01:00.000Z',
+      has_unread: true,
     } as never;
 
     expect(mergeConversationPreservingActivity(existing, incoming)).toMatchObject({
@@ -588,6 +692,482 @@ describe('chat page helpers', () => {
       active_session_status: 'completed',
       pending_notification_types: [],
     });
+  });
+
+  it('accepts authoritative sidebar runtime fields despite older persisted timestamps', () => {
+    const existing = {
+      conversation_id: 'conv-a',
+      updated_at: '2026-01-01T00:05:01.000Z',
+      has_active_turn: true,
+      active_turn_chat_mode: 'build',
+      active_turn_chat_mode_source: 'user',
+      active_session_status: 'active',
+      active_session_completion_reason: null,
+      pending_notification_types: [],
+      conversation_state: { state_version: 4 },
+      root_controller_conversation_id: 'conv-root',
+    } as never;
+    const incoming = {
+      conversation_id: 'conv-a',
+      updated_at: '2026-01-01T00:01:01.000Z',
+      has_active_turn: false,
+      active_turn_chat_mode: null,
+      active_turn_chat_mode_source: null,
+      active_session_status: 'completed',
+      active_session_completion_reason: 'completed',
+      pending_notification_types: ['step_question'],
+      has_unread: false,
+      last_read_at: '2026-01-01T00:05:00.000Z',
+      conversation_state: null,
+      root_controller_conversation_id: null,
+    } as never;
+
+    expect(mergeAuthoritativeSidebarConversation(existing, incoming)).toMatchObject({
+      has_active_turn: false,
+      active_turn_chat_mode: null,
+      active_session_status: 'completed',
+      pending_notification_types: ['step_question'],
+      updated_at: '2026-01-01T00:05:01.000Z',
+      conversation_state: { state_version: 4 },
+      root_controller_conversation_id: 'conv-root',
+    });
+  });
+
+  it('applies an older cross-row push and requests reconciliation', () => {
+    const admission = new SidebarRevisionAdmission();
+    expect(admission.admitPush('conversation-a', '11')).toEqual({
+      apply: true,
+      reconcile: false,
+    });
+    expect(admission.admitPush('conversation-b', '10')).toEqual({
+      apply: true,
+      reconcile: true,
+    });
+    expect(admission.observedDurableHighWatermark).toBe('11');
+  });
+
+  it('orders revisions exactly within each revision domain', () => {
+    const durable = new SidebarRevisionAdmission();
+    expect(durable.admitPush('conversation-a', '900719925474099300001').apply).toBe(true);
+    expect(durable.admitPush('conversation-a', '900719925474099300000').apply).toBe(false);
+    expect(durable.admitPush('conversation-a', '900719925474099300002').apply).toBe(true);
+
+    const legacy = new SidebarRevisionAdmission();
+    expect(legacy.admitPush(
+      'conversation-a',
+      '2026-09-08T08:51:44.000100+00:00',
+    ).apply).toBe(true);
+    expect(legacy.admitPush(
+      'conversation-a',
+      '2026-09-08T08:51:44.000050+00:00',
+    ).apply).toBe(false);
+    expect(legacy.admitPush(
+      'conversation-a',
+      '2026-09-08T08:51:44.000900+00:00',
+    ).apply).toBe(true);
+  });
+
+  it('keeps the durable fence across a legacy push and delayed REST response', () => {
+    const admission = new SidebarRevisionAdmission();
+    expect(admission.admitPush('conversation-a', '42')).toEqual({
+      apply: true,
+      reconcile: false,
+    });
+    expect(admission.admitPush(
+      'conversation-a',
+      '2026-09-08T08:51:44.000900+00:00',
+    )).toEqual({
+      apply: false,
+      reconcile: true,
+    });
+    expect(admission.admitProjection('41')).toEqual({
+      apply: false,
+      reconcile: true,
+    });
+    expect(admission.observedDurableHighWatermark).toBe('42');
+  });
+
+  it('uses a removal revision to prevent stale resurrection', () => {
+    const admission = new SidebarRevisionAdmission();
+    expect(admission.admitPush('conversation-a', '42').apply).toBe(true);
+    expect(admission.admitPush('conversation-a', '41').apply).toBe(false);
+    expect(admission.admitProjection('41').apply).toBe(false);
+    expect(admission.admitPush('conversation-a', '43').apply).toBe(true);
+  });
+
+  it('advances the REST cursor only after the applied projection is recorded', () => {
+    const admission = new SidebarRevisionAdmission();
+    expect(admission.admitProjection('41').apply).toBe(true);
+    expect(admission.authoritativeRestCursor).toBeNull();
+    admission.recordProjection('41', ['conversation-a']);
+    expect(admission.authoritativeRestCursor).toBe('41');
+    expect(admission.admitPush('conversation-a', '43')).toEqual({
+      apply: true,
+      reconcile: true,
+    });
+    expect(admission.authoritativeRestCursor).toBe('41');
+    expect(admission.needsReconciliation).toBe(true);
+  });
+
+  describe('sidebar invalidation coalescing', () => {
+    function deferred() {
+      let resolve!: () => void;
+      let reject!: (error: Error) => void;
+      const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      });
+      return { promise, resolve, reject };
+    }
+
+    it('coalesces three invalidations during one flight into one trailing call', async () => {
+      const flights = [deferred(), deferred()];
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(() => flights[calls++].promise);
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      coalescer.invalidate();
+      coalescer.invalidate();
+      coalescer.invalidate();
+      expect(calls).toBe(1);
+      flights[0].resolve();
+      await Promise.resolve();
+      expect(calls).toBe(2);
+      flights[1].resolve();
+      await coalescer.whenIdle();
+      expect(calls).toBe(2);
+    });
+
+    it('applies the trailing response after a stale first response', async () => {
+      const admission = new SidebarRevisionAdmission();
+      admission.observeInvalidation('42');
+      const flights = [deferred(), deferred()];
+      const revisions = ['41', '42'];
+      const applied: string[] = [];
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(async () => {
+        const index = calls++;
+        await flights[index].promise;
+        const revision = revisions[index];
+        if (admission.admitProjection(revision).apply) {
+          admission.recordProjection(revision, ['conversation-a']);
+          applied.push(revision);
+        }
+      });
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      coalescer.invalidate();
+      flights[0].resolve();
+      await Promise.resolve();
+      flights[1].resolve();
+      await coalescer.whenIdle();
+
+      expect(calls).toBe(2);
+      expect(applied).toEqual(['42']);
+      expect(admission.authoritativeRestCursor).toBe('42');
+    });
+
+    it('does not self-refresh for a permanently unversioned legacy response', async () => {
+      const admission = new SidebarRevisionAdmission();
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(async () => {
+        calls += 1;
+        admission.admitProjection(null);
+      });
+
+      coalescer.invalidate();
+      await coalescer.whenIdle();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+    });
+
+    it('does not run trailing work after disposal', async () => {
+      const flight = deferred();
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(async () => {
+        calls += 1;
+        await flight.promise;
+      });
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      coalescer.invalidate();
+      coalescer.dispose();
+      flight.resolve();
+      await coalescer.whenIdle();
+      coalescer.invalidate();
+      await Promise.resolve();
+      expect(calls).toBe(1);
+    });
+
+    it('allows a future invalidation after request failure', async () => {
+      let calls = 0;
+      const coalescer = new SerialInvalidationCoalescer(async () => {
+        calls += 1;
+        if (calls === 1) throw new Error('request failed');
+      });
+
+      coalescer.invalidate();
+      await coalescer.whenIdle();
+      coalescer.invalidate();
+      await coalescer.whenIdle();
+      expect(calls).toBe(2);
+    });
+
+    it('recovers when an ordinary request supersedes a valid reconciliation then fails', async () => {
+      const admission = new SidebarRevisionAdmission();
+      admission.recordProjection('41', ['conversation-a']);
+      admission.observeInvalidation('42');
+      const firstRecovery = deferred();
+      const trailingRecovery = deferred();
+      let calls = 0;
+      const applied: string[] = [];
+      const coalescer = new SerialInvalidationCoalescer(async () => {
+        const call = calls++;
+        await (call === 0 ? firstRecovery.promise : trailingRecovery.promise);
+        // The first response is valid but a newer ordinary request owns the
+        // consumer epoch, so only the trailing response reaches admission.
+        if (call > 0 && admission.admitProjection('42').apply) {
+          admission.recordProjection('42', ['conversation-a']);
+          applied.push('42');
+        }
+      });
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      // The superseding request returns unversioned data. It cannot cross the
+      // durable fence, so its failure path retains recovery through invalidate.
+      expect(admission.admitProjection(null).apply).toBe(false);
+      if (admission.needsReconciliation) coalescer.invalidate();
+      firstRecovery.resolve();
+      await Promise.resolve();
+      trailingRecovery.resolve();
+      await coalescer.whenIdle();
+
+      expect(calls).toBe(2);
+      expect(applied).toEqual(['42']);
+      expect(admission.authoritativeRestCursor).toBe('42');
+      expect(admission.needsReconciliation).toBe(false);
+    });
+
+    it('runs one trailing reconciliation with the current filter', async () => {
+      const flights = [deferred(), deferred()];
+      let selectedFilter = 'channel-a';
+      let calls = 0;
+      const appliedFilters: string[] = [];
+      let coalescer!: SerialInvalidationCoalescer;
+      coalescer = new SerialInvalidationCoalescer(async () => {
+        const call = calls++;
+        const requestFilter = selectedFilter;
+        await flights[call].promise;
+        if (requestFilter !== selectedFilter) {
+          coalescer.invalidate();
+          return;
+        }
+        appliedFilters.push(requestFilter);
+      });
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      selectedFilter = 'channel-b';
+      flights[0].resolve();
+      await vi.waitFor(() => expect(calls).toBe(2));
+      flights[1].resolve();
+      await coalescer.whenIdle();
+
+      expect(calls).toBe(2);
+      expect(appliedFilters).toEqual(['channel-b']);
+    });
+
+    it('retains a trailing attempt after a filter change during full-load fallback', async () => {
+      const fullLoad = deferred();
+      const trailing = deferred();
+      let selectedFilter = 'channel-a';
+      let calls = 0;
+      const appliedFilters: string[] = [];
+      let coalescer!: SerialInvalidationCoalescer;
+      coalescer = new SerialInvalidationCoalescer(async () => {
+        const call = calls++;
+        const requestFilter = selectedFilter;
+        if (call === 0) {
+          // The delta requests a full load. The full-load response becomes
+          // stale when the user changes the filter during the request.
+          await fullLoad.promise;
+          if (requestFilter !== selectedFilter) {
+            coalescer.invalidate();
+          }
+          return;
+        }
+        await trailing.promise;
+        appliedFilters.push(requestFilter);
+      });
+
+      coalescer.invalidate();
+      await Promise.resolve();
+      selectedFilter = 'channel-b';
+      fullLoad.resolve();
+      await vi.waitFor(() => expect(calls).toBe(2));
+      trailing.resolve();
+      await coalescer.whenIdle();
+
+      expect(calls).toBe(2);
+      expect(appliedFilters).toEqual(['channel-b']);
+    });
+  });
+
+  describe('rendered overview reconciliation', () => {
+    it('requires both child and root projections to apply', async () => {
+      let rootApplied = false;
+      let focusedApplied = true;
+      const reconcile = () => reconcileRenderedOverviewSources({
+        focusedScopeKey: 'session:child',
+        rootScopeKey: 'conversation:root',
+        currentFocusedScopeKey: () => 'session:child',
+        loadRoot: async () => rootApplied,
+        loadFocused: async () => focusedApplied,
+      });
+
+      expect(await reconcile()).toBe(false);
+      rootApplied = true;
+      expect(await reconcile()).toBe(true);
+      focusedApplied = false;
+      expect(await reconcile()).toBe(false);
+    });
+
+    it('rejects completion when focus changes during both loads', async () => {
+      let resolveRoot!: () => void;
+      let resolveFocused!: () => void;
+      const root = new Promise<void>((resolve) => { resolveRoot = resolve; });
+      const focused = new Promise<void>((resolve) => { resolveFocused = resolve; });
+      let currentScopeKey = 'session:child-a';
+      const pending = reconcileRenderedOverviewSources({
+        focusedScopeKey: currentScopeKey,
+        rootScopeKey: 'conversation:root',
+        currentFocusedScopeKey: () => currentScopeKey,
+        loadRoot: async () => {
+          await root;
+          return true;
+        },
+        loadFocused: async () => {
+          await focused;
+          return true;
+        },
+      });
+
+      currentScopeKey = 'session:child-b';
+      resolveRoot();
+      resolveFocused();
+      expect(await pending).toBe(false);
+    });
+
+    it('retains the root-only and cached success path', async () => {
+      const loadRoot = vi.fn(async () => true);
+      const loadFocused = vi.fn(async () => true);
+      expect(await reconcileRenderedOverviewSources({
+        focusedScopeKey: 'conversation:root',
+        rootScopeKey: 'conversation:root',
+        currentFocusedScopeKey: () => 'conversation:root',
+        loadRoot,
+        loadFocused,
+      })).toBe(true);
+      expect(loadRoot).not.toHaveBeenCalled();
+      expect(loadFocused).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('does not accept ready-empty history for a populated conversation', () => {
+    expect(snapshotNeedsHistoryRecovery(({
+      conversation: {
+        has_message_history: true,
+      },
+      timeline: { items: [], has_more_before: false },
+    } as unknown) as Parameters<typeof snapshotNeedsHistoryRecovery>[0])).toBe(true);
+
+    expect(snapshotNeedsHistoryRecovery(({
+      conversation: {
+        has_message_history: false,
+      },
+      timeline: { items: [], has_more_before: false },
+    } as unknown) as Parameters<typeof snapshotNeedsHistoryRecovery>[0])).toBe(false);
+  });
+
+  it('projects accepted Chat v2 runtime into the sidebar row', () => {
+    const active = {
+      ...emptyChatV2State(),
+      conversationId: 'conv-a',
+      runtime: {
+        runtime_epoch: 'epoch-a',
+        runtime_revision: 2,
+        generated_at: '2026-01-01T00:05:00.000Z',
+        has_active_turn: true,
+        active_turn: {
+          turn_id: 'turn-a',
+          session_id: 'session-a',
+          status: 'running' as const,
+          chat_mode: 'build' as const,
+          chat_mode_source: 'one_shot',
+        },
+        volatile_items: [],
+      },
+    };
+
+    expect(chatV2RuntimeConversationPatch(active)).toEqual({
+      has_active_turn: true,
+      active_turn_chat_mode: 'build',
+      active_turn_chat_mode_source: 'one_shot',
+    });
+    expect(chatV2RuntimeConversationPatch({
+      ...active,
+      runtime: {
+        ...active.runtime,
+        runtime_revision: 3,
+        has_active_turn: false,
+        active_turn: null,
+      },
+    })).toEqual({
+      has_active_turn: false,
+      active_turn_chat_mode: null,
+      active_turn_chat_mode_source: null,
+    });
+  });
+
+  it('orders foreign sidebar runtime patches by timestamp and turn identity', () => {
+    const settled = orderedConversationUpdatedRowPatch({
+      has_active_turn: false,
+      turn_id: 'turn-a',
+      updated_at: '2026-01-01T00:02:00.000Z',
+    }, {
+      updatedAt: '2026-01-01T00:01:00.000Z',
+      activeTurnId: 'turn-a',
+    });
+    expect(settled.runtimeApplied).toBe(true);
+    expect(settled.patch.has_active_turn).toBe(false);
+
+    const staleActive = orderedConversationUpdatedRowPatch({
+      title: 'Still applies',
+      has_active_turn: true,
+      turn_id: 'turn-a',
+      updated_at: '2026-01-01T00:01:30.000Z',
+    }, settled.state);
+    expect(staleActive.runtimeApplied).toBe(false);
+    expect(staleActive.patch).toMatchObject({ title: 'Still applies' });
+    expect(staleActive.patch).not.toHaveProperty('has_active_turn');
+    expect(staleActive.patch).not.toHaveProperty('updated_at');
+
+    const newerTurn = orderedConversationUpdatedRowPatch({
+      has_active_turn: true,
+      turn_id: 'turn-b',
+      updated_at: '2026-01-01T00:03:00.000Z',
+    }, settled.state);
+    const delayedTerminal = orderedConversationUpdatedRowPatch({
+      has_active_turn: false,
+      turn_id: 'turn-a',
+      updated_at: '2026-01-01T00:04:00.000Z',
+    }, newerTurn.state);
+    expect(delayedTerminal.runtimeApplied).toBe(false);
+    expect(delayedTerminal.patch).not.toHaveProperty('has_active_turn');
   });
 
   it('resets a pending-question form only for a different notification', () => {
@@ -716,6 +1296,445 @@ describe('chat page helpers', () => {
     })).toBe(false);
   });
 
+  describe('shouldApplyPendingNotificationConsumerRefresh', () => {
+    it('discards a stale notification-list refresh superseded by a newer one', () => {
+      // Two racing refreshEscalations()/refreshPendingNotifications() calls for
+      // the same conversation: the older request must lose even though it
+      // resolves later.
+      const epochByConversation = new Map<string, number>([['conv-1', 2]]);
+
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-1',
+        refreshConversationId: 'conv-1',
+        requestEpoch: 1,
+        currentEpoch: epochByConversation.get('conv-1'),
+      })).toBe(false);
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-1',
+        refreshConversationId: 'conv-1',
+        requestEpoch: 2,
+        currentEpoch: epochByConversation.get('conv-1'),
+      })).toBe(true);
+    });
+
+    it('discards an in-flight notification-list refresh superseded by a server push', () => {
+      // A refreshPendingDirectQuestion() fetch starts, then a WebSocket push
+      // (escalation/step_question/credential_request) bumps the epoch before
+      // the fetch resolves. The push must win.
+      const requestEpoch = 5;
+      const serverPushEpoch = 6;
+
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-1',
+        refreshConversationId: 'conv-1',
+        requestEpoch,
+        currentEpoch: serverPushEpoch,
+      })).toBe(false);
+    });
+
+    it('discards a same-epoch response when the user switched conversations mid-flight', () => {
+      // The epoch was not touched (no other refresh, no push), but the user
+      // navigated away from the conversation the request was made for.
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-2',
+        refreshConversationId: 'conv-1',
+        requestEpoch: 3,
+        currentEpoch: 3,
+      })).toBe(false);
+    });
+
+    it('applies the freshest response for the still-active conversation', () => {
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-1',
+        refreshConversationId: 'conv-1',
+        requestEpoch: 3,
+        currentEpoch: 3,
+      })).toBe(true);
+    });
+
+    it('resolves independently from a concurrent sidebar projection refresh race', () => {
+      // Simultaneous full sidebar refresh (loadSidebarProjection), delta
+      // sidebar refresh (resyncSidebarData), notification-list refresh, and a
+      // WebSocket pending-notification push each use their own epoch domain
+      // and must not interfere with one another.
+      let sidebarProjectionRefreshEpoch = 0;
+      const pendingNotificationEpochByConversation = new Map<string, number>();
+      let pendingNotificationEpoch = 0;
+
+      // Full sidebar refresh (loadSidebarProjection) starts first.
+      const fullSidebarEpoch = ++sidebarProjectionRefreshEpoch;
+      // A delta sidebar refresh (resyncSidebarData) starts and completes first.
+      const deltaSidebarEpoch = ++sidebarProjectionRefreshEpoch;
+      expect(shouldApplySidebarProjectionRefresh({
+        requestEpoch: deltaSidebarEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })).toBe(true);
+      // The older full refresh must be discarded once it resolves.
+      expect(shouldApplySidebarProjectionRefresh({
+        requestEpoch: fullSidebarEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })).toBe(false);
+
+      // Concurrently, a notification-list refresh starts for conv-1.
+      pendingNotificationEpoch += 1;
+      pendingNotificationEpochByConversation.set('conv-1', pendingNotificationEpoch);
+      const notificationRequestEpoch = pendingNotificationEpoch;
+      // Before it resolves, the server pushes newer pending-notification state.
+      pendingNotificationEpoch += 1;
+      pendingNotificationEpochByConversation.set('conv-1', pendingNotificationEpoch);
+
+      // The notification refresh must be discarded (its own epoch domain),
+      // independent of the sidebar projection outcome above.
+      expect(shouldApplyPendingNotificationConsumerRefresh({
+        activeConversationId: 'conv-1',
+        refreshConversationId: 'conv-1',
+        requestEpoch: notificationRequestEpoch,
+        currentEpoch: pendingNotificationEpochByConversation.get('conv-1'),
+      })).toBe(false);
+      // The sidebar projection epoch domain is unaffected by the notification push.
+      expect(shouldApplySidebarProjectionRefresh({
+        requestEpoch: deltaSidebarEpoch,
+        currentEpoch: sidebarProjectionRefreshEpoch,
+      })).toBe(true);
+    });
+
+    /**
+     * Models the exact `openConversation()` switch-race gap found in review:
+     * `currentConversation` can keep reporting the outgoing conversation for
+     * the whole duration of an uncached detail fetch for the incoming one,
+     * so a stale in-flight request for the outgoing conversation must be
+     * rejected by the load-generation check even when the conversation-id
+     * and epoch checks alone would still pass.
+     */
+    describe('conversation switch (load generation) races', () => {
+      function makeHarness() {
+        let conversationLoadRequestId = 0;
+        let activeConversationId = 'conv-A';
+        // currentConversation deliberately lags activeConversationId here,
+        // mirroring openConversation() leaving it pointed at the outgoing
+        // conversation until an uncached detail fetch resolves.
+        let currentConversationId: string | null = 'conv-A';
+        let pendingNotificationEpoch = 0;
+        const pendingNotificationEpochByConversation = new Map<string, number>();
+
+        function beginPendingNotificationRefresh(conversationId: string): number {
+          pendingNotificationEpoch += 1;
+          pendingNotificationEpochByConversation.set(conversationId, pendingNotificationEpoch);
+          return pendingNotificationEpoch;
+        }
+
+        function invalidateOnSwitchAway(fromConversationId: string, toConversationId: string): void {
+          if (fromConversationId && fromConversationId !== toConversationId) {
+            // Mirrors the new observePendingNotificationServerPush() call at
+            // the top of openConversation()'s genuine-switch branch.
+            pendingNotificationEpoch += 1;
+            pendingNotificationEpochByConversation.set(fromConversationId, pendingNotificationEpoch);
+          }
+        }
+
+        function startRefresh(conversationId: string) {
+          const requestEpoch = beginPendingNotificationRefresh(conversationId);
+          const loadRequestId = conversationLoadRequestId;
+          return () => shouldApplyPendingNotificationConsumerRefresh({
+            activeConversationId: currentConversationId,
+            refreshConversationId: conversationId,
+            requestEpoch,
+            currentEpoch: pendingNotificationEpochByConversation.get(conversationId),
+            loadRequestId,
+            activeLoadRequestId: conversationLoadRequestId,
+          });
+        }
+
+        function beginSwitch(toConversationId: string): void {
+          const fromConversationId = activeConversationId;
+          invalidateOnSwitchAway(fromConversationId, toConversationId);
+          conversationLoadRequestId = nextConversationLoadId(conversationLoadRequestId);
+          activeConversationId = toConversationId;
+          // currentConversation is NOT updated yet: the incoming detail
+          // fetch is still uncached and in flight.
+        }
+
+        function finishSwitch(conversationId: string): void {
+          currentConversationId = conversationId;
+        }
+
+        return { startRefresh, beginSwitch, finishSwitch };
+      }
+
+      it('discards a deferred success response for the outgoing conversation (A→B)', () => {
+        const h = makeHarness();
+        // refreshPendingNotifications() starts for A, then the user
+        // switches to B before it resolves. currentConversation still
+        // reports A while the switch is in flight.
+        const applies = h.startRefresh('conv-A');
+        h.beginSwitch('conv-B');
+        // The deferred success handler for A must not apply.
+        expect(applies()).toBe(false);
+      });
+
+      it('discards a deferred 503 error/controller-unavailable response for the outgoing conversation (A→B)', () => {
+        const h = makeHarness();
+        const applies = h.startRefresh('conv-A');
+        h.beginSwitch('conv-B');
+        // Same guard call sits in the catch branch ahead of
+        // markControllerUnavailable(); a stale 503 must not mark the
+        // (now-irrelevant) controller as unavailable for A.
+        const caughtError = { status: 503 };
+        let controllerMarkedUnavailableFor: string | null = null;
+        if (applies()) {
+          controllerMarkedUnavailableFor = 'conv-A';
+        }
+        expect(applies()).toBe(false);
+        expect(controllerMarkedUnavailableFor).toBeNull();
+        expect(caughtError.status).toBe(503);
+      });
+
+      it('discards a stale A response in an A→B→A sequence even though A is active again', () => {
+        const h = makeHarness();
+        // First refresh for A starts.
+        const staleApplies = h.startRefresh('conv-A');
+        // Switch away to B (invalidates A's epoch) and back to A again,
+        // without the stale request ever resolving in between.
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+        h.beginSwitch('conv-A');
+        h.finishSwitch('conv-A');
+        // A fresh refresh for the re-entered A starts and resolves first.
+        const freshApplies = h.startRefresh('conv-A');
+        expect(freshApplies()).toBe(true);
+        // The original stale A request must still be rejected: its
+        // captured epoch and load generation both predate the current
+        // state, even though activeConversationId is back to 'conv-A'.
+        expect(staleApplies()).toBe(false);
+      });
+
+      it('applies a fresh response once the incoming conversation is fully active', () => {
+        const h = makeHarness();
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+        const applies = h.startRefresh('conv-B');
+        expect(applies()).toBe(true);
+      });
+    });
+
+    /**
+     * Deferred consumer-level coverage requested in follow-up review: these
+     * tests drive the exact control flow of `refreshEscalations()` /
+     * `refreshPendingNotifications()` (chat/[conversationId]/+page.svelte,
+     * the `try { ... } catch (caughtError) { if (!applies()) return; ... }`
+     * shape) with real, manually-settled Promises instead of synchronous
+     * boolean assertions on the guard alone. They assert the three pieces of
+     * state the review named explicitly — `escalationError`, pending
+     * notification state, and controller-recovery/unavailable state — are
+     * left untouched when a deferred response (success or 503) resolves
+     * after the conversation it was issued for is no longer active.
+     *
+     * A full mount of the ~10k-line page component was judged disproportionate
+     * for this fix (heavy SvelteKit router/websocket/store wiring unrelated
+     * to this race); this harness instead re-executes the production
+     * async/catch shape verbatim against the real exported guard so the
+     * catch-path branching genuinely runs, rather than being inferred from a
+     * boolean return.
+     */
+    describe('deferred consumer-level stale-503 coverage (refreshEscalations / refreshPendingNotifications shape)', () => {
+      class FakeApiError extends Error {
+        status: number;
+        constructor(status: number, message = 'Service unavailable') {
+          super(message);
+          this.status = status;
+        }
+      }
+
+      function asFakeApiError(error: unknown): FakeApiError {
+        return error instanceof FakeApiError ? error : new FakeApiError(500, 'Unexpected error');
+      }
+
+      function deferred<T>() {
+        let resolve!: (value: T) => void;
+        let reject!: (reason: unknown) => void;
+        const promise = new Promise<T>((res, rej) => {
+          resolve = res;
+          reject = rej;
+        });
+        return { promise, resolve, reject };
+      }
+
+      function makeConsumerHarness() {
+        let conversationLoadRequestId = 0;
+        let activeConversationId: string | null = 'conv-A';
+        let currentConversationId: string | null = 'conv-A';
+        let pendingNotificationEpoch = 0;
+        const pendingNotificationEpochByConversation = new Map<string, number>();
+
+        // Mirrors component state mutated by the real catch/success branches.
+        const state = {
+          escalationError: '',
+          pendingNotificationTypesByConversation: new Map<string, string[]>([['conv-A', []], ['conv-B', []]]),
+          appliedNotificationCallCount: 0,
+          controllerRecoveryConversationId: null as string | null,
+          controllerMarkedUnavailableCount: 0,
+        };
+
+        function beginPendingNotificationRefresh(conversationId: string): number {
+          pendingNotificationEpoch += 1;
+          pendingNotificationEpochByConversation.set(conversationId, pendingNotificationEpoch);
+          return pendingNotificationEpoch;
+        }
+
+        function beginSwitch(toConversationId: string): void {
+          const fromConversationId = activeConversationId;
+          if (fromConversationId && fromConversationId !== toConversationId) {
+            // Mirrors observePendingNotificationServerPush(previousConversationId)
+            // called at the top of openConversation()'s genuine-switch branch.
+            pendingNotificationEpoch += 1;
+            pendingNotificationEpochByConversation.set(fromConversationId, pendingNotificationEpoch);
+          }
+          conversationLoadRequestId = nextConversationLoadId(conversationLoadRequestId);
+          activeConversationId = toConversationId;
+        }
+
+        function finishSwitch(conversationId: string): void {
+          currentConversationId = conversationId;
+        }
+
+        // Verbatim shape of refreshEscalations()/refreshPendingNotifications():
+        // capture epoch + load generation, await the notifications fetch,
+        // gate both the success and catch branches behind `applies()`.
+        function startNotificationsRefresh(conversationId: string, fetchPromise: Promise<unknown>): Promise<void> {
+          const requestEpoch = beginPendingNotificationRefresh(conversationId);
+          const loadRequestId = conversationLoadRequestId;
+          const applies = () => shouldApplyPendingNotificationConsumerRefresh({
+            activeConversationId: currentConversationId,
+            refreshConversationId: conversationId,
+            requestEpoch,
+            currentEpoch: pendingNotificationEpochByConversation.get(conversationId),
+            loadRequestId,
+            activeLoadRequestId: conversationLoadRequestId,
+          });
+          return fetchPromise
+            .then((notifications) => {
+              if (!applies()) return;
+              state.appliedNotificationCallCount += 1;
+              state.pendingNotificationTypesByConversation.set(
+                conversationId,
+                notifications as string[],
+              );
+              state.escalationError = '';
+            })
+            .catch((caughtError) => {
+              if (!applies()) return;
+              state.escalationError = asFakeApiError(caughtError).message;
+              if (asFakeApiError(caughtError).status === 503) {
+                state.controllerRecoveryConversationId = conversationId;
+                state.controllerMarkedUnavailableCount += 1;
+              }
+            });
+        }
+
+        return { state, beginSwitch, finishSwitch, startNotificationsRefresh };
+      }
+
+      it('discards a deferred success response for the outgoing conversation (A\u2192B)', async () => {
+        const h = makeConsumerHarness();
+        const fetch = deferred<string[]>();
+        const refreshA = h.startNotificationsRefresh('conv-A', fetch.promise);
+
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+
+        fetch.resolve(['gate']);
+        await refreshA;
+
+        expect(h.state.appliedNotificationCallCount).toBe(0);
+        expect(h.state.pendingNotificationTypesByConversation.get('conv-A')).toEqual([]);
+        expect(h.state.escalationError).toBe('');
+        expect(h.state.controllerRecoveryConversationId).toBeNull();
+      });
+
+      it('discards a deferred 503 for the outgoing conversation without marking it unavailable (A\u2192B)', async () => {
+        const h = makeConsumerHarness();
+        const fetch = deferred<string[]>();
+        const refreshA = h.startNotificationsRefresh('conv-A', fetch.promise);
+
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+
+        fetch.reject(new FakeApiError(503));
+        await refreshA;
+
+        expect(h.state.escalationError).toBe('');
+        expect(h.state.controllerRecoveryConversationId).toBeNull();
+        expect(h.state.controllerMarkedUnavailableCount).toBe(0);
+        expect(h.state.pendingNotificationTypesByConversation.get('conv-A')).toEqual([]);
+      });
+
+      it('discards a deferred success response from a stale A request in an A\u2192B\u2192A sequence', async () => {
+        const h = makeConsumerHarness();
+        const staleFetch = deferred<string[]>();
+        const staleRefreshA = h.startNotificationsRefresh('conv-A', staleFetch.promise);
+
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+        h.beginSwitch('conv-A');
+        h.finishSwitch('conv-A');
+
+        // A fresh refresh for the re-entered A resolves first.
+        const freshRefreshA = h.startNotificationsRefresh('conv-A', Promise.resolve(['step_question']));
+        await freshRefreshA;
+        expect(h.state.pendingNotificationTypesByConversation.get('conv-A')).toEqual(['step_question']);
+        expect(h.state.appliedNotificationCallCount).toBe(1);
+
+        // The original, now-stale A request finally resolves.
+        staleFetch.resolve(['gate']);
+        await staleRefreshA;
+
+        // Must not overwrite the fresher state applied above.
+        expect(h.state.appliedNotificationCallCount).toBe(1);
+        expect(h.state.pendingNotificationTypesByConversation.get('conv-A')).toEqual(['step_question']);
+        expect(h.state.escalationError).toBe('');
+        expect(h.state.controllerRecoveryConversationId).toBeNull();
+      });
+
+      it('discards a deferred 503 from a stale A request in an A\u2192B\u2192A sequence', async () => {
+        const h = makeConsumerHarness();
+        const staleFetch = deferred<string[]>();
+        const staleRefreshA = h.startNotificationsRefresh('conv-A', staleFetch.promise);
+
+        h.beginSwitch('conv-B');
+        h.finishSwitch('conv-B');
+        h.beginSwitch('conv-A');
+        h.finishSwitch('conv-A');
+
+        // A fresh refresh for the re-entered A succeeds first, establishing
+        // a clean baseline that the stale rejection must not disturb.
+        const freshRefreshA = h.startNotificationsRefresh('conv-A', Promise.resolve(['auth_challenge']));
+        await freshRefreshA;
+        expect(h.state.escalationError).toBe('');
+
+        staleFetch.reject(new FakeApiError(503));
+        await staleRefreshA;
+
+        expect(h.state.escalationError).toBe('');
+        expect(h.state.controllerRecoveryConversationId).toBeNull();
+        expect(h.state.controllerMarkedUnavailableCount).toBe(0);
+        expect(h.state.pendingNotificationTypesByConversation.get('conv-A')).toEqual(['auth_challenge']);
+      });
+
+      it('applies a fresh 503 for the conversation that is still active, marking it unavailable', async () => {
+        const h = makeConsumerHarness();
+        const fetch = deferred<string[]>();
+        const refreshA = h.startNotificationsRefresh('conv-A', fetch.promise);
+
+        fetch.reject(new FakeApiError(503));
+        await refreshA;
+
+        expect(h.state.escalationError).toBe('Service unavailable');
+        expect(h.state.controllerRecoveryConversationId).toBe('conv-A');
+        expect(h.state.controllerMarkedUnavailableCount).toBe(1);
+      });
+    });
+  });
+
   it('merges sidebar upsert rows without replacing the whole list', () => {
     const baseConversation = (id: string, lastMessageAt: string | null): Conversation => ({
       conversation_id: id,
@@ -768,6 +1787,11 @@ describe('chat page helpers', () => {
       'conv-a',
       'conv-b',
     ]);
+
+    const filteredReset = mergeSidebarConversationRows(existing, [
+      baseConversation('conv-c', '2026-01-01T00:04:00.000Z'),
+    ], { reset: true });
+    expect(filteredReset.map((conversation) => conversation.conversation_id)).toEqual(['conv-c']);
   });
 
   it('removes a sidebar conversation row without disturbing the rest of the list', () => {
@@ -854,6 +1878,8 @@ describe('chat page helpers', () => {
         has_more: true,
       },
       context_types: ['web'],
+      sidebar_revision: '42',
+      sync_timestamp: '2026-09-08T08:51:44Z',
     } as unknown as SidebarProjection;
 
     const cloned = cloneSidebarProjection(projection);
@@ -862,6 +1888,10 @@ describe('chat page helpers', () => {
 
     expect(cloned.conversations.items[0].title).toBe('Original');
     expect(cloned.context_types).toEqual(['web']);
+    expect(cloned.conversations.cursor).toBe('next');
+    expect(cloned.conversations.has_more).toBe(true);
+    expect(cloned.sidebar_revision).toBe('42');
+    expect(cloned.sync_timestamp).toBe('2026-09-08T08:51:44Z');
   });
 
   it('stores sidebar projection cache snapshots with LRU eviction', () => {
@@ -880,6 +1910,34 @@ describe('chat page helpers', () => {
     expect([...cache.keys()]).toEqual(['b', 'c']);
     projection.context_types.push('web');
     expect(cache.get('c')?.context_types).toEqual([]);
+  });
+
+  it('preserves cached background work when a sidebar delta omits it', () => {
+    const cached = {
+      items: [{
+        kind: 'delegated_session' as const,
+        work_id: 'session-1',
+        controller_conversation_id: 'conversation-1',
+        session_id: 'session-1',
+        title: 'Background task',
+        agent_id: 'agent-1',
+        status: 'active',
+        todos: [],
+      }],
+      active_count: 1,
+      truncated: false,
+      generated_at: '2026-01-01T00:00:00Z',
+    };
+    const delta = {
+      agents: [],
+      agent_direct_chats: [],
+      conversations: { items: [], cursor: null, has_more: false },
+      context_types: [],
+      background_work: null,
+      background_work_changed: false,
+    } as SidebarProjection;
+
+    expect(mergeSidebarBackgroundWork(cached, delta)).toBe(cached);
   });
 
   it('matches conversations against active sidebar projection filters', () => {
@@ -1072,26 +2130,43 @@ describe('chat page helpers', () => {
       captureWatermark: () => ({ cursor: 'cached' }),
       probe: async () => snapshot,
       applyIfUnchanged: apply,
+      snapshot: vi.fn(async () => undefined),
       sync,
-    })).resolves.toBe('snapshot');
+    })).resolves.toBe('cache-hit');
 
     expect(apply).toHaveBeenCalledWith(snapshot, { cursor: 'cached' });
     expect(sync).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['miss', null, true],
-    ['live frame race', { cursor: 'stale' }, false],
-  ])('falls back to current-cursor sync after %s', async (_name, snapshot, applyResult) => {
+  it('hydrates an authoritative snapshot after a cache-only miss', async () => {
     const sync = vi.fn(async () => undefined);
+    const snapshot = vi.fn(async () => undefined);
 
     await expect(refreshCachedTimeline({
       captureWatermark: () => ({ cursor: 'cached' }),
-      probe: async () => snapshot,
-      applyIfUnchanged: () => applyResult,
+      probe: async () => null,
+      applyIfUnchanged: () => true,
+      snapshot,
+      sync,
+    })).resolves.toBe('snapshot');
+
+    expect(snapshot).toHaveBeenCalledTimes(1);
+    expect(sync).not.toHaveBeenCalled();
+  });
+
+  it('falls back to current-cursor sync when a cache hit loses a live-state race', async () => {
+    const sync = vi.fn(async () => undefined);
+    const snapshot = vi.fn(async () => undefined);
+
+    await expect(refreshCachedTimeline({
+      captureWatermark: () => ({ cursor: 'cached' }),
+      probe: async () => ({ cursor: 'stale' }),
+      applyIfUnchanged: () => false,
+      snapshot,
       sync,
     })).resolves.toBe('sync');
 
+    expect(snapshot).not.toHaveBeenCalled();
     expect(sync).toHaveBeenCalledTimes(1);
   });
 
@@ -1302,6 +2377,361 @@ describe('chat page helpers', () => {
     });
   });
 
+  describe('directQuestionFromPendingSummary (canonical hydration)', () => {
+    it('converts a canonical direct question without requiring a push frame', () => {
+      expect(directQuestionFromPendingSummary({
+        notification_id: 'question-1',
+        notification_type: 'step_question',
+        step_name: 'direct',
+        questions: [{
+          id: 'scope',
+          question: 'Which scope?',
+          header: 'Scope',
+          options: [{ id: 'focused', label: 'Focused', description: null }],
+          multiple: false,
+          allow_custom: true,
+          required: true,
+        }],
+        context: { context: 'Choose the implementation scope.' },
+      })).toEqual({
+        notificationId: 'question-1',
+        stepName: 'direct',
+        question: 'Which scope?',
+        questionId: 'scope',
+        options: ['Focused'],
+        questions: [{
+          id: 'scope',
+          question: 'Which scope?',
+          header: 'Scope',
+          options: [{ id: 'focused', label: 'Focused', description: null }],
+          multiple: false,
+          allow_custom: true,
+          required: true,
+        }],
+        context: 'Choose the implementation scope.',
+        kind: 'question',
+        structured: true,
+      });
+    });
+
+    it('does not hydrate task-backed questions in the direct chat form', () => {
+      expect(directQuestionFromPendingSummary({
+        notification_id: 'question-task',
+        notification_type: 'step_question',
+        task_id: 'task-1',
+      })).toBeNull();
+    });
+
+    it('does not hydrate task-backed auth challenges in the direct chat form', () => {
+      expect(directQuestionFromPendingSummary({
+        notification_id: 'auth-task',
+        notification_type: 'auth_challenge',
+        task_id: 'task-1',
+      })).toBeNull();
+    });
+  });
+
+  describe('canonicalStateCanSettleDirectQuestion', () => {
+    const question = {
+      notificationId: 'question-1',
+      question: 'Continue?',
+      options: [],
+      context: '',
+      observedStateVersion: 7,
+    };
+
+    it('rejects an absent state that is not newer than the displayed question', () => {
+      expect(canonicalStateCanSettleDirectQuestion(7, question)).toBe(false);
+    });
+
+    it('accepts a causally newer state', () => {
+      expect(canonicalStateCanSettleDirectQuestion(8, question)).toBe(true);
+    });
+  });
+
+  describe('sanitizeManagedQuestionOrigin', () => {
+    it('returns undefined when no managed-origin field is present', () => {
+      expect(sanitizeManagedQuestionOrigin(undefined)).toBeUndefined();
+      expect(sanitizeManagedQuestionOrigin(null)).toBeUndefined();
+      expect(sanitizeManagedQuestionOrigin({})).toBeUndefined();
+    });
+
+    it('drops blank/whitespace-only fields', () => {
+      expect(sanitizeManagedQuestionOrigin({
+        managed_conversation_title: '   ',
+        managed_target_agent_id: null,
+        managed_origin_conversation_id: '',
+      })).toBeUndefined();
+    });
+
+    it('keeps only the present, trimmed fields', () => {
+      expect(sanitizeManagedQuestionOrigin({
+        managed_conversation_title: '  Research helper  ',
+        managed_target_agent_id: 'lumi',
+      })).toEqual({ title: 'Research helper', targetAgentId: 'lumi' });
+    });
+
+    it('carries a safe origin conversation id when the backend provides one', () => {
+      expect(sanitizeManagedQuestionOrigin({
+        managed_conversation_title: 'Research helper',
+        managed_target_agent_id: 'lumi',
+        managed_origin_conversation_id: 'conv-parent-1',
+      })).toEqual({
+        title: 'Research helper',
+        targetAgentId: 'lumi',
+        originConversationId: 'conv-parent-1',
+      });
+    });
+  });
+
+  describe('directQuestionFromPendingSummary managed-origin threading', () => {
+    it('attaches managed-origin metadata onto the hydrated question', () => {
+      const question = directQuestionFromPendingSummary({
+        notification_id: 'question-managed',
+        notification_type: 'step_question',
+        question: 'Continue?',
+        managed_conversation_title: 'Research helper',
+        managed_target_agent_id: 'lumi',
+        managed_origin_conversation_id: 'conv-parent-1',
+      });
+      expect(question?.managedOrigin).toEqual({
+        title: 'Research helper',
+        targetAgentId: 'lumi',
+        originConversationId: 'conv-parent-1',
+      });
+    });
+
+    it('omits managedOrigin when no managed fields are present', () => {
+      const question = directQuestionFromPendingSummary({
+        notification_id: 'question-plain',
+        notification_type: 'step_question',
+        question: 'Continue?',
+      });
+      expect(question?.managedOrigin).toBeUndefined();
+    });
+  });
+
+  describe('direct question submit/cancel acknowledgement', () => {
+    it('builds a "Response sent" acknowledgement without managed origin', () => {
+      expect(buildDirectQuestionAck('notif-1', 'sent')).toEqual({
+        notificationId: 'notif-1',
+        kind: 'sent',
+      });
+      expect(directQuestionAckMessage('sent')).toBe('Response sent');
+    });
+
+    it('builds a "Request cancelled" acknowledgement', () => {
+      expect(buildDirectQuestionAck('notif-1', 'cancelled')).toEqual({
+        notificationId: 'notif-1',
+        kind: 'cancelled',
+      });
+      expect(directQuestionAckMessage('cancelled')).toBe('Request cancelled');
+    });
+
+    it('carries managed-origin metadata into the acknowledgement', () => {
+      const ack = buildDirectQuestionAck('notif-1', 'sent', {
+        title: 'Research helper',
+        targetAgentId: 'lumi',
+        originConversationId: 'conv-parent-1',
+      });
+      expect(ack.managedOrigin).toEqual({
+        title: 'Research helper',
+        targetAgentId: 'lumi',
+        originConversationId: 'conv-parent-1',
+      });
+    });
+
+    it('labels the acknowledgement with the managed child title and agent when both are present', () => {
+      const ack = buildDirectQuestionAck('notif-1', 'sent', {
+        title: 'Research helper',
+        targetAgentId: 'lumi',
+      });
+      expect(directQuestionAckManagedLabel(ack)).toBe('Research helper · lumi');
+    });
+
+    it('falls back to whichever single managed field is present', () => {
+      expect(directQuestionAckManagedLabel(buildDirectQuestionAck('notif-1', 'sent', { title: 'Research helper' })))
+        .toBe('Research helper');
+      expect(directQuestionAckManagedLabel(buildDirectQuestionAck('notif-1', 'sent', { targetAgentId: 'lumi' })))
+        .toBe('lumi');
+    });
+
+    it('has no managed label when no managed origin is present', () => {
+      expect(directQuestionAckManagedLabel(buildDirectQuestionAck('notif-1', 'sent'))).toBeNull();
+      expect(directQuestionAckManagedLabel(null)).toBeNull();
+    });
+
+    it('only offers navigation when a safe origin conversation id was provided', () => {
+      const withOrigin = buildDirectQuestionAck('notif-1', 'sent', {
+        title: 'Research helper',
+        originConversationId: 'conv-parent-1',
+      });
+      expect(directQuestionAckOriginConversationId(withOrigin)).toBe('conv-parent-1');
+
+      const withoutOrigin = buildDirectQuestionAck('notif-1', 'sent', { title: 'Research helper' });
+      expect(directQuestionAckOriginConversationId(withoutOrigin)).toBeNull();
+      expect(directQuestionAckOriginConversationId(null)).toBeNull();
+    });
+
+    it('restores the form on submit failure when no authoritative settle arrived', () => {
+      expect(shouldRestoreDirectQuestionOnSubmitFailure('notif-1', new Set())).toBe(true);
+      expect(shouldRestoreDirectQuestionOnSubmitFailure('notif-1', new Set(['notif-2']))).toBe(true);
+    });
+
+    it('keeps the acknowledgement settled when an authoritative terminal event already arrived', () => {
+      expect(shouldRestoreDirectQuestionOnSubmitFailure('notif-1', new Set(['notif-1']))).toBe(false);
+    });
+
+    it('is notification-scoped: a delayed terminal A cannot affect an in-flight B', () => {
+      const authoritativelySettled = new Set(['notif-A']);
+      // Notification B failed its own submit; A's unrelated settlement must
+      // not block B's restoration.
+      expect(shouldRestoreDirectQuestionOnSubmitFailure('notif-B', authoritativelySettled)).toBe(true);
+      // Notification A's own failure must be suppressed because A is
+      // already authoritatively settled.
+      expect(shouldRestoreDirectQuestionOnSubmitFailure('notif-A', authoritativelySettled)).toBe(false);
+    });
+  });
+
+  describe('escalationSubmittingLabel', () => {
+    it('describes an in-flight approval submission', () => {
+      expect(escalationSubmittingLabel('approve')).toBe('Submitting approval…');
+    });
+
+    it('describes an in-flight denial submission', () => {
+      expect(escalationSubmittingLabel('deny')).toBe('Submitting denial…');
+    });
+  });
+
+  describe('escalationFromPendingSummary (canonical hydration)', () => {
+    it('converts a canonical pending.escalation summary without requiring a legacy push frame', () => {
+      const result = escalationFromPendingSummary({
+        notification_id: 'notif-1',
+        notification_type: 'escalation',
+        call_id: 'call-1',
+        tool_call_id: 'tool-call-1',
+        session_id: 'session-1',
+        tool_name: 'run_shell',
+        arguments_display: { command: 'rm -rf /tmp/x' },
+        risk: 'high',
+        reasoning: 'destructive command',
+        timeout_seconds: 120,
+        managed_conversation_title: 'Build worker',
+        managed_target_agent_id: 'laforge',
+        managed_origin_conversation_id: 'child-1',
+        created_at: '2024-01-01T00:00:00.000Z',
+      }, () => 1_700_000_000_000);
+
+      expect(result).toEqual({
+        call_id: 'call-1',
+        session_id: 'session-1',
+        tool_name: 'run_shell',
+        arguments_display: { command: 'rm -rf /tmp/x' },
+        decision: 'escalate',
+        resolved: false,
+        reasoning: 'destructive command',
+        risk: 'high',
+        timeout_seconds: 120,
+        managed_conversation_title: 'Build worker',
+        managed_target_agent_id: 'laforge',
+        managed_origin_conversation_id: 'child-1',
+        received_at: Date.parse('2024-01-01T00:00:00.000Z'),
+      });
+    });
+
+    it('falls back to notification_id when call_id is absent, and to now() when created_at is absent', () => {
+      const result = escalationFromPendingSummary({
+        notification_id: 'notif-2',
+        notification_type: 'escalation',
+      }, () => 1_700_000_000_000);
+
+      expect(result).toMatchObject({ call_id: 'notif-2', received_at: 1_700_000_000_000 });
+    });
+
+    it('returns null for non-escalation summaries or a missing summary', () => {
+      expect(escalationFromPendingSummary(null)).toBeNull();
+      expect(escalationFromPendingSummary(undefined)).toBeNull();
+      expect(escalationFromPendingSummary({ notification_id: 'q-1', notification_type: 'step_question' })).toBeNull();
+    });
+  });
+
+  describe('mergeHydratedEscalation (dedup by call_id)', () => {
+    it('appends a hydrated escalation not already present or excluded', () => {
+      const existing = [{ call_id: 'a', received_at: 1 } as never];
+      const hydrated = { call_id: 'b', received_at: 2 } as never;
+      const result = mergeHydratedEscalation(existing, hydrated, new Set());
+      expect(result.map((item) => (item as { call_id: string }).call_id)).toEqual(['a', 'b']);
+    });
+
+    it('does not duplicate an escalation already in the queue', () => {
+      const existing = [{ call_id: 'a', received_at: 1 } as never];
+      const hydrated = { call_id: 'a', received_at: 5 } as never;
+      const result = mergeHydratedEscalation(existing, hydrated, new Set());
+      expect(result).toBe(existing);
+    });
+
+    it('enriches an incomplete push prompt from canonical state', () => {
+      const existing = [{
+        call_id: 'a',
+        received_at: 1,
+        tool_name: 'bash',
+        arguments_display: null,
+      } as never];
+      const hydrated = {
+        call_id: 'a',
+        received_at: 5,
+        tool_name: 'bash',
+        arguments_display: { command: 'uv run pytest -q' },
+        risk: 'medium',
+      } as never;
+
+      expect(mergeHydratedEscalation(existing, hydrated, new Set())).toEqual([{
+        call_id: 'a',
+        received_at: 1,
+        tool_name: 'bash',
+        arguments_display: { command: 'uv run pytest -q' },
+        risk: 'medium',
+      }]);
+    });
+
+    it('excludes a call_id currently resolving in-flight or already locally settled', () => {
+      const existing: never[] = [];
+      const inFlight = { call_id: 'in-flight', received_at: 1 } as never;
+      const settled = { call_id: 'settled', received_at: 1 } as never;
+      expect(mergeHydratedEscalation(existing, inFlight, new Set(['in-flight']))).toBe(existing);
+      expect(mergeHydratedEscalation(existing, settled, new Set(['settled']))).toBe(existing);
+    });
+
+    it('returns the existing array unchanged when hydrated is null', () => {
+      const existing = [{ call_id: 'a', received_at: 1 } as never];
+      expect(mergeHydratedEscalation(existing, null, new Set())).toBe(existing);
+    });
+  });
+
+  describe('managedInteractionVisibleInScope', () => {
+    it('shows every interaction in the parent conversation', () => {
+      expect(managedInteractionVisibleInScope('child-a', null)).toBe(true);
+      expect(managedInteractionVisibleInScope(null, null)).toBe(true);
+    });
+
+    it('shows only interactions from the selected managed child', () => {
+      expect(managedInteractionVisibleInScope('child-a', 'child-a')).toBe(true);
+      expect(managedInteractionVisibleInScope('child-b', 'child-a')).toBe(false);
+      expect(managedInteractionVisibleInScope(null, 'child-a')).toBe(false);
+    });
+  });
+
+  it('does not mark the compact header waiting for another managed child escalation', () => {
+    const escalations = [{ managed_origin_conversation_id: 'child-b' }];
+    expect(managedEscalationPending(escalations, 'child-a')).toBe(false);
+    expect(mobileConversationStatusLabel(
+      'active',
+      false,
+      managedEscalationPending(escalations, 'child-a'),
+    )).toBe('active');
+    expect(managedEscalationPending(escalations, 'child-b')).toBe(true);
+  });
+
   it('normalizes chat mode tones for running indicators', () => {
     expect(normalizeChatModeTone('plan')).toBe('plan');
     expect(normalizeChatModeTone('build')).toBe('build');
@@ -1510,6 +2940,23 @@ describe('chat page helpers', () => {
       context: 'Reddit login',
       kind: 'auth_challenge',
     });
+    expect(pending?.managedOrigin).toBeUndefined();
+  });
+
+  it('threads managed-origin metadata from a live auth challenge push event', () => {
+    const pending = pendingDirectQuestionFromAuthChallengeEvent({
+      notification_id: 'auth-2',
+      message: 'Enter the MFA code.',
+      managed_conversation_title: 'Research helper',
+      managed_target_agent_id: 'lumi',
+      managed_origin_conversation_id: 'conv-parent-1',
+    });
+
+    expect(pending?.managedOrigin).toEqual({
+      title: 'Research helper',
+      targetAgentId: 'lumi',
+      originConversationId: 'conv-parent-1',
+    });
   });
 
   it('scopes retries to failed subloads only', () => {
@@ -1566,10 +3013,223 @@ describe('chat page helpers', () => {
     const effective = coalescer.run('conversation:conv-1', async () => {
       runs += 1;
     });
+    const burst = coalescer.run('conversation:conv-1', async () => {
+      runs += 1;
+    });
     expect(effective).toBe(first);
+    expect(burst).toBe(first);
+    expect(coalescer.has('conversation:conv-1')).toBe(true);
     releaseFirst?.();
     await effective;
     expect(runs).toBe(2);
+    expect(coalescer.has('conversation:conv-1')).toBe(false);
+  });
+
+  it('bounds one promise to initial plus one rerun and defers later requests', async () => {
+    const coalescer = new ChatV2CanonicalRecoveryCoalescer();
+    let releaseInitial: (() => void) | undefined;
+    let releaseRerun: (() => void) | undefined;
+    let rerunStarted: (() => void) | undefined;
+    const rerunStartedPromise = new Promise<void>((resolve) => {
+      rerunStarted = resolve;
+    });
+    const operations: string[] = [];
+    const initial = coalescer.run('conversation:conv-1', async () => {
+      operations.push('initial');
+      await new Promise<void>((resolve) => {
+        releaseInitial = resolve;
+      });
+    });
+    const joined = coalescer.run('conversation:conv-1', async () => {
+      operations.push('rerun');
+      rerunStarted?.();
+      await new Promise<void>((resolve) => {
+        releaseRerun = resolve;
+      });
+    });
+    expect(joined).toBe(initial);
+    releaseInitial?.();
+    await rerunStartedPromise;
+
+    const deferred = coalescer.run('conversation:conv-1', async () => {
+      operations.push('deferred');
+    });
+    expect(deferred).not.toBe(initial);
+    releaseRerun?.();
+    await initial;
+    expect(operations).toEqual(['initial', 'rerun']);
+
+    await deferred;
+    expect(operations).toEqual(['initial', 'rerun', 'deferred']);
+  });
+
+  it('fences A→B→A authority by route generation', () => {
+    const firstA = beginCanonicalTimelineAuthority('A', 1);
+    const currentA = beginCanonicalTimelineAuthority('A', 3);
+    expect(transitionCanonicalTimelineAuthority(currentA, 'A', 1, 'ready')).toBe(currentA);
+    const accepted = acceptCanonicalTimelineBase(currentA, 'A', 3);
+    const ready = transitionCanonicalTimelineAuthority(accepted, 'A', 3, 'ready');
+    expect(canonicalTimelineAuthorityIsReady(ready, 'A', 3)).toBe(true);
+    expect(canonicalTimelineAuthorityIsReady(firstA, 'A', 3)).toBe(false);
+  });
+
+  it('keeps loading and error authority distinct from matching ready', () => {
+    const loading = beginCanonicalTimelineAuthority('A', 4);
+    expect(canonicalTimelineBaseIsAccepted(loading, 'A', 4)).toBe(false);
+    expect(canonicalTimelineAuthorityIsReady(loading, 'A', 4)).toBe(false);
+    const failed = transitionCanonicalTimelineAuthority(loading, 'A', 4, 'error');
+    expect(canonicalTimelineAuthorityIsReady(failed, 'A', 4)).toBe(false);
+    const retrying = transitionCanonicalTimelineAuthority(failed, 'A', 4, 'loading');
+    const accepted = acceptCanonicalTimelineBase(retrying, 'A', 4);
+    expect(canonicalTimelineBaseIsAccepted(accepted, 'A', 4)).toBe(true);
+    const ready = transitionCanonicalTimelineAuthority(accepted, 'A', 4, 'ready');
+    expect(canonicalTimelineAuthorityIsReady(ready, 'A', 4)).toBe(true);
+  });
+
+  it('backfills multiple non-renderable pages before a visible row', async () => {
+    let state = {
+      visibleCount: 0,
+      hasMoreBefore: true,
+      beforeCursor: 'cursor-3' as string | null,
+    };
+    const calls: string[] = [];
+    const status = await backfillInitialVisibleHistory({
+      maxPages: 4,
+      getState: () => state,
+      loadPage: async (before) => {
+        calls.push(before);
+        return before;
+      },
+      applyPage: (before) => {
+        state = before === 'cursor-1'
+          ? { visibleCount: 1, hasMoreBefore: false, beforeCursor: null }
+          : {
+              visibleCount: 0,
+              hasMoreBefore: true,
+              beforeCursor: before === 'cursor-3' ? 'cursor-2' : 'cursor-1',
+            };
+        return true;
+      },
+      isCurrent: () => true,
+    });
+    expect(status).toBe('visible');
+    expect(calls).toEqual(['cursor-3', 'cursor-2', 'cursor-1']);
+  });
+
+  it('keeps older history non-authoritative when the page budget is exhausted', async () => {
+    let cursor = 10;
+    const status = await backfillInitialVisibleHistory({
+      maxPages: 2,
+      getState: () => ({
+        visibleCount: 0,
+        hasMoreBefore: true,
+        beforeCursor: `cursor-${cursor}`,
+      }),
+      loadPage: async () => ({ cursor: cursor - 1 }),
+      applyPage: (page) => {
+        cursor = page.cursor;
+        return true;
+      },
+      isCurrent: () => true,
+    });
+    expect(status).toBe('budget_exhausted');
+    expect(cursor).toBe(8);
+  });
+
+  it('rejects a late backfill page after an A→B route change', async () => {
+    let current = true;
+    let applied = false;
+    let release: (() => void) | undefined;
+    const pending = backfillInitialVisibleHistory({
+      maxPages: 2,
+      getState: () => ({
+        visibleCount: 0,
+        hasMoreBefore: true,
+        beforeCursor: 'cursor-A',
+      }),
+      loadPage: async () => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        return {};
+      },
+      applyPage: () => {
+        applied = true;
+        return true;
+      },
+      isCurrent: () => current,
+    });
+    current = false;
+    release?.();
+    expect(await pending).toBe('stale');
+    expect(applied).toBe(false);
+  });
+
+  it('treats a truly empty authoritative page as exhausted', async () => {
+    const status = await backfillInitialVisibleHistory({
+      maxPages: 8,
+      getState: () => ({
+        visibleCount: 0,
+        hasMoreBefore: false,
+        beforeCursor: null,
+      }),
+      loadPage: async () => {
+        throw new Error('must not load');
+      },
+      applyPage: () => true,
+      isCurrent: () => true,
+    });
+    expect(status).toBe('exhausted');
+  });
+
+  it('preserves cached visible rows without requesting older history', async () => {
+    const loadPage = vi.fn();
+    const status = await backfillInitialVisibleHistory({
+      maxPages: 8,
+      getState: () => ({
+        visibleCount: 2,
+        hasMoreBefore: true,
+        beforeCursor: 'older',
+      }),
+      loadPage,
+      applyPage: () => true,
+      isCurrent: () => true,
+    });
+    expect(status).toBe('visible');
+    expect(loadPage).not.toHaveBeenCalled();
+  });
+
+  it('propagates initial history backfill failures for retry handling', async () => {
+    await expect(backfillInitialVisibleHistory({
+      maxPages: 8,
+      getState: () => ({
+        visibleCount: 0,
+        hasMoreBefore: true,
+        beforeCursor: 'older',
+      }),
+      loadPage: async () => {
+        throw new Error('backfill unavailable');
+      },
+      applyPage: () => true,
+      isCurrent: () => true,
+    })).rejects.toThrow('backfill unavailable');
+  });
+
+  it('stops without advancing state when a backfill page is rejected', async () => {
+    let cursor = 'current-before';
+    const status = await backfillInitialVisibleHistory({
+      maxPages: 8,
+      getState: () => ({
+        visibleCount: 0,
+        hasMoreBefore: true,
+        beforeCursor: cursor,
+      }),
+      loadPage: async () => ({ before_cursor: 'stale-before' }),
+      applyPage: () => false,
+      isCurrent: () => true,
+    });
+    expect(status).toBe('rejected');
+    expect(cursor).toBe('current-before');
   });
 
   it('keeps A refresh visible through A→B→A rerun despite metadata failure and resubscribes once', async () => {
@@ -2060,6 +3720,34 @@ describe('chat page helpers', () => {
       expect(timelineWindowHasHiddenTail({ start: 0, end: 150 }, 300)).toBe(true);
       expect(timelineWindowHasHiddenTail({ start: 0, end: null }, 300)).toBe(false);
       expect(timelineWindowSize({ start: 100, end: 250 }, 300)).toBe(150);
+    });
+
+    it('rebases a collapsed live tail after an authoritative snapshot shrinks history', () => {
+      // Cached view: 257 rows, rendering its 100-row live tail from 157.
+      // A fresh snapshot has 100 rows, so retaining that start hides all rows.
+      expect(shouldRebaseLiveTailWindow({ start: 157, end: null }, 100)).toBe(true);
+      expect(shouldRebaseLiveTailWindow({ start: 0, end: null }, 100)).toBe(false);
+      // Explicit finite windows are not live tails and retain their existing
+      // pagination semantics, including intentionally empty ranges.
+      expect(shouldRebaseLiveTailWindow({ start: 100, end: 100 }, 100)).toBe(false);
+    });
+
+    it('keeps a nonempty live tail through cached-snapshot shrink reconciliation', () => {
+      expect(reconcileLiveTailWindow({ start: 157, end: null }, 100)).toEqual({
+        start: 0,
+        end: null,
+      });
+      // Existing finite-window behavior remains: tail-pinned reconciliation
+      // remounts the current tail, while scrolled-up windows still use
+      // freezeTailWindow before this helper is called.
+      expect(reconcileLiveTailWindow({ start: 20, end: 60 }, 100)).toEqual({
+        start: 0,
+        end: null,
+      });
+      expect(freezeTailWindow({ start: 20, end: 60 }, 100, 100)).toEqual({
+        start: 20,
+        end: 60,
+      });
     });
 
     it('auto-loads older rows when collapsed groups leave the viewport under-filled', () => {

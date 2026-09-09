@@ -70,7 +70,7 @@ _DESCRIPTION = (
     "before unfamiliar or complex mutations."
 )
 
-_BASE_SCHEMA = {
+_BASE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {
@@ -592,6 +592,7 @@ async def handle_agent_management_tool(
     user_email: str | None,
     current_agent_id: str | None,
     runtime_access: RuntimeAccessContext | None = None,
+    self_mutation_approved: bool = False,
 ) -> ToolResult:
     """Execute an agent-management tool call."""
 
@@ -607,6 +608,7 @@ async def handle_agent_management_tool(
             is_error=True,
             metadata={"code": "agent_management_context_denied"},
         )
+    assert runtime_access is not None
     actor_email = user_email or runtime_access.user_email
     agent_id = current_agent_id or runtime_access.agent_id
     if not actor_email or not agent_id:
@@ -617,6 +619,7 @@ async def handle_agent_management_tool(
             actor_email=actor_email,
             current_agent_id=agent_id,
             arguments=arguments,
+            self_mutation_approved=self_mutation_approved,
         )
     except AgentManagementError as exc:
         return ToolResult(

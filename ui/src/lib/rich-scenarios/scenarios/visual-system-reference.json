@@ -1,0 +1,218 @@
+{
+  "schema_version": 1,
+  "id": "visual-system-reference",
+  "title": "Generic visual system reference",
+  "description": "Contract-tolerant cards, media, source-linked headlines, icons, status, and editorial disclosure.",
+  "group": "reference",
+  "sort_key": 1000,
+  "content": "Visual system reference fallback.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Reference surface",
+      "subtitle": "Reusable generic Rich visual language."
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "General Rich",
+        "title": "A responsive visual system for decision-ready deliverables",
+        "subtitle": "Use semantic blocks and safe links; let the browser own media placement, visual hierarchy, and interaction."
+      },
+      {
+        "type": "grid",
+        "columns": 3,
+        "blocks": [
+          {
+            "type": "card",
+            "variant": "feature",
+            "icon": "activity",
+            "eyebrow": "Featured analysis",
+            "title": "Renderer health is stable",
+            "summary": "All core visual blocks render safely across compact chat and full view.",
+            "href": "https://example.org/fixture/health",
+            "media": {
+              "artifact_id": "fixture-visual-system-health",
+              "href": "/fixtures/daily-pulse-lovosice.svg",
+              "alt": "Abstract blue editorial illustration",
+              "credit": "Cognis fixture",
+              "placement": "top",
+              "aspect_ratio": "16 / 7",
+              "focal_point": "50% 50%"
+            },
+            "source_ids": [
+              "visual-reference"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "status",
+            "icon": "✅",
+            "eyebrow": "Status",
+            "title": "Evidence linked",
+            "dek": "Citations remain visible and never turn untrusted content into markup.",
+            "tone": "success",
+            "citations": [
+              "visual-reference"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "action",
+            "icon": "arrow_up_right",
+            "eyebrow": "Next action",
+            "title": "Review the rollout checklist",
+            "content": "Use the source-linked action card to keep a whole-card destination explicit.",
+            "href": "https://example.org/fixture/checklist"
+          }
+        ]
+      },
+      {
+        "type": "grid",
+        "columns": 3,
+        "blocks": [
+          {
+            "type": "card",
+            "variant": "visual",
+            "icon": "activity",
+            "eyebrow": "Image-forward",
+            "title": "Visual card with media",
+            "summary": "The image becomes a full-bleed background with a legibility gradient behind the title and summary.",
+            "href": "https://example.org/fixture/visual",
+            "media": {
+              "artifact_id": "fixture-visual-system-card",
+              "href": "/fixtures/daily-pulse-lovosice.svg",
+              "alt": "Abstract blue editorial illustration, full-bleed card variant",
+              "credit": "Cognis fixture",
+              "aspect_ratio": "16 / 7",
+              "focal_point": "50% 50%"
+            },
+            "source_ids": [
+              "visual-reference"
+            ]
+          },
+          {
+            "type": "card",
+            "variant": "visual",
+            "icon": "info",
+            "eyebrow": "Image-forward, no media",
+            "title": "Visual card without media",
+            "summary": "Without an authored image, this falls back to the standard flat card treatment."
+          },
+          {
+            "type": "card",
+            "variant": "visual",
+            "icon": "info",
+            "eyebrow": "Image-forward, broken media",
+            "title": "Visual card with a broken image",
+            "summary": "A failed image load also falls back to the flat card treatment.",
+            "media": {
+              "artifact_id": "fixture-visual-system-broken",
+              "href": "/fixtures/does-not-exist.svg",
+              "alt": "Intentionally missing fixture image"
+            }
+          }
+        ]
+      },
+      {
+        "type": "grid",
+        "columns": 3,
+        "blocks": [
+          {
+            "type": "metric",
+            "icon": "trend_up",
+            "label": "Mobile coverage",
+            "value": "320–430px",
+            "delta": "+3 viewports",
+            "timestamp": "Updated now",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "icon": "clock",
+            "label": "Median scan time",
+            "value": "14s",
+            "delta": "−18%",
+            "timestamp": "This week",
+            "tone": "neutral"
+          },
+          {
+            "type": "metric",
+            "icon": "unknown_icon_name",
+            "label": "Safe fallback",
+            "value": "No markup",
+            "delta": "Unknown icon omitted",
+            "tone": "warning"
+          }
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Visual system adoption",
+        "description": "The SVG baseline remains useful before Chart.js enhancement.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "series": [
+          {
+            "id": "adopted-surfaces",
+            "label": "Adopted surfaces",
+            "points": [
+              {
+                "x": "2026-07-13",
+                "y": 2
+              },
+              {
+                "x": "2026-07-14",
+                "y": 4
+              },
+              {
+                "x": "2026-07-15",
+                "y": 7
+              }
+            ]
+          }
+        ],
+        "x_axis": {
+          "type": "time",
+          "label": "Weekday"
+        },
+        "y_axis": {
+          "type": "linear",
+          "label": "Surfaces",
+          "unit": "surfaces",
+          "min": 0,
+          "max": 8
+        },
+        "legend_position": "none",
+        "palette_token": "cool"
+      },
+      {
+        "type": "accordion",
+        "items": [
+          {
+            "type": "section",
+            "title": "What changed",
+            "summary": "The summary stays visible while the contextual notes and evidence remain opt-in.",
+            "content": "Expanded editorial context avoids repeating the section title and can include supporting citations.",
+            "blocks": [
+              {
+                "type": "source_list",
+                "title": "Supporting evidence"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "assets": [],
+    "sources": [
+      {
+        "id": "visual-reference",
+        "title": "Cognis visual system fixture",
+        "url": "https://example.org/fixture/visual-system",
+        "publisher": "Cognis"
+      }
+    ],
+    "datasets": [],
+    "exports": []
+  }
+}

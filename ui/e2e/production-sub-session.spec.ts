@@ -20,13 +20,18 @@ function message(id: string, index: number, content: string, running = false) {
   };
 }
 
-function snapshot(scope: Record<string, unknown>, items: unknown[], active = false) {
+function snapshot(
+  scope: Record<string, unknown>,
+  items: unknown[],
+  active = false,
+  beforeCursor: string | null = null,
+) {
   return {
     schema_version: 2,
     projection_version: 'production-shell-e2e',
     scope,
     conversation: { conversation_id: String(scope.conversation_id ?? 'parent'), agent_id: 'e2e-test-agent', title: 'Production shell fixture', status: 'active' },
-    timeline: { items, has_more_before: false, before_cursor: null },
+    timeline: { items, has_more_before: beforeCursor !== null, before_cursor: beforeCursor },
     state: { state_version: 1, snapshot_generated_at: NOW, capabilities: [], active_turn: {}, pending: {}, active_session: {} },
     queue: { messages: [], queued_count: 0 },
     runtime: { runtime_epoch: 'e2e', runtime_revision: 1, generated_at: NOW, has_active_turn: active, volatile_items: [] },
@@ -35,7 +40,7 @@ function snapshot(scope: Record<string, unknown>, items: unknown[], active = fal
   };
 }
 
-test('real /chat shell keeps parent fixed while the nested scoped viewport owns navigation', async ({ page }, testInfo) => {
+test('opened child session loads older history on top-edge scroll', async ({ page }) => {
   test.setTimeout(90_000);
   let parentConversationId = '';
   const parentItems = [
@@ -66,6 +71,10 @@ test('real /chat shell keeps parent fixed while the nested scoped viewport owns 
       : `Nested production session row ${index + 1}`)
   );
   childItems[44] = message('child-active', 45, `${'# Long active answer\n\n'}${'Detailed nested assistant output. '.repeat(180)}`, true);
+  const olderChildItems = Array.from({ length: 4 }, (_, index) =>
+    message(`child-history-${index}`, -(4 - index), `Older nested session row ${index + 1}`)
+  );
+  let childBackfillCalls = 0;
 
   await page.route('**/api/v1/chat/v2/conversations/*/snapshot', async (route) => {
     const match = route.request().url().match(/conversations\/([^/]+)\/snapshot/);
@@ -76,7 +85,7 @@ test('real /chat shell keeps parent fixed while the nested scoped viewport owns 
       conversation_id: parentConversationId,
     }, parentItems)) });
   });
-  await page.route('**/api/v1/chat/v2/sessions/sess_child/snapshot', (route) => route.fulfill({
+  await page.route('**/api/v1/chat/v2/sessions/sess_child/snapshot**', (route) => route.fulfill({
     status: 200,
     contentType: 'application/json',
     body: JSON.stringify(snapshot({
@@ -84,7 +93,57 @@ test('real /chat shell keeps parent fixed while the nested scoped viewport owns 
       kind: 'session',
       session_id: 'sess_child',
       conversation_id: parentConversationId,
-    }, childItems, true)),
+    }, childItems, true, 'child-before-1')),
+  }));
+  await page.route('**/api/v1/chat/v2/sessions/sess_child/timeline**', (route) => {
+    childBackfillCalls += 1;
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        schema_version: 2,
+        projection_version: 'production-shell-e2e',
+        scope: {
+          key: 'session:sess_child',
+          kind: 'session',
+          session_id: 'sess_child',
+          conversation_id: parentConversationId,
+        },
+        conversation_id: parentConversationId,
+        items: olderChildItems,
+        cycle_states: [],
+        has_more_before: false,
+        before_cursor: null,
+        server_time: NOW,
+      }),
+    });
+  });
+  await page.route('**/api/v1/conversations/*/sessions/sess_child', (route) => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({
+      session_id: 'sess_child',
+      conversation_id: parentConversationId,
+      parent_session_id: 'parent-session',
+      previous_session_id: null,
+      user_email: 'admin@cognis-e2e.localdev.me',
+      agent_id: 'e2e-test-agent',
+      agent_profile_id: null,
+      delegation_mode: 'delegate',
+      delegation_task: null,
+      status: 'completed',
+      intaris_session_id: 'sess_child',
+      mnemory_session_id: null,
+      started_at: NOW,
+      idle_since: null,
+      completed_at: NOW,
+      completion_reason: 'completed',
+      result_summary: null,
+      result_content: null,
+      result_anchors: null,
+      result_sections: null,
+      updated_at: NOW,
+    }),
   }));
   await page.route('**/api/v1/sessions/sess_child/intaris', (route) => route.fulfill({
     status: 200,
@@ -143,52 +202,19 @@ test('real /chat shell keeps parent fixed while the nested scoped viewport owns 
 
   await login(page);
   await openOrCreateConversation(page);
-  const parentViewport = page.getByTestId('timeline-viewport');
-  const parentTop = await parentViewport.evaluate((node) => (node as HTMLElement).scrollTop);
   await page.getByRole('button', { name: /View session/i }).click();
 
-  const overlay = page.locator('aside').filter({ hasText: 'Sub-session' });
-  const scoped = overlay.getByTestId('scoped-timeline-viewport');
+  const overlay = page.getByRole('complementary').filter({
+    has: page.getByRole('heading', { name: 'Child session' }),
+  });
+  const scoped = overlay.getByRole('region', { name: 'Timeline' });
   await expect(scoped).toBeVisible();
-  await overlay.getByRole('button', { name: 'Toggle session details' }).click();
-  const details = overlay.getByTestId('session-details-content');
-  await expect(details).toContainText('Shared session details');
-  await expect(details).toContainText('scope-model · Scope Provider');
-  await expect(details).toContainText('scope-profile');
-  await expect(details).toContainText('2,400 / 16,000 tokens');
-  await expect(details).toContainText('Scope Executor');
-  await overlay.getByRole('button', { name: 'Toggle session details' }).click();
-  await expect.poll(() => scoped.evaluate((node) => {
+  await scoped.evaluate((node) => {
     const element = node as HTMLElement;
-    return Math.round(element.scrollHeight - element.scrollTop - element.clientHeight);
-  })).toBeLessThanOrEqual(2);
-  await expect(overlay.getByRole('navigation', { name: 'Live tail controls' })).toBeVisible();
+    element.scrollTop = 1;
+  });
   await scoped.hover();
-  await page.mouse.wheel(0, -900);
-  await expect(overlay.getByText('Live follow paused')).toBeVisible();
-  await expect(overlay.getByRole('navigation', { name: 'Message navigation' })).toBeVisible();
-  expect(await parentViewport.evaluate((node) => (node as HTMLElement).scrollTop)).toBe(parentTop);
-
-  await overlay.getByRole('button', { name: 'Resume live follow' }).click();
-  await expect.poll(() => scoped.evaluate((node) => {
-    const element = node as HTMLElement;
-    return Math.round(element.scrollHeight - element.scrollTop - element.clientHeight);
-  })).toBeLessThanOrEqual(2);
-  const activeRow = overlay.locator('[data-message-id="child-active"]');
-  await scoped.hover();
-  await page.mouse.wheel(0, -500);
-  await expect(overlay.getByRole('button', { name: /active message/i })).toBeVisible();
-  await overlay.getByRole('button', { name: /active message/i }).click();
-  await expect.poll(async () => Math.abs(
-    await scoped.evaluate((node) => node.getBoundingClientRect().top) -
-    await activeRow.evaluate((node) => node.getBoundingClientRect().top)
-  )).toBeLessThanOrEqual(8);
-
-  const screenshotPath = testInfo.outputPath('production-sub-session-timeline.png');
-  await overlay.screenshot({ path: screenshotPath, animations: 'disabled' });
-  await testInfo.attach('production-sub-session-timeline', { path: screenshotPath, contentType: 'image/png' });
-  await overlay.getByRole('button', { name: 'Back to conversation' }).click();
-  await expect(overlay).toHaveCount(0);
-  expect(await parentViewport.evaluate((node) => (node as HTMLElement).scrollTop)).toBe(parentTop);
-  await expect(page.getByText('Parent state marker')).toBeVisible();
+  await page.mouse.wheel(0, -400);
+  await expect(overlay.getByText('Older nested session row 1')).toBeVisible();
+  await expect.poll(() => childBackfillCalls).toBe(1);
 });

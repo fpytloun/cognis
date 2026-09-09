@@ -17,6 +17,10 @@ from cognis.api.models import (
     ExecutorTokenResponse,
     ExecutorUpdateRequest,
 )
+from cognis.core.executor_availability import (
+    is_executor_type_available,
+    unavailable_executor_reason,
+)
 from cognis.core.executor_policy import (
     ensure_executor_type_allowed,
     load_executor_policy,
@@ -29,6 +33,7 @@ from cognis.models.executor_inference import (
     resolve_executor_local_inference_config,
 )
 from cognis.models.executor_resources import normalize_executor_resource_snapshot
+from cognis.models.runtime_capabilities import normalize_runtime_capability_report
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.store.local_models import lock_local_model_dispatch_guard
 from cognis.store.models import ExecutorRow
@@ -91,10 +96,15 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
     received_at = _resource_snapshot_received_at(runtime_metadata, row)
     runtime_metadata.pop("resource_snapshot", None)
     runtime_metadata.pop("resource_snapshot_received_at", None)
+    observed_capabilities = normalize_runtime_capability_report(
+        runtime_metadata.get("observed_capabilities")
+    )
     return ExecutorConfigResponse(
         executor_id=row.executor_id,
         name=row.name,
         executor_type=row.executor_type,
+        available=is_executor_type_available(row.executor_type),
+        unavailable_reason=unavailable_executor_reason(row.executor_type),
         labels=row.labels or {},
         enabled_tools=row.enabled_tools or [],
         enabled_tool_groups=row.enabled_tool_groups or [],
@@ -109,6 +119,8 @@ def _executor_to_response(row: Any) -> ExecutorConfigResponse:
         desired_config_version=getattr(row, "desired_config_version", 0),
         applied_config_version=getattr(row, "applied_config_version", 0),
         runtime_metadata=runtime_metadata,
+        observed_tools=list(getattr(row, "observed_tools", None) or []),
+        observed_capabilities=observed_capabilities,
         resource_snapshot=(
             resource_snapshot.with_current_freshness(received_at=received_at)
             if resource_snapshot is not None

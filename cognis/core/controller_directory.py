@@ -76,7 +76,13 @@ class ControllerInstanceDirectory:
             self._task = None
         async with self._write_lock:
             self._state = "stopped"
-            await self._write(self._state, live=False)
+            try:
+                await self._write(self._state, live=False)
+            except Exception:
+                # Shutdown must not fail because another transaction briefly
+                # holds the directory database. The expired heartbeat remains
+                # the authoritative fallback for stale-instance detection.
+                logger.warning("controller directory stop write failed", exc_info=True)
 
     async def get_ready(self, owner_id: str) -> ControllerInstance | None:
         """Resolve one ready controller for new routing or admission."""
@@ -89,6 +95,31 @@ class ControllerInstanceDirectory:
                     ControllerInstanceRow.lifecycle_state == "ready",
                     ControllerInstanceRow.expires_at > now,
                 )
+            )
+        if row is None:
+            return None
+        return ControllerInstance(
+            owner_id=row.owner_id,
+            controller_id=row.controller_id,
+            incarnation_id=row.incarnation_id,
+            internal_url=row.internal_url,
+            lifecycle_state=row.lifecycle_state,
+        )
+
+    async def get_ready_replacement(self, owner_id: str) -> ControllerInstance | None:
+        """Resolve a ready replacement for one draining controller incarnation."""
+
+        async with self._session_factory() as session:
+            now = database_now_expression(session)
+            row = await session.scalar(
+                select(ControllerInstanceRow)
+                .where(
+                    ControllerInstanceRow.owner_id != owner_id,
+                    ControllerInstanceRow.lifecycle_state == "ready",
+                    ControllerInstanceRow.expires_at > now,
+                )
+                .order_by(ControllerInstanceRow.updated_at.desc())
+                .limit(1)
             )
         if row is None:
             return None

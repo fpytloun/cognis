@@ -1,14 +1,16 @@
 import { readable } from 'svelte/store';
+import { isIosStandalonePwa } from '$lib/stores/pwa';
 
 /**
  * Viewport helpers.
  *
  * - `isMobile` store: true when viewport < 1024px (our mobile/desktop pivot).
  *   Replaces one-shot `window.innerWidth` checks; updates on resize.
- * - `isTouch()` helper: true when the primary input is coarse (phone/tablet).
+ * - `isTouch()` helper: true when any input is coarse (phone/tablet or a
+ *   tablet with an attached trackpad).
  * - `viewportMetrics` store: visualViewport-backed CSS variables for mobile
- *   shells. The shell is sized to the visible viewport; composers should not
- *   add a separate keyboard offset on top.
+ *   chat bodies. The app shell remains fixed; only keyboard-avoiding chat
+ *   surfaces reserve the occluded bottom area.
  */
 
 const MOBILE_BREAKPOINT = 1024;
@@ -27,7 +29,14 @@ export const isMobile = readable(readIsMobile(), (set) => {
 
 export function isTouch(): boolean {
   if (typeof window === 'undefined') return false;
-  return window.matchMedia?.('(hover: none) and (pointer: coarse)').matches ?? false;
+  return window.matchMedia?.('(any-pointer: coarse)').matches ?? false;
+}
+
+export function hasConservativeTouchKeyboardFallback(): boolean {
+  return typeof window !== 'undefined'
+    && !window.visualViewport
+    && isTouch()
+    && Math.min(window.screen.width, window.screen.height) < 600;
 }
 
 interface ViewportMetrics {
@@ -40,7 +49,13 @@ export interface ViewportInput {
   innerHeight: number;
   visualViewportHeight?: number;
   visualViewportOffsetTop?: number;
+  layoutViewportBaseline?: number;
   keyboardCanBeOpen?: boolean;
+}
+
+export interface ViewportCssPolicy {
+  height: string | null;
+  bottomControlInset: string | null;
 }
 
 export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics {
@@ -48,6 +63,7 @@ export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics 
   const visualHeight = input.visualViewportHeight ?? innerHeight;
   const visualOffsetTop = input.visualViewportOffsetTop ?? 0;
   const keyboardOverlap = innerHeight - (visualOffsetTop + visualHeight);
+  const layoutViewportShrink = Math.max(0, (input.layoutViewportBaseline ?? innerHeight) - innerHeight);
   // The on-screen keyboard manifests as overlay mode in iOS PWA standalone:
   // window.innerHeight stays at the full layout viewport while
   // visualViewport.height shrinks by roughly the keyboard height. We do NOT
@@ -56,17 +72,41 @@ export function calculateViewportMetrics(input: ViewportInput): ViewportMetrics 
   // and reacting to it would push the app shell down past the fixed mobile
   // header on non-chat routes (visible "top bounces" regression on Projects,
   // Tasks, Settings when an input gains focus).
-  const keyboardOpen = keyboardOverlap > 80 && input.keyboardCanBeOpen !== false;
-  // Keep the app shell anchored to the top while the keyboard is open. iOS can
-  // report a positive visualViewport.offsetTop during input focus; applying it
-  // to the fixed shell moves sticky headers. Instead, shrink from the bottom by
-  // using the visual viewport's bottom edge as the shell height.
+  const keyboardOpen = (keyboardOverlap > 80 || layoutViewportShrink > 80) && input.keyboardCanBeOpen !== false;
+  // A positive visualViewport.offsetTop means iOS panned the visible viewport
+  // over the layout viewport to reveal the focused input. Compensate only when
+  // a real keyboard overlap exists; applying offset-only focus movement caused
+  // the historical non-chat header bounce.
   const height = keyboardOpen ? visualOffsetTop + visualHeight : innerHeight;
-  const offsetTop = 0;
+  const offsetTop = keyboardOpen ? visualOffsetTop : 0;
   return {
     height: Math.max(0, height),
     offsetTop: Math.max(0, offsetTop),
     keyboardOpen,
+  };
+}
+
+export function viewportCssPolicy(
+  metrics: ViewportMetrics,
+  iosStandalonePwa: boolean,
+): ViewportCssPolicy {
+  if (metrics.keyboardOpen) {
+    return {
+      height: `${Math.round(metrics.height)}px`,
+      bottomControlInset: '0px',
+    };
+  }
+  if (iosStandalonePwa) {
+    return {
+      // Do not size the closed shell with viewport units. The fixed shell uses
+      // top/bottom edges so WebKit keeps controls inside the visible viewport.
+      height: null,
+      bottomControlInset: null,
+    };
+  }
+  return {
+    height: null,
+    bottomControlInset: null,
   };
 }
 
@@ -82,7 +122,7 @@ function hasFocusedTextInput(): boolean {
   return tagName === 'input' || tagName === 'textarea' || activeElement.isContentEditable;
 }
 
-function readViewportMetrics(): ViewportMetrics {
+function readViewportMetrics(layoutViewportBaseline?: number): ViewportMetrics {
   if (typeof window === 'undefined') {
     return { height: 0, offsetTop: 0, keyboardOpen: false };
   }
@@ -95,6 +135,7 @@ function readViewportMetrics(): ViewportMetrics {
     innerHeight: window.innerHeight,
     visualViewportHeight: vv?.height,
     visualViewportOffsetTop: vv?.offsetTop,
+    layoutViewportBaseline,
     keyboardCanBeOpen: hasFocusedTextInput(),
   });
 }
@@ -102,23 +143,23 @@ function readViewportMetrics(): ViewportMetrics {
 function syncViewportVariables(metrics = readViewportMetrics()): void {
   if (typeof document === 'undefined' || typeof window === 'undefined') return;
   const root = document.documentElement;
-  if (metrics.keyboardOpen) {
-    // Keep the shell top fixed and shrink only its bottom edge above the
-    // keyboard/form-accessory bar.
-    root.style.setProperty('--app-viewport-height', `${Math.round(metrics.height)}px`);
-    root.style.setProperty('--app-viewport-offset-top', '0px');
-    root.style.setProperty('--app-bottom-control-inset', '0px');
-  } else {
-    // Keyboard closed: clear the inline overrides so the shell falls back to
-    // the `:root` rule's `100dvh`. On iOS PWA standalone with
-    // `viewport-fit=cover`, `100dvh` covers the full physical viewport
-    // including the home-indicator safe area, while `window.innerHeight` can
-    // underreport by ~34pt and leave a visible strip below the bottom tab bar
-    // and chat composer.
+  const standalonePwa = isIosStandalonePwa();
+  const policy = viewportCssPolicy(metrics, standalonePwa);
+  root.dataset.standalonePwa = standalonePwa ? 'true' : 'false';
+  if (policy.height === null) {
     root.style.removeProperty('--app-viewport-height');
-    root.style.removeProperty('--app-viewport-offset-top');
-    root.style.removeProperty('--app-bottom-control-inset');
+  } else {
+    root.style.setProperty('--app-viewport-height', policy.height);
   }
+  if (policy.bottomControlInset === null) {
+    root.style.removeProperty('--app-bottom-control-inset');
+  } else {
+    root.style.setProperty('--app-bottom-control-inset', policy.bottomControlInset);
+  }
+  // Never move the fixed application frame during the keyboard animation.
+  // Only compositor-stable headers compensate the visual viewport pan.
+  root.style.setProperty('--app-viewport-offset-top', '0px');
+  root.style.setProperty('--app-visual-viewport-offset-top', `${Math.round(metrics.offsetTop)}px`);
   root.style.setProperty('--app-bottom-inset', '0px');
   root.dataset.keyboard = metrics.keyboardOpen ? 'open' : 'closed';
 }
@@ -129,8 +170,13 @@ export const viewportMetrics = readable<ViewportMetrics>(
   if (typeof window === 'undefined') return;
   const vv = window.visualViewport;
   const scheduledTimers = new Set<number>();
+  let layoutViewportBaseline = window.innerHeight;
   const update = () => {
-    const metrics = readViewportMetrics();
+    const focusedTextInput = hasFocusedTextInput();
+    if (!focusedTextInput) {
+      layoutViewportBaseline = window.innerHeight;
+    }
+    const metrics = readViewportMetrics(isTouch() ? layoutViewportBaseline : undefined);
     syncViewportVariables(metrics);
     set(metrics);
   };
@@ -187,8 +233,10 @@ export const viewportMetrics = readable<ViewportMetrics>(
     const root = document.documentElement;
     root.style.removeProperty('--app-viewport-height');
     root.style.removeProperty('--app-viewport-offset-top');
+    root.style.removeProperty('--app-visual-viewport-offset-top');
     root.style.removeProperty('--app-bottom-inset');
     root.style.removeProperty('--app-bottom-control-inset');
     delete root.dataset.keyboard;
+    delete root.dataset.standalonePwa;
   };
 });

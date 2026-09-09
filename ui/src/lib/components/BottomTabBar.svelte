@@ -2,11 +2,11 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import Clock from 'lucide-svelte/icons/clock';
   import FolderKanban from 'lucide-svelte/icons/folder-kanban';
   import ListTodo from 'lucide-svelte/icons/list-todo';
   import MessageSquareText from 'lucide-svelte/icons/message-square-text';
   import Settings from 'lucide-svelte/icons/settings';
+  import LayoutDashboard from 'lucide-svelte/icons/layout-dashboard';
   import { blockingOverlayActive } from '$lib/stores/overlays';
   import { emitTabReset } from '$lib/stores/tabReset';
   import { viewportMetrics } from '$lib/stores/viewport';
@@ -26,14 +26,15 @@
   let navEl = $state<HTMLElement | null>(null);
 
   const tabs = [
+    { href: '/', label: 'Dashboard', icon: LayoutDashboard },
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
     { href: '/projects', label: 'Projects', icon: FolderKanban },
     { href: '/tasks', label: 'Tasks', icon: ListTodo },
-    { href: '/schedules', label: 'Schedules', icon: Clock },
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
   function isActive(href: string, pathname: string): boolean {
+    if (href === '/') return pathname === '/';
     if (href === '/chat' && pathname.startsWith('/chat')) return true;
     return pathname.startsWith(href);
   }

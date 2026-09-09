@@ -39,13 +39,13 @@ def prompt_serialization_margin_ratio_for_model(
     OpenAI Responses style models serialize tool and conversation state into a
     provider-side envelope that can be larger than local message token counts.
     Keep the default margin conservative for all providers, and use a larger
-    margin when model metadata or model id indicates Responses/GPT-5.x traffic.
+    margin when model metadata or model ID indicates OpenAI Responses traffic.
     """
 
     if model_info is not None and bool(getattr(model_info, "supports_responses_api", False)):
         return _RESPONSES_PROMPT_SERIALIZATION_MARGIN_RATIO
     normalized_model = str(model_id or getattr(model_info, "model_id", "") or "").lower()
-    if "gpt-5" in normalized_model or "chatgpt-5" in normalized_model:
+    if any(family in normalized_model for family in ("gpt-5", "chatgpt-5", "gpt-6", "chatgpt-6")):
         return _RESPONSES_PROMPT_SERIALIZATION_MARGIN_RATIO
     return _PROMPT_SERIALIZATION_MARGIN_RATIO
 

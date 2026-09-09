@@ -9,7 +9,7 @@ import json
 import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -24,6 +24,7 @@ from cognis.core.executor_connection_ownership import (
 )
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
+from cognis.models.executor_calls import normalize_executor_call_snapshot
 from cognis.models.executor_resources import normalize_executor_resource_snapshot
 from cognis.models.local_models import (
     OllamaRuntimeOperationStatus,
@@ -42,7 +43,7 @@ from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.providers.executor.forwarding import ForwardedExecutorConnection
-from cognis.store.coordination import database_now_expression
+from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now_expression
 from cognis.store.models import CoordinationLeaseRow, ExecutorRow
 from cognis.tools.executor.lsp.runtime import (
     LSP_STATUS_CAPABILITY,
@@ -51,6 +52,8 @@ from cognis.tools.executor.lsp.runtime import (
 )
 
 _logger = get_logger(__name__)
+
+SELF_OWNED_MISSING_CONNECTION_GRACE_SECONDS = 5.0
 
 
 def _inference_chunk_timeout_seconds() -> float:
@@ -92,6 +95,11 @@ EXECUTOR_WS_RECONNECTIONS = Counter(
     "cognis_executor_ws_reconnections_total",
     "Executor reconnection events",
 )
+EXECUTOR_BRIDGE_FAILURES = Counter(
+    "cognis_executor_bridge_failures_total",
+    "Forwarded executor bridge operation failures by delivery certainty",
+    labelnames=("operation", "delivery_state", "reason"),
+)
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -107,11 +115,14 @@ _RESOURCE_SNAPSHOT_MAX_DEPTH = 8
 _RESOURCE_SNAPSHOT_MAX_STRING_LENGTH = 512
 _LOCAL_MODEL_NOTIFICATION_MAX_PENDING = 256
 _OWNED_CALLBACK_POLL_SECONDS = 0.25
+_CONNECTION_DIRECTORY_REFRESH_SLICE_SECONDS = 1.0
 _TOOL_PROGRESS_MAX_PENDING_PER_CALL = 64
 _INFERENCE_EVENT_QUEUE_MAX_PENDING = 128
 _PHYSICAL_CANCEL_SEND_TIMEOUT_SECONDS = 1.0
-_MIN_RECONNECT_RETRY_BUDGET_SECONDS = 60.0
+_MIN_RECONNECT_RETRY_BUDGET_SECONDS = 900.0
 _RECONNECT_RETRY_BUDGET_ENV = "COGNIS_EXECUTOR_RECONNECT_RETRY_BUDGET_SECONDS"
+_MAX_RETIRING_FORWARDED_PROXIES = 64
+_MAX_RETIRING_FORWARDED_PROXIES_PER_EXECUTOR = 4
 
 
 def executor_reconnect_retry_budget_seconds() -> float:
@@ -245,6 +256,8 @@ def _transient_executor_output(
             details.append("The tool was not retried automatically because reconnect timed out.")
         else:
             details.append("The tool was not retried automatically.")
+    if auto_retry_skipped_reason == "dispatch_attempt_limit":
+        details.append(f"Check that executor '{executor_id}' is active, then retry the tool.")
     if not details:
         details.append("The controller may retry this call on the same executor if it is safe.")
     return f"{base} {' '.join(details)}"
@@ -261,6 +274,16 @@ class ExecutorRPCError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.data = data
+
+
+class _PreSendDispatchError(RuntimeError):
+    """Wrap a controller-local dispatch-fence failure for breaker filtering."""
+
+
+def _write_was_rejected(exc: Exception) -> bool:
+    """Return whether the local WebSocket stack rejected a write before transport."""
+
+    return isinstance(exc, RuntimeError) and 'Cannot call "send" once' in str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -290,16 +313,29 @@ class WebSocketExecutorConnection:
             Awaitable[WebSocketExecutorConnection | None],
         ]
         | None = None,
+        tool_call_started: Callable[[], bool] | None = None,
+        tool_call_finished: Callable[[], None] | None = None,
     ) -> None:
         self._ws = ws
         self.executor_id = executor_id
         self.capabilities = capabilities
-        self.breaker = breaker or CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+        self.breaker = breaker or CircuitBreaker(
+            failure_threshold=5,
+            recovery_timeout=30.0,
+            name=f"executor.websocket:{executor_id}",
+            should_trip=lambda exc: (
+                not isinstance(exc, (_PreSendDispatchError, ExecutorDisconnectedError))
+            ),
+        )
         self.connection_owner = connection_owner
+        self.executor_instance_id: str | None = None
         self._replay_connection_resolver = replay_connection_resolver
+        self._tool_call_started = tool_call_started
+        self._tool_call_finished = tool_call_finished
 
         # Correlation tracking
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._queued_send_ids: set[str] = set()
         self._receiver_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
 
@@ -323,6 +359,7 @@ class WebSocketExecutorConnection:
         self._background_shell_completed_callback: Any | None = None
         self._oauth_loopback_callback: Any | None = None
         self._resource_snapshot_callback: Any | None = None
+        self._call_snapshot_callback: Any | None = None
         self._resource_snapshot_task: asyncio.Task[None] | None = None
         self._pending_resource_snapshot: dict[str, Any] | None = None
         self._resource_snapshot_last_dispatched_at: float | None = None
@@ -372,9 +409,11 @@ class WebSocketExecutorConnection:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._receiver_task
 
-    async def close(self) -> None:
+    async def close(self, *, cause: str | None = None) -> None:
         """Close the connection and cancel the receiver."""
         self._connected = False
+        if cause is not None and self._close_error_type is None:
+            self._close_error_type = cause
         if self._receiver_task is not None and not self._receiver_task.done():
             self._receiver_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -403,6 +442,7 @@ class WebSocketExecutorConnection:
         params: dict[str, Any],
         timeout: float | None = None,
         *,
+        before_send: Callable[[str, str | None], Awaitable[None]] | None = None,
         on_sent: Callable[[], Awaitable[None]] | None = None,
         stable_call_id: str | None = None,
         replay_safe: bool = False,
@@ -448,6 +488,7 @@ class WebSocketExecutorConnection:
 
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        self._queued_send_ids.add(request_id)
 
         effective_timeout = timeout or _RPC_TIMEOUT_SECONDS
         start = perf_counter()
@@ -458,15 +499,68 @@ class WebSocketExecutorConnection:
             async def _do_call() -> dict[str, Any]:
                 nonlocal send_attempted
                 async with self._send_lock:
+                    if not self._connected:
+                        raise ExecutorDisconnectedError(
+                            f"Executor {self.executor_id} is not connected",
+                            DeliveryState.NOT_SENT,
+                            code="executor_disconnected",
+                            executor_id=self.executor_id,
+                            retry_after=1.0,
+                        )
+                    if before_send is not None:
+                        try:
+                            await before_send(self.executor_id, self.executor_instance_id)
+                        except Exception as exc:
+                            raise _PreSendDispatchError() from exc
+                    if not self._connected:
+                        raise ExecutorDisconnectedError(
+                            f"Executor {self.executor_id} is not connected",
+                            DeliveryState.NOT_SENT,
+                            code="executor_disconnected",
+                            executor_id=self.executor_id,
+                            retry_after=1.0,
+                        )
+                    self._queued_send_ids.discard(request_id)
                     send_attempted = True
-                    await self._ws.send_json(request)
+                    try:
+                        await self._ws.send_json(request)
+                    except asyncio.CancelledError:
+                        self._connected = False
+                        self._fail_submitted_pending(
+                            "Executor connection send cancelled", exclude_request_id=request_id
+                        )
+                        receiver = self._receiver_task
+                        if receiver is not None and not receiver.done():
+                            receiver.cancel()
+                        raise
+                    except Exception as exc:
+                        # One failed physical write invalidates this transport.
+                        # Queued siblings then fail as definitely not sent instead
+                        # of charging the same outage to the shared breaker.
+                        self._connected = False
+                        self._fail_submitted_pending(
+                            "Executor connection send failed", exclude_request_id=request_id
+                        )
+                        receiver = self._receiver_task
+                        if receiver is not None and not receiver.done():
+                            receiver.cancel()
+                        if _write_was_rejected(exc):
+                            raise ExecutorDisconnectedError(
+                                f"Executor {self.executor_id} rejected the write",
+                                DeliveryState.NOT_SENT,
+                                code="executor_disconnected",
+                                executor_id=self.executor_id,
+                                retry_after=1.0,
+                            ) from exc
+                        raise
                 nonlocal submitted
                 submitted = True
-                if on_sent is not None:
-                    await on_sent()
-                return await asyncio.wait_for(future, timeout=effective_timeout)
+                return {}
 
-            result = await self.breaker.call(_do_call)
+            await self.breaker.call(_do_call, operation=method)
+            if on_sent is not None:
+                await on_sent()
+            result = await asyncio.wait_for(future, timeout=effective_timeout)
             EXECUTOR_WS_RPC_DURATION.labels(method=method).observe(perf_counter() - start)
             return result
         except TimeoutError as exc:
@@ -490,10 +584,21 @@ class WebSocketExecutorConnection:
                     retry_after=1.0,
                 ) from exc
             raise
-        except CircuitBreakerError:
+        except CircuitBreakerError as exc:
             EXECUTOR_WS_RPC_ERRORS.labels(method=method, error_type="circuit_open").inc()
             self._pending.pop(request_id, None)
-            raise
+            raise ExecutorDeliveryError(
+                f"Executor {self.executor_id} transport circuit is open before dispatch",
+                DeliveryState.NOT_SENT,
+                code="executor_circuit_open",
+                executor_id=self.executor_id,
+                owner_id=(
+                    self.connection_owner.owner_id if self.connection_owner is not None else None
+                ),
+                epoch=self.epoch,
+                retry_after=exc.retry_after_seconds,
+                executor_instance_id=self.executor_instance_id,
+            ) from exc
         except ExecutorDisconnectedError as exc:
             EXECUTOR_WS_RPC_ERRORS.labels(method=method, error_type="disconnected").inc()
             self._pending.pop(request_id, None)
@@ -505,7 +610,7 @@ class WebSocketExecutorConnection:
                     on_sent=on_sent,
                     stable_call_id=stable_call_id,
                 )
-            if send_attempted:
+            if send_attempted and submitted:
                 raise ExecutorDisconnectedError(
                     str(exc),
                     DeliveryState.ACCEPTED_UNKNOWN,
@@ -521,6 +626,12 @@ class WebSocketExecutorConnection:
             raise
         except ExecutorRPCError:
             raise
+        except _PreSendDispatchError as exc:
+            self._pending.pop(request_id, None)
+            cause = exc.__cause__
+            if isinstance(cause, Exception):
+                raise cause from exc
+            raise
         except Exception as exc:
             EXECUTOR_WS_RPC_ERRORS.labels(method=method, error_type="unknown").inc()
             self._pending.pop(request_id, None)
@@ -532,6 +643,8 @@ class WebSocketExecutorConnection:
                     retry_after=1.0,
                 ) from exc
             raise
+        finally:
+            self._queued_send_ids.discard(request_id)
 
     async def _retry_replay_safe_rpc(
         self,
@@ -637,15 +750,46 @@ class WebSocketExecutorConnection:
             return []
         return [cast(dict[str, Any], tool) for tool in tools if isinstance(tool, dict)]
 
+    async def fetch_tool_result(self, call_id: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        """Ask this executor for the outcome of a previously accepted tool call.
+
+        Returns the executor's report with ``state`` in ``active``,
+        ``terminal``, or ``unknown``. The caller must compare
+        ``executor_instance_id`` with the instance that accepted the call before
+        trusting ``unknown`` as evidence that nothing ran.
+        """
+
+        result = await self.rpc_call(
+            "tool.result_fetch",
+            {"call_id": call_id},
+            timeout=timeout,
+            replay_safe=True,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def tool_execute(
         self,
         tool_call: ToolCall,
         timeout_seconds: int | None = None,
         output_chunk_callback: ToolOutputChunkCallback | None = None,
         *,
-        on_sent: Callable[[], Awaitable[None]] | None = None,
+        before_send: Callable[[str, str | None], Awaitable[None]] | None = None,
+        on_sent: Callable[[str, str | None], Awaitable[None]] | None = None,
     ) -> ToolResult:
         """Execute a tool call on the remote executor."""
+        tracked = False
+        if self._tool_call_started is not None:
+            tracked = self._tool_call_started()
+            if not tracked:
+                return ToolResult(
+                    output="Executor tool admission is closed while the controller drains.",
+                    is_error=True,
+                    metadata={
+                        "code": "executor_draining",
+                        "delivery_state": DeliveryState.NOT_SENT.value,
+                        "retryable": False,
+                    },
+                )
         if output_chunk_callback is not None:
             self._tool_chunk_callbacks[tool_call.call_id] = output_chunk_callback
         try:
@@ -659,8 +803,13 @@ class WebSocketExecutorConnection:
                     "execution_scope_id": tool_call.execution_scope_id,
                     "timeout_seconds": timeout_seconds or 300,
                 },
-                timeout=float(timeout_seconds) if timeout_seconds else None,
-                on_sent=on_sent,
+                timeout=float(timeout_seconds + 10) if timeout_seconds else None,
+                before_send=before_send,
+                on_sent=(
+                    (lambda: on_sent(self.executor_id, self.executor_instance_id))
+                    if on_sent is not None
+                    else None
+                ),
             )
             return ToolResult(
                 output=str(result.get("output", "")),
@@ -680,8 +829,31 @@ class WebSocketExecutorConnection:
             )
             metadata["epoch"] = metadata.get("epoch") or self.epoch
             metadata["retryable"] = exc.delivery_state != DeliveryState.TERMINAL
+            metadata["transport"] = {
+                "route": "physical_websocket",
+                "delivery_state": exc.delivery_state.value,
+                "close_code": self.close_metadata["close_code"],
+                "close_reason": self.close_metadata["close_reason"],
+                "error_type": self.close_metadata["error_type"],
+                # Authoritative identity of the process that accepted this call.
+                # Reconciliation must never infer it from a replacement
+                # connection, or a restarted executor could look like the
+                # original one and a mutating call could be replayed.
+                "executor_instance_id": self.executor_instance_id,
+            }
+            cause = exc.__cause__
+            if isinstance(cause, CircuitBreakerError):
+                metadata["circuit"] = cause.metadata()
+            output = (
+                _transient_executor_output(
+                    executor_id=self.executor_id,
+                    code="executor_circuit_open",
+                )
+                if exc.code == "executor_circuit_open"
+                else "Executor delivery failed; recovery is restricted to the same executor."
+            )
             return ToolResult(
-                output="Executor delivery failed; recovery is restricted to the same executor.",
+                output=output,
                 is_error=True,
                 metadata=metadata,
             )
@@ -693,8 +865,9 @@ class WebSocketExecutorConnection:
             )
         except asyncio.CancelledError:
             raise
-        except CircuitBreakerError:
+        except CircuitBreakerError as exc:
             code = "executor_circuit_open"
+            owner = self.connection_owner
             return ToolResult(
                 output=_transient_executor_output(executor_id=self.executor_id, code=code),
                 is_error=True,
@@ -702,8 +875,12 @@ class WebSocketExecutorConnection:
                     "code": code,
                     "delivery_state": DeliveryState.NOT_SENT.value,
                     "executor_id": self.executor_id,
+                    "executor_instance_id": self.executor_instance_id,
+                    "owner_id": owner.owner_id if owner is not None else None,
+                    "epoch": owner.epoch if owner is not None else None,
                     "retryable": True,
                     "same_executor_only": True,
+                    "circuit": exc.metadata(),
                 },
             )
         except ExecutorRPCError as exc:
@@ -713,6 +890,8 @@ class WebSocketExecutorConnection:
             return ToolResult(output=f"Tool execution failed: {error_detail}", is_error=True)
         finally:
             self._tool_chunk_callbacks.pop(tool_call.call_id, None)
+            if tracked and self._tool_call_finished is not None:
+                self._tool_call_finished()
 
     async def cancel_call(self, call_id: str) -> None:
         """Cancel a running tool execution on the remote executor."""
@@ -1021,18 +1200,32 @@ class WebSocketExecutorConnection:
 
                 if data is None:
                     break
+                if not isinstance(data, dict):
+                    raise TypeError("Executor WebSocket frame must be a JSON object")
 
                 # Every physical-socket frame is fenced at receipt time.  A
                 # takeover may happen after a request was sent but before its
                 # response arrives, so outbound validation alone is not enough.
                 await self._ensure_current_ownership()
+                # A valid frame on this owned physical socket proves that the
+                # transport recovered. Do not leave outbound dispatch blocked by
+                # stale breaker state while the same duplex connection is active.
+                if not await self._apply_owned_effect(
+                    lambda: self.breaker.reset_nowait(
+                        reason="owned_inbound_frame",
+                        operation="receive",
+                    )
+                ):
+                    await self._close_for_ownership_loss()
+                    break
 
                 # JSON-RPC response (has "id" and "result" or "error")
                 msg_id = data.get("id")
-                if msg_id and msg_id in self._pending:
+                if isinstance(msg_id, str) and msg_id in self._pending:
+                    response_id = msg_id
 
                     def resolve_response(
-                        response_id: str = msg_id,
+                        response_id: str = response_id,
                         response: dict[str, Any] = data,
                     ) -> None:
                         future = self._pending.pop(response_id)
@@ -1065,6 +1258,26 @@ class WebSocketExecutorConnection:
                             name=f"executor-heartbeat-renewal-{self.executor_id}",
                         )
                     params = data.get("params", {})
+                    call_snapshot = (
+                        params.get("call_snapshot") if isinstance(params, dict) else None
+                    )
+                    normalized_call_snapshot = normalize_executor_call_snapshot(call_snapshot)
+                    if (
+                        normalized_call_snapshot is not None
+                        and self._call_snapshot_callback is not None
+                        and normalized_call_snapshot.executor_instance_id
+                        == self.executor_instance_id
+                    ):
+                        self._track_notification_task(
+                            self._dispatch_callback(
+                                self._call_snapshot_callback,
+                                self.executor_id,
+                                normalized_call_snapshot.model_dump(mode="json"),
+                                include_owner=True,
+                                fence_callback=False,
+                            ),
+                            name=f"executor-call-snapshot-{self.executor_id}",
+                        )
                     snapshot = params.get("resource_snapshot") if isinstance(params, dict) else None
                     if (
                         isinstance(snapshot, dict)
@@ -1122,28 +1335,37 @@ class WebSocketExecutorConnection:
                     )
                 elif method == "llm.chunk":
                     params = data.get("params", {})
+                    if not isinstance(params, dict):
+                        params = {}
                     req_id = params.get("request_id")
-                    if (
-                        req_id
-                        and req_id in self._inference_queues
-                        and not await self._apply_owned_effect(
-                            lambda req_id=req_id, payload=params: self._enqueue_inference_event(
-                                req_id, payload
-                            )
-                        )
-                    ):
-                        await self._close_for_ownership_loss()
-                        break
+                    if isinstance(req_id, str) and req_id in self._inference_queues:
+                        request_id = req_id
+
+                        def enqueue_chunk(
+                            request_id: str = request_id,
+                            payload: dict[str, Any] = params,
+                        ) -> None:
+                            self._enqueue_inference_event(request_id, payload)
+
+                        if not await self._apply_owned_effect(enqueue_chunk):
+                            await self._close_for_ownership_loss()
+                            break
                 elif method == "llm.done":
                     params = data.get("params", {})
+                    if not isinstance(params, dict):
+                        params = {}
                     req_id = params.get("request_id")
-                    if req_id and req_id in self._inference_queues:
+                    if isinstance(req_id, str) and req_id in self._inference_queues:
+                        request_id = req_id
                         params["done"] = True
-                        if not await self._apply_owned_effect(
-                            lambda req_id=req_id, payload=params: self._enqueue_inference_event(
-                                req_id, payload, done=True
-                            )
-                        ):
+
+                        def enqueue_done(
+                            request_id: str = request_id,
+                            payload: dict[str, Any] = params,
+                        ) -> None:
+                            self._enqueue_inference_event(request_id, payload, done=True)
+
+                        if not await self._apply_owned_effect(enqueue_done):
                             await self._close_for_ownership_loss()
                             break
                 elif method == "shell.background_completed":
@@ -1293,6 +1515,11 @@ class WebSocketExecutorConnection:
 
         self._resource_snapshot_callback = callback
 
+    def register_call_snapshot_callback(self, callback: Any | None) -> None:
+        """Register a callback for every valid call-liveness snapshot."""
+
+        self._call_snapshot_callback = callback
+
     def register_heartbeat_callback(self, callback: Any | None) -> None:
         """Register the DB ownership renewal callback for executor heartbeats."""
 
@@ -1417,10 +1644,26 @@ class WebSocketExecutorConnection:
 
     def _fail_pending(self, reason: str) -> None:
         """Fail all pending RPC futures with a disconnection error."""
-        for future in self._pending.values():
+        queued = {
+            request_id: future
+            for request_id, future in self._pending.items()
+            if request_id in self._queued_send_ids
+        }
+        for request_id, future in self._pending.items():
+            if request_id in queued:
+                continue
             if not future.done():
                 future.set_exception(ExecutorDisconnectedError(reason))
-        self._pending.clear()
+        self._pending = queued
+
+    def _fail_submitted_pending(self, reason: str, *, exclude_request_id: str) -> None:
+        """Fail submitted calls while leaving lock-queued calls definitely unsent."""
+
+        for request_id, future in self._pending.items():
+            if request_id == exclude_request_id or request_id in self._queued_send_ids:
+                continue
+            if not future.done():
+                future.set_exception(ExecutorDisconnectedError(reason))
 
     async def _terminate_pending(self, reason: str) -> None:
         """Promptly terminate all RPC, stream, and queued notification work."""
@@ -1661,8 +1904,79 @@ class WebSocketExecutorProvider:
         self._cluster_auth: Any | None = None
         self._forwarded_connections: dict[tuple[str, str, int], ForwardedExecutorConnection] = {}
         self._forwarded_by_executor: dict[str, ForwardedExecutorConnection] = {}
+        # Proxies removed from routing that are still draining in-flight calls.
+        # Tracked so shutdown can close them instead of orphaning drain tasks.
+        self._retiring_forwarded: set[ForwardedExecutorConnection] = set()
         self._cluster_refresh_task: asyncio.Task[None] | None = None
         self._cluster_refresh_lock = asyncio.Lock()
+        self._cluster_lease_store: DatabaseLeaseStore | None = None
+        self._missing_self_owned_connections: dict[str, float] = {}
+        self._tool_admission_open = True
+        self._active_tool_tasks: set[asyncio.Task[Any]] = set()
+        self._detached_tool_tasks: set[asyncio.Task[Any]] = set()
+        self._tool_calls_settled = asyncio.Event()
+        self._tool_calls_settled.set()
+
+    def _tool_call_started(self) -> bool:
+        """Atomically admit and track one physical tool operation."""
+
+        if not self._tool_admission_open:
+            return False
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Tool execution requires an asyncio task")
+        self._active_tool_tasks.add(task)
+        self._tool_calls_settled.clear()
+        return True
+
+    def _tool_call_finished(self) -> None:
+        """Remove the current physical tool operation from drain tracking."""
+
+        task = asyncio.current_task()
+        if task is not None:
+            self._active_tool_tasks.discard(task)
+        self._set_tool_calls_settled_if_idle()
+
+    def track_detached_tool_call(self, task: asyncio.Task[Any]) -> None:
+        """Track an accepted bridge tool after its requester transport disconnects."""
+
+        if task.done() or task in self._detached_tool_tasks:
+            return
+        self._detached_tool_tasks.add(task)
+        self._tool_calls_settled.clear()
+
+        def settled(done: asyncio.Task[Any]) -> None:
+            self._detached_tool_tasks.discard(done)
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                done.exception()
+            self._set_tool_calls_settled_if_idle()
+
+        task.add_done_callback(settled)
+
+    def _set_tool_calls_settled_if_idle(self) -> None:
+        if not self._active_tool_tasks and not self._detached_tool_tasks:
+            self._tool_calls_settled.set()
+
+    async def drain_tool_calls(self, *, timeout_seconds: float) -> bool:
+        """Close physical tool admission and wait for accepted tools to settle.
+
+        Result, status, reconciliation, and explicit cancellation RPCs remain
+        available. A timeout or cancellation stops only this wait. It never
+        cancels an accepted tool operation.
+        """
+
+        self._tool_admission_open = False
+        self._set_tool_calls_settled_if_idle()
+        if self._tool_calls_settled.is_set():
+            return True
+        if timeout_seconds <= 0:
+            return False
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await self._tool_calls_settled.wait()
+        except TimeoutError:
+            return False
+        return True
 
     async def configure_cluster(
         self,
@@ -1679,6 +1993,7 @@ class WebSocketExecutorProvider:
         if not enabled:
             return
         self._cluster_session_factory = session_factory
+        self._cluster_lease_store = DatabaseLeaseStore(session_factory)
         self._cluster_directory = controller_directory
         self._cluster_runtime = controller_runtime
         self._cluster_auth = auth_provider
@@ -1713,8 +2028,11 @@ class WebSocketExecutorProvider:
             return
         discovered: dict[str, ForwardedExecutorConnection] = {}
         discovered_handles: dict[str, ExecutorHandle] = {}
+        observed_self_owned: set[str] = set()
         candidate_cache = {
-            key: proxy for key, proxy in self._forwarded_connections.items() if not proxy.closing
+            key: proxy
+            for key, proxy in self._forwarded_connections.items()
+            if not proxy.closing and not proxy.retiring
         }
         async with self._cluster_session_factory() as session:
             now = database_now_expression(session)
@@ -1730,13 +2048,43 @@ class WebSocketExecutorProvider:
             )
             for lease in leases:
                 executor_id = lease.resource_key.removeprefix("executor_connection:")
-                if executor_id in self._connections:
+                if self.get_local_connection(executor_id) is not None:
+                    self._missing_self_owned_connections.pop(executor_id, None)
                     continue
-                if (
-                    self._cluster_runtime is None
-                    or lease.owner_id == self._cluster_runtime.owner_id
-                ):
+                if self._cluster_runtime is None:
                     continue
+                if lease.owner_id == self._cluster_runtime.owner_id:
+                    observed_self_owned.add(executor_id)
+                    observed_at = perf_counter()
+                    first_missing = self._missing_self_owned_connections.setdefault(
+                        executor_id, observed_at
+                    )
+                    if (
+                        observed_at - first_missing >= SELF_OWNED_MISSING_CONNECTION_GRACE_SECONDS
+                        and self._cluster_lease_store is not None
+                    ):
+                        released = await self._cluster_lease_store.release(
+                            Lease(
+                                resource_key=lease.resource_key,
+                                owner_id=lease.owner_id,
+                                fencing_token=int(lease.fencing_token),
+                                lease_expires_at=lease.lease_expires_at,
+                            )
+                        )
+                        if released:
+                            _logger.warning(
+                                "executor cluster directory released stale self-owned lease",
+                                extra={
+                                    "extra_data": {
+                                        "executor_id": executor_id,
+                                        "owner_id": lease.owner_id,
+                                        "connection_epoch": int(lease.fencing_token),
+                                    }
+                                },
+                            )
+                            self._missing_self_owned_connections.pop(executor_id, None)
+                    continue
+                self._missing_self_owned_connections.pop(executor_id, None)
                 controller = await self._cluster_directory.get_ready(lease.owner_id)
                 if controller is None or not controller.internal_url:
                     continue
@@ -1749,7 +2097,7 @@ class WebSocketExecutorProvider:
                 runtime_metadata = dict(row.runtime_metadata or {})
                 key = (executor_id, lease.owner_id, int(lease.fencing_token))
                 proxy = candidate_cache.get(key)
-                if proxy is None or proxy.closing:
+                if proxy is None or proxy.closing or proxy.retiring:
                     proxy = ForwardedExecutorConnection(
                         executor_id=executor_id,
                         capabilities=capabilities,
@@ -1784,6 +2132,11 @@ class WebSocketExecutorProvider:
                         "forwarded": True,
                     },
                 )
+        self._missing_self_owned_connections = {
+            executor_id: first_missing
+            for executor_id, first_missing in self._missing_self_owned_connections.items()
+            if executor_id in observed_self_owned
+        }
         for executor_id in self._connections:
             discovered.pop(executor_id, None)
             discovered_handles.pop(executor_id, None)
@@ -1808,7 +2161,11 @@ class WebSocketExecutorProvider:
             for waiter in self._connection_waiters.pop(executor_id, set()):
                 waiter.set()
         for proxy in stale:
-            await proxy.close()
+            # Retire rather than close: the directory poll must not abort tool
+            # calls that are still streaming on a proxy it happens to supersede.
+            # A genuinely dead bridge drains immediately because its receive loop
+            # already failed every pending call.
+            await self._retire_forwarded_proxy(proxy)
 
     # ------------------------------------------------------------------
     # Called by the WS endpoint when an executor connects
@@ -1836,6 +2193,8 @@ class WebSocketExecutorProvider:
             capabilities or ExecutorCapabilities(),
             connection_owner=connection_owner,
             replay_connection_resolver=self._wait_for_replacement_connection,
+            tool_call_started=self._tool_call_started,
+            tool_call_finished=self._tool_call_finished,
         )
         conn.register_background_shell_completed_callback(self._background_shell_completed_callback)
         conn.register_oauth_loopback_callback(self._oauth_loopback_callback)
@@ -1856,7 +2215,10 @@ class WebSocketExecutorProvider:
                 "executor_ws: executor reconnected, closing previous connection",
                 extra={"extra_data": {"executor_id": executor_id}},
             )
-            asyncio.create_task(old.close(), name=f"executor-old-conn-close-{executor_id}")
+            asyncio.create_task(
+                old.close(cause="ExecutorConnectionReplaced"),
+                name=f"executor-old-conn-close-{executor_id}",
+            )
 
         self._connections[executor_id] = conn
         EXECUTOR_WS_CONNECTIONS.inc()
@@ -1871,6 +2233,8 @@ class WebSocketExecutorProvider:
                 metadata=metadata or {},
             )
         else:
+            if not ready:
+                self._handles[executor_id].status = "pending"
             if metadata:
                 self._handles[executor_id].metadata = metadata
 
@@ -2042,8 +2406,8 @@ class WebSocketExecutorProvider:
         self, handle: ExecutorHandle
     ) -> WebSocketExecutorConnection | ForwardedExecutorConnection:
         """Return the live connection for a handle."""
-        conn = self.get_connection(handle.executor_id)
-        if conn is None or not conn.connected:
+        conn = self.get_ready_connection(handle.executor_id)
+        if conn is None:
             raise ExecutorDisconnectedError(
                 f"Executor {handle.executor_id} is not connected",
                 DeliveryState.NOT_SENT,
@@ -2104,6 +2468,10 @@ class WebSocketExecutorProvider:
             self._cluster_refresh_task = None
         for proxy in self._forwarded_connections.values():
             await proxy.close()
+        for proxy in tuple(self._retiring_forwarded):
+            with contextlib.suppress(Exception):
+                await proxy.close()
+        self._retiring_forwarded.clear()
         self._forwarded_connections.clear()
         self._forwarded_by_executor.clear()
 
@@ -2168,14 +2536,33 @@ class WebSocketExecutorProvider:
         if local is not None:
             return local
         forwarded = self._forwarded_by_executor.get(executor_id)
-        return forwarded if forwarded is not None and not forwarded.closing else None
+        if forwarded is None or forwarded.closing or forwarded.retiring:
+            # A retired proxy still drains its in-flight calls but must never be
+            # handed out for a new dispatch.
+            return None
+        return forwarded
+
+    def get_ready_connection(
+        self, executor_id: str
+    ) -> WebSocketExecutorConnection | ForwardedExecutorConnection | None:
+        """Return a connection that completed executor configuration."""
+
+        handle = self._handles.get(executor_id)
+        if handle is None or handle.status != "ready":
+            return None
+        return self.get_connection(executor_id)
 
     async def invalidate_forwarded_connection(
         self,
         executor_id: str,
         connection: ForwardedExecutorConnection,
     ) -> None:
-        """Drop one stale forwarded proxy before owner/epoch re-resolution."""
+        """Drop one stale forwarded proxy before owner/epoch re-resolution.
+
+        The proxy is retired rather than closed: it is removed from the registry
+        so the next call resolves a fresh transport, while calls already in
+        flight on it (belonging to other sessions) are allowed to finish.
+        """
 
         async with self._cluster_refresh_lock:
             proxy = self._forwarded_by_executor.get(executor_id)
@@ -2185,7 +2572,61 @@ class WebSocketExecutorProvider:
             for key, candidate in tuple(self._forwarded_connections.items()):
                 if candidate is connection:
                     self._forwarded_connections.pop(key, None)
-            await connection.close()
+            await self._retire_forwarded_proxy(connection)
+
+    async def _retire_forwarded_proxy(self, proxy: ForwardedExecutorConnection) -> None:
+        """Retire one proxy and keep it tracked until it finishes draining."""
+
+        same_executor = [
+            candidate
+            for candidate in self._retiring_forwarded
+            if candidate.executor_id == proxy.executor_id
+        ]
+        while (
+            len(same_executor) >= _MAX_RETIRING_FORWARDED_PROXIES_PER_EXECUTOR
+            or len(self._retiring_forwarded) >= _MAX_RETIRING_FORWARDED_PROXIES
+        ):
+            candidates = same_executor or list(self._retiring_forwarded)
+            oldest = min(
+                candidates,
+                key=lambda candidate: candidate.retirement_started_at or 0.0,
+            )
+            self._retiring_forwarded.discard(oldest)
+            await oldest.close()
+            same_executor = [candidate for candidate in same_executor if candidate is not oldest]
+            _logger.warning(
+                "executor_ws: evicted oldest retiring forwarded proxy",
+                extra={
+                    "extra_data": {
+                        "executor_id": oldest.executor_id,
+                        "owner_id": oldest.owner_id,
+                        "epoch": oldest.epoch,
+                    }
+                },
+            )
+        self._retiring_forwarded.add(proxy)
+        await proxy.retire()
+        task = proxy.drain_task
+        if task is None:
+            self._retiring_forwarded.discard(proxy)
+            return
+
+        def drained(done: asyncio.Task[None]) -> None:
+            self._retiring_forwarded.discard(proxy)
+            if not done.cancelled() and done.exception() is not None:
+                _logger.warning(
+                    "executor_ws: forwarded proxy drain failed",
+                    extra={
+                        "extra_data": {
+                            "executor_id": proxy.executor_id,
+                            "owner_id": proxy.owner_id,
+                            "epoch": proxy.epoch,
+                            "error_type": type(done.exception()).__name__,
+                        }
+                    },
+                )
+
+        task.add_done_callback(drained)
 
     async def notify_browser_session_terminal(
         self,
@@ -2342,9 +2783,13 @@ class WebSocketExecutorProvider:
         timeout: float | None = None,
         failed_connection: WebSocketExecutorConnection | ForwardedExecutorConnection | None = None,
         delivery_state: DeliveryState | str = DeliveryState.NOT_SENT,
+        accepted_unknown_replay_safe: bool = False,
         failed_generation: int | None = None,
         failed_owner_id: str | None = None,
         failed_epoch: int | None = None,
+        require_recovered_connection: bool = False,
+        cancel_event: asyncio.Event | None = None,
+        execution_fence: Any | None = None,
     ) -> WebSocketExecutorConnection | ForwardedExecutorConnection | None:
         """Wait for an eligible same-ID transport under delivery-certainty rules."""
 
@@ -2357,26 +2802,52 @@ class WebSocketExecutorProvider:
         self._connection_waiters.setdefault(executor_id, set()).add(event)
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError
+                if execution_fence is not None:
+                    await execution_fence.assert_current()
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     return None
                 if self._cluster_enabled:
-                    try:
-                        await asyncio.wait_for(
-                            self.refresh_cluster_directory(),
-                            timeout=remaining,
-                        )
-                    except TimeoutError:
-                        return None
-                conn = self.get_connection(executor_id)
+                    refresh_task = asyncio.create_task(self.refresh_cluster_directory())
+                    cancel_task = (
+                        asyncio.create_task(cancel_event.wait())
+                        if cancel_event is not None
+                        else None
+                    )
+                    refresh_waiters: set[asyncio.Task[Any]] = {refresh_task}
+                    if cancel_task is not None:
+                        refresh_waiters.add(cancel_task)
+                    done, pending = await asyncio.wait(
+                        refresh_waiters,
+                        timeout=min(
+                            remaining,
+                            _CONNECTION_DIRECTORY_REFRESH_SLICE_SECONDS,
+                        ),
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for pending_task in pending:
+                        pending_task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    if cancel_task is not None and cancel_task in done:
+                        refresh_task.cancel()
+                        await asyncio.gather(refresh_task, return_exceptions=True)
+                        raise asyncio.CancelledError
+                    if refresh_task not in done:
+                        continue
+                    await refresh_task
+                conn = self.get_ready_connection(executor_id)
                 if self._connection_is_retry_eligible(
                     executor_id,
                     conn,
                     failed_connection=failed_connection,
                     delivery_state=state,
+                    accepted_unknown_replay_safe=accepted_unknown_replay_safe,
                     failed_generation=failed_generation,
                     failed_owner_id=failed_owner_id,
                     failed_epoch=failed_epoch,
+                    require_recovered_connection=require_recovered_connection,
                 ):
                     return conn
                 remaining = deadline - asyncio.get_running_loop().time()
@@ -2405,18 +2876,34 @@ class WebSocketExecutorProvider:
         *,
         failed_connection: WebSocketExecutorConnection | ForwardedExecutorConnection | None,
         delivery_state: DeliveryState,
+        accepted_unknown_replay_safe: bool,
         failed_generation: int | None,
         failed_owner_id: str | None,
         failed_epoch: int | None,
+        require_recovered_connection: bool,
     ) -> bool:
         if connection is None:
             return False
-        if isinstance(connection, ForwardedExecutorConnection) and connection.closing:
+        if isinstance(connection, ForwardedExecutorConnection) and (
+            connection.closing or connection.retiring
+        ):
             return False
+        if connection is failed_connection and require_recovered_connection:
+            breaker = getattr(connection, "breaker", None)
+            opened_at = getattr(breaker, "opened_at", None)
+            recovery_timeout = getattr(breaker, "recovery_timeout", None)
+            if (
+                opened_at is not None
+                and isinstance(recovery_timeout, int | float)
+                and datetime.now(UTC) - opened_at < timedelta(seconds=recovery_timeout)
+            ):
+                return False
         if delivery_state is DeliveryState.NOT_SENT:
             return True
         if connection is failed_connection:
             return False
+        if delivery_state is DeliveryState.ACCEPTED_UNKNOWN and accepted_unknown_replay_safe:
+            return True
         handle = self._handles.get(executor_id)
         metadata = dict(handle.metadata or {}) if handle is not None else {}
         candidate_generation = metadata.get("generation")
@@ -2424,6 +2911,8 @@ class WebSocketExecutorProvider:
             candidate_generation = metadata.get("active_executor_generation")
         if not isinstance(candidate_generation, int):
             candidate_generation = None
+        candidate_owner_id: str | None
+        candidate_epoch: int | None
         if isinstance(connection, ForwardedExecutorConnection):
             candidate_owner_id = connection.owner_id
             candidate_epoch = connection.epoch

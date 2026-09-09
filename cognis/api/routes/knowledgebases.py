@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, NoReturn, cast
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, Query, Request, Response, UploadFile
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.responses import StreamingResponse
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
@@ -16,6 +17,7 @@ from cognis.knowledgebase.service import (
     KnowledgebaseFacetLimitError,
     KnowledgebaseNotReadyError,
     KnowledgebaseRequestError,
+    KnowledgebaseService,
     KnowledgebaseValidationError,
     normalize_source_path,
 )
@@ -57,14 +59,14 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/knowledgebases", tags=["knowledgebases"])
 
 
-def _service(request: Request):
+def _service(request: Request) -> KnowledgebaseService:
     service = getattr(request.app.state, "knowledgebase_service", None)
     if service is None:
         raise api_exception(404, "not_found", "Knowledgebase feature is not available")
-    return service
+    return cast(KnowledgebaseService, service)
 
 
-def _disabled_error(exc: RuntimeError) -> None:
+def _disabled_error(exc: RuntimeError) -> NoReturn:
     if isinstance(exc, KnowledgebaseNotReadyError):
         raise api_exception(
             503,
@@ -76,9 +78,8 @@ def _disabled_error(exc: RuntimeError) -> None:
     )
 
 
-def _raise_disabled(exc: RuntimeError) -> None:
+def _raise_disabled(exc: RuntimeError) -> NoReturn:
     _disabled_error(exc)
-    raise AssertionError("unreachable")
 
 
 def _raise_product_error(exc: KnowledgebaseRequestError) -> None:
@@ -90,11 +91,11 @@ def _raise_product_error(exc: KnowledgebaseRequestError) -> None:
     raise api_exception(400, "validation_error", message) from exc
 
 
-def _session_factory(request: Request):
+def _session_factory(request: Request) -> async_sessionmaker[Any]:
     session_factory = getattr(request.app.state, "session_factory", None)
     if session_factory is None:
         raise api_exception(500, "internal_error", "Session factory unavailable")
-    return session_factory
+    return cast(async_sessionmaker[Any], session_factory)
 
 
 def _access_context(request: Request) -> KnowledgebaseAccessContext:
@@ -137,7 +138,7 @@ async def knowledgebase_capabilities(request: Request) -> KnowledgebaseCapabilit
             notes=["Knowledgebase service is not configured."],
         )
     try:
-        return await service.capabilities()
+        return cast(KnowledgebaseCapabilities, await service.capabilities())
     except Exception:
         return KnowledgebaseCapabilities(
             enabled=bool(getattr(service, "enabled", False)),

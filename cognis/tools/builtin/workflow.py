@@ -8,10 +8,13 @@ here exist solely for visibility on the Tools page and tool registry.
 from __future__ import annotations
 
 import copy
+from typing import Any
 
 from cognis.models.credential import SUPPORTED_CREDENTIAL_KINDS
 from cognis.models.deliverable import (
     CANONICAL_CHART_BLOCK_SCHEMA,
+    DASHBOARD_PRESENTATION_DESCRIPTOR,
+    DASHBOARD_SKELETON,
     PULSE_DAILY_SKELETON,
     PULSE_PRESENTATION_DESCRIPTOR,
     PULSE_WRITE_DELIVERABLE_SCHEMA,
@@ -267,15 +270,25 @@ _GENERIC_RICH_BLOCK_SCHEMA = {
     "additionalProperties": True,
 }
 
-_WRITE_DELIVERABLE_SCHEMA = {
+_PAYLOAD_ARTIFACT_SCHEMA = {
     "type": "object",
-    "definitions": {"genericRichBlock": _GENERIC_RICH_BLOCK_SCHEMA},
     "properties": {
-        "action": {
+        "artifact_id": {
             "type": "string",
-            "const": "write_deliverable",
-            "description": "Select the generic write_deliverable operation.",
-        },
+            "pattern": "^art_[0-9a-f]{32}$",
+            "description": (
+                "Immutable application/json artifact produced by artifact_publish. "
+                "Local paths, URLs, content refs, base64, and artifact value refs are not accepted."
+            ),
+        }
+    },
+    "required": ["artifact_id"],
+    "additionalProperties": False,
+}
+
+_TEXT_WRITE_DELIVERABLE_SCHEMA = {
+    "type": "object",
+    "properties": {
         "content": {
             "type": "string",
             "minLength": 1,
@@ -289,72 +302,91 @@ _WRITE_DELIVERABLE_SCHEMA = {
         },
         "format": {
             "type": "string",
-            "enum": ["markdown", "plain", "html", "rich"],
+            "enum": ["markdown", "plain", "html"],
             "description": "How the deliverable should be rendered.",
             "default": "markdown",
-        },
-        "rich": {
-            "type": "object",
-            "description": (
-                "Renderer-neutral Rich Deliverables v2 payload for format='rich'. "
-                "Canonical shape is block-composed with blocks, assets, sources, "
-                "datasets, exports, and metadata. content remains required fallback."
-            ),
-            "properties": {
-                "blocks": {
-                    "type": "array",
-                    "items": _GENERIC_RICH_BLOCK_SCHEMA,
-                    "description": (
-                        "Canonical blocks. card/metric/status/action and all existing blocks "
-                        "accept optional variant, dek/summary, href, source_ids/citations, "
-                        "scalar icon, tone, and authorized media."
-                    ),
-                },
-                "metadata": {
-                    "type": "object",
-                    "properties": {
-                        "presentation": {
-                            "not": {"const": "pulse"},
-                            "description": (
-                                "Pulse payloads must use action='rich:pulse'; omit this "
-                                "field for explicit generic rich fallback."
-                            ),
-                        }
-                    },
-                },
-            },
-            "required": ["blocks"],
         },
         "title": {
             "type": "string",
             "description": "Optional title for the deliverable.",
-        },
-        "target": {
-            "type": "string",
-            "enum": ["channel", "none"],
-            "description": (
-                "Optional delivery hint. Final workflow policy decides what actually "
-                "gets delivered."
-            ),
         },
         "outputs": {
             "type": "object",
             "description": "Optional structured sidecar data for evaluators or later steps.",
         },
     },
-    "required": ["action", "content"],
+    "required": ["content"],
+    "additionalProperties": False,
 }
 
-_PULSE_WRITE_DELIVERABLE_SCHEMA = copy.deepcopy(PULSE_WRITE_DELIVERABLE_SCHEMA)
-_PULSE_WRITE_DELIVERABLE_SCHEMA.setdefault("properties", {})["action"] = {
-    "type": "string",
-    "const": "rich:pulse",
-    "description": "Select the validated Pulse authoring operation.",
+_GENERIC_RICH_PAYLOAD_SCHEMA = {
+    "type": "object",
+    "definitions": {"genericRichBlock": _GENERIC_RICH_BLOCK_SCHEMA},
+    "properties": {
+        "title": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "blocks": {
+            "type": "array",
+            "items": _GENERIC_RICH_BLOCK_SCHEMA,
+        },
+        "assets": {"type": "array", "items": {"type": "object"}},
+        "sources": {"type": "array", "items": {"type": "object"}},
+        "datasets": {"type": "array", "items": {"type": "object"}},
+        "exports": {"type": "array", "items": {"type": "object"}},
+        "outputs": {"type": "object"},
+        "metadata": {
+            "type": "object",
+            "properties": {"presentation": False},
+        },
+    },
+    "required": ["title", "blocks"],
+    "additionalProperties": True,
 }
-_PULSE_WRITE_DELIVERABLE_SCHEMA["required"] = [
-    "action",
-    *[field for field in _PULSE_WRITE_DELIVERABLE_SCHEMA.get("required", []) if field != "action"],
+
+_RICH_WRITE_DELIVERABLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "definitions": {"genericRichBlock": _GENERIC_RICH_BLOCK_SCHEMA},
+    "properties": {
+        "action": {"type": "string", "const": "rich"},
+        "payload": _GENERIC_RICH_PAYLOAD_SCHEMA,
+        "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+    },
+    "required": ["action"],
+    "oneOf": [{"required": ["payload"]}, {"required": ["payload_artifact"]}],
+    "additionalProperties": False,
+}
+
+_DASHBOARD_AUTHORING_SCHEMA: dict[str, Any] = copy.deepcopy(_RICH_WRITE_DELIVERABLE_SCHEMA)
+_DASHBOARD_AUTHORING_SCHEMA["properties"]["action"]["const"] = "rich:dashboard"
+
+_PULSE_WRITE_DELIVERABLE_SCHEMA = copy.deepcopy(PULSE_WRITE_DELIVERABLE_SCHEMA)
+_PULSE_BLOCK_SCHEMA = _PULSE_WRITE_DELIVERABLE_SCHEMA["definitions"]["pulseRichBlock"]
+_PULSE_PAYLOAD_SCHEMA = _PULSE_WRITE_DELIVERABLE_SCHEMA["properties"]["rich"]
+_PULSE_PAYLOAD_SCHEMA["properties"]["title"] = {
+    "type": "string",
+    "minLength": 1,
+    "pattern": "\\S",
+}
+_PULSE_PAYLOAD_SCHEMA["required"] = [
+    "title",
+    *[field for field in _PULSE_PAYLOAD_SCHEMA.get("required", []) if field != "title"],
 ]
+_PULSE_METADATA_SCHEMA = _PULSE_PAYLOAD_SCHEMA["properties"]["metadata"]
+_PULSE_METADATA_SCHEMA["properties"]["presentation"] = False
+_PULSE_METADATA_SCHEMA["required"] = [
+    field for field in _PULSE_METADATA_SCHEMA.get("required", []) if field != "presentation"
+]
+_PULSE_AUTHORING_SCHEMA = {
+    "type": "object",
+    "definitions": {"pulseRichBlock": _PULSE_BLOCK_SCHEMA},
+    "properties": {
+        "action": {"type": "string", "const": "rich:pulse"},
+        "payload": _PULSE_PAYLOAD_SCHEMA,
+        "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+    },
+    "required": ["action"],
+    "oneOf": [{"required": ["payload"]}, {"required": ["payload_artifact"]}],
+    "additionalProperties": False,
+}
 
 _WRITE_DELIVERABLE_DESCRIPTION = (
     "Write a durable deliverable after the work is complete. In workflow/task "
@@ -368,9 +400,9 @@ _WRITE_DELIVERABLE_DESCRIPTION = (
     "when the turn should produce "
     "a durable/rendered/shareable artifact such as a report, spec, dashboard, "
     "or rich document; do not use it for normal answers, intermediate progress, "
-    "drafts, notes, or status updates. The content argument is always the "
-    "required fallback artifact for model-visible summaries, channels, "
-    "compaction, notifications, and accessibility.\n\n"
+    "drafts, notes, or status updates. Ordinary text needs only content. Rich "
+    "authoring uses one canonical payload or payload_artifact source, and Cognis "
+    "derives its Markdown fallback.\n\n"
     "Decision tree before authoring: (1) Is this a normal conversational answer, "
     "a status update, or intermediate progress? Answer inline in the assistant "
     "message; do not call this tool. (2) Does the reader only need prose "
@@ -378,12 +410,13 @@ _WRITE_DELIVERABLE_DESCRIPTION = (
     "not force it into blocks. (3) Does the reader benefit from structure a "
     "human designer would choose deliberately — comparison, dashboard, "
     "narrative-with-evidence, timeline, reference doc, or visual monitoring? "
-    "Use format='rich' and compose from the generic block vocabulary (see the "
+    "Use action='rich' and compose from the generic block vocabulary (see the "
     "block type enum and, for detailed composition guidance and archetype "
     "recipes, call describe_tool for this tool or load the "
-    "cognis-rich-deliverable skill). (4) Is the artifact specifically a daily "
-    "Pulse presentation? Use the registered rich:pulse operation instead of "
-    "generic rich.\n\n"
+    "cognis-rich-deliverable skill). (4) Is the artifact an operational "
+    "dashboard? Use the registered rich:dashboard operation. (5) Is the "
+    "artifact specifically a daily Pulse presentation? Use the registered "
+    "rich:pulse operation instead of generic rich.\n\n"
     "Compose for a reader, not a form: pick blocks the way a human editor would "
     "— use dashboard/metric/card_grid for at-a-glance status, comparison_matrix "
     "or decision_matrix for options being weighed, research_answer or "
@@ -512,6 +545,11 @@ _GENERIC_RICH_COMPOSITION_GUIDE: dict[str, object] = {
             "only if there are real numbers to scan. Do not force structure "
             "that is not in the content."
         ),
+        "operational_dashboard": (
+            "Use the registered rich:dashboard operation for an operational "
+            "or capacity dashboard. It applies the strict native dashboard "
+            "composition contract over generic Rich primitives."
+        ),
         "daily_pulse_or_briefing": (
             "Use the registered rich:pulse operation instead of generic rich "
             "for this specific archetype; it is an optional preset, not a "
@@ -537,11 +575,40 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
     name="write_deliverable",
     description=_WRITE_DELIVERABLE_DESCRIPTION,
     parameters={},
+    provider_exposure_schema={
+        "type": "object",
+        "properties": {
+            "content": {"type": "string", "minLength": 1},
+            "format": {
+                "type": "string",
+                "enum": ["markdown", "plain", "html"],
+                "default": "markdown",
+            },
+            "title": {"type": "string"},
+            "outputs": {"type": "object"},
+            "action": {
+                "type": "string",
+                "enum": ["rich", "rich:dashboard", "rich:pulse"],
+            },
+            "payload": {
+                "type": "object",
+                "description": (
+                    "Inline Rich payload. Call describe_tool for the selected action's "
+                    "authoritative contract."
+                ),
+            },
+            "payload_artifact": _PAYLOAD_ARTIFACT_SCHEMA,
+        },
+        "additionalProperties": False,
+    },
     source=_SOURCE,
     category="deliverable",
     read_only=False,
     descriptor_extensions={
-        "presentation_contracts": {"rich:pulse": PULSE_PRESENTATION_DESCRIPTOR},
+        "presentation_contracts": {
+            "rich:dashboard": DASHBOARD_PRESENTATION_DESCRIPTOR,
+            "rich:pulse": PULSE_PRESENTATION_DESCRIPTOR,
+        },
         "rich_media_contract": {
             "input": _RICH_MEDIA_INPUT_SCHEMA,
             "persisted_reference": {"type": "object", "required": ["key"]},
@@ -556,16 +623,28 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
     native_operations=[
         NativeToolOperation(
             operation="write_deliverable",
-            summary="Write a generic durable deliverable.",
+            summary="Write a Markdown, plain-text, or HTML deliverable. Only content is required.",
             mutation_kind=ToolMutationKind.CREATE,
-            input_schema=_WRITE_DELIVERABLE_SCHEMA,
+            input_schema=_TEXT_WRITE_DELIVERABLE_SCHEMA,
             semantics=declared_default_semantics(ToolMutationKind.CREATE),
             examples=[
                 {
-                    "action": "write_deliverable",
                     "content": "## Summary\nFallback text",
-                    "format": "rich",
-                    "rich": {
+                }
+            ],
+            side_effects=["Persists a durable deliverable after validation succeeds."],
+        ),
+        NativeToolOperation(
+            operation="rich",
+            summary="Write a generic Rich Deliverable from one canonical payload source.",
+            mutation_kind=ToolMutationKind.CREATE,
+            input_schema=_RICH_WRITE_DELIVERABLE_SCHEMA,
+            semantics=declared_default_semantics(ToolMutationKind.CREATE),
+            examples=[
+                {
+                    "action": "rich",
+                    "payload": {
+                        "title": "Request trend",
                         "blocks": [
                             {
                                 "type": "chart",
@@ -607,13 +686,9 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
                     },
                 },
                 {
-                    "action": "write_deliverable",
-                    "content": (
-                        "## Should we migrate to arm64 Bottlerocket?\nYes, based on cost "
-                        "and operational fit. See attached comparison."
-                    ),
-                    "format": "rich",
-                    "rich": {
+                    "action": "rich",
+                    "payload": {
+                        "title": "Should we migrate to arm64 Bottlerocket?",
                         "blocks": [
                             {
                                 "type": "research_answer",
@@ -664,6 +739,35 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
             validator_ids=["write_deliverable.rich"],
         ),
         NativeToolOperation(
+            operation="rich:dashboard",
+            summary=(
+                "Author a validated native dashboard with compact metrics, "
+                "structured data, and a wide presentation canvas."
+            ),
+            mutation_kind=ToolMutationKind.CREATE,
+            input_schema=_DASHBOARD_AUTHORING_SCHEMA,
+            semantics=declared_default_semantics(ToolMutationKind.CREATE),
+            examples=[
+                {
+                    "action": "rich:dashboard",
+                    "payload": {
+                        key: value for key, value in DASHBOARD_SKELETON.items() if key != "metadata"
+                    }
+                    | {
+                        "metadata": {
+                            key: value
+                            for key, value in DASHBOARD_SKELETON["metadata"].items()
+                            if key != "presentation"
+                        }
+                    },
+                }
+            ],
+            side_effects=[
+                "Persists a deliverable only after the dashboard presentation validator succeeds."
+            ],
+            validator_ids=["write_deliverable.rich"],
+        ),
+        NativeToolOperation(
             operation="rich:pulse",
             summary=(
                 "Author a validated, visual-first Pulse Rich Deliverable using the registered "
@@ -672,14 +776,24 @@ WRITE_DELIVERABLE_TOOL = BaseToolDefinition(
                 "operation before authoring."
             ),
             mutation_kind=ToolMutationKind.CREATE,
-            input_schema=_PULSE_WRITE_DELIVERABLE_SCHEMA,
+            input_schema=_PULSE_AUTHORING_SCHEMA,
             semantics=declared_default_semantics(ToolMutationKind.CREATE),
             examples=[
                 {
                     "action": "rich:pulse",
-                    "content": "Daily pulse fallback.",
-                    "format": "rich",
-                    "rich": PULSE_DAILY_SKELETON,
+                    "payload": {
+                        "title": "Daily pulse",
+                        **{
+                            key: value
+                            for key, value in PULSE_DAILY_SKELETON.items()
+                            if key != "metadata"
+                        },
+                        "metadata": {
+                            key: value
+                            for key, value in PULSE_DAILY_SKELETON["metadata"].items()
+                            if key != "presentation"
+                        },
+                    },
                 }
             ],
             side_effects=[
@@ -873,14 +987,9 @@ LIST_CREDENTIALS_TOOL = ToolDefinition(
 STEP_TODO_WRITE_TOOL = ToolDefinition(
     name="step_todo_write",
     description=(
-        "Track required progress for genuine multistep work within this step. Do not create a "
-        "todo list for work that can be completed in a single response, including straightforward "
-        "questions, short answers, or simple clarification. Keep created todos current across "
-        "turns, and mark every item completed or cancelled before terminal completion. Multiple "
-        "in_progress items are allowed for genuinely parallel workstreams. Architect todos should "
-        "track durable workstreams or milestones; developer todos should track granular "
-        "implementation, test, and acceptance steps. Stable labels or hierarchy are optional when "
-        "useful. The todos array replaces the entire current list."
+        "Track progress for genuine multistep work. Keep statuses current as work changes, "
+        "and complete or cancel every item before finishing. The todos array replaces the "
+        "entire current list."
     ),
     parameters={
         "type": "object",

@@ -81,7 +81,9 @@ import Zap from 'lucide-svelte/icons/zap';
     interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
     allow_policy_text: '',
     deny_policy_text: '',
-    max_concurrent_runs: 1
+    max_concurrent_runs: 1,
+    retry_failed_tasks: false,
+    fail_paused_task_on_next_fire: true
   });
 
   const statusColors: Record<string, string> = {
@@ -168,7 +170,9 @@ import Zap from 'lucide-svelte/icons/zap';
       interaction_mode_override: s.interaction_mode_override ?? 'none',
       allow_policy_text: policyText((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy, 'allow_policies'),
       deny_policy_text: policyText((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy, 'deny_policies'),
-      max_concurrent_runs: s.max_concurrent_runs
+      max_concurrent_runs: s.max_concurrent_runs,
+      retry_failed_tasks: s.retry_failed_tasks,
+      fail_paused_task_on_next_fire: s.fail_paused_task_on_next_fire
     };
   }
 
@@ -241,7 +245,9 @@ import Zap from 'lucide-svelte/icons/zap';
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
         interaction_mode_override: form.interaction_mode_override,
-        max_concurrent_runs: form.max_concurrent_runs
+        max_concurrent_runs: form.max_concurrent_runs,
+        retry_failed_tasks: form.retry_failed_tasks,
+        fail_paused_task_on_next_fire: form.fail_paused_task_on_next_fire
       });
       await loadData();
       addToast('Schedule saved', 'success');
@@ -496,6 +502,15 @@ import Zap from 'lucide-svelte/icons/zap';
             <Input id="edit-concurrent" bind:value={form.max_concurrent_runs} type="number" />
           </div>
         </div>
+
+        <label class="flex items-start gap-3 text-sm text-slate-300">
+          <input type="checkbox" bind:checked={form.retry_failed_tasks} class="mt-1" />
+          <span>Retry failed tasks before the next regular schedule time.</span>
+        </label>
+        <label class="flex items-start gap-3 text-sm text-slate-300">
+          <input type="checkbox" bind:checked={form.fail_paused_task_on_next_fire} class="mt-1" />
+          <span>Fail paused tasks when the next regular run starts.</span>
+        </label>
 
         <div class="space-y-1">
           <label for="edit-task-title" class="text-xs font-medium uppercase tracking-widest text-slate-400">Task title</label>

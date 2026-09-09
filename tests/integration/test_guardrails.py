@@ -23,7 +23,11 @@ from tests.integration.conftest import (
 def test_intaris_records_session_events(live_stack: LiveStack, run_id: str) -> None:
     """After a chat turn, Intaris should have recorded session events."""
     agent_id = f"guard-agent-{run_id}"
-    live_create_agent(live_stack, agent_id)
+    live_create_agent(
+        live_stack,
+        agent_id,
+        capabilities={"memory_backend": "none", "guardrails_backend": "intaris"},
+    )
     conv = live_create_conversation(live_stack, agent_id)
     cid = conv["conversation_id"]
 

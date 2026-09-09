@@ -180,17 +180,17 @@ def _eval_node(node: ast.AST, context: dict[str, Any]) -> Any:
 def _compare(left: Any, op: ast.cmpop, right: Any) -> bool:
     try:
         if isinstance(op, ast.Eq):
-            return left == right
+            return bool(left == right)
         if isinstance(op, ast.NotEq):
-            return left != right
+            return bool(left != right)
         if isinstance(op, ast.Lt):
-            return left < right
+            return bool(left < right)
         if isinstance(op, ast.LtE):
-            return left <= right
+            return bool(left <= right)
         if isinstance(op, ast.Gt):
-            return left > right
+            return bool(left > right)
         if isinstance(op, ast.GtE):
-            return left >= right
+            return bool(left >= right)
         if isinstance(op, ast.In):
             return left in right
         if isinstance(op, ast.NotIn):

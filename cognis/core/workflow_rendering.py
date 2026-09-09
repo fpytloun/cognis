@@ -7,13 +7,13 @@ import json
 import re
 from collections.abc import Mapping
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.relativedelta import relativedelta
 from jinja2 import StrictUndefined, nodes
-from jinja2.exceptions import TemplateError
-from jinja2.sandbox import SandboxedEnvironment, SecurityError
+from jinja2.exceptions import SecurityError, TemplateError
+from jinja2.sandbox import SandboxedEnvironment
 
 from cognis.models.workflow import DeterministicOutputConfig, StepOutput
 
@@ -115,7 +115,7 @@ def _date_delta(value: str, *, subtract: bool, **parts: int) -> str:
         raise WorkflowRenderError("date helper duration contains unsupported values")
     delta = relativedelta(**parts)
     result = _datetime(value) - delta if subtract else _datetime(value) + delta
-    return result.isoformat()
+    return cast(str, result.isoformat())
 
 
 def _convert_timezone(value: str, from_timezone: str, to_timezone: str) -> str:
@@ -191,7 +191,7 @@ class WorkflowRenderer:
             raise WorkflowRenderError("workflow template uses a forbidden construct")
         if sum(1 for _ in parsed.find_all(nodes.Node)) > MAX_TEMPLATE_NODES:
             raise WorkflowRenderError("workflow template exceeds complexity limit")
-        return safe_context
+        return cast(dict[str, Any], safe_context)
 
     def _bounded(self, value: Any, *, limit: int | None = None) -> Any:
         safe = _validate_json_like(value)
@@ -212,7 +212,7 @@ class WorkflowRenderer:
             RecursionError,
         ) as exc:
             raise WorkflowRenderError("workflow text rendering failed") from exc
-        return self._bounded(rendered)
+        return cast(str, self._bounded(rendered))
 
     def render_expression(self, source: str, context: Mapping[str, Any]) -> bool:
         match = _EXACT_EXPRESSION.fullmatch(source)

@@ -86,6 +86,7 @@ async def test_work_projection_bootstrap_is_idempotent_and_creates_indexes(
         "ix_work_records_pairing",
         "ix_work_records_owner_category_order",
         "ix_work_records_owner_category_entity",
+        "ix_work_records_overview_evidence",
     } <= set(indexes["work_records"])
     assert {
         "ix_work_session_projections_queue",

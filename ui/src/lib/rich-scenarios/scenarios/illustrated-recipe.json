@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "id": "illustrated-recipe",
+  "title": "Illustrated rosemary focaccia",
+  "description": "An image-led, safety-conscious recipe fixture that associates each visual with its cooking step.",
+  "group": "food",
+  "sort_key": 1500,
+  "content": "Illustrated rosemary focaccia recipe with ingredients, method, food safety, storage, and provenance.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Weekend baking",
+      "subtitle": "A practical image-forward recipe fixture with attached step visuals.",
+      "density": "comfortable",
+      "toc": false
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Illustrated recipe",
+        "title": "Golden rosemary focaccia",
+        "subtitle": "A crisp-edged, olive-oil-rich bread for a shared lunch. The visual sequence stays beside the work it explains.",
+        "badges": ["Serves 6", "20 min active", "2 h 25 min total", "Easy"],
+        "media": {
+          "ref": "/fixtures/rich-scenarios/illustrated-recipe/focaccia-hero.svg",
+          "src": "/fixtures/rich-scenarios/illustrated-recipe/focaccia-hero.svg",
+          "alt": "Golden rosemary focaccia in a dark baking pan",
+          "credit": "Synthetic fixture illustration generated for Cognis visual QA"
+        }
+      },
+      {
+        "type": "grid",
+        "columns": 4,
+        "blocks": [
+          {"type": "metric", "label": "Yield", "value": "6 portions", "icon": "users"},
+          {"type": "metric", "label": "Prep", "value": "20 min", "icon": "clock"},
+          {"type": "metric", "label": "Bake", "value": "22 min", "icon": "flame"},
+          {"type": "metric", "label": "Difficulty", "value": "Easy", "icon": "check"}
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "section",
+            "title": "Ingredients",
+            "blocks": [
+              {
+                "type": "table",
+                "title": "Dough",
+                "columns": ["Ingredient", "Amount"],
+                "rows": [
+                  {"Ingredient": "Strong white flour", "Amount": "500 g"},
+                  {"Ingredient": "Fine sea salt", "Amount": "10 g"},
+                  {"Ingredient": "Instant yeast", "Amount": "7 g"},
+                  {"Ingredient": "Warm water", "Amount": "380 ml"},
+                  {"Ingredient": "Extra-virgin olive oil", "Amount": "45 ml"}
+                ]
+              },
+              {
+                "type": "table",
+                "title": "Topping",
+                "columns": ["Ingredient", "Amount"],
+                "rows": [
+                  {"Ingredient": "Fresh rosemary", "Amount": "2 sprigs"},
+                  {"Ingredient": "Flaky salt", "Amount": "1 tsp"},
+                  {"Ingredient": "Cherry tomatoes (optional)", "Amount": "150 g"}
+                ]
+              }
+            ]
+          },
+          {
+            "type": "section",
+            "title": "Equipment",
+            "blocks": [
+              {"type": "checklist", "title": "Set out", "checklist": [
+                {"title": "Large mixing bowl", "done": false},
+                {"title": "23 × 33 cm baking pan", "done": false},
+                {"title": "Digital scale", "done": false},
+                {"title": "Clean tea towel or reusable cover", "done": false}
+              ]},
+              {"type": "callout", "title": "Timing", "tone": "info", "content": "Allow 90 minutes for the first rise. The dough must look doubled and airy before you pan it."}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Method",
+        "subtitle": "Four numbered steps with a figure immediately after the action it shows.",
+        "blocks": [
+          {
+            "type": "steps",
+            "title": "Mix and rise",
+            "items": [
+              {"step": "1", "title": "Make the dough", "content": "Mix flour, salt, yeast, water, and 30 ml oil until no dry flour remains."},
+              {"step": "2", "title": "Let it rise", "content": "Cover the bowl. Leave it at room temperature until doubled, about 90 minutes."}
+            ]
+          },
+          {
+            "type": "figure",
+            "ref": "/fixtures/rich-scenarios/illustrated-recipe/mix-and-rise.svg",
+            "src": "/fixtures/rich-scenarios/illustrated-recipe/mix-and-rise.svg",
+            "alt": "Bowl of wet focaccia dough with a cover beside it",
+            "caption": "After mixing, the dough is loose. Its first rise supplies structure and flavor.",
+            "credit": "Synthetic fixture illustration generated for Cognis visual QA"
+          },
+          {
+            "type": "steps",
+            "title": "Pan and bake",
+            "items": [
+              {"step": "3", "title": "Dimple the dough", "content": "Oil the pan, stretch in the dough, then press deep dimples with oiled fingertips. Add rosemary, salt, and tomatoes."},
+              {"step": "4", "title": "Bake until deeply golden", "content": "Bake at 220 °C for 20–22 minutes. Cool in the pan for 10 minutes before slicing."}
+            ]
+          },
+          {
+            "type": "figure",
+            "ref": "/fixtures/rich-scenarios/illustrated-recipe/dimple-and-bake.svg",
+            "src": "/fixtures/rich-scenarios/illustrated-recipe/dimple-and-bake.svg",
+            "alt": "Dimpled focaccia dough with rosemary going into a hot oven",
+            "caption": "The dimples hold olive oil and protect the rosemary from scorching.",
+            "credit": "Synthetic fixture illustration generated for Cognis visual QA"
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "section",
+            "title": "Adapt and recover",
+            "blocks": [
+              {"type": "table", "title": "Substitutions", "columns": ["Use", "Instead of"], "rows": [
+                {"Use": "Bread flour", "Instead of": "Strong white flour"},
+                {"Use": "Thyme or oregano", "Instead of": "Rosemary"},
+                {"Use": "Roasted peppers", "Instead of": "Cherry tomatoes"}
+              ]},
+              {"type": "callout", "title": "If the dough resists stretching", "tone": "warning", "content": "Rest it for 10 minutes, then stretch again. Do not add extra flour; it makes the crumb dry."},
+              {"type": "callout", "title": "If the top browns too fast", "tone": "warning", "content": "Move the pan down one rack and loosely cover it with foil for the remaining bake time."}
+            ]
+          },
+          {
+            "type": "section",
+            "title": "Store and reheat",
+            "blocks": [
+              {"type": "figure", "ref": "/fixtures/rich-scenarios/illustrated-recipe/serve-and-store.svg", "src": "/fixtures/rich-scenarios/illustrated-recipe/serve-and-store.svg", "alt": "Focaccia wrapped in paper beside a reheated slice", "caption": "Keep the cooled bread covered at room temperature for up to two days.", "credit": "Synthetic fixture illustration generated for Cognis visual QA"},
+              {"type": "markdown", "content": "Freeze sliced focaccia in an airtight container for up to one month. Reheat from thawed at **180 °C for 6–8 minutes**."}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Allergen and food safety",
+        "blocks": [
+          {"type": "callout", "title": "Allergens", "tone": "warning", "content": "Contains wheat (gluten). Check the yeast and any toppings for allergen cross-contact when serving guests."},
+          {"type": "callout", "title": "Food safety", "tone": "danger", "content": "Wash tomatoes and herbs before use. Cool bread fully before sealing it, or trapped steam can encourage mold."}
+        ]
+      },
+      {
+        "type": "source_list",
+        "title": "Provenance"
+      }
+    ],
+    "sources": [
+      {"id": "recipe-fixture", "title": "Cognis illustrated recipe fixture", "publisher": "Cognis"},
+      {"id": "usda-food-safety", "title": "Food Safety Basics", "publisher": "USDA Food Safety and Inspection Service", "url": "https://www.fsis.usda.gov/food-safety/safe-food-handling-and-preparation/food-safety-basics"}
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

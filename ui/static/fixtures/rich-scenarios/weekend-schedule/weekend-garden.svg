@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Family weekend picnic in a garden</title>
+  <desc id="desc">A warm illustrated garden scene with a picnic blanket, trees, and a small sun.</desc>
+  <rect width="1600" height="900" fill="#f5d7a3"/>
+  <path d="M0 500C260 410 480 555 730 470S1180 370 1600 485V900H0Z" fill="#94b983"/>
+  <circle cx="1300" cy="165" r="74" fill="#f7b95e"/>
+  <path d="M150 560V250M150 360C40 360 35 220 150 185C270 220 265 360 150 360M470 610V205M470 315C350 315 355 160 470 130C590 160 590 315 470 315M1050 565V260M1050 365C930 365 930 205 1050 175C1170 205 1170 365 1050 365" stroke="#476947" stroke-width="48" stroke-linecap="round"/>
+  <rect x="640" y="555" width="380" height="190" rx="18" fill="#c96158"/>
+  <path d="M640 620H1020M735 555V745M830 555V745M925 555V745" stroke="#f7ddad" stroke-width="22"/>
+  <path d="M690 735L625 825M970 735L1035 825" stroke="#714c35" stroke-width="20" stroke-linecap="round"/>
+  <text x="80" y="840" fill="#35533b" font-family="sans-serif" font-size="34">Illustration · Cognis local fixture</text>
+</svg>

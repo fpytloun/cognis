@@ -421,8 +421,86 @@ def test_split_events_preserves_tail_with_token_budget_and_cycle_boundary() -> N
     )
 
     assert older
-    assert preserved[0].type in {"user_message", "assistant_message", "assistant_thinking"}
+    assert preserved[0].type in {
+        "user_message",
+        "assistant_message",
+        "assistant_thinking",
+        "tool_call",
+    }
     assert preserved[0].type != "tool_result"
+
+
+def test_split_events_compacts_tool_heavy_single_turn_at_tool_cycle_boundary() -> None:
+    events = [CachedEvent(seq=1, type="user_message", data={"content": "debug this"})]
+    for index in range(120):
+        call_id = f"call-{index}"
+        events.extend(
+            [
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_call",
+                    data={"call_id": call_id, "name": "read", "arguments": {}},
+                ),
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_result",
+                    data={"call_id": call_id, "name": "read", "result": "x" * 100},
+                ),
+            ]
+        )
+
+    older, preserved = _split_events(events, preserve_turns=10)
+
+    assert older
+    assert preserved
+    assert preserved[0].type == "tool_call"
+    assert older[-1].type == "tool_result"
+    assert len(older) + len(preserved) == len(events)
+
+
+def test_split_events_keeps_parallel_tool_call_batch_together() -> None:
+    events = [CachedEvent(seq=1, type="user_message", data={"content": "inspect"})]
+    for batch in range(60):
+        first_call = f"call-{batch}-a"
+        second_call = f"call-{batch}-b"
+        events.extend(
+            [
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_call",
+                    data={"call_id": first_call, "name": "read", "arguments": {}},
+                ),
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_call",
+                    data={"call_id": second_call, "name": "read", "arguments": {}},
+                ),
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_result",
+                    data={"call_id": first_call, "name": "read", "result": "a"},
+                ),
+                CachedEvent(
+                    seq=len(events) + 1,
+                    type="tool_result",
+                    data={"call_id": second_call, "name": "read", "result": "b"},
+                ),
+            ]
+        )
+
+    older, preserved = _split_events(events, preserve_turns=10)
+
+    assert older
+    assert preserved[0].type == "tool_call"
+    assert preserved[1].type == "tool_call"
+    preserved_call_ids = {
+        event.data.get("call_id") for event in preserved if event.type == "tool_call"
+    }
+    assert all(
+        event.data.get("call_id") in preserved_call_ids
+        for event in preserved
+        if event.type == "tool_result"
+    )
 
 
 def test_mechanical_summary_keeps_recoverable_tool_handles() -> None:

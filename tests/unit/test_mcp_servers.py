@@ -38,6 +38,18 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
     return {"Authorization": f"Bearer {token}"}
 
 
+async def _seed_user_for_auth(app: object, email: str, role: str) -> None:
+    async with app.state.session_factory() as session:
+        await create_user(
+            session,
+            email=email,
+            name=email.split("@")[0].title(),
+            password_hash=app.state.password_hasher.hash("password123"),
+            role=role,
+        )
+        await session.commit()
+
+
 def test_mcp_server_config_validates_transport_fields() -> None:
     MCPServerConfig(name="stdio", transport="stdio", command="/bin/echo")
     MCPServerConfig(
@@ -142,6 +154,7 @@ def test_regular_user_can_create_private_mcp_server(monkeypatch: object, tmp_pat
 
 def test_create_mcp_server_requires_command_for_stdio(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
+        client.portal.call(_seed_user_for_auth, client.app, "admin@example.com", "admin")
         response = client.post(
             "/api/v1/mcp-servers",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
@@ -228,6 +241,7 @@ def test_admin_can_create_http_mcp_server_with_headers(monkeypatch: object, tmp_
 
 def test_http_mcp_server_rejects_env_payload(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
+        client.portal.call(_seed_user_for_auth, client.app, "admin@example.com", "admin")
         response = client.post(
             "/api/v1/mcp-servers",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),

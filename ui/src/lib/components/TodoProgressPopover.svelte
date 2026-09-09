@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { TodoSnapshotItem } from '$lib/todos';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import { summarizeTodoProgress, visibleTodos as activeVisibleTodos } from '$lib/todos';
 
   let {
@@ -150,7 +151,7 @@
       <div class="space-y-1.5">
         {#each visibleTodos as todo}
           <div class={`flex items-start gap-2 rounded-xl border px-2.5 py-2 leading-5 ${statusClass(todo.status)}`}>
-            <span class="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-current opacity-80"></span>
+            <TodoStatusDot status={todo.status} class="mt-1.5 h-1.5 w-1.5" labelled={false} />
             <span class={`min-w-0 flex-1 break-words ${todo.status === 'completed' ? 'line-through opacity-70' : ''}`}>
               {todo.content}
             </span>

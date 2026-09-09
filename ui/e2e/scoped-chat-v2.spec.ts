@@ -70,6 +70,61 @@ test.describe('ScopedChatV2Timeline', () => {
     })).toBeLessThanOrEqual(2);
   });
 
+  test('positions a switched scope at the tail before it is revealed', async ({ page }) => {
+    const shell = page.getByTestId('scoped-timeline-shell');
+    const viewport = shell.getByTestId('scoped-timeline-viewport');
+    await expect(shell.getByText('Parent conversation event 20', { exact: true })).toBeVisible();
+    await expect.poll(() => viewport.evaluate((node) => {
+      const element = node as HTMLElement;
+      return element.scrollHeight - element.scrollTop - element.clientHeight;
+    })).toBeLessThanOrEqual(2);
+
+    await page.evaluate(() => {
+      const samples: Array<{ scopeKey: string; scrollTop: number }> = [];
+      let active = true;
+      const sample = (): void => {
+        const viewport = document.querySelector<HTMLElement>('[data-testid="scoped-timeline-viewport"]');
+        const scopeKey = viewport?.closest<HTMLElement>('[data-scope-key]')?.dataset.scopeKey ?? '';
+        if (
+          viewport
+          && getComputedStyle(viewport).visibility !== 'hidden'
+          && viewport.scrollHeight > viewport.clientHeight + 1
+          && viewport.scrollTop <= 1
+        ) {
+          samples.push({ scopeKey, scrollTop: viewport.scrollTop });
+        }
+        if (active) requestAnimationFrame(sample);
+      };
+      requestAnimationFrame(sample);
+      (window as typeof window & {
+        __viewportRevealSamples?: Array<{ scopeKey: string; scrollTop: number }>;
+        __stopViewportRevealSampling?: () => void;
+      }).__viewportRevealSamples = samples;
+      (window as typeof window & {
+        __stopViewportRevealSampling?: () => void;
+      }).__stopViewportRevealSampling = () => { active = false; };
+    });
+
+    await page.getByTestId('scope-child').click();
+    await expect(shell.getByText('Child delegated session event 20', { exact: true })).toBeVisible();
+    await page.getByTestId('scope-parent').click();
+    await expect(shell.getByText('Parent conversation event 20', { exact: true })).toBeVisible();
+    await expect.poll(() => viewport.evaluate((node) => {
+      const element = node as HTMLElement;
+      return element.scrollHeight - element.scrollTop - element.clientHeight;
+    })).toBeLessThanOrEqual(2);
+    await expect(shell.getByRole('button', { name: 'Resume live follow' })).toHaveCount(0);
+    const topFlashSamples = await page.evaluate(() => {
+      const state = window as typeof window & {
+        __viewportRevealSamples?: Array<{ scopeKey: string; scrollTop: number }>;
+        __stopViewportRevealSampling?: () => void;
+      };
+      state.__stopViewportRevealSampling?.();
+      return state.__viewportRevealSamples ?? [];
+    });
+    expect(topFlashSamples).toEqual([]);
+  });
+
   test('updates task evaluation and outcome without resetting scope and excludes it from nested sessions', async ({ page }) => {
     await page.route('**/api/v1/step-runs/fixture-step/deliverables/fixture-deliverable', async (route) => {
       await route.fulfill({
@@ -238,31 +293,27 @@ test.describe('ScopedChatV2Timeline', () => {
   test('loads multiple scoped history pages, preserves the scroll anchor, and reaches terminal cursor', async ({ page }) => {
     const timeline = page.getByTestId('scoped-timeline-shell');
     const viewport = timeline.getByTestId('scoped-timeline-viewport');
-    await expect(timeline.getByRole('button', { name: /Load older/ })).toBeVisible();
-    const anchor = await viewport.evaluate((node) => {
-      const element = node as HTMLElement;
-      element.scrollTop = 120;
-      element.dispatchEvent(new Event('scroll'));
-      return element.scrollHeight - element.scrollTop;
-    });
-    await expect(timeline.getByRole('button', { name: 'Resume live follow' })).toBeVisible();
+    await expect(timeline.getByText(/Load older/i)).toHaveCount(0);
     const settledAnchor = await viewport.evaluate((node) => {
       const element = node as HTMLElement;
+      element.scrollTop = 0;
       return element.scrollHeight - element.scrollTop;
     });
-    await timeline.getByRole('button', { name: /Load older/ }).click();
+    await viewport.evaluate((node) => node.dispatchEvent(new Event('scroll')));
     await expect(timeline.locator('[data-has-older="true"]')).toBeVisible();
+    await expect(timeline.getByText('Parent conversation event 4', { exact: true })).toBeVisible();
     await page.waitForTimeout(50);
     const after = await viewport.evaluate((node) => {
       const element = node as HTMLElement;
       return element.scrollHeight - element.scrollTop;
     });
-    expect(anchor).toBeGreaterThan(0);
+    expect(settledAnchor).toBeGreaterThan(0);
     expect(Math.abs(after - settledAnchor)).toBeLessThanOrEqual(2);
-    await expect(timeline.getByText('Parent conversation event 4', { exact: true })).toBeVisible();
-    await timeline.getByRole('button', { name: /Load older/ }).click();
+    await viewport.evaluate((node) => { (node as HTMLElement).scrollTop = 100; });
+    await viewport.hover();
+    await page.mouse.wheel(0, -500);
     await expect(timeline.locator('[data-has-older="false"]')).toBeVisible();
-    await expect(timeline.getByRole('button', { name: /Load older/ })).toHaveCount(0);
+    await expect(timeline.getByText(/Load older/i)).toHaveCount(0);
     await expect(timeline.getByText('Parent conversation event 4', { exact: true })).toBeVisible();
     await expect.poll(() => page.evaluate(() => {
       const controller = (window as typeof window & {

@@ -94,6 +94,27 @@ The important rule is simple: **the controller decides, executors do**. Even loc
 
 ## Quick Start
 
+### Python package split
+
+`cognis-controller` is the control plane. A plain installation is
+remote-WebSocket-only: it does not install the local executor, its tools, or
+its runtime dependencies.
+
+```bash
+pip install cognis-controller
+```
+
+For local in-process or subprocess execution, install the executor package too.
+The `full` extra is the normal full-capability installation:
+
+```bash
+pip install "cognis-controller" "cognis-executor[full]"
+```
+
+There is no `local-executors` extra. The official controller Docker image is
+intentionally remote-only; connect an external or sidecar
+`cognis-executor[full]` executor when the controller needs tool execution.
+
 ### Prerequisites
 
 - Python 3.12+
@@ -134,12 +155,33 @@ For headless setup:
 cognis-controller admin create-user admin@example.com --name "Admin"
 ```
 
+### macOS executor
+
+Homebrew is the recommended way to install an executor on macOS:
+
+```bash
+brew tap fpytloun/tap
+brew install cognis-executor
+cognis-executor configure
+cognis-executor start
+```
+
+The formula uses Google Chrome from the system and runs as a per-user launchd
+service. See the
+[macOS executor guide](docs/guide/macos-executor.md) for configuration,
+diagnostics, logs, upgrades, and source development installs.
+
 ## Docker
 
 Cognis publishes two images:
 
-- `ghcr.io/fpytloun/cognis` for the controller and bundled UI
+- `ghcr.io/fpytloun/cognis` for the remote-only controller and bundled UI
 - `ghcr.io/fpytloun/cognis-executor` for WebSocket executors with browser, shell, coding, search, and LSP tooling
+
+The controller image cannot execute host tools. It must connect an external or
+sidecar executor. Local executor rows persisted in the controller database
+remain unavailable until a compatible executor package/process is installed
+and connected.
 
 Run the controller with persistent state:
 
@@ -166,6 +208,11 @@ docker run -d \
   -e COGNIS_EXECUTOR_TOKEN=eyJ... \
   ghcr.io/fpytloun/cognis-executor:latest
 ```
+
+`latest` is the recommended general executor image. It includes browser,
+document, MCP, Git, `uvx`, and `npx` support. Use the `minimal` tag only when
+you intentionally need a reduced system tool set. Use `development` when you
+also need preinstalled language servers.
 
 For a local non-TLS controller, use `ws://localhost:8080/api/executor/ws` only with local networking. Remote executors should use `wss://`.
 
@@ -228,6 +275,19 @@ export COGNIS_EXECUTOR_TOKEN=<jwt-token>
 export COGNIS_EXECUTOR_WORKDIR=~
 cognis-executor
 ```
+
+## Executor package
+
+Install a normal remote executor with the complete component set:
+
+```bash
+pip install "cognis-executor[full]==0.14.0"
+uvx --from 'cognis-executor[full]' cognis-executor
+```
+
+Use bare `cognis-executor` for a minimal filesystem/shell/search executor, or
+select the `browser`, `mcp`, `web`, `documents`, `inference`, and `channels`
+extras as needed.
 
 ## Development
 

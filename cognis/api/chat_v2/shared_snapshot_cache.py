@@ -13,7 +13,6 @@ from typing import Any, Literal
 from pydantic import ValidationError
 
 from cognis.api.chat_v2.cached_event_store import (
-    CACHE_SCHEMA_VERSION,
     CachedSessionEventStore,
     DerivedEnvelopeEncoding,
     EventCacheBounds,
@@ -30,6 +29,7 @@ from cognis.api.chat_v2.snapshot_metrics import (
 from cognis.api.chat_v2.sync import ConversationSessionRef, current_projection_version
 from cognis.core.redis_service import RedisService
 
+SNAPSHOT_CACHE_SCHEMA_VERSION = 3
 _DEFAULT_LOCK_LEASE_SECONDS = 15
 _DEFAULT_BUILD_DEADLINE_SECONDS = 120.0
 _LOCK_POLL_MAX_SECONDS = 0.1
@@ -82,8 +82,6 @@ class _SnapshotIdentity:
     lock_key: str
     fence: GenerationFence
     lineage: tuple[dict[str, Any], ...]
-    overview_fence: str
-    overview_ready: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,8 +208,6 @@ class SharedChatSnapshotCache:
         session_refs: Sequence[ConversationSessionRef],
         cursor_secret: str,
         build: Callable[[], Awaitable[ChatSnapshot]],
-        overview_fence: str = "",
-        overview_coverage: Sequence[tuple[str, int]] | None = None,
         fail_open: bool = True,
     ) -> ChatSnapshot | None:
         result = await self.get_or_build_result(
@@ -220,8 +216,6 @@ class SharedChatSnapshotCache:
             session_refs=session_refs,
             cursor_secret=cursor_secret,
             build=build,
-            overview_fence=overview_fence,
-            overview_coverage=overview_coverage,
             fail_open=fail_open,
         )
         return result.snapshot
@@ -233,8 +227,6 @@ class SharedChatSnapshotCache:
         scope_key: str,
         session_refs: Sequence[ConversationSessionRef],
         cursor_secret: str,
-        overview_fence: str = "",
-        overview_coverage: Sequence[tuple[str, int]] | None = None,
     ) -> CachedSnapshotResult:
         """Read an identity- and generation-fenced snapshot without coordinating a fill."""
 
@@ -245,13 +237,9 @@ class SharedChatSnapshotCache:
                 authority_token=authority_token,
                 scope_key=scope_key,
                 session_refs=session_refs,
-                overview_fence=overview_fence,
-                overview_coverage=overview_coverage,
             )
             if identity is None:
                 return CachedSnapshotResult(None, "unavailable")
-            if not identity.overview_ready:
-                return CachedSnapshotResult(None, "miss")
             cached, read_status, cache_tier = await self._read(
                 identity,
                 authority_token=authority_token,
@@ -279,8 +267,6 @@ class SharedChatSnapshotCache:
         session_refs: Sequence[ConversationSessionRef],
         cursor_secret: str,
         build: Callable[[], Awaitable[ChatSnapshot]],
-        overview_fence: str = "",
-        overview_coverage: Sequence[tuple[str, int]] | None = None,
         fail_open: bool = True,
         request_trace: SnapshotRequestTrace | None = None,
     ) -> SnapshotCacheResult:
@@ -298,8 +284,6 @@ class SharedChatSnapshotCache:
             authority_token=authority_token,
             scope_key=scope_key,
             session_refs=session_refs,
-            overview_fence=overview_fence,
-            overview_coverage=overview_coverage,
         )
         if identity is None:
             if request_trace is not None:
@@ -310,15 +294,6 @@ class SharedChatSnapshotCache:
                 await build() if fail_open else None,
                 "bypass",
                 "internal",
-            )
-        if not identity.overview_ready:
-            if request_trace is not None:
-                request_trace.select("bypass")
-            self._remember_outcome(scope_key, "retry" if fail_open else "skipped")
-            return SnapshotCacheResult(
-                await build() if fail_open else None,
-                "bypass",
-                "context_changed",
             )
         cached, read_status, cache_tier = await self._read(
             identity,
@@ -384,8 +359,6 @@ class SharedChatSnapshotCache:
                             authority_token=authority_token,
                             scope_key=scope_key,
                             session_refs=session_refs,
-                            overview_fence=overview_fence,
-                            overview_coverage=overview_coverage,
                         )
                         if refreshed is None:
                             break
@@ -591,7 +564,6 @@ class SharedChatSnapshotCache:
                     authority_token=authority_token,
                     scope_key=scope_key,
                     lineage=identity.lineage,
-                    overview_fence=identity.overview_fence,
                     cursor_secret=cursor_secret,
                 )
                 if encoding is None:
@@ -677,8 +649,6 @@ class SharedChatSnapshotCache:
         authority_token: str,
         scope_key: str,
         session_refs: Sequence[ConversationSessionRef],
-        overview_fence: str = "",
-        overview_coverage: Sequence[tuple[str, int]] | None = None,
     ) -> _SnapshotIdentity | None:
         fence = await self._event_store.create_generation_fence(
             [(ref.store, ref.event_store_session_id, ref.authority_token) for ref in session_refs]
@@ -702,28 +672,21 @@ class SharedChatSnapshotCache:
             authority_token,
             scope_key,
             current_projection_version(),
-            overview_fence,
+            str(SNAPSHOT_CACHE_SCHEMA_VERSION),
         )
-        value_key = f"cognis:chat-event-cache:v{CACHE_SCHEMA_VERSION}:snapshot:{digest}"
+        value_key = f"cognis:chat-event-cache:v{SNAPSHOT_CACHE_SCHEMA_VERSION}:snapshot:{digest}"
         local_digest = self._event_store.derived_key_digest(
             "snapshot-local",
             digest,
             repr(lineage),
         )
         local_key = f"{value_key}:local:{local_digest}"
-        covered_by_session = dict(overview_coverage or ())
-        overview_ready = overview_coverage is None or all(
-            covered_by_session.get(entry.backing_session_id, -1) >= entry.watermark_floor
-            for entry in fence.entries
-        )
         return _SnapshotIdentity(
             value_key=value_key,
             local_key=local_key,
             lock_key=f"{value_key}:lock",
             fence=fence,
             lineage=lineage,
-            overview_fence=overview_fence,
-            overview_ready=overview_ready,
         )
 
     async def _read(
@@ -770,7 +733,6 @@ class SharedChatSnapshotCache:
             authority_token=authority_token,
             scope_key=scope_key,
             lineage=identity.lineage,
-            overview_fence=identity.overview_fence,
             cursor_secret=cursor_secret,
         )
         if decoded.status == "saturated":
@@ -801,7 +763,6 @@ class SharedChatSnapshotCache:
         scope_key: str,
         lineage: tuple[dict[str, Any], ...],
         cursor_secret: str,
-        overview_fence: str = "",
     ) -> DerivedEnvelopeEncoding | None:
         try:
             cursor = validate_cursor(
@@ -811,12 +772,11 @@ class SharedChatSnapshotCache:
                 projection_version=current_projection_version(),
             )
             envelope = {
-                "version": CACHE_SCHEMA_VERSION,
+                "version": SNAPSHOT_CACHE_SCHEMA_VERSION,
                 "operation": "snapshot",
                 "authority": authority_token,
                 "conversation": self._event_store.derived_key_digest("conversation", scope_key),
                 "projection_version": current_projection_version(),
-                "overview_fence": overview_fence,
                 "lineage": lineage,
                 "watermarks": [item.model_dump(mode="json") for item in cursor.session_watermarks],
                 "value": snapshot.model_dump(mode="json"),
@@ -833,7 +793,6 @@ class SharedChatSnapshotCache:
         scope_key: str,
         lineage: tuple[dict[str, Any], ...],
         cursor_secret: str,
-        overview_fence: str = "",
     ) -> _DecodedSnapshot:
         decoding = await self._event_store.decode_derived_envelope(payload)
         if decoding.status != "decoded":
@@ -842,13 +801,12 @@ class SharedChatSnapshotCache:
         try:
             if (
                 raw is None
-                or raw.get("version") != CACHE_SCHEMA_VERSION
+                or raw.get("version") != SNAPSHOT_CACHE_SCHEMA_VERSION
                 or raw.get("operation") != "snapshot"
                 or not hmac.compare_digest(str(raw.get("authority")), authority_token)
                 or raw.get("conversation")
                 != self._event_store.derived_key_digest("conversation", scope_key)
                 or raw.get("projection_version") != current_projection_version()
-                or raw.get("overview_fence") != overview_fence
             ):
                 return _DecodedSnapshot("invalid")
             if raw.get("lineage") != list(lineage):

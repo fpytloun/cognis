@@ -29,7 +29,8 @@ def test_send_message_and_receive_response(live_stack: LiveStack, run_id: str) -
 
     events = live_chat_ws(live_stack, cid, "What is 2 + 2? Answer with just the number.")
     assert any(e["type"] == "message_complete" for e in events), (
-        f"No message_complete. Got: {[e.get('type') for e in events]}"
+        f"No message_complete. Got: {[e.get('type') for e in events]}; "
+        f"error codes: {[e.get('code') for e in events if e.get('type') == 'error']}"
     )
 
 

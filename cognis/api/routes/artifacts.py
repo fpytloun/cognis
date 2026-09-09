@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import quote
 
@@ -29,6 +30,48 @@ from cognis.store.queries import (
 router = APIRouter(prefix="/api/v1/artifacts", tags=["artifacts"])
 
 ArtifactURLMode = Literal["download", "view"]
+TEXT_PREVIEW_MAX_BYTES = 512 * 1024
+TEXT_PREVIEW_EXTENSIONS = {
+    ".c",
+    ".conf",
+    ".cpp",
+    ".css",
+    ".csv",
+    ".go",
+    ".h",
+    ".hpp",
+    ".html",
+    ".ini",
+    ".java",
+    ".js",
+    ".json",
+    ".jsonl",
+    ".log",
+    ".md",
+    ".py",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+TEXT_PREVIEW_MIME_TYPES = {
+    "application/javascript",
+    "application/json",
+    "application/sql",
+    "application/toml",
+    "application/xml",
+    "application/x-ndjson",
+    "application/x-sh",
+    "application/yaml",
+}
 
 
 def _kind_for_content_type(content_type: str) -> ArtifactKind:
@@ -45,7 +88,7 @@ def _kind_for_content_type(content_type: str) -> ArtifactKind:
 
 def _is_expired(row: object, *, now: datetime | None = None) -> bool:
     expires_at = getattr(row, "expires_at", None)
-    if expires_at is None:
+    if not isinstance(expires_at, datetime):
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
@@ -64,6 +107,39 @@ def _clamp_ttl_to_artifact_expiry(row: object, requested_ttl_seconds: int) -> in
 
 def _is_html_content_type(content_type: str) -> bool:
     return content_type.split(";", 1)[0].strip().lower() == "text/html"
+
+
+def _is_text_preview_supported(filename: str, content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return (
+        media_type.startswith("text/")
+        or media_type in TEXT_PREVIEW_MIME_TYPES
+        or Path(filename).suffix.lower() in TEXT_PREVIEW_EXTENSIONS
+    )
+
+
+def _text_preview_payload(*, filename: str, content_type: str, content: bytes) -> dict[str, object]:
+    if not _is_text_preview_supported(filename, content_type):
+        raise api_exception(415, "unsupported_media_type", "Artifact cannot be previewed as text")
+    preview_bytes = content[:TEXT_PREVIEW_MAX_BYTES]
+    if b"\x00" in preview_bytes:
+        raise api_exception(415, "unsupported_media_type", "Artifact cannot be previewed as text")
+    try:
+        text = preview_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if len(content) > TEXT_PREVIEW_MAX_BYTES and exc.reason == "unexpected end of data":
+            text = preview_bytes[: exc.start].decode("utf-8")
+        else:
+            raise api_exception(
+                415, "unsupported_media_type", "Artifact is not valid UTF-8 text"
+            ) from exc
+    return {
+        "filename": filename,
+        "mime_type": content_type,
+        "size_bytes": len(content),
+        "content": text,
+        "truncated": len(content) > TEXT_PREVIEW_MAX_BYTES,
+    }
 
 
 def _assert_view_allowed(content_type: str) -> None:
@@ -228,6 +304,45 @@ async def get_signed_url(
     }
 
 
+@router.get("/{artifact_id}/text-preview")
+async def get_text_preview(request: Request, artifact_id: str) -> dict[str, object]:
+    user = require_current_user(request)
+    artifact_store = request.app.state.artifact_store
+    if is_deliverable_ref(artifact_id):
+        async with request.app.state.session_factory() as session:
+            ref = await get_accessible_deliverable_ref(
+                session, artifact_store, artifact_id, user.email
+            )
+        if ref is None:
+            raise api_exception(404, "not_found", "Artifact not found")
+        return {
+            "artifact_id": artifact_id,
+            **_text_preview_payload(
+                filename=ref.filename,
+                content_type=ref.mime_type,
+                content=ref.content_bytes,
+            ),
+        }
+
+    async with request.app.state.session_factory() as session:
+        row = await get_artifact_record(session, artifact_id)
+    if row is None or row.status == "deleted" or _is_expired(row):
+        raise api_exception(404, "not_found", "Artifact not found")
+    if row.owner_email and row.owner_email != user.email and getattr(user, "role", "") != "admin":
+        raise api_exception(404, "not_found", "Artifact not found")
+    content, content_type = await artifact_store.async_load(
+        row.namespace, row.object_id, row.filename
+    )
+    return {
+        "artifact_id": artifact_id,
+        **_text_preview_payload(
+            filename=row.filename,
+            content_type=content_type,
+            content=content,
+        ),
+    }
+
+
 @router.get("/virtual/deliverables/view/{deliverable_id}/{filename:path}")
 async def serve_signed_deliverable_view(
     request: Request,
@@ -356,14 +471,16 @@ async def _serve_signed_artifact(
     ):
         raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
     async with request.app.state.session_factory() as session:
-        row = await get_artifact_record(session, object_id)
-        if row is None and namespace == "skills":
-            row = await get_skill_asset_by_artifact_object(
+        artifact_row = await get_artifact_record(session, object_id)
+        skill_asset_row = None
+        if artifact_row is None and namespace == "skills":
+            skill_asset_row = await get_skill_asset_by_artifact_object(
                 session,
                 artifact_namespace=namespace,
                 artifact_object_id=object_id,
                 filename=filename,
             )
+        row = artifact_row or skill_asset_row
     if row is None:
         raise api_exception(404, "not_found", "Artifact not found")
     if getattr(row, "status", None) == "deleted" or _is_expired(row):

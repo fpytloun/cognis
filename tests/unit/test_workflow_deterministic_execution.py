@@ -727,6 +727,74 @@ async def test_exhausted_software_review_route_persists_post_exhaustion_target(
         await db_engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_shipped_code_review_route_allows_one_correction_then_reaches_named_gate(
+    tmp_path: object,
+) -> None:
+    db_engine, session_factory, engine, task, _event_bus = await _engine_runtime(tmp_path)
+    workflow = SOFTWARE_DEVELOPMENT_WORKFLOW
+    route_index = next(
+        index for index, step in enumerate(workflow.steps) if step.name == "code_review_route"
+    )
+    route = workflow.steps[route_index]
+    exhausted_gate = workflow.steps[route_index + 1]
+    assert route.condition is not None
+    assert route.condition.max_loop_iterations == 1
+    assert route.condition.on_exhausted == "continue"
+    assert exhausted_gate.name == "code_review_exhausted_gate"
+    assert exhausted_gate.gate is not None
+    assert (
+        exhausted_gate.gate.message
+        == "Implementation still has blocking findings after one correction cycle. "
+        "Replan or escalate before continuing."
+    )
+
+    state = WorkflowState(current_step_index=route_index)
+    loop_key = f"condition:{route.name}->{route.condition.then}"
+    state.loop_iterations[loop_key] = 1
+    step_run_id = "step-code-review-one-correction-exhausted"
+    async with session_factory() as session:
+        await create_step_run(
+            session,
+            task_id=task.task_id,
+            step_name=route.name,
+            step_type="condition",
+            agent_id=task.agent_id,
+            step_run_id=step_run_id,
+            status="running",
+        )
+        await session.commit()
+
+    try:
+        result = await engine._execute_condition_step(  # noqa: SLF001
+            task,
+            route,
+            state,
+            workflow,
+            step_run_id,
+            {},
+            WorkflowRenderer(),
+            {
+                "steps": {
+                    "code_review": {
+                        "metadata": {
+                            "decision": "revise",
+                            "required_scope_complete": True,
+                            "missing_scope_count": 0,
+                            "must_fix_count": 1,
+                        }
+                    }
+                }
+            },
+        )
+
+        assert result.step_run_status == "failed"
+        assert result.error_action == "continue"
+        assert result.next_step_index == route_index + 1
+    finally:
+        await db_engine.dispose()
+
+
 def test_backward_review_route_marks_compact_retry_and_reopens_terminal_todos() -> None:
     engine = object.__new__(WorkflowEngine)
     workflow = SOFTWARE_DEVELOPMENT_WORKFLOW

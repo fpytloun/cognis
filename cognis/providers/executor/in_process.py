@@ -13,7 +13,21 @@ from typing import Any, cast
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.executor.lsp_runtime import (
+    LSPStatusReport,
+    build_lsp_manager,
+    build_lsp_status_report,
+    build_lsp_unavailable_report,
+    cleanup_lsp_manager,
+)
+from cognis.executor.tool_definitions_runtime import executor_tool_handlers
 from cognis.logging import get_logger
+from cognis.mcp_runtime import (
+    MCPClient,
+    build_mcp_client,
+    mcp_tools_to_definitions,
+    runtime_mcp_server_key,
+)
 from cognis.models.config import ProviderHealth
 from cognis.models.tool import (
     ExecutorCapabilities,
@@ -37,17 +51,8 @@ from cognis.tools.executor.browser.manager import (
     BrowserManagerCleanupRetainer,
     BrowserSessionOwner,
 )
-from cognis.tools.executor.definitions import executor_tool_handlers
 from cognis.tools.executor.file_freshness import get_file_freshness_tracker
-from cognis.tools.executor.lsp import (
-    LSP_MANAGER_KEY,
-    LSPManager,
-    LSPStatusReport,
-    build_lsp_manager,
-    build_lsp_status_report,
-    build_lsp_unavailable_report,
-    cleanup_lsp_manager,
-)
+from cognis.tools.executor.lsp.manager import LSP_MANAGER_KEY, LSPManager
 from cognis.tools.executor.project_context import (
     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
     handle_project_context_probe,
@@ -55,12 +60,6 @@ from cognis.tools.executor.project_context import (
 from cognis.tools.executor.shell import (
     cleanup_shell_manager,
     set_background_shell_completion_callback,
-)
-from cognis.tools.mcp import (
-    MCPClient,
-    build_mcp_client,
-    mcp_tools_to_definitions,
-    runtime_mcp_server_key,
 )
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
@@ -169,9 +168,12 @@ class InProcessExecutorConnection:
         tool_call: ToolCall,
         timeout_seconds: int | None = None,
         output_chunk_callback: ToolOutputChunkCallback | None = None,
+        before_send: Any | None = None,
+        on_sent: Any | None = None,
     ) -> ToolResult:
         """Execute a tool call through the runtime registry."""
 
+        del before_send, on_sent
         registered_tool = self.registry.get(tool_call.name)
         handler = None if registered_tool is None else registered_tool.handler
         if handler is None:

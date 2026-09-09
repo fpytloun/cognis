@@ -39,6 +39,7 @@ async def test_route_admission_has_exactly_one_winner(first: str, source_type: s
     url = os.getenv("COGNIS_TEST_POSTGRES_URL")
     if not url:
         pytest.skip("COGNIS_TEST_POSTGRES_URL is not configured")
+    url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
     schema = f"managed_route_{uuid.uuid4().hex[:12]}"
     admin = create_async_engine(url)
     async with admin.begin() as connection:

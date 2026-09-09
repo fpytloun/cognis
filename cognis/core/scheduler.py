@@ -17,7 +17,7 @@ import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
@@ -61,6 +61,16 @@ _DEFAULT_MISSED_STAGGER_SECONDS = 5
 _DEFAULT_MAX_CONSECUTIVE_ERRORS = 5
 
 
+def _safe_schedule_error(value: object) -> str:
+    """Return a bounded single-line schedule error without traceback content."""
+    text = str(value or "Scheduled run failed").splitlines()[0].strip()
+    for marker in ("api_key=", "password=", "secret=", "token=", "authorization:"):
+        index = text.lower().find(marker)
+        if index >= 0:
+            text = f"{text[:index]}{marker}[redacted]"
+    return text[:240] or "Scheduled run failed"
+
+
 class Scheduler:
     """Cron/interval/one-shot schedule evaluator.
 
@@ -77,6 +87,7 @@ class Scheduler:
         missed_stagger_seconds: int = _DEFAULT_MISSED_STAGGER_SECONDS,
         max_consecutive_errors: int = _DEFAULT_MAX_CONSECUTIVE_ERRORS,
         controller_owner_id: str = "simple-controller",
+        notification_service: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._task_queue = task_queue
@@ -91,12 +102,15 @@ class Scheduler:
         self._missed_stagger_seconds = missed_stagger_seconds
         self._max_consecutive_errors = max_consecutive_errors
         self._controller_owner_id = controller_owner_id
+        self._notification_service = notification_service
         self._lease_store = DatabaseLeaseStore(session_factory)
         self._fire_store = ScheduleFireStore(session_factory)
         self._manual_triggers: dict[str, asyncio.Task[str | None]] = {}
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_task_terminal_event)
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_task_terminal_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_task_terminal_event)
+        event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_schedule_action_event)
+        event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_schedule_action_event)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -110,6 +124,8 @@ class Scheduler:
         self._stop_event.clear()
 
         try:
+            if self._notification_service is not None:
+                await self._notification_service.reconcile_schedule_actions()
             await self._initialise_next_fire_times()
             await self._catch_up_missed()
         except Exception:
@@ -198,7 +214,7 @@ class Scheduler:
             return _MAX_SLEEP_SECONDS
 
         delta = (row - datetime.now(UTC)).total_seconds()
-        return max(delta, 0.0)
+        return float(max(delta, 0.0))
 
     async def _interruptible_sleep(self, seconds: float) -> None:
         """Sleep for *seconds*, but wake early if signalled or stopped."""
@@ -378,10 +394,49 @@ class Scheduler:
                 schedule_id=schedule_id,
                 scheduled_fire_at=scheduled_fire_at,
                 lease=lease,
+                max_consecutive_errors=self._max_consecutive_errors,
             )
             if claim is None:
                 return None
             sched = claim.schedule
+            for replaced_task_id in claim.replaced_paused_task_ids:
+                await self._event_bus.publish(
+                    Event(
+                        type=EventType.TASK_FAILED,
+                        data={
+                            "task_id": replaced_task_id,
+                            "reason": "Replaced at the next scheduled firing while still paused.",
+                            "suppress_schedule_retry": True,
+                        },
+                    )
+                )
+            if claim.replaced_paused_task_ids:
+                disabled_reason = str(sched.disabled_reason or "")
+                auto_disabled = disabled_reason.startswith("auto_consecutive_failures:")
+                await self._event_bus.publish(
+                    Event(
+                        type=(
+                            EventType.SCHEDULE_DISABLED
+                            if auto_disabled
+                            else EventType.SCHEDULE_ERROR
+                        ),
+                        data={
+                            "schedule_id": schedule_id,
+                            "consecutive_errors": int(sched.consecutive_errors or 0),
+                            "created_by": sched.created_by,
+                            "agent_id": sched.agent_id,
+                            "schedule_name": sched.name,
+                            "task_id": claim.replaced_paused_task_ids[-1],
+                            "error": ("Replaced at the next scheduled firing while still paused."),
+                            **({"reason": disabled_reason} if auto_disabled else {}),
+                        },
+                    )
+                )
+            if claim.replaced_paused_task_ids:
+                async with self._db_session() as db:
+                    current_schedule = await get_schedule(db, schedule_id)
+                if current_schedule is None or not current_schedule.enabled:
+                    return None
             if claim.status == "skipped":
                 await self._advance_claimed_fire(
                     sched,
@@ -445,9 +500,7 @@ class Scheduler:
                 errors = int(sched.consecutive_errors or 0) + 1
                 disabled = errors >= self._max_consecutive_errors
                 backoff = self._compute_backoff_delay(errors)
-                disabled_reason = (
-                    f"Auto-disabled after {errors} consecutive errors" if disabled else None
-                )
+                failure_reason = f"auto_consecutive_failures:{errors}" if disabled else None
                 settled = await self._fire_store.mark_failed(
                     claim=claim,
                     lease=lease,
@@ -456,7 +509,7 @@ class Scheduler:
                         None if disabled else datetime.now(UTC) + timedelta(seconds=backoff)
                     ),
                     consecutive_errors=errors,
-                    disabled_reason=disabled_reason,
+                    disabled_reason=failure_reason,
                 )
                 if settled:
                     await self._event_bus.publish(
@@ -475,9 +528,7 @@ class Scheduler:
                                 "schedule_name": sched.name,
                                 "error": f"{type(exc).__name__}: {exc}",
                                 **(
-                                    {"reason": disabled_reason}
-                                    if disabled_reason is not None
-                                    else {}
+                                    {"reason": failure_reason} if failure_reason is not None else {}
                                 ),
                             },
                         )
@@ -755,7 +806,7 @@ class Scheduler:
                     },
                 )
             )
-            return task.task_id
+            return str(task.task_id)
 
         except Exception as exc:
             if created_workflow_id is not None and created_task_id is None:
@@ -778,9 +829,8 @@ class Scheduler:
                     next_fire_at=next_fire if not disabled else None,
                     last_run_status="failed",
                     consecutive_errors=errors,
-                    disabled_reason=(
-                        f"Auto-disabled after {errors} consecutive errors" if disabled else None
-                    ),
+                    disabled_reason=(f"auto_consecutive_failures:{errors}" if disabled else None),
+                    last_terminal_task_id=None,
                     enabled=False if disabled else None,
                 )
                 await db.commit()
@@ -796,7 +846,7 @@ class Scheduler:
                         type=EventType.SCHEDULE_DISABLED,
                         data={
                             "schedule_id": schedule_id,
-                            "reason": f"Auto-disabled after {errors} consecutive errors",
+                            "reason": f"auto_consecutive_failures:{errors}",
                             "created_by": sched.created_by,
                             "agent_id": sched.agent_id,
                             "schedule_name": sched.name,
@@ -832,74 +882,124 @@ class Scheduler:
             task = await get_task(db, task_id)
             if task is None or task.source_type != "scheduler" or not task.source_ref:
                 return
-            if await self._fire_store.is_manual_task(task_id):
-                return
+            manual_fire = await self._fire_store.is_manual_task(task_id)
             schedule_id = str(task.source_ref)
             sched = await get_schedule(db, schedule_id)
             if sched is None:
                 return
 
         fire_at = _task_fire_at(task)
-        if _task_terminal_event_is_stale(fire_at, sched.last_fired_at):
-            logger.info(
-                "Ignoring stale terminal event for scheduled task %s",
-                task_id,
-                extra={
-                    "extra_data": {
-                        "schedule_id": schedule_id,
-                        "task_fire_at": fire_at.isoformat()
-                        if isinstance(fire_at, datetime)
-                        else None,
-                        "last_fired_at": sched.last_fired_at.isoformat()
-                        if isinstance(sched.last_fired_at, datetime)
-                        else None,
-                    }
-                },
-            )
-            return
-
         status = str(getattr(task, "status", "") or "").lower()
         recorded_fire_at = fire_at if isinstance(fire_at, datetime) else datetime.now(UTC)
-        if status == "completed":
-            next_fire = (
-                None
-                if sched.schedule_type == "one_shot"
-                else self._compute_next_fire(sched, recorded_fire_at)
+        if manual_fire:
+            projection = await self._fire_store.project_manual_terminal_result(
+                task_id=task_id,
+                status=status,
+                completed_at=recorded_fire_at,
+                max_consecutive_errors=self._max_consecutive_errors,
+                recovery_next_fire_at=None,
             )
-            async with self._db_session() as db:
-                await update_schedule_fire_state(
-                    db,
-                    schedule_id,
-                    last_fired_at=recorded_fire_at,
-                    next_fire_at=next_fire,
-                    last_run_status="success",
-                    consecutive_errors=0,
+            if projection is not None and status == "completed":
+                if projection["auto_disabled_state"]:
+                    await self._update_auto_disabled_schedule_action(
+                        projection=projection,
+                        task_id=task_id,
+                        error="Latest run succeeded, but the schedule remains automatically disabled.",
+                    )
+                else:
+                    await self._resolve_schedule_action(
+                        projection["schedule_id"],
+                        projection["created_by"],
+                        "schedule_recovered",
+                        task_id=task_id,
+                    )
+            if (
+                projection is not None
+                and status == "cancelled"
+                and projection["auto_disabled_state"]
+            ):
+                await self._update_auto_disabled_schedule_action(
+                    projection=projection,
+                    task_id=task_id,
+                    error="Latest run was cancelled, and the schedule remains automatically disabled.",
                 )
-                await db.commit()
+            if projection is None or status in {"completed", "cancelled"}:
+                return
+            auto_disabled = bool(projection["auto_disabled"])
+            disabled_reason = projection["disabled_reason"]
+            if projection["auto_disabled_state"] and not auto_disabled:
+                await self._update_auto_disabled_schedule_action(
+                    projection=projection,
+                    task_id=task_id,
+                    error=task.result_summary or f"Task {status}",
+                )
+                return
+            await self._event_bus.publish(
+                Event(
+                    type=(
+                        EventType.SCHEDULE_DISABLED if auto_disabled else EventType.SCHEDULE_ERROR
+                    ),
+                    data={
+                        "schedule_id": projection["schedule_id"],
+                        "consecutive_errors": projection["errors"],
+                        "task_id": task_id,
+                        "created_by": projection["created_by"],
+                        "agent_id": projection["agent_id"],
+                        "schedule_name": projection["schedule_name"],
+                        "error": task.result_summary or f"Task {status}",
+                        **({"reason": disabled_reason} if disabled_reason else {}),
+                    },
+                )
+            )
             return
-
-        if status not in {"failed", "cancelled"}:
+        if status not in {"completed", "failed", "cancelled"}:
             return
 
         now = datetime.now(UTC)
         errors = int(sched.consecutive_errors or 0) + 1
         disabled = errors >= self._max_consecutive_errors
         backoff = self._compute_backoff_delay(errors)
-        disabled_reason = f"Auto-disabled after {errors} consecutive errors" if disabled else None
-        async with self._db_session() as db:
-            await update_schedule_fire_state(
-                db,
-                schedule_id,
-                last_fired_at=recorded_fire_at,
-                next_fire_at=now + timedelta(seconds=backoff) if not disabled else None,
-                last_run_status="failed",
-                consecutive_errors=errors,
-                disabled_reason=disabled_reason,
-                enabled=False if disabled else None,
+        next_fire_at = (
+            now + timedelta(seconds=backoff)
+            if status == "failed"
+            and bool(getattr(sched, "retry_failed_tasks", False))
+            and not bool(event.data.get("suppress_schedule_retry"))
+            and not disabled
+            else sched.next_fire_at
+        )
+        projection = await self._fire_store.project_recurring_terminal_result(
+            task_id=task_id,
+            status=status,
+            next_fire_at=next_fire_at,
+            max_consecutive_errors=self._max_consecutive_errors,
+        )
+        if projection is not None and status == "completed":
+            if projection["auto_disabled_state"]:
+                await self._update_auto_disabled_schedule_action(
+                    projection=projection,
+                    task_id=task_id,
+                    error="Latest run succeeded, but the schedule remains automatically disabled.",
+                )
+            else:
+                await self._resolve_schedule_action(
+                    projection["schedule_id"],
+                    projection["created_by"],
+                    "schedule_recovered",
+                    task_id=task_id,
+                )
+        if projection is not None and status == "cancelled" and projection["auto_disabled_state"]:
+            await self._update_auto_disabled_schedule_action(
+                projection=projection,
+                task_id=task_id,
+                error="Latest run was cancelled, and the schedule remains automatically disabled.",
             )
-            await db.commit()
+        if projection is None or status in {"completed", "cancelled"}:
+            return
+        auto_disabled = bool(projection["auto_disabled"])
+        errors = int(projection["errors"])
+        disabled_reason = projection["disabled_reason"]
 
-        if disabled:
+        if auto_disabled:
             logger.warning(
                 "Schedule %s auto-disabled after task %s failed",
                 schedule_id,
@@ -920,6 +1020,13 @@ class Scheduler:
                 )
             )
             return
+        if projection["auto_disabled_state"]:
+            await self._update_auto_disabled_schedule_action(
+                projection=projection,
+                task_id=task_id,
+                error=task.result_summary or "Scheduled task failed",
+            )
+            return
 
         await self._event_bus.publish(
             Event(
@@ -936,6 +1043,73 @@ class Scheduler:
                 },
             )
         )
+
+    async def _update_auto_disabled_schedule_action(
+        self,
+        *,
+        projection: dict[str, Any],
+        task_id: str,
+        error: str,
+    ) -> None:
+        """Update an existing critical incident without another external alert."""
+        service = getattr(self, "_notification_service", None)
+        if service is None:
+            return
+        await service.upsert_schedule_action(
+            schedule_id=projection["schedule_id"],
+            user_email=projection["created_by"],
+            agent_id=projection["agent_id"],
+            schedule_name=projection["schedule_name"],
+            consecutive_errors=int(projection["errors"]),
+            error_summary=_safe_schedule_error(error),
+            auto_disabled=True,
+            task_id=task_id,
+        )
+
+    async def _handle_schedule_action_event(self, event: Event) -> None:
+        """Project schedule failure events into one owner-scoped notification."""
+        service = getattr(self, "_notification_service", None)
+        if service is None:
+            return
+        data = event.data
+        required = ("schedule_id", "created_by", "agent_id", "schedule_name")
+        if any(not isinstance(data.get(key), str) or not data.get(key) for key in required):
+            return
+        errors = data.get("consecutive_errors")
+        if not isinstance(errors, int):
+            reason = str(data.get("reason") or "")
+            try:
+                errors = int(reason.rsplit(":", 1)[1])
+            except (IndexError, ValueError):
+                errors = 1
+        await service.upsert_schedule_action(
+            schedule_id=data["schedule_id"],
+            user_email=data["created_by"],
+            agent_id=data["agent_id"],
+            schedule_name=data["schedule_name"],
+            consecutive_errors=errors,
+            error_summary=_safe_schedule_error(data.get("error")),
+            auto_disabled=event.type == EventType.SCHEDULE_DISABLED,
+            task_id=data.get("task_id") if isinstance(data.get("task_id"), str) else None,
+        )
+
+    async def _resolve_schedule_action(
+        self,
+        schedule_id: str,
+        user_email: str,
+        reason: str,
+        *,
+        task_id: str,
+    ) -> None:
+        service = getattr(self, "_notification_service", None)
+        if service is not None:
+            await service.resolve_schedule_action(
+                schedule_id,
+                user_email=user_email,
+                reason=reason,
+                expected_terminal_task_id=task_id,
+                require_canonical_success=True,
+            )
 
     # ------------------------------------------------------------------
     # Schedule computation
@@ -960,7 +1134,7 @@ class Scheduler:
             if sched.last_fired_at is not None:
                 return None
             if sched.one_shot_at and sched.one_shot_at > after:
-                return sched.one_shot_at
+                return cast(datetime, sched.one_shot_at)
             # Due now or in the past
             return after
 
@@ -976,7 +1150,7 @@ class Scheduler:
 
         local_after = after.astimezone(tz)
         cron = croniter(expr, local_after)
-        next_local: datetime = cron.get_next(datetime)  # type: ignore[assignment]
+        next_local: datetime = cron.get_next(datetime)
         return next_local.astimezone(UTC).replace(tzinfo=UTC)
 
     @staticmethod

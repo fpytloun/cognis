@@ -38,23 +38,51 @@ not be described as hosting.
 
 ## Writing a rich deliverable
 
-Agents use `write_deliverable` with `format="rich"`. The call always includes
-a channel-safe fallback in `content`; the structured payload is carried in
-`rich`.
+Agents use the `write_deliverable` `rich` action. The action accepts one
+canonical payload source. Cognis normalizes that payload and derives the
+channel-safe Markdown fallback.
 
 ```text
 write_deliverable(
-  action="write_deliverable",
-  format="rich",
-  title="Weekly delivery review",
-  content="Accessible Markdown fallback…",
-  rich={ blocks: [...], sources: [...], metadata: {...} }
+  action="rich",
+  payload={
+    title: "Weekly delivery review",
+    blocks: [...],
+    sources: [...],
+    metadata: {...}
+  }
 )
 ```
+
+For large payloads, publish an `application/json` file with
+`artifact_publish`. Then pass its immutable `art_*` ID:
+
+```text
+write_deliverable(
+  action="rich",
+  payload_artifact={ artifact_id: "art_<32 lowercase hex characters>" }
+)
+```
+
+Do not combine `payload` and `payload_artifact`. Rich calls do not accept
+`content`, `format`, `rich`, top-level `title`, `target`, or top-level
+`outputs`. Put the title and optional outputs in the payload.
 
 The **Cognis Rich Deliverable** system skill guides agents toward appropriate
 composition, hierarchy, evidence, and block selection. It is a writing and
 presentation guide; it does not replace schema validation.
+
+### Dashboard presentation
+
+Use `action: "rich:dashboard"` for dense, technical operational views. The
+action owns the presentation metadata and applies a wide canvas with compact
+spacing. Do not set `metadata.presentation` in an authored payload.
+
+Embedded chat hosts keep control of their width. Full and standalone views use
+the wider bounded dashboard canvas.
+
+The payload can include a top-level `title`. The stored deliverable title from
+the host takes precedence when both values exist.
 
 ## Choose the smallest useful format
 

@@ -16,6 +16,8 @@ from cognis.core.harness_guards import (
     record_tool_call,
     record_tool_result,
     same_turn_duplicate_rejection_payload,
+    tool_call_argument_fingerprint,
+    uncertain_outcome_rejection_payload,
 )
 
 
@@ -131,9 +133,7 @@ class TestSameTurnToolCallLedger:
 
         retry.seed_from(source)
 
-        assert retry.already_executed(
-            "agent_conversation_create", {"agent_id": "laforge"}
-        )
+        assert retry.already_executed("agent_conversation_create", {"agent_id": "laforge"})
 
     def test_rejection_payload_is_stable(self) -> None:
         payload = json.loads(same_turn_duplicate_rejection_payload("bash", {"command": "x"}))
@@ -141,6 +141,61 @@ class TestSameTurnToolCallLedger:
         assert payload["status"] == "skipped"
         assert payload["reason"] == "duplicate_tool_call_same_turn_lineage"
         assert payload["tool"] == "bash"
+
+    def test_uncertain_outcome_is_not_a_successful_execution(self) -> None:
+        ledger = SameTurnToolCallLedger()
+        fingerprint = tool_call_argument_fingerprint("bash", {"command": "mv a b"})
+        ledger.record_uncertain_fingerprint("bash", fingerprint)
+
+        assert ledger.uncertain_outcome("bash", {"command": "mv a b"}) is True
+        assert ledger.already_executed("bash", {"command": "mv a b"}) is False
+
+    def test_consume_uncertain_allows_deliberate_second_reissue(self) -> None:
+        ledger = SameTurnToolCallLedger()
+        fingerprint = tool_call_argument_fingerprint("bash", {"command": "mv a b"})
+        ledger.record_uncertain_fingerprint("bash", fingerprint)
+
+        # First re-issue: warn once and clear.
+        assert ledger.consume_uncertain("bash", {"command": "mv a b"}) is True
+        # Second re-issue: nothing blocks it anymore.
+        assert ledger.consume_uncertain("bash", {"command": "mv a b"}) is False
+        assert ledger.uncertain_outcome("bash", {"command": "mv a b"}) is False
+
+    def test_confirmed_execution_supersedes_uncertainty(self) -> None:
+        ledger = SameTurnToolCallLedger()
+        fingerprint = tool_call_argument_fingerprint("bash", {"command": "mv a b"})
+        ledger.record_uncertain_fingerprint("bash", fingerprint)
+        ledger.record_fingerprint("bash", fingerprint)
+
+        assert ledger.already_executed("bash", {"command": "mv a b"}) is True
+        assert ledger.uncertain_outcome("bash", {"command": "mv a b"}) is False
+        # And an executed entry is never downgraded back to uncertain.
+        ledger.record_uncertain_fingerprint("bash", fingerprint)
+        assert ledger.uncertain_outcome("bash", {"command": "mv a b"}) is False
+
+    def test_seed_from_copies_uncertain_lineage(self) -> None:
+        source = SameTurnToolCallLedger()
+        source.record_uncertain_fingerprint(
+            "bash", tool_call_argument_fingerprint("bash", {"command": "mv a b"})
+        )
+        retry = SameTurnToolCallLedger()
+
+        retry.seed_from(source)
+
+        assert retry.uncertain_outcome("bash", {"command": "mv a b"}) is True
+        assert retry.already_executed("bash", {"command": "mv a b"}) is False
+
+    def test_uncertain_rejection_payload_is_honest(self) -> None:
+        payload = json.loads(uncertain_outcome_rejection_payload("bash", {"command": "x"}))
+
+        assert payload["status"] == "blocked_uncertain_outcome"
+        assert payload["reason"] == "previous_identical_call_outcome_unknown"
+        assert payload["tool"] == "bash"
+        message = payload["message"]
+        assert "UNKNOWN" in message
+        assert "successfully" not in message
+        # The model gets an explicit escape hatch instead of a wedged turn.
+        assert "re-issue the exact same call once more" in message
 
 
 class TestArgumentSanity:

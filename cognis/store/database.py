@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from cognis.logging import get_logger
+from cognis.store import work_live_invalidation as _work_live_invalidation  # noqa: F401
 
 logger = get_logger(__name__)
 

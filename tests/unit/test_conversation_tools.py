@@ -32,6 +32,7 @@ class _FakeIntaris:
         types: list[str] | None = None,
         last_n: int | None = None,
         allow_missing_stream: bool = False,
+        before_seq: int | None = None,
     ) -> SimpleNamespace:
         del allow_missing_stream
         events = [
@@ -41,7 +42,11 @@ class _FakeIntaris:
         ]
         if types is not None:
             events = [event for event in events if event["type"] in types]
-        if last_n is not None:
+        if before_seq is not None:
+            events = [event for event in events if event["seq"] < before_seq]
+            has_more = len(events) > limit
+            events = events[-limit:]
+        elif last_n is not None:
             has_more = len(events) > last_n
             events = events[-last_n:] if last_n > 0 else []
         elif limit:
@@ -284,7 +289,7 @@ async def test_read_conversation_messages_rejects_unsupported_kinds(
     handlers = ct.build_conversation_tool_handlers(lambda: _SessionContext(), _FakeIntaris())
 
     with pytest.raises(ValueError, match="Unsupported message kind"):
-        await handlers["read_conversation_messages"]({"kinds": ["tool_call"]}, _context())
+        await handlers["read_conversation_messages"]({"kinds": ["system_message"]}, _context())
 
 
 @pytest.mark.asyncio

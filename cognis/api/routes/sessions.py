@@ -14,7 +14,9 @@ from cognis.api.models import (
     SessionResponse,
 )
 from cognis.api.serializers import session_to_response
+from cognis.core.runtime_selection import resolve_runtime_selection
 from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
+from cognis.models.session import SessionModel
 from cognis.store.queries import get_session_row
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,8 @@ def _context_usage_for_session(request: Request, session_id: str) -> dict[str, A
     if session_cache is None:
         return None
     try:
-        return session_cache.get_context_usage(session_id)
+        result = session_cache.get_context_usage(session_id)
+        return result if isinstance(result, dict) else None
     except Exception:
         logger.debug(
             "Failed to fetch cached context usage for session %s", session_id, exc_info=True
@@ -100,6 +103,19 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
     if row is None:
         raise api_exception(404, "not_found", "Session not found")
     require_resource_owner(request, row.user_email)
+    agent = await request.app.state.agent_registry.get(row.agent_id, owner_email=row.user_email)
+    runtime_selection = (
+        resolve_runtime_selection(
+            agent,
+            SessionModel.model_validate(row, from_attributes=True),
+        ).as_dict()
+        if agent is not None
+        else None
+    )
+    session_cache = getattr(request.app.state, "session_cache", None)
+    ensure_runtime_metadata = getattr(session_cache, "ensure_runtime_metadata", None)
+    if callable(ensure_runtime_metadata):
+        await ensure_runtime_metadata(SessionModel.model_validate(row, from_attributes=True))
     intaris_sid = row.intaris_session_id or row.session_id
     try:
         guardrails = request.app.state.providers.guardrails
@@ -128,6 +144,7 @@ async def session_intaris_detail(request: Request, session_id: str) -> IntarisSe
             context_usage=_context_usage_for_session(request, row.session_id),
             token_usage=_token_usage_for_session(request, row.session_id),
             last_generation=_last_generation_for_session(request, row.session_id),
+            runtime_selection=runtime_selection,
         )
     except Exception as exc:
         logger.warning("Failed to fetch Intaris session %s", intaris_sid, exc_info=True)

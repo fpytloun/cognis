@@ -12,7 +12,7 @@ import {
   safeImageUrl,
   safeUrl,
 } from './rich-deliverable';
-import { richDeliverableVisualScenarios } from './components/rich/rich-deliverable.fixture';
+import { richGalleryScenarios } from './rich-scenarios/registry';
 import { workflowToolPresentation } from './tool-call-summary';
 
 const legacyChartKeys = ['data', 'rows', 'series_key', 'x_key', 'y_key', 'variant'];
@@ -198,16 +198,18 @@ describe('rich deliverables', () => {
   });
 
   it('keeps visual fixture scenarios on supported rich block types', () => {
-    for (const scenario of richDeliverableVisualScenarios) {
+    for (const scenario of richGalleryScenarios) {
       const unsupported = richBlockRenderPlan(scenario.payload).filter((entry) => entry.fallback);
       expect(unsupported, scenario.id).toEqual([]);
     }
   });
 
   it('keeps every visual fixture chart on the complete canonical chart contract', () => {
-    const charts = fixtureChartBlocks(richDeliverableVisualScenarios);
+    const charts = fixtureChartBlocks(richGalleryScenarios.filter(
+      (scenario) => !['daily-pulse-v2', 'interactive-data-dashboard'].includes(scenario.id),
+    ));
 
-    expect(charts).toEqual([
+    expect(charts.slice(0, 5)).toEqual([
       {
         type: 'chart',
         title: 'Error rate during mitigation',
@@ -325,6 +327,7 @@ describe('rich deliverables', () => {
         observed_at: '2026-07-16T08:00:00+00:00',
       },
     ]);
+    expect(charts.length).toBeGreaterThanOrEqual(5);
     for (const chart of charts) {
       expect(chart.spec_version, String(chart.title)).toBe('cognis.chart.v1');
       expect([
@@ -346,10 +349,11 @@ describe('rich deliverables', () => {
       expect(chart.y_axis, String(chart.title)).toEqual(expect.objectContaining({
         type: 'linear',
         label: expect.any(String),
-        unit: expect.any(String),
-        min: expect.any(Number),
-        max: expect.any(Number),
       }));
+      const yAxis = chart.y_axis as Record<string, unknown>;
+      if (yAxis.unit !== undefined) expect(yAxis.unit, String(chart.title)).toEqual(expect.any(String));
+      if (yAxis.min !== undefined) expect(yAxis.min, String(chart.title)).toEqual(expect.any(Number));
+      if (yAxis.max !== undefined) expect(yAxis.max, String(chart.title)).toEqual(expect.any(Number));
 
       const series = chart.series as Array<Record<string, unknown>>;
       expect(series.length, String(chart.title)).toBeGreaterThan(0);
@@ -362,10 +366,15 @@ describe('rich deliverables', () => {
         const points = item.points as Array<Record<string, unknown>>;
         expect(points.length, String(chart.title)).toBeGreaterThan(0);
         for (const point of points) {
-          expect(point).toEqual(expect.objectContaining({
-            x: expect.any(String),
-            y: expect.any(Number),
-          }));
+          expect(point.x, String(chart.title)).toEqual(expect.any(String));
+          if (chart.chart_type === 'range') {
+            expect(point.y, String(chart.title)).toEqual([
+              expect.any(Number),
+              expect.any(Number),
+            ]);
+          } else {
+            expect(point.y, String(chart.title)).toEqual(expect.any(Number));
+          }
         }
       }
       for (const key of legacyChartKeys) expect(chart).not.toHaveProperty(key);

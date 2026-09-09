@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -15,6 +16,7 @@ from cognis.models.executor_inference import (
     executor_local_inference_config_confirmed,
     resolve_executor_local_inference_config,
 )
+from cognis.models.runtime_capabilities import RuntimeCapabilityReport
 
 
 def test_fast_path_local_inference_requires_matching_generation_flags_and_endpoint() -> None:
@@ -91,6 +93,68 @@ def _executor_row(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+@pytest.mark.asyncio
+async def test_reload_mcp_credentials_keeps_executor_available_and_persists_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = SimpleNamespace(
+        rpc_call=AsyncMock(
+            return_value={
+                "state": "applied",
+                "credential_revision": {"token_id": "token-1", "token_version": 2},
+            }
+        )
+    )
+    app = _app_with_ws_connection(connection)
+    row = _executor_row(
+        runtime_state="active",
+        desired_config_version=7,
+        applied_config_version=7,
+    )
+    payload = {
+        "server": {"server_id": "mcp-1"},
+        "credential_revision": {"token_id": "token-1", "token_version": 2},
+    }
+    persisted = AsyncMock()
+
+    async def _get_executor_row(_session: object, executor_id: str) -> SimpleNamespace:
+        assert executor_id == "remote-1"
+        return row
+
+    monkeypatch.setattr(executor_runtime, "get_executor_row", _get_executor_row)
+    monkeypatch.setattr(
+        executor_runtime,
+        "_build_mcp_credential_reload_payload",
+        AsyncMock(return_value=payload),
+    )
+    monkeypatch.setattr(executor_runtime, "_persist_mcp_credential_revision", persisted)
+
+    result = await executor_runtime.reload_mcp_server_credentials(
+        app,
+        "remote-1",
+        "mcp-1",
+    )
+
+    assert result == "applied"
+    assert row.runtime_state == "active"
+    assert row.desired_config_version == 7
+    assert row.applied_config_version == 7
+    connection.rpc_call.assert_awaited_once_with(
+        "executor.mcp.reload_credentials",
+        payload,
+        timeout=executor_runtime.MCP_CREDENTIAL_RELOAD_TIMEOUT_SECONDS,
+        stable_call_id="mcp-credential:remote-1:mcp-1:token-1:2",
+        replay_safe=True,
+    )
+    persisted.assert_awaited_once_with(
+        app,
+        row,
+        connection=connection,
+        server_id="mcp-1",
+        revision={"token_id": "token-1", "token_version": 2},
+    )
+
+
 async def _wait_for_call_count(calls: list[str], expected: int) -> None:
     while len(calls) < expected:
         await asyncio.sleep(0)
@@ -156,6 +220,7 @@ async def test_legacy_generation_normalizes_confirms_and_is_restart_idempotent(
     configure_calls: list[int] = []
     normalization_calls: list[int] = []
     ready_calls: list[object] = []
+    capability_report = RuntimeCapabilityReport.unknown().model_dump(mode="json")
 
     class _Connection:
         connected = True
@@ -180,6 +245,7 @@ async def test_legacy_generation_normalizes_confirms_and_is_restart_idempotent(
                     "local_model_runtime": runtime_metadata["ollama_runtime"],
                 },
                 "runtime_metadata": runtime_metadata,
+                "observed_capabilities": capability_report,
             }
 
     connection = _Connection()
@@ -246,6 +312,7 @@ async def test_legacy_generation_normalizes_confirms_and_is_restart_idempotent(
     assert row.desired_config_version == 1
     assert row.applied_config_version == 1
     assert row.runtime_metadata["ollama_runtime"]["port"] == 11434
+    assert row.runtime_metadata["observed_capabilities"]["schema_version"] == 1
     assert executor_local_inference_config_confirmed(row) is True
 
     assert await executor_runtime.reconcile_executor(app, "remote-1") is True

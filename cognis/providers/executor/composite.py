@@ -8,21 +8,35 @@ Dispatches ``spawn``, ``get_executor``, ``cancel``, etc. based on the
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from collections.abc import Awaitable
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core import executor_availability
+from cognis.core.executor_availability import (
+    is_executor_type_available,
+    unavailable_executor_reason,
+)
 from cognis.core.executor_policy import ensure_executor_type_allowed, load_executor_policy
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.tool import ExecutorConfig, ExecutorHandle
-from cognis.providers.executor.in_process import InProcessExecutorProvider
-from cognis.providers.executor.subprocess import SubprocessExecutorProvider
 from cognis.providers.executor.websocket import WebSocketExecutorProvider
 from cognis.store.queries import list_executors
 from cognis.tools.executor.lsp.runtime import LSPStatusReport, build_lsp_unavailable_report
 
+if TYPE_CHECKING:
+    from cognis.providers.executor.in_process import InProcessExecutorProvider
+    from cognis.providers.executor.subprocess import SubprocessExecutorProvider
+
 _logger = get_logger(__name__)
+
+
+def is_executor_package_available() -> bool:
+    """Proxy the controller-owned package check for test seams."""
+
+    return executor_availability.is_executor_package_available()
 
 
 class CompositeExecutorProvider:
@@ -36,12 +50,14 @@ class CompositeExecutorProvider:
 
     def __init__(
         self,
-        in_process: InProcessExecutorProvider,
-        websocket: WebSocketExecutorProvider,
-        subprocess: SubprocessExecutorProvider,
+        in_process: InProcessExecutorProvider | None = None,
+        websocket: WebSocketExecutorProvider | None = None,
+        subprocess: SubprocessExecutorProvider | None = None,
         session_factory: async_sessionmaker[AsyncSession] | None = None,
     ) -> None:
         self._in_process = in_process
+        if websocket is None:
+            raise ValueError("WebSocket executor provider is required")
         self._websocket = websocket
         self._subprocess = subprocess
         self._session_factory = session_factory
@@ -49,9 +65,15 @@ class CompositeExecutorProvider:
         self._handle_types: dict[str, str] = {}
 
     @property
-    def in_process(self) -> InProcessExecutorProvider:
+    def in_process(self) -> InProcessExecutorProvider | None:
         """Direct access to the in-process sub-provider."""
         return self._in_process
+
+    @property
+    def subprocess(self) -> SubprocessExecutorProvider | None:
+        """Direct access to the optional subprocess sub-provider."""
+
+        return self._subprocess
 
     @property
     def websocket(self) -> WebSocketExecutorProvider:
@@ -69,7 +91,7 @@ class CompositeExecutorProvider:
             policy = await load_executor_policy(self._session_factory)
             ensure_executor_type_allowed(executor_type, policy)
         provider = self._get_provider(executor_type)
-        handle = await provider.spawn(config)
+        handle = cast(ExecutorHandle, await provider.spawn(config))
         self._handle_types[handle.executor_id] = executor_type
         return handle
 
@@ -88,26 +110,45 @@ class CompositeExecutorProvider:
     async def list_active(self) -> list[ExecutorHandle]:
         """List all active executors across all sub-providers."""
         results: list[ExecutorHandle] = []
-        results.extend(await self._in_process.list_active())
+        local_available = is_executor_package_available()
+        if local_available and self._in_process is not None:
+            results.extend(await self._in_process.list_active())
         results.extend(await self._websocket.list_active())
-        results.extend(await self._subprocess.list_active())
+        if local_available and self._subprocess is not None:
+            results.extend(await self._subprocess.list_active())
         return results
 
     async def cleanup(self) -> None:
         """Clean up all sub-providers."""
-        await self._in_process.cleanup()
-        await self._subprocess.cleanup()
+        local_available = is_executor_package_available()
+        if local_available and self._in_process is not None:
+            await self._in_process.cleanup()
+        if local_available and self._subprocess is not None:
+            await self._subprocess.cleanup()
         await self._websocket.cleanup()
         self._handle_types.clear()
 
     async def health(self) -> ProviderHealth:
         """Aggregate health from all sub-providers."""
-        ip_health = await self._in_process.health()
         ws_health = await self._websocket.health()
-        sp_health = await self._subprocess.health()
+        statuses = [ws_health.status]
+        local_available = is_executor_package_available()
+        if local_available and self._in_process is not None and self._subprocess is not None:
+            ip_health = await self._in_process.health()
+            sp_health = await self._subprocess.health()
+            local_details: dict[str, Any] = {
+                "available": True,
+                "in_process": ip_health.details,
+                "subprocess": sp_health.details,
+            }
+            statuses.extend([ip_health.status, sp_health.status])
+        else:
+            local_details = {
+                "available": False,
+                "reason": unavailable_executor_reason("in_process"),
+            }
 
         # Overall status: healthy if any sub-provider is healthy
-        statuses = [ip_health.status, ws_health.status, sp_health.status]
         if "healthy" in statuses:
             overall = "healthy"
         elif "degraded" in statuses:
@@ -119,9 +160,10 @@ class CompositeExecutorProvider:
             name="executor",
             status=overall,
             details={
-                "in_process": ip_health.details,
+                "local": local_details,
+                "in_process": local_details.get("in_process"),
                 "websocket": ws_health.details,
-                "subprocess": sp_health.details,
+                "subprocess": local_details.get("subprocess"),
             },
         )
 
@@ -131,7 +173,11 @@ class CompositeExecutorProvider:
 
     async def get_lsp_statuses(self, *, owner_email: str | None = None) -> list[LSPStatusReport]:
         """Return normalized LSP status across executor types."""
-        reports = await self._in_process.get_lsp_statuses(owner_email=owner_email)
+        reports = (
+            await self._in_process.get_lsp_statuses(owner_email=owner_email)
+            if is_executor_package_available() and self._in_process is not None
+            else []
+        )
         reports_by_id = {report.executor_id: report for report in reports if report.executor_id}
 
         if self._session_factory is None:
@@ -146,12 +192,25 @@ class CompositeExecutorProvider:
         async with self._session_factory() as session:
             rows = await list_executors(session, owner_email=owner_email)
 
-        remote_tasks: list[Any] = []
+        remote_tasks: list[Awaitable[LSPStatusReport]] = []
         for row in rows:
             if row.executor_id in reports_by_id:
                 continue
+            if row.executor_type in {"in_process", "subprocess"} and (
+                self._in_process is None or self._subprocess is None
+            ):
+                reports.append(
+                    build_lsp_unavailable_report(
+                        executor_id=row.executor_id,
+                        executor_type=row.executor_type,
+                        source=row.config or {},
+                        state="unavailable",
+                        warning=unavailable_executor_reason(row.executor_type),
+                    )
+                )
+                continue
             if row.executor_type == "in_process":
-                state = (
+                state: Literal["ready", "disabled", "unsupported", "unavailable"] = (
                     "disabled"
                     if not bool((row.config or {}).get("lsp_enabled", True))
                     else "unavailable"
@@ -169,10 +228,12 @@ class CompositeExecutorProvider:
                 continue
             if row.executor_type not in {"websocket", "subprocess"}:
                 continue
-            handle = self._websocket.get_handle(row.executor_id)
-            if handle is not None:
-                handle.executor_type = row.executor_type
-                remote_tasks.append(self._websocket.get_lsp_status(handle, source=row.config or {}))
+            remote_handle = self._websocket.get_handle(row.executor_id)
+            if remote_handle is not None:
+                remote_handle.executor_type = row.executor_type
+                remote_tasks.append(
+                    self._websocket.get_lsp_status(remote_handle, source=row.config or {})
+                )
                 continue
             state = (
                 "disabled"
@@ -193,7 +254,7 @@ class CompositeExecutorProvider:
         if remote_tasks:
             remote_results = await asyncio.gather(*remote_tasks, return_exceptions=True)
             for result in remote_results:
-                if isinstance(result, Exception):
+                if isinstance(result, BaseException):
                     _logger.debug("executor: failed to gather remote LSP status: %s", result)
                     continue
                 reports.append(result)
@@ -212,11 +273,23 @@ class CompositeExecutorProvider:
 
     def _get_provider(self, executor_type: str) -> Any:
         """Resolve the sub-provider for an executor type."""
+        if executor_type not in {"in_process", "subprocess", "websocket"}:
+            raise ValueError(f"Unknown executor type: {executor_type}")
+        if not is_executor_type_available(executor_type):
+            self._raise_unavailable(executor_type)
         if executor_type == "in_process":
+            if self._in_process is None:
+                self._raise_unavailable(executor_type)
             return self._in_process
         if executor_type == "subprocess":
+            if self._subprocess is None:
+                self._raise_unavailable(executor_type)
             return self._subprocess
         if executor_type == "websocket":
             return self._websocket
-        msg = f"Unknown executor type: {executor_type}"
-        raise ValueError(msg)
+        raise ValueError(f"Unknown executor type: {executor_type}")
+
+    @staticmethod
+    def _raise_unavailable(executor_type: str) -> None:
+        reason = unavailable_executor_reason(executor_type)
+        raise ValueError(reason or f"Executor type '{executor_type}' is unavailable")

@@ -499,7 +499,7 @@
 {#if item.role === 'assistant'}
   <div class={`flex w-full min-w-0 items-start ${compact ? '' : 'gap-2 sm:gap-3'}`}>
     {#if !compact}
-      <div class="relative mt-0.5 shrink-0">
+      <div class="relative mt-0.5 shrink-0" data-copy-exclude>
         {#if agent}
           <button
             type="button"
@@ -528,7 +528,7 @@
         <MessageAttachments attachments={item.attachments} />
       {/if}
 
-      <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3">
+      <div class="mt-2.5 flex items-center justify-between gap-3 text-[11px] opacity-80 sm:mt-3" data-copy-exclude>
         <div class="flex min-w-0 items-center gap-1.5">
           <AgentAvatar name={agentName} avatarUrl={agentAvatarUrl} class="h-4 w-4 rounded-md text-[9px]" />
           <Popover text={runtimeTooltip} placement="top">
@@ -610,7 +610,7 @@
       <MessageAttachments attachments={item.attachments} />
     {/if}
 
-    <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5">
+    <div class="mt-2 flex items-center justify-end gap-2 text-[11px] opacity-70 sm:mt-2.5" data-copy-exclude>
       {#if deliveryStatusLabel}
         <span class={`rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.16em] ${deliveryStatusClass()}`}>{deliveryStatusLabel}</span>
       {/if}

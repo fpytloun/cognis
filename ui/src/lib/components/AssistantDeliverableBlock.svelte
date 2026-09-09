@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
-
   import { api } from '$lib/api/client';
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
   import { extractMarkdownHeadings } from '$lib/markdown';
@@ -15,12 +13,14 @@
 
   export let item: AssistantDeliverableTimelineItem | RenderAssistantDeliverableTimelineItem;
   export let loadDeliverable: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
+  export let displayOnly = false;
   export let collapsedByDefault = false;
 
   let deliverable: Deliverable | null = null;
   let loading = true;
   let error: string | null = null;
   let accessorConversationId = '';
+  let loadGeneration = 0;
   $: deliverableId = 'deliverable_id' in item ? item.deliverable_id : item.deliverableId;
 
   $: deliverableFormat = deliverable?.format ?? item.format ?? 'markdown';
@@ -93,36 +93,47 @@
     return result.url;
   }
 
-  onMount(() => {
-    let cancelled = false;
+  async function loadCurrent(
+    id: string,
+    loaderOverride: ((deliverableId: string) => Promise<Deliverable>) | undefined,
+    previewOnly: boolean,
+  ): Promise<void> {
+    const generation = ++loadGeneration;
     loading = true;
     error = null;
+    if (deliverable?.deliverable_id !== id) deliverable = null;
     accessorConversationId = currentConversationId();
-    const loader = loadDeliverable
-      ? loadDeliverable(deliverableId)
-      : api.deliverables.get(deliverableId, { accessorConversationId });
-    loader
-      .then((result: Deliverable) => {
-        if (!cancelled) deliverable = result;
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          error = err instanceof Error ? err.message : 'Failed to load deliverable';
-        }
-      })
-      .finally(() => {
-        if (!cancelled) loading = false;
-      });
-    return () => {
-      cancelled = true;
-    };
-  });
+    if (previewOnly && !loaderOverride) {
+      loading = false;
+      return;
+    }
+    try {
+      const result = await (loaderOverride
+        ? loaderOverride(id)
+        : api.deliverables.get(id, { accessorConversationId }));
+      if (generation === loadGeneration && deliverableId === id) deliverable = result;
+    } catch (err) {
+      if (generation === loadGeneration && deliverableId === id) {
+        error = err instanceof Error ? err.message : 'Failed to load deliverable';
+      }
+    } finally {
+      if (generation === loadGeneration && deliverableId === id) loading = false;
+    }
+  }
+
+  $: void loadCurrent(deliverableId, loadDeliverable, displayOnly);
 </script>
 
 <div class="assistant-deliverable-wrapper" data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
-  {#if loading}
+  {#if loading && !deliverable}
     <div class="text-sm text-slate-400">Loading deliverable…</div>
-  {:else if error}
+  {:else if displayOnly && !deliverable}
+    <div class="rounded-xl border border-slate-700/70 bg-slate-900/60 p-3" data-testid="display-only-deliverable">
+      <p class="text-sm font-medium text-slate-200">{deliverableTitle}</p>
+      {#if item.format}<p class="mt-1 text-xs text-slate-500">{item.format} deliverable · preview only</p>{/if}
+      {#if item.content && !collapsedByDefault}<p class="mt-2 line-clamp-6 whitespace-pre-wrap text-sm text-slate-300">{item.content}</p>{/if}
+    </div>
+  {:else if error && !deliverable}
     <div class="space-y-2">
       <div class="text-sm font-medium text-rose-300">Could not load deliverable</div>
       <div class="text-xs text-slate-500">{error}</div>
@@ -133,6 +144,7 @@
       {/if}
     </div>
   {:else if deliverable && richPayload}
+    {#key deliverableId}
     <RichDeliverable
       title={deliverableTitle}
       content={deliverable.content}
@@ -146,6 +158,7 @@
       compact
       {collapsedByDefault}
     />
+    {/key}
   {/if}
 </div>
 

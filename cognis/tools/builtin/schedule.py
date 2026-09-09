@@ -56,7 +56,7 @@ _DESCRIPTION = (
     "before unfamiliar or complex mutations."
 )
 
-_BASE_SCHEMA = {
+_BASE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "action": {
@@ -193,6 +193,14 @@ _BASE_SCHEMA = {
             "type": "boolean",
             "description": "Whether to delete a one-shot schedule after it fires.",
         },
+        "retry_failed_tasks": {
+            "type": "boolean",
+            "description": "Retry failed tasks before the next regular fire. Defaults to false.",
+        },
+        "fail_paused_task_on_next_fire": {
+            "type": "boolean",
+            "description": "Fail paused tasks at the next regular fire. Defaults to true.",
+        },
         "interaction_mode_override": {
             "type": "string",
             "enum": ["none", "explicit_gates", "step_requests"],
@@ -299,6 +307,8 @@ _DEFINITION_FIELDS = (
     "allow_silent_completion",
     "max_concurrent_runs",
     "delete_after_run",
+    "retry_failed_tasks",
+    "fail_paused_task_on_next_fire",
     "interaction_mode_override",
     "session_policy",
 )
@@ -645,6 +655,8 @@ async def _handle_create(
             enabled=arguments.get("enabled", True),
             max_concurrent_runs=arguments.get("max_concurrent_runs", 1),
             delete_after_run=arguments.get("delete_after_run", False),
+            retry_failed_tasks=arguments.get("retry_failed_tasks", False),
+            fail_paused_task_on_next_fire=arguments.get("fail_paused_task_on_next_fire", True),
             completion_mode_family=arguments.get("completion_mode_family", "default"),
             allow_silent_completion=arguments.get("allow_silent_completion", False),
             interaction_mode_override=arguments.get("interaction_mode_override", "none"),
@@ -702,6 +714,8 @@ async def _handle_update(
             "enabled",
             "max_concurrent_runs",
             "delete_after_run",
+            "retry_failed_tasks",
+            "fail_paused_task_on_next_fire",
             "completion_mode_family",
             "allow_silent_completion",
             "interaction_mode_override",
@@ -786,6 +800,11 @@ async def _handle_update(
 
         if not fields:
             return ToolResult(output="No fields to update.")
+        if fields.get("enabled") is False:
+            fields["disabled_reason"] = "disabled_by_user"
+        elif fields.get("enabled") is True:
+            fields["disabled_reason"] = None
+            fields["consecutive_errors"] = 0
 
         if _requires_next_fire_recompute(fields):
             fields["next_fire_at"] = _compute_next_fire_for_update(existing, fields)
@@ -895,6 +914,8 @@ def _row_to_model(row: Any) -> ScheduleModel:
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
+        retry_failed_tasks=bool(getattr(row, "retry_failed_tasks", False)),
+        fail_paused_task_on_next_fire=bool(getattr(row, "fail_paused_task_on_next_fire", True)),
         completion_delivery=CompletionDeliveryPolicy(
             completion_mode_family=getattr(row, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
@@ -922,7 +943,8 @@ async def _count_active_tasks_safe(session_factory: Any, schedule_id: str) -> in
 def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -> dict[str, Any]:
     """Serialize the full persisted schedule definition for safe LLM edits."""
     template = row.task_template if isinstance(row.task_template, dict) else {}
-    delivery = template.get("delivery") if isinstance(template.get("delivery"), dict) else {}
+    delivery_value = template.get("delivery")
+    delivery: dict[str, Any] = delivery_value if isinstance(delivery_value, dict) else {}
     model = _row_to_model(row)
     return {
         "schedule_id": row.schedule_id,
@@ -953,6 +975,8 @@ def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -
         "enabled": row.enabled,
         "max_concurrent_runs": row.max_concurrent_runs,
         "delete_after_run": row.delete_after_run,
+        "retry_failed_tasks": bool(getattr(row, "retry_failed_tasks", False)),
+        "fail_paused_task_on_next_fire": bool(getattr(row, "fail_paused_task_on_next_fire", True)),
         "interaction_mode_override": getattr(row, "interaction_mode_override", "none"),
         "session_policy": template.get("session_policy") or {},
         "last_fired_at": _iso(row.last_fired_at),

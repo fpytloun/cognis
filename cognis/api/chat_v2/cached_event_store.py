@@ -34,7 +34,7 @@ from cognis.core.redis_service import RedisService
 from cognis.providers.guardrails.events import EventAppendNotification, EventStoreAuthority
 from cognis.runtime_context import scoped_runtime_context
 
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 MAX_REDIS_VALUE_BYTES = 2 * 1024 * 1024
 MAX_RAW_VALUE_BYTES = 16 * 1024 * 1024
 DEFAULT_CACHE_TTL_SECONDS = 60 * 60
@@ -1428,7 +1428,7 @@ class CachedSessionEventStore:
                 self._authority_digest(authority),
                 value.last_seq,
             )
-            return value.model_copy(update={"last_seq": last_seq})
+            return self._watermark_with_floor(value, last_seq)
         return value
 
     async def _generation(self, token: str) -> _Generation | None:
@@ -1558,26 +1558,34 @@ class CachedSessionEventStore:
             watermark.last_seq,
         )
         if not self._redis.configured:
-            return watermark.model_copy(update={"last_seq": local_last_seq}), True
+            return self._watermark_with_floor(watermark, local_last_seq), True
         result = await self._redis.eval(
             _ADVANCE_WATERMARK_FLOOR,
             keys=[self._append_watermark_key(token, authority_digest)],
             args=[local_last_seq, self._policy.generation_ttl_seconds],
         )
         if result is None or isinstance(result, bool):
-            return watermark.model_copy(update={"last_seq": local_last_seq}), False
+            return self._watermark_with_floor(watermark, local_last_seq), False
         try:
             last_seq = int(result)
         except (TypeError, ValueError):
-            return watermark.model_copy(update={"last_seq": local_last_seq}), False
+            return self._watermark_with_floor(watermark, local_last_seq), False
         if last_seq < local_last_seq:
-            return watermark.model_copy(update={"last_seq": local_last_seq}), False
+            return self._watermark_with_floor(watermark, local_last_seq), False
         last_seq = self._advance_local_watermark_floor(
             token,
             authority_digest,
             last_seq,
         )
-        return watermark.model_copy(update={"last_seq": last_seq}), True
+        return self._watermark_with_floor(watermark, last_seq), True
+
+    @staticmethod
+    def _watermark_with_floor(
+        watermark: SessionWatermark,
+        last_seq: int,
+    ) -> SessionWatermark:
+        availability = watermark.availability if last_seq == watermark.last_seq else None
+        return watermark.model_copy(update={"last_seq": last_seq, "availability": availability})
 
     def _advance_local_watermark_floor(
         self,
@@ -2348,6 +2356,10 @@ class CachedSessionEventStore:
                 and isinstance(value.last_seq, int)
                 and not isinstance(value.last_seq, bool)
                 and value.last_seq >= 0
+                and (
+                    value.availability is None
+                    or value.availability.durable_last_seq == value.last_seq
+                )
             )
         if not isinstance(value, SessionEventPage) or len(value.events) > limit:
             return False
@@ -2356,9 +2368,24 @@ class CachedSessionEventStore:
         if direction == "backward" and value.has_more_after:
             return False
         if not value.events:
-            return (
-                value.first_seq is None and not value.has_more_before and not value.has_more_after
-            )
+            if (
+                value.first_seq is not None
+                or value.last_seq is not None
+                or value.has_more_before
+                or value.has_more_after
+            ):
+                return False
+            if not value.verified_empty:
+                return True
+            availability = value.availability
+            if availability is None or availability.history_gap is not None:
+                return False
+            if direction == "forward":
+                return (after_seq or 0) >= availability.durable_last_seq
+            requested_end = availability.durable_last_seq
+            if before_seq is not None:
+                requested_end = min(requested_end, max(0, before_seq - 1))
+            return requested_end == 0
         if value.verified_empty:
             return False
         seqs = [event.seq for event in value.events]
@@ -2369,11 +2396,9 @@ class CachedSessionEventStore:
             )
             or seqs != sorted(set(seqs))
             or value.first_seq != seqs[0]
-            or value.last_seq is None
-            or value.last_seq < seqs[-1]
+            or value.last_seq != seqs[-1]
+            or (value.availability is not None and value.availability.durable_last_seq < seqs[-1])
         ):
-            return False
-        if (direction == "backward" or not value.has_more_after) and value.last_seq != seqs[-1]:
             return False
         if after_seq is not None and any(seq <= after_seq for seq in seqs):
             return False
@@ -2532,6 +2557,24 @@ class BoundSessionEventStore:
             session_id=session_id,
         )
         return cast(SessionWatermark, value)
+
+    async def read_authoritative_session_high_watermark(
+        self, *, session_id: str
+    ) -> SessionWatermark:
+        """Read the backing store without consulting or populating cache tiers."""
+
+        value = await self._cache._read_upstream(
+            authority=self._authority,
+            operation="watermark",
+            session_id=session_id,
+            after_seq=None,
+            before_seq=None,
+            limit=1,
+            direction="forward",
+        )
+        if not isinstance(value, SessionWatermark):
+            raise TypeError("watermark read returned a non-watermark value")
+        return value
 
 
 __all__ = [

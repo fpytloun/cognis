@@ -112,12 +112,14 @@ async def test_conversation_todos_postgres_replacement_takes_advisory_lock() -> 
     )
 
     assert persisted == [{"content": "new", "status": "in_progress"}]
-    assert len(session.executed) == 2
+    assert len(session.executed) == 3
     lock_statement, lock_params = session.executed[0]
     delete_statement, _ = session.executed[1]
     assert "pg_advisory_xact_lock" in lock_statement
     assert lock_params == {"key": "todo-replace:conversation:conv_1"}
     assert delete_statement.startswith("DELETE FROM conversation_todos")
+    update_statement, _ = session.executed[2]
+    assert update_statement.startswith("UPDATE conversations SET updated_at=")
     assert len(session.added) == 1
     assert session.flushed is True
 

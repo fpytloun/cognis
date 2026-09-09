@@ -1,16 +1,103 @@
 import { fireEvent, render as renderComponent, screen, within } from '@testing-library/svelte';
-import { describe, expect, it } from 'vitest';
+import { tick } from 'svelte';
+import { describe, expect, it, vi } from 'vitest';
 
 import { SUPPORTED_RICH_BLOCK_TYPES, type RichBlock } from '$lib/rich-deliverable';
+import { requireRichScenario } from '$lib/rich-scenarios/registry';
 import RichDeliverable from './RichDeliverable.svelte';
-import { dailyPulseScenario } from './daily-pulse.fixture';
-import { richDeliverableVisualFixture } from './rich-deliverable.fixture';
+
+const dailyPulseScenario = requireRichScenario('daily-pulse-v2');
+const richDeliverableVisualFixture = requireRichScenario('research-answer');
+
+const mocks = vi.hoisted(() => ({
+  addToast: vi.fn(),
+}));
+
+vi.mock('$lib/stores/toasts', () => ({
+  addToast: mocks.addToast,
+}));
 
 function render(_: typeof RichDeliverable, props: { payload: unknown; surface?: 'embedded' | 'standalone' } & Record<string, unknown>) {
   return renderComponent(RichDeliverable, { surface: 'standalone', ...props });
 }
 
 describe('RichDeliverable component rendering', () => {
+  it('only applies the wide inline sidebar layout while the TOC is open', async () => {
+    const resizeObserverDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'ResizeObserver');
+    class WideResizeObserver {
+      constructor(private readonly callback: ResizeObserverCallback) {}
+      observe() {
+        this.callback([{ contentRect: { width: 1280 } } as ResizeObserverEntry], this as unknown as ResizeObserver);
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+    Object.defineProperty(globalThis, 'ResizeObserver', { configurable: true, value: WideResizeObserver });
+
+    try {
+      const { container } = render(RichDeliverable, {
+        surface: 'embedded',
+        content: 'Fallback',
+        payload: {
+          metadata: { toc: { enabled: true } },
+          blocks: [
+            { type: 'section', title: 'Overview', blocks: [{ type: 'markdown', content: 'Body' }] },
+            { type: 'section', title: 'Details', blocks: [{ type: 'markdown', content: 'More body' }] },
+          ],
+        },
+      });
+      await tick();
+      const document = container.querySelector('[data-testid="rich-deliverable-inline-document"]')!;
+      expect(document).not.toHaveClass('inline-toc-sidebar');
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Open table of contents' }));
+      await tick();
+      expect(document).toHaveClass('inline-toc-sidebar');
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Close table of contents' }));
+      await tick();
+      expect(document).not.toHaveClass('inline-toc-sidebar');
+    } finally {
+      if (resizeObserverDescriptor) Object.defineProperty(globalThis, 'ResizeObserver', resizeObserverDescriptor);
+      else delete (globalThis as { ResizeObserver?: typeof ResizeObserver }).ResizeObserver;
+    }
+  });
+
+  it('shows share copy feedback and a clipboard icon after copying the share link', async () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const shareLinkCallback = vi.fn().mockResolvedValue('https://cognis.example/share');
+
+    try {
+      render(RichDeliverable, {
+        content: 'Fallback',
+        payload: { blocks: [{ type: 'markdown', content: 'Body' }] },
+        shareLinkCallback,
+      });
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Copy share link' }));
+
+      expect(shareLinkCallback).toHaveBeenCalledOnce();
+      expect(writeText).toHaveBeenCalledWith('https://cognis.example/share');
+      expect(screen.getByRole('button', { name: 'Share link copied' })).toHaveAttribute('title', 'Copied into clipboard');
+      expect(screen.getByTestId('rich-share-copied-icon')).toBeTruthy();
+      expect(screen.queryByTestId('rich-share-icon')).toBeNull();
+      expect(mocks.addToast).toHaveBeenCalledWith('Copied into clipboard', 'success');
+
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      expect(screen.getByRole('button', { name: 'Copy share link' })).toHaveAttribute('title', 'Copy share link');
+      expect(screen.getByTestId('rich-share-icon')).toBeTruthy();
+      expect(screen.queryByTestId('rich-share-copied-icon')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(['title', 'label', 'name'] as const)(
     'uses a leading hero %s as the single document identity',
     (alias) => {

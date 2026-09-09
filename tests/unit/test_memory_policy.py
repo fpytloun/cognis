@@ -259,6 +259,7 @@ def test_management_treats_unavailable_backend_profile_options_as_read_only() ->
 @pytest.mark.asyncio
 async def test_remember_jobs_are_gated_and_record_safe_origin_metadata() -> None:
     loop = object.__new__(AgentLoop)
+    loop.trusted_evidence_admission_key = None
     loop.remember_queue = SimpleNamespace(enqueue=AsyncMock())
     session = SimpleNamespace(
         mnemory_session_id="memory-session",
@@ -269,6 +270,9 @@ async def test_remember_jobs_are_gated_and_record_safe_origin_metadata() -> None
     )
     base_context = {
         "session": session,
+        "conversation": SimpleNamespace(conversation_id="memory-conversation"),
+        "turn_id": "memory-turn",
+        "trusted_evidence_admission": None,
         "system_initiated": False,
         "remember_user_event_seq": 1,
         "remember_assistant_event_seq": 2,
@@ -341,6 +345,7 @@ async def test_compaction_remember_obeys_frozen_policy(
             compacted=True,
             method="summary",
             summary="Durable summary",
+            turns_compacted=1,
         ),
         trigger="test",
     )

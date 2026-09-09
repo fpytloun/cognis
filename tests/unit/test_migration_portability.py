@@ -156,6 +156,48 @@ def test_task_delivery_default_migrates_to_preferred_channel(tmp_path: Path) -> 
         engine.dispose()
 
 
+def test_durable_work_projection_repairs_partial_schema(tmp_path: Path) -> None:
+    database_path = tmp_path / "durable-work-partial.db"
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    config.config_file_name = None
+    command.upgrade(config, "122_durable_work_projection")
+
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(sa.text("DROP TABLE work_session_projections"))
+            connection.execute(sa.text("DROP INDEX ix_work_records_owner_version_newest"))
+            connection.execute(sa.text("DROP INDEX ix_work_records_pairing"))
+        command.stamp(config, "121_channel_recipient_intents")
+        command.upgrade(config, "122_durable_work_projection")
+
+        with engine.connect() as connection:
+            inspector = sa.inspect(connection)
+            assert inspector.has_table("work_records")
+            assert inspector.has_table("work_session_projections")
+            assert {
+                str(index["name"])
+                for index in inspector.get_indexes("work_records")
+                if index.get("name")
+            } >= {
+                "ix_work_records_owner_session_version_order",
+                "ix_work_records_owner_version_newest",
+                "ix_work_records_pairing",
+            }
+            assert {
+                str(index["name"])
+                for index in inspector.get_indexes("work_session_projections")
+                if index.get("name")
+            } >= {
+                "ix_work_session_projections_queue",
+                "ix_work_session_projections_owner_state",
+                "ix_work_session_projections_lease",
+            }
+    finally:
+        engine.dispose()
+
+
 def test_postgres_integration_schemas_never_fall_back_to_public() -> None:
     offenders = []
     for path in sorted(POSTGRES_INTEGRATION_TESTS.glob("*postgres.py")):

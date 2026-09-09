@@ -17,20 +17,22 @@ depends_on = None
 
 def _columns() -> dict[str, dict[str, object]]:
     return {
-        column["name"]: column for column in sa.inspect(op.get_bind()).get_columns("deliverables")
+        str(column["name"]): dict(column)
+        for column in sa.inspect(op.get_bind()).get_columns("deliverables")
     }
 
 
 def _unique_constraint_names() -> set[str]:
     return {
-        constraint["name"]
+        str(constraint["name"])
         for constraint in sa.inspect(op.get_bind()).get_unique_constraints("deliverables")
+        if constraint.get("name")
     }
 
 
 def _foreign_key_names() -> set[str]:
     return {
-        constraint["name"]
+        str(constraint["name"])
         for constraint in sa.inspect(op.get_bind()).get_foreign_keys("deliverables")
         if constraint.get("name")
     }

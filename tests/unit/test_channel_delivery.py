@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -11,6 +13,7 @@ from cognis.channels.delivery import (
     ChannelDeliveryStatus,
     ChannelProjection,
 )
+from cognis.channels.signal_failures import SignalDeliveryFailure
 from cognis.core.events import Event, EventBus, EventType
 from cognis.models.channel import ChannelCapabilities, OutboundMessage
 
@@ -48,6 +51,14 @@ class _Session:
         return None
 
 
+class _SessionContext:
+    async def __aenter__(self) -> _Session:
+        return _Session()
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+
 def test_render_escalation_notification_includes_required_details() -> None:
     service = _make_service()
 
@@ -65,6 +76,43 @@ def test_render_escalation_notification_includes_required_details() -> None:
     assert "/approve" in content
     assert "/deny" in content
     assert "optionally add a note" in content
+
+
+@pytest.mark.asyncio
+async def test_duplicate_notification_delivery_reuses_stable_outbox_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivery_ids: list[str] = []
+
+    async def _route(_session: object, _conversation_id: str) -> tuple[str, str, str, None, str]:
+        return ("signal", "acct-1", "chat-1", None, "user@example.com")
+
+    async def _create_or_get(_session: object, **kwargs: object) -> tuple[object, bool]:
+        delivery_ids.append(str(kwargs["delivery_id"]))
+        return SimpleNamespace(delivery_id=kwargs["delivery_id"]), len(delivery_ids) == 1
+
+    monkeypatch.setattr("cognis.channels.delivery.get_conversation_channel_route", _route)
+    monkeypatch.setattr(
+        "cognis.store.queries.create_or_get_channel_delivery_outbox",
+        _create_or_get,
+    )
+    service = ChannelDeliveryService(
+        session_factory=lambda: _SessionContext(),  # type: ignore[arg-type]
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: None,
+    )
+    service._deliver_outbox = AsyncMock()  # type: ignore[method-assign]
+
+    for _ in range(2):
+        await service._enqueue_notification_delivery(
+            notification_id="audit-call-1",
+            conversation_id="conv-1",
+            session_id="sess-1",
+            content="Approval required",
+        )
+
+    assert len(delivery_ids) == 2
+    assert delivery_ids[0] == delivery_ids[1]
 
 
 def test_render_gate_notification_lists_real_options_and_task_board_instruction() -> None:
@@ -211,6 +259,32 @@ async def test_notification_event_delivers_rich_escalation_text() -> None:
     content = service.send_to_conversation.await_args.args[1]
     assert "Approval required for tool `bash`." in content
     assert "Reply /approve to allow it or /deny to block it." in content
+
+
+@pytest.mark.asyncio
+async def test_durable_notification_uses_retryable_outbox_path() -> None:
+    service = _make_service()
+    service._resolve_channel = AsyncMock(return_value=("signal", "acct-1", "+420111222333"))  # type: ignore[method-assign]
+    service._enqueue_notification_delivery = AsyncMock()  # type: ignore[method-assign]
+
+    await service._handle_notification_event(
+        Event(
+            type=EventType.NOTIFICATION_CREATED,
+            data={
+                "notification_id": "audit-call-1",
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "notification_type": "escalation",
+                "payload": {"tool_name": "bash"},
+            },
+        )
+    )
+
+    service._enqueue_notification_delivery.assert_awaited_once()
+    assert (
+        service._enqueue_notification_delivery.await_args.kwargs["notification_id"]
+        == "audit-call-1"
+    )
 
 
 @pytest.mark.asyncio
@@ -546,6 +620,7 @@ async def test_deliver_outbox_keeps_partial_multipart_delivery_retryable(
     mark_sent = AsyncMock(return_value=True)
     mark_failed = AsyncMock(return_value=True)
     mark_uncertain = AsyncMock(return_value=True)
+
     monkeypatch.setattr("cognis.store.queries.claim_channel_delivery_outbox", claim)
     monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_sent", mark_sent)
     monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_failed", mark_failed)
@@ -794,6 +869,160 @@ async def test_send_to_route_treats_missing_signal_message_id_as_failure() -> No
     )
 
     assert status == ChannelDeliveryStatus.UNCERTAIN
+
+
+@pytest.mark.asyncio
+async def test_deliver_outbox_persists_signal_uncertainty_without_resend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = SimpleNamespace(
+        delivery_id="cdel-signal-worker",
+        account_id="acct-1",
+        channel_type="signal",
+        chat_id="chat-1",
+        thread_id=None,
+        user_email="owner@example.com",
+        conversation_id="conv-1",
+        session_id=None,
+        source_type="channel_tool_message",
+        status="pending",
+        attachments_json=None,
+        deliverable_id=None,
+        fallback_text="one two three four",
+        completed_chunk_count=1,
+        projected_chunk_count=None,
+        projection_digest=None,
+        inflight_chunk_index=None,
+        inflight_idempotent=None,
+        lease_token=None,
+        lease_expires_at=None,
+        next_attempt_at=None,
+    )
+
+    class _WorkerSession:
+        async def get(self, _model: object, _identifier: object) -> object:
+            return row
+
+        def expunge(self, _value: object) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield _WorkerSession()
+
+    class _Adapter:
+        capabilities = ChannelCapabilities(max_message_length=5)
+
+        mode = "uncertain"
+
+        async def send_message(self, _message: object) -> str:
+            if self.mode == "cancel":
+                raise asyncio.CancelledError
+            raise SignalDeliveryFailure(
+                {
+                    "classification": "rate_limit",
+                    "provider_code": -5,
+                    "retry_after_seconds": 7,
+                    "challenge": False,
+                }
+            )
+
+    class _Manager:
+        def find_adapter_for_channel(
+            self, _channel_type: str, _account_id: str
+        ) -> tuple[object, object]:
+            return _Adapter(), object()
+
+    service = ChannelDeliveryService(
+        session_factory=session_factory,
+        event_bus=EventBus(),
+        channel_manager_ref=lambda: _Manager(),
+    )
+    send_calls = 0
+    uncertain_calls: list[dict[str, object]] = []
+
+    async def mark_uncertain(_session: object, **kwargs: object) -> bool:
+        uncertain_calls.append(kwargs)
+        row.status = "uncertain"
+        row.last_error = kwargs["last_error"]
+        row.lease_token = None
+        return True
+
+    async def claim(_session: object, **kwargs: object) -> object:
+        row.status = "sending"
+        row.lease_token = kwargs["lease_token"]
+        return row
+
+    async def mark_inflight(_session: object, **kwargs: object) -> bool:
+        row.inflight_chunk_index = kwargs["chunk_index"]
+        row.inflight_idempotent = kwargs["idempotent"]
+        return True
+
+    original_send_to_route = service._send_to_route
+
+    async def send_to_route(**kwargs: object) -> ChannelDeliveryStatus:
+        nonlocal send_calls
+        send_calls += 1
+        status = await original_send_to_route(**kwargs)
+        return status
+
+    monkeypatch.setattr("cognis.store.queries.claim_channel_delivery_outbox", claim)
+    monkeypatch.setattr("cognis.store.queries.mark_channel_delivery_chunk_inflight", mark_inflight)
+    monkeypatch.setattr(
+        "cognis.store.queries.mark_channel_delivery_uncertain",
+        mark_uncertain,
+    )
+    monkeypatch.setattr(service, "_send_to_route", send_to_route)
+    monkeypatch.setattr(
+        "cognis.store.queries.list_channel_delivery_outbox_stale_sending",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.list_channel_delivery_outbox_due",
+        AsyncMock(return_value=[]),
+    )
+
+    await service._deliver_outbox(  # noqa: SLF001
+        delivery_id=row.delivery_id,
+        final_content=None,
+        fallback_text=None,
+        ignore_next_attempt=True,
+    )
+    await service.recover_pending_deliveries()
+
+    assert send_calls == 1
+    assert row.status == "uncertain"
+    assert row.completed_chunk_count == 1
+    assert row.inflight_chunk_index == 1
+    assert len(uncertain_calls) == 1
+    assert uncertain_calls[0]["last_error"] == (
+        '{"challenge": false, "classification": "rate_limit", '
+        '"kind": "signal_delivery_failure", "next_step": "Do not resend automatically. '
+        'Reconcile Signal delivery externally before any manual resend.", '
+        '"provider": "signal-cli", "provider_code": -5, '
+        '"retry_after_seconds": 7.0, "retry_scheduled": false, '
+        '"side_effect_certainty": "uncertain"}'
+    )
+
+    row.status = "pending"
+    row.inflight_chunk_index = None
+    row.lease_token = None
+    _Adapter.mode = "cancel"
+    with pytest.raises(asyncio.CancelledError):
+        await service._deliver_outbox(  # noqa: SLF001
+            delivery_id=row.delivery_id,
+            final_content=None,
+            fallback_text=None,
+            ignore_next_attempt=True,
+        )
+    assert row.inflight_chunk_index == 1
+    assert len(uncertain_calls) == 1
 
 
 @pytest.mark.asyncio

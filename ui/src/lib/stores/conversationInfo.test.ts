@@ -28,9 +28,9 @@ describe('conversationInfoDrawer', () => {
 
   it('clamps and persists the accessible inspector width', () => {
     conversationInfoDrawer.setWidth(100);
-    expect(conversationInfoDrawer.preferredWidth).toBe(384);
+    expect(conversationInfoDrawer.preferredWidth).toBe(320);
     expect(JSON.parse(window.localStorage.getItem('cognis.conversationInfo.v2') ?? '{}')).toMatchObject({
-      preferredWidth: 384,
+      preferredWidth: 320,
     });
 
     conversationInfoDrawer.setWidth(1200);
@@ -44,7 +44,7 @@ describe('conversationInfoDrawer', () => {
     expect(JSON.parse(window.localStorage.getItem('cognis.conversationInfo.v2') ?? '{}')).toMatchObject({
       open: true,
       tab: 'work',
-      preferredWidth: 512,
+      preferredWidth: 352,
     });
   });
 

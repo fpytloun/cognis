@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "id": "metrics-dashboard",
+  "title": "Weekly metrics dashboard",
+  "description": "Dashboard use case with status cards, charts, and trend table.",
+  "group": "dashboard",
+  "sort_key": 400,
+  "content": "Metrics dashboard fallback content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Weekly dashboard",
+      "subtitle": "For status updates, analytics summaries, and executive reporting.",
+      "badges": [
+        "Trend",
+        "KPI",
+        "Operational"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Week 28",
+        "title": "Agent reliability improved while rich-output adoption increased",
+        "subtitle": "Throughput is stable; the remaining risk is renderer maturity and visual QA coverage."
+      },
+      {
+        "type": "grid",
+        "blocks": [
+          {
+            "type": "metric",
+            "label": "Completed turns",
+            "value": "18.4k",
+            "delta": "+12%",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Tool failures",
+            "value": "0.7%",
+            "delta": "-0.4 pp",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Rich outputs",
+            "value": "146",
+            "delta": "+38%",
+            "tone": "neutral"
+          },
+          {
+            "type": "metric",
+            "label": "Median latency",
+            "value": "4.8s",
+            "delta": "+0.2s",
+            "tone": "warning"
+          }
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Rich deliverable adoption",
+        "description": "Synthetic weekday output mix for validating grouped canonical series.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "grouped_bar",
+        "series": [
+          {
+            "id": "rich-deliverables",
+            "label": "Rich deliverables",
+            "points": [
+              {
+                "x": "Mon",
+                "y": 14
+              },
+              {
+                "x": "Tue",
+                "y": 21
+              },
+              {
+                "x": "Wed",
+                "y": 27
+              },
+              {
+                "x": "Thu",
+                "y": 35
+              },
+              {
+                "x": "Fri",
+                "y": 49
+              }
+            ]
+          },
+          {
+            "id": "markdown-only",
+            "label": "Markdown-only",
+            "points": [
+              {
+                "x": "Mon",
+                "y": 82
+              },
+              {
+                "x": "Tue",
+                "y": 76
+              },
+              {
+                "x": "Wed",
+                "y": 68
+              },
+              {
+                "x": "Thu",
+                "y": 57
+              },
+              {
+                "x": "Fri",
+                "y": 43
+              }
+            ]
+          }
+        ],
+        "x_axis": {
+          "type": "category",
+          "label": "Weekday"
+        },
+        "y_axis": {
+          "type": "linear",
+          "label": "Outputs",
+          "unit": "deliverables",
+          "min": 0,
+          "max": 100
+        },
+        "stack": false,
+        "legend_position": "bottom",
+        "palette_token": "default"
+      },
+      {
+        "type": "table",
+        "title": "Top workflow categories",
+        "columns": [
+          {
+            "key": "category",
+            "label": "Category"
+          },
+          {
+            "key": "volume",
+            "label": "Volume",
+            "align": "right"
+          },
+          {
+            "key": "success",
+            "label": "Success rate",
+            "align": "right"
+          }
+        ],
+        "rows": [
+          {
+            "category": "Research reports",
+            "volume": 58,
+            "success": "98.2%"
+          },
+          {
+            "category": "Incident summaries",
+            "volume": 31,
+            "success": "99.1%"
+          },
+          {
+            "category": "Implementation plans",
+            "volume": 44,
+            "success": "96.8%"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

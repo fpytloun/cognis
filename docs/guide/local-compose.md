@@ -27,6 +27,10 @@ COGNIS_IMAGE=ghcr.io/fpytloun/cognis:<tag>
 COGNIS_EXECUTOR_IMAGE=ghcr.io/fpytloun/cognis-executor:<tag>
 ```
 
+Use `latest` or `general` for normal operation. The `minimal` tag omits
+browser, document, Git, Node, and `uvx` system tooling. The `development` tag
+adds preinstalled language servers.
+
 The default compose path builds Cognis and the executor from the checkout. Use
 prebuilt Cognis images only when you intentionally want to test a published
 image instead of local source.
@@ -112,9 +116,10 @@ workspace, browser profiles, and caches in the `cognis-executor-home` volume.
 The seed file explicitly enables insecure `ws://` only for this trusted local
 Compose network; remote executors should keep using `wss://`.
 
-The first phase is optimized for practical local validation. Browser automation
-uses the executor-native Playwright runtime in the container; headed browser UX
-may need additional host/display tuning.
+The Compose build selects the recommended `general` executor target. This
+target preinstalls Patchright with Google Chrome. Configure the executor
+browser runtime as `patchright` with channel `chrome`. Headed browser UX can
+need additional host or display configuration.
 
 ## Executor mode 2: host executor
 
@@ -136,7 +141,7 @@ Or use the published CLI:
 set -a
 source .local/cognis-compose/executor-token/host-executor.env
 set +a
-uvx cognis-executor
+uvx --from 'cognis-executor[full]' cognis-executor
 ```
 
 The host executor connects to `ws://localhost:8080/api/executor/ws`. Plain

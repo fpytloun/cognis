@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from io import BytesIO
-from typing import Any
+from typing import Any, cast
 
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,12 +53,12 @@ def _image_dimensions(content: bytes, mime_type: str) -> tuple[int, int] | None:
         return None
 
 
-def _iter_blocks(blocks: list[Any], path: str = "$.blocks"):
+def _iter_blocks(blocks: list[Any], path: str = "$.blocks") -> Iterator[tuple[dict[str, Any], str]]:
     for index, block in enumerate(blocks):
         if not isinstance(block, dict):
             continue
         block_path = f"{path}[{index}]"
-        yield block, block_path
+        yield cast(dict[str, Any], block), block_path
         for key in ("blocks", "children"):
             children = block.get(key)
             if isinstance(children, list):
@@ -308,4 +309,4 @@ def _expired(row: Any) -> bool:
         return False
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=UTC)
-    return expires_at <= datetime.now(UTC)
+    return bool(expires_at <= datetime.now(UTC))

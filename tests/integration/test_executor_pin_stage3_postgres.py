@@ -145,7 +145,7 @@ async def test_concurrent_mark_and_switch_preserve_projection() -> None:
 
 
 @pytest.mark.asyncio
-async def test_two_controllers_missing_selector_have_one_cas_transition_and_outbox() -> None:
+async def test_two_controllers_preserve_missing_primary_selector_without_failover() -> None:
     suffix = uuid4().hex
     schema_name = f"cognis_executor_pin_failover_{suffix}"
     conversation_id = f"selector-conversation-{suffix}"
@@ -223,10 +223,11 @@ async def test_two_controllers_missing_selector_have_one_cas_transition_and_outb
             ensure_active_executor_pin(**kwargs),
         )
         assert [result.active_executor_id for result in results] == [
-            f"replacement-{suffix}",
-            f"replacement-{suffix}",
+            "missing-selector",
+            "missing-selector",
         ]
-        assert sum(result.notice is not None for result in results) == 1
+        assert all(result.transient_unavailable for result in results)
+        assert all(result.notice is None for result in results)
         from sqlalchemy import func
 
         from cognis.store.models import ExecutorPinNoticeOutboxRow, ExecutorPinTransitionRow
@@ -240,11 +241,11 @@ async def test_two_controllers_missing_selector_have_one_cas_transition_and_outb
                 select(func.count()).select_from(ExecutorPinNoticeOutboxRow)
             )
             assert task is not None
-            assert task.active_executor_id == f"replacement-{suffix}"
-            assert task.active_executor_generation == 4
-            assert transitions == 1
-            assert outbox == 1
-        assert dispatcher.calls == 1
+            assert task.active_executor_id == "missing-selector"
+            assert task.active_executor_generation == 3
+            assert transitions == 0
+            assert outbox == 0
+        assert dispatcher.calls == 0
     finally:
         await engine.dispose()
         async with admin.begin() as connection:

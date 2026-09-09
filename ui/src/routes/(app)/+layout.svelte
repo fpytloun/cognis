@@ -6,28 +6,22 @@
   import Bot from 'lucide-svelte/icons/bot';
 import Box from 'lucide-svelte/icons/box';
 import BookOpen from 'lucide-svelte/icons/book-open';
-import BrainCircuit from 'lucide-svelte/icons/brain-circuit';
 import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
-import CircleHelp from 'lucide-svelte/icons/circle-help';
 import Clock from 'lucide-svelte/icons/clock';
 import FolderKanban from 'lucide-svelte/icons/folder-kanban';
 import Library from 'lucide-svelte/icons/library';
+import LayoutDashboard from 'lucide-svelte/icons/layout-dashboard';
 import ListTodo from 'lucide-svelte/icons/list-todo';
 import Menu from 'lucide-svelte/icons/menu';
 import MessageSquareText from 'lucide-svelte/icons/message-square-text';
 import Radio from 'lucide-svelte/icons/radio';
 import RefreshCw from 'lucide-svelte/icons/refresh-cw';
-import ServerCrash from 'lucide-svelte/icons/server-crash';
 import Settings from 'lucide-svelte/icons/settings';
-import ShieldAlert from 'lucide-svelte/icons/shield-alert';
 import Workflow from 'lucide-svelte/icons/workflow';
 import Wrench from 'lucide-svelte/icons/wrench';
 import X from 'lucide-svelte/icons/x';
 
-  import { api } from '$lib/api/client';
-  import { deriveGettingStartedSteps, isGettingStartedDismissed } from '$lib/getting-started';
-  import ShortcutHelp from '$lib/components/ShortcutHelp.svelte';
   import ToastViewport from '$lib/components/ToastViewport.svelte';
   import ConfirmDialog from '$lib/components/ui/ConfirmDialog.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
@@ -38,17 +32,17 @@ import X from 'lucide-svelte/icons/x';
   import { sidebarTooltip } from '$lib/actions/sidebarTooltip';
   import BottomTabBar from '$lib/components/BottomTabBar.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
-  import { openShortcutHelp, requestCancelActiveTurn, requestChatComposerFocus } from '$lib/shortcuts';
   import { auth } from '$lib/stores/auth';
   import { mobileNavOpen as mobileNavOpenStore, mobileNavOpenSignal } from '$lib/stores/mobileNav';
-  import { blockingOverlayActive, resetOverlayState } from '$lib/stores/overlays';
+   import { resetOverlayState } from '$lib/stores/overlays';
   import { workspaceHealth } from '$lib/system';
-  import type { SystemDiagnostics } from '$lib/types/api';
   import { wsClient, wsState } from '$lib/ws/client';
+  import { invalidateAllWorkScopes, invalidateWorkFromSocket } from '$lib/work/workViewState';
 
   let { children }: { children: Snippet } = $props();
 
   const navigationItems = [
+    { href: '/', label: 'Dashboard', icon: LayoutDashboard },
     { href: '/chat', label: 'Chat', icon: MessageSquareText },
     { href: '/agents', label: 'Agents', icon: Bot },
     { href: '/projects', label: 'Projects', icon: FolderKanban },
@@ -63,13 +57,15 @@ import X from 'lucide-svelte/icons/x';
     { href: '/settings', label: 'Settings', icon: Settings }
   ];
 
+  function navigationItemActive(href: string, pathname: string): boolean {
+    return href === '/' ? pathname === '/' : pathname.startsWith(href);
+  }
+
   let bootstrapped = $state(false);
-  let diagnostics = $state<SystemDiagnostics | null>(null);
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
   let mobileHeaderEl = $state<HTMLElement | null>(null);
   let workspaceRunning = false;
-  let diagnosticsLoadedForUser: string | null = null;
   let workspaceLoadingSlow = $state(false);
   let workspaceLoadingSlowTimer: number | null = null;
 
@@ -132,126 +128,8 @@ import X from 'lucide-svelte/icons/x';
   // they want the full labels.
   let sidebarExpanded = $derived(!sidebarCollapsed);
 
-  function isTextInputTarget(target: EventTarget | null): boolean {
-    if (!(target instanceof HTMLElement)) {
-      return false;
-    }
-    const tagName = target.tagName.toLowerCase();
-    return tagName === 'input' || tagName === 'textarea' || target.isContentEditable;
-  }
-
-  let outageBanners = $derived.by(() => {
-    const health = $workspaceHealth.health;
-    if (!health) {
-      return [];
-    }
-
-    const banners = [];
-    const memoryStatus = String(health.providers?.memory?.status ?? 'unknown');
-    if (memoryStatus !== 'healthy' && memoryStatus !== 'unknown') {
-      banners.push({
-        id: 'memory',
-        variant: 'warning',
-        title: 'Memory unavailable',
-        description: "Chat still works, but recall is unavailable for this conversation.",
-        href: '/settings?tab=system',
-        icon: BrainCircuit
-      });
-    }
-
-    const guardrailsStatus = String(health.providers?.guardrails?.status ?? 'unknown');
-    if (guardrailsStatus !== 'healthy' && guardrailsStatus !== 'unknown') {
-      banners.push({
-        id: 'guardrails',
-        variant: 'error',
-        title: 'Guardrails unavailable',
-        description: 'Tool execution is blocked until Intaris recovers. Check diagnostics.',
-        href: '/settings?tab=system',
-        icon: ShieldAlert
-      });
-    }
-
-    const llmStatus = String(health.providers?.llm?.status ?? 'unknown');
-    if (llmStatus !== 'healthy' && llmStatus !== 'unknown') {
-      const llmDetail = JSON.stringify(health.providers?.llm ?? {}).toLowerCase();
-      banners.push({
-        id: 'llm',
-        variant: 'error',
-        title: llmDetail.includes('not configured') || llmDetail.includes('no llm model configured') ? 'No LLM provider configured' : 'LLM provider issue',
-        description:
-          llmDetail.includes('not configured') || llmDetail.includes('no llm model configured')
-            ? 'Configure an LLM provider before using chat and tasks.'
-            : 'Chat and tasks are unavailable until the configured provider recovers.',
-        href: '/settings?tab=providers',
-        icon: ServerCrash
-      });
-    }
-
-    return banners;
-  });
-
-  function handleGlobalShortcuts(event: KeyboardEvent): void {
-    if ($blockingOverlayActive) {
-      return;
-    }
-    const activeTagIsInput = isTextInputTarget(event.target);
-    if (event.key === 'Escape') {
-      requestCancelActiveTurn();
-      if (activeTagIsInput && document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur();
-      }
-      return;
-    }
-
-    if (activeTagIsInput) {
-      return;
-    }
-
-    if (event.key === '/') {
-      event.preventDefault();
-      requestChatComposerFocus();
-      return;
-    }
-
-    if (event.key === '?') {
-      event.preventDefault();
-      openShortcutHelp();
-      return;
-    }
-
-    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n') {
-      event.preventDefault();
-      void goto('/chat/new');
-    }
-  }
-
-  async function loadDiagnosticsIfNeeded(): Promise<void> {
-    const user = auth.getSnapshot().user;
-    if (user?.role !== 'admin') {
-      diagnostics = null;
-      diagnosticsLoadedForUser = null;
-      return;
-    }
-    const userKey = user.email;
-    if (diagnosticsLoadedForUser === userKey) {
-      return;
-    }
-    try {
-      diagnostics = await api.system.diagnostics();
-      diagnosticsLoadedForUser = userKey;
-    } catch {
-      diagnostics = null;
-    }
-  }
-
-  function shouldShowGettingStarted(): boolean {
-    if (!diagnostics || isGettingStartedDismissed()) {
-      return false;
-    }
-    return deriveGettingStartedSteps(diagnostics).some((step) => !step.done);
-  }
-
   function currentTitle(pathname: string): string {
+    if (pathname === '/') return 'Control Center';
     return navigationItems.find((item) => pathname.startsWith(item.href))?.label ?? 'Workspace';
   }
 
@@ -269,18 +147,39 @@ import X from 'lucide-svelte/icons/x';
   let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
   let isChatWindowMode = $derived(isChatDetailRoute && $page.url.searchParams.get('window') === '1');
+  let isDashboardRoute = $derived($page.url.pathname === '/');
   let showMobileHeader = $derived(!isChatDetailRoute);
   let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute && !isChatWindowMode);
-  let hasStatusBanners = $derived(outageBanners.length > 0 || shouldShowGettingStarted());
   let contentShellClass = $derived.by(() => {
     if (isChatWindowMode) {
       return 'min-h-0 min-w-0 flex-1 overflow-hidden';
     }
     if (isChatRoute) {
-      return `min-h-0 min-w-0 flex-1 overflow-hidden ${showMobileHeader && !hasStatusBanners ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0' : ''}`;
+      return `min-h-0 min-w-0 flex-1 overflow-hidden ${
+        showMobileHeader
+          ? 'pt-[var(--app-shell-top-offset,0px)] lg:pt-0'
+          : 'app-chat-mobile-safe-top lg:pt-0'
+      }`;
     }
-    return `min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 lg:px-0 ${hasStatusBanners ? 'pt-3 lg:pt-4' : 'pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] lg:pt-0'}`;
+    // The dashboard is the one non-chat route with a viewport-bounded desktop/
+    // tablet layout: at md+ this scroll surface should never need to scroll
+    // because ControlCenter fills it exactly (fixed chrome, internal list
+    // scrolling). It keeps `overflow-y-auto` (rather than `overflow-hidden`)
+    // so it still degrades safely if content ever exceeds the viewport, and
+    // narrow/phone widths keep the natural page-scroll behavior below md.
+    const dashboardMdLayout = isDashboardRoute ? 'md:flex md:h-full md:min-h-0 md:flex-col' : '';
+    return `min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 lg:px-0 ${dashboardMdLayout} pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] lg:pt-0`;
   });
+
+  // Non-chat routes drop the shell's right padding so the data-app-content
+  // scroll surface reaches the viewport right edge (no decorative scrollbar
+  // gutter). Chat detail/window mode keep symmetric left/right padding so
+  // their layout is not regressed to an asymmetric one-sided gutter.
+  let shellSpacingClass = $derived(
+    isChatRoute
+      ? 'app-chat-shell-safe lg:gap-4 lg:px-4'
+      : 'app-shell-safe-block lg:gap-4 lg:pl-4'
+  );
 
   $effect(() => {
     if (typeof window === 'undefined') return;
@@ -354,8 +253,7 @@ import X from 'lucide-svelte/icons/x';
     restoreSidebarState();
     startAuthBootstrap();
 
-    window.addEventListener('keydown', handleGlobalShortcuts);
-    window.addEventListener('resize', syncMobileHeaderOffset);
+     window.addEventListener('resize', syncMobileHeaderOffset);
 
     // Pages that hide the global mobile header (chat detail) use this
     // signal to open the main nav drawer from their own hamburger button.
@@ -367,13 +265,24 @@ import X from 'lucide-svelte/icons/x';
       }
       openMobileNav();
     });
+    const unsubscribeWork = wsClient.subscribe((event) => {
+      if (event.type === 'work_invalidated') invalidateWorkFromSocket(event);
+    });
+    let previousWsStatus = $wsState.status;
+    const unsubscribeWsState = wsState.subscribe((state) => {
+      if (state.status === 'connected' && previousWsStatus === 'reconnecting') {
+        invalidateAllWorkScopes();
+      }
+      previousWsStatus = state.status;
+    });
 
     return () => {
       resetOverlayState();
-      window.removeEventListener('keydown', handleGlobalShortcuts);
-      window.removeEventListener('resize', syncMobileHeaderOffset);
+       window.removeEventListener('resize', syncMobileHeaderOffset);
       setShellOffsetVariable('--app-shell-top-offset', 0);
       unsubscribeMobileNav();
+      unsubscribeWork();
+      unsubscribeWsState();
       clearWorkspaceLoadingSlowTimer();
       stopWorkspace();
     };
@@ -401,7 +310,6 @@ import X from 'lucide-svelte/icons/x';
 
     if ($auth.status === 'authenticated') {
       startWorkspace();
-      void loadDiagnosticsIfNeeded();
       return;
     }
 
@@ -439,25 +347,31 @@ import X from 'lucide-svelte/icons/x';
   <a class="skip-link" href="#main-content">Skip to content</a>
   <ToastViewport />
   <ConfirmDialog />
-  <ShortcutHelp />
-  <div class="app-shell-viewport fixed inset-x-0 top-[var(--app-viewport-offset-top,0px)] h-[var(--app-viewport-height,100dvh)] overflow-hidden overscroll-none bg-slate-950">
-    <div class="mx-auto flex h-full w-full max-w-[2400px] min-w-0 overflow-hidden lg:gap-6 lg:px-6 lg:py-4 lg:pb-4">
+  <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-slate-950">
+    <div class={`flex h-full w-full min-w-0 overflow-hidden ${shellSpacingClass}`}>
       {#if !isChatWindowMode}
       <aside
-        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-72 p-5' : 'w-16 p-3'}`}
+        class={`hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-t-3xl border border-b-0 border-slate-800/80 bg-slate-900 shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
       >
         <div class="min-w-0 min-h-0 flex-1 overflow-y-auto">
           {#if sidebarExpanded}
-            <div class="flex items-center gap-3 border-b border-slate-800/80 pb-5">
+            <a
+              class="flex items-center gap-3 border-b border-slate-800/80 pb-5 rounded-xl transition hover:bg-slate-800/60"
+              href="/"
+              aria-label="Open Control Center"
+              data-testid="sidebar-logo-link"
+            >
               <img alt="" class="h-11 w-11 rounded-2xl shadow-card" src="/pwa/icon-192.png" />
               <div class="min-w-0 space-y-1">
                 <p class="text-sm font-medium uppercase tracking-[0.3em] text-sky-300">Cognis</p>
                 <h1 class="text-xl font-semibold text-white">Agent workspace</h1>
               </div>
-            </div>
+            </a>
           {:else}
             <div class="flex justify-center border-b border-slate-800/80 pb-4">
-              <img alt="Cognis" class="h-9 w-9 rounded-xl shadow-card" src="/pwa/icon-192.png" />
+              <a href="/" aria-label="Open Control Center" data-testid="sidebar-logo-link" class="rounded-xl transition hover:opacity-80">
+                <img alt="Cognis" class="h-9 w-9 rounded-xl shadow-card" src="/pwa/icon-192.png" />
+              </a>
             </div>
           {/if}
 
@@ -475,7 +389,7 @@ import X from 'lucide-svelte/icons/x';
               {#if sidebarExpanded}
                 <a
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center rounded-2xl text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
+                   class={`flex items-center rounded-2xl text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'} gap-3 px-4 py-3`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -485,7 +399,7 @@ import X from 'lucide-svelte/icons/x';
                 <a
                   use:sidebarTooltip={item.label}
                   aria-label={`Open ${item.label}`}
-                  class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
+                   class={`flex items-center justify-center rounded-2xl px-2 py-3 text-sm transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-800 hover:text-white'}`}
                   href={item.href}
                 >
                   <item.icon class="h-4 w-4 shrink-0" />
@@ -511,12 +425,8 @@ import X from 'lucide-svelte/icons/x';
                 <span class="text-right">{websocketStatusLabel()}</span>
               </div>
               <div class="flex gap-2">
-                <Button class="flex-1 justify-center" size="sm" variant="secondary" onclick={openShortcutHelp}>
-                  <CircleHelp class="mr-1.5 h-3.5 w-3.5" />
-                  Help
-                </Button>
                 {#if $wsState.status === 'stalled'}
-                  <Button class="flex-1 justify-center" size="sm" variant="secondary" onclick={() => wsClient.connect()}>
+                  <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => wsClient.connect()}>
                     <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
                     Reconnect
                   </Button>
@@ -543,11 +453,6 @@ import X from 'lucide-svelte/icons/x';
                 class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`}
                 aria-label={`WebSocket ${$wsState.status}`}
               ></span>
-              <div use:sidebarTooltip={'Help'} class="inline-flex">
-                <Button aria-label="Open keyboard shortcuts" class="h-9 w-9" size="icon" variant="ghost" onclick={openShortcutHelp}>
-                  <CircleHelp class="h-4 w-4" />
-                </Button>
-              </div>
               {#if $auth.user?.role === 'admin'}
                 <div use:sidebarTooltip={'Getting started'} class="inline-flex">
                   <Button aria-label="Open getting started guide" class="h-9 w-9" size="icon" variant="ghost" onclick={() => goto('/getting-started')}>
@@ -600,15 +505,10 @@ import X from 'lucide-svelte/icons/x';
       -->
       <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent" id="main-content">
         {#if showMobileHeader}
-        <!--
-          Mobile top bar. On iOS PWAs with `black-translucent` status bar,
-          the system draws content under the status bar, so pad the header
-          top by `env(safe-area-inset-top)` so the hamburger + title sit
-          below the camera cutout instead of being obscured by it.
-        -->
-        <header bind:this={mobileHeaderEl} class="fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950 px-3 pt-[calc(0.625rem+env(safe-area-inset-top))] pb-2.5 sm:gap-3 sm:px-4 sm:pt-[calc(0.625rem+env(safe-area-inset-top))] sm:pb-2.5 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
+        <!-- The iOS-managed viewport already starts below the status area. -->
+        <header bind:this={mobileHeaderEl} class="app-keyboard-stable-header fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-slate-800/80 bg-slate-950 px-3 py-1 sm:gap-3 sm:px-4 sm:py-1 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
-            <Button aria-label="Open navigation" class="h-11 w-11 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
+            <Button aria-label="Open navigation" class="h-10 w-10 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
@@ -617,16 +517,6 @@ import X from 'lucide-svelte/icons/x';
           </div>
 
           <div class="flex shrink-0 items-center gap-2">
-            <Button
-              aria-label="Open keyboard shortcuts"
-              class="h-11 w-11 md:h-9 md:w-9"
-              size="icon"
-              variant="secondary"
-              onclick={openShortcutHelp}
-              title="Keyboard shortcuts"
-            >
-              <CircleHelp class="h-5 w-5" />
-            </Button>
             <span
               class={`inline-flex h-2.5 w-2.5 rounded-full ${$wsState.status === 'connected' ? 'bg-emerald-400' : $wsState.status === 'stalled' ? 'bg-rose-400' : 'bg-sky-400'}`}
               aria-label={`WebSocket ${$wsState.status}`}
@@ -635,7 +525,7 @@ import X from 'lucide-svelte/icons/x';
             {#if $wsState.status === 'stalled'}
               <Button
                 aria-label="Reconnect WebSocket"
-                class="h-11 w-11 md:h-9 md:w-9"
+                class="h-10 w-10 md:h-9 md:w-9"
                 size="icon"
                 variant="secondary"
                 onclick={() => wsClient.connect()}
@@ -646,48 +536,6 @@ import X from 'lucide-svelte/icons/x';
             {/if}
           </div>
         </header>
-        {/if}
-
-        {#if hasStatusBanners}
-          <div class="space-y-3 px-3 pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] sm:px-4 lg:px-0 lg:pt-0">
-            {#if outageBanners.length > 0}
-              {#each outageBanners as banner (banner.id)}
-                <div class={`rounded-2xl border px-4 py-4 text-sm ${banner.variant === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : 'border-rose-500/30 bg-rose-500/10 text-rose-100'}`}>
-                  <div class="flex flex-wrap items-center justify-between gap-3">
-                    <div class="flex min-w-0 items-start gap-3">
-                       <banner.icon class="mt-0.5 h-5 w-5 shrink-0" />
-                      <div>
-                        <p class="font-medium">{banner.title}</p>
-                        <p class="mt-1 opacity-90">{banner.description}</p>
-                      </div>
-                    </div>
-                    <div class="flex flex-wrap gap-2">
-                      <Button size="sm" variant="secondary" onclick={() => workspaceHealth.refresh()}>
-                        <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
-                        Refresh
-                      </Button>
-                      <Button size="sm" variant="secondary" onclick={() => goto(banner.href)}>
-                        <Settings class="mr-1.5 h-3.5 w-3.5" />
-                        Configure
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              {/each}
-            {/if}
-
-            {#if shouldShowGettingStarted()}
-              <div class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-4 text-sm text-sky-100">
-                <div class="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <p class="font-medium">Finish first-run setup</p>
-                    <p class="mt-1 text-sky-100/80">Cognis still needs providers, agents, or companion services before the workspace is fully ready.</p>
-                  </div>
-                  <Button size="sm" onclick={() => goto('/getting-started')}>Open guide</Button>
-                </div>
-              </div>
-            {/if}
-          </div>
         {/if}
 
         <!--
@@ -739,7 +587,7 @@ import X from 'lucide-svelte/icons/x';
     <nav class="space-y-2">
       {#each navigationItems as item}
         <a
-          class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${$page.url.pathname.startsWith(item.href) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
+           class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-sky-500/20 text-white' : 'text-slate-300 hover:bg-slate-900 hover:text-white'}`}
           href={item.href}
           onclick={closeMobileNav}
         >
@@ -760,12 +608,8 @@ import X from 'lucide-svelte/icons/x';
           <span class="text-right">{websocketStatusLabel()}</span>
         </div>
         <div class="flex gap-2">
-          <Button class="flex-1 justify-center" variant="secondary" onclick={() => { closeMobileNav(); openShortcutHelp(); }}>
-            <CircleHelp class="mr-1.5 h-3.5 w-3.5" />
-            Help
-          </Button>
           {#if $wsState.status === 'stalled'}
-            <Button class="flex-1 justify-center" variant="secondary" onclick={() => { closeMobileNav(); wsClient.connect(); }}>
+            <Button class="w-full justify-center" variant="secondary" onclick={() => { closeMobileNav(); wsClient.connect(); }}>
               <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
               Reconnect
             </Button>

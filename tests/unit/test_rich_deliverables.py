@@ -12,12 +12,16 @@ from alembic.runtime.migration import MigrationContext
 from cognis.api.serializers import deliverable_to_response
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.models.deliverable import (
+    DASHBOARD_PRESENTATION_DESCRIPTOR,
     RICH_DELIVERABLE_MAX_BLOCKS,
     RICH_DELIVERABLE_MAX_BYTES,
     RICH_DELIVERABLE_MAX_DATASET_ROWS,
     RICH_DELIVERABLE_MAX_STRING_LENGTH,
     RichPayloadValidationError,
     normalize_rich_payload,
+    rich_export_metadata,
+    rich_presentation_descriptor,
+    rich_render_metadata,
 )
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
@@ -94,6 +98,168 @@ def test_rich_payload_normalization_rejects_unknown_blocks() -> None:
     assert err["path"] == "$.blocks[1]"
     assert err["expected"]
     assert "valid_example" in err
+
+
+def test_rich_payload_normalizes_renderer_neutral_dashboard_contract() -> None:
+    payload, warnings = normalize_rich_payload(
+        {
+            "title": "Capacity",
+            "metadata": {"presentation": "dashboard"},
+            "blocks": [
+                {
+                    "type": "section_header",
+                    "eyebrow": "Fleet",
+                    "title": "Capacity",
+                    "subtitle": "Current allocation",
+                    "status": "Attention",
+                    "tone": "warning",
+                },
+                {
+                    "type": "grid",
+                    "layout": "split-2-1",
+                    "columns": 2,
+                    "blocks": [
+                        {
+                            "type": "metric",
+                            "label": "Used",
+                            "value": "72%",
+                            "surface": "raised",
+                            "span": 2,
+                            "progress": {"value": 72, "max": 100, "label": "Capacity"},
+                        },
+                        {"type": "status", "title": "Headroom", "status": "Healthy"},
+                    ],
+                },
+                {
+                    "type": "table",
+                    "rows": [
+                        {
+                            "service": {"type": "code", "value": "api"},
+                            "state": {
+                                "type": "badge",
+                                "value": "Healthy",
+                                "tone": "positive",
+                                "emphasis": "strong",
+                                "align": "center",
+                            },
+                            "used": {
+                                "type": "progress",
+                                "value": 7,
+                                "max": 10,
+                                "label": "Usage",
+                            },
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert warnings == []
+    assert payload is not None
+    assert payload["metadata"] == {
+        "presentation": "dashboard",
+        "canvas": "wide",
+        "density": "compact",
+    }
+    assert rich_presentation_descriptor("dashboard") == DASHBOARD_PRESENTATION_DESCRIPTOR
+    assert rich_render_metadata(payload)["canvas"] == "wide"
+    assert rich_export_metadata(payload)["presentation"] == "dashboard"
+
+
+@pytest.mark.parametrize(
+    ("mutator", "expected_path"),
+    [
+        (lambda payload: payload["blocks"][0].update(surface="glass"), "$.blocks[0].surface"),
+        (lambda payload: payload["blocks"][0].update(span=5), "$.blocks[0].span"),
+        (
+            lambda payload: payload["blocks"][0]["progress"].update(value=11),
+            "$.blocks[0].progress.value",
+        ),
+        (
+            lambda payload: payload["blocks"][2]["rows"][0]["state"].update(tone="green"),
+            "$.blocks[2].rows[0].state.tone",
+        ),
+    ],
+)
+def test_rich_primitives_report_exact_validation_paths(mutator, expected_path: str) -> None:
+    payload = {
+        "blocks": [
+            {"type": "metric", "value": 1, "progress": {"value": 1, "max": 10}},
+            {"type": "status", "status": "Healthy"},
+            {
+                "type": "table",
+                "rows": [{"state": {"type": "badge", "value": "Healthy"}}],
+            },
+        ]
+    }
+    mutator(payload)
+
+    with pytest.raises(RichPayloadValidationError) as exc_info:
+        normalize_rich_payload(payload)
+
+    assert exc_info.value.path == expected_path
+
+
+def test_typed_cell_under_data_reports_exact_input_path() -> None:
+    with pytest.raises(RichPayloadValidationError) as exc_info:
+        normalize_rich_payload(
+            {
+                "blocks": [
+                    {
+                        "type": "table",
+                        "data": [{"state": {"type": "badge", "value": "Healthy", "tone": "green"}}],
+                    }
+                ]
+            }
+        )
+
+    assert exc_info.value.path == "$.blocks[0].data[0].state.tone"
+
+
+def test_typed_cell_under_data_is_validated_when_rows_is_empty() -> None:
+    with pytest.raises(RichPayloadValidationError) as exc_info:
+        normalize_rich_payload(
+            {
+                "blocks": [
+                    {
+                        "type": "table",
+                        "rows": [],
+                        "data": [{"state": {"type": "badge", "value": "Healthy", "tone": "green"}}],
+                    }
+                ]
+            }
+        )
+
+    assert exc_info.value.path == "$.blocks[0].data[0].state.tone"
+
+
+@pytest.mark.parametrize("density", ["dense", "airy"])
+def test_legacy_density_values_remain_normalizable(density: str) -> None:
+    payload, warnings = normalize_rich_payload(
+        {"metadata": {"density": density}, "blocks": [{"type": "metric", "value": 1}]}
+    )
+
+    assert warnings == []
+    assert payload is not None
+    assert payload["metadata"]["density"] == density
+
+
+def test_dashboard_contract_rejects_missing_data_block() -> None:
+    with pytest.raises(RichPayloadValidationError) as exc_info:
+        normalize_rich_payload(
+            {
+                "title": "Incomplete",
+                "metadata": {"presentation": "dashboard"},
+                "blocks": [
+                    {"type": "metric", "value": 1},
+                    {"type": "status", "status": "Healthy"},
+                ],
+            }
+        )
+
+    assert exc_info.value.reason == "invalid_dashboard_composition"
+    assert exc_info.value.path == "$.blocks"
 
 
 def test_rich_payload_normalization_enforces_block_count_cap() -> None:

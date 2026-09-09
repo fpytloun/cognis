@@ -15,6 +15,7 @@ ui/standalone-build/
 ui/coverage/
 ui/playwright-report/
 ui/test-results/
+ui/review-artifacts/
 cognis/ui_dist/
 .playwright-mcp/
 .worktrees

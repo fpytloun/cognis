@@ -37,6 +37,7 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 |---|---|
 | [Settings](guide/settings.md) | Configure providers, routing, secrets, executors, diagnostics, and users |
 | [Executors](guide/executors.md) | Choose where tools run, configure browser automation, and route tools safely |
+| [macOS Executor Distribution](guide/macos-executor.md) | Install, configure, operate, upgrade, and develop the Homebrew macOS executor |
 | [Channels](guide/channels.md) | Connect external messaging platforms and understand pairing |
 | [Deployment](guide/deployment.md) | Docker, systemd, remote executors, TLS, backups, and production hardening |
 | [High Availability](guide/high-availability.md) | Kubernetes topology, migration choreography, failover, recovery, and operational limits |

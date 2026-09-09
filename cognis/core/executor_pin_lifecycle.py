@@ -202,11 +202,10 @@ async def ensure_active_executor_pin(
     canonicalization_session: Any = None,
     now: datetime | None = None,
 ) -> ExecutorPinLifecycleResult:
-    """Perform admission-only selector-primary failover.
+    """Preserve the selected executor across transient admission failures.
 
-    Explicit primary pins are immutable here. Existing additional-to-primary
-    expiry/disconnect fallback remains admission-only. In-flight runtimes never
-    call this function, so an accepted/partial operation cannot be replayed.
+    All active pin sources are immutable while work recovers. Runtime admission
+    owns the durable 900-second wait and terminal timeout.
     """
 
     source = normalize_active_executor_source(
@@ -238,62 +237,63 @@ async def ensure_active_executor_pin(
                     source=source,
                 )
                 await session.commit()
-    if source not in {"selector_primary", "additional"}:
-        return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
-
-    target = pool.by_id(active_executor_id)
-    if target is None:
-        current_time = now or _now()
-        additional_expired = source == "additional" and (
-            active_executor_expires_at is None
-            or _pin_expired(active_executor_expires_at, now=current_time)
-        )
-        reason = (
-            "secondary assignment has no expiry"
-            if source == "additional" and active_executor_expires_at is None
-            else "secondary assignment expired"
-            if additional_expired
-            else "executor is missing from the current assigned pool"
-        )
-        if not additional_expired and active_executor_unavailable_since is None:
-            from cognis.store.queries import mark_executor_unavailable
-
-            async with session_factory() as session:
-                await mark_executor_unavailable(
-                    session,
-                    conversation_id=conversation_id,
-                    task_id=task_id,
-                    expected_executor_id=active_executor_id,
-                    expected_generation=active_executor_generation,
-                    observed_at=current_time,
-                )
-                await session.commit()
-            return ExecutorPinLifecycleResult(
-                active_executor_id=active_executor_id,
-                transient_unavailable=True,
-                retry_after_seconds=retry_interval_seconds,
-            )
-        if (
-            not additional_expired
-            and active_executor_unavailable_since is not None
-            and (current_time - active_executor_unavailable_since).total_seconds() < retry_seconds
-        ):
-            return ExecutorPinLifecycleResult(
-                active_executor_id=active_executor_id,
-                transient_unavailable=True,
-                retry_after_seconds=retry_interval_seconds,
-            )
-    elif source == "explicit_primary":
+    if source not in {"selector_primary", "additional", "explicit_primary"}:
         return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
 
     current_time = now or _now()
-    connection_ready = target is not None and _target_ready(target, ws_provider)
-    transport_unavailable = target is not None and target.usable and not connection_ready
     additional_expired = source == "additional" and (
         active_executor_expires_at is None
         or _pin_expired(active_executor_expires_at, now=current_time)
     )
-    if connection_ready and not additional_expired:
+    if additional_expired and active_executor_unavailable_since is None:
+        candidates = sorted(
+            pool.usable_primaries(),
+            key=lambda candidate: (
+                not _target_ready(candidate, ws_provider),
+                candidate.executor_id,
+            ),
+        )
+        fallback = candidates[0] if candidates else None
+        if fallback is not None and fallback.row is not None:
+            from cognis.store.queries import cas_executor_failover
+
+            reason = (
+                "secondary assignment has no expiry"
+                if active_executor_expires_at is None
+                else "secondary assignment expired"
+            )
+            fallback_source = (
+                "explicit_primary"
+                if execution and execution.get("executor_id")
+                else "selector_primary"
+            )
+            async with session_factory() as session:
+                persisted, _, _ = await cas_executor_failover(
+                    session,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    expected_executor_id=active_executor_id,
+                    new_executor_id=fallback.executor_id,
+                    expected_generation=active_executor_generation,
+                    reason=reason,
+                    failover_source=fallback_source,
+                )
+                if persisted:
+                    await session.commit()
+            if persisted:
+                if notice_dispatcher is not None:
+                    await notice_dispatcher.dispatch_pending(limit=10)
+                return ExecutorPinLifecycleResult(
+                    active_executor_id=fallback.executor_id,
+                    notice=_fallback_notice(
+                        previous_executor_id=active_executor_id,
+                        new_executor_id=fallback.executor_id,
+                        reason=reason,
+                    ),
+                )
+
+    target = pool.by_id(active_executor_id)
+    if target is not None and _target_ready(target, ws_provider):
         if active_executor_unavailable_since is not None:
             from cognis.store.queries import clear_executor_unavailable
 
@@ -307,154 +307,8 @@ async def ensure_active_executor_pin(
                 )
                 await session.commit()
         return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
-    if source == "additional" and active_executor_expires_at is None:
-        reason = "secondary assignment has no expiry"
-    elif active_executor_expires_at is not None and _pin_expired(
-        active_executor_expires_at, now=current_time
-    ):
-        reason = "secondary assignment expired"
-    elif target is None:
-        reason = "executor is missing from the current assigned pool"
-    elif transport_unavailable:
-        reason = "executor transport disconnected or not ready"
-    else:
-        reason = f"executor state is {target.state.value}"
-    if not additional_expired and active_executor_unavailable_since is None:
-        from cognis.store.queries import mark_executor_unavailable
-
-        async with session_factory() as session:
-            await mark_executor_unavailable(
-                session,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                expected_executor_id=active_executor_id,
-                expected_generation=active_executor_generation,
-                observed_at=current_time,
-            )
-            await session.commit()
-        return ExecutorPinLifecycleResult(
-            active_executor_id=active_executor_id,
-            transient_unavailable=True,
-            retry_after_seconds=retry_interval_seconds,
-        )
-    if (
-        not additional_expired
-        and active_executor_unavailable_since is not None
-        and (current_time - active_executor_unavailable_since).total_seconds() < retry_seconds
-    ):
-        return ExecutorPinLifecycleResult(
-            active_executor_id=active_executor_id,
-            transient_unavailable=True,
-            retry_after_seconds=retry_interval_seconds,
-        )
-    current_selector = execution is None or (
-        isinstance(execution.get("executor_selector"), dict)
-        and bool(execution.get("executor_selector"))
+    return ExecutorPinLifecycleResult(
+        active_executor_id=active_executor_id,
+        transient_unavailable=True,
+        retry_after_seconds=retry_interval_seconds,
     )
-    fallback_source = (
-        "selector_primary"
-        if source == "selector_primary" and current_selector
-        else "explicit_primary"
-        if source == "additional" and execution and execution.get("executor_id")
-        else "selector_primary"
-        if source == "additional"
-        and execution
-        and isinstance(execution.get("executor_selector"), dict)
-        and execution.get("executor_selector")
-        else None
-    )
-    if source == "selector_primary" and not current_selector:
-        return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
-    if source == "additional" and fallback_source is None:
-        return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
-    candidates = [
-        candidate
-        for candidate in pool.usable_primaries()
-        if candidate.executor_id != active_executor_id
-        and _target_ready(candidate, ws_provider)
-        and (
-            (source == "selector_primary" and candidate.selection_source == "selector")
-            or (fallback_source == "selector_primary" and candidate.selection_source == "selector")
-            or (fallback_source == "explicit_primary" and candidate.selection_source != "selector")
-        )
-    ]
-    fallback = sorted(candidates, key=lambda item: item.executor_id)[0] if candidates else None
-    if fallback is None or fallback.row is None:
-        logger.warning(
-            "executor_pin_lifecycle: no primary executor available for fallback",
-            extra={
-                "extra_data": {
-                    "conversation_id": conversation_id,
-                    "task_id": task_id,
-                    "previous_executor_id": active_executor_id,
-                    "reason": reason,
-                }
-            },
-        )
-        return ExecutorPinLifecycleResult(active_executor_id=active_executor_id)
-
-    from cognis.store.queries import cas_executor_failover
-
-    async with session_factory() as session:
-        persisted, _, _ = await cas_executor_failover(
-            session,
-            conversation_id=conversation_id,
-            task_id=task_id,
-            expected_executor_id=active_executor_id,
-            new_executor_id=fallback.executor_id,
-            expected_generation=active_executor_generation,
-            reason=reason,
-            failover_source=fallback_source or "selector_primary",
-        )
-        if persisted:
-            await session.commit()
-    if not persisted:
-        from cognis.store.queries import get_conversation, get_task
-
-        try:
-            async with session_factory() as session:
-                authoritative = (
-                    await get_task(session, task_id)
-                    if task_id
-                    else (
-                        await get_conversation(session, conversation_id)
-                        if conversation_id
-                        else None
-                    )
-                )
-        except AttributeError:
-            authoritative = None
-        winner = getattr(authoritative, "active_executor_id", None) or active_executor_id
-        logger.warning(
-            "executor_pin_lifecycle: failed to persist primary fallback",
-            extra={
-                "extra_data": {
-                    "conversation_id": conversation_id,
-                    "task_id": task_id,
-                    "previous_executor_id": active_executor_id,
-                    "new_executor_id": fallback.executor_id,
-                    "reason": reason,
-                }
-            },
-        )
-        return ExecutorPinLifecycleResult(active_executor_id=winner)
-    if notice_dispatcher is not None:
-        await notice_dispatcher.dispatch_pending(limit=10)
-    notice = _fallback_notice(
-        previous_executor_id=active_executor_id,
-        new_executor_id=fallback.executor_id,
-        reason=reason,
-    )
-    logger.info(
-        "executor_pin_lifecycle: switched back to primary executor",
-        extra={
-            "extra_data": {
-                "conversation_id": conversation_id,
-                "task_id": task_id,
-                "previous_executor_id": active_executor_id,
-                "new_executor_id": fallback.executor_id,
-                "reason": reason,
-            }
-        },
-    )
-    return ExecutorPinLifecycleResult(active_executor_id=fallback.executor_id, notice=notice)

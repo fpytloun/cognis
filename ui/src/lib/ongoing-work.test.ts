@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import type { TimelineItem, TurnCycleState } from '$lib/chat-v2/types';
-import type { BackgroundWorkItem } from '$lib/types/api';
+import type { TimelineItem, TurnCycleState, WorkstreamRef } from '$lib/chat-v2/types';
+import type { BackgroundWorkItem, Session } from '$lib/types/api';
 import {
+  activeRootSessionLineageIds,
   backgroundWorkItemIsRunning,
   currentCycleDelegations,
+  directChildBackgroundWork,
   mergeCurrentCycleDelegations,
   overlayManagedConversationStatus,
   sortBackgroundWorkByActivity,
+  workstreamSessionIds,
 } from './ongoing-work';
 
 function delegation(
@@ -176,6 +179,154 @@ describe('mergeCurrentCycleDelegations', () => {
   });
 });
 
+describe('direct child background work', () => {
+  it('includes direct children across controller rotations and excludes other work', () => {
+    const items: BackgroundWorkItem[] = [
+      {
+        kind: 'background_command',
+        work_id: 'shell-direct',
+        controller_conversation_id: 'conv',
+        controller_session_id: 'controller-current',
+        session_id: 'controller-current',
+        executor_id: 'executor-1',
+        title: 'Run integration tests',
+        agent_id: 'laforge',
+        status: 'running',
+        todos: [],
+      },
+      {
+        kind: 'managed_conversation',
+        work_id: 'managed-direct',
+        controller_conversation_id: 'conv',
+        controller_session_id: 'controller-old',
+        target_conversation_id: 'managed-target',
+        title: 'Managed direct child',
+        agent_id: 'laforge',
+        status: 'running',
+        todos: [],
+      },
+      {
+        kind: 'delegated_session',
+        work_id: 'delegate-direct',
+        controller_conversation_id: 'conv',
+        session_id: 'delegate-direct',
+        parent_session_id: 'controller-current',
+        title: 'Delegate direct child',
+        agent_id: 'system:review',
+        status: 'active',
+        todos: [],
+      },
+      {
+        kind: 'managed_conversation',
+        work_id: 'managed-self',
+        controller_conversation_id: 'parent-conv',
+        controller_session_id: 'external-parent',
+        target_conversation_id: 'conv',
+        title: 'Viewed managed conversation',
+        agent_id: 'laforge',
+        status: 'running',
+        todos: [],
+      },
+      {
+        kind: 'delegated_session',
+        work_id: 'delegate-sibling',
+        controller_conversation_id: 'conv',
+        session_id: 'delegate-sibling',
+        parent_session_id: 'sibling-controller',
+        title: 'Sibling',
+        agent_id: 'system:review',
+        status: 'active',
+        todos: [],
+      },
+      {
+        kind: 'delegated_session',
+        work_id: 'delegate-grandchild',
+        controller_conversation_id: 'conv',
+        session_id: 'delegate-grandchild',
+        parent_session_id: 'delegate-direct',
+        title: 'Grandchild',
+        agent_id: 'system:review',
+        status: 'active',
+        todos: [],
+      },
+      {
+        kind: 'delegated_session',
+        work_id: 'delegate-unknown-parent',
+        controller_conversation_id: 'conv',
+        session_id: 'delegate-unknown-parent',
+        title: 'Unknown parent',
+        agent_id: 'system:review',
+        status: 'active',
+        todos: [],
+      },
+    ];
+
+    expect(directChildBackgroundWork(
+      items,
+      new Set(['controller-old', 'controller-current']),
+    ).map((item) => item.work_id)).toEqual([
+      'shell-direct',
+      'managed-direct',
+      'delegate-direct',
+    ]);
+  });
+
+  it('resolves only the active root compaction lineage', () => {
+    const session = (
+      sessionId: string,
+      activityScopeId: string,
+      previousSessionId: string | null,
+    ): Session => ({
+      session_id: sessionId,
+      activity_scope_id: activityScopeId,
+      conversation_id: 'conv',
+      parent_session_id: null,
+      previous_session_id: previousSessionId,
+      user_email: 'owner@example.com',
+      agent_id: 'riker',
+      agent_profile_id: null,
+      delegation_mode: null,
+      delegation_task: null,
+      status: 'active',
+      intaris_session_id: sessionId,
+      mnemory_session_id: null,
+      started_at: null,
+      idle_since: null,
+      completed_at: null,
+      completion_reason: null,
+      result_summary: null,
+      result_content: null,
+      result_anchors: null,
+      result_sections: null,
+      updated_at: null,
+    });
+    const sessions = [
+      session('before-reset', 'scope-old', null),
+      session('controller-old', 'scope-current', 'before-reset'),
+      session('controller-current', 'scope-current', 'controller-old'),
+    ];
+
+    expect([...activeRootSessionLineageIds(
+      sessions,
+      'controller-current',
+    )]).toEqual([
+      'controller-current',
+      'controller-old',
+    ]);
+  });
+
+  it('uses all physical backing sessions for a logical workstream', () => {
+    expect([...workstreamSessionIds({
+      session_id: 'controller-current',
+      backing_session_ids: ['controller-old', 'controller-current'],
+    } as WorkstreamRef)]).toEqual([
+      'controller-current',
+      'controller-old',
+    ]);
+    expect([...workstreamSessionIds(null)]).toEqual([]);
+  });
+});
+
 describe('backgroundWorkItemIsRunning', () => {
   const managed = (status: string): BackgroundWorkItem => ({
     kind: 'managed_conversation',
@@ -200,6 +351,15 @@ describe('backgroundWorkItemIsRunning', () => {
       ...managed('active'),
       kind: 'delegated_session',
       session_id: 'sess_1',
+    })).toBe(true);
+  });
+
+  it('treats a running background command as running', () => {
+    expect(backgroundWorkItemIsRunning({
+      ...managed('running'),
+      kind: 'background_command',
+      work_id: 'shell_1',
+      executor_id: 'executor-1',
     })).toBe(true);
   });
 });

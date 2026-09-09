@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "id": "data-projections",
+  "title": "Synthetic home solar projection",
+  "description": "A cross-domain household-energy projection with observed baseline, forecast ranges, assumptions, and a bounded decision.",
+  "group": "projections",
+  "sort_key": 1620,
+  "content": "Synthetic household solar generation and payback projection. Forecasts are estimates based on stated assumptions and do not guarantee financial results.",
+  "payload": {
+    "title": "Synthetic home solar projection",
+    "metadata": {"canvas": "wide", "density": "compact", "eyebrow": "Synthetic household-energy projection", "subtitle": "Generated 2026-09-05 21:00 UTC · observed data through August 2026 · forecast through August 2027"},
+    "blocks": [
+      {
+        "type": "section_header",
+        "eyebrow": "Decision support",
+        "title": "A 6 kWp solar option can offset a meaningful share of annual use under the base case",
+        "subtitle": "Synthetic household data. Forecasts are estimates with weather, tariff, shading, and self-consumption uncertainty.",
+        "status": "Observed: 12 months · Forecast horizon: 12 months",
+        "tone": "info"
+      },
+      {
+        "type": "grid",
+        "layout": "equal",
+        "blocks": [
+          {"type": "metric", "label": "Observed annual use", "value": "5,840 kWh", "delta": "12-month baseline", "description": "Synthetic meter readings through Aug 2026", "tone": "neutral"},
+          {"type": "metric", "label": "Expected generation", "value": "5,600 kWh", "delta": "Range 4,900–6,350 kWh", "description": "First projected year; no battery", "tone": "info"},
+          {"type": "metric", "label": "Self-consumption", "value": "46%", "delta": "Scenario range 38–58%", "description": "Assumes daytime load shifting", "tone": "info"},
+          {"type": "metric", "label": "Expected annual benefit", "value": "31,400 CZK", "delta": "Range 23,000–39,000 CZK", "description": "Synthetic tariff and export assumptions", "tone": "success"},
+          {"type": "metric", "label": "Simple payback", "value": "8.1 years", "delta": "Range 6.5–10.6 years", "description": "Before financing and maintenance costs", "tone": "warning"},
+          {"type": "metric", "label": "Model freshness", "value": "5 days", "delta": "Generated Sep 5", "description": "Re-run after tariff or roof changes", "tone": "info"}
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Observed consumption and forecast generation",
+        "description": "Observed annual use is shown in the baseline metric above. This chart contains forecast generation only: a range and an exact expected-value marker. The current renderer does not mix observed lines with range series or add a forecast-boundary marker.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "range",
+        "legend_position": "bottom",
+        "palette_token": "cool",
+        "series": [
+          {"id": "generation_range", "label": "Forecast generation range (kWh)", "points": [{"x": "Sep", "y": [400, 520]}, {"x": "Oct", "y": [290, 377]}, {"x": "Nov", "y": [105, 160]}, {"x": "Dec", "y": [60, 95]}, {"x": "Jan", "y": [68, 108]}, {"x": "Feb", "y": [135, 200]}, {"x": "Mar", "y": [290, 430]}, {"x": "Apr", "y": [530, 700]}, {"x": "May", "y": [750, 960]}, {"x": "Jun", "y": [800, 1020]}, {"x": "Jul", "y": [780, 970]}, {"x": "Aug", "y": [700, 810]}]},
+          {"id": "expected_generation", "label": "Expected generation (kWh)", "points": [{"x": "Sep", "y": [460, 460]}, {"x": "Oct", "y": [330, 330]}, {"x": "Nov", "y": [130, 130]}, {"x": "Dec", "y": [75, 75]}, {"x": "Jan", "y": [85, 85]}, {"x": "Feb", "y": [165, 165]}, {"x": "Mar", "y": [355, 355]}, {"x": "Apr", "y": [600, 600]}, {"x": "May", "y": [840, 840]}, {"x": "Jun", "y": [900, 900]}, {"x": "Jul", "y": [880, 880]}, {"x": "Aug", "y": [780, 780]}]}
+        ],
+        "x_axis": {"type": "category", "label": "Forecast month"},
+        "y_axis": {"type": "linear", "label": "kWh", "min": 0, "max": 1100},
+        "source": "Synthetic household meter baseline and projection model",
+        "source_url": "/fixtures/rich-scenarios/data-projections/source-export.json",
+        "observed_at": "2026-09-05T21:00:00Z"
+      },
+      {
+        "type": "table",
+        "title": "Scenarios and assumptions",
+        "description": "All values are synthetic. The supported decision depends most on roof shading validation and the actual electricity tariff.",
+        "columns": [{"key": "scenario", "label": "Scenario"}, {"key": "generation", "label": "Year-1 generation"}, {"key": "benefit", "label": "Annual benefit"}, {"key": "payback", "label": "Simple payback"}],
+        "rows": [
+          {"scenario": "Conservative: 15% shading, 38% self-consumption", "generation": "4,900 kWh", "benefit": "23,000 CZK", "payback": "10.6 years"},
+          {"scenario": "Base: 8% shading, 46% self-consumption", "generation": "5,600 kWh", "benefit": "31,400 CZK", "payback": "8.1 years"},
+          {"scenario": "Favorable: 3% shading, 58% self-consumption", "generation": "6,350 kWh", "benefit": "39,000 CZK", "payback": "6.5 years"}
+        ]
+      },
+      {
+        "type": "callout",
+        "title": "Supported decision and visual limitation",
+        "content": "Use the base case to decide whether to obtain roof shading and installer quotes, not to commit to a purchase. Expected and range series make forecast uncertainty visible. Observed-versus-forecast styling is not sufficient for direct comparison: observed use is a baseline metric, while the range chart cannot also render an observed line or a canonical forecast boundary."
+      },
+      {
+        "type": "source_list",
+        "title": "Source and generation time",
+        "sources": [{"title": "Synthetic household-meter export and solar model", "url": "/fixtures/rich-scenarios/data-projections/source-export.json", "description": "Fictional data generated for renderer acceptance. Model generated 2026-09-05 21:00 UTC; observations end 2026-08-31."}]
+      }
+    ],
+    "sources": [],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

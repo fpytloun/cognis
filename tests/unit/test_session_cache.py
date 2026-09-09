@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -46,15 +47,21 @@ async def test_session_cache_uses_byte_payloads_with_injected_service(
 ) -> None:
     service = RedisService("")
     redis_set = AsyncMock(return_value=True)
+    redis_eval = AsyncMock(return_value=1)
     monkeypatch.setattr(service, "set", redis_set)
+    monkeypatch.setattr(service, "eval", redis_eval)
     cache = SessionCache(_Guardrails(), redis_service=service, redis_ttl_seconds=45)
 
     await cache.refresh(_session("session-bytes"))
 
     key, payload = redis_set.await_args.args
-    assert key == "cognis:session-cache:v2:session-bytes"
+    assert key.startswith("cognis:session-cache:v3:session-bytes:")
+    assert ":chunk:" in key
     assert isinstance(payload, bytes)
     assert redis_set.await_args.kwargs == {"ttl_seconds": 45}
+    metadata = redis_eval.await_args.kwargs["args"][3]
+    assert isinstance(metadata, bytes)
+    assert b'"events":[]' in metadata
 
 
 @pytest.mark.asyncio
@@ -81,7 +88,180 @@ async def test_session_cache_classifies_redis_read_failure_as_error(
 
     error_inc.assert_called_once_with()
     miss_inc.assert_not_called()
-    redis_get.assert_awaited_once_with("cognis:session-cache:v2:session-failed")
+    assert [call.args[0] for call in redis_get.await_args_list] == [
+        "cognis:session-cache:v3:session-failed",
+        "cognis:session-cache:v2:session-failed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_session_cache_append_writes_only_the_new_event_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    redis_set = AsyncMock(return_value=True)
+    redis_eval = AsyncMock(return_value=1)
+    monkeypatch.setattr(service, "set", redis_set)
+    monkeypatch.setattr(service, "eval", redis_eval)
+    cache = SessionCache(_Guardrails(), redis_service=service)
+    session = _session("session-incremental")
+    await cache.refresh(session)
+    redis_set.reset_mock()
+    redis_eval.reset_mock()
+
+    await cache.append_recorded_events(
+        session,
+        [SessionEvent(type="assistant_message", data={"content": "new"})],
+        EventAppendResult(ok=True, count=1, first_seq=13, last_seq=13),
+    )
+
+    redis_set.assert_awaited_once()
+    chunk = json.loads(redis_set.await_args.args[1].decode("utf-8"))
+    assert [event["seq"] for event in chunk["events"]] == [13]
+    metadata = redis_eval.await_args.kwargs["args"][3]
+    assert isinstance(metadata, bytes)
+    assert b'"events":[]' in metadata
+    assert b'"last_event_seq":13' in metadata
+
+
+@pytest.mark.asyncio
+async def test_cold_redis_hydration_does_not_block_warm_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    release = asyncio.Event()
+
+    async def slow_get(key: str) -> bytes | None:
+        if "session-cold" in key:
+            await release.wait()
+        return None
+
+    monkeypatch.setattr(service, "get", slow_get)
+    cache = SessionCache(_Guardrails(), redis_service=service)
+    warm_session = _session("session-warm")
+    cache._entries[warm_session.session_id] = await SessionCache(  # noqa: SLF001
+        _Guardrails()
+    ).refresh(warm_session)
+
+    cold_task = asyncio.create_task(cache._ensure_entry(_session("session-cold")))  # noqa: SLF001
+    await asyncio.sleep(0)
+    warm_entry = await asyncio.wait_for(cache._ensure_entry(warm_session), timeout=0.1)  # noqa: SLF001
+
+    assert warm_entry.session_id == warm_session.session_id
+    release.set()
+    await cold_task
+    await cache.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["none", "compaction", "skill", "depth"])
+async def test_incremental_redis_generation_hydrates_complete_cached_event_chain(
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    values: dict[str, bytes] = {}
+    service = RedisService("")
+
+    async def fake_get(key: str) -> bytes | None:
+        return values.get(key)
+
+    async def fake_set(key: str, value: bytes, *, ttl_seconds: int) -> bool:
+        del ttl_seconds
+        values[key] = value
+        return True
+
+    async def fake_eval(
+        script: str,
+        *,
+        keys: tuple[str, ...],
+        args: tuple[object, ...],
+    ) -> int:
+        del script
+        candidate = args[3]
+        assert isinstance(candidate, bytes)
+        current = values.get(keys[0])
+        if current is not None:
+            current_metadata = json.loads(current)
+            if current_metadata["generation"] != args[0]:
+                return 0
+            if int(current_metadata["last_event_seq"]) > int(args[1]):
+                return 0
+            if str(current_metadata.get("event_head") or "") != args[2]:
+                return 0
+        elif args[0]:
+            return 0
+        values[keys[0]] = candidate
+        return 1
+
+    monkeypatch.setattr(service, "get", fake_get)
+    monkeypatch.setattr(service, "set", fake_set)
+    monkeypatch.setattr(service, "eval", fake_eval)
+    session = _session("session-chain")
+    writer = SessionCache(_Guardrails(), redis_service=service)
+    await writer.refresh(session)
+    await writer.append_recorded_events(
+        session,
+        [SessionEvent(type="assistant_message", data={"content": "new"})],
+        EventAppendResult(ok=True, count=1, first_seq=13, last_seq=13),
+    )
+
+    reader = SessionCache(_Guardrails(), redis_service=service)
+    hydrated = await reader._ensure_entry(session)  # noqa: SLF001
+
+    assert [event.seq for event in hydrated.events] == [4, 13]
+    assert hydrated.last_event_seq == 13
+    assert hydrated.redis_persisted_seq == 13
+    assert hydrated.redis_event_head
+    old_generation = hydrated.redis_generation
+    if replacement == "compaction":
+        await writer.apply_compaction(session, summary="retained summary", compaction_seq=12)
+    elif replacement == "skill":
+        for seq in (14, 15):
+            await writer.append_recorded_events(
+                session,
+                [
+                    SessionEvent(
+                        type="developer_message",
+                        data={
+                            "kind": "loaded_skill",
+                            "skill_id": "skill_daily",
+                            "content": f"revision {seq}",
+                            "context_injection": True,
+                            "replayable": True,
+                            "visibility": "agent_context",
+                        },
+                    )
+                ],
+                EventAppendResult(ok=True, count=1, first_seq=seq, last_seq=seq),
+            )
+    elif replacement == "depth":
+        for seq in range(14, 80):
+            await writer.append_recorded_events(
+                session,
+                [SessionEvent(type="assistant_message", data={"content": str(seq)})],
+                EventAppendResult(ok=True, count=1, first_seq=seq, last_seq=seq),
+            )
+    if replacement != "none":
+        fresh = SessionCache(_Guardrails(), redis_service=service)
+        current = await fresh._ensure_entry(session)  # noqa: SLF001
+        assert current.redis_generation != old_generation
+        assert current.redis_chain_depth <= 32
+        expected = writer.get_entry(session.session_id)
+        assert expected is not None
+        assert [(event.seq, event.data) for event in current.events] == [
+            (event.seq, event.data) for event in expected.events
+        ]
+        # The old worker cannot republish removed membership, even at a higher watermark.
+        canonical_metadata = values[f"cognis:session-cache:v3:{session.session_id}"]
+        await reader.append_recorded_events(
+            session,
+            [SessionEvent(type="assistant_message", data={"content": "stale"})],
+            EventAppendResult(ok=True, count=1, first_seq=14, last_seq=14),
+        )
+        assert values[f"cognis:session-cache:v3:{session.session_id}"] == canonical_metadata
+        await fresh.aclose()
+    await writer.aclose()
+    await reader.aclose()
 
 
 @pytest.mark.asyncio
@@ -920,6 +1100,8 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
             "pressure_mode": "normal",
             "steady_target_tokens": 5_000,
         },
+        turn_id="turn-current",
+        runtime_selection_revision=7,
     )
     cache.update_last_llm_usage(
         session.session_id,
@@ -936,6 +1118,7 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
     usage = cache.get_context_usage(session.session_id)
 
     assert usage is not None
+    assert usage["runtime_metadata_revision"] == 0
     assert usage["provider_id"] == "proxy"
     assert usage["reasoning_effort"] == "high"
     assert usage["agent_id"] == "agent-1"
@@ -943,6 +1126,10 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
     assert usage["requested_agent_profile_id"] == "build"
     assert usage["agent_profile_source"] == "conversation"
     assert usage["agent_profile_synthetic"] is False
+    assert usage["turn_id"] == "turn-current"
+    assert usage["runtime_selection_revision"] == 7
+    assert usage["measurement_source"] == "projected_prompt"
+    assert isinstance(usage["measured_at"], str)
     assert usage["max_input_tokens"] == 6_000
     assert usage["available_prompt_tokens"] == 6_000
     assert usage["effective_prompt_budget"] == 6_000
@@ -995,6 +1182,134 @@ async def test_session_cache_exposes_last_llm_usage_in_context_snapshot() -> Non
     assert cleared_usage["requested_agent_profile_id"] is None
     assert cleared_usage["agent_profile_source"] is None
     assert cleared_usage["agent_profile_synthetic"] is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_diagnostics_write_through_and_hydrate_from_redis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    redis_set = AsyncMock(return_value=True)
+    redis_eval = AsyncMock(side_effect=[1, 1, 1])
+    redis_get = AsyncMock(return_value=None)
+    monkeypatch.setattr(service, "set", redis_set)
+    monkeypatch.setattr(service, "eval", redis_eval)
+    monkeypatch.setattr(service, "get", redis_get)
+    session = _session("session-runtime-diagnostics")
+    writer = SessionCache(_Guardrails(), max_entries=10, redis_service=service)
+    await writer.refresh(session)
+    redis_set.reset_mock()
+
+    payload_holder: dict[str, bytes] = {}
+    reader_service = RedisService("")
+    redis_get = AsyncMock(
+        side_effect=lambda key: (
+            payload_holder.get("runtime") if "session-runtime:v1" in key else None
+        )
+    )
+    monkeypatch.setattr(reader_service, "get", redis_get)
+    reader = SessionCache(_Guardrails(), max_entries=10, redis_service=reader_service)
+    await reader.refresh(session)
+    reader.update_context_usage(
+        session,
+        prompt_tokens=100,
+        max_context_tokens=1_000,
+        model="stale-model",
+    )
+
+    writer.update_context_usage(
+        session,
+        prompt_tokens=2_000,
+        max_context_tokens=8_000,
+        model="gpt-5.6-luna",
+        provider_id="proxy",
+    )
+    writer.update_last_llm_usage(
+        session.session_id,
+        {"prompt_tokens": 1_500, "completion_tokens": 200, "total_tokens": 1_700},
+    )
+    await writer.persist_runtime_metadata(session.session_id)
+
+    assert redis_eval.await_count == 3
+    payload_write = redis_eval.await_args_list[2]
+    assert "session-runtime:v1" in payload_write.kwargs["keys"][0]
+    payload = payload_write.kwargs["args"][1]
+    assert isinstance(payload, bytes)
+    payload_holder["runtime"] = payload
+    await reader.ensure_runtime_metadata(session)
+
+    usage = reader.get_context_usage(session.session_id)
+    assert usage is not None
+    assert usage["runtime_metadata_revision"] == 1
+    assert usage["prompt_tokens"] == 2_000
+    assert usage["max_context_tokens"] == 8_000
+    assert usage["model"] == "gpt-5.6-luna"
+    assert usage["last_llm_usage"]["total_tokens"] == 1_700
+
+
+@pytest.mark.asyncio
+async def test_runtime_diagnostics_reject_delayed_older_redis_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RedisService("")
+    revision = 0
+    stored_payload: bytes | None = None
+
+    async def fake_eval(
+        script: str,
+        *,
+        keys: tuple[str, ...],
+        args: tuple[object, ...],
+    ) -> int:
+        nonlocal revision, stored_payload
+        if "INCR" in script:
+            revision += 1
+            return revision
+        candidate_revision = int(args[0])
+        candidate_payload = args[1]
+        assert isinstance(candidate_payload, bytes)
+        if candidate_revision == 1:
+            await asyncio.sleep(0.01)
+        current_revision = (
+            int(json.loads(stored_payload.decode("utf-8"))["revision"])
+            if stored_payload is not None
+            else 0
+        )
+        if current_revision >= candidate_revision:
+            return 0
+        stored_payload = candidate_payload
+        return 1
+
+    monkeypatch.setattr(service, "eval", fake_eval)
+    monkeypatch.setattr(service, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "set", AsyncMock(return_value=True))
+    session = _session("session-runtime-ordering")
+    older = SessionCache(_Guardrails(), max_entries=10, redis_service=service)
+    newer = SessionCache(_Guardrails(), max_entries=10, redis_service=service)
+    await older.refresh(session)
+    await newer.refresh(session)
+    older.update_context_usage(
+        session,
+        prompt_tokens=100,
+        max_context_tokens=8_000,
+        model="older",
+    )
+    newer.update_context_usage(
+        session,
+        prompt_tokens=200,
+        max_context_tokens=8_000,
+        model="newer",
+    )
+
+    await asyncio.gather(
+        older.persist_runtime_metadata(session.session_id),
+        newer.persist_runtime_metadata(session.session_id),
+    )
+
+    assert stored_payload is not None
+    stored = json.loads(stored_payload.decode("utf-8"))
+    assert stored["revision"] == 2
+    assert stored["last_prompt_tokens"] == 200
 
 
 @pytest.mark.asyncio

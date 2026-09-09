@@ -46,7 +46,8 @@ export interface ToolGroupSummary {
   durationMs: number | null;
   startedAt: string | null;
   failedCount: number;
-  status: 'running' | 'failed' | 'complete';
+  deniedCount: number;
+  status: 'running' | 'failed' | 'denied' | 'complete';
 }
 
 export interface TimelineItemRow {
@@ -82,7 +83,8 @@ export interface ThinkingGroupRow {
 
 export type ActivitySegmentEntry =
   | { kind: 'tool_group'; group: ToolGroupRow }
-  | { kind: 'assistant'; item: MessageTimelineItem };
+  | { kind: 'assistant'; item: MessageTimelineItem }
+  | { kind: 'recovery_notice'; item: MessageTimelineItem };
 
 export interface ActivitySegmentRow {
   kind: 'activity_segment';
@@ -416,9 +418,12 @@ function formatEditDetail(stats: ToolGroupSummary['editStats'] | null, fallbackT
   return `${fileLabel} (+${stats.additions}/-${stats.deletions})`;
 }
 
-function appendFailureDetail(label: string, failedCount: number): string {
-  if (failedCount <= 0) return label;
-  return `${label} (${failedCount} failed)`;
+function appendFailureDetail(label: string, failedCount: number, deniedCount: number): string {
+  const parts: string[] = [];
+  if (failedCount > 0) parts.push(`${failedCount} failed`);
+  if (deniedCount > 0) parts.push(`${deniedCount} denied`);
+  if (parts.length === 0) return label;
+  return `${label} (${parts.join(', ')})`;
 }
 
 function shouldShowFailureDetail(kind: ToolGroupKind): boolean {
@@ -478,9 +483,16 @@ function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
   const durationMs = items.some((item) => typeof item.duration_ms === 'number')
     ? items.reduce((total, item) => total + (item.duration_ms ?? 0), 0)
     : null;
-  const failedCount = items.filter((item) => item.is_error || item.status === 'failed').length;
+  const failedCount = items.filter(
+    (item) => item.status !== 'denied' && (item.is_error || item.status === 'failed')
+  ).length;
+  const deniedCount = items.filter((item) => item.status === 'denied').length;
   const failed = failedCount > 0;
-  const running = !failed && items.some((item) => item.status === 'pending' || item.status === 'running' || item.status === 'waiting');
+  // Denied (declined escalation approval) is terminal and rejected, but a
+  // real execution failure elsewhere in the same group is the more severe
+  // signal and takes precedence for the group's status.
+  const denied = !failed && deniedCount > 0;
+  const running = !failed && !denied && items.some((item) => item.status === 'pending' || item.status === 'running' || item.status === 'waiting');
   const editStats = kind === 'edit' ? summarizeEditStats(items) : null;
   const detailLabel = kind === 'edit'
     ? formatEditDetail(editStats, items.length)
@@ -489,13 +501,14 @@ function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
     kind,
     toolCount: items.length,
     detailLabel: shouldShowFailureDetail(kind)
-      ? appendFailureDetail(detailLabel, failedCount)
+      ? appendFailureDetail(detailLabel, failedCount, deniedCount)
       : detailLabel,
     editStats: editStats ?? undefined,
     durationMs,
     startedAt: earliestTimestamp(items),
     failedCount,
-    status: failed ? 'failed' as const : running ? 'running' as const : 'complete' as const
+    deniedCount,
+    status: failed ? 'failed' as const : denied ? 'denied' as const : running ? 'running' as const : 'complete' as const
   };
   let summary: ToolGroupSummary;
   switch (kind) {
@@ -635,26 +648,26 @@ function segmentStableDisambiguator(entries: ActivitySegmentEntry[]): string | n
 
 function activitySegmentId(entries: ActivitySegmentEntry[], runKey: NormalizedRunKey): string {
   const firstItemId = entries.find((entry) => {
-    if (entry.kind === 'assistant') return !!entry.item.id;
+    if (entry.kind !== 'tool_group') return !!entry.item.id;
     return entry.group.items.some((item) => !!item.id);
   });
-  const itemId = firstItemId?.kind === 'assistant'
-    ? firstItemId.item.id
-    : firstItemId?.group.items.find((item) => !!item.id)?.id;
+  const itemId = firstItemId?.kind !== 'tool_group'
+    ? firstItemId?.item.id
+    : firstItemId.group.items.find((item) => !!item.id)?.id;
   const firstTurnId = entries.find((entry) => {
-    if (entry.kind === 'assistant') return !!entry.item.turn_id;
+    if (entry.kind !== 'tool_group') return !!entry.item.turn_id;
     return entry.group.items.some((item) => !!item.turn_id);
   });
-  const turnId = firstTurnId?.kind === 'assistant'
-    ? firstTurnId.item.turn_id
-    : firstTurnId?.group.items.find((item) => !!item.turn_id)?.turn_id;
+  const turnId = firstTurnId?.kind !== 'tool_group'
+    ? firstTurnId?.item.turn_id
+    : firstTurnId.group.items.find((item) => !!item.turn_id)?.turn_id;
   const firstCycleIndex = entries.find((entry) => {
-    if (entry.kind === 'assistant') return typeof entry.item.turn_cycle_index === 'number';
+    if (entry.kind !== 'tool_group') return typeof entry.item.turn_cycle_index === 'number';
     return entry.group.items.some((item) => typeof item.turn_cycle_index === 'number');
   });
-  const cycleIndex = firstCycleIndex?.kind === 'assistant'
-    ? firstCycleIndex.item.turn_cycle_index
-    : firstCycleIndex?.group.items.find((item) => typeof item.turn_cycle_index === 'number')?.turn_cycle_index;
+  const cycleIndex = firstCycleIndex?.kind !== 'tool_group'
+    ? firstCycleIndex?.item.turn_cycle_index
+    : firstCycleIndex.group.items.find((item) => typeof item.turn_cycle_index === 'number')?.turn_cycle_index;
   // When the segment has a stable (turn, cycle) identity — which every stamped
   // turn now does — key on `{turn}:{cycle}:{stableDisambiguator}`. The
   // disambiguator is the run's first tool call_id (or first assistant id),
@@ -755,6 +768,47 @@ function groupMatchesRunTurn(
   turnId: string | null | undefined
 ): boolean {
   return group.items.every((item) => item.turn_id === turnId);
+}
+
+function isBridgeableRecoveryNotice(
+  item: TimelineItem
+): item is MessageTimelineItem & { turn_id: string; retry_source_turn_id: string } {
+  return item.kind === 'message'
+    && item.role === 'system'
+    && item.notice_kind === 'model_recovery'
+    && item.notice_scope === 'turn'
+    && typeof item.turn_id === 'string'
+    && typeof item.retry_source_turn_id === 'string';
+}
+
+function activityTargets(item: ToolCallTimelineItem): Set<string> {
+  const arguments_ = item.arguments;
+  if (!arguments_) return new Set();
+  const targets = new Set<string>();
+  for (const key of [
+    'conversation_id',
+    'task_id',
+    'workflow_id',
+    'schedule_id',
+    'artifact_id',
+    'deliverable_id'
+  ]) {
+    const value = arguments_[key];
+    if (typeof value === 'string' && value) targets.add(`${key}:${value}`);
+  }
+  return targets;
+}
+
+function groupsShareActivityTarget(
+  entries: ActivitySegmentEntry[],
+  candidate: ToolGroupRow
+): boolean {
+  const candidateTargets = new Set(candidate.items.flatMap((item) => [...activityTargets(item)]));
+  if (candidateTargets.size === 0) return false;
+  return entries.some((entry) => entry.kind === 'tool_group'
+    && entry.group.items.some((item) => {
+      return [...activityTargets(item)].some((target) => candidateTargets.has(target));
+    }));
 }
 
 function mergeAdjacentToolGroupsAcrossCycles(rows: TimelineRow[]): TimelineRow[] {
@@ -916,6 +970,24 @@ function collectActivityRun(
       }
       entries.push({ kind: 'tool_group', group: candidate });
       runKey = advanced;
+      nextIndex += 1;
+      continue;
+    }
+
+    if (candidate.kind === 'item' && isBridgeableRecoveryNotice(candidate.item)) {
+      const nextToolGroup = rows[nextIndex + 1];
+      if (
+        candidate.item.retry_source_turn_id !== runTurnId
+        || !nextToolGroup
+        || nextToolGroup.kind !== 'tool_group'
+        || !groupMatchesRunTurn(nextToolGroup, candidate.item.turn_id)
+        || continueRunKey(runKey, nextToolGroup) === null
+        || !groupsShareActivityTarget(entries, nextToolGroup)
+      ) {
+        break;
+      }
+      entries.push({ kind: 'recovery_notice', item: candidate.item });
+      runTurnId = candidate.item.turn_id;
       nextIndex += 1;
       continue;
     }

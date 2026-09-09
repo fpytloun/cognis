@@ -75,4 +75,17 @@ describe('rich evidence helpers', () => {
     expect(sortMatrixRows(rows, { key: 'score', direction: 'asc' }).map((row) => row.option)).toEqual(['A', 'B']);
     expect(sortMatrixRows(rows, { key: 'option', direction: 'desc' }).map((row) => row.option)).toEqual(['B', 'A']);
   });
+
+  it('sorts typed table cells by their canonical unwrapped value, not the cell object or display label', () => {
+    const rows = [
+      { collection: { type: 'code', value: 'z_collection' }, seen: { type: 'number', value: 3, label: 'three' } },
+      { collection: { type: 'code', value: 'a_collection' }, seen: { type: 'number', value: 41, label: 'forty-one' } },
+      { collection: { type: 'code', value: 'm_collection' }, seen: { type: 'number', value: 1, label: 'one' } },
+    ];
+
+    expect(sortMatrixRows(rows, { key: 'seen', direction: 'asc' }).map((row) => (row.seen as { value: number }).value))
+      .toEqual([1, 3, 41]);
+    expect(sortMatrixRows(rows, { key: 'collection', direction: 'asc' }).map((row) => (row.collection as { value: string }).value))
+      .toEqual(['a_collection', 'm_collection', 'z_collection']);
+  });
 });

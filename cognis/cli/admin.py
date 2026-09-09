@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import ENV_TEMPLATE, load_config
+from cognis.mfa import reset_user_mfa, revoke_user_auth_sessions
 from cognis.security import create_password_hasher, generate_api_key_material
 from cognis.store.queries import (
     count_admins,
@@ -81,11 +82,33 @@ def reset_password_command(email: str) -> None:
         password = typer.prompt("New password", hide_input=True, confirmation_prompt=True)
         async with session_factory() as session:
             updated = await update_user_password(session, email, password_hasher.hash(password))
+            if updated:
+                await revoke_user_auth_sessions(session, user_email=email)
             await session.commit()
         if not updated:
             typer.echo(f"User {email} not found")
             raise typer.Exit(code=1)
         typer.echo(f"Updated password for {email}")
+
+    asyncio.run(_run())
+
+
+@admin_app.command("reset-mfa")
+def reset_mfa_command(email: str) -> None:
+    """Remove a user's MFA factor and revoke all browser and native sessions."""
+
+    import asyncio
+
+    async def _run() -> None:
+        _, _, session_factory = await _get_runtime()
+        async with session_factory() as session:
+            user = await get_user(session, email)
+            if user is None:
+                typer.echo(f"User {email} not found")
+                raise typer.Exit(code=1)
+            await reset_user_mfa(session, user_email=email)
+            await session.commit()
+        typer.echo(f"Reset MFA and revoked sessions for {email}")
 
     asyncio.run(_run())
 

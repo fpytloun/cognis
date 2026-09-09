@@ -92,7 +92,7 @@ async def create_user_schedule(
         task_template["session_policy"] = request_model.session_policy.model_dump()
 
     async with session_factory() as db:
-        row = await create_schedule(
+        created_row = await create_schedule(
             db,
             name=request_model.name,
             description=request_model.description,
@@ -115,7 +115,7 @@ async def create_user_schedule(
             created_by=owner_email,
         )
         await db.commit()
-        row = await get_schedule(db, row.schedule_id)
+        row = await get_schedule(db, created_row.schedule_id)
 
     if scheduler is not None and row is not None:
         await scheduler.notify_schedule_changed(row.schedule_id)

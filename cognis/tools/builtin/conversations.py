@@ -5,17 +5,20 @@ from __future__ import annotations
 import base64
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from cognis.api.serializers import conversation_to_response, serialize_event_rows
+from cognis.core.agent_registry import AgentRegistry
 from cognis.core.artifact_inputs import safe_attachment_metadata
 from cognis.core.conversation_search import join_session_matches
+from cognis.core.historical_tool_output import source_session_authority
 from cognis.core.long_lived_chat import is_long_lived_chat_context
 from cognis.core.session_cache import CachedEvent
 from cognis.models.search import SearchRequestFilters, SearchSessionsRequest
 from cognis.models.session import ConversationContext, SessionModel
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolCapability, ToolSource
+from cognis.runtime_context import scoped_runtime_context
 from cognis.store.queries import (
     get_conversation,
     get_session_row,
@@ -29,7 +32,7 @@ _SOURCE = ToolSource(type="builtin")
 _SEARCH_SESSIONS_OVERFETCH_FACTOR = 3
 _SEARCH_SESSIONS_MAX_LIMIT = 100
 _READ_DEFAULT_TYPES = ["user_message", "assistant_message"]
-_READ_ALLOWED_TYPES = frozenset(_READ_DEFAULT_TYPES)
+_READ_ALLOWED_TYPES = frozenset([*_READ_DEFAULT_TYPES, "tool_call", "tool_result"])
 _CONTENT_TRUNCATION_LIMIT = 4_000
 _CONTENT_HARD_LIMIT = 32_000
 
@@ -92,7 +95,9 @@ SEARCH_CONVERSATIONS_TOOL = _tool(
 
 READ_CONVERSATION_MESSAGES_TOOL = _tool(
     "read_conversation_messages",
-    "Read user and assistant messages from one owned conversation with anchor-based pagination. Defaults to the current conversation.",
+    "Read messages from one owned conversation with anchor-based pagination. "
+    "Opt into tool_call/tool_result kinds for compact metadata and historical references only. "
+    "Use read_tool_output with the reference for content. Defaults to the current conversation.",
     {
         "conversation_id": {"type": "string"},
         "anchor": {
@@ -111,7 +116,10 @@ READ_CONVERSATION_MESSAGES_TOOL = _tool(
         "cursor": {"type": "string", "description": "Opaque cursor returned by a previous read."},
         "kinds": {
             "type": "array",
-            "items": {"type": "string", "enum": ["user_message", "assistant_message"]},
+            "items": {
+                "type": "string",
+                "enum": ["user_message", "assistant_message", "tool_call", "tool_result"],
+            },
         },
         "include_content_truncation": {"type": "boolean", "default": True},
         "limit": {"type": "integer", "default": 50, "maximum": 200},
@@ -169,7 +177,7 @@ def _user(context: ToolExecutionContext) -> str:
 def _current_conversation_id(context: ToolExecutionContext) -> str | None:
     runtime_access = context.runtime_metadata.get("runtime_access")
     if isinstance(runtime_access, dict) and isinstance(runtime_access.get("conversation_id"), str):
-        return runtime_access["conversation_id"]
+        return cast(str, runtime_access["conversation_id"])
     value = context.runtime_metadata.get("conversation_id")
     return value if isinstance(value, str) else None
 
@@ -177,7 +185,7 @@ def _current_conversation_id(context: ToolExecutionContext) -> str | None:
 def _event_content(event: dict[str, Any]) -> str:
     data = event.get("data")
     if isinstance(data, dict) and isinstance(data.get("content"), str):
-        return data["content"]
+        return cast(str, data["content"])
     return ""
 
 
@@ -344,8 +352,8 @@ def _tag_session_events(row: Any, events: list[dict[str, Any]]) -> list[dict[str
         copied = dict(event)
         data = copied.get("data")
         copied["data"] = dict(data) if isinstance(data, dict) else {}
-        copied["data"].setdefault("session_id", row.session_id)
-        copied["data"].setdefault("intaris_session_id", row.intaris_session_id or row.session_id)
+        copied["data"]["session_id"] = row.session_id
+        copied["data"]["intaris_session_id"] = row.intaris_session_id or row.session_id
         tagged.append(copied)
     return tagged
 
@@ -453,8 +461,11 @@ def build_conversation_tool_handlers(
             user_email=user_email,
         )
         async with session_factory() as session:
-            display_min_score = float(
-                await get_setting_value(session, "search.display_min_score", 0.2)
+            raw_min_score = await get_setting_value(session, "search.display_min_score", 0.2)
+            display_min_score = (
+                float(raw_min_score)
+                if isinstance(raw_min_score, str | bytes | bytearray | int | float)
+                else 0.2
             )
             matches = await join_session_matches(
                 session,
@@ -484,8 +495,10 @@ def build_conversation_tool_handlers(
             raise ValueError("conversation_id is required outside an active conversation")
         limit = min(max(int(arguments.get("limit") or 50), 1), 200)
         read_types = _read_types(arguments)
+        tool_history = bool(set(read_types) & {"tool_call", "tool_result"})
         include_truncation = bool(arguments.get("include_content_truncation", True))
-        anchor = arguments.get("anchor") if isinstance(arguments.get("anchor"), dict) else {}
+        raw_anchor = arguments.get("anchor")
+        anchor: dict[str, Any] = raw_anchor if isinstance(raw_anchor, dict) else {}
         async with session_factory() as session:
             conversation = await get_conversation(session, conversation_id)
             if (
@@ -508,6 +521,15 @@ def build_conversation_tool_handlers(
             cursor_payload = _decode_cursor(str(arguments["cursor"]))
             if cursor_payload.get("tool") != "read_conversation_messages":
                 raise ValueError("Invalid cursor")
+            if "version" in cursor_payload:
+                if (
+                    cursor_payload["version"] != 2
+                    or cursor_payload.get("conversation_id") != conversation_id
+                    or cursor_payload.get("kinds") != sorted(set(read_types))
+                ):
+                    raise ValueError("Cursor scope does not match this read")
+            elif tool_history:
+                raise ValueError("Legacy cursors support message kinds only")
             cursor_session_id = cursor_payload.get("sid")
             cursor_seq = cursor_payload.get("seq")
             cursor_dir = cursor_payload.get("dir")
@@ -528,12 +550,37 @@ def build_conversation_tool_handlers(
 
         anchor_kind, anchor_index = _validate_anchor(anchor, session_rows)
         events: list[dict[str, Any]] = []
+        history_gaps: list[dict[str, Any]] = []
+
+        async def read_row(row: Any, **kwargs: Any) -> Any:
+            if tool_history:
+                authority = await source_session_authority(
+                    AgentRegistry(session_factory), row, user_email=user_email
+                )
+                with scoped_runtime_context(
+                    user_email=authority.user_email,
+                    agent_id=authority.agent_id,
+                    agent_owner_email=authority.agent_owner_email,
+                ):
+                    result = await intaris.read_events(
+                        row.intaris_session_id or row.session_id, **kwargs
+                    )
+            else:
+                result = await intaris.read_events(
+                    row.intaris_session_id or row.session_id, **kwargs
+                )
+            gap = getattr(result, "history_gap", None)
+            if gap is not None:
+                gap_data = gap.model_dump() if hasattr(gap, "model_dump") else gap
+                history_gaps.append({"session_id": row.session_id, "history_gap": gap_data})
+            return result
+
         has_more_forward = False
         has_more_backward = False
         if anchor_kind == "latest":
             for row in reversed(session_rows):
-                result = await intaris.read_events(
-                    row.intaris_session_id or row.session_id,
+                result = await read_row(
+                    row,
                     last_n=limit - len(events),
                     types=read_types,
                     allow_missing_stream=True,
@@ -554,23 +601,21 @@ def build_conversation_tool_handlers(
                     if remaining <= 0:
                         break
                     if row is session_rows[anchor_index]:
-                        after_seq = max(0, seq - remaining - 1)
-                        read_limit = remaining + 1
-                        result = await intaris.read_events(
-                            row.intaris_session_id or row.session_id,
-                            after_seq=after_seq,
-                            limit=read_limit,
+                        result = await read_row(
+                            row,
+                            before_seq=seq,
+                            limit=remaining,
                             types=read_types,
                             allow_missing_stream=True,
                         )
                         row_events = [
                             event for event in list(result.events) if _event_seq(event) < seq
                         ]
-                        if row_events and _event_seq(row_events[0]) > 1:
+                        if result.has_more:
                             has_more_backward = True
                     else:
-                        result = await intaris.read_events(
-                            row.intaris_session_id or row.session_id,
+                        result = await read_row(
+                            row,
                             last_n=remaining,
                             types=read_types,
                             allow_missing_stream=True,
@@ -581,6 +626,8 @@ def build_conversation_tool_handlers(
                     row_events = _tag_session_events(row, row_events)[-remaining:]
                     collected = [*row_events, *collected]
                     remaining = limit - len(collected)
+                    if remaining == 0 and row is not session_rows[0]:
+                        has_more_backward = True
                 events = collected[-limit:]
                 has_more_forward = True
             else:
@@ -599,8 +646,8 @@ def build_conversation_tool_handlers(
                             after = _non_negative_int(anchor.get("after"), 5)
                             row_after_seq = max(0, seq - before - 1)
                             read_limit = before + after + 1
-                    result = await intaris.read_events(
-                        row.intaris_session_id or row.session_id,
+                    result = await read_row(
+                        row,
                         after_seq=row_after_seq,
                         limit=read_limit,
                         types=read_types,
@@ -629,13 +676,43 @@ def build_conversation_tool_handlers(
                     has_more_backward = True
 
         events = events[:limit]
-        serialized = serialize_event_rows(
-            events,
-            log_label="conversation_tool_read",
-            log_context={"conversation_id": conversation_id},
-        )
         response_events: list[dict[str, Any]] = []
-        for item in serialized:
+        for event in events:
+            if event.get("type") in {"tool_call", "tool_result"}:
+                data = event["data"]
+                call_id = data.get("call_id")
+                # Do not shorten identifiers into misleading recovery locators.
+                if not isinstance(call_id, str) or not call_id or len(call_id) > 512:
+                    continue
+                reference = {
+                    "conversation_id": conversation_id,
+                    "session_id": data["session_id"],
+                    "seq": event["seq"],
+                    "kind": event["type"],
+                    "call_id": call_id,
+                }
+                metadata = {
+                    "session_id": data["session_id"],
+                    "seq": event["seq"],
+                    "kind": event["type"],
+                    "call_id": call_id,
+                    "reference": reference,
+                }
+                name = data.get("tool") or data.get("name") or data.get("tool_name")
+                if isinstance(name, str) and len(name) <= 512:
+                    metadata["tool_name"] = name
+                if isinstance(data.get("is_error"), bool):
+                    metadata["is_error"] = data["is_error"]
+                response_events.append(metadata)
+                continue
+            serialized = serialize_event_rows(
+                cast(list[object], [event]),
+                log_label="conversation_tool_read",
+                log_context={"conversation_id": conversation_id},
+            )
+            if not serialized:
+                continue
+            item = serialized[0]
             payload = item.model_dump(mode="json")
             data = payload.get("data") if isinstance(payload, dict) else None
             event_data = data if isinstance(data, dict) else {}
@@ -666,11 +743,15 @@ def build_conversation_tool_handlers(
             "conversation_id": conversation_id,
             "events": response_events,
             "ordering": "chronological",
+            **({"history_gaps": history_gaps} if history_gaps else {}),
             "page": {
                 "next_cursor": (
                     _encode_cursor(
                         {
                             "tool": "read_conversation_messages",
+                            "version": 2,
+                            "conversation_id": conversation_id,
+                            "kinds": sorted(set(read_types)),
                             "sid": last_event["session_id"],
                             "seq": last_event["seq"],
                             "dir": "f",
@@ -683,6 +764,9 @@ def build_conversation_tool_handlers(
                     _encode_cursor(
                         {
                             "tool": "read_conversation_messages",
+                            "version": 2,
+                            "conversation_id": conversation_id,
+                            "kinds": sorted(set(read_types)),
                             "sid": first_event["session_id"],
                             "seq": first_event["seq"],
                             "dir": "b",
@@ -734,7 +818,7 @@ def build_conversation_tool_handlers(
                         break
                 if session_row is None:
                     raise ValueError("session_id does not belong to this conversation")
-            elif getattr(conversation, "active_session_id", None):
+            elif isinstance(conversation.active_session_id, str):
                 session_row = await get_session_row(session, conversation.active_session_id)
                 if session_row is not None and session_row.conversation_id != conversation_id:
                     session_row = None

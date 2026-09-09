@@ -16,7 +16,10 @@ depends_on = None
 
 
 def _column_map(table_name: str) -> dict[str, dict[str, object]]:
-    return {column["name"]: column for column in sa.inspect(op.get_bind()).get_columns(table_name)}
+    return {
+        str(column["name"]): dict(column)
+        for column in sa.inspect(op.get_bind()).get_columns(table_name)
+    }
 
 
 def upgrade() -> None:

@@ -13,10 +13,12 @@ import {
   restartAccumulatedWorkTraversal,
   resolvedAccumulatedWorkProjection,
   applyPendingNewestWorkPage,
+  applyExactWorkSummary,
   currentWorkPage,
   moveToCachedWorkPage,
   orderedWorkDeliverables,
   replaceNewestWorkPage,
+  retainExactWorkSummary,
   resolvedCurrentWorkPage,
   storeOlderWorkPage,
   storeWorkPageAt,
@@ -55,6 +57,42 @@ function page(
     server_time: `2026-01-01T00:00:${String(index).padStart(2, '0')}Z`,
   };
 }
+
+it('retains the prior exact summary until the matching revision exact summary arrives', () => {
+  const prior = {
+    ...page(1),
+    detail: 'full' as const,
+    work_revision: 4,
+    summary: { ...page(1).summary, commands: 40 },
+  };
+  const latest = {
+    ...page(2),
+    detail: 'lightweight' as const,
+    work_revision: 5,
+    summary: { ...page(2).summary, commands: 5 },
+  };
+  const retained = retainExactWorkSummary(latest, prior);
+  expect(retained.summary.commands).toBe(40);
+
+  const stale = {
+    ...latest,
+    detail: 'full' as const,
+    work_revision: 4,
+    summary: { ...latest.summary, commands: 400 },
+  };
+  expect(applyExactWorkSummary(retained, stale).summary.commands).toBe(40);
+
+  const exact = {
+    ...latest,
+    detail: 'full' as const,
+    summary: { ...latest.summary, commands: 50 },
+  };
+  expect(applyExactWorkSummary(retained, exact)).toMatchObject({
+    detail: 'full',
+    summary: { commands: 50 },
+    work_revision: 5,
+  });
+});
 
 function mutation(
   id: string,
@@ -157,9 +195,11 @@ describe('work page navigation', () => {
     const newest = page(2, { hasMore: true, cursor: 'older' });
     newest.graph_fingerprint = 'graph-a';
     let state = appendOlderWorkPage(createAccumulatedWorkState(newest), page(1));
-    state = refreshNewestWorkPage(state, page(3, { hasMore: true, cursor: 'new-boundary' }));
+    const refreshedSameGraph = page(3, { hasMore: true, cursor: 'new-boundary' });
+    refreshedSameGraph.graph_fingerprint = 'graph-a';
+    state = refreshNewestWorkPage(state, refreshedSameGraph);
     expect(state.projection.commands.map((item) => item.id)).toEqual([
-      'command-3', 'command-2', 'command-1',
+      'command-3', 'command-1',
     ]);
     expect(state.beforeCursor).toBeNull();
 
@@ -184,7 +224,89 @@ describe('work page navigation', () => {
     expect(state.projection.commands).toEqual([]);
   });
 
-  it('keeps an absent running command when a partial refresh has no tombstone', () => {
+  it('does not resurrect an older-page command tombstoned by the newest live page', () => {
+    let state = appendOlderWorkPage(
+      createAccumulatedWorkState(page(3, { hasMore: true, cursor: 'older' })),
+      page(2, { hasMore: false }),
+    );
+    const refreshed = page(4, { hasMore: true, cursor: 'older' });
+    refreshed.removed_call_ids = ['call-2'];
+    state = refreshNewestWorkPage(state, refreshed);
+    expect(state.projection.commands.map((item) => item.call_id)).not.toContain('call-2');
+    state = appendOlderWorkPage(state, page(2, { hasMore: false }));
+    expect(state.projection.commands.map((item) => item.call_id)).not.toContain('call-2');
+  });
+
+  it('persists a tombstone first observed on an older page across later pages', () => {
+    let state = createAccumulatedWorkState(page(5, { hasMore: true, cursor: 'older-1' }));
+    const tombstonePage = page(4, { hasMore: true, cursor: 'older-2' });
+    tombstonePage.commands = [];
+    tombstonePage.removed_call_ids = ['call-3'];
+    state = appendOlderWorkPage(state, tombstonePage);
+    state = appendOlderWorkPage(state, page(3, { hasMore: false }));
+    expect(state.projection.commands.map((item) => item.call_id)).not.toContain('call-3');
+  });
+
+  it('replaces cumulative Files snapshots instead of double-counting a new mutation for the same path', () => {
+    const oldApp = mutation('old-app', {
+      path: 'repo/src/app.ts',
+      pathId: 'root:src/app.ts',
+      relativePath: 'src/app.ts',
+      rootId: 'root',
+      rootLabel: 'repo',
+    });
+    oldApp.additions = 2;
+    const sharedConfig = mutation('shared-config', {
+      path: 'repo/config.ts',
+      pathId: 'root:config.ts',
+      relativePath: 'config.ts',
+      rootId: 'root',
+      rootLabel: 'repo',
+    });
+    sharedConfig.additions = 3;
+    const initial = page(1, { mutation: oldApp });
+    initial.mutations.push(sharedConfig);
+    initial.summary = {
+      mutations: 0,
+      commands: 0,
+      changed_files: 2,
+      artifacts: 0,
+      additions: 5,
+      deletions: 0,
+    };
+    let state = createAccumulatedWorkState(initial);
+
+    const newApp = mutation('new-app', {
+      path: 'repo/src/app.ts',
+      pathId: 'root:src/app.ts',
+      relativePath: 'src/app.ts',
+      rootId: 'root',
+      rootLabel: 'repo',
+    });
+    newApp.additions = 5;
+    const refreshed = page(2, { mutation: newApp });
+    refreshed.mutations.push(sharedConfig);
+    refreshed.summary = {
+      mutations: 0,
+      commands: 0,
+      changed_files: 2,
+      artifacts: 0,
+      additions: 8,
+      deletions: 0,
+    };
+
+    state = refreshNewestWorkPage(state, refreshed, { replaceCumulativeFiles: true });
+    const projection = resolvedAccumulatedWorkProjection(state);
+    expect(new Set(projection.mutations.map((item) => item.id))).toEqual(
+      new Set(['new-app', 'shared-config']),
+    );
+    expect(projection.mutations.some((item) => item.id === 'old-app')).toBe(false);
+    expect(projection.mutations.reduce((total, item) => total + (item.additions ?? 0), 0)).toBe(8);
+    expect(projection.summary).toMatchObject({ changed_files: 2, additions: 8 });
+    expect(state.loadedPages).toBe(1);
+  });
+
+  it('replaces an absent running command when the live newest page no longer contains it', () => {
     const running = page(2, { hasMore: true, cursor: 'older' });
     running.commands[0].status = 'running';
     let state = createAccumulatedWorkState(running);
@@ -194,7 +316,6 @@ describe('work page navigation', () => {
 
     expect(state.projection.commands.map((item) => item.id)).toEqual([
       'command-3',
-      'command-2',
     ]);
   });
   it('keeps every loaded item and rebuilds root candidates from retained mutations', () => {
@@ -244,7 +365,7 @@ describe('work page navigation', () => {
     state = restartAccumulatedWorkTraversal(state);
     expect(state.beforeCursor).toBe('fresh');
     expect(state.projection.commands.map((item) => item.id)).toEqual([
-      'command-4', 'command-3', 'command-2',
+      'command-4', 'command-2',
     ]);
   });
   it('resets page cursors when an empty descendant changes the graph fingerprint', () => {

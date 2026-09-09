@@ -8,7 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal, cast
 
 from cognis.store.coordination import DatabaseLeaseStore, Lease
 from cognis.store.direct_turns import (
@@ -21,9 +21,11 @@ from cognis.store.direct_turns import (
 from cognis.store.models import DirectTurnRequestRow
 
 DIRECT_TURN_LEASE_SECONDS = 30.0
-DIRECT_TURN_POLL_SECONDS = 0.5
+DIRECT_TURN_ACTIVE_POLL_SECONDS = 0.5
+DIRECT_TURN_CANCELLATION_POLL_SECONDS = 2.0
+DIRECT_TURN_RECOVERY_INTERVAL_SECONDS = 30.0
 INTARIS_TAKEOVER_QUARANTINE_SECONDS = 35.0
-TOOL_TAKEOVER_QUARANTINE_SECONDS = 120.0
+TOOL_RECOVERY_DEADLINE_SECONDS = 60.0
 DIRECT_TURN_CONTROLLER_MAX_ATTEMPTS = 3
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,14 @@ class StaleDirectTurnOwner(RuntimeError):
 
 class PermanentDirectTurnControllerError(PermanentDirectTurnPayloadError):
     """A deterministic controller failure that must not block FIFO recovery."""
+
+
+class ToolRecoveryPersistenceError(RuntimeError):
+    """Recovery cannot safely reach the next canonical model boundary."""
+
+    def __init__(self, message: str, *, ambiguous: bool) -> None:
+        super().__init__(message)
+        self.ambiguous = ambiguous
 
 
 @dataclass
@@ -79,6 +89,27 @@ class DirectTurnExecutionFence:
         if row.cancel_requested_at is not None:
             raise asyncio.CancelledError
 
+    async def bind_tool_dispatch(
+        self,
+        call_id: str,
+        executor_id: str,
+        executor_instance_id: str | None,
+        *,
+        dispatch_state: Literal["dispatching", "sent"],
+    ) -> None:
+        if dispatch_state not in {"dispatching", "sent"}:
+            raise ValueError("invalid tool dispatch state")
+        row = await self.store.merge_tool_dispatch(
+            self.request_id,
+            lease=self.lease,
+            call_id=call_id,
+            executor_id=executor_id,
+            executor_instance_id=executor_instance_id,
+            dispatch_state=dispatch_state,
+        )
+        if row is None:
+            raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
+
 
 ExecuteClaimedTurn = Callable[
     [DirectTurnRequestRow, MaterializedDirectTurnPayload, DirectTurnExecutionFence],
@@ -93,6 +124,7 @@ FencedPermanentFailureHandler = Callable[
     [DirectTurnRequestRow, PermanentDirectTurnPayloadError, Lease], Awaitable[None]
 ]
 TurnStateChanged = Callable[[DirectTurnRequestRow], Awaitable[None]]
+RecoverToolCalls = Callable[[DirectTurnRequestRow, Lease], Awaitable[None]]
 
 
 class DurableDirectTurnRuntime:
@@ -112,6 +144,7 @@ class DurableDirectTurnRuntime:
         on_permanent_failure: PermanentFailureHandler | None = None,
         on_fenced_permanent_failure: FencedPermanentFailureHandler | None = None,
         on_state_change: TurnStateChanged | None = None,
+        recover_tool_calls: RecoverToolCalls | None = None,
         simple_mode: bool,
     ) -> None:
         self.store = store
@@ -126,9 +159,11 @@ class DurableDirectTurnRuntime:
         self._on_permanent_failure = on_permanent_failure
         self._on_fenced_permanent_failure = on_fenced_permanent_failure
         self._on_state_change = on_state_change
+        self._recover_tool_calls = recover_tool_calls
         self._simple_mode = simple_mode
         self._accepting_claims = False
         self._wake = asyncio.Event()
+        self._wake_generation = 0
         self._stop = asyncio.Event()
         self._worker: asyncio.Task[None] | None = None
         self._active: dict[str, asyncio.Task[None]] = {}
@@ -140,17 +175,17 @@ class DurableDirectTurnRuntime:
             return
         self._accepting_claims = True
         self._stop.clear()
-        self._wake.set()
+        self._signal_wake()
         self._worker = asyncio.create_task(self._run(), name="direct-turn-claim-worker")
 
     async def stop_claiming(self) -> None:
         self._accepting_claims = False
-        self._wake.set()
+        self._signal_wake()
 
     async def stop(self) -> None:
         await self.stop_claiming()
         self._stop.set()
-        self._wake.set()
+        self._signal_wake()
         if self._worker is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._worker
@@ -163,6 +198,10 @@ class DurableDirectTurnRuntime:
             await asyncio.gather(*pending, return_exceptions=True)
 
     async def wake(self) -> None:
+        self._signal_wake()
+
+    def _signal_wake(self) -> None:
+        self._wake_generation += 1
         self._wake.set()
 
     async def run_once(self) -> None:
@@ -218,7 +257,7 @@ class DurableDirectTurnRuntime:
 
     async def _run(self) -> None:
         while not self._stop.is_set():
-            self._wake.clear()
+            generation = self._wake_generation
             if self._accepting_claims:
                 try:
                     await self.run_once()
@@ -226,8 +265,16 @@ class DurableDirectTurnRuntime:
                     raise
                 except Exception:
                     logger.exception("direct-turn claim/recovery iteration failed")
+            if self._wake_generation != generation:
+                continue
+            self._wake.clear()
+            if self._wake_generation != generation:
+                continue
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=DIRECT_TURN_POLL_SECONDS)
+                await asyncio.wait_for(
+                    self._wake.wait(),
+                    timeout=DIRECT_TURN_RECOVERY_INTERVAL_SECONDS,
+                )
 
     async def _execute(self, row: DirectTurnRequestRow, lease: Lease) -> None:
         fence = DirectTurnExecutionFence(self.store, row.request_id, lease)
@@ -365,7 +412,11 @@ class DurableDirectTurnRuntime:
                     },
                 )
                 self._retry_after[row.request_id] = (
-                    asyncio.get_running_loop().time() + DIRECT_TURN_POLL_SECONDS
+                    asyncio.get_running_loop().time() + DIRECT_TURN_ACTIVE_POLL_SECONDS
+                )
+                asyncio.get_running_loop().call_later(
+                    DIRECT_TURN_ACTIVE_POLL_SECONDS,
+                    self._signal_wake,
                 )
                 retry_scheduled = True
         finally:
@@ -387,9 +438,10 @@ class DurableDirectTurnRuntime:
                 retry_delay = (
                     float(retry_after_seconds)
                     if isinstance(retry_after_seconds, (int, float)) and retry_after_seconds > 0
-                    else DIRECT_TURN_POLL_SECONDS
+                    else DIRECT_TURN_ACTIVE_POLL_SECONDS
                 )
                 self._retry_after[row.request_id] = asyncio.get_running_loop().time() + retry_delay
+                asyncio.get_running_loop().call_later(retry_delay, self._signal_wake)
                 retry_scheduled = True
             if updated is not None and updated.status in {
                 DirectTurnStatus.COMPLETED.value,
@@ -400,7 +452,7 @@ class DurableDirectTurnRuntime:
                 self._retry_after.pop(row.request_id, None)
             await self._notify_state_changed(updated or row)
             if not retry_scheduled:
-                self._wake.set()
+                self._signal_wake()
 
     async def _recover_failure_visibility(self) -> None:
         if self._on_permanent_failure is None:
@@ -478,7 +530,7 @@ class DurableDirectTurnRuntime:
         """Poll durable cancellation so a missed cluster signal still interrupts."""
 
         while True:
-            await asyncio.sleep(DIRECT_TURN_POLL_SECONDS)
+            await asyncio.sleep(DIRECT_TURN_CANCELLATION_POLL_SECONDS)
             try:
                 row = await self.store.get(request_id)
             except asyncio.CancelledError:
@@ -515,13 +567,166 @@ class DurableDirectTurnRuntime:
                 )
                 await self._lease_store.release(lease)
                 await self._notify_state_changed(cancelled or row)
-                self._wake.set()
+                self._signal_wake()
                 continue
             append_recovery_metadata = {
                 key: outcome[key]
                 for key in ("user_append_phase", "user_append_session_id", "session_id")
                 if key in outcome
             }
+            if phase == "tool_in_flight":
+                recovery_row = await self.store.begin_tool_recovery(
+                    row.request_id,
+                    lease=lease,
+                    controller_id=self._controller_id,
+                    incarnation_id=self._incarnation_id,
+                    deadline_seconds=TOOL_RECOVERY_DEADLINE_SECONDS,
+                )
+                if recovery_row is None:
+                    await self._lease_store.release(lease)
+                    continue
+                try:
+                    recover_tool_calls = self._recover_tool_calls
+                    if recover_tool_calls is None:
+                        raise ToolRecoveryPersistenceError(
+                            "Tool recovery handler is unavailable.",
+                            ambiguous=True,
+                        )
+                    recovery_outcome = (
+                        recovery_row.outcome if isinstance(recovery_row.outcome, dict) else {}
+                    )
+                    deadline_raw = recovery_outcome.get("recovery_deadline_at")
+                    try:
+                        deadline = datetime.fromisoformat(str(deadline_raw).replace("Z", "+00:00"))
+                        if deadline.tzinfo is None:
+                            deadline = deadline.replace(tzinfo=UTC)
+                    except ValueError as exc:
+                        raise ToolRecoveryPersistenceError(
+                            "The durable tool recovery deadline is malformed.",
+                            ambiguous=True,
+                        ) from exc
+                    remaining = max(0.1, (deadline - datetime.now(UTC)).total_seconds())
+                    ownership_lost = asyncio.Event()
+
+                    async def _run_recovery(
+                        recover: RecoverToolCalls = cast(RecoverToolCalls, recover_tool_calls),
+                        row: DirectTurnRequestRow = cast(DirectTurnRequestRow, recovery_row),
+                        current_lease: Lease = cast(Lease, lease),
+                    ) -> None:
+                        await recover(row, current_lease)
+
+                    recovery_task: asyncio.Task[None] = asyncio.create_task(
+                        _run_recovery(),
+                        name=f"direct-turn-tool-recovery:{row.request_id}",
+                    )
+                    renewal = asyncio.create_task(
+                        self._renew(lease, recovery_task, ownership_lost),
+                        name=f"direct-turn-tool-recovery-renew:{row.request_id}",
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            recovery_task,
+                            timeout=remaining,
+                        )
+                    except asyncio.CancelledError:
+                        if ownership_lost.is_set():
+                            raise StaleDirectTurnOwner(row.request_id) from None
+                        raise
+                    except TimeoutError as exc:
+                        raise ToolRecoveryPersistenceError(
+                            "The durable tool recovery deadline elapsed.",
+                            ambiguous=True,
+                        ) from exc
+                    finally:
+                        renewal.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await renewal
+                    checkpointed = await self.store.checkpoint(
+                        row.request_id,
+                        lease=lease,
+                        phase="tool_recovery_result_persisted",
+                        metadata={
+                            **{
+                                key: value
+                                for key, value in (
+                                    recovery_row.outcome
+                                    if isinstance(recovery_row.outcome, dict)
+                                    else {}
+                                ).items()
+                                if key not in {"phase", "phase_started_at"}
+                            },
+                        },
+                    )
+                    if checkpointed is None:
+                        raise StaleDirectTurnOwner(row.request_id)
+                    recovered = await self.store.finish_tool_recovery(
+                        row.request_id,
+                        lease=lease,
+                        outcome={
+                            **(
+                                checkpointed.outcome
+                                if isinstance(checkpointed.outcome, dict)
+                                else {}
+                            ),
+                            "phase": "user_appended",
+                            "user_append_phase": "user_appended",
+                            "interruption_reason": "tool execution was interrupted after restart",
+                            "tool_recovery_result_persisted": True,
+                        },
+                    )
+                    if recovered is None:
+                        raise StaleDirectTurnOwner(row.request_id)
+                    if recovered.status == DirectTurnStatus.CANCELLED.value:
+                        await self._lease_store.release(lease)
+                        await self._notify_state_changed(recovered)
+                        continue
+                except StaleDirectTurnOwner:
+                    await self._lease_store.release(lease)
+                    continue
+                except ToolRecoveryPersistenceError as exc:
+                    terminal = await self.store.mark_tool_recovery_terminal(
+                        row.request_id,
+                        lease=lease,
+                        status=(
+                            DirectTurnStatus.AMBIGUOUS if exc.ambiguous else DirectTurnStatus.FAILED
+                        ),
+                        outcome={
+                            "phase": "ambiguous" if exc.ambiguous else "failed",
+                            "code": (
+                                "tool_outcome_ambiguous"
+                                if exc.ambiguous
+                                else "tool_recovery_persistence_failed"
+                            ),
+                            "reason": str(exc)[:1000],
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    if terminal is None:
+                        await self._lease_store.release(lease)
+                        continue
+                except Exception as exc:
+                    logger.exception(
+                        "direct-turn tool recovery failed permanently",
+                        extra={"request_id": row.request_id},
+                    )
+                    terminal = await self.store.mark_tool_recovery_terminal(
+                        row.request_id,
+                        lease=lease,
+                        status=DirectTurnStatus.FAILED,
+                        outcome={
+                            "phase": "failed",
+                            "code": "tool_recovery_persistence_failed",
+                            "error": str(exc)[:1000],
+                        },
+                    )
+                    if terminal is None:
+                        await self._lease_store.release(lease)
+                        continue
+                await self._lease_store.release(lease)
+                updated = await self.store.get(row.request_id)
+                await self._notify_state_changed(updated or row)
+                self._signal_wake()
+                continue
             if not self._quarantine_elapsed(outcome, phase):
                 await self._lease_store.release(lease)
                 continue
@@ -681,16 +886,6 @@ class DurableDirectTurnRuntime:
                         "reason": "event append could not be reconciled",
                     },
                 )
-            elif phase == "tool_in_flight":
-                await self.store.mark_stale_ambiguous(
-                    row.request_id,
-                    lease=lease,
-                    outcome={
-                        "phase": "ambiguous",
-                        "reason": "tool outcome was not durably recorded",
-                        "call_id": outcome.get("call_id"),
-                    },
-                )
             elif phase == "model_response":
                 if append_reconciliation is True:
                     await self.store.reconcile_stale_completed(
@@ -731,7 +926,7 @@ class DurableDirectTurnRuntime:
             await self._lease_store.release(lease)
             updated = await self.store.get(row.request_id)
             await self._notify_state_changed(updated or row)
-            self._wake.set()
+            self._signal_wake()
 
     async def _reconcile_append_safely(self, row: DirectTurnRequestRow) -> bool | None:
         """Reconcile a stale append without letting one poisoned row starve claims."""
@@ -771,14 +966,7 @@ class DurableDirectTurnRuntime:
                 started = started.replace(tzinfo=UTC)
         except ValueError:
             return True
-        if phase == "tool_in_flight":
-            raw_timeout = outcome.get("timeout_seconds")
-            quarantine = (
-                max(1.0, min(float(raw_timeout), 14_400.0))
-                if isinstance(raw_timeout, int | float)
-                else TOOL_TAKEOVER_QUARANTINE_SECONDS
-            )
-        elif phase in {"intaris_append", "canonical_user_append"}:
+        if phase in {"intaris_append", "canonical_user_append"}:
             quarantine = INTARIS_TAKEOVER_QUARANTINE_SECONDS
         else:
             quarantine = 0.0

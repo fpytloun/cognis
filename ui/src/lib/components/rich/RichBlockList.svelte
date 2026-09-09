@@ -1,10 +1,16 @@
 <script lang="ts">
   import type { RichBlock, RichMediaUrlFor } from '$lib/rich-deliverable';
+  import { blockSpan } from './block-helpers';
   import RichBlockView from './RichBlockView.svelte';
 
   export let blocks: RichBlock[] = [];
   export let sources: Record<string, unknown>[] = [];
   export let mediaUrlFor: RichMediaUrlFor = () => '';
+
+  function spanStyle(block: RichBlock): string | undefined {
+    const span = blockSpan(block);
+    return span ? `span ${span}` : undefined;
+  }
 </script>
 
 <div class="rich-block-list">
@@ -13,11 +19,16 @@
       <span class="rich-legacy-anchor" id={block.__legacy_anchor} aria-hidden="true"></span>
     {/if}
     {#if block.type === 'markdown'}
-      <div class="rich-block-anchor">
+      <div class="rich-block-anchor" style:grid-column={spanStyle(block)}>
         <RichBlockView {block} {sources} {mediaUrlFor} />
       </div>
     {:else}
-      <div class="rich-block-anchor" id={typeof block.__publication_anchor === 'string' ? block.__publication_anchor : undefined} tabindex="-1">
+      <div
+        class="rich-block-anchor"
+        id={typeof block.__publication_anchor === 'string' ? block.__publication_anchor : undefined}
+        style:grid-column={spanStyle(block)}
+        tabindex="-1"
+      >
         <RichBlockView {block} {sources} {mediaUrlFor} />
       </div>
     {/if}

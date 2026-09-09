@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "id": "incident-report",
+  "title": "Production incident report",
+  "description": "Operational report with severity, timeline, impact, metrics, root cause, and corrective actions.",
+  "group": "operations",
+  "sort_key": 200,
+  "content": "Incident report fallback content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Incident report",
+      "subtitle": "Operationally useful, skim-friendly, and audit-friendly.",
+      "badges": [
+        "P1",
+        "Resolved",
+        "SLO impact"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "P1 resolved",
+        "title": "Chat turn failures during rich deliverable replay",
+        "subtitle": "Root cause was an app-specific event type emitted into a generic Intaris append-only event stream.",
+        "badges": [
+          "31 min duration",
+          "No data loss",
+          "Hotfix shipped"
+        ]
+      },
+      {
+        "type": "kv",
+        "title": "Incident facts",
+        "items": [
+          {
+            "label": "Started",
+            "value": "10:42 UTC"
+          },
+          {
+            "label": "Detected by",
+            "value": "Direct smoke test"
+          },
+          {
+            "label": "Customer impact",
+            "value": "Rich deliverable writes failed post-tool"
+          },
+          {
+            "label": "Resolution",
+            "value": "Lifecycle subtype event"
+          }
+        ]
+      },
+      {
+        "type": "timeline",
+        "title": "Timeline",
+        "items": [
+          {
+            "time": "10:42",
+            "title": "Validation error",
+            "content": "SessionEvent was constructed with event_kind instead of type.",
+            "tone": "danger"
+          },
+          {
+            "time": "10:51",
+            "title": "HTTPStatusError",
+            "content": "Intaris rejected the app-specific event type.",
+            "tone": "warning"
+          },
+          {
+            "time": "11:04",
+            "title": "Boundary fixed",
+            "content": "Cognis now emits lifecycle.event=assistant_deliverable.",
+            "tone": "success"
+          },
+          {
+            "time": "11:18",
+            "title": "Renderer gap exposed",
+            "content": "Persistence is fixed; UX polish and block coverage remain.",
+            "tone": "neutral"
+          }
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Error rate during mitigation",
+        "description": "Synthetic incident curve for validating chart rendering.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "series": [
+          {
+            "id": "error-rate",
+            "label": "Error rate",
+            "points": [
+              {
+                "x": "10:40",
+                "y": 2
+              },
+              {
+                "x": "10:50",
+                "y": 9
+              },
+              {
+                "x": "11:00",
+                "y": 6
+              },
+              {
+                "x": "11:10",
+                "y": 1
+              },
+              {
+                "x": "11:20",
+                "y": 0
+              }
+            ]
+          }
+        ],
+        "x_axis": {
+          "type": "category",
+          "label": "Mitigation time"
+        },
+        "y_axis": {
+          "type": "linear",
+          "label": "Error rate",
+          "unit": "%",
+          "min": 0,
+          "max": 10
+        },
+        "legend_position": "none",
+        "palette_token": "cool"
+      },
+      {
+        "type": "table",
+        "title": "Corrective actions",
+        "columns": [
+          {
+            "key": "action",
+            "label": "Action"
+          },
+          {
+            "key": "owner",
+            "label": "Owner"
+          },
+          {
+            "key": "status",
+            "label": "Status"
+          }
+        ],
+        "rows": [
+          {
+            "action": "Use generic lifecycle event subtype",
+            "owner": "Cognis UI/API",
+            "status": "Done"
+          },
+          {
+            "action": "Add event-construction regression",
+            "owner": "Agent loop",
+            "status": "Done"
+          },
+          {
+            "action": "Add visual E2E fixture",
+            "owner": "Frontend",
+            "status": "In progress"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

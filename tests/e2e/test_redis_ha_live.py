@@ -59,6 +59,7 @@ def _login(client: httpx.Client, url: str) -> str:
         json={
             "email": os.getenv("COGNIS_LOCAL_ADMIN_EMAIL", "admin@cognis-e2e.localdev.me"),
             "password": os.getenv("COGNIS_LOCAL_ADMIN_PASSWORD", "cognis-local-admin"),
+            "mode": "native",
         },
     )
     response.raise_for_status()

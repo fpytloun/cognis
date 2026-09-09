@@ -18,6 +18,22 @@ safety net.
 
 ## Runtime invariants
 
+### Managed-channel final delivery
+
+The scheduler commits the final outbox row with the managed turn result and
+binding version. The completion observer only repeats this idempotent enqueue
+and wakes the delivery worker. It does not await transport I/O.
+
+The application owns the tracked delivery worker from startup through shutdown.
+The worker scans persisted work on startup, on wakeup, and every 30 seconds.
+The periodic scan covers cancellation after commit but before wakeup.
+An observer rollback cannot remove the scheduler's previously committed row.
+
+Outbox claims and managed binding leases fence each send. Shutdown cancellation
+leaves unacknowledged non-idempotent sends for uncertain-outcome recovery, not
+automatic resend. Persisted outbox status owns uncertainty across projections
+and route recovery. Error text does not determine delivery certainty.
+
 1. Managed agent conversation + `delegate(wait=false)` is rejected.
 2. Workflow task step + `delegate(wait=false)` is forced to synchronous joined
    execution by the step orchestration mode.
@@ -53,9 +69,28 @@ safety net.
     children remain `OrchestrationMode.NONE`; async completion only notifies the
     parent and never continues the child.
 11. Start an initial independent review fresh. Keep fixes in the implementing
-    agent, then prefer follow-up/fork lineage for re-review. Start another fresh
-    reviewer only when deliberately seeking independent evidence.
-12. A managed-conversation join is only a bounded parent wait (3600 seconds by
+    agent. Re-review may continue the compatible reviewer only when its retained
+    investigative context is materially useful and its role, criteria, findings,
+    and dispositions remain preserved; otherwise start a fresh reviewer. Fork only
+    an independent branch requiring inherited context.
+12. Child-context guidance is compact and evidence-oriented. Continue only the
+    same bounded problem when role, responsibilities, tools, authority, and
+    output remain compatible and retained context is materially useful; send
+    only the context delta. Create a fresh isolated child for a changed
+    responsibility or capability scope or an independent workstream, with a
+    compact contract and exact references, never the parent transcript. Fork
+    only an independent branch requiring inherited context, not an ordinary
+    handoff or review. Reviewer input includes objective, criteria, exact
+    diff/artifact, verification, and invariants, not implementation reasoning.
+    Re-review preserves reviewer role, criteria, findings, and dispositions and
+    reuses context only when materially useful. Child returns include status,
+    results/findings, changed references, verification, risks, and questions;
+    detailed logs remain inspectable outside the parent's active context.
+13. In coordinate mode, the architect owns decomposition through integration,
+    acceptance, and final delivery. Workers have bounded responsibilities; do
+    not downgrade the architect into a worker by default. Preserve proportional
+    review and the bounded one-correction rule.
+14. A managed-conversation join is only a bounded parent wait (3600 seconds by
     default, with an explicit per-call override). Its timeout arms
     a completion handoff conditionally while the child is still queued/running;
     it never cancels the child or rewrites a terminal link. If completion wins
@@ -63,7 +98,15 @@ safety net.
     reporting idle. Starting another turn clears the prior `completed_at`
     marker. Runtime reconciliation preserves live work and repairs impossible
     terminal combinations such as a completed conversation with a running turn.
-13. Durable follow-up intents use a deterministic observable turn ID derived
+    Timeout and cooperative reattachment return control to the same controller
+    turn, including repeated timeouts. Fallback delivery ownership does not
+    imply permission to end that turn. Reattached results omit completion
+    content because the durable notification remains its sole delivery path.
+    The agent loop owns this per-call continuation decision and its existing
+    turn-local reattachment keys. Handoff transactions, scheduler cancellation,
+    recovery, and notification deduplication remain unchanged. An unrelated
+    asynchronous operation in the same batch retains its termination behavior.
+ 15. Durable follow-up intents use a deterministic observable turn ID derived
     from `(conversation_id, follow_up_id)`. Pending and pre-admission processing
     intents are claimed with a durable owner and expiry; another replica may
     reclaim only an expired lease. Admission fences the intent and dedupe row
@@ -75,7 +118,7 @@ safety net.
     automatic continuation, consumes one of the configured total attempts.
     Explicit transient retries resume from persisted conversation state;
     external side effects still need tool/backend idempotency.
-14. `agent_conversation_set_profile` resolves a controller-owned managed link,
+ 16. `agent_conversation_set_profile` resolves a controller-owned managed link,
     accepts only an enabled agent-switchable target profile, and changes the
     target conversation and active session only while the per-conversation
     admission lock confirms there is no active or queued turn. The next managed

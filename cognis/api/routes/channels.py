@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse
 
 from cognis.api.common import error_response, require_current_user
 from cognis.api.models import ChannelPairingRequestResponse
-from cognis.channels.registry import get_channel_meta, list_channel_types
 from cognis.core.agent_profiles import normalize_agent_profile_id, resolve_agent_profile
 from cognis.logging import get_logger
 
@@ -265,6 +264,8 @@ async def _validate_channel_default_profile(
 @router.get("/types")
 async def list_types(request: Request) -> list[dict[str, Any]]:
     """List all supported channel types with metadata."""
+    from cognis.channels.registry import list_channel_types
+
     types = list_channel_types()
     return [t.model_dump() for t in types]
 
@@ -272,6 +273,8 @@ async def list_types(request: Request) -> list[dict[str, Any]]:
 @router.get("/types/{channel_type}", response_model=None)
 async def get_type(request: Request, channel_type: str) -> Any:
     """Get metadata for a specific channel type."""
+    from cognis.channels.registry import get_channel_meta
+
     meta = get_channel_meta(channel_type)
     if meta is None:
         return error_response(404, "not_found", f"Unknown channel type: {channel_type}")
@@ -343,6 +346,8 @@ async def create_account(request: Request) -> Any:
     channel_type = body.get("channel_type")
     if not channel_type:
         return error_response(400, "validation_error", "channel_type is required")
+
+    from cognis.channels.registry import get_channel_meta
 
     meta = get_channel_meta(channel_type)
     if meta is None:

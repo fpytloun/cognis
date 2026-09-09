@@ -19,9 +19,10 @@ from cognis.settings_schema import (
         ("session.core_memories_max_tokens", 2000),
         ("session.immutable_prefix_repair_cooldown_seconds", 300),
         ("session.recall_ttl_seconds", 86400),
+        ("session.optional_recall_timeout_seconds", 5.0),
     ],
 )
-def test_ws6_session_settings_are_known_and_validated(key: str, value: int) -> None:
+def test_ws6_session_settings_are_known_and_validated(key: str, value: int | float) -> None:
     assert key in known_setting_keys()
     validate_setting_value(key, value)
 
@@ -32,10 +33,11 @@ def test_ws6_session_settings_are_known_and_validated(key: str, value: int) -> N
         "session.memory_instructions_max_tokens",
         "session.core_memories_max_tokens",
         "session.recall_ttl_seconds",
+        "session.optional_recall_timeout_seconds",
     ],
 )
 def test_ws6_positive_session_settings_reject_zero(key: str) -> None:
-    with pytest.raises(ValueError, match="greater than zero"):
+    with pytest.raises(ValueError, match="greater than zero|at least 0.1"):
         validate_setting_value(key, 0)
 
 
@@ -75,7 +77,11 @@ def test_zero_disables_managed_conversation_cleanup() -> None:
 
 
 def test_executor_policy_changes_apply_to_next_runtime_without_cleanup() -> None:
-    for key in ("executors.allow_in_process", "executors.allow_subprocess"):
+    for key in (
+        "executors.allow_in_process",
+        "executors.allow_subprocess",
+        "work.source_preview_max_lifetime_seconds",
+    ):
         spec = SETTINGS_REGISTRY[key]
         assert spec.application_scope == "next_runtime"
         assert key not in HOT_APPLIED_SETTING_KEYS

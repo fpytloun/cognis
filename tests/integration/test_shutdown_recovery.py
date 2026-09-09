@@ -10,12 +10,11 @@ Uses the live_stack infrastructure to manage Cognis as a subprocess.
 
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import signal
+import sqlite3
 import subprocess
-import time
 
 import httpx
 import pytest
@@ -145,6 +144,8 @@ def test_stale_session_recovery_on_restart(
             "DATA_DIR": str(intaris_dir),
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
+            "METRICS_HOST": "127.0.0.1",
+            "METRICS_PORT": str(_free_port()),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
             "LLM_API_KEY": "test-api-key",
             "OPENAI_API_KEY": "test-api-key",
@@ -192,7 +193,7 @@ def test_stale_session_recovery_on_restart(
         # Login
         login = http.post(
             f"{cognis_url}/api/auth/login",
-            json={"email": admin_email, "password": admin_password},
+            json={"email": admin_email, "password": admin_password, "mode": "native"},
         )
         assert login.status_code == 200
         token = login.json()["token"]
@@ -215,14 +216,6 @@ def test_stale_session_recovery_on_restart(
             headers=headers,
             json={"default": {"model": llm_model, "reasoning_effort": None}},
         )
-
-        # Lower stale threshold so recovery triggers faster
-        stale_setting = http.put(
-            f"{cognis_url}/api/v1/settings/session.stale_after_seconds",
-            headers=headers,
-            json={"value": 5},
-        )
-        assert stale_setting.status_code == 200
 
         # Create agent and conversation
         agent_resp = http.post(
@@ -258,30 +251,18 @@ def test_stale_session_recovery_on_restart(
         assert conv_resp.status_code == 200
         cid = conv_resp.json()["conversation_id"]
 
-        # Chat to create an active session
-        import websockets.sync.client as wsc
-
-        ws_url = f"ws://127.0.0.1:{cognis_port}/api/ws"
-        with wsc.connect(ws_url, close_timeout=5, open_timeout=10) as ws:
-            ws.send(json.dumps({"type": "auth", "token": token}))
-            auth_msg = json.loads(ws.recv(timeout=15))
-            assert auth_msg["type"] == "authenticated"
-            ws.send(json.dumps({"type": "reconnect", "conversation_id": cid, "last_seq": 0}))
-            time.sleep(0.3)
-            ws.send(
-                json.dumps(
-                    {"type": "message", "conversation_id": cid, "content": "Hello, test recovery."}
-                )
-            )
-            deadline = time.monotonic() + 90
-            while time.monotonic() < deadline:
-                try:
-                    raw = ws.recv(timeout=max(1.0, deadline - time.monotonic()))
-                    event = json.loads(raw)
-                    if event.get("type") in ("message_complete", "error"):
-                        break
-                except (TimeoutError, Exception):
-                    break
+        # Chat v2 HTTP admission creates the active session. WebSocket is
+        # subscription-only and is not part of the mutation contract.
+        admission = http.put(
+            f"{cognis_url}/api/v1/chat/v2/conversations/{cid}/messages/recovery-crash-turn",
+            headers=headers,
+            json={
+                "client_message_id": "recovery-crash-message",
+                "content": "Hello, test recovery.",
+                "attachments": [],
+            },
+        )
+        assert admission.status_code == 202
 
         # Verify session exists
         sessions_resp = http.get(
@@ -295,8 +276,14 @@ def test_stale_session_recovery_on_restart(
         os.killpg(cognis_proc.pid, signal.SIGKILL)
         cognis_proc.wait(timeout=5)
 
-        # Wait for sessions to become stale (> stale_after_seconds)
-        time.sleep(8)
+        # Age the crashed session directly. The stale threshold is an internal
+        # recovery setting and is intentionally unavailable through public API.
+        with sqlite3.connect(cognis_dir / "cognis.db") as database:
+            database.execute(
+                "UPDATE sessions SET updated_at = ? WHERE session_id = ?",
+                ("2000-01-01 00:00:00.000000", sessions[0]["session_id"]),
+            )
+            database.commit()
 
         # Restart Cognis (same data dir, so it has the old DB)
         cognis_proc = _start_service(
@@ -310,7 +297,7 @@ def test_stale_session_recovery_on_restart(
         # Re-login (tokens are still valid since keys are the same)
         login2 = http.post(
             f"{cognis_url}/api/auth/login",
-            json={"email": admin_email, "password": admin_password},
+            json={"email": admin_email, "password": admin_password, "mode": "native"},
         )
         assert login2.status_code == 200
         token2 = login2.json()["token"]

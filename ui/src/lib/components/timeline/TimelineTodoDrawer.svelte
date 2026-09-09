@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ChevronUp from 'lucide-svelte/icons/chevron-up';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import type { TodoSnapshotItem } from '$lib/timeline-render-model';
 
   let {
@@ -23,13 +24,6 @@
     inProgress: activeTodos.filter((todo: TodoSnapshotItem) => todo.status === 'in_progress').length,
     pending: activeTodos.filter((todo: TodoSnapshotItem) => todo.status === 'pending').length,
   }));
-
-  function todoStatusDot(status: string): string {
-    if (status === 'completed') return 'bg-emerald-400';
-    if (status === 'cancelled') return 'bg-slate-600';
-    if (status === 'in_progress') return 'bg-sky-400';
-    return 'bg-sky-400';
-  }
 
   function isCompactViewport(): boolean {
     return window.innerWidth <= compactDrawerMaxWidthPx || window.innerHeight <= compactDrawerMaxHeightPx;
@@ -84,11 +78,7 @@
       <ul class="divide-y divide-slate-800/40 border-t border-slate-800/60">
         {#each todos as todo}
           <li class="flex items-center gap-2 px-3 py-1.5 text-sm text-slate-200">
-            <span
-              class={`inline-block h-2 w-2 shrink-0 rounded-full ${todoStatusDot(todo.status)}`}
-              aria-label={todo.status.replace('_', ' ')}
-              title={todo.status.replace('_', ' ')}
-            ></span>
+            <TodoStatusDot status={todo.status} />
             <span class="scrollbar-hidden-x min-w-0 flex-1">{todo.content}</span>
           </li>
         {/each}

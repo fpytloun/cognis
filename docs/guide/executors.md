@@ -15,6 +15,46 @@ This separation lets Cognis:
 - connect to remote machines when tools need local access
 - optionally route model inference through a matching executor
 
+## Installing the executor package
+
+The normal installation includes all built-in executor components:
+
+```bash
+pip install "cognis-executor[full]==0.14.0"
+uvx --from 'cognis-executor[full]' cognis-executor
+```
+
+Homebrew is the recommended macOS installation. See the
+[macOS executor distribution guide](macos-executor.md). The public tap exists;
+the formula becomes available with the first release containing immutable
+macOS executor assets.
+
+The bare package is intentionally minimal. It includes filesystem, shell,
+search, project-context, WebSocket, MCP transport, channel adapters, and LSP
+support. Add only the optional components needed by a host: `browser`, `web`,
+`documents`, or `inference`. The `mcp` and `channels` extras remain as
+compatibility aliases. Their shared runtimes are part of `cognis-common`. The
+`full` extra combines the normal optional component set.
+
+For local in-process or subprocess execution, install both distributions. The
+`full` extra is the normal full-capability installation:
+
+```bash
+pip install "cognis-controller" "cognis-executor[full]"
+```
+
+For development from this checkout, the workspace installs both distributions
+with:
+
+```bash
+uv sync --all-extras
+uv build --all-packages
+```
+
+There is no `local-executors` extra. A controller-only installation has no
+local tool runner; persisted local executor rows are unavailable until the
+executor package is installed and the process is running.
+
 ## Executor modes
 
 Depending on configuration, Cognis can use:
@@ -99,8 +139,9 @@ The Local Compose deployment supports two WebSocket executor modes:
   and keeps browser profiles/workspace state in the `cognis-executor-home`
   Docker volume.
 - **Host executor**: after seeding, source
-  `.local/cognis-compose/executor-token/host-executor.env` and run either
-  `uv run cognis-executor` from a checkout or `uvx cognis-executor`. This is
+   `.local/cognis-compose/executor-token/host-executor.env` and run either
+   `uv run cognis-executor` from a checkout or
+   `uvx --from 'cognis-executor[full]' cognis-executor`. This is
   useful when tools need host filesystem access, host browser profiles, local
   credentials, or easier debugging.
 
@@ -217,14 +258,14 @@ In `Settings -> Executors`, the browser section stores executor config like:
     "realistic_launch": true,
     "xvfb_auto": true,
     "engine": "chromium",
-    "runtime": "playwright",
-    "channel": null,
+    "runtime": "patchright",
+    "channel": "chrome",
     "max_sessions": 8,
     "idle_timeout_seconds": 1800,
     "navigation_timeout_seconds": 60,
     "wait_until": "domcontentloaded",
     "network_idle_after_dom_seconds": 3,
-    "stealth_enabled": true,
+    "stealth_enabled": false,
     "realistic_user_agent": true,
     "default_timezone_id": "UTC",
     "default_accept_language": "en-US,en;q=0.9"
@@ -232,17 +273,17 @@ In `Settings -> Executors`, the browser section stores executor config like:
 }
 ```
 
-The default human-like setup for a sticky local executor is now:
+The recommended human-like setup for a sticky local executor is:
 
 - `profile_mode_default = "persistent_local"`
 - `persistent_profiles_enabled = true`
 - `realistic_launch = true`
-- `stealth_enabled = true` (applies `playwright-stealth` evasions to every new context)
+- `stealth_enabled = false` for Patchright, which already includes evasions
 - `xvfb_auto = true` for headed Linux executors without a real display
 
-This keeps cookies, local storage, and other profile state in a local
-Playwright user data directory on that executor. It is best for sites that are
-hostile to clean ephemeral contexts, but it is explicitly executor-local.
+This recommended setup keeps cookies, local storage, and other profile state in a local browser
+user data directory on that executor. It is best for sites that are hostile to
+clean ephemeral contexts, but it is explicitly executor-local.
 
 Browser fetches use short-lived ephemeral sessions and separate web settings:
 `web.browser_fetch.session_idle_seconds`, `navigation_timeout_seconds`,
@@ -522,7 +563,8 @@ The executor CLI reads connection parameters from environment variables so that 
 
 CLI flags (`--controller-url`, `--token`, `--workdir`) still work and take precedence over environment variables.
 
-When installed from PyPI, the recommended command is `uvx cognis-executor`.
+When installed from PyPI, the recommended command is
+`uvx --from 'cognis-executor[full]' cognis-executor`.
 
 ### System-level executor (template unit)
 
@@ -571,7 +613,14 @@ systemctl --user enable --now cognis-executor
 
 # Keep running after logout
 loginctl enable-linger $USER
+
+# Read or follow the user-systemd journal
+cognis-executor logs --lines 100
+cognis-executor logs --follow
 ```
+
+`cognis-executor logs -n 100 -f` is the short form for following the last 100
+user-service log lines. The same command reads Homebrew service logs on macOS.
 
 ### Controller
 
@@ -579,11 +628,30 @@ A system-level controller unit (`cognis-controller.service`) is also provided. S
 
 ### Running from a git checkout
 
-The default `ExecStart` uses `uvx cognis-executor` (PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with a `WorkingDirectory` for uv project resolution. The executor process still switches to `COGNIS_EXECUTOR_WORKDIR` or the service user's home directory before it accepts tool calls.
+The default `ExecStart` uses `uvx --from 'cognis-executor[full]' cognis-executor`
+(PyPI). To run from a local git checkout, swap to `uv run cognis-executor` with
+a `WorkingDirectory` for uv project resolution. The executor process still
+switches to `COGNIS_EXECUTOR_WORKDIR` or the service user's home directory
+before it accepts tool calls.
 
 ## Running as a Docker container
 
-The published executor image is `ghcr.io/fpytloun/cognis-executor`. It includes the Python executor runtime, Playwright browsers, `Xvfb`, shell tools, search tools, Node/npm, common language servers, Python formatting tools, Go/Rust/C/C++ build tooling, and a persistent non-root home directory.
+The published executor image is `ghcr.io/fpytloun/cognis-executor`.
+
+| Tag | Use |
+|---|---|
+| `latest`, `general` | Recommended normal image. Includes Patchright with Chrome, document tools, MCP prerequisites, Git, `uvx`, `npx`, and common shell utilities. |
+| `minimal` | Reduced system image for constrained deployments. It does not include browser, document, Git, Node, or `uvx` system tooling. |
+| `development` | The general image plus preinstalled language servers, Ruff, Prettier, Clangd, and ShellCheck. |
+
+Release tags follow the same pattern: `<version>`, `<version>-minimal`,
+`<version>-general`, and `<version>-development`. Use `latest` or `general`
+unless you intentionally accept missing system capabilities.
+
+The general and development images preinstall Patchright with Google Chrome.
+Set the executor browser runtime to `patchright` and the channel to `chrome`.
+Image contents do not override an executor configuration that explicitly
+selects another runtime.
 
 Create a WebSocket executor in `Settings -> Executors` and generate a token before starting the container.
 
@@ -620,7 +688,28 @@ Mount `/home/cognis` as a volume when you want browser profiles, LSP caches, she
 docker volume create cognis-executor-home
 ```
 
-The entrypoint initializes `.bashrc`, `.profile`, `.cognis/cache`, `.cache`, `.local/bin`, and `workspace` when the home directory is writable. If the container runs as root, it fixes ownership and drops to the `cognis` user. If Kubernetes sets `runAsUser`, the entrypoint does not attempt to `chown`; the volume must already be writable by that UID or group.
+The entrypoint initializes `.bashrc`, `.profile`, `.cognis/cache`, `.cache`, `.local/bin`, and `workspace` when the home directory is writable. If the container runs as root, it fixes the home-directory ownership and drops to the `cognis` user. If Kubernetes sets `runAsUser`, the entrypoint does not attempt to `chown`; the volume must already be writable by that UID or group.
+
+### Optional runtime sudo
+
+All variants contain the `sudo` command, but the `cognis` user has no sudo
+grant by default. To enable an explicit root-equivalent runtime:
+
+```bash
+docker run \
+  --user 0:0 \
+  -e COGNIS_EXECUTOR_ENABLE_SUDO=1 \
+  ...
+  ghcr.io/fpytloun/cognis-executor:latest
+```
+
+Both settings are required. The entrypoint validates a temporary sudoers
+grant and then drops to the `cognis` user. Setting the environment variable
+without starting as root causes startup to fail.
+
+CAUTION: A sudo-enabled executor can modify the complete container. Runtime
+package installation also increases the writable layer and does not update the
+published image. Use a derived image for persistent additions.
 
 ### Kubernetes security context
 

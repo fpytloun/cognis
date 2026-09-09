@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "id": "publication-report",
+  "title": "Publication-grade technical report",
+  "description": "A realistic long-form fixture covering navigation, citations, figures, tables, code, diagrams, and an appendix.",
+  "group": "publication",
+  "sort_key": 700,
+  "content": "Publication report fallback with abstract, findings, implementation, validation, appendix, and references.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Technical publication",
+      "subtitle": "A realistic fixture for PDF and responsive publication QA.",
+      "badges": [
+        "Peer-review shape",
+        "IEEE citations",
+        "Appendix"
+      ],
+      "toc": {
+        "enabled": true,
+        "depth": 3
+      },
+      "publication": true
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Research report",
+        "title": "Progressive Rich Deliverables for publication-grade agent output",
+        "subtitle": "A renderer-neutral approach that stays lightweight for short reports while scaling to navigable technical publications."
+      },
+      {
+        "type": "section",
+        "title": "Abstract",
+        "content": "Rich Deliverables can support publication semantics without turning every response into a magazine layout. Policy-driven navigation and numbering keep simple reports restrained."
+      },
+      {
+        "type": "research_answer",
+        "title": "Background and motivation",
+        "paragraphs": [
+          {
+            "text": "Semantic headings and stable anchors enable reliable navigation and PDF outlines.",
+            "citations": [
+              "weasy"
+            ]
+          },
+          {
+            "text": "First-use citation numbering keeps references deterministic across renderer targets.",
+            "citations": [
+              "ieee",
+              "weasy"
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "System design",
+        "content": "The canonical payload remains block-composed. Publication metadata only activates document-level behavior.",
+        "blocks": [
+          {
+            "type": "figure",
+            "title": "Renderer pipeline",
+            "alt": "Three-stage renderer pipeline",
+            "src": "data:image/svg+xml,%3Csvg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 640 180\"%3E%3Crect width=\"640\" height=\"180\" fill=\"%23eef2f6\"/%3E%3Cg fill=\"%23283b4c\" font-family=\"sans-serif\" font-size=\"22\"%3E%3Ctext x=\"40\" y=\"98\"%3ECanonical payload%3C/text%3E%3Ctext x=\"265\" y=\"98\"%3ESemantics%3C/text%3E%3Ctext x=\"455\" y=\"98\"%3EHTML / PDF%3C/text%3E%3C/g%3E%3Cpath d=\"M210 90h45m145 0h45\" stroke=\"%2352647d\" stroke-width=\"4\"/%3E%3C/svg%3E",
+            "caption": "Renderer-neutral blocks are enriched with deterministic publication semantics before target rendering."
+          },
+          {
+            "type": "mermaid",
+            "title": "Navigation flow",
+            "source": "flowchart LR\n  P[Payload] --> I[Index]\n  I --> T[TOC]\n  I --> B[Bookmarks]\n  I --> R[References]"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Evaluation",
+        "content": "The fixture exercises layout behavior using realistic captions and constrained mobile widths.",
+        "blocks": [
+          {
+            "type": "table",
+            "title": "Validation matrix",
+            "caption": "Required behavior across browser and PDF renderers.",
+            "columns": [
+              "surface",
+              "navigation",
+              "citations",
+              "overflow"
+            ],
+            "rows": [
+              {
+                "surface": "Chat 320–430 px",
+                "navigation": "Collapsible",
+                "citations": "Interactive previews",
+                "overflow": "No clipping"
+              },
+              {
+                "surface": "Standalone HTML",
+                "navigation": "Linked TOC",
+                "citations": "Expandable detail",
+                "overflow": "Responsive table"
+              },
+              {
+                "surface": "A4 PDF",
+                "navigation": "Leaders and pages",
+                "citations": "IEEE bibliography",
+                "overflow": "Repeated headers"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Implementation notes",
+        "content": "No Chromium runtime is added to the controller image.",
+        "blocks": [
+          {
+            "type": "code",
+            "title": "Conservative metadata",
+            "language": "json",
+            "content": "{\"toc\":{\"enabled\":true,\"depth\":3},\"publication\":{\"number_figures\":true,\"number_tables\":true}}"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Limitations",
+        "content": "Equations remain accessible Unicode or preformatted text. Full TeX/MathML rendering is deliberately excluded until a safe lightweight dependency is justified."
+      },
+      {
+        "type": "section",
+        "title": "Appendix A — Canonical references",
+        "content": "Cross-target references use stable block `id`/`anchor` values and ordinary fragment links where authored Markdown is appropriate."
+      },
+      {
+        "type": "tabs",
+        "title": "Supplemental views",
+        "items": [
+          {
+            "type": "markdown",
+            "title": "Operational notes",
+            "content": "Item-backed tab content remains local to the container."
+          },
+          {
+            "type": "markdown",
+            "title": "Reviewer notes",
+            "content": "It is intentionally excluded from document navigation."
+          }
+        ]
+      },
+      {
+        "type": "markdown",
+        "title": "Closing summary",
+        "content": "This titled Markdown block intentionally contains no Markdown heading."
+      },
+      {
+        "type": "source_list",
+        "title": "Source previews"
+      }
+    ],
+    "sources": [
+      {
+        "id": "weasy",
+        "authors": [
+          "S. CourtBouillon contributors"
+        ],
+        "title": "WeasyPrint Features",
+        "publication": "WeasyPrint Documentation",
+        "year": 2026,
+        "accessed": "2026-07-11",
+        "url": "https://doc.courtbouillon.org/weasyprint/stable/api_reference.html",
+        "snippet": "WeasyPrint supports PDF bookmarks, internal links, named strings, and target counters."
+      },
+      {
+        "id": "ieee",
+        "author": "IEEE",
+        "title": "IEEE Reference Guide",
+        "publication": "IEEE Author Center",
+        "year": 2025,
+        "url": "https://journals.ieeeauthorcenter.ieee.org/",
+        "snippet": "IEEE references are numbered in order of first citation."
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

@@ -27,6 +27,7 @@
 //     windows are notified so they cross to the new JS runtime.
 
 import { build, files, prerendered, version } from '$service-worker';
+import { PushObservationRegistry } from '$lib/push-observation';
 
 const sw = self as unknown as ServiceWorkerGlobalScope;
 
@@ -35,6 +36,9 @@ const RUNTIME = `cognis-runtime-${version}`;
 const COGNIS_CACHE_PREFIX = 'cognis-';
 const CACHE_OPERATION_TIMEOUT_MS = 3_000;
 const NAVIGATION_FETCH_TIMEOUT_MS = 8_000;
+const PUSH_OBSERVATION_DB = 'cognis-push-observations';
+const PUSH_OBSERVATION_STORE = 'observations';
+const PUSH_OBSERVATION_TTL_MS = 24 * 60 * 60 * 1000;
 
 const PRECACHE_URLS = [
   ...build,
@@ -95,6 +99,7 @@ type WebPushPayload = {
   tag?: string;
   kind?: string;
   conversation_id?: string;
+  occurred_at?: string;
   icon?: unknown;
 };
 
@@ -102,13 +107,105 @@ type ActiveConversationMessage = {
   type?: string;
   conversation_id?: string | null;
   active?: boolean;
+  observed_at?: string;
 };
 
 type ServiceWorkerControlMessage = ActiveConversationMessage & {
-  type?: 'GET_VERSION' | 'SKIP_WAITING' | 'ACTIVE_CONVERSATION';
+  type?: 'GET_VERSION' | 'SKIP_WAITING' | 'ACTIVE_CONVERSATION' | 'CONVERSATION_OBSERVED';
 };
 
 const activeConversationByClient = new Map<string, string>();
+const pushObservations = new PushObservationRegistry();
+let pushObservationDbPromise: Promise<IDBDatabase> | null = null;
+
+type StoredPushObservation = {
+  key: string;
+  client_id: string;
+  conversation_id: string;
+  observed_at: string;
+  expires_at: number;
+};
+
+function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+function transactionComplete(transaction: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'));
+    transaction.onerror = () => reject(transaction.error ?? new Error('IndexedDB transaction failed'));
+  });
+}
+
+function pushObservationDb(): Promise<IDBDatabase> {
+  if (pushObservationDbPromise) return pushObservationDbPromise;
+  pushObservationDbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(PUSH_OBSERVATION_DB, 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains(PUSH_OBSERVATION_STORE)) {
+        request.result.createObjectStore(PUSH_OBSERVATION_STORE, { keyPath: 'key' });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => {
+      pushObservationDbPromise = null;
+      reject(request.error);
+    };
+  });
+  return pushObservationDbPromise;
+}
+
+async function persistPushObservation(
+  clientId: string,
+  conversationId: unknown,
+  observedAt: unknown,
+): Promise<void> {
+  const normalizedConversationId = typeof conversationId === 'string' ? conversationId.trim() : '';
+  if (!normalizedConversationId || typeof observedAt !== 'string' || !Number.isFinite(Date.parse(observedAt))) return;
+  const db = await pushObservationDb();
+  const transaction = db.transaction(PUSH_OBSERVATION_STORE, 'readwrite');
+  const completion = transactionComplete(transaction);
+  transaction.objectStore(PUSH_OBSERVATION_STORE).put({
+    key: `${clientId}:${normalizedConversationId}`,
+    client_id: clientId,
+    conversation_id: normalizedConversationId,
+    observed_at: observedAt,
+    expires_at: Date.now() + PUSH_OBSERVATION_TTL_MS,
+  } satisfies StoredPushObservation);
+  await completion;
+}
+
+async function restorePushObservations(clientIds: string[]): Promise<void> {
+  const db = await pushObservationDb();
+  const transaction = db.transaction(PUSH_OBSERVATION_STORE, 'readonly');
+  const stored = await requestResult(
+    transaction.objectStore(PUSH_OBSERVATION_STORE).getAll() as IDBRequest<StoredPushObservation[]>,
+  );
+  const retainedClientIds = new Set(clientIds);
+  const now = Date.now();
+  const expiredKeys: string[] = [];
+  for (const observation of stored) {
+    if (observation.expires_at <= now || !retainedClientIds.has(observation.client_id)) {
+      expiredKeys.push(observation.key);
+      continue;
+    }
+    pushObservations.record(
+      observation.client_id,
+      observation.conversation_id,
+      observation.observed_at,
+    );
+  }
+  if (expiredKeys.length === 0) return;
+  const cleanup = db.transaction(PUSH_OBSERVATION_STORE, 'readwrite');
+  const completion = transactionComplete(cleanup);
+  const store = cleanup.objectStore(PUSH_OBSERVATION_STORE);
+  for (const key of expiredKeys) store.delete(key);
+  await completion;
+}
 
 sw.addEventListener('message', (event) => {
   const data = event.data as ServiceWorkerControlMessage | undefined;
@@ -135,6 +232,18 @@ sw.addEventListener('message', (event) => {
     const conversationId = typeof data.conversation_id === 'string' ? data.conversation_id.trim() : '';
     if (data.active && conversationId) activeConversationByClient.set(sourceId, conversationId);
     else activeConversationByClient.delete(sourceId);
+    return;
+  }
+
+  if (data?.type === 'CONVERSATION_OBSERVED') {
+    const sourceId = (event.source as Client | null | undefined)?.id;
+    if (!sourceId) return;
+    pushObservations.record(sourceId, data.conversation_id, data.observed_at);
+    event.waitUntil(
+      persistPushObservation(sourceId, data.conversation_id, data.observed_at).catch(() => {
+        // In-memory correlation still covers the common case when persistence is unavailable.
+      }),
+    );
   }
 });
 
@@ -288,11 +397,26 @@ async function hasForegroundClientFor(target: URL, conversationId: string | unde
   });
 }
 
+async function wasPushObserved(
+  conversationId: string | undefined,
+  occurredAt: string | undefined,
+): Promise<boolean> {
+  if (!conversationId || !occurredAt) return false;
+  const clients = await sw.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  const clientIds = clients.map((client) => client.id);
+  pushObservations.retainClients(clientIds);
+  await restorePushObservations(clientIds).catch(() => {
+    // Fall back to the current in-memory and foreground checks.
+  });
+  return pushObservations.wasObserved(clientIds, conversationId, occurredAt);
+}
+
 sw.addEventListener('push', (event) => {
   const payload = parsePushPayload(event);
   event.waitUntil(
     (async () => {
       const target = new URL(payload.url || '/chat', sw.location.origin);
+      if (await wasPushObserved(payload.conversation_id, payload.occurred_at)) return;
       if (await hasForegroundClientFor(target, payload.conversation_id)) return;
       await sw.registration.showNotification(payload.title || 'Cognis', {
         body: payload.body || 'Cognis needs your attention.',

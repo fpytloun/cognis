@@ -14,7 +14,8 @@ import type {
   SendMessageV2Response,
   TimelineBackfillResponse,
   WorkProjectionResponse,
-  ActivityOverviewResponse
+  ActivityOverviewResponse,
+  WorkActivityListResponse
 } from './types';
 import type { TimelineScope } from './types';
 
@@ -35,6 +36,22 @@ export class ChatV2ApiError extends Error {
 export interface ChatV2ApiClientOptions {
   fetch?: typeof fetch;
 }
+
+export interface ChatV2TimelineRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export type ClientPerformanceMetric =
+  | 'cached_restore_ms'
+  | 'timeline_fresh_ms'
+  | 'activity_overview_cache_fresh_ms'
+  | 'activity_overview_cache_stale_ms'
+  | 'activity_overview_cache_miss_ms'
+  | 'activity_overview_request_success_ms'
+  | 'activity_overview_request_error_ms'
+  | 'activity_overview_request_aborted_ms'
+  | 'activity_overview_request_deduplicated_ms';
 
 type RequestOptions = RequestInit & {
   fetchImpl?: typeof fetch;
@@ -167,9 +184,14 @@ export class ChatV2ApiClient {
     );
   }
 
-  snapshot(scope: TimelineScope | string): Promise<ChatSnapshot> {
+  snapshot(
+    scope: TimelineScope | string,
+    options: ChatV2TimelineRequestOptions = {}
+  ): Promise<ChatSnapshot> {
     return request<ChatSnapshot>(this.scopePath(scope, 'snapshot'), {
-      fetchImpl: this.fetchImpl
+      fetchImpl: this.fetchImpl,
+      signal: options.signal,
+      timeoutMs: options.timeoutMs
     });
   }
 
@@ -192,7 +214,7 @@ export class ChatV2ApiClient {
   }
 
   async clientPerformance(
-    metric: 'cached_restore_ms' | 'timeline_fresh_ms',
+    metric: ClientPerformanceMetric,
     durationMs: number
   ): Promise<void> {
     try {
@@ -216,6 +238,7 @@ export class ChatV2ApiClient {
       from?: string;
       to?: string;
       sessionId?: string;
+      detail?: 'lightweight' | 'full';
       signal?: AbortSignal;
     } = {}
   ): Promise<WorkProjectionResponse> {
@@ -227,6 +250,7 @@ export class ChatV2ApiClient {
         from: options.from,
         to: options.to,
         session_id: options.sessionId,
+        detail: options.detail,
       })}`,
       {
         fetchImpl: this.fetchImpl,
@@ -235,40 +259,90 @@ export class ChatV2ApiClient {
     );
   }
 
+  refreshWork(
+    scope: TimelineScope,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<import('./types').WorkRefreshResponse> {
+    return request<import('./types').WorkRefreshResponse>('/api/v1/work/refresh', {
+      fetchImpl: this.fetchImpl,
+      method: 'POST',
+      signal: options.signal,
+      body: JSON.stringify({ scope })
+    });
+  }
+
+  fileHistory(
+    payload: import('./types').WorkFileHistoryRequest,
+    options: { signal?: AbortSignal } = {}
+  ): Promise<import('./types').WorkFileHistoryResponse> {
+    return request<import('./types').WorkFileHistoryResponse>('/api/v1/work/file-history', {
+      fetchImpl: this.fetchImpl,
+      method: 'POST',
+      signal: options.signal,
+      body: JSON.stringify(payload)
+    });
+  }
+
+  workActivities(
+    options: { limit?: number; cursor?: string | null; signal?: AbortSignal } = {}
+  ): Promise<WorkActivityListResponse> {
+    return request<WorkActivityListResponse>(
+      `/api/v1/work/activities${encodeQuery({
+        limit: options.limit ?? 20,
+        cursor: options.cursor,
+      })}`,
+      {
+        fetchImpl: this.fetchImpl,
+        signal: options.signal,
+      }
+    );
+  }
+
   activityOverview(
     scope: TimelineScope | string,
-    options: { signal?: AbortSignal } = {}
+    options: { detail?: 'lightweight' | 'full'; signal?: AbortSignal } = {}
   ): Promise<ActivityOverviewResponse> {
-    return request<ActivityOverviewResponse>(this.scopePath(scope, 'activity-overview'), {
+    return request<ActivityOverviewResponse>(
+      `${this.scopePath(scope, 'activity-overview')}${encodeQuery({ detail: options.detail })}`,
+      {
       fetchImpl: this.fetchImpl,
       signal: options.signal
-    });
+      }
+    );
   }
 
   sync(
     scope: TimelineScope | string,
     cursor: string,
-    options: { limit?: number } = {}
+    options: { limit?: number } & ChatV2TimelineRequestOptions = {}
   ): Promise<ChatSyncResponse> {
     return request<ChatSyncResponse>(
       `${this.scopePath(scope, 'sync')}${encodeQuery({
         cursor,
         limit: options.limit
       })}`,
-      { fetchImpl: this.fetchImpl }
+      {
+        fetchImpl: this.fetchImpl,
+        signal: options.signal,
+        timeoutMs: options.timeoutMs
+      }
     );
   }
 
   timeline(
     scope: TimelineScope | string,
-    options: { before?: string | null; limit?: number } = {}
+    options: { before?: string | null; limit?: number } & ChatV2TimelineRequestOptions = {}
   ): Promise<TimelineBackfillResponse> {
     return request<TimelineBackfillResponse>(
       `${this.scopePath(scope, 'timeline')}${encodeQuery({
         before: options.before ?? null,
         limit: options.limit
       })}`,
-      { fetchImpl: this.fetchImpl }
+      {
+        fetchImpl: this.fetchImpl,
+        signal: options.signal,
+        timeoutMs: options.timeoutMs
+      }
     );
   }
 

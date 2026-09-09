@@ -111,8 +111,39 @@ async def test_cancellation_during_success_release_preserves_every_permit() -> N
         "failure_count": 0,
         "next_probe_in_seconds": 0.0,
         "probe_active": False,
+        "active": 0,
+        "max_concurrency": 2,
     }
     await _assert_all_permits_available(admission, 2)
+
+
+@pytest.mark.asyncio
+async def test_controller_process_source_reads_are_bounded_to_eight() -> None:
+    admission = BackgroundEventReadAdmission(max_concurrency=8)
+    release = asyncio.Event()
+    active = 0
+    observed_max = 0
+
+    async def operation() -> None:
+        nonlocal active, observed_max
+        active += 1
+        observed_max = max(observed_max, active)
+        try:
+            await release.wait()
+        finally:
+            active -= 1
+
+    tasks = [asyncio.create_task(admission.run(operation)) for _ in range(16)]
+    for _ in range(100):
+        if active == 8:
+            break
+        await asyncio.sleep(0.001)
+    assert active == 8
+    assert admission.diagnostics()["max_concurrency"] == 8
+    release.set()
+    await asyncio.gather(*tasks)
+    assert observed_max == 8
+    assert admission.diagnostics()["active"] == 0
 
 
 @pytest.mark.asyncio

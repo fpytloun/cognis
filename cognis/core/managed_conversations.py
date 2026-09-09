@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from cognis.core.chat_modes import CHAT_MODES, ChatMode
 from cognis.logging import get_logger
+from cognis.models.session import next_event_page_after_seq
 from cognis.models.workflow import normalize_session_policy
 from cognis.store import queries
 
@@ -427,10 +428,10 @@ async def last_managed_conversation_user_message_for_retry(
                     allow_missing_stream=True,
                 )
                 events.extend(list(getattr(result, "events", []) or []))
-                last_seq = int(getattr(result, "last_seq", 0) or 0)
-                if not getattr(result, "has_more", False) or last_seq <= after_seq:
+                next_after_seq = next_event_page_after_seq(result, after_seq)
+                if next_after_seq is None:
                     break
-                after_seq = last_seq
+                after_seq = next_after_seq
         except Exception:
             logger.warning(
                 "managed conversation: failed to read retry user messages",

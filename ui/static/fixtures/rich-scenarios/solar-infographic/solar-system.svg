@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
+  <title id="title">Solar System orbital diagram</title>
+  <desc id="desc">The Sun and eight planet orbits shown in a dark blue field.</desc>
+  <rect width="1200" height="675" fill="#071827"/>
+  <g fill="none" stroke="#47667a" stroke-width="2" opacity=".72">
+    <ellipse cx="510" cy="337" rx="110" ry="45"/><ellipse cx="510" cy="337" rx="155" ry="72"/>
+    <ellipse cx="510" cy="337" rx="205" ry="96"/><ellipse cx="510" cy="337" rx="263" ry="123"/>
+    <ellipse cx="510" cy="337" rx="337" ry="158"/><ellipse cx="510" cy="337" rx="425" ry="199"/>
+    <ellipse cx="510" cy="337" rx="520" ry="244"/><ellipse cx="510" cy="337" rx="580" ry="272"/>
+  </g>
+  <circle cx="510" cy="337" r="50" fill="#f7c948"/>
+  <g font-family="system-ui, sans-serif" font-size="13" fill="#dbeafe">
+    <circle cx="618" cy="337" r="7" fill="#a9b9c8"/><text x="628" y="318">Mercury</text>
+    <circle cx="655" cy="337" r="10" fill="#e8bd88"/><text x="666" y="367">Venus</text>
+    <circle cx="712" cy="337" r="11" fill="#4c9ee8"/><text x="723" y="318">Earth</text>
+    <circle cx="770" cy="337" r="8" fill="#d66b44"/><text x="780" y="367">Mars</text>
+    <circle cx="843" cy="337" r="26" fill="#d6a15b"/><text x="872" y="318">Jupiter</text>
+    <ellipse cx="936" cy="337" rx="24" ry="10" fill="none" stroke="#e8d3a3" stroke-width="6"/><circle cx="936" cy="337" r="18" fill="#d4bd83"/><text x="963" y="367">Saturn</text>
+    <circle cx="1004" cy="337" r="16" fill="#8ed4dc"/><text x="1024" y="318">Uranus</text>
+    <circle cx="1083" cy="337" r="15" fill="#547bbd"/><text x="1102" y="367">Neptune</text>
+  </g>
+  <text x="50" y="72" fill="#f8fafc" font-family="Georgia, serif" font-size="42">Our planetary neighborhood</text>
+  <text x="50" y="105" fill="#9fb7c9" font-family="system-ui, sans-serif" font-size="20">Not to scale. Planet positions are illustrative.</text>
+</svg>

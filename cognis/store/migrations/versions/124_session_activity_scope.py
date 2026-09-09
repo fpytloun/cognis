@@ -62,14 +62,24 @@ def _backfill_activity_scopes(connection: sa.Connection) -> None:
 
 
 def upgrade() -> None:
-    op.add_column("sessions", sa.Column("activity_scope_id", sa.String(), nullable=True))
+    columns = {
+        str(column["name"]): column for column in sa.inspect(op.get_bind()).get_columns("sessions")
+    }
+    if "activity_scope_id" not in columns:
+        op.add_column("sessions", sa.Column("activity_scope_id", sa.String(), nullable=True))
     _backfill_activity_scopes(op.get_bind())
-    with op.batch_alter_table("sessions") as batch_op:
-        batch_op.alter_column(
-            "activity_scope_id",
-            existing_type=sa.String(),
-            nullable=False,
-        )
+    activity_scope_nullable = (
+        True
+        if "activity_scope_id" not in columns
+        else bool(columns["activity_scope_id"]["nullable"])
+    )
+    if activity_scope_nullable:
+        with op.batch_alter_table("sessions") as batch_op:
+            batch_op.alter_column(
+                "activity_scope_id",
+                existing_type=sa.String(),
+                nullable=False,
+            )
 
 
 def downgrade() -> None:

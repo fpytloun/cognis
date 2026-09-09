@@ -5,6 +5,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
+  import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
   import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
@@ -78,6 +79,28 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   }>();
 
   let localBindings = $state<string[]>([]);
+  const editorId = $props.id();
+  let activeSection = $state('identity');
+  let toolSearch = $state('');
+  const sections = $derived.by(() => [
+    { id: 'identity', label: 'Identity', suffix: errors.name ? '!' : '' },
+    { id: 'providers', label: 'Providers & models' },
+    { id: 'tools', label: 'Tools & access', count: tools.length },
+    ...(!isSystemAsset || editableFieldSet.has('agent_profiles')
+      ? [{ id: 'profiles', label: 'Profiles', count: form.agentProfiles.length, suffix: errors.agentProfiles ? '!' : '' }]
+      : []),
+    ...(form.agentType === 'primary'
+      ? [{ id: 'workflows', label: 'Workflows', suffix: errors.stepAgentOverridesJson ? '!' : '' }]
+      : [])
+  ]);
+  $effect(() => {
+    if (!sections.some((section) => section.id === activeSection)) activeSection = 'identity';
+  });
+
+  function matchesTool(tool: AgentToolOption): boolean {
+    return [tool.name, tool.description, tool.category, tool.source?.raw_tool_name]
+      .join(' ').toLowerCase().includes(toolSearch.trim().toLowerCase());
+  }
   let showAvatarModal = $state(false);
   let showAvatarLightbox = $state(false);
   let skillDetailId = $state<string | null>(null);
@@ -554,8 +577,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 </script>
 
 <form class="space-y-5" onsubmit={handleSubmit}>
-  <div class="grid gap-5 lg:grid-cols-[minmax(0,1fr)_360px]">
-    <div class="space-y-5">
+  <AccessibleTabs tabs={sections} activeId={activeSection} idPrefix={editorId}
+    ariaLabel="Agent configuration" onChange={(id) => { activeSection = id; }} />
+  <div class="min-w-0 space-y-5">
+    <div class="min-w-0 space-y-5">
+      <div hidden={activeSection !== 'identity'} id={`${editorId}-panel-identity`} role="tabpanel" aria-labelledby={`${editorId}-tab-identity`} tabindex="0">
+      <div class="space-y-5">
       <!-- Identity -->
       <Card class="p-5">
         <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Identity</p>
@@ -732,7 +759,12 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       </Card>
 
       <!-- Tools & Permissions -->
+      </div>
+      </div>
+      {#snippet executorSettings()}
       <Card class="p-5">
+        <h2 class="mb-1 text-lg font-semibold text-white">Tools & access</h2>
+        <p class="mb-5 text-sm text-slate-400">Choose where this agent works, which tools it can use, and which resources it can access.</p>
         <div class="mb-4 grid gap-4 md:grid-cols-2">
           <label class="space-y-2 text-sm font-medium text-slate-200">
             <span>Executor</span>
@@ -751,7 +783,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </label>
         </div>
 
-        <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
+      </Card>
+      {/snippet}
+        {#snippet backendSettings()}
+        <div class="rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
           <div class="mb-3">
             <p class="text-sm font-medium text-slate-200">Backend capabilities</p>
             <p class="mt-1 text-xs text-slate-400">
@@ -837,6 +872,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           {/if}
         </div>
 
+        {/snippet}
+
+      <div hidden={activeSection !== 'tools'} id={`${editorId}-panel-tools`} role="tabpanel" aria-labelledby={`${editorId}-tab-tools`} tabindex="0" class="space-y-5">
+      {@render executorSettings()}
+      <Card class="p-5">
         <!-- Stage 36: Additional executors (multi-executor agents) -->
         <div class="mb-4 rounded-2xl border border-slate-700 bg-slate-950/40 p-4">
           <div class="mb-2 flex items-center justify-between">
@@ -950,6 +990,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
         {#if tools.length > 0}
           <div class="mt-4 space-y-3 rounded-2xl border border-slate-800 bg-slate-950/60 p-4">
+            <label class="block space-y-2 text-sm text-slate-200">
+              <span>Find a tool</span>
+              <input type="search" bind:value={toolSearch} placeholder="Search names, descriptions, or categories"
+                onkeydown={(event) => { if (event.key === 'Enter') event.preventDefault(); }}
+                class="w-full rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100" />
+            </label>
+            {#if toolSearch.trim() && !tools.some(matchesTool)}
+              <p role="status" class="text-sm text-slate-400">No tools match “{toolSearch}”.</p>
+            {/if}
             <div>
               <p class="text-sm font-medium text-slate-200">Tool categories</p>
               <p class="mt-1 text-xs text-slate-400">Agents inherit all tools from their executor by default. Disable categories or individual tools here, then use permissions to require evaluation or deny access.</p>
@@ -970,12 +1019,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               {/each}
             </div>
 
-            <!-- Scroll-within-scroll is painful on touch. On mobile let the
-                 whole page scroll through this list; on desktop cap it. -->
-            <div class="space-y-2 md:max-h-80 md:overflow-y-auto">
-              {#each toolCategories as category}
-                {@const categoryTools = toolsForCategory(category)}
-                <details class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+            <!-- Use the page scroll instead of a nested tool-list scroller. -->
+            <div class="space-y-2">
+              {#each toolCategories.filter((category) => toolsForCategory(category).some(matchesTool)) as category}
+                {@const categoryTools = toolsForCategory(category).filter(matchesTool)}
+                <details open={!!toolSearch.trim()} class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
                   <summary class="cursor-pointer text-sm font-medium text-slate-200">
                     {category}
                     <span class="ml-2 text-xs text-slate-500">{categoryDisabled(category) ? 'disabled' : 'enabled'}</span>
@@ -1007,16 +1055,16 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
               {/each}
             </div>
 
-            {#if mcpServerGroups.length > 0}
+            {#if mcpServerGroups.some((group) => group.tools.some(matchesTool))}
               <div class="mt-4 space-y-2 rounded-xl border border-sky-500/20 bg-sky-500/5 p-3">
                 <div>
                   <p class="text-sm font-medium text-sky-100">MCP servers</p>
                   <p class="mt-1 text-xs text-slate-400">Disable a whole MCP server group, or keep the server enabled and disable individual tools below.</p>
                 </div>
                 <div class="space-y-2">
-                  {#each mcpServerGroups as group}
+                  {#each mcpServerGroups.filter((group) => group.tools.some(matchesTool)) as group}
                     {@const serverDisabled = mcpServerDisabled(group.key)}
-                    <details class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+                    <details open={!!toolSearch.trim()} class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
                       <summary class="cursor-pointer text-sm font-medium text-slate-200">
                         <span>{group.label}</span>
                         <span class="ml-2 rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">{mcpSourceLabel(group.sourceType)}</span>
@@ -1037,7 +1085,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                           </span>
                         </label>
                         <div class="space-y-2 border-t border-slate-800 pt-3">
-                          {#each group.tools as tool}
+                          {#each group.tools.filter(matchesTool) as tool}
                             <div class="grid gap-2 md:grid-cols-[1fr_auto_auto] items-center text-sm {serverDisabled ? 'opacity-50' : ''}">
                               <label class="flex items-center gap-3 text-slate-200">
                                 <input
@@ -1252,6 +1300,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       </Card>
 
       <!-- Provider & Model -->
+      </div>
+      <div hidden={activeSection !== 'providers'} id={`${editorId}-panel-providers`} role="tabpanel" aria-labelledby={`${editorId}-tab-providers`} tabindex="0" class="space-y-5">
+      {@render backendSettings()}
       <Card class="p-5">
         <p class="mb-3 text-xs font-medium uppercase tracking-[0.25em] text-slate-400">LLM Configuration</p>
         <div class="grid gap-4 md:grid-cols-2">
@@ -1315,7 +1366,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         </div>
       </Card>
 
+      </div>
       {#if !isSystemAsset || editableFieldSet.has('agent_profiles')}
+      <div hidden={activeSection !== 'profiles'} id={`${editorId}-panel-profiles`} role="tabpanel" aria-labelledby={`${editorId}-tab-profiles`} tabindex="0">
       <Card class="p-5">
         <div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
@@ -1506,9 +1559,11 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           <p class="mt-3 text-sm text-rose-300">{errors.agentProfiles}</p>
         {/if}
       </Card>
+      </div>
       {/if}
 
       <!-- Secondary Agent Bindings (primary only) -->
+      <div hidden={activeSection !== 'workflows'} id={`${editorId}-panel-workflows`} role="tabpanel" aria-labelledby={`${editorId}-tab-workflows`} tabindex="0" class="space-y-5">
       {#if form.agentType === 'primary' && !readonly && secondaryAgents.length > 0}
         <Card class="p-5">
           <div>
@@ -1599,6 +1654,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       </Card>
       {/if}
 
+      </div>
       {#if error}
         <p class="rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
           {error}
@@ -1606,13 +1662,22 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       {/if}
 
       {#if !readonly || isSystemAsset}
-        <div class="flex justify-end gap-3">
+        <div class="sticky bottom-0 z-10 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/95 p-4 backdrop-blur">
+          <div class="text-xs text-slate-400">
+            <p>Save applies to all sections.</p>
+            {#each Object.entries(errors) as [field, message]}
+              <button type="button" class="mt-1 block text-left text-rose-300 underline"
+                onclick={() => { activeSection = field === 'name' ? 'identity' : field === 'agentProfiles' ? 'profiles' : 'workflows'; }}>
+                {message}
+              </button>
+            {/each}
+          </div>
           <Button type="submit" disabled={saving || !canSubmit}>{saving ? 'Saving…' : mode === 'create' ? 'Create agent' : isSystemAsset ? 'Save overrides' : 'Save changes'}</Button>
         </div>
       {/if}
     </div>
 
-    <div class="space-y-5">
+    <div hidden={activeSection !== 'identity'} class="space-y-5">
       {#if form.agentType === 'primary'}
         <Card class="p-5">
           <p class="text-xs font-medium uppercase tracking-[0.25em] text-slate-400">Editable identity preview</p>

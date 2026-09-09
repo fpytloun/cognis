@@ -13,6 +13,26 @@ import {
 } from './tool-call-summary';
 
 describe('tool call summaries', () => {
+  it('accepts one-shot recovery without fabricating a managed conversation', () => {
+    const presentation = managedConversationToolPresentation({
+      toolName: 'agent_conversation_recover_channel',
+      status: 'completed',
+      arguments: { delivery_id: 'delivery-uncertain', reason: 'Reconciled externally.' },
+      result: JSON.stringify({
+        status: 'released',
+        delivery_id: 'delivery-uncertain',
+        delivery_status: 'uncertain',
+        route_reserved: true,
+        remaining_blockers: [{ blocker_type: 'one_shot_delivery', blocker_id: 'delivery-next', status: 'pending' }],
+        message: 'The selected reservation was released. Another blocker remains.'
+      })
+    });
+    expect(presentation).not.toBeNull();
+    expect(presentation?.conversations).toEqual([]);
+    expect(presentation?.displayStatus).toBe('completed');
+    expect(presentation?.resultSummary).toContain('Another blocker remains');
+  });
+
   it('animates only queued or running managed conversation states', () => {
     expect(managedConversationStatusIsRunning('running')).toBe(true);
     expect(managedConversationStatusIsRunning('queued')).toBe(true);
@@ -1012,6 +1032,31 @@ describe('tool call summaries', () => {
             { key: 'type', value: 'episodic' },
             { key: 'artifacts', value: 'attached' }
           ])
+        }
+      ]
+    });
+  });
+
+  it('counts structured memory search results instead of a stale result message', () => {
+    expect(memoryToolPresentation({
+      toolName: 'memory_search',
+      status: 'completed',
+      arguments: { query: 'espresso machine' },
+      result: JSON.stringify({
+        message: '0 memories found.',
+        results: [
+          {
+            id: 'mem_espresso',
+            memory: 'User owns a Lelit Bianca espresso machine.'
+          }
+        ]
+      })
+    })).toMatchObject({
+      resultSummary: '1 memory found.',
+      resultItems: [
+        {
+          title: 'mem_espresso',
+          accent: 'memory'
         }
       ]
     });

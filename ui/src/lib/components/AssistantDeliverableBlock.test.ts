@@ -55,6 +55,12 @@ function deliverable(overrides: Partial<Deliverable> = {}): Deliverable {
   };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => { resolve = nextResolve; });
+  return { promise, resolve };
+}
+
 describe('AssistantDeliverableBlock', () => {
   beforeEach(() => {
     mocks.getDeliverable.mockReset();
@@ -177,11 +183,10 @@ describe('AssistantDeliverableBlock', () => {
     render(AssistantDeliverableBlock, { item: item(), collapsedByDefault: true });
 
     const root = await screen.findByTestId('rich-deliverable');
-    const inlineDocument = screen.getByTestId('rich-deliverable-inline-document');
     const expand = screen.getByRole('button', { name: 'Expand document' });
     expect(expand).toHaveAttribute('aria-expanded', 'false');
-    expect(expand).toHaveAttribute('aria-controls', inlineDocument.id);
-    expect(inlineDocument).not.toBeVisible();
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
+    expect(expand).toHaveAttribute('aria-controls');
     expect(screen.getByTestId('rich-deliverable-toolbar')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Open full view' })).toBeVisible();
 
@@ -189,13 +194,93 @@ describe('AssistantDeliverableBlock', () => {
     const fullView = screen.getByTestId('rich-deliverable-full-view');
     expect(within(fullView).getByText('Validated')).toBeVisible();
     await fireEvent.click(within(fullView).getByRole('button', { name: 'Close' }));
-    expect(inlineDocument).not.toBeVisible();
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
 
     await fireEvent.click(expand);
     expect(screen.getByRole('button', { name: 'Collapse document' })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
     await fireEvent.click(screen.getByRole('button', { name: 'Collapse document' }));
-    expect(screen.getByTestId('rich-deliverable-inline-document')).not.toBeVisible();
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
     expect(root.querySelector('.assistant-deliverable-card')).toBeNull();
+  });
+
+  it('resets collapsed state and content when the deliverable item changes', async () => {
+    mocks.getDeliverable
+      .mockResolvedValueOnce(deliverable())
+      .mockResolvedValueOnce(deliverable({
+        deliverable_id: 'dlv-2',
+        title: 'Second report',
+        content: '# Second body\n\nReplacement content',
+      }));
+    const { rerender } = render(AssistantDeliverableBlock, {
+      item: item(),
+      collapsedByDefault: true,
+    });
+    await screen.findByTestId('rich-deliverable');
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
+    expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
+
+    await rerender({
+      item: item({
+        id: 'assistant-deliverable:dlv-2',
+        deliverable_id: 'dlv-2',
+        title: 'Second report',
+      }),
+      collapsedByDefault: true,
+    });
+    await screen.findByRole('heading', { name: 'Second report' });
+    expect(screen.getByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
+    expect(mocks.getDeliverable).toHaveBeenLastCalledWith('dlv-2', expect.anything());
+  });
+
+  it('keeps the current deliverable visible during same-ID revalidation', async () => {
+    const refresh = deferred<Deliverable>();
+    const firstLoader = vi.fn(async () => deliverable());
+    const secondLoader = vi.fn(() => refresh.promise);
+    const { rerender } = render(AssistantDeliverableBlock, {
+      item: item(),
+      loadDeliverable: firstLoader,
+    });
+    await screen.findByRole('heading', { name: 'Final report' });
+
+    await rerender({ item: item(), loadDeliverable: secondLoader });
+
+    expect(screen.getByRole('heading', { name: 'Final report' })).toBeInTheDocument();
+    expect(screen.queryByText('Loading deliverable…')).not.toBeInTheDocument();
+    refresh.resolve(deliverable());
+  });
+
+  it('uses measured inline container width for TOC layout', async () => {
+    let triggerResize = (_width: number) => {};
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: ResizeObserverCallback) {
+        triggerResize = (width) => callback(
+          [{ contentRect: { width } } as ResizeObserverEntry],
+          {} as ResizeObserver,
+        );
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    });
+    mocks.getDeliverable.mockResolvedValue(deliverable({
+      content: '# Report\n\n## One\n\nA\n\n## Two\n\nB\n\n## Three\n\nC',
+    }));
+    render(AssistantDeliverableBlock, { item: item(), collapsedByDefault: true });
+    const root = await screen.findByTestId('rich-deliverable');
+    expect(root).toHaveAttribute('data-inline-toc-layout', 'drawer');
+
+    triggerResize(1200);
+    await waitFor(() => expect(root).toHaveAttribute('data-inline-toc-layout', 'sidebar'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
+    expect(root.querySelector('.rich-inline-document')).not.toHaveClass('inline-toc-sidebar');
+    await fireEvent.click(screen.getByRole('button', { name: 'Open table of contents' }));
+    expect(root.querySelector('.rich-inline-document')).toHaveClass('inline-toc-sidebar');
+
+    triggerResize(760);
+    await waitFor(() => expect(root).toHaveAttribute('data-inline-toc-layout', 'drawer'));
+    expect(root.querySelector('.rich-inline-document')).not.toHaveClass('inline-toc-sidebar');
+    vi.unstubAllGlobals();
   });
 });

@@ -109,6 +109,7 @@ class CompactionModelContext(BaseModel):
     model: str | None = None
     provider_id: str | None = None
     reasoning_effort: str | None = None
+    compaction_id: str | None = None
 
 
 def _split_events(
@@ -188,6 +189,9 @@ def _snap_keep_from_to_cycle_boundary(events: list[Any], keep_from: int) -> int:
     keep_from = max(0, min(keep_from, len(events)))
     while keep_from > 0 and not _is_compaction_tail_cycle_boundary(events[keep_from]):
         keep_from -= 1
+    if keep_from < len(events) and getattr(events[keep_from], "type", None) == "tool_call":
+        while keep_from > 0 and getattr(events[keep_from - 1], "type", None) == "tool_call":
+            keep_from -= 1
     return keep_from
 
 
@@ -196,6 +200,10 @@ def _is_compaction_tail_cycle_boundary(event: Any) -> bool:
         "user_message",
         "assistant_message",
         "assistant_thinking",
+        # Preserve the complete tool cycle from its call onward. Without this
+        # boundary, a long single user turn made only of tool events can snap
+        # the tail to index zero and incorrectly make compaction a no-op.
+        "tool_call",
     }
 
 
@@ -526,7 +534,11 @@ class CompactionStrategy:
     ) -> CompactionResult:
         """Generate a compaction summary and optionally record it."""
         entry = self.session_cache.get_entry(session.session_id)
-        if entry is None:
+        if (
+            entry is None
+            or not bool(getattr(entry, "initialized", False))
+            or bool(getattr(entry, "canonical_stale", False))
+        ):
             if not record:
                 return CompactionResult(compacted=False, method="noop")
             entry = await self.session_cache.refresh(session)
@@ -699,6 +711,7 @@ class CompactionStrategy:
             preserved_tail_events=preserved_events,
             method="llm",
             resolved_model=resolved_model,
+            compaction_id=model_context.compaction_id if model_context else None,
         )
 
     async def compact_with_fallback(
@@ -801,6 +814,7 @@ class CompactionStrategy:
             preserved_tail_events=preserved_events,
             method="mechanical_sliding_window",
             resolved_model=resolved_model,
+            compaction_id=model_context.compaction_id if model_context else None,
         )
 
     async def _record_compaction(
@@ -813,6 +827,7 @@ class CompactionStrategy:
         preserved_tail_events: list[Any],
         method: str,
         resolved_model: str | None,
+        compaction_id: str | None,
     ) -> CompactionResult:
         result = self._build_compaction_result(
             session=session,
@@ -831,6 +846,7 @@ class CompactionStrategy:
             type="compaction_summary",
             data={
                 "summary": summary,
+                "compaction_id": compaction_id,
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
                 "turns_compacted": turns_compacted,

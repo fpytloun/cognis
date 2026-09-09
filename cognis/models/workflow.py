@@ -6,7 +6,7 @@ import hashlib
 import json
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
@@ -775,6 +775,15 @@ class WorkflowState(BaseModel):
     ) = None
     pending_pause_payload: dict[str, Any] | None = None
     current_step_status: Literal["running", "paused"] | None = None
+
+    @field_validator("current_step_status", mode="before")
+    @classmethod
+    def _normalize_terminal_current_step_status(cls, value: Any) -> str | None:
+        """Normalize terminal values persisted by older controller versions."""
+
+        if value in {"completed", "failed", "cancelled"}:
+            return None
+        return cast(str | None, value)
 
     @field_validator("last_retry_reason", mode="before")
     @classmethod

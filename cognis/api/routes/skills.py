@@ -486,7 +486,7 @@ async def update_skill_route(
         current_steps = (
             getattr(current_version, "steps", None) if current_version is not None else None
         )
-        comparable_asset_inputs = _canonical_asset_inputs(asset_inputs)
+        comparable_asset_inputs = _canonical_asset_inputs(asset_inputs or [])
         current_asset_inputs = _canonical_asset_inputs(asset_refs_to_inputs(current_assets))
         current_source_hash = compute_decomposition_source_hash(
             instructions,
@@ -708,7 +708,9 @@ async def patch_skill_route(
         current_assets = await load_skill_asset_refs(session, current)
         try:
             instructions = (
-                body.instructions if "instructions" in mutations else current.instructions
+                body.instructions
+                if "instructions" in mutations and body.instructions is not None
+                else current.instructions
             )
             tools = _coerce_tools_list(current.tools)
             if body.tools is not None:
@@ -921,6 +923,18 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             if current_version is not None
             else []
         )
+        raw_default_tags = defaults.get("tags")
+        default_tags = (
+            [item for item in raw_default_tags if isinstance(item, str)]
+            if isinstance(raw_default_tags, list)
+            else []
+        )
+        raw_default_steps = defaults.get("steps")
+        default_steps = (
+            [item for item in raw_default_steps if isinstance(item, dict)]
+            if isinstance(raw_default_steps, list)
+            else None
+        )
         if (
             row.name == str(defaults["name"])
             and row.description
@@ -933,7 +947,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
             and current_templates == normalize_prompt_templates(defaults.get("prompt_templates"))
             and (current_steps or []) == (defaults.get("steps") or [])
             and current_decomposition_hash == expected_decomposition_hash
-            and (row.tags or []) == list(defaults["tags"])
+            and (row.tags or []) == default_tags
             and row.auto_load == bool(defaults.get("auto_load", False))
             and not current_assets
         ):
@@ -950,7 +964,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 tools=normalize_skill_tools(defaults.get("tools")),
                 linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")),
                 prompt_templates=normalize_prompt_templates(defaults.get("prompt_templates")),
-                tags=list(defaults["tags"]),
+                tags=default_tags,
                 auto_load=bool(defaults.get("auto_load", False)),
             )
         except ValueError as exc:
@@ -968,7 +982,7 @@ async def reset_skill_route(request: Request, skill_id: str) -> SkillResponse:
                 linked_tool_ids=normalize_linked_tool_ids(defaults.get("linked_tool_ids")) or [],
                 prompt_templates=row.prompt_templates,
                 secret_placeholders=None,
-                steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+                steps=default_steps,
                 assets=None,
                 allow_binary_assets=True,
             )
@@ -1163,7 +1177,14 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
         prompt_templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         secret_placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
         steps = normalize_skill_steps(skill_data.get("steps"))
-        tags = body.tags or skill_data.get("tags") or []
+        raw_tags = body.tags or skill_data.get("tags") or []
+        tags = (
+            [item for item in raw_tags if isinstance(item, str)]
+            if isinstance(raw_tags, list)
+            else []
+        )
+        raw_description = skill_data.get("description")
+        description = raw_description if isinstance(raw_description, str) else None
         assets = skill_data.get("assets")
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc
@@ -1172,7 +1193,7 @@ async def import_skill_route(request: Request, body: SkillImportRequest) -> Skil
         row = await create_skill(
             session,
             name=name,
-            description=skill_data.get("description"),
+            description=description,
             instructions=instructions,
             tools=tools,
             linked_tool_ids=linked_tool_ids,
@@ -1275,24 +1296,24 @@ async def export_skill_route(
     warnings = _export_warnings(format, export_data)
 
     if format == "cognis_package":
-        content = export_cognis_package(export_data, asset_bytes)
+        package_content = export_cognis_package(export_data, asset_bytes)
         safe_name = row.name.lower().replace(" ", "-")
         return SkillExportResponse(
             format=format,
-            content_b64=base64.b64encode(content).decode("ascii"),
+            content_b64=base64.b64encode(package_content).decode("ascii"),
             content_type="application/zip",
             filename=f"{safe_name}.cognis-skill.zip",
             warnings=warnings,
         )
     if format == "cognis_yaml":
-        content = export_cognis_yaml(export_data)
+        text_content = export_cognis_yaml(export_data)
         filename = f"{row.name.lower().replace(' ', '-')}.yaml"
     else:
-        content = export_skill_md(export_data)
+        text_content = export_skill_md(export_data)
         filename = "SKILL.md"
     return SkillExportResponse(
         format=format,
-        content=content,
+        content=text_content,
         content_type="text/plain; charset=utf-8",
         filename=filename,
         warnings=warnings,

@@ -24,7 +24,8 @@ from typing import Any
 
 from prometheus_client import Counter, Histogram
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
@@ -38,7 +39,7 @@ from cognis.core.task_execution import (
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.models import NotificationRow, Task
+from cognis.store.models import DirectTurnRequestRow, NotificationRow, Schedule, Task
 from cognis.store.queries import (
     get_agent_direct_conversation,
     get_latest_active_conversation_for_agent,
@@ -52,6 +53,11 @@ logger = get_logger(__name__)
 
 _ACTIVE_TASK_STATUSES = {"queued", "ready", "running", "paused"}
 _RESOLUTION_POLL_SECONDS = 0.5
+_RESOLUTION_CLAIM_SECONDS = 30.0
+_RESOLUTION_COMPLETION_GRACE_SECONDS = 2.0
+_INTARIS_SUBMISSION_TIMEOUT_SECONDS = 25.0
+_INTERACTION_RECORD_TIMEOUT_SECONDS = 2.0
+_CLUSTER_PUBLISH_TIMEOUT_SECONDS = 2.0
 _SENSITIVE_ARGUMENT_KEY_TOKENS = (
     "api_key",
     "authorization",
@@ -65,6 +71,26 @@ _SENSITIVE_ARGUMENT_KEY_TOKENS = (
 _DISPLAY_ARGUMENT_MAX_DEPTH = 4
 _DISPLAY_ARGUMENT_MAX_ITEMS = 50
 _DISPLAY_ARGUMENT_MAX_STRING_LENGTH = 4_000
+
+
+def _safe_schedule_error_summary(value: object) -> str:
+    text = str(value or "Scheduled run failed").splitlines()[0].strip()
+    lowered = text.lower()
+    if any(
+        token in lowered
+        for token in (
+            "api_key",
+            "api key",
+            "password",
+            "secret",
+            "token",
+            "authorization",
+            "bearer ",
+        )
+    ) or ("://" in lowered and "@" in lowered):
+        return "Scheduled run failed"
+    return text[:240] or "Scheduled run failed"
+
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -90,6 +116,12 @@ NOTIFICATION_ESCALATION_SUBMIT_FAILURES = Counter(
     "cognis_notification_escalation_submit_failures_total",
     "Escalation decision submissions to Intaris that failed",
 )
+NOTIFICATION_CREATE_STAGE_DURATION = Histogram(
+    "cognis_notification_create_stage_duration_seconds",
+    "Duration of notification creation stages.",
+    ["type", "stage"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
+)
 # ---------------------------------------------------------------------------
 # Types
 # ---------------------------------------------------------------------------
@@ -101,6 +133,7 @@ class NotificationType(StrEnum):
     STEP_QUESTION = "step_question"
     CREDENTIAL_REQUEST = "credential_request"
     AUTH_CHALLENGE = "auth_challenge"
+    SCHEDULE_ACTION = "schedule_action"
 
 
 class Notification(BaseModel):
@@ -117,8 +150,38 @@ class Notification(BaseModel):
     payload: dict[str, Any] = {}
     status: str = "pending"
     resolution: dict[str, Any] | None = None
+    revision: int = 1
+    expires_at: datetime | None = None
     created_at: datetime | None = None
     resolved_at: datetime | None = None
+
+
+def _managed_origin_conversation_id(
+    payload: dict[str, Any] | None,
+    *,
+    target_conversation_id: str | None = None,
+) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("managed_origin_conversation_id")
+    if not isinstance(value, str) or not value or value == target_conversation_id:
+        return None
+    return value
+
+
+def _notification_visible_in_conversation(
+    row: NotificationRow,
+    conversation_id: str,
+) -> bool:
+    if row.conversation_id == conversation_id:
+        return True
+    return (
+        _managed_origin_conversation_id(
+            row.payload if isinstance(row.payload, dict) else None,
+            target_conversation_id=row.conversation_id,
+        )
+        == conversation_id
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +204,39 @@ class NotificationService:
         self._event_bus = event_bus
         self._providers = providers
         self.cluster_signals: Any = None
+        self._background_tasks: set[asyncio.Task[None]] = set()
+
+    def _run_best_effort(
+        self,
+        awaitable: Awaitable[None],
+        *,
+        operation: str,
+        notification_id: str,
+        timeout: float | None = None,
+    ) -> None:
+        """Run bounded post-commit work without extending the resolve request."""
+
+        async def _runner() -> None:
+            try:
+                if timeout is None:
+                    await awaitable
+                else:
+                    await asyncio.wait_for(awaitable, timeout=timeout)
+            except Exception:
+                logger.warning(
+                    "notification: best-effort completion failed",
+                    extra={
+                        "extra_data": {
+                            "notification_id": notification_id,
+                            "operation": operation,
+                        }
+                    },
+                    exc_info=True,
+                )
+
+        task = asyncio.create_task(_runner(), name=f"notification:{operation}:{notification_id}")
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _publish_cluster_change(
         self,
@@ -170,6 +266,65 @@ class NotificationService:
             revision=f"{revision.isoformat()}:{notification_id}",
         )
 
+    async def _publish_notification_cluster_changes(
+        self,
+        *,
+        conversation_id: str,
+        user_email: str,
+        notification_id: str,
+        task_id: str | None,
+        session_id: str | None,
+        revision: datetime,
+        payload: dict[str, Any] | None,
+    ) -> None:
+        conversation_ids = [conversation_id]
+        origin_conversation_id = _managed_origin_conversation_id(
+            payload,
+            target_conversation_id=conversation_id,
+        )
+        if origin_conversation_id:
+            conversation_ids.append(origin_conversation_id)
+        await asyncio.gather(
+            *(
+                self._publish_cluster_change(
+                    conversation_id=scope_conversation_id,
+                    user_email=user_email,
+                    notification_id=notification_id,
+                    task_id=task_id,
+                    session_id=session_id,
+                    revision=revision,
+                )
+                for scope_conversation_id in conversation_ids
+            )
+        )
+
+    async def _publish_schedule_action_cluster_change(
+        self,
+        *,
+        user_email: str,
+        conversation_id: str,
+        notification_id: str,
+        schedule_id: str,
+        task_id: str | None,
+        revision: datetime,
+    ) -> None:
+        """Invalidate owner-wide schedule action views on remote controllers."""
+        if self.cluster_signals is None:
+            return
+        from cognis.core.cluster_signals import ClusterSignalKind, ClusterSignalScope
+
+        await self.cluster_signals.publish(
+            ClusterSignalKind.SCHEDULE_ACTION_CHANGED,
+            scope=ClusterSignalScope(
+                owner_token=self.cluster_signals.owner_token(user_email),
+                conversation_id=conversation_id,
+                schedule_id=schedule_id,
+                task_id=task_id,
+                notification_id=notification_id,
+            ),
+            revision=f"{revision.isoformat()}:{notification_id}",
+        )
+
     # ------------------------------------------------------------------
     # Target resolution
     # ------------------------------------------------------------------
@@ -180,6 +335,9 @@ class NotificationService:
         self,
         task_id: str | None,
         conversation_id: str | None,
+        *,
+        session_id: str | None = None,
+        user_email: str | None = None,
     ) -> str | None:
         """Resolve the user-facing conversation for a notification.
 
@@ -188,19 +346,32 @@ class NotificationService:
         delivery.  This ensures escalations, gates, and step questions
         from scheduled tasks reach the user via the configured channel.
 
-        For managed-conversation notifications (no task_id), the target
-        is walked up the ``ManagedConversationLink`` chain until a
-        conversation with no open link is found (i.e. the channel-bound
-        parent).  This covers the delegate → managed conv → parent conv
-        chain: delegate child sessions share the managed conversation's
-        conversation_id, so a single link hop already covers two levels.
+        For non-task child-session notifications, the target first follows
+        ``Session.parent_session_id`` to the root session's conversation.
+        This remains correct when a delegated child has a distinct
+        conversation_id.
+
+        The target is then walked up the ``ManagedConversationLink`` chain
+        until a conversation with no open link is found (i.e. the
+        channel-bound parent).  This covers the delegate → managed conv →
+        parent conv chain.
         Up to ``_MANAGED_LINK_HOP_CAP`` hops are followed to handle
         nested managed conversations; a visited-set prevents cycles.
 
         For direct-chat notifications, the conversation_id is used as-is.
         """
         if not task_id:
-            return await self._resolve_managed_conversation_chain(conversation_id)
+            managed_conversation_id = await self._resolve_managed_conversation_chain(
+                conversation_id
+            )
+            if managed_conversation_id != conversation_id:
+                return managed_conversation_id
+            session_conversation_id = await self._resolve_parent_session_conversation(
+                session_id=session_id,
+                user_email=user_email,
+                fallback_conversation_id=conversation_id,
+            )
+            return await self._resolve_managed_conversation_chain(session_conversation_id)
 
         async with self._session_factory() as db:
             task_row = await get_task(db, task_id)
@@ -210,8 +381,9 @@ class NotificationService:
             delivery_mode = task_row.delivery_mode or "same_conversation"
 
             if delivery_mode == "same_conversation":
-                # For chat-created tasks, source_ref is the originating conversation
-                if task_row.source_type == "chat" and task_row.source_ref:
+                # Agent-created tasks also store the originating conversation
+                # in source_ref. Keep interactive prompts on that conversation.
+                if task_row.source_type in {"chat", "agent"} and task_row.source_ref:
                     return task_row.source_ref
                 return conversation_id
 
@@ -253,6 +425,40 @@ class NotificationService:
 
         return conversation_id
 
+    async def _resolve_parent_session_conversation(
+        self,
+        *,
+        session_id: str | None,
+        user_email: str | None,
+        fallback_conversation_id: str | None,
+    ) -> str | None:
+        """Resolve a delegated session lineage to its root conversation."""
+        if not session_id:
+            return fallback_conversation_id
+
+        candidate_session_id = session_id
+        candidate_conversation_id = fallback_conversation_id
+        visited: set[str] = set()
+        for _ in range(self._MANAGED_LINK_HOP_CAP):
+            if candidate_session_id in visited:
+                logger.warning(
+                    "notification: parent session cycle detected",
+                    extra={"extra_data": {"session_id": session_id}},
+                )
+                break
+            visited.add(candidate_session_id)
+            async with self._session_factory() as db:
+                session_row = await get_session_row(db, candidate_session_id)
+            if session_row is None or (
+                user_email is not None and session_row.user_email != user_email
+            ):
+                break
+            candidate_conversation_id = session_row.conversation_id
+            if not session_row.parent_session_id:
+                break
+            candidate_session_id = session_row.parent_session_id
+        return candidate_conversation_id
+
     async def _resolve_managed_conversation_chain(
         self,
         conversation_id: str | None,
@@ -287,6 +493,9 @@ class NotificationService:
     async def resolve_managed_origin_metadata(
         self,
         conversation_id: str,
+        *,
+        session_id: str | None = None,
+        user_email: str | None = None,
     ) -> dict[str, Any]:
         """Return managed-origin metadata for a notification payload.
 
@@ -295,11 +504,25 @@ class NotificationService:
         from the first link hop.  Returns an empty dict when the
         conversation is not a managed target.
         """
+        origin_conversation_id = conversation_id
         async with self._session_factory() as db:
-            link = await get_managed_conversation_link_for_target(db, conversation_id)
+            link = await get_managed_conversation_link_for_target(db, origin_conversation_id)
+        if link is None:
+            origin_conversation_id = (
+                await self._resolve_parent_session_conversation(
+                    session_id=session_id,
+                    user_email=user_email,
+                    fallback_conversation_id=conversation_id,
+                )
+                or conversation_id
+            )
+            async with self._session_factory() as db:
+                link = await get_managed_conversation_link_for_target(db, origin_conversation_id)
         if link is None:
             return {}
         return {
+            "managed_origin_conversation_id": origin_conversation_id,
+            "managed_link_id": link.link_id,
             "managed_conversation_title": link.title or "",
             "managed_target_agent_id": link.target_agent_id or "",
         }
@@ -307,6 +530,458 @@ class NotificationService:
     # ------------------------------------------------------------------
     # Create
     # ------------------------------------------------------------------
+
+    async def upsert_schedule_action(
+        self,
+        *,
+        schedule_id: str,
+        user_email: str,
+        agent_id: str,
+        schedule_name: str,
+        consecutive_errors: int,
+        error_summary: str,
+        auto_disabled: bool,
+        task_id: str | None = None,
+        reopen_resolved: bool = True,
+    ) -> Notification | None:
+        """Create or update the single actionable notification for a schedule."""
+        notification_id = f"notif_schedule_{schedule_id}"
+        now = datetime.now(UTC)
+        async with self._session_factory() as db:
+            schedule = (
+                await db.execute(
+                    select(Schedule).where(Schedule.schedule_id == schedule_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                schedule is None
+                or schedule.created_by != user_email
+                or schedule.agent_id != agent_id
+                or int(schedule.consecutive_errors or 0) != consecutive_errors
+            ):
+                return None
+            canonical_auto_disabled = not schedule.enabled and str(
+                schedule.disabled_reason or ""
+            ).startswith("auto_consecutive_failures:")
+            if auto_disabled != canonical_auto_disabled:
+                return None
+            if not canonical_auto_disabled and schedule.last_run_status != "failed":
+                return None
+            if not schedule.enabled and not canonical_auto_disabled:
+                return None
+            if schedule.last_terminal_task_id != task_id:
+                return None
+
+            conversation = await get_latest_active_conversation_for_agent(db, user_email, agent_id)
+            if conversation is None:
+                conversation = await get_agent_direct_conversation(db, user_email, agent_id)
+            conversation_id = (
+                conversation.conversation_id
+                if conversation is not None
+                else f"schedule:{schedule_id}"
+            )
+            payload = {
+                "schedule_id": schedule_id,
+                "schedule_name": schedule_name,
+                "severity": "critical" if auto_disabled else "warning",
+                "consecutive_errors": consecutive_errors,
+                "error_summary": _safe_schedule_error_summary(error_summary),
+                "latest_error_at": now.isoformat(),
+                "auto_disabled": auto_disabled,
+                "action_url": f"/schedules/{schedule_id}",
+                "message": (
+                    f'Schedule "{schedule_name}" was automatically disabled.'
+                    if auto_disabled
+                    else f'Schedule "{schedule_name}" failed.'
+                ),
+            }
+            inserted = False
+            row = (
+                await db.execute(
+                    select(NotificationRow)
+                    .where(NotificationRow.notification_id == notification_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is None:
+                row = NotificationRow(
+                    notification_id=notification_id,
+                    notification_type=NotificationType.SCHEDULE_ACTION,
+                    user_email=user_email,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    payload=payload,
+                    status="pending",
+                    created_at=now,
+                )
+                db.add(row)
+                try:
+                    await db.commit()
+                except IntegrityError:
+                    await db.rollback()
+                    row = (
+                        await db.execute(
+                            select(NotificationRow)
+                            .where(NotificationRow.notification_id == notification_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if row is None:
+                        raise
+                else:
+                    inserted = True
+                    NOTIFICATIONS_CREATED.labels(type=NotificationType.SCHEDULE_ACTION).inc()
+            if row.user_email != user_email:
+                raise ValueError("Schedule notification owner mismatch")
+            existing_payload = dict(row.payload or {})
+            from cognis.api.dashboard_issues import schedule_incident_token
+
+            incident_token = schedule_incident_token(
+                schedule_id,
+                task_id,
+                schedule.last_fired_at,
+            )
+            payload["incident_token"] = incident_token
+            if (
+                not inserted
+                and row.status == "resolved"
+                and existing_payload.get("incident_token") == incident_token
+            ):
+                return Notification(
+                    notification_id=notification_id,
+                    notification_type=NotificationType.SCHEDULE_ACTION,
+                    user_email=user_email,
+                    conversation_id=row.conversation_id,
+                    task_id=row.task_id,
+                    payload=existing_payload,
+                    status="resolved",
+                    resolution=row.resolution,
+                    created_at=row.created_at,
+                    resolved_at=row.resolved_at,
+                )
+            if (
+                not inserted
+                and row.status == "resolved"
+                and not reopen_resolved
+                and (
+                    existing_payload.get("incident_token") is None
+                    or (task_id is None and schedule.last_fired_at is None)
+                )
+            ):
+                return Notification(
+                    notification_id=notification_id,
+                    notification_type=NotificationType.SCHEDULE_ACTION,
+                    user_email=user_email,
+                    conversation_id=row.conversation_id,
+                    task_id=row.task_id,
+                    payload=existing_payload,
+                    status="resolved",
+                    resolution=row.resolution,
+                    created_at=row.created_at,
+                    resolved_at=row.resolved_at,
+                )
+            if (
+                not inserted
+                and row.status == "pending"
+                and existing_payload.get("auto_disabled") is True
+            ):
+                payload["auto_disabled"] = True
+                payload["severity"] = "critical"
+                payload["consecutive_errors"] = max(
+                    int(existing_payload.get("consecutive_errors") or 0),
+                    consecutive_errors,
+                )
+            if not inserted:
+                row.conversation_id = conversation_id
+                row.task_id = task_id
+                row.payload = payload
+                row.status = "pending"
+                row.resolution = None
+                row.resolved_at = None
+                await db.commit()
+
+        event_data = {
+            "notification_id": notification_id,
+            "notification_type": NotificationType.SCHEDULE_ACTION,
+            "user_email": user_email,
+            "conversation_id": conversation_id,
+            "task_id": task_id,
+            "payload": payload,
+        }
+        await self._event_bus.publish(
+            Event(type=EventType.SCHEDULE_ACTION_CHANGED, data={**event_data, "status": "pending"})
+        )
+        await self._publish_notification_cluster_changes(
+            conversation_id=conversation_id,
+            user_email=user_email,
+            notification_id=notification_id,
+            task_id=task_id,
+            session_id=None,
+            revision=now,
+            payload=payload,
+        )
+        await self._publish_schedule_action_cluster_change(
+            user_email=user_email,
+            conversation_id=conversation_id,
+            notification_id=notification_id,
+            schedule_id=schedule_id,
+            task_id=task_id,
+            revision=now,
+        )
+        return Notification(
+            notification_id=notification_id,
+            notification_type=NotificationType.SCHEDULE_ACTION,
+            user_email=user_email,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            payload=payload,
+            status="pending",
+            created_at=now,
+        )
+
+    async def dismiss_schedule_action(
+        self,
+        schedule_id: str,
+        *,
+        user_email: str,
+        incident_token: str,
+    ) -> str:
+        """Dismiss the current schedule incident with compare-and-set semantics."""
+        from cognis.api.dashboard_issues import schedule_incident_token
+
+        notification_id = f"notif_schedule_{schedule_id}"
+        now = datetime.now(UTC)
+        async with self._session_factory() as db:
+            schedule = (
+                await db.execute(
+                    select(Schedule).where(Schedule.schedule_id == schedule_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if schedule is None or schedule.created_by != user_email:
+                return "not_found"
+            current_token = schedule_incident_token(
+                schedule_id,
+                schedule.last_terminal_task_id,
+                schedule.last_fired_at,
+            )
+            if incident_token != current_token:
+                return "stale"
+            row = (
+                await db.execute(
+                    select(NotificationRow)
+                    .where(NotificationRow.notification_id == notification_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if row is not None and row.user_email != user_email:
+                return "not_found"
+            if row is not None and row.status == "resolved":
+                resolved_token = (row.payload or {}).get("incident_token")
+                return "dismissed" if resolved_token == current_token else "stale"
+            if row is None:
+                conversation = await get_latest_active_conversation_for_agent(
+                    db, user_email, schedule.agent_id
+                )
+                if conversation is None:
+                    conversation = await get_agent_direct_conversation(
+                        db, user_email, schedule.agent_id
+                    )
+                row = NotificationRow(
+                    notification_id=notification_id,
+                    notification_type=NotificationType.SCHEDULE_ACTION,
+                    user_email=user_email,
+                    conversation_id=(
+                        conversation.conversation_id
+                        if conversation is not None
+                        else f"schedule:{schedule_id}"
+                    ),
+                    task_id=schedule.last_terminal_task_id,
+                    payload={
+                        "schedule_id": schedule_id,
+                        "schedule_name": schedule.name,
+                        "incident_token": current_token,
+                        "action_url": f"/schedules/{schedule_id}",
+                    },
+                    status="resolved",
+                    resolution={"decision": "dismissed", "reason": "user_dismissed"},
+                    created_at=now,
+                    resolved_at=now,
+                )
+                db.add(row)
+            else:
+                payload = dict(row.payload or {})
+                if payload.get("incident_token") not in {None, current_token}:
+                    return "stale"
+                payload["incident_token"] = current_token
+                row.payload = payload
+                row.status = "resolved"
+                row.resolution = {"decision": "dismissed", "reason": "user_dismissed"}
+                row.resolved_at = now
+            await db.commit()
+            conversation_id = row.conversation_id
+            task_id = row.task_id
+            payload = dict(row.payload or {})
+        await self._event_bus.publish(
+            Event(
+                type=EventType.SCHEDULE_ACTION_CHANGED,
+                data={
+                    "notification_id": notification_id,
+                    "notification_type": NotificationType.SCHEDULE_ACTION,
+                    "user_email": user_email,
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                    "payload": payload,
+                    "decision": "dismissed",
+                    "status": "resolved",
+                },
+            )
+        )
+        await self._publish_notification_cluster_changes(
+            conversation_id=conversation_id,
+            user_email=user_email,
+            notification_id=notification_id,
+            task_id=task_id,
+            session_id=None,
+            revision=now,
+            payload=payload,
+        )
+        await self._publish_schedule_action_cluster_change(
+            user_email=user_email,
+            conversation_id=conversation_id,
+            notification_id=notification_id,
+            schedule_id=schedule_id,
+            task_id=task_id,
+            revision=now,
+        )
+        return "dismissed"
+
+    async def resolve_schedule_action(
+        self,
+        schedule_id: str,
+        *,
+        user_email: str,
+        reason: str,
+        expected_terminal_task_id: str | None = None,
+        require_canonical_success: bool = False,
+    ) -> bool:
+        """Resolve a schedule notification after recovery or decommissioning."""
+        notification_id = f"notif_schedule_{schedule_id}"
+        now = datetime.now(UTC)
+        async with self._session_factory() as db:
+            if require_canonical_success:
+                schedule = (
+                    await db.execute(
+                        select(Schedule)
+                        .where(Schedule.schedule_id == schedule_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    schedule is None
+                    or schedule.created_by != user_email
+                    or schedule.last_run_status != "success"
+                    or not schedule.enabled
+                    or str(schedule.disabled_reason or "").startswith("auto_consecutive_failures:")
+                    or schedule.last_terminal_task_id != expected_terminal_task_id
+                ):
+                    return False
+            row = await db.get(NotificationRow, notification_id)
+            if row is None or row.user_email != user_email:
+                return False
+            conversation_id = row.conversation_id
+            task_id = row.task_id
+            payload = dict(row.payload or {})
+            result = await db.execute(
+                update(NotificationRow)
+                .where(
+                    NotificationRow.notification_id == notification_id,
+                    NotificationRow.user_email == user_email,
+                    NotificationRow.status == "pending",
+                )
+                .values(
+                    status="resolved",
+                    resolution={"decision": "resolved", "reason": reason},
+                    resolved_at=now,
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                await db.rollback()
+                return False
+            await db.commit()
+        await self._event_bus.publish(
+            Event(
+                type=EventType.SCHEDULE_ACTION_CHANGED,
+                data={
+                    "notification_id": notification_id,
+                    "notification_type": NotificationType.SCHEDULE_ACTION,
+                    "user_email": user_email,
+                    "conversation_id": conversation_id,
+                    "task_id": task_id,
+                    "payload": payload,
+                    "decision": "resolved",
+                    "status": "resolved",
+                },
+            )
+        )
+        await self._publish_notification_cluster_changes(
+            conversation_id=conversation_id,
+            user_email=user_email,
+            notification_id=notification_id,
+            task_id=task_id,
+            session_id=None,
+            revision=now,
+            payload=payload,
+        )
+        await self._publish_schedule_action_cluster_change(
+            user_email=user_email,
+            conversation_id=conversation_id,
+            notification_id=notification_id,
+            schedule_id=schedule_id,
+            task_id=task_id,
+            revision=now,
+        )
+        NOTIFICATIONS_RESOLVED.labels(
+            type=NotificationType.SCHEDULE_ACTION, decision="resolved"
+        ).inc()
+        return True
+
+    async def reconcile_schedule_actions(self, *, limit: int = 500) -> int:
+        """Recreate notifications from durable actionable schedule state."""
+        async with self._session_factory() as db:
+            rows = list(
+                (
+                    await db.scalars(
+                        select(Schedule)
+                        .where(
+                            or_(
+                                and_(
+                                    Schedule.last_run_status == "failed",
+                                    Schedule.enabled.is_(True),
+                                ),
+                                Schedule.disabled_reason.like("auto_consecutive_failures:%"),
+                            ),
+                        )
+                        .order_by(Schedule.updated_at.desc(), Schedule.schedule_id)
+                        .limit(limit)
+                    )
+                ).all()
+            )
+        for row in rows:
+            await self.upsert_schedule_action(
+                schedule_id=row.schedule_id,
+                user_email=row.created_by,
+                agent_id=row.agent_id,
+                schedule_name=row.name,
+                consecutive_errors=int(row.consecutive_errors or 0),
+                error_summary="Scheduled run failed",
+                auto_disabled=(
+                    not row.enabled
+                    and str(row.disabled_reason or "").startswith("auto_consecutive_failures:")
+                ),
+                task_id=row.last_terminal_task_id,
+                reopen_resolved=False,
+            )
+        return len(rows)
 
     async def create(
         self,
@@ -335,7 +1010,12 @@ class NotificationService:
         # Resolve target conversation (task source for task-originated;
         # managed-conversation chain for non-task notifications).
         resolved_conversation_id = (
-            await self.resolve_target_conversation(task_id, conversation_id)
+            await self.resolve_target_conversation(
+                task_id,
+                conversation_id,
+                session_id=session_id,
+                user_email=user_email,
+            )
         ) or conversation_id
 
         # When the notification originated inside a managed sub-conversation
@@ -343,9 +1023,18 @@ class NotificationService:
         # origin metadata so channel renderers can surface the context.
         enriched_payload = dict(payload or {})
         if resolved_conversation_id != conversation_id and not task_id:
-            origin_meta = await self.resolve_managed_origin_metadata(conversation_id)
+            origin_meta = await self.resolve_managed_origin_metadata(
+                conversation_id,
+                session_id=session_id,
+                user_email=user_email,
+            )
             if origin_meta:
                 enriched_payload = {**enriched_payload, **origin_meta}
+        expires_at = _notification_payload_expires_at(
+            notification_type,
+            enriched_payload,
+            created_at=now,
+        )
 
         notification = Notification(
             notification_id=nid,
@@ -358,10 +1047,14 @@ class NotificationService:
             session_id=session_id,
             payload=enriched_payload,
             status="pending",
+            revision=1,
+            expires_at=expires_at,
             created_at=now,
         )
 
-        # Persist to DB
+        # Persist before any delivery so every observer can recover from the
+        # durable notification row.
+        commit_started = monotonic()
         async with self._session_factory() as db:
             db.add(
                 NotificationRow(
@@ -375,70 +1068,110 @@ class NotificationService:
                     session_id=session_id,
                     payload=enriched_payload,
                     status="pending",
+                    revision=1,
+                    expires_at=expires_at,
                     created_at=now,
                 )
             )
             await db.commit()
-        await self._publish_cluster_change(
-            conversation_id=resolved_conversation_id,
-            user_email=user_email,
-            notification_id=nid,
-            task_id=task_id,
-            session_id=session_id,
-            revision=now,
-        )
+        NOTIFICATION_CREATE_STAGE_DURATION.labels(
+            type=notification_type,
+            stage="commit",
+        ).observe(monotonic() - commit_started)
 
-        # Register PauseWaiter so the blocking coroutine can be resolved
-        pause_context = (
-            enriched_payload.get("context")
-            if isinstance(enriched_payload.get("context"), dict)
-            else None
-        )
-        if pause_context is None and notification_type == NotificationType.ESCALATION:
-            pause_context = {
-                "call_id": enriched_payload.get("call_id"),
-                "tool_name": enriched_payload.get("tool_name"),
-                "risk": enriched_payload.get("risk"),
-                "reasoning": enriched_payload.get("reasoning"),
-                "timeout_seconds": enriched_payload.get("timeout_seconds"),
-            }
-        self._pause_waiter.register(
-            PendingPause(
-                pause_id=nid,
-                pause_type=notification_type,
-                task_id=task_id,
-                step_name=step_name,
-                step_run_id=step_run_id,
-                session_id=session_id,
+        self._run_best_effort(
+            self._publish_notification_cluster_changes(
                 conversation_id=resolved_conversation_id,
-                question=enriched_payload.get("message") or enriched_payload.get("question"),
-                options=enriched_payload.get("options")
-                if isinstance(enriched_payload.get("options"), list)
-                else None,
-                questions=normalize_questions(enriched_payload.get("questions"))
-                if enriched_payload.get("questions") is not None
-                else None,
-                context=pause_context if isinstance(pause_context, dict) else None,
-            )
+                user_email=user_email,
+                notification_id=nid,
+                task_id=task_id,
+                session_id=session_id,
+                revision=now,
+                payload=enriched_payload,
+            ),
+            operation="create_cluster_publish",
+            notification_id=nid,
+            timeout=3.0,
         )
 
-        # Publish to EventBus for real-time WebSocket delivery unless the
-        # caller explicitly requested persist-only silent delivery.
-        if not suppress_event:
-            await self._event_bus.publish(
-                Event(
-                    type=EventType.NOTIFICATION_CREATED,
-                    data={
-                        "notification_id": nid,
-                        "notification_type": notification_type,
-                        "user_email": user_email,
-                        "conversation_id": resolved_conversation_id,
-                        "task_id": task_id,
-                        "step_name": step_name,
-                        "session_id": session_id,
-                        "payload": enriched_payload,
-                    },
+        if not _is_callback_only_notification(notification_type, enriched_payload):
+            # Register PauseWaiter so the blocking coroutine can be resolved.
+            pause_context = (
+                enriched_payload.get("context")
+                if isinstance(enriched_payload.get("context"), dict)
+                else None
+            )
+            if pause_context is None and notification_type == NotificationType.ESCALATION:
+                pause_context = {
+                    "call_id": enriched_payload.get("call_id"),
+                    "tool_name": enriched_payload.get("tool_name"),
+                    "risk": enriched_payload.get("risk"),
+                    "reasoning": enriched_payload.get("reasoning"),
+                    "timeout_seconds": enriched_payload.get("timeout_seconds"),
+                }
+            self._pause_waiter.register(
+                PendingPause(
+                    pause_id=nid,
+                    pause_type=notification_type,
+                    task_id=task_id,
+                    step_name=step_name,
+                    step_run_id=step_run_id,
+                    session_id=session_id,
+                    conversation_id=resolved_conversation_id,
+                    question=enriched_payload.get("message") or enriched_payload.get("question"),
+                    options=enriched_payload.get("options")
+                    if isinstance(enriched_payload.get("options"), list)
+                    else None,
+                    questions=normalize_questions(enriched_payload.get("questions"))
+                    if enriched_payload.get("questions") is not None
+                    else None,
+                    context=pause_context if isinstance(pause_context, dict) else None,
                 )
+            )
+            # A remote controller can resolve the durable row between the commit
+            # and local waiter registration. Replay that terminal state locally so
+            # the owner does not wait for the next polling interval.
+            registered_row = None
+            async with self._session_factory() as db:
+                get_row = getattr(db, "get", None)
+                if callable(get_row):
+                    registered_row = await get_row(NotificationRow, nid)
+            if (
+                registered_row is not None
+                and registered_row.status == "resolved"
+                and isinstance(registered_row.resolution, dict)
+            ):
+                self._pause_waiter.resolve(
+                    nid,
+                    PauseResolution(
+                        decision=str(registered_row.resolution.get("decision") or "deny"),
+                        data=_resolution_waiter_data(registered_row.resolution, {}),
+                    ),
+                )
+
+        # Local delivery and HA invalidation are independent post-commit work.
+        # A slow PostgreSQL NOTIFY or unrelated EventBus subscriber must not
+        # delay waiter registration or the caller entering the pause.
+        if not suppress_event:
+            self._run_best_effort(
+                self._event_bus.publish(
+                    Event(
+                        type=EventType.NOTIFICATION_CREATED,
+                        data={
+                            "notification_id": nid,
+                            "notification_type": notification_type,
+                            "user_email": user_email,
+                            "conversation_id": resolved_conversation_id,
+                            "task_id": task_id,
+                            "step_name": step_name,
+                            "session_id": session_id,
+                            "payload": enriched_payload,
+                        },
+                    )
+                ),
+                operation="create_local_event",
+                notification_id=nid,
+                timeout=3.0,
             )
 
         NOTIFICATIONS_CREATED.labels(type=notification_type).inc()
@@ -471,6 +1204,8 @@ class NotificationService:
         *,
         user_email: str | None = None,
         admission_guard: Callable[[Any], Awaitable[bool]] | None = None,
+        expected_revision: int | None = None,
+        data_factory: Callable[[], Awaitable[dict[str, Any]]] | None = None,
     ) -> bool:
         """Resolve a notification, update DB, resolve PauseWaiter.
 
@@ -483,6 +1218,10 @@ class NotificationService:
         """
         resolution_data = data or {}
         now = datetime.now(UTC)
+        claim_token = f"resolve_{uuid.uuid4().hex}"
+        claim_revision = 0
+        owns_claim = False
+        waits_for_existing_claim = False
 
         async with self._session_factory() as db:
             if admission_guard is not None and not await admission_guard(db):
@@ -495,7 +1234,9 @@ class NotificationService:
                     extra={"extra_data": {"notification_id": notification_id}},
                 )
                 return False
-            if row.status != "pending":
+            if user_email is not None and row.user_email != user_email:
+                return False
+            if row.status == "resolved":
                 if _is_same_resolution(row, decision, resolution_data):
                     waiter_ok = self._pause_waiter.resolve(
                         notification_id,
@@ -526,6 +1267,103 @@ class NotificationService:
                     },
                 )
                 return False
+            row_revision = _notification_revision(row)
+            current_resolution = row.resolution if isinstance(row.resolution, dict) else {}
+            same_inflight_request = row.status == "resolving" and _resolution_claim_matches(
+                current_resolution, decision, resolution_data
+            )
+            if (
+                expected_revision is not None
+                and row_revision != expected_revision
+                and not same_inflight_request
+            ):
+                return False
+            if row.status == "resolving":
+                existing = row.resolution if isinstance(row.resolution, dict) else {}
+                if str(existing.get("decision") or "").lower() != decision.lower():
+                    return False
+                claimed_at = row.resolved_at
+                if claimed_at is not None:
+                    claimed_at = (
+                        claimed_at
+                        if claimed_at.tzinfo is not None
+                        else claimed_at.replace(tzinfo=UTC)
+                    )
+                if (
+                    claimed_at is None
+                    or (now - claimed_at).total_seconds() < _RESOLUTION_CLAIM_SECONDS
+                ):
+                    if not _resolution_claim_matches(existing, decision, resolution_data):
+                        return False
+                    waits_for_existing_claim = True
+                else:
+                    result = await db.execute(
+                        update(NotificationRow)
+                        .where(
+                            NotificationRow.notification_id == notification_id,
+                            NotificationRow.status == "resolving",
+                            NotificationRow.resolved_at == row.resolved_at,
+                            NotificationRow.revision == row_revision,
+                        )
+                        .values(
+                            resolution={
+                                "decision": decision,
+                                "state": "submitting",
+                                "claim_token": claim_token,
+                                **resolution_data,
+                            },
+                            resolved_at=now,
+                            revision=row_revision + 1,
+                        )
+                    )
+                    await db.commit()
+                    owns_claim = _claim_update_succeeded(
+                        result,
+                        row=row,
+                        claim_token=claim_token,
+                    )
+                    if not owns_claim:
+                        return False
+                    claim_revision = row_revision + 1
+            elif row.status == "pending":
+                result = await db.execute(
+                    update(NotificationRow)
+                    .where(
+                        NotificationRow.notification_id == notification_id,
+                        NotificationRow.status == "pending",
+                        NotificationRow.revision == row_revision,
+                    )
+                    .values(
+                        status="resolving",
+                        resolution={
+                            "decision": decision,
+                            "state": "submitting",
+                            "claim_token": claim_token,
+                            **resolution_data,
+                        },
+                        resolved_at=now,
+                        revision=row_revision + 1,
+                    )
+                )
+                await db.commit()
+                owns_claim = _claim_update_succeeded(
+                    result,
+                    row=row,
+                    claim_token=claim_token,
+                )
+                if not owns_claim:
+                    return await self.resolve(
+                        notification_id,
+                        decision,
+                        resolution_data,
+                        user_email=user_email,
+                        admission_guard=admission_guard,
+                        expected_revision=expected_revision,
+                        data_factory=data_factory,
+                    )
+                claim_revision = row_revision + 1
+            else:
+                return False
 
             notification_type = row.notification_type
             created_at = row.created_at
@@ -535,13 +1373,95 @@ class NotificationService:
             step_name = row.step_name
             session_id = row.session_id
             notification_payload = dict(row.payload) if isinstance(row.payload, dict) else {}
-        if notification_type == NotificationType.ESCALATION:
+        if waits_for_existing_claim:
+            return await self._wait_for_existing_resolution_claim(
+                notification_id,
+                decision,
+                resolution_data,
+                user_email=user_email,
+                admission_guard=admission_guard,
+            )
+        if data_factory is not None and owns_claim:
+            heartbeat_stop = asyncio.Event()
+
+            async def _refresh_claim() -> None:
+                interval = max(1.0, _RESOLUTION_CLAIM_SECONDS / 3)
+                while not heartbeat_stop.is_set():
+                    try:
+                        await asyncio.wait_for(heartbeat_stop.wait(), timeout=interval)
+                        return
+                    except TimeoutError:
+                        pass
+                    async with self._session_factory() as heartbeat_db:
+                        heartbeat_result = await heartbeat_db.execute(
+                            update(NotificationRow)
+                            .where(
+                                NotificationRow.notification_id == notification_id,
+                                NotificationRow.status == "resolving",
+                                NotificationRow.revision == claim_revision,
+                            )
+                            .values(resolved_at=datetime.now(UTC))
+                        )
+                        await heartbeat_db.commit()
+                        if not int(getattr(heartbeat_result, "rowcount", 0) or 0):
+                            return
+
+            heartbeat_task = asyncio.create_task(_refresh_claim())
+            try:
+                generated_data = await data_factory()
+            except Exception:
+                async with self._session_factory() as db:
+                    await db.execute(
+                        update(NotificationRow)
+                        .where(
+                            NotificationRow.notification_id == notification_id,
+                            NotificationRow.status == "resolving",
+                            NotificationRow.revision == claim_revision,
+                        )
+                        .values(
+                            status="pending",
+                            resolution=None,
+                            resolved_at=None,
+                            revision=claim_revision + 1,
+                        )
+                    )
+                    await db.commit()
+                raise
+            finally:
+                heartbeat_stop.set()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
+            resolution_data = {**resolution_data, **generated_data}
+            async with self._session_factory() as db:
+                result = await db.execute(
+                    update(NotificationRow)
+                    .where(
+                        NotificationRow.notification_id == notification_id,
+                        NotificationRow.status == "resolving",
+                        NotificationRow.revision == claim_revision,
+                    )
+                    .values(
+                        resolution={
+                            "decision": decision,
+                            "state": "submitting",
+                            "claim_token": claim_token,
+                            **resolution_data,
+                        }
+                    )
+                )
+                await db.commit()
+                if not int(getattr(result, "rowcount", 0) or 0):
+                    return False
+        if notification_type == NotificationType.ESCALATION and owns_claim:
             try:
                 with scoped_runtime_context(user_email=user_email or row_user_email):
-                    await self._providers.guardrails.submit_decision(
-                        notification_id, decision, resolution_data.get("note")
+                    await asyncio.wait_for(
+                        self._providers.guardrails.submit_decision(
+                            notification_id, decision, resolution_data.get("note")
+                        ),
+                        timeout=_INTARIS_SUBMISSION_TIMEOUT_SECONDS,
                     )
-            except Exception:
+            except Exception as exc:
                 NOTIFICATION_ESCALATION_SUBMIT_FAILURES.inc()
                 logger.warning(
                     "notification: escalation decision submit failed",
@@ -550,6 +1470,23 @@ class NotificationService:
                     },
                     exc_info=True,
                 )
+                if not isinstance(exc, TimeoutError):
+                    async with self._session_factory() as db:
+                        await db.execute(
+                            update(NotificationRow)
+                            .where(
+                                NotificationRow.notification_id == notification_id,
+                                NotificationRow.status == "resolving",
+                                NotificationRow.revision == claim_revision,
+                            )
+                            .values(
+                                status="pending",
+                                resolution=None,
+                                resolved_at=None,
+                                revision=claim_revision + 1,
+                            )
+                        )
+                        await db.commit()
                 return False
 
         async with self._session_factory() as db:
@@ -557,7 +1494,7 @@ class NotificationService:
                 await db.rollback()
                 return False
             current = await db.get(NotificationRow, notification_id)
-            if current is not None and current.status != "pending":
+            if current is not None and current.status == "resolved":
                 if not _is_same_resolution(current, decision, resolution_data):
                     return False
                 self._pause_waiter.resolve(
@@ -572,12 +1509,14 @@ class NotificationService:
                 update(NotificationRow)
                 .where(
                     NotificationRow.notification_id == notification_id,
-                    NotificationRow.status == "pending",
+                    NotificationRow.status == "resolving",
+                    NotificationRow.revision == claim_revision,
                 )
                 .values(
                     status="resolved",
                     resolution={"decision": decision, "state": "resolved", **resolution_data},
                     resolved_at=now,
+                    revision=claim_revision + 1,
                 )
             )
             await db.commit()
@@ -593,17 +1532,8 @@ class NotificationService:
             PauseResolution(decision=decision, data=resolution_data),
         )
 
-        await self._record_user_interaction(
-            notification_id=notification_id,
-            notification_type=str(notification_type),
-            notification_payload=notification_payload,
-            resolution_data=resolution_data,
-            decision=decision,
-            session_id=session_id,
-            user_email=row_user_email,
-        )
-
-        # Publish resolution event
+        # Publish the authoritative terminal state locally before scheduling
+        # best-effort cross-controller and timeline mirrors.
         await self._event_bus.publish(
             Event(
                 type=EventType.NOTIFICATION_RESOLVED,
@@ -616,16 +1546,41 @@ class NotificationService:
                     "step_name": step_name,
                     "session_id": session_id,
                     "decision": decision,
+                    "resumes_execution": True,
+                    "managed_origin_conversation_id": _managed_origin_conversation_id(
+                        notification_payload,
+                        target_conversation_id=conversation_id,
+                    ),
                 },
             )
         )
-        await self._publish_cluster_change(
-            conversation_id=conversation_id,
-            user_email=row_user_email,
+        self._run_best_effort(
+            self._publish_notification_cluster_changes(
+                conversation_id=conversation_id,
+                user_email=row_user_email,
+                notification_id=notification_id,
+                task_id=task_id,
+                session_id=session_id,
+                revision=now,
+                payload=notification_payload,
+            ),
+            operation="cluster_publish",
             notification_id=notification_id,
-            task_id=task_id,
-            session_id=session_id,
-            revision=now,
+            timeout=_CLUSTER_PUBLISH_TIMEOUT_SECONDS,
+        )
+        self._run_best_effort(
+            self._record_user_interaction(
+                notification_id=notification_id,
+                notification_type=str(notification_type),
+                notification_payload=notification_payload,
+                resolution_data=resolution_data,
+                decision=decision,
+                session_id=session_id,
+                user_email=row_user_email,
+            ),
+            operation="interaction_record",
+            notification_id=notification_id,
+            timeout=_INTERACTION_RECORD_TIMEOUT_SECONDS,
         )
 
         # Metrics — normalize decision to a known set to prevent cardinality explosion
@@ -652,6 +1607,161 @@ class NotificationService:
         )
         return True
 
+    async def _wait_for_existing_resolution_claim(
+        self,
+        notification_id: str,
+        decision: str,
+        resolution_data: dict[str, Any],
+        *,
+        user_email: str | None,
+        admission_guard: Callable[[Any], Awaitable[bool]] | None,
+    ) -> bool:
+        """Wait until another resolver reaches an authoritative terminal state."""
+
+        deadline = monotonic() + _RESOLUTION_CLAIM_SECONDS + _RESOLUTION_COMPLETION_GRACE_SECONDS
+        while True:
+            async with self._session_factory() as db:
+                if admission_guard is not None and not await admission_guard(db):
+                    await db.rollback()
+                    return False
+                row = await db.get(NotificationRow, notification_id)
+                if row is None or (user_email is not None and row.user_email != user_email):
+                    return False
+                if row.status == "resolved":
+                    if not _is_same_resolution(row, decision, resolution_data):
+                        return False
+                    self._pause_waiter.resolve(
+                        notification_id,
+                        PauseResolution(
+                            decision=decision,
+                            data=_resolution_waiter_data(row.resolution, resolution_data),
+                        ),
+                    )
+                    return True
+                if row.status != "resolving":
+                    return False
+                existing = row.resolution if isinstance(row.resolution, dict) else {}
+                if not _resolution_claim_matches(existing, decision, resolution_data):
+                    return False
+                claimed_at = row.resolved_at
+                if claimed_at is not None and claimed_at.tzinfo is None:
+                    claimed_at = claimed_at.replace(tzinfo=UTC)
+                claim_is_stale = (
+                    claimed_at is not None
+                    and (datetime.now(UTC) - claimed_at).total_seconds()
+                    >= _RESOLUTION_CLAIM_SECONDS
+                )
+
+            if claim_is_stale:
+                return await self.resolve(
+                    notification_id,
+                    decision,
+                    resolution_data,
+                    user_email=user_email,
+                    admission_guard=admission_guard,
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_RESOLUTION_POLL_SECONDS, remaining))
+
+    async def find_oldest_pending_escalation(
+        self,
+        *,
+        user_email: str,
+        conversation_id: str,
+    ) -> Notification | None:
+        """Return the oldest actionable escalation for one owned conversation."""
+        async with self._session_factory() as db:
+            row = (
+                (
+                    await db.execute(
+                        select(NotificationRow)
+                        .where(
+                            NotificationRow.user_email == user_email,
+                            NotificationRow.conversation_id == conversation_id,
+                            NotificationRow.notification_type == NotificationType.ESCALATION,
+                            NotificationRow.status.in_(("pending", "resolving")),
+                        )
+                        .order_by(
+                            NotificationRow.created_at.asc(),
+                            NotificationRow.notification_id.asc(),
+                        )
+                        .limit(1)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            return _row_to_notification(row) if row is not None else None
+
+    async def find_tool_escalation(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+    ) -> Notification | None:
+        """Find the durable escalation that owns an unresolved tool call."""
+        async with self._session_factory() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(NotificationRow)
+                        .where(
+                            NotificationRow.notification_type == NotificationType.ESCALATION,
+                            NotificationRow.session_id == session_id,
+                            NotificationRow.status.in_(("pending", "resolving", "resolved")),
+                        )
+                        .order_by(NotificationRow.created_at.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                payload = row.payload if isinstance(row.payload, dict) else {}
+                if payload.get("tool_call_id") == tool_call_id:
+                    return _row_to_notification(row)
+        return None
+
+    async def find_tool_question(
+        self,
+        *,
+        session_id: str,
+        tool_call_id: str,
+    ) -> Notification | None:
+        """Find the durable question or auth challenge for one tool call."""
+
+        async with self._session_factory() as db:
+            rows = (
+                (
+                    await db.execute(
+                        select(NotificationRow)
+                        .where(
+                            NotificationRow.notification_type.in_(
+                                (
+                                    NotificationType.STEP_QUESTION,
+                                    NotificationType.AUTH_CHALLENGE,
+                                )
+                            ),
+                            NotificationRow.session_id == session_id,
+                            NotificationRow.status.in_(("pending", "resolving", "resolved")),
+                        )
+                        .order_by(NotificationRow.created_at.desc())
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for row in rows:
+                payload = row.payload if isinstance(row.payload, dict) else {}
+                if (
+                    payload.get("tool_call_id") == tool_call_id
+                    or payload.get("origin_call_id") == tool_call_id
+                ):
+                    return _row_to_notification(row)
+        return None
+
     async def wait_for_resolution(
         self,
         notification_id: str,
@@ -666,16 +1776,23 @@ class NotificationService:
         if execution_fence is not None:
             await execution_fence.suspend_capacity()
         deadline = monotonic() + timeout if timeout > 0 else None
-        local_wait = asyncio.create_task(self._pause_waiter.wait(notification_id, timeout=timeout))
+        local_timeout = (
+            timeout + _RESOLUTION_CLAIM_SECONDS + _RESOLUTION_COMPLETION_GRACE_SECONDS
+            if timeout > 0
+            else timeout
+        )
+        local_wait = asyncio.create_task(
+            self._pause_waiter.wait(notification_id, timeout=local_timeout)
+        )
         resolved: PauseResolution | None = None
+        claim_grace_applied = False
         try:
             while True:
                 if local_wait.done() and resolved is None:
-                    resolved = await local_wait
+                    with contextlib.suppress(TimeoutError):
+                        resolved = await local_wait
                 if cancel_event is not None and cancel_event.is_set():
                     raise asyncio.CancelledError
-                if resolved is None and deadline is not None and monotonic() >= deadline:
-                    raise TimeoutError
 
                 async with self._session_factory() as db:
                     await assert_task_execution_fence(db)
@@ -695,6 +1812,30 @@ class NotificationService:
                                 decision=decision,
                                 data=_resolution_waiter_data(row.resolution, {}),
                             )
+                        elif (
+                            row.status == "resolving"
+                            and deadline is not None
+                            and monotonic() >= deadline
+                            and not claim_grace_applied
+                        ):
+                            claimed_at = row.resolved_at
+                            if claimed_at is not None and claimed_at.tzinfo is None:
+                                claimed_at = claimed_at.replace(tzinfo=UTC)
+                            if claimed_at is not None:
+                                claim_remaining = max(
+                                    0.0,
+                                    _RESOLUTION_CLAIM_SECONDS
+                                    - (datetime.now(UTC) - claimed_at).total_seconds(),
+                                )
+                                deadline = monotonic() + min(
+                                    claim_remaining + _RESOLUTION_COMPLETION_GRACE_SECONDS,
+                                    _RESOLUTION_CLAIM_SECONDS
+                                    + _RESOLUTION_COMPLETION_GRACE_SECONDS,
+                                )
+                                claim_grace_applied = True
+
+                if resolved is None and deadline is not None and monotonic() >= deadline:
+                    raise TimeoutError
 
                 if resolved is not None and (
                     execution_fence is None or await execution_fence.ensure_capacity()
@@ -760,8 +1901,10 @@ class NotificationService:
                 "event": "user_interaction_resolved",
                 "interaction_id": notification_id,
                 "interaction_type": notification_type,
-                "origin_call_id": notification_payload.get("origin_call_id"),
-                "origin_tool_name": notification_payload.get("origin_tool_name"),
+                "origin_call_id": notification_payload.get("tool_call_id")
+                or notification_payload.get("origin_call_id"),
+                "origin_tool_name": notification_payload.get("tool_name")
+                or notification_payload.get("origin_tool_name"),
                 **_user_interaction_display(
                     notification_type=notification_type,
                     notification_payload=notification_payload,
@@ -830,10 +1973,8 @@ class NotificationService:
         async with self._session_factory() as db:
             stmt = select(NotificationRow).where(
                 NotificationRow.user_email == user_email,
-                NotificationRow.status == "pending",
+                NotificationRow.status.in_(("pending", "resolving")),
             )
-            if conversation_id:
-                stmt = stmt.where(NotificationRow.conversation_id == conversation_id)
             if task_id:
                 stmt = stmt.where(NotificationRow.task_id == task_id)
             if session_id:
@@ -841,6 +1982,12 @@ class NotificationService:
             stmt = stmt.order_by(NotificationRow.created_at.desc())
             result = await db.execute(stmt)
             rows = result.scalars().all()
+            if conversation_id:
+                rows = [
+                    row
+                    for row in rows
+                    if _notification_visible_in_conversation(row, conversation_id)
+                ]
 
         for row in rows:
             if await self._reconcile_remote_escalation(row):
@@ -853,8 +2000,18 @@ class NotificationService:
             for row in rows:
                 if row.notification_id in resolved_submitted:
                     continue
-                if _is_expired_escalation(row, now=now):
-                    stale_notifications.append((row.notification_id, "timeout"))
+                if _is_expired_notification(row, now=now) and not _has_fresh_resolution_claim(
+                    row, now=now
+                ):
+                    reason = (
+                        "timeout"
+                        if row.notification_type == NotificationType.ESCALATION
+                        else "expired"
+                    )
+                    stale_notifications.append((row.notification_id, reason))
+                    continue
+                if _is_callback_only_notification(row.notification_type, row.payload):
+                    visible_rows.append(_row_to_notification(row))
                     continue
                 if row.task_id:
                     status = task_status_cache.get(row.task_id)
@@ -868,13 +2025,23 @@ class NotificationService:
                 visible_rows.append(_row_to_notification(row))
 
         for notification_id, reason in stale_notifications:
-            await self.mark_orphaned(notification_id, reason=reason)
+            if reason == "timeout":
+                await self.resolve_timeout(notification_id)
+            else:
+                await self.mark_orphaned(
+                    notification_id,
+                    reason=reason,
+                    resolving_before=now - timedelta(seconds=_RESOLUTION_CLAIM_SECONDS),
+                )
 
         return visible_rows
 
     async def _reconcile_remote_escalation(self, row: NotificationRow) -> bool:
         """Resolve locally when Intaris already recorded an external decision."""
-        if row.notification_type != NotificationType.ESCALATION or row.status != "pending":
+        if row.notification_type != NotificationType.ESCALATION or row.status not in {
+            "pending",
+            "resolving",
+        }:
             return False
         resolution = row.resolution if isinstance(row.resolution, dict) else {}
 
@@ -907,7 +2074,7 @@ class NotificationService:
                 update(NotificationRow)
                 .where(
                     NotificationRow.notification_id == row.notification_id,
-                    NotificationRow.status == "pending",
+                    NotificationRow.status == row.status,
                 )
                 .values(
                     status="resolved",
@@ -918,13 +2085,16 @@ class NotificationService:
                         "state": "resolved_remote",
                     },
                     resolved_at=now,
+                    revision=NotificationRow.revision + 1,
                 )
             )
             await db.commit()
-            if not int(getattr(result, "rowcount", 0) or 0):
+            rowcount = getattr(result, "rowcount", None)
+            if rowcount is not None and not int(rowcount or 0):
                 current = await db.get(NotificationRow, row.notification_id)
-                if current is None or not _is_same_resolution(current, decision, {"note": note}):
-                    return False
+                return bool(
+                    current is not None and _is_same_resolution(current, decision, {"note": note})
+                )
 
         self._pause_waiter.resolve(
             row.notification_id,
@@ -943,16 +2113,41 @@ class NotificationService:
                     "step_name": row.step_name,
                     "session_id": row.session_id,
                     "decision": decision,
+                    "resumes_execution": True,
+                    "managed_origin_conversation_id": _managed_origin_conversation_id(
+                        row.payload if isinstance(row.payload, dict) else None,
+                        target_conversation_id=row.conversation_id,
+                    ),
                 },
             )
         )
-        await self._publish_cluster_change(
-            conversation_id=row.conversation_id,
-            user_email=row.user_email,
+        self._run_best_effort(
+            self._publish_notification_cluster_changes(
+                conversation_id=row.conversation_id,
+                user_email=row.user_email,
+                notification_id=row.notification_id,
+                task_id=row.task_id,
+                session_id=row.session_id,
+                revision=now,
+                payload=row.payload if isinstance(row.payload, dict) else None,
+            ),
+            operation="cluster_publish",
             notification_id=row.notification_id,
-            task_id=row.task_id,
-            session_id=row.session_id,
-            revision=now,
+            timeout=_CLUSTER_PUBLISH_TIMEOUT_SECONDS,
+        )
+        self._run_best_effort(
+            self._record_user_interaction(
+                notification_id=row.notification_id,
+                notification_type=str(row.notification_type),
+                notification_payload=dict(row.payload) if isinstance(row.payload, dict) else {},
+                resolution_data={"note": note},
+                decision=decision,
+                session_id=row.session_id,
+                user_email=row.user_email,
+            ),
+            operation="interaction_record",
+            notification_id=row.notification_id,
+            timeout=_INTERACTION_RECORD_TIMEOUT_SECONDS,
         )
 
         safe_decision = (
@@ -980,6 +2175,84 @@ class NotificationService:
             },
         )
         return True
+
+    async def resolve_timeout(self, notification_id: str) -> PauseResolution | None:
+        """Atomically deny a pending or stale resolving escalation on timeout."""
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(seconds=_RESOLUTION_CLAIM_SECONDS)
+        resolution = {"decision": "deny", "reason": "timeout", "state": "timed_out"}
+        async with self._session_factory() as db:
+            result = await db.execute(
+                update(NotificationRow)
+                .where(
+                    NotificationRow.notification_id == notification_id,
+                    or_(
+                        NotificationRow.status == "pending",
+                        and_(
+                            NotificationRow.status == "resolving",
+                            NotificationRow.resolved_at <= stale_before,
+                        ),
+                    ),
+                )
+                .values(
+                    status="resolved",
+                    resolution=resolution,
+                    resolved_at=now,
+                    revision=NotificationRow.revision + 1,
+                )
+            )
+            await db.commit()
+            if not int(getattr(result, "rowcount", 0) or 0):
+                row = await db.get(NotificationRow, notification_id)
+                if (
+                    row is not None
+                    and row.status == "resolved"
+                    and isinstance(row.resolution, dict)
+                ):
+                    return PauseResolution(
+                        decision=str(row.resolution.get("decision") or "deny"),
+                        data=_resolution_waiter_data(row.resolution, {}),
+                    )
+                return None
+            row = await db.get(NotificationRow, notification_id)
+        if row is None:
+            return None
+        terminal = PauseResolution(decision="deny", data={"reason": "timeout"})
+        self._pause_waiter.resolve(notification_id, terminal)
+        await self._event_bus.publish(
+            Event(
+                type=EventType.NOTIFICATION_RESOLVED,
+                data={
+                    "notification_id": row.notification_id,
+                    "notification_type": row.notification_type,
+                    "user_email": row.user_email,
+                    "conversation_id": row.conversation_id,
+                    "task_id": row.task_id,
+                    "step_name": row.step_name,
+                    "session_id": row.session_id,
+                    "decision": "deny",
+                    "managed_origin_conversation_id": _managed_origin_conversation_id(
+                        row.payload if isinstance(row.payload, dict) else None,
+                        target_conversation_id=row.conversation_id,
+                    ),
+                },
+            )
+        )
+        self._run_best_effort(
+            self._publish_notification_cluster_changes(
+                conversation_id=row.conversation_id,
+                user_email=row.user_email,
+                notification_id=row.notification_id,
+                task_id=row.task_id,
+                session_id=row.session_id,
+                revision=now,
+                payload=row.payload if isinstance(row.payload, dict) else None,
+            ),
+            operation="cluster_publish",
+            notification_id=row.notification_id,
+            timeout=_CLUSTER_PUBLISH_TIMEOUT_SECONDS,
+        )
+        return terminal
 
     async def reconcile_remote_escalation(self, notification_id: str) -> bool:
         """Resolve a pending escalation if Intaris recorded an external decision."""
@@ -1019,31 +2292,47 @@ class NotificationService:
                 return None
             return _row_to_notification(row)
 
-    async def mark_orphaned(self, notification_id: str, *, reason: str) -> bool:
-        """Mark a pending notification as terminal without resuming a waiter."""
+    async def mark_orphaned(
+        self,
+        notification_id: str,
+        *,
+        reason: str,
+        resolving_before: datetime | None = None,
+    ) -> bool:
+        """Mark a stale notification as terminal without resuming a waiter."""
         now = datetime.now(UTC)
+        terminal_predicate = NotificationRow.status == "pending"
+        if resolving_before is not None:
+            stale_resolving = and_(
+                NotificationRow.status == "resolving",
+                or_(
+                    NotificationRow.resolved_at.is_(None),
+                    NotificationRow.resolved_at <= resolving_before,
+                ),
+            )
+            terminal_predicate = or_(terminal_predicate, stale_resolving)
         async with self._session_factory() as db:
             row = await db.get(NotificationRow, notification_id)
-            if row is None or row.status != "pending":
+            if row is None:
                 return False
-            await db.execute(
+            result = await db.execute(
                 update(NotificationRow)
-                .where(NotificationRow.notification_id == notification_id)
+                .where(
+                    NotificationRow.notification_id == notification_id,
+                    terminal_predicate,
+                )
+                .execution_options(synchronize_session=False)
                 .values(
                     status="resolved",
                     resolution={"decision": "cancel", "reason": reason},
                     resolved_at=now,
+                    revision=NotificationRow.revision + 1,
                 )
             )
             await db.commit()
-        await self._publish_cluster_change(
-            conversation_id=row.conversation_id,
-            user_email=row.user_email,
-            notification_id=row.notification_id,
-            task_id=row.task_id,
-            session_id=row.session_id,
-            revision=now,
-        )
+            if not int(getattr(result, "rowcount", 0) or 0):
+                return False
+        self._pause_waiter.clear(notification_id)
         await self._event_bus.publish(
             Event(
                 type=EventType.NOTIFICATION_RESOLVED,
@@ -1056,8 +2345,26 @@ class NotificationService:
                     "step_name": row.step_name,
                     "session_id": row.session_id,
                     "decision": "cancel",
+                    "managed_origin_conversation_id": _managed_origin_conversation_id(
+                        row.payload if isinstance(row.payload, dict) else None,
+                        target_conversation_id=row.conversation_id,
+                    ),
                 },
             )
+        )
+        self._run_best_effort(
+            self._publish_notification_cluster_changes(
+                conversation_id=row.conversation_id,
+                user_email=row.user_email,
+                notification_id=row.notification_id,
+                task_id=row.task_id,
+                session_id=row.session_id,
+                revision=now,
+                payload=row.payload if isinstance(row.payload, dict) else None,
+            ),
+            operation="cluster_publish",
+            notification_id=row.notification_id,
+            timeout=_CLUSTER_PUBLISH_TIMEOUT_SECONDS,
         )
         NOTIFICATIONS_RESOLVED.labels(type=row.notification_type, decision="cancel").inc()
         if row.created_at:
@@ -1083,16 +2390,19 @@ class NotificationService:
 
         async with self._session_factory() as db:
             result = await db.execute(
-                select(NotificationRow.notification_id).where(
+                select(NotificationRow).where(
                     NotificationRow.task_id == task_id,
                     NotificationRow.status == "pending",
                 )
             )
-            notification_ids = list(result.scalars().all())
+            rows = list(result.scalars().all())
 
         resolved = 0
-        for notification_id in notification_ids:
-            if await self.mark_orphaned(notification_id, reason=reason):
+        for row in rows:
+            if _is_callback_only_notification(row.notification_type, row.payload):
+                self._pause_waiter.clear(row.notification_id)
+                continue
+            if await self.mark_orphaned(row.notification_id, reason=reason):
                 resolved += 1
         return resolved
 
@@ -1112,34 +2422,78 @@ class NotificationService:
         Returns the number of notifications reconciled.
         """
         async with self._session_factory() as db:
-            stmt = select(NotificationRow).where(NotificationRow.status == "pending")
+            stmt = select(NotificationRow).where(
+                NotificationRow.status.in_(("pending", "resolving"))
+            )
             result = await db.execute(stmt)
             rows = result.scalars().all()
             task_status_cache: dict[str, str | None] = {}
+            direct_turns_by_session: dict[str, list[DirectTurnRequestRow]] = {}
             for row in rows:
                 if row.task_id and row.task_id not in task_status_cache:
                     task_row = await get_task(db, row.task_id)
                     task_status_cache[row.task_id] = (
                         str(task_row.status) if task_row is not None else None
                     )
+                if (
+                    row.task_id is None
+                    and row.notification_type
+                    in {NotificationType.STEP_QUESTION, NotificationType.AUTH_CHALLENGE}
+                    and row.session_id
+                    and row.session_id not in direct_turns_by_session
+                ):
+                    direct_turns_by_session[row.session_id] = list(
+                        (
+                            await db.execute(
+                                select(DirectTurnRequestRow)
+                                .where(DirectTurnRequestRow.session_id == row.session_id)
+                                .order_by(DirectTurnRequestRow.admission_order.desc())
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
 
         count = 0
         orphaned_count = 0
         for row in rows:
-            if row.notification_type == NotificationType.STEP_QUESTION and row.task_id is None:
-                await self.mark_orphaned(
-                    row.notification_id,
-                    reason="controller_restart",
-                )
+            if _is_expired_notification(row, now=datetime.now(UTC)):
+                if row.notification_type == NotificationType.ESCALATION:
+                    await self.resolve_timeout(row.notification_id)
+                else:
+                    await self.mark_orphaned(
+                        row.notification_id,
+                        reason="expired",
+                        resolving_before=datetime.now(UTC)
+                        - timedelta(seconds=_RESOLUTION_CLAIM_SECONDS),
+                    )
                 orphaned_count += 1
                 continue
-            if _is_expired_escalation(row, now=datetime.now(UTC)):
-                await self.mark_orphaned(
-                    row.notification_id,
-                    reason="timeout",
-                )
-                orphaned_count += 1
+            if _is_callback_only_notification(row.notification_type, row.payload):
+                self._pause_waiter.clear(row.notification_id)
                 continue
+            if (
+                row.notification_type
+                in {NotificationType.STEP_QUESTION, NotificationType.AUTH_CHALLENGE}
+                and row.task_id is None
+            ):
+                owner = _find_direct_turn_owner(
+                    row,
+                    direct_turns_by_session.get(row.session_id or "", []),
+                )
+                if owner is not None and owner.status in {
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "absorbed",
+                    "ambiguous",
+                }:
+                    if await self.mark_orphaned(
+                        row.notification_id,
+                        reason="direct_turn_terminal",
+                    ):
+                        orphaned_count += 1
+                    continue
             if row.task_id:
                 status = task_status_cache.get(row.task_id)
                 if status not in _ACTIVE_TASK_STATUSES:
@@ -1184,7 +2538,7 @@ class NotificationService:
             )
         if orphaned_count:
             logger.info(
-                "notification: marked %d direct-chat step questions orphaned after restart",
+                "notification: marked %d direct-chat questions orphaned after restart",
                 orphaned_count,
             )
         return count
@@ -1193,6 +2547,41 @@ class NotificationService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _is_callback_only_notification(
+    notification_type: str,
+    payload: dict[str, Any] | None,
+) -> bool:
+    if notification_type != NotificationType.AUTH_CHALLENGE or not isinstance(payload, dict):
+        return False
+    metadata = payload.get("metadata")
+    return (
+        payload.get("kind") == "oauth_authorization"
+        and isinstance(metadata, dict)
+        and metadata.get("callback_only") is True
+    )
+
+
+def _find_direct_turn_owner(
+    notification: NotificationRow,
+    candidates: list[DirectTurnRequestRow],
+) -> DirectTurnRequestRow | None:
+    payload = notification.payload if isinstance(notification.payload, dict) else {}
+    call_id = payload.get("tool_call_id") or payload.get("origin_call_id")
+    if not isinstance(call_id, str) or not call_id:
+        return None
+    for candidate in candidates:
+        outcome = candidate.outcome if isinstance(candidate.outcome, dict) else {}
+        descriptors = outcome.get("tool_calls")
+        if not isinstance(descriptors, list):
+            continue
+        if any(
+            isinstance(descriptor, dict) and descriptor.get("call_id") == call_id
+            for descriptor in descriptors
+        ):
+            return candidate
+    return None
 
 
 def _row_to_notification(row: NotificationRow) -> Notification:
@@ -1208,6 +2597,8 @@ def _row_to_notification(row: NotificationRow) -> Notification:
         payload=row.payload or {},
         status=row.status,
         resolution=row.resolution,
+        revision=_notification_revision(row),
+        expires_at=getattr(row, "expires_at", None),
         created_at=row.created_at,
         resolved_at=row.resolved_at,
     )
@@ -1442,6 +2833,9 @@ def _is_same_resolution(
         return False
     if str(row.resolution.get("decision") or "").lower() != decision.lower():
         return False
+    submission_id = resolution_data.get("submission_id")
+    if submission_id is not None:
+        return bool(row.resolution.get("submission_id") == submission_id)
     if row.resolution.get("state") == "resolved_remote":
         return True
     persisted_data = {
@@ -1450,12 +2844,70 @@ def _is_same_resolution(
     return _normalize_resolution_data(persisted_data) == _normalize_resolution_data(resolution_data)
 
 
+def _resolution_claim_matches(
+    resolution: dict[str, Any],
+    decision: str,
+    resolution_data: dict[str, Any],
+) -> bool:
+    """Return true when an in-flight claim represents the same request."""
+
+    if str(resolution.get("decision") or "").lower() != decision.lower():
+        return False
+    submission_id = resolution_data.get("submission_id")
+    if submission_id is not None:
+        return bool(resolution.get("submission_id") == submission_id)
+    persisted_data = {
+        key: value
+        for key, value in resolution.items()
+        if key not in {"decision", "state", "claim_token"}
+    }
+    return _normalize_resolution_data(persisted_data) == _normalize_resolution_data(resolution_data)
+
+
+def _claim_update_succeeded(result: Any, *, row: Any, claim_token: str) -> bool:
+    """Read a real SQL rowcount while supporting lightweight unit DB stubs."""
+    rowcount = getattr(result, "rowcount", None)
+    if rowcount is not None:
+        return bool(int(rowcount or 0))
+    resolution = row.resolution if isinstance(row.resolution, dict) else {}
+    return row.status == "resolving" and resolution.get("claim_token") == claim_token
+
+
 def _normalize_resolution_data(data: dict[str, Any]) -> dict[str, Any]:
     """Normalize semantically equivalent persisted/input resolution payloads."""
     normalized = dict(data)
     if normalized.get("note") == "":
         normalized.pop("note")
     return normalized
+
+
+def _notification_revision(row: Any) -> int:
+    return int(getattr(row, "revision", 1) or 1)
+
+
+def _notification_payload_expires_at(
+    notification_type: str,
+    payload: dict[str, Any],
+    *,
+    created_at: datetime,
+) -> datetime | None:
+    raw = payload.get("expires_at")
+    metadata = payload.get("metadata")
+    if raw is None and isinstance(metadata, dict):
+        raw = metadata.get("expires_at")
+    if isinstance(raw, str):
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            pass
+    if notification_type != NotificationType.ESCALATION:
+        return None
+    try:
+        timeout_seconds = max(0.0, float(payload.get("timeout_seconds", 300)))
+    except (TypeError, ValueError):
+        timeout_seconds = 300.0
+    return created_at + timedelta(seconds=timeout_seconds)
 
 
 def _resolution_waiter_data(
@@ -1470,9 +2922,19 @@ def _resolution_waiter_data(
     return data
 
 
-def _is_expired_escalation(row: NotificationRow, *, now: datetime) -> bool:
-    """Return true when an escalation prompt has exceeded its approval window."""
-    if row.notification_type != NotificationType.ESCALATION or row.status != "pending":
+def _is_expired_notification(row: NotificationRow, *, now: datetime) -> bool:
+    """Return true when a pending notification has exceeded its expiry."""
+    if row.status not in {
+        "pending",
+        "resolving",
+    }:
+        return False
+    expires_at = row.expires_at
+    if expires_at is not None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return now >= expires_at
+    if row.notification_type != NotificationType.ESCALATION:
         return False
     created_at = row.created_at
     if created_at is None:
@@ -1483,9 +2945,20 @@ def _is_expired_escalation(row: NotificationRow, *, now: datetime) -> bool:
         (row.payload or {}).get("timeout_seconds") if isinstance(row.payload, dict) else None
     )
     try:
-        timeout_seconds = float(timeout_raw)
-    except (TypeError, ValueError):
+        timeout_seconds = (
+            float(timeout_raw) if isinstance(timeout_raw, (int, float, str)) else 300.0
+        )
+    except ValueError:
         timeout_seconds = 300.0
     if timeout_seconds <= 0:
         return True
     return now >= created_at + timedelta(seconds=timeout_seconds)
+
+
+def _has_fresh_resolution_claim(row: NotificationRow, *, now: datetime) -> bool:
+    if row.status != "resolving" or row.resolved_at is None:
+        return False
+    claimed_at = row.resolved_at
+    if claimed_at.tzinfo is None:
+        claimed_at = claimed_at.replace(tzinfo=UTC)
+    return (now - claimed_at).total_seconds() < _RESOLUTION_CLAIM_SECONDS

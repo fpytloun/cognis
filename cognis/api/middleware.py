@@ -25,6 +25,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from cognis.api.authentication import (
+    AccessTokenAuthenticationError,
+    AuthenticatedUser,
+    authenticate_access_token,
+)
 from cognis.api.models import ErrorBody, ErrorResponse
 from cognis.runtime_context import current_user_email
 from cognis.security import parse_api_key, verify_api_key
@@ -227,20 +232,15 @@ PUBLIC_ROUTES = {
     ("GET", "/api/v1/pwa-reset"),
     ("POST", "/api/auth/login"),
     ("POST", "/api/auth/refresh"),
+    ("POST", "/api/auth/mfa/setup/start"),
+    ("POST", "/api/auth/mfa/setup/confirm"),
+    ("POST", "/api/auth/mfa/verify"),
     ("GET", "/api/v1/mcp/oauth/callback"),
     ("GET", "/.well-known/agent.json"),
 }
 
 AUTH_LOOKUP_CACHE_TTL_SECONDS = 45.0
 API_KEY_TOUCH_DEBOUNCE_SECONDS = 60.0
-
-
-@dataclass
-class AuthenticatedUser:
-    email: str
-    role: str
-    name: str | None = None
-    auth_type: str = "jwt"
 
 
 @dataclass(frozen=True)
@@ -504,41 +504,30 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         if authorization and authorization.startswith("Bearer "):
             token = authorization.removeprefix("Bearer ").strip()
             try:
-                claims = auth_provider.verify_jwt(token, audience=["cognis"])
-            except Exception:
+                user, claims = await authenticate_access_token(
+                    token=token,
+                    auth_provider=auth_provider,
+                    session_factory=session_factory,
+                )
+            except AccessTokenAuthenticationError as exc:
+                if exc.account_disabled:
+                    return JSONResponse(
+                        status_code=403,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="account_disabled", message="Account disabled")
+                        ).model_dump(),
+                    )
                 return JSONResponse(
                     status_code=401,
                     content=ErrorResponse(
                         error=ErrorBody(code="unauthorized", message="Invalid or expired token")
                     ).model_dump(),
                 )
-            # Check if user is disabled (JWT may have been issued before disable).
-            # Positive active-user cache entries are invalidated by in-process
-            # query hooks; other processes rely on the short TTL bound.
-            user_email = str(claims["sub"])
-            cached_user_state, is_active = self._auth_cache.get_user_active(user_email)
-            if not cached_user_state:
-                async with session_factory() as session:
-                    user_row = await get_user(session, user_email)
-                    is_active = None if user_row is None else user_row.is_active
-                    self._auth_cache.put_user_active(user_email, is_active)
-            if is_active is False:
-                return JSONResponse(
-                    status_code=403,
-                    content=ErrorResponse(
-                        error=ErrorBody(code="account_disabled", message="Account disabled")
-                    ).model_dump(),
-                )
-            context_token = current_user_email.set(user_email)
-            request.state.user = AuthenticatedUser(
-                email=user_email,
-                role=str(claims.get("role", "user")),
-                name=claims.get("name"),
-                auth_type="jwt",
-            )
+            context_token = current_user_email.set(user.email)
+            request.state.user = user
             request.state.claims = claims
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
-                user_key=user_email,
+                user_key=user.email,
                 path=request.url.path,
                 method=request.method,
             ):
@@ -588,8 +577,8 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                                 error=ErrorBody(code="unauthorized", message="Expired API key")
                             ).model_dump(),
                         )
-                    user = await get_user(session, record.user_email)
-                    if user is None:
+                    user_row = await get_user(session, record.user_email)
+                    if user_row is None:
                         return JSONResponse(
                             status_code=401,
                             content=ErrorResponse(
@@ -598,8 +587,8 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                                 )
                             ).model_dump(),
                         )
-                    self._auth_cache.put_user_active(user.email, user.is_active)
-                    if not user.is_active:
+                    self._auth_cache.put_user_active(user_row.email, user_row.is_active)
+                    if not user_row.is_active:
                         return JSONResponse(
                             status_code=403,
                             content=ErrorResponse(
@@ -608,9 +597,9 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                         )
                     identity = _CachedApiKeyIdentity(
                         key_id=record.key_id,
-                        user_email=user.email,
-                        role=user.role,
-                        name=user.name,
+                        user_email=user_row.email,
+                        role=user_row.role,
+                        name=user_row.name,
                         expires_at=expires_at,
                     )
                     self._auth_cache.put_api_key_identity(full_key_hash, identity)
@@ -686,6 +675,13 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                         status_code=401,
                         content=ErrorResponse(
                             error=ErrorBody(code="unauthorized", message="Unknown session owner")
+                        ).model_dump(),
+                    )
+                if browser_session.auth_version != user_row.auth_version:
+                    return JSONResponse(
+                        status_code=401,
+                        content=ErrorResponse(
+                            error=ErrorBody(code="unauthorized", message="Stale session cookie")
                         ).model_dump(),
                     )
             context_token = current_user_email.set(user_row.email)

@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.anchored_output import markdown_heading_anchors
-from cognis.core.chat_modes import is_plan_hidden_tool
+from cognis.core.chat_modes import is_plan_mutating_tool_call
 from cognis.core.content_refs import (
     build_deliverable_public_url,
     continuation_scope_task_id,
@@ -36,10 +36,17 @@ from cognis.core.credential_grants import (
     grant_credential_to_agent_definition,
 )
 from cognis.core.mcp_oauth import MCPOAuthError
+from cognis.core.memory_aliases import MemoryAliasState
 from cognis.core.session import executor_home_from_workspace_root
 from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.tool_output_presentation import present_tool_output
 from cognis.logging import get_logger
+from cognis.mcp_runtime import (
+    HTTP_MCP_TRANSPORTS,
+    MCPClientError,
+    _normalize_call_result,
+    build_mcp_client,
+)
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.credential import CredentialAccessError, CredentialResolution
@@ -58,7 +65,7 @@ from cognis.models.tool import (
     tool_capabilities,
     tool_input_schema,
 )
-from cognis.providers.executor.delivery import ExecutorDeliveryError
+from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.runtime_context import (
     RuntimeAccessContext,
     current_agent_id,
@@ -97,12 +104,6 @@ from cognis.tools.builtin.skill_management import (
 )
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
 from cognis.tools.introspection import validate_available_tool_call_with_context
-from cognis.tools.mcp import (
-    HTTP_MCP_TRANSPORTS,
-    MCPClientError,
-    _normalize_call_result,
-    build_mcp_client,
-)
 from cognis.tools.native_validation import NativeValidationContext
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
@@ -135,6 +136,11 @@ def _mcp_oauth_setup_failed_result(
             "retryable": retryable,
         },
     )
+
+
+# Result metadata owned by the controller. An executor payload may never supply
+# or override these, otherwise a tool could forge its own guardrails verdict.
+_CONTROLLER_OWNED_RESULT_METADATA_KEYS = ("evaluation",)
 
 
 def _effective_content_trust(
@@ -230,6 +236,7 @@ _MAX_BROWSER_UPLOAD_BYTES = 50 * 1024 * 1024
 _MAX_BROWSER_UPLOAD_FILES = 10
 _MAX_ARTIFACT_VALUE_REF_BYTES = 50 * 1024 * 1024
 _ARTIFACT_VALUE_REF_PREFIX = "$artifact:"
+_SENSITIVE_VALUE_REF_PREFIXES = ("$credential:", "$auth_challenge:")
 _ARTIFACT_VALUE_REF_FIELDS = frozenset(
     {
         "content_b64",
@@ -290,6 +297,8 @@ class PermissionDecision:
     path: str | None = None
     latency_ms: int = 0
     call_id: str | None = None  # Intaris evaluation call_id (for escalation tracking)
+    session_status: str | None = None
+    status_reason: str | None = None
 
 
 def caller_assignable_tools(
@@ -394,6 +403,7 @@ class ToolRouter:
         event_bus: Any | None = None,
         task_queue: Any | None = None,
         mcp_oauth_service: Any | None = None,
+        session_cache: Any | None = None,
     ) -> None:
         self.guardrails = guardrails
         self.llm = llm
@@ -408,6 +418,7 @@ class ToolRouter:
         self.event_bus = event_bus
         self._task_queue = task_queue
         self._mcp_oauth_service = mcp_oauth_service
+        self._session_cache = session_cache
         self._scheduler: Any | None = None
         self.non_bypassable_patterns = non_bypassable_patterns or []
         self._decision_cache_ttl_seconds = 15.0
@@ -429,6 +440,7 @@ class ToolRouter:
         event_bus: Any | None = None,
         task_queue: Any | None = None,
         mcp_oauth_service: Any | None = None,
+        session_cache: Any | None = None,
     ) -> ToolRouter:
         """Create a router with cached non-bypassable patterns from settings."""
 
@@ -449,6 +461,7 @@ class ToolRouter:
             event_bus=event_bus,
             task_queue=task_queue,
             mcp_oauth_service=mcp_oauth_service,
+            session_cache=session_cache,
         )
 
     def classify(self, tool_name: str, registry: ToolRegistry) -> ToolRoute:
@@ -498,8 +511,8 @@ class ToolRouter:
         if registered_tool is None:
             return PermissionDecision(decision="deny", reasoning="Unknown tool", source="registry")
         evaluation_context = await self._evaluation_context(tool_call, registered_tool.definition)
-        if evaluation_context.get("read_only_required") is True and is_plan_hidden_tool(
-            registered_tool.definition
+        if evaluation_context.get("read_only_required") is True and is_plan_mutating_tool_call(
+            registered_tool.definition, tool_call.arguments
         ):
             return PermissionDecision(
                 decision="deny",
@@ -508,6 +521,43 @@ class ToolRouter:
                     "because the agent must not make changes while planning."
                 ),
                 source="chat_mode",
+            )
+
+        self_mutation = (
+            stable_tool_id(registered_tool.definition) == "builtin:manage_agents"
+            and str(tool_call.arguments.get("agent_id") or "").strip()
+            == (current_agent_id.get() or agent.agent_id)
+            and is_plan_mutating_tool_call(registered_tool.definition, tool_call.arguments)
+        )
+        if self_mutation:
+            if (
+                agent.permissions is not None
+                and agent.permissions.resolve_permission(
+                    tool_call.name, tool_id=stable_tool_id(registered_tool.definition)
+                )
+                is Permission.DENY
+            ):
+                return PermissionDecision(
+                    decision="deny", reasoning="Tool denied by agent policy", source="agent"
+                )
+            evaluation_context["minimum_outcome"] = "escalate"
+            evaluation_context["approval_call_id"] = (tool_call.runtime_metadata or {}).get(
+                "approval_call_id"
+            )
+            evaluation = await self.guardrails.evaluate(
+                session_id=_guardrails_session_id(session),
+                tool_name=tool_call.name,
+                arguments=tool_call.arguments,
+                context=evaluation_context,
+            )
+            return PermissionDecision(
+                decision=evaluation.decision,
+                reasoning=evaluation.reasoning,
+                source="guardrails",
+                risk=evaluation.risk,
+                path=evaluation.path,
+                latency_ms=evaluation.latency_ms,
+                call_id=evaluation.call_id,
             )
 
         # When guardrails are disabled for this agent, auto-approve all tools
@@ -537,6 +587,8 @@ class ToolRouter:
                 path=evaluation.path,
                 latency_ms=evaluation.latency_ms,
                 call_id=evaluation.call_id,
+                session_status=getattr(evaluation, "session_status", None),
+                status_reason=getattr(evaluation, "status_reason", None),
             )
 
         permission = Permission.EVALUATE
@@ -577,6 +629,8 @@ class ToolRouter:
             path=evaluation.path,
             latency_ms=evaluation.latency_ms,
             call_id=evaluation.call_id,
+            session_status=getattr(evaluation, "session_status", None),
+            status_reason=getattr(evaluation, "status_reason", None),
         )
         self._cache_decision(
             session.session_id,
@@ -809,6 +863,8 @@ class ToolRouter:
         registry: ToolRegistry,
         executor: Any,
         output_chunk_callback: ToolOutputChunkCallback | None = None,
+        before_executor_send: Callable[[str, str | None], Coroutine[Any, Any, None]] | None = None,
+        after_executor_send: Callable[[str, str | None], Coroutine[Any, Any, None]] | None = None,
     ) -> ToolResult:
         """Execute a tool call using the appropriate route."""
 
@@ -880,6 +936,12 @@ class ToolRouter:
                     memory_provider=self.memory,
                     agent_id=agent.agent_id if agent else None,
                     user_email=current_user_email.get() or session.user_email,
+                    aliases=(
+                        self._session_cache.get_memory_aliases(session.session_id)
+                        or MemoryAliasState()
+                        if self._session_cache is not None
+                        else None
+                    ),
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -891,7 +953,9 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.TOOL_OUTPUT:
-            if self.tool_output_store is None:
+            if self.tool_output_store is None and not (
+                tool_call.name == "read_tool_output" and "reference" in tool_call.arguments
+            ):
                 result = ToolResult(output="Tool output store not available.", is_error=True)
             else:
                 result = await handle_tool_output_tool(
@@ -899,6 +963,9 @@ class ToolRouter:
                     arguments=dict(tool_call.arguments),
                     store=self.tool_output_store,
                     pressure_mode=tool_call.runtime_metadata.get("context_pressure_mode"),
+                    session_factory=self._session_factory,
+                    intaris=self.guardrails,
+                    user_email=current_user_email.get() or session.user_email,
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -950,6 +1017,9 @@ class ToolRouter:
                     is_error=True,
                 )
             else:
+                image_runtime_metadata = dict(tool_call.runtime_metadata)
+                if self.tool_output_store is not None:
+                    image_runtime_metadata["tool_output_store"] = self.tool_output_store
                 result = await handle_image_tool(
                     tool_name=tool_call.name,
                     arguments=dict(tool_call.arguments),
@@ -957,7 +1027,7 @@ class ToolRouter:
                     artifact_store=self.artifact_store,
                     session_factory=self._session_factory,
                     user_email=session.user_email,
-                    runtime_metadata=tool_call.runtime_metadata,
+                    runtime_metadata=image_runtime_metadata,
                 )
                 if result.attachments:
                     result = result.model_copy(
@@ -1063,6 +1133,7 @@ class ToolRouter:
                         else None
                     ),
                 )
+                assert registered_tool is not None
                 domain_validation = await validate_available_tool_call_with_context(
                     [registered_tool.definition],
                     tool_call.name,
@@ -1087,6 +1158,11 @@ class ToolRouter:
                         user_email=actor_email,
                         current_agent_id=current_id,
                         runtime_access=self._runtime_access_from_tool_call(tool_call),
+                        self_mutation_approved=(
+                            decision.source == "guardrails"
+                            and decision.decision == "approve"
+                            and bool((tool_call.runtime_metadata or {}).get("approval_call_id"))
+                        ),
                     )
             combined_meta: dict[str, Any] = {"evaluation": eval_meta}
             if result.metadata is not None:
@@ -1255,6 +1331,7 @@ class ToolRouter:
             if self._session_factory is None:
                 result = ToolResult(output="Schedule management not available.", is_error=True)
             else:
+                assert registered_tool is not None
                 domain_validation = await validate_available_tool_call_with_context(
                     [registered_tool.definition],
                     tool_call.name,
@@ -1386,6 +1463,8 @@ class ToolRouter:
             "path": decision.path,
             "latency_ms": decision.latency_ms,
             "call_id": decision.call_id,
+            "session_status": decision.session_status,
+            "status_reason": decision.status_reason,
         }
         if decision.decision == "deny":
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="denied").inc()
@@ -1517,12 +1596,23 @@ class ToolRouter:
                 result = controller_result
             else:
                 inner_timeout = registered_tool.definition.timeout_seconds
-                outer_timeout = inner_timeout + 10 if inner_timeout > 0 else inner_timeout
+                # Leave room for executor-side timeout cleanup and result delivery.
+                outer_timeout = inner_timeout + 20 if inner_timeout > 0 else inner_timeout
                 result = await asyncio.wait_for(
                     executor.tool_execute(
                         scoped_tool_call,
                         timeout_seconds=inner_timeout,
                         output_chunk_callback=output_chunk_callback,
+                        **(
+                            {"before_send": before_executor_send}
+                            if before_executor_send is not None
+                            else {}
+                        ),
+                        **(
+                            {"on_sent": after_executor_send}
+                            if after_executor_send is not None
+                            else {}
+                        ),
                     ),
                     timeout=outer_timeout,
                 )
@@ -1548,6 +1638,33 @@ class ToolRouter:
                 executor, "executor_id", None
             )
             metadata["epoch"] = metadata.get("epoch") or getattr(executor, "epoch", None)
+            # Parity with the physical transport: only a terminal delivery is
+            # definitively not retryable.
+            metadata["retryable"] = exc.delivery_state != DeliveryState.TERMINAL
+            if hasattr(executor, "owner_id"):
+                metadata["transport"] = {
+                    "route": "forwarded_bridge",
+                    "delivery_state": exc.delivery_state.value,
+                    # Present only when the owner controller could attribute the
+                    # failure to a physical executor process. Bridge-local
+                    # failures stay unattributed and therefore unreconcilable.
+                    "executor_instance_id": exc.executor_instance_id,
+                }
+                logger.warning(
+                    "tool_router: forwarded executor delivery failed",
+                    extra={
+                        "extra_data": {
+                            "tool_name": tool_call.name,
+                            "call_id": cid,
+                            "executor_id": metadata.get("executor_id"),
+                            "owner_id": metadata.get("owner_id"),
+                            "epoch": metadata.get("epoch"),
+                            "delivery_state": exc.delivery_state.value,
+                            "code": exc.code,
+                            "executor_instance_id": exc.executor_instance_id,
+                        }
+                    },
+                )
             result = ToolResult(
                 output="Executor delivery failed; recovery is restricted to the same executor.",
                 is_error=True,
@@ -1588,6 +1705,52 @@ class ToolRouter:
             result,
             registered_tool.definition.max_result_size,
             call_id=cid,
+            runtime_metadata=tool_call.runtime_metadata,
+            content_trust=_effective_content_trust(registered_tool, result),
+        )
+
+    async def finalize_recovered_executor_result(
+        self,
+        *,
+        result: ToolResult,
+        tool_call: ToolCall,
+        registered_tool: Any,
+        session: SessionModel,
+        agent: AgentDefinition,
+    ) -> ToolResult:
+        """Run the normal post-execution pipeline over a recovered tool result.
+
+        A result recovered from the executor after a transport reconnect must
+        cross exactly the same boundary as a directly returned one: browser
+        credential state encrypted rather than left in metadata, attachments
+        materialized, producer post-processing applied, and output sanitized and
+        bounded according to the tool's trust level.
+        """
+
+        # Controller-owned audit metadata survives any failure below, matching
+        # ordinary execution where evaluation is attached after error handling.
+        controller_metadata = {
+            key: value
+            for key, value in (result.metadata or {}).items()
+            if key in _CONTROLLER_OWNED_RESULT_METADATA_KEYS
+        }
+        try:
+            result = await self._persist_browser_auth_state_if_needed(result, session, agent)
+            result = await self._materialize_inline_attachments(result, session, tool_call.name)
+            result = await self._postprocess_tool_result(result, tool_call, session)
+        except CredentialAccessError as exc:
+            # Match ordinary execution: the credential error still flows through
+            # sanitization so bounds and trust wrapping are applied uniformly.
+            result = self._credential_error_result(exc)
+        if controller_metadata:
+            result = result.model_copy(
+                update={"metadata": {**(result.metadata or {}), **controller_metadata}}
+            )
+        return self._sanitize_result(
+            tool_call.name,
+            result,
+            registered_tool.definition.max_result_size,
+            call_id=tool_call.call_id,
             runtime_metadata=tool_call.runtime_metadata,
             content_trust=_effective_content_trust(registered_tool, result),
         )
@@ -1668,12 +1831,23 @@ class ToolRouter:
                 }
             )
         executor_id = str(getattr(executor, "executor_id", "") or "")
-        if executor_id and not await self._wait_for_executor_reconfigure(executor_id):
+        credential_revision = await self._mcp_oauth_service.credential_revision_for_server_id(
+            user_email=session.user_email,
+            server_id=server_id,
+        )
+        if executor_id and (
+            credential_revision is None
+            or not await self._wait_for_mcp_credential_revision(
+                executor_id,
+                server_id,
+                credential_revision,
+            )
+        ):
             return result.model_copy(
                 update={
                     "metadata": {
                         **metadata,
-                        "code": "mcp_oauth_reconfigure_pending",
+                        "code": "mcp_oauth_credential_reload_pending",
                         "retryable": True,
                     }
                 }
@@ -1690,13 +1864,16 @@ class ToolRouter:
                     }
                 }
             )
-        retried = await asyncio.wait_for(
-            executor.tool_execute(
-                tool_call,
-                timeout_seconds=timeout_seconds,
-                output_chunk_callback=output_chunk_callback,
+        retried = cast(
+            ToolResult,
+            await asyncio.wait_for(
+                executor.tool_execute(
+                    tool_call,
+                    timeout_seconds=timeout_seconds,
+                    output_chunk_callback=output_chunk_callback,
+                ),
+                timeout=outer_timeout,
             ),
-            timeout=outer_timeout,
         )
         retry_metadata = retried.metadata if isinstance(retried.metadata, dict) else {}
         second_auth_failure = bool(
@@ -1733,9 +1910,11 @@ class ToolRouter:
             }
         )
 
-    async def _wait_for_executor_reconfigure(
+    async def _wait_for_mcp_credential_revision(
         self,
         executor_id: str,
+        server_id: str,
+        credential_revision: dict[str, str | int],
         *,
         timeout_seconds: float = 30.0,
     ) -> bool:
@@ -1748,9 +1927,13 @@ class ToolRouter:
                 row = await get_executor_row(store_session, executor_id)
             if row is None:
                 return False
-            if int(getattr(row, "desired_config_version", 0) or 0) == int(
-                getattr(row, "applied_config_version", 0) or 0
-            ) and getattr(row, "runtime_state", None) in {"active", "degraded"}:
+            runtime_metadata = getattr(row, "runtime_metadata", None) or {}
+            revisions = runtime_metadata.get("mcp_credential_revisions")
+            applied = revisions.get(server_id) if isinstance(revisions, dict) else None
+            if applied == credential_revision and getattr(row, "runtime_state", None) in {
+                "active",
+                "degraded",
+            }:
                 return True
             await asyncio.sleep(0.1)
         return False
@@ -2418,12 +2601,17 @@ class ToolRouter:
 
     def _sanitize_sensitive_refs_for_guardrails(self, value: Any, *, root: bool = False) -> Any:
         if isinstance(value, dict):
-            if not root and isinstance(value.get("value_ref"), str) and value["value_ref"].strip():
+            if (
+                not root
+                and isinstance(value.get("value_ref"), str)
+                and self._is_sensitive_value_ref(value["value_ref"])
+            ):
                 return "<resolved-at-execution>"
             sanitized: dict[str, Any] = {}
             for key, item in value.items():
                 if key in {"auth_state", "value"} and (
                     isinstance(value.get("value_ref"), str)
+                    and self._is_sensitive_value_ref(value["value_ref"])
                     or isinstance(value.get("auth_state_ref"), str)
                 ):
                     sanitized[key] = "<resolved-at-execution>"
@@ -2583,7 +2771,7 @@ class ToolRouter:
     ) -> dict[str, Any]:
         resolved = dict(arguments)
         value_ref = resolved.get("value_ref")
-        if isinstance(value_ref, str) and value_ref.strip():
+        if isinstance(value_ref, str) and self._is_sensitive_value_ref(value_ref):
             value = await self._resolve_value_ref(
                 value_ref.strip(),
                 session=session,
@@ -2594,7 +2782,7 @@ class ToolRouter:
                 else None,
             )
             resolved["value"] = str(value)
-        elif isinstance(value_ref, str):
+        elif isinstance(value_ref, str) and not value_ref.strip():
             resolved.pop("value_ref", None)
         args = resolved.get("args")
         if tool_call.name == "browser_eval" and isinstance(args, list):
@@ -2686,7 +2874,7 @@ class ToolRouter:
     ) -> Any:
         if isinstance(value, dict):
             value_ref = value.get("value_ref")
-            if isinstance(value_ref, str) and value_ref.strip():
+            if isinstance(value_ref, str) and self._is_sensitive_value_ref(value_ref):
                 return await self._resolve_value_ref(
                     value_ref.strip(),
                     session=session,
@@ -2710,6 +2898,10 @@ class ToolRouter:
                 for item in value
             ]
         return value
+
+    @staticmethod
+    def _is_sensitive_value_ref(ref: str) -> bool:
+        return ref.strip().startswith(_SENSITIVE_VALUE_REF_PREFIXES)
 
     async def _resolve_value_ref(
         self,
@@ -3175,8 +3367,15 @@ class ToolRouter:
         mime_type = str(raw.get("mime_type") or "application/octet-stream")
         filename = sanitize_artifact_filename(str(raw.get("filename") or "attachment"))
         kind = _kind_for_mime_type(mime_type)
-        artifact_id = self.artifact_store.generate_id("doc" if kind is ArtifactKind.PDF else "att")
-        namespace = "documents" if kind is ArtifactKind.PDF else "attachments"
+        published = tool_name == "artifact_publish"
+        artifact_id = self.artifact_store.generate_id(
+            "art" if published else ("doc" if kind is ArtifactKind.PDF else "att")
+        )
+        namespace = (
+            "artifacts"
+            if published
+            else ("documents" if kind is ArtifactKind.PDF else "attachments")
+        )
         await self.artifact_store.async_save(
             namespace,
             artifact_id,
@@ -3193,16 +3392,15 @@ class ToolRouter:
                 object_id=artifact_id,
                 filename=filename,
                 owner_email=session.user_email,
-                purpose=str(raw.get("purpose") or tool_name),
+                purpose=tool_name if published else str(raw.get("purpose") or tool_name),
                 kind=kind.value,
                 mime_type=mime_type,
                 size_bytes=len(content),
                 status="attached",
                 expires_at=None,
-                conversation_id=None
-                if tool_name == "artifact_publish"
-                else session.conversation_id,
-                session_id=None if tool_name == "artifact_publish" else session.session_id,
+                content_hash=hashlib.sha256(content).hexdigest(),
+                conversation_id=None if published else session.conversation_id,
+                session_id=None if published else session.session_id,
                 message_role="assistant",
             )
             await db_session.commit()
@@ -3369,7 +3567,7 @@ class ToolRouter:
             return None
         if tool_call.runtime_metadata.get("read_only_required") is not True:
             return None
-        if not is_plan_hidden_tool(registered_tool.definition):
+        if not is_plan_mutating_tool_call(registered_tool.definition, tool_call.arguments):
             return None
         return self._sanitize_result(
             tool_call.name,

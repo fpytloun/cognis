@@ -34,6 +34,7 @@ from sqlalchemy.orm import aliased
 from cognis.logging import get_logger
 from cognis.store.models import (
     Conversation,
+    DirectTurnRequestRow,
     ManagedConversationLink,
     StepRun,
     Task,
@@ -49,6 +50,20 @@ logger = get_logger(__name__)
 _TASK_TERMINAL_STATES = ("failed", "completed", "cancelled")
 _STEPRUN_NON_TERMINAL_STATES = ("running", "paused", "evaluating", "pending")
 _SESSION_TERMINAL_STATES = ("completed", "failed", "cancelled", "terminated")
+
+
+def _managed_active_turn_has_durable_request() -> Any:
+    """Return whether the managed link's active turn still has durable state."""
+
+    return exists(
+        select(DirectTurnRequestRow.request_id).where(
+            DirectTurnRequestRow.conversation_id == ManagedConversationLink.target_conversation_id,
+            DirectTurnRequestRow.turn_id == ManagedConversationLink.active_turn_id,
+            DirectTurnRequestRow.status.in_(
+                ("queued", "claimed", "running", "absorbing", "recoverable")
+            ),
+        )
+    )
 
 
 INVARIANT_RECONCILED_TOTAL = Counter(
@@ -234,8 +249,10 @@ async def _count_managed_conversation_terminal_state(
         )
     )
     if include_restart_stale:
-        violation |= (ManagedConversationLink.conversation_state == "open") & (
-            ManagedConversationLink.turn_state.in_(("queued", "running"))
+        violation |= (
+            (ManagedConversationLink.conversation_state == "open")
+            & (ManagedConversationLink.turn_state.in_(("queued", "running")))
+            & ~_managed_active_turn_has_durable_request()
         )
     stmt = select(ManagedConversationLink.link_id).where(violation)
     result = await session.execute(stmt)
@@ -285,6 +302,7 @@ async def _reconcile_managed_conversation_terminal_state(
             .where(
                 ManagedConversationLink.conversation_state == "open",
                 ManagedConversationLink.turn_state.in_(("queued", "running")),
+                ~_managed_active_turn_has_durable_request(),
             )
             .values(
                 turn_state="interrupted",

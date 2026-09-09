@@ -54,6 +54,7 @@ async def build_credential_request_resolution_data(
     response: str | None = None,
     response_payload: dict[str, object] | None = None,
     credential: Any | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, object]:
     """Store a requested credential and return safe metadata for the agent loop."""
 
@@ -94,14 +95,15 @@ async def build_credential_request_resolution_data(
                 f"Credential approval is missing required fields: {', '.join(missing)}"
             )
 
-    requested_metadata = (
-        requested.get("metadata") if isinstance(requested.get("metadata"), dict) else {}
-    )
+    raw_requested_metadata = requested.get("metadata")
+    requested_metadata = raw_requested_metadata if isinstance(raw_requested_metadata, dict) else {}
     credential_metadata = getattr(credential, "metadata", None) if credential is not None else None
     metadata = {
         **requested_metadata,
         **(credential_metadata if isinstance(credential_metadata, dict) else {}),
     }
+    if idempotency_key is not None:
+        metadata["idempotency_key"] = idempotency_key
     created = await credentials_provider.upsert_credential(
         credential_id=str(
             requested.get("credential_id")
@@ -135,6 +137,7 @@ async def build_auth_challenge_resolution_data(
     credentials_provider: Any,
     response: str | None = None,
     response_payload: dict[str, object] | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, object]:
     """Build safe resolution data for an auth challenge notification."""
 
@@ -170,7 +173,11 @@ async def build_auth_challenge_resolution_data(
             kind="text",
             label=f"Challenge response {notification.notification_id}",
             payload={"value": response_value},
-            metadata={"notification_id": notification.notification_id, "ephemeral": True},
+            metadata={
+                "notification_id": notification.notification_id,
+                "ephemeral": True,
+                **({"idempotency_key": idempotency_key} if idempotency_key else {}),
+            },
             description="Ephemeral auth challenge response",
             expires_at=datetime.now(UTC) + timedelta(minutes=10),
         )

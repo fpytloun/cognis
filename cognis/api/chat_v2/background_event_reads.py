@@ -22,6 +22,14 @@ BACKGROUND_EVENT_READ_BACKOFF_SECONDS = Gauge(
     "cognis_background_event_read_backoff_seconds",
     "Current controller-local delay before the next background event-read probe.",
 )
+BACKGROUND_EVENT_READ_ACTIVE = Gauge(
+    "cognis_background_event_read_active",
+    "Active controller-process background source head and event reads.",
+)
+BACKGROUND_EVENT_READ_LIMIT = Gauge(
+    "cognis_background_event_read_limit",
+    "Configured per-controller background source-read concurrency limit.",
+)
 
 
 class BackgroundEventReadAdmission:
@@ -47,6 +55,10 @@ class BackgroundEventReadAdmission:
         if not 0 <= jitter_ratio <= 0.5:
             raise ValueError("jitter_ratio must be between 0 and 0.5")
         self._slots = asyncio.Semaphore(max_concurrency)
+        self._max_concurrency = max_concurrency
+        self._active = 0
+        with contextlib.suppress(Exception):
+            BACKGROUND_EVENT_READ_LIMIT.set(max_concurrency)
         self._initial_backoff = initial_backoff_seconds
         self._max_backoff = max_backoff_seconds
         self._jitter_ratio = jitter_ratio
@@ -66,12 +78,17 @@ class BackgroundEventReadAdmission:
             "failure_count": self._failure_count,
             "next_probe_in_seconds": max(0.0, self._next_probe_at - self._clock()),
             "probe_active": self._probe_active,
+            "active": self._active,
+            "max_concurrency": self._max_concurrency,
         }
 
     async def run(self, operation: Callable[[], Awaitable[_Result]]) -> _Result:
         """Run one admitted background event read."""
 
         probe, failure_epoch = await self._acquire()
+        self._active += 1
+        with contextlib.suppress(Exception):
+            BACKGROUND_EVENT_READ_ACTIVE.set(self._active)
         try:
             result = await operation()
         except asyncio.CancelledError:
@@ -80,8 +97,13 @@ class BackgroundEventReadAdmission:
         except BaseException:
             await self._release_failed(probe)
             raise
-        await self._release_succeeded(probe, failure_epoch)
-        return result
+        else:
+            await self._release_succeeded(probe, failure_epoch)
+            return result
+        finally:
+            self._active -= 1
+            with contextlib.suppress(Exception):
+                BACKGROUND_EVENT_READ_ACTIVE.set(self._active)
 
     async def _acquire(self) -> tuple[bool, int]:
         while True:

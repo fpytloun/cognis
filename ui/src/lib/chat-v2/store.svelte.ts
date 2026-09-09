@@ -3,6 +3,7 @@ import type {
   ChatRealtimeFrame,
   ChatSnapshot,
   ChatSyncResponse,
+  QueueMessage,
   QueueMutationResponse,
   SendMessageV2Response,
   TimelineBackfillResponse,
@@ -13,15 +14,20 @@ import type { AttachmentRef } from '$lib/types/api';
 import {
   addOptimisticUserMessage,
   addLocalSystemMessage,
-  applyBackfill,
+  applyBackfillResult,
   applyCancelResponse,
   applyQueueMutationResponse,
   applyRealtimeFrame,
   applySendResponse,
   applySnapshot,
   applySyncResponse,
+  deleteQueuedAdmission,
   emptyChatV2State,
   markOptimisticUserMessageFailed,
+  promoteQueuedUserMessage,
+  replaceCanonicalQueue,
+  updateQueuedAdmissionContent,
+  visibleQueueMessages,
   visibleTimelineItems,
   type ChatV2ClientState,
   type ChatV2SyncResult
@@ -38,6 +44,7 @@ export class ChatV2Store {
   private mutationRevision = 0;
 
   readonly visibleItems: TimelineItem[] = $derived(visibleTimelineItems(this._state));
+  readonly visibleQueue = $derived(visibleQueueMessages(this._state));
   readonly cycleStates: TurnCycleState[] = $derived(this._state.cycleStates);
 
   get snapshot(): ChatV2ClientState {
@@ -63,6 +70,22 @@ export class ChatV2Store {
     return true;
   }
 
+  replaceFromSnapshotForCanonicalBootstrap(
+    snapshot: ChatSnapshot,
+    watermark: ChatV2RefreshWatermark,
+    bootstrapPending: boolean
+  ): boolean {
+    if (bootstrapPending) {
+      this.replaceState(applySnapshot(
+        snapshot,
+        this._state,
+        { adoptUnscopedLocalAdmissions: true },
+      ));
+      return true;
+    }
+    return this.replaceFromSnapshotIfUnchanged(snapshot, watermark);
+  }
+
   replaceFromSnapshot(snapshot: ChatSnapshot): void {
     this.replaceState(applySnapshot(snapshot, this._state));
   }
@@ -72,12 +95,23 @@ export class ChatV2Store {
     attachments?: AttachmentRef[];
     clientMessageId: string;
     createdAt?: string;
+    chatMode?: 'default' | 'plan' | 'build';
   }): void {
     this.replaceState(addOptimisticUserMessage(this._state, input));
   }
 
   markOptimisticUserFailed(clientMessageId: string): void {
     this.replaceState(markOptimisticUserMessageFailed(this._state, clientMessageId));
+  }
+
+  promoteQueuedUser(input: {
+    content: string;
+    attachments?: AttachmentRef[];
+    clientMessageId: string;
+    createdAt?: string;
+    chatMode?: 'default' | 'plan' | 'build';
+  }): void {
+    this.replaceState(promoteQueuedUserMessage(this._state, input));
   }
 
   addLocalSystemMessage(input: { id: string; content: string; noticeId?: string | null; createdAt?: string }): void {
@@ -96,8 +130,10 @@ export class ChatV2Store {
     return result;
   }
 
-  applyBackfill(response: TimelineBackfillResponse): void {
-    this.replaceState(applyBackfill(this._state, response));
+  applyBackfill(response: TimelineBackfillResponse): boolean {
+    const result = applyBackfillResult(this._state, response);
+    this.replaceState(result.state);
+    return result.admitted;
   }
 
   applySend(response: SendMessageV2Response): void {
@@ -110,6 +146,26 @@ export class ChatV2Store {
 
   applyQueueMutation(response: QueueMutationResponse): void {
     this.replaceState(applyQueueMutationResponse(this._state, response));
+  }
+
+  replaceQueue(queue: NonNullable<ChatV2ClientState['queue']>): void {
+    this.replaceState(replaceCanonicalQueue(this._state, queue));
+  }
+
+  updateQueuedAdmission(
+    queueId: string,
+    content: string,
+    source?: Pick<QueueMessage, 'client_message_id' | 'attachments' | 'created_at'>
+  ): void {
+    this.replaceState(updateQueuedAdmissionContent(this._state, queueId, content, {
+      clientMessageId: source?.client_message_id,
+      attachments: source?.attachments,
+      createdAt: source?.created_at
+    }));
+  }
+
+  deleteQueuedAdmission(queueId: string, clientMessageId?: string | null): void {
+    this.replaceState(deleteQueuedAdmission(this._state, queueId, clientMessageId));
   }
 
   reset(): void {
@@ -150,7 +206,11 @@ export class ChatV2Store {
     // the cache. $state.snapshot is proxy-safe whether the input is plain data
     // or a reactive proxy from a caller.
     const restored = $state.snapshot(state) as ChatV2ClientState;
-    this.replaceState({ ...restored, cycleStates: restored.cycleStates ?? [] });
+    this.replaceState({
+      ...restored,
+      cycleStates: restored.cycleStates ?? [],
+      admissionPlacements: restored.admissionPlacements ?? {}
+    });
   }
 
   /**

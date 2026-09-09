@@ -14,6 +14,16 @@ def test_sanitize_client_error_detail_redacts_api_keys() -> None:
     assert "[redacted]" in detail
 
 
+def test_sanitize_client_error_detail_redacts_generic_tokens() -> None:
+    detail = sanitize_client_error_detail(
+        "Database failed with token=secret-value password=hunter2",
+        fallback="request failed",
+    )
+    assert "secret-value" not in detail
+    assert "hunter2" not in detail
+    assert detail.count("[redacted]") == 2
+
+
 def test_sanitize_client_error_detail_redacts_long_quoted_content() -> None:
     detail = sanitize_client_error_detail(
         'Provider error: "' + ("x" * 80) + '"',

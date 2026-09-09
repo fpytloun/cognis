@@ -833,7 +833,7 @@ def test_runtime_operations_require_exact_authorized_targets_and_safe_payloads(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         owner_headers = _auth_headers(client.app, email="owner@example.com")
         other_headers = _auth_headers(client.app, email="other@example.com")
         viewer_headers = _auth_headers(

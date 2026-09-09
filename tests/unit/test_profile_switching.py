@@ -16,6 +16,9 @@ class _DatabaseSession:
     async def rollback(self) -> None:
         self.rollbacks += 1
 
+    async def flush(self) -> None:
+        return None
+
 
 class _SessionFactory:
     def __init__(self, db: _DatabaseSession) -> None:
@@ -40,7 +43,10 @@ class _SessionCache:
         self.reasoning_overrides: list[tuple[str, None]] = []
         self.tool_runtime_info: list[tuple[str, None]] = []
 
-    def set_model_override(self, session_id: str, value: None) -> None:
+    def set_model_override(
+        self, session_id: str, value: None, provider_id: str | None = None
+    ) -> None:
+        del provider_id
         self.model_overrides.append((session_id, value))
 
     def set_reasoning_effort_override(self, session_id: str, value: None) -> None:
@@ -56,27 +62,42 @@ async def test_persist_agent_profile_switch_respects_conversation_scope(
     monkeypatch: pytest.MonkeyPatch,
     persist_conversation: bool,
 ) -> None:
-    stored_conversations: list[tuple[str, str]] = []
-    stored_sessions: list[tuple[str, str]] = []
-
-    async def _set_conversation(_db: object, conversation_id: str, profile_id: str) -> None:
-        stored_conversations.append((conversation_id, profile_id))
-
-    async def _set_session(_db: object, session_id: str, profile_id: str) -> None:
-        stored_sessions.append((session_id, profile_id))
-
-    monkeypatch.setattr(
-        "cognis.store.queries.set_conversation_agent_profile_id",
-        _set_conversation,
-    )
-    monkeypatch.setattr(
-        "cognis.store.queries.set_session_agent_profile_id",
-        _set_session,
-    )
     db = _DatabaseSession()
     cache = _SessionCache()
-    conversation = SimpleNamespace(conversation_id="conv-1", agent_profile_id="developer")
-    session = SimpleNamespace(session_id="sess-1", agent_profile_id="developer")
+    conversation = SimpleNamespace(
+        conversation_id="conv-1",
+        active_session_id="sess-1",
+        agent_profile_id="developer",
+        updated_at=None,
+    )
+    session = SimpleNamespace(
+        session_id="sess-1",
+        conversation_id="conv-1",
+        agent_profile_id="developer",
+        model_override="old-model",
+        model_override_provider_id="old-provider",
+        reasoning_effort_override="high",
+        fast_mode_override=True,
+        runtime_override_revision=3,
+        updated_at=None,
+    )
+
+    async def _get_conversation_for_update(_db: object, conversation_id: str) -> object:
+        assert conversation_id == conversation.conversation_id
+        return conversation
+
+    async def _get_session_for_update(_db: object, session_id: str) -> object:
+        assert session_id == session.session_id
+        return session
+
+    monkeypatch.setattr(
+        "cognis.store.queries.get_conversation_for_update",
+        _get_conversation_for_update,
+    )
+    monkeypatch.setattr(
+        "cognis.store.queries.get_session_for_update",
+        _get_session_for_update,
+    )
 
     await persist_agent_profile_switch(
         session_factory=_SessionFactory(db),
@@ -87,10 +108,13 @@ async def test_persist_agent_profile_switch_respects_conversation_scope(
         persist_conversation=persist_conversation,
     )
 
-    assert stored_sessions == [("sess-1", "senior")]
-    assert stored_conversations == ([("conv-1", "senior")] if persist_conversation else [])
     assert session.agent_profile_id == "senior"
     assert conversation.agent_profile_id == ("senior" if persist_conversation else "developer")
+    assert session.model_override is None
+    assert session.model_override_provider_id is None
+    assert session.reasoning_effort_override is None
+    assert session.fast_mode_override is None
+    assert session.runtime_override_revision == 4
     assert cache.model_overrides == [("sess-1", None)]
     assert cache.reasoning_overrides == [("sess-1", None)]
     assert cache.tool_runtime_info == [("sess-1", None)]

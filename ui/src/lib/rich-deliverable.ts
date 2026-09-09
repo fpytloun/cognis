@@ -46,9 +46,15 @@ export const SUPPORTED_RICH_BLOCK_TYPES = new Set([
   'link_preview',
   'source_list',
   'code',
+  'section_header',
 ]);
 
 export interface RichDeliverablePayload {
+  /** Optional payload-level document title. The host-supplied `title` prop
+   * on `RichDeliverable` (the deliverable's own stored title/label) always
+   * takes precedence when set -- this is only a fallback for payloads
+   * authored with the title inline instead of as separate host metadata. */
+  title?: string;
   blocks: RichBlock[];
   assets: Record<string, unknown>[];
   sources: Record<string, unknown>[];
@@ -71,10 +77,26 @@ export function privateDeliverableMediaUrl(
   return `/api/v1/deliverables/${encodeURIComponent(deliverableId)}/media/${encodeURIComponent(mediaKey)}${query}`;
 }
 
-export type RichPresentation = 'default' | 'pulse';
+export type RichPresentation = 'default' | 'pulse' | 'dashboard';
 
 export function richPresentation(metadata: Record<string, unknown>): RichPresentation {
-  return metadata.presentation === 'pulse' ? 'pulse' : 'default';
+  if (metadata.presentation === 'pulse') return 'pulse';
+  if (metadata.presentation === 'dashboard') return 'dashboard';
+  return 'default';
+}
+
+/** Host-managed canvas width intent. `standard` preserves each surface's
+ * existing bounded width (unchanged); `wide` opts a payload into a
+ * materially wider bounded canvas in the surfaces that own their own width
+ * (full-view modal, standalone page) -- dense multi-column dashboards need
+ * more lateral room than long-form prose. Embedded chat rendering already
+ * fills whatever width its host container grants (no self-imposed cap), so
+ * `wide` there is a no-op by design: the host, not this component, decides
+ * how much room an embedded card gets. */
+export type RichCanvas = 'standard' | 'wide';
+
+export function richCanvas(metadata: Record<string, unknown>): RichCanvas {
+  return metadata.canvas === 'wide' ? 'wide' : 'standard';
 }
 
 export type RichDensity = 'airy' | 'dense';
@@ -87,7 +109,7 @@ export type RichDensity = 'airy' | 'dense';
 const DENSITY_SIGNAL_TYPES = new Set([
   'dashboard', 'status', 'status_grid', 'metric', 'kv', 'key_value',
   'table', 'comparison_matrix', 'decision_matrix', 'chart', 'incident_timeline',
-  'incident_checklist', 'checklist',
+  'incident_checklist', 'checklist', 'section_header',
 ]);
 
 /** Density is a spacing-rhythm heuristic, not an authoring requirement:
@@ -98,9 +120,15 @@ const DENSITY_SIGNAL_TYPES = new Set([
  * rhythm); a composition dominated by prose/research/narrative blocks
  * stays "airy" (the default, more generous rhythm). Requires a minimum
  * absolute count so a single metric in an otherwise long-form document
- * doesn't flip the whole document dense. */
+ * doesn't flip the whole document dense.
+ *
+ * `compact`/`comfortable` are the author-facing metadata vocabulary and
+ * are accepted as aliases of the internal `dense`/`airy` values so both
+ * vocabularies resolve identically -- no behavior change for existing
+ * `dense`/`airy` authors. */
 export function richDensity(metadata: Record<string, unknown>, blocks: RichBlock[]): RichDensity {
-  if (metadata.density === 'dense' || metadata.density === 'airy') return metadata.density;
+  if (metadata.density === 'dense' || metadata.density === 'compact') return 'dense';
+  if (metadata.density === 'airy' || metadata.density === 'comfortable') return 'airy';
   let total = 0;
   let signals = 0;
   const visit = (block: RichBlock) => {
@@ -150,6 +178,7 @@ export function normalizeRichDeliverable(value: unknown): RichDeliverablePayload
     ? raw.blocks.map((block) => block && typeof block === 'object' && !Array.isArray(block) ? block as RichBlock : { type: 'unknown', raw: block })
     : [];
   return {
+    title: typeof raw.title === 'string' ? raw.title : undefined,
     blocks,
     assets: list('assets'),
     sources: list('sources'),

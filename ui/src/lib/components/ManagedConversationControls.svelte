@@ -24,6 +24,14 @@
   const conversationState = $derived(conversation.managed_agent?.conversation_state ?? 'open');
   const turnState = $derived(managedConversationTurnState(conversation));
   const active = $derived(turnState === 'running' || turnState === 'queued');
+  const parentConversationId = $derived(
+    conversation.managed_agent?.controller_conversation_id
+      ?? conversation.root_controller_conversation_id
+      ?? null
+  );
+  const showParentConversation = $derived(
+    parentConversationId !== null && parentConversationId !== conversation.conversation_id
+  );
 </script>
 
 <section class="rounded-2xl border border-sky-500/30 bg-sky-500/10 px-4 py-3 text-sm text-sky-100" data-testid="managed-conversation-controls">
@@ -31,6 +39,12 @@
     <div class="min-w-0 sm:flex-1">
       <p class="font-medium">Agent work</p>
       <p class="mt-1 text-sky-100/80">Read-only target conversation · state {conversationState} · turn {turnState}</p>
+      {#if showParentConversation && parentConversationId}
+        <a
+          class="mt-1 inline-flex text-xs text-sky-200 underline decoration-sky-300/50 underline-offset-2 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300"
+          href={`/chat/${encodeURIComponent(parentConversationId)}`}
+        >Parent conversation</a>
+      {/if}
       {#if conversation.managed_agent?.last_error && !active}
         <p class="mt-2 break-words text-xs text-rose-100">Last error: {conversation.managed_agent.last_error}</p>
       {/if}

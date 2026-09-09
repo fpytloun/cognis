@@ -133,7 +133,11 @@ def suppress_chatgpt_default_instructions() -> bool:
         return ""
 
     common_utils.get_chatgpt_default_instructions = _empty_default_instructions
-    transformation.get_chatgpt_default_instructions = _empty_default_instructions
+    setattr(  # noqa: B010 - LiteLLM omits this dynamic helper from its type surface.
+        transformation,
+        "get_chatgpt_default_instructions",
+        _empty_default_instructions,
+    )
     setattr(common_utils, _SUPPRESS_INSTRUCTIONS_SENTINEL, True)
     logger.debug(
         "chatgpt_patches: ChatGPT default instructions helper patched to return empty string"

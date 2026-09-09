@@ -3,8 +3,9 @@ export type ConversationInfoMode = ConversationInfoTab | 'context';
 export type ConversationInfoPresentation = 'closed' | 'pinned' | 'overlay' | 'focus';
 
 const STORAGE_KEY = 'cognis.conversationInfo.v2';
-export const INSPECTOR_MIN_WIDTH = 384;
-export const INSPECTOR_DEFAULT_WIDTH = 512;
+const LEGACY_INSPECTOR_DEFAULT_WIDTH = 512;
+export const INSPECTOR_MIN_WIDTH = 320;
+export const INSPECTOR_DEFAULT_WIDTH = 352;
 export const INSPECTOR_MAX_WIDTH = 960;
 
 class ConversationInfoDrawerState {
@@ -58,7 +59,9 @@ class ConversationInfoDrawerState {
           : 'overview';
       this.preferredPinned = value.preferredPinned !== false;
       if (Number.isFinite(value.preferredWidth)) {
-        this.preferredWidth = this.clampWidth(value.preferredWidth!);
+        this.preferredWidth = value.preferredWidth === LEGACY_INSPECTOR_DEFAULT_WIDTH
+          ? INSPECTOR_DEFAULT_WIDTH
+          : this.clampWidth(value.preferredWidth!);
       }
     } catch {
       // Ignore invalid preferences and keep safe defaults.

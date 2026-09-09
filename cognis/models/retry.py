@@ -13,9 +13,11 @@ class RetryReason(StrEnum):
 def normalize_retry_reason(value: RetryReason | str | None) -> RetryReason:
     if isinstance(value, RetryReason):
         return value
+    if value is None:
+        return RetryReason.TRANSIENT_RUNTIME
     try:
         return RetryReason(value)
-    except (TypeError, ValueError):
+    except ValueError:
         return RetryReason.TRANSIENT_RUNTIME
 
 

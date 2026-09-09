@@ -35,6 +35,28 @@ Approved-exception baseline for `claude_code`:
 
 ## Memory Provider (Mnemory)
 
+Cognis keeps canonical Mnemory record IDs at the provider and audit boundaries.
+Model-visible structured memory results replace those IDs with Intaris-session
+aliases. The controller resolves aliases before provider calls and rejects
+unknown or stale aliases without forwarding them. Mnemory's current
+`/api/memories/recent` contract returns formatted text without record IDs, so
+`memory_recent` is the only result path that cannot create aliases. Cognis does
+not parse arbitrary formatted memory text.
+
+Before a mutation through an alias, Cognis fetches the current record and
+compares its revision identity with the bound identity. A mismatch rejects the
+mutation as stale. Native Mnemory revision tokens are also sent as an
+`If-Match` precondition. Older Mnemory versions use the deterministic record
+snapshot comparison to detect a stale alias. Cognis rejects an alias mutation
+when Mnemory does not provide an atomic native revision token. A caller can
+still use a canonical memory ID for the compatible unconditional operation.
+
+Known structured memory-reference fields use aliases. Cognis omits an
+unresolved reference instead of exposing its canonical memory ID. Artifact IDs
+remain unchanged. A signed artifact URL can contain a canonical memory ID
+because the Mnemory signature binds that transport URL to the canonical
+resource. Cognis does not rewrite signed URLs.
+
 Memory backends additionally expose server-owned descriptor metadata, strict
 option validation/defaults, and a resolver to a provider-neutral frozen policy:
 `enabled`, bootstrap instructions/core behavior, `auto_recall`,

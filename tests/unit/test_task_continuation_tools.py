@@ -163,11 +163,15 @@ async def test_list_task_step_runs_allows_owned_task_from_main_chat(
             "step_type": "direct",
             "status": "approved",
             "attempt": 1,
+            "attempt_number": 1,
+            "superseded_by_step_run_id": None,
             "agent_id": "agent-owner",
             "conversation_id": "conv-owner",
             "session_id": None,
             "intaris_session_id": None,
             "deliverable_id": "dlv_owner",
+            "started_at": None,
+            "completed_at": None,
             "runtime_info": {"source": "test"},
         }
     ]

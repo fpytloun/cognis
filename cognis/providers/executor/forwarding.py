@@ -11,11 +11,12 @@ import math
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from websockets.asyncio.client import ClientConnection, connect
 
+from cognis.logging import get_logger
 from cognis.models.local_models import (
     OllamaRuntimeOperationStatus,
     OllamaRuntimeStartRequest,
@@ -23,6 +24,8 @@ from cognis.models.local_models import (
 )
 from cognis.models.tool import ExecutorCapabilities, ToolCall, ToolResult
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
+
+_logger = get_logger(__name__)
 
 BRIDGE_EVENT_QUEUE_SIZE = 128
 BRIDGE_MAX_PENDING_CALLS = 32
@@ -35,6 +38,15 @@ BRIDGE_RESULT_CHUNK_BYTES = 180 * 1024
 BRIDGE_RESULT_ASSEMBLY_TIMEOUT_SECONDS = 30.0
 BRIDGE_MAX_RESULT_CHUNKS = math.ceil(BRIDGE_RESULT_MAX_BYTES / BRIDGE_RESULT_CHUNK_BYTES)
 BRIDGE_MAX_ACTIVE_ASSEMBLIES = 32
+# A retired proxy keeps serving its in-flight calls for at most this long. One
+# session's transport failure must not abort another session's running tool.
+BRIDGE_RETIRE_DRAIN_TIMEOUT_SECONDS = 600.0
+
+
+def _bridge_write_was_rejected(exc: Exception) -> bool:
+    """Return whether the local bridge client rejected a write before transport."""
+
+    return isinstance(exc, RuntimeError) and 'Cannot call "send" once' in str(exc)
 
 
 class ForwardedDeliveryError(ExecutorDeliveryError):
@@ -51,6 +63,7 @@ class ForwardedDeliveryError(ExecutorDeliveryError):
         epoch: int | None = None,
         code: str = "executor_delivery_failure",
         retry_after: float | None = None,
+        executor_instance_id: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -61,6 +74,7 @@ class ForwardedDeliveryError(ExecutorDeliveryError):
             owner_id=owner_id,
             epoch=epoch,
             retry_after=retry_after,
+            executor_instance_id=executor_instance_id,
         )
 
 
@@ -72,6 +86,7 @@ class _PendingCall:
     )
     accepted: bool = False
     submitted: bool = False
+    accepted_event: asyncio.Event = field(default_factory=asyncio.Event)
     assembly: _ResultAssembly | None = None
 
 
@@ -126,6 +141,11 @@ class ForwardedExecutorConnection:
         self._active_assemblies = 0
         self._cancel_tasks: set[asyncio.Task[None]] = set()
         self._closing = False
+        self._retiring = False
+        self._drain_task: asyncio.Task[None] | None = None
+        self._pending_changed = asyncio.Event()
+        self.executor_instance_id: str | None = None
+        self.retirement_started_at: float | None = None
 
     @property
     def connected(self) -> bool:
@@ -134,6 +154,93 @@ class ForwardedExecutorConnection:
     @property
     def closing(self) -> bool:
         return self._closing
+
+    @property
+    def retiring(self) -> bool:
+        """Whether this proxy still drains in-flight calls but takes no new ones."""
+
+        return self._retiring
+
+    @property
+    def pending_call_count(self) -> int:
+        """Number of forwarded calls still awaiting an outcome."""
+
+        return len(self._pending)
+
+    @property
+    def drain_task(self) -> asyncio.Task[None] | None:
+        """Task draining a retired proxy, when retirement is active."""
+
+        return self._drain_task
+
+    async def retire(
+        self,
+        *,
+        drain_timeout: float = BRIDGE_RETIRE_DRAIN_TIMEOUT_SECONDS,
+    ) -> None:
+        """Stop routing new calls here and close once in-flight calls finish.
+
+        One proxy is shared by every session that targets the same remote
+        executor owner. Closing it on a single call's transport failure would
+        fail every other session's in-flight tool call, so a failed call retires
+        the proxy instead: new calls build a fresh transport while existing calls
+        are allowed to complete.
+        """
+
+        if self._closing or self._retiring:
+            return
+        self._retiring = True
+        self.retirement_started_at = asyncio.get_running_loop().time()
+        if not self._pending:
+            await self.close()
+            return
+        _logger.info(
+            "bridge client: retiring proxy with in-flight calls",
+            extra={
+                "extra_data": {
+                    "executor_id": self.executor_id,
+                    "owner_id": self.owner_id,
+                    "epoch": self.epoch,
+                    "in_flight_calls": len(self._pending),
+                    "drain_timeout_seconds": drain_timeout,
+                }
+            },
+        )
+        self._drain_task = asyncio.create_task(
+            self._drain_then_close(drain_timeout),
+            name=f"forwarded-executor-drain-{self.executor_id}-{self.epoch}",
+        )
+
+    async def _drain_then_close(self, drain_timeout: float) -> None:
+        deadline = asyncio.get_running_loop().time() + max(drain_timeout, 0.0)
+        try:
+            while self._pending:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                self._pending_changed.clear()
+                if not self._pending:
+                    break
+                try:
+                    await asyncio.wait_for(self._pending_changed.wait(), timeout=remaining)
+                except TimeoutError:
+                    break
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._pending:
+                _logger.warning(
+                    "bridge client: retired proxy drain timed out",
+                    extra={
+                        "extra_data": {
+                            "executor_id": self.executor_id,
+                            "owner_id": self.owner_id,
+                            "epoch": self.epoch,
+                            "in_flight_calls": len(self._pending),
+                        }
+                    },
+                )
+            await asyncio.shield(self.close())
 
     def _clear_assembly(self, pending: _PendingCall) -> None:
         assembly = pending.assembly
@@ -148,6 +255,7 @@ class ForwardedExecutorConnection:
         pending = self._pending.pop(call_id, None)
         if pending is not None:
             self._clear_assembly(pending)
+            self._pending_changed.set()
         return pending
 
     def _schedule_cancel(self, call_id: str) -> None:
@@ -369,6 +477,8 @@ class ForwardedExecutorConnection:
                 if self._closing:
                     raise ForwardedDeliveryError("Controller bridge is closing", "not_sent")
                 self._negotiated_capabilities = negotiated_capabilities
+                instance_id = response.get("executor_instance_id")
+                self.executor_instance_id = instance_id if isinstance(instance_id, str) else None
                 self._opening_ws = None
                 self._ws = ws
                 self._connected = True
@@ -393,18 +503,19 @@ class ForwardedExecutorConnection:
         self,
         frame: dict[str, Any],
         *,
-        on_send_attempt: Callable[[], None] | None = None,
+        on_sent: Callable[[], None] | None = None,
     ) -> None:
         encoded = self._encode_frame(frame)
         await self._ensure_open()
         if self._ws is None:
             raise ForwardedDeliveryError("Bridge is unavailable", "not_sent")
         async with self._send_lock:
-            if on_send_attempt is not None:
-                on_send_attempt()
             await self._ws.send(encoded)
+            if on_sent is not None:
+                on_sent()
 
     async def _receive_loop(self) -> None:
+        termination_reason = "event_queue_overflow"
         try:
             assert self._ws is not None
             async for raw in self._ws:
@@ -416,6 +527,7 @@ class ForwardedExecutorConnection:
                 frame_type = frame.get("type")
                 if frame_type == "accepted":
                     pending.accepted = True
+                    pending.accepted_event.set()
                 elif frame_type == "event":
                     try:
                         pending.events.put_nowait(frame)
@@ -425,10 +537,15 @@ class ForwardedExecutorConnection:
                                 ForwardedDeliveryError(
                                     "Forwarded event queue overflow",
                                     "accepted_unknown",
+                                    executor_id=self.executor_id,
+                                    owner_id=self.owner_id,
+                                    epoch=self.epoch,
+                                    executor_instance_id=self.executor_instance_id,
                                 )
                             )
-                        await self.close()
-                        return
+                        self._pop_pending(call_id)
+                        self._schedule_cancel(call_id)
+                        continue
                 elif frame_type == "result":
                     if pending.assembly is not None:
                         self._protocol_failure(call_id, "Unexpected unchunked result")
@@ -471,15 +588,34 @@ class ForwardedExecutorConnection:
                             retry_after=float(frame["retry_after"])
                             if isinstance(frame.get("retry_after"), (int, float))
                             else None,
+                            executor_instance_id=frame.get("executor_instance_id")
+                            if isinstance(frame.get("executor_instance_id"), str)
+                            else (self.executor_instance_id if pending.accepted else None),
                         )
                     )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            termination_reason = type(exc).__name__
+        else:
+            termination_reason = "peer_closed"
         finally:
             self._connected = False
-            for call_id in tuple(self._pending):
+            abandoned = tuple(self._pending)
+            if abandoned:
+                _logger.warning(
+                    "bridge client: receive loop ended with in-flight calls",
+                    extra={
+                        "extra_data": {
+                            "executor_id": self.executor_id,
+                            "owner_id": self.owner_id,
+                            "epoch": self.epoch,
+                            "in_flight_calls": len(abandoned),
+                            "reason": termination_reason,
+                        }
+                    },
+                )
+            for call_id in abandoned:
                 pending = self._pop_pending(call_id)
                 if pending is None:
                     continue
@@ -488,6 +624,12 @@ class ForwardedExecutorConnection:
                         ForwardedDeliveryError(
                             "Controller bridge disconnected",
                             "accepted_unknown" if pending.submitted else "not_sent",
+                            executor_id=self.executor_id,
+                            owner_id=self.owner_id,
+                            epoch=self.epoch,
+                            executor_instance_id=(
+                                self.executor_instance_id if pending.accepted else None
+                            ),
                         )
                     )
 
@@ -498,8 +640,19 @@ class ForwardedExecutorConnection:
         *,
         timeout: float,
     ) -> tuple[str, _PendingCall]:
+        if self._retiring:
+            # Never physically sent, so the caller may safely re-resolve a live
+            # proxy and dispatch again.
+            raise ForwardedDeliveryError("Controller bridge is retired", "not_sent")
         if len(self._pending) >= BRIDGE_MAX_PENDING_CALLS:
-            raise ForwardedDeliveryError("Forwarded call limit exceeded", "not_sent")
+            raise ForwardedDeliveryError(
+                "Forwarded call limit exceeded",
+                "not_sent",
+                code="executor_bridge_capacity",
+                executor_id=self.executor_id,
+                owner_id=self.owner_id,
+                epoch=self.epoch,
+            )
         call_id = uuid.uuid4().hex
         pending = _PendingCall(future=asyncio.get_running_loop().create_future())
         self._pending[call_id] = pending
@@ -521,7 +674,7 @@ class ForwardedExecutorConnection:
             self._encode_frame(call_frame)
             await self._send(
                 call_frame,
-                on_send_attempt=lambda: setattr(pending, "submitted", True),
+                on_sent=lambda: setattr(pending, "submitted", True),
             )
         except asyncio.CancelledError:
             cancel_task = asyncio.create_task(self._cancel(call_id))
@@ -538,7 +691,11 @@ class ForwardedExecutorConnection:
                 raise
             raise ForwardedDeliveryError(
                 "Bridge call submission outcome is unknown",
-                "accepted_unknown",
+                "not_sent" if _bridge_write_was_rejected(exc) else "accepted_unknown",
+                executor_id=self.executor_id,
+                owner_id=self.owner_id,
+                epoch=self.epoch,
+                executor_instance_id=(None),
             ) from exc
         return call_id, pending
 
@@ -605,6 +762,10 @@ class ForwardedExecutorConnection:
             error = ForwardedDeliveryError(
                 "Forwarded RPC timed out",
                 "accepted_unknown" if pending.submitted else "not_sent",
+                executor_id=self.executor_id,
+                owner_id=self.owner_id,
+                epoch=self.epoch,
+                executor_instance_id=(self.executor_instance_id if pending.accepted else None),
             )
             if (
                 replay_safe
@@ -635,36 +796,88 @@ class ForwardedExecutorConnection:
         )
         return list(result.get("tools") or [])
 
+    async def fetch_tool_result(self, call_id: str, *, timeout: float = 30.0) -> dict[str, Any]:
+        """Forward an outcome lookup so HA turns can reconcile after reconnects.
+
+        The owner controller relays this to the executor, whose reply carries the
+        authoritative ``executor_instance_id`` the caller must verify.
+        """
+
+        result = await self.rpc_call(
+            "tool.result_fetch",
+            {"call_id": call_id},
+            timeout=timeout,
+            replay_safe=True,
+        )
+        return result if isinstance(result, dict) else {}
+
     async def tool_execute(
         self,
         tool_call: ToolCall,
         timeout_seconds: int | None = None,
         output_chunk_callback: Any | None = None,
+        before_send: Any | None = None,
+        on_sent: Any | None = None,
     ) -> ToolResult:
         timeout = float(timeout_seconds or 300)
+        await self._ensure_open()
+        if before_send is not None:
+            await before_send(self.executor_id, self.executor_instance_id)
         call_id, pending = await self._start_call(
             "tool",
             {"tool_call": tool_call.model_dump(mode="json")},
             timeout=timeout,
         )
         self._tool_bridge_ids[tool_call.call_id] = call_id
+        accepted_task: asyncio.Task[bool] | None = None
         try:
-            while not pending.future.done() or not pending.events.empty():
-                event_task = asyncio.create_task(pending.events.get())
-                done, _ = await asyncio.wait(
-                    {pending.future, event_task},
+            if on_sent is not None:
+                accepted_task = asyncio.create_task(pending.accepted_event.wait())
+                accepted_done, _ = await asyncio.wait(
+                    cast(set[asyncio.Future[Any]], {accepted_task, pending.future}),
                     timeout=timeout + 1,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not done:
+                if accepted_task in accepted_done:
+                    await on_sent(self.executor_id, self.executor_instance_id)
+                elif pending.future in accepted_done:
+                    accepted_task.cancel()
+                    await asyncio.gather(accepted_task, return_exceptions=True)
+                    # Propagate an early bridge error/result before entering the
+                    # normal progress loop. No physical acceptance was confirmed.
+                    return ToolResult.model_validate(await pending.future)
+                else:
+                    await self._cancel(call_id)
+                    raise ForwardedDeliveryError(
+                        "Forwarded tool acceptance timed out",
+                        "accepted_unknown" if pending.submitted else "not_sent",
+                        executor_id=self.executor_id,
+                        owner_id=self.owner_id,
+                        epoch=self.epoch,
+                        executor_instance_id=None,
+                    )
+            while not pending.future.done() or not pending.events.empty():
+                event_task = asyncio.create_task(pending.events.get())
+                event_done, _ = await asyncio.wait(
+                    cast(set[asyncio.Future[Any]], {pending.future, event_task}),
+                    timeout=timeout + 1,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not event_done:
                     event_task.cancel()
                     await asyncio.gather(event_task, return_exceptions=True)
                     await self._cancel(call_id)
                     raise ForwardedDeliveryError(
                         "Forwarded tool timed out",
                         "accepted_unknown" if pending.submitted else "not_sent",
+                        executor_id=self.executor_id,
+                        owner_id=self.owner_id,
+                        epoch=self.epoch,
+                        executor_instance_id=(
+                            self.executor_instance_id if pending.accepted else None
+                        ),
                     )
-                if event_task in done:
+                if event_task in event_done:
                     event = event_task.result()
                     if output_chunk_callback is not None:
                         payload = event.get("payload") or {}
@@ -679,6 +892,9 @@ class ForwardedExecutorConnection:
             await self._cancel(call_id)
             raise
         finally:
+            if accepted_task is not None and not accepted_task.done():
+                accepted_task.cancel()
+                await asyncio.gather(accepted_task, return_exceptions=True)
             self._pop_pending(call_id)
             self._tool_bridge_ids.pop(tool_call.call_id, None)
 
@@ -687,6 +903,11 @@ class ForwardedExecutorConnection:
         pending = self._pending.get(bridge_id) if bridge_id is not None else None
         if bridge_id is not None:
             await self._cancel(bridge_id)
+        else:
+            # A replacement bridge has no requester-local bridge ID. Cancel by
+            # the stable executor call ID through the physical connection.
+            with contextlib.suppress(Exception):
+                await self.rpc_call("tool.cancel", {"call_id": call_id}, timeout=10.0)
         if pending is not None and not pending.future.done():
             pending.future.cancel()
 
@@ -749,6 +970,10 @@ class ForwardedExecutorConnection:
 
     async def close(self) -> None:
         self._closing = True
+        drain_task = self._drain_task
+        self._drain_task = None
+        if drain_task is not None and drain_task is not asyncio.current_task():
+            drain_task.cancel()
         receiver = self._receiver
         if receiver is not None and receiver is not asyncio.current_task():
             receiver.cancel()
@@ -757,6 +982,18 @@ class ForwardedExecutorConnection:
         opening_ws = self._opening_ws
         self._opening_ws = None
         self._connected = False
+        if self._pending:
+            _logger.warning(
+                "bridge client: closing proxy with in-flight calls",
+                extra={
+                    "extra_data": {
+                        "executor_id": self.executor_id,
+                        "owner_id": self.owner_id,
+                        "epoch": self.epoch,
+                        "in_flight_calls": len(self._pending),
+                    }
+                },
+            )
         for call_id in tuple(self._pending):
             pending = self._pop_pending(call_id)
             if pending is None:
@@ -766,6 +1003,12 @@ class ForwardedExecutorConnection:
                     ForwardedDeliveryError(
                         "Controller bridge closed",
                         "accepted_unknown" if pending.submitted else "not_sent",
+                        executor_id=self.executor_id,
+                        owner_id=self.owner_id,
+                        epoch=self.epoch,
+                        executor_instance_id=(
+                            self.executor_instance_id if pending.accepted else None
+                        ),
                     )
                 )
         self._tool_bridge_ids.clear()
@@ -775,6 +1018,8 @@ class ForwardedExecutorConnection:
             await opening_ws.close()
         if receiver is not None and receiver is not asyncio.current_task():
             await asyncio.gather(receiver, return_exceptions=True)
+        if drain_task is not None and drain_task is not asyncio.current_task():
+            await asyncio.gather(drain_task, return_exceptions=True)
         if self._cancel_tasks:
             try:
                 await asyncio.wait_for(

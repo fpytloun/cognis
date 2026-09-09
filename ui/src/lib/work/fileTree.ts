@@ -9,18 +9,22 @@ export interface WorkFileDiff {
   generated?: boolean;
   truncated?: boolean;
   path_id?: string | null;
+  /** Additive: identifies a file's rename-lineage generation for lazy file-history fetches. */
+  path_generation_id?: string | null;
   root_name?: string | null;
   root_id?: string | null;
   additions?: number | null;
   deletions?: number | null;
   content_truncated?: boolean;
   preview_omitted?: boolean;
+  preview_omission_reason?: 'not_persisted' | 'retention_expired' | 'projection_budget' | 'sensitive' | null;
   source_workstream?: {
     key: string;
     title: string;
     agent_id: string;
     status: string;
   } | null;
+  source_item_id?: string | null;
 }
 
 export interface FileTreeCounts {
@@ -107,6 +111,15 @@ function diffCounts(diff: WorkFileDiff): Pick<FileTreeCounts, 'additions' | 'del
     return { additions: diff.additions, deletions: diff.deletions };
   }
   return countLines(diff.diff);
+}
+
+/**
+ * One accessor for the additive, still backend-optional file-history identity.
+ * Returns null when the server has not populated it yet, so callers fall
+ * back to inline `file_diffs` instead of attempting a lazy history fetch.
+ */
+export function fileDiffGenerationId(diff: WorkFileDiff): string | null {
+  return diff.path_generation_id ?? null;
 }
 
 export function inferFileStatus(diff: WorkFileDiff): FileChangeStatus {
@@ -197,7 +210,11 @@ export function buildFileTree(diffs: WorkFileDiff[]): FileTreeNode[] {
     }
 
     const stats = diffCounts(diff);
-    const identity = diff.path_id ?? diff.path;
+    // Include the source workstream so identical relative paths edited by
+    // different sibling sessions in a shared repository root never merge
+    // into one file node (and one combined diff history).
+    const sourceKey = diff.source_workstream?.key ?? '';
+    const identity = `${sourceKey}:${diff.path_id ?? diff.path}`;
     const file: FileTreeFile = {
       kind: 'file',
       id: nodeId('file', diff.path, identity),

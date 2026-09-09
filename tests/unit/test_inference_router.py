@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from cognis.executor.backends.litellm import LiteLLMExecutorBackend
+from cognis.executor.inference_types import CognisInferenceRequest
 from cognis.models.config import GeneratedImage, ImageGenerationResult
 from cognis.providers.llm.errors import LLMStreamProviderError
 from cognis.providers.llm.inference_router import InferenceRouter
@@ -71,6 +74,79 @@ class _Provider:
     async def get_executor(self, handle: SimpleNamespace):
         assert handle.executor_id == "exec-1"
         return self.connection
+
+
+@pytest.mark.asyncio
+async def test_incomplete_response_survives_executor_backend_and_controller_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _provider_events():
+        yield {
+            "type": "response.output_item.added",
+            "item": {"type": "message", "id": "msg_1", "content": []},
+        }
+        yield {
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "delta": "partial",
+        }
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_123",
+                "status": "incomplete",
+                "output": [
+                    {
+                        "type": "message",
+                        "id": "msg_1",
+                        "content": [{"type": "output_text", "text": "partial"}],
+                    }
+                ],
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        }
+
+    async def _aresponses(**_kwargs: object):
+        return _provider_events()
+
+    monkeypatch.setattr("cognis.executor.backends.litellm.litellm.aresponses", _aresponses)
+    backend = LiteLLMExecutorBackend()
+    backend_chunks = [
+        chunk
+        async for chunk in backend.stream_complete(
+            CognisInferenceRequest(
+                model="openai/gpt-5.4",
+                messages=[{"role": "user", "content": "continue"}],
+                request_kwargs={"cognis_llm_api": "responses"},
+            )
+        )
+    ]
+
+    class _IncompleteConnection(_Connection):
+        async def llm_complete_stream(self, **_: object):
+            for chunk in backend_chunks:
+                yield json.loads(json.dumps(chunk))
+
+    provider = _Provider()
+    provider.connection = _IncompleteConnection()
+    result = await InferenceRouter(provider).route_generate(
+        messages=[{"role": "user", "content": "continue"}],
+        model="openai/gpt-5.4",
+        executor_labels={"location": "local"},
+        request_kwargs={"cognis_llm_api": "responses"},
+    )
+
+    assert result["choices"][0]["message"]["content"] == "partial"
+    assert result["response_status"] == "incomplete"
+    assert result["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert result["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "prompt_tokens": 100,
+        "completion_tokens": 50,
+        "total_tokens": 150,
+    }
 
 
 @pytest.mark.asyncio

@@ -108,6 +108,19 @@ Any state → cancelled (user can cancel anytime)
 | `failed` | Workflow failed after exhausting retries. |
 | `cancelled` | User or system cancelled the task. |
 
+Executor recovery is infrastructure waiting, not a task pause. An owned task
+remains `running` while it waits. After controller ownership loss, normal
+fenced recovery can make it claimable without changing the recovery deadline.
+Only gates, caller questions, credentials, authentication, or an explicit user
+action can put a task in `paused`.
+
+Scheduler-created tasks receive immutable trigger context from
+`ScheduleFireRow.scheduled_fire_at` and the schedule timezone. Queue
+eligibility in `Task.scheduled_for` does not define the target date.
+The fire row stores the timezone snapshot. Migration 146 installs an insertion
+trigger for SQLite and PostgreSQL. This trigger snapshots the schedule timezone
+when an old controller omits the new column during a rolling upgrade.
+
 ### Task dependencies
 
 Tasks can depend on other tasks, forming a DAG:

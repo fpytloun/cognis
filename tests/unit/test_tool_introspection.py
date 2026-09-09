@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from cognis.core.orchestration_targets import (
     OrchestrationTarget,
     OrchestrationTargetSnapshot,
 )
+from cognis.mcp_runtime import mcp_tools_to_definitions
 from cognis.models.deliverable import (
     PULSE_DAILY_SKELETON,
     SUPPORTED_RICH_BLOCK_TYPES,
@@ -48,7 +50,6 @@ from cognis.tools.introspection import (
     validate_available_tool_call,
     validate_available_tool_call_with_context,
 )
-from cognis.tools.mcp import mcp_tools_to_definitions
 
 
 def test_all_native_tools_have_consistent_descriptors_and_examples() -> None:
@@ -117,6 +118,73 @@ def test_describe_tool_resolves_every_available_static_tool() -> None:
         assert result["descriptor"]["schema_hash"] == tool.descriptor.schema_hash
 
 
+def test_describe_tool_without_operation_preserves_full_descriptor_shape() -> None:
+    result = describe_available_tool([MANAGE_AGENTS_TOOL], MANAGE_AGENTS_TOOL.name)
+
+    assert result == {
+        "valid": True,
+        "tool_id": stable_tool_id(MANAGE_AGENTS_TOOL),
+        "name": MANAGE_AGENTS_TOOL.name,
+        "callable_name": MANAGE_AGENTS_TOOL.name,
+        "description": MANAGE_AGENTS_TOOL.description,
+        "source": MANAGE_AGENTS_TOOL.source.model_dump(mode="json"),
+        "category": MANAGE_AGENTS_TOOL.category,
+        "read_only": MANAGE_AGENTS_TOOL.read_only,
+        "descriptor": MANAGE_AGENTS_TOOL.descriptor.model_dump(mode="json"),
+    }
+
+
+@pytest.mark.parametrize("tool", [MANAGE_AGENTS_TOOL, MANAGE_SCHEDULES_TOOL])
+def test_describe_tool_operation_returns_one_materially_smaller_schema(
+    tool: ToolDefinition,
+) -> None:
+    assert tool.descriptor is not None
+    selected = tool.descriptor.operations[0]
+
+    full = describe_available_tool([tool], tool.name)
+    projected = describe_available_tool([tool], tool.name, selected.operation)
+
+    assert projected["valid"] is True
+    assert projected["descriptor"]["schema_hash"] == tool.descriptor.schema_hash
+    assert projected["descriptor"]["authority"] == tool.descriptor.authority
+    assert projected["descriptor"]["operation"] == selected.model_dump(mode="json")
+    assert "input_schema" not in projected["descriptor"]
+    assert "operations" not in projected["descriptor"]
+    assert len(json.dumps(projected)) < len(json.dumps(full)) * 0.75
+
+
+def test_describe_tool_operation_retains_schema_and_dynamic_options() -> None:
+    resolved = resolve_descriptor_dynamic_options(
+        [MANAGE_AGENTS_TOOL],
+        {
+            "agent_management.assignable_tools": ["builtin:list_agents"],
+            "agent_management.tool_groups": ["conversations"],
+        },
+    )[0]
+
+    result = describe_available_tool([resolved], resolved.name, "tools_set")
+    operation = result["descriptor"]["operation"]
+
+    assert operation["input_schema"]["properties"]["action"]["const"] == "tools_set"
+    assert "action" in operation["input_schema"]["required"]
+    assert operation["dynamic_options"][0]["values"]
+
+
+def test_describe_tool_invalid_operation_returns_safe_sorted_index() -> None:
+    result = describe_available_tool(
+        [MANAGE_SCHEDULES_TOOL],
+        MANAGE_SCHEDULES_TOOL.name,
+        "List",
+    )
+
+    assert result["valid"] is False
+    assert result["error"] == "operation_not_available"
+    assert result["requested_operation"] == "List"
+    assert result["available_operations"] == sorted(result["available_operations"])
+    assert "descriptor" not in result
+    assert "description" not in result
+
+
 def test_introspection_cannot_reveal_tool_absent_from_filtered_inventory() -> None:
     allowed = ToolDefinition(
         name="allowed_read",
@@ -135,6 +203,12 @@ def test_introspection_cannot_reveal_tool_absent_from_filtered_inventory() -> No
     assert describe_available_tool([allowed], stable_tool_id(denied))["error"] == (
         "tool_not_available"
     )
+    unavailable = describe_available_tool([allowed], stable_tool_id(denied), "secret")
+    assert unavailable == {
+        "valid": False,
+        "error": "tool_not_available",
+        "message": "No unique currently authorized tool matches the supplied identifier.",
+    }
     assert validate_available_tool_call([allowed], denied.name, {})["error"] == (
         "tool_not_available"
     )
@@ -460,6 +534,35 @@ def test_mcp_descriptor_preserves_live_schema_annotations_and_output_schema() ->
     assert tool.read_only is False
 
 
+def test_describe_external_single_operation_preserves_external_metadata() -> None:
+    tool = mcp_tools_to_definitions(
+        "calendar",
+        [
+            {
+                "name": "events",
+                "description": "List calendar events.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"calendar_id": {"type": "string"}},
+                    "required": ["calendar_id"],
+                },
+                "outputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": True},
+            }
+        ],
+        30,
+        server_id="srv_calendar",
+    )[0]
+
+    result = describe_available_tool([tool], tool.name, tool.name)
+
+    assert result["valid"] is True
+    assert result["descriptor"]["authority"] == "external"
+    assert result["descriptor"]["operation"]["input_schema"] == tool.parameters
+    assert result["descriptor"]["output_schema"] == {"type": "object"}
+    assert result["descriptor"]["annotations"] == {"readOnlyHint": True}
+
+
 def test_replaced_ad_hoc_operations_are_absent() -> None:
     assert MANAGE_AGENTS_TOOL.native_operations is not None
     assert MANAGE_SCHEDULES_TOOL.native_operations is not None
@@ -490,14 +593,62 @@ def test_write_deliverable_registers_authoritative_pulse_operation() -> None:
     assert contract["valid_skeleton"]
 
 
+def test_write_deliverable_registers_authoritative_dashboard_operation() -> None:
+    assert WRITE_DELIVERABLE_TOOL.descriptor is not None
+    operation = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.descriptor.operations
+        if operation.operation == "rich:dashboard"
+    )
+
+    contract = WRITE_DELIVERABLE_TOOL.descriptor.extensions["presentation_contracts"][
+        "rich:dashboard"
+    ]
+    assert operation.validator_ids == ["write_deliverable.rich"]
+    assert operation.examples[0]["action"] == "rich:dashboard"
+    assert operation.input_schema["properties"]["action"]["const"] == "rich:dashboard"
+    assert contract["presentation"] == "dashboard"
+    assert contract["valid_skeleton"]
+
+
+@pytest.mark.parametrize(
+    "operation_name",
+    ["write_deliverable", "rich", "rich:dashboard", "rich:pulse"],
+)
+def test_write_deliverable_operation_projection_excludes_tool_wide_extensions(
+    operation_name: str,
+) -> None:
+    assert WRITE_DELIVERABLE_TOOL.descriptor is not None
+    selected = next(
+        operation
+        for operation in WRITE_DELIVERABLE_TOOL.descriptor.operations
+        if operation.operation == operation_name
+    )
+
+    full = describe_available_tool([WRITE_DELIVERABLE_TOOL], "write_deliverable")
+    projected = describe_available_tool(
+        [WRITE_DELIVERABLE_TOOL],
+        "write_deliverable",
+        operation_name,
+    )
+
+    assert projected["valid"] is True
+    assert projected["descriptor"]["operation"] == selected.model_dump(mode="json")
+    assert "operations" not in projected["descriptor"]
+    assert "input_schema" not in projected["descriptor"]
+    assert "extensions" not in projected["descriptor"]
+    assert full["descriptor"]["extensions"] == WRITE_DELIVERABLE_TOOL.descriptor.extensions
+    assert len(json.dumps(projected)) < len(json.dumps(full)) * 0.75
+
+
 @pytest.mark.asyncio
 async def test_write_deliverable_generic_block_types_match_runtime_validation() -> None:
     described = describe_available_tool([WRITE_DELIVERABLE_TOOL], "write_deliverable")
     operations = described["descriptor"]["operations"]
-    generic = next(item for item in operations if item["operation"] == "write_deliverable")
+    generic = next(item for item in operations if item["operation"] == "rich")
     pulse = next(item for item in operations if item["operation"] == "rich:pulse")
     generic_type = generic["input_schema"]["definitions"]["genericRichBlock"]["properties"]["type"]
-    pulse_type = pulse["input_schema"]["properties"]["rich"]["properties"]["blocks"]["items"][
+    pulse_type = pulse["input_schema"]["properties"]["payload"]["properties"]["blocks"]["items"][
         "properties"
     ]["type"]
     supported_types = generic_type["enum"]
@@ -509,14 +660,15 @@ async def test_write_deliverable_generic_block_types_match_runtime_validation() 
     assert pulse_type == {"type": "string"}
 
     markdown = {
-        "action": "write_deliverable",
-        "content": "Fallback",
-        "format": "rich",
-        "rich": {"blocks": [{"type": "markdown", "content": "## Summary"}]},
+        "action": "rich",
+        "payload": {
+            "title": "Summary",
+            "blocks": [{"type": "markdown", "content": "## Summary"}],
+        },
     }
     unsupported = {
         **markdown,
-        "rich": {"blocks": [{"type": "text", "content": "## Summary"}]},
+        "payload": {"title": "Summary", "blocks": [{"type": "text", "content": "## Summary"}]},
     }
 
     assert (
@@ -527,7 +679,7 @@ async def test_write_deliverable_generic_block_types_match_runtime_validation() 
         )["valid"]
         is True
     )
-    normalize_required_rich_payload(markdown["rich"])
+    normalize_required_rich_payload(markdown["payload"])
 
     schema_result = validate_available_tool_call(
         [WRITE_DELIVERABLE_TOOL],
@@ -537,7 +689,7 @@ async def test_write_deliverable_generic_block_types_match_runtime_validation() 
     assert schema_result["valid"] is False
     assert any("text" in error and "is not one of" in error for error in schema_result["errors"])
     with pytest.raises(RichPayloadValidationError, match="unsupported_rich_block_type"):
-        normalize_required_rich_payload(unsupported["rich"])
+        normalize_required_rich_payload(unsupported["payload"])
 
     pulse_payload = deepcopy(PULSE_DAILY_SKELETON)
     pulse_payload["blocks"][0]["type"] = "research_answer"

@@ -387,6 +387,14 @@ process list, command output, or credential material.
 ### Executor → Controller
 
 ```python
+# Non-disruptive authentication and configuration probe. The controller
+# validates the token and executor policy, returns a bounded JSON-RPC response,
+# and closes this socket without taking ownership or changing runtime state.
+"executor.probe" → {
+    "token": str,                  # JWT (aud=cognis-executor, sub=executor_id)
+}
+# → {"status": "authenticated", "executor_id": str}
+
 # Authentication on connect (first message, before any other exchange)
 "executor.ready" → {
     "token": str,                  # JWT (aud=cognis-executor, sub=executor_id)
@@ -640,34 +648,28 @@ or missing tool), but the controller does not dispatch tool calls to them.
 
 #### Active Executor Recovery
 
-The controller evaluates executor recovery at a new admission boundary, never
-by silently moving an in-flight model stream or tool call. If a
-selector-selected primary executor remains unavailable after its reconnect
-grace:
+Active work waits for the same selected executor for 900 seconds. The
+controller stores the first unavailable timestamp on the task or conversation.
+A controller restart uses this timestamp and does not start a new window.
+The database clock sets this timestamp and calculates the remaining window.
+Controller clock skew cannot extend or shorten the deadline.
 
-1. Atomically switch the durable pin to another usable primary matching the
-   same selector.
-2. Persist one system notice describing the previous and replacement
-   executors and warning that local state may differ.
-3. Start later admitted work on the replacement.
-4. Keep explicit primary pins fixed. Additional executors remain explicit-only
-   and are not failover capacity.
+The owning controller keeps the turn or task running while it waits
+asynchronously for executor readiness. If ownership changes, the fenced
+recovery path resumes the wait with the original deadline. Executor waiting
+does not create a user pause.
+
+If the deadline expires, the controller records one terminal
+`executor_recovery_timeout` error. It includes the executor ID, first
+unavailable timestamp, deadline, wait duration, and execution phase.
+
+The rule applies to explicit-primary, selector-primary, and additional pins.
+An additional assignment expiry does not move active recovery work. After the
+recovery marker clears, a later turn returns to a primary executor.
 
 An in-flight call whose outcome is unknown is recorded as ambiguous rather than
 replayed on another executor. A partially emitted model stream is not restarted
 silently.
-
-Reminder shape:
-
-```text
-The selector-selected primary executor "infra-runner" remained unavailable
-after reconnect grace. The controller switched later admissions to matching
-primary executor "local-macbook". Files, working directory, tools, and local
-state may differ. No ambiguous in-flight operation was replayed.
-```
-
-The reminder must be factual. It must not speculate about why the executor is
-offline.
 
 ### Error Handling
 
@@ -679,8 +681,8 @@ offline.
 | Executor exceeds resource limits | Executor self-enforces and reports error |
 | Controller goes down (tool-only run) | Executor detects disconnect, exits cleanly |
 | Controller goes down (runtime-hosted run) | Executor keeps the runtime lease for a grace period, buffers events locally, then marks the run orphaned if the controller does not reclaim it |
-| Active additional executor is unavailable at a later admission boundary | After reconnect grace, return later admitted work to a usable primary, persist a factual notice, and never replay an ambiguous in-flight call |
-| Required executor is offline or lacks the requested tool | Notify the user and cancel the turn; do not run the work on another host |
+| Selected executor is unavailable | Wait for the same executor for up to 900 seconds, then fail once with `executor_recovery_timeout` |
+| Controller restarts during executor recovery | Reclaim through the durable fence and continue from the original deadline |
 
 ## Executor Implementations
 

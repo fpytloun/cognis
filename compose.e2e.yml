@@ -44,6 +44,8 @@ services:
       # Default backends: no memory, no guardrails (for e2e agents)
       COGNIS_DEFAULT_MEMORY_BACKEND: none
       COGNIS_DEFAULT_GUARDRAILS_BACKEND: none
+      # Mount authenticated test control-plane routes only in this E2E overlay.
+      COGNIS_E2E_MODE: "true"
 
   cognis-executor:
     environment:
@@ -74,7 +76,8 @@ services:
       dockerfile: Dockerfile
     depends_on:
       cognis:
-        condition: service_started
+        # Both processes bootstrap the shared database; serialize startup.
+        condition: service_healthy
       mock-llm:
         condition: service_healthy
     profiles:
@@ -101,5 +104,29 @@ services:
       [
         "sh",
         "-lc",
-        "python /app/scripts/local_compose_seed.py && python /app/scripts/seed_e2e.py"
+        "/opt/venv/bin/python /app/scripts/local_compose_seed.py && /opt/venv/bin/python /app/scripts/seed_e2e.py"
       ]
+
+  # Test-only harness: seeds the Work Activity conformance fixtures used by
+  # ui/e2e/work-live.spec.ts. Requires seed-e2e to have already created the
+  # e2e admin/agent. Never runs in production; opt-in via the `e2e` profile.
+  seed-work-conformance:
+    image: ${COGNIS_IMAGE:-cognis-local:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      cognis:
+        condition: service_started
+    profiles:
+      - e2e
+    environment:
+      COGNIS_DATA_DIR: /data
+      COGNIS_LOG_FORMAT: ${COGNIS_LOG_FORMAT:-text}
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_LOCAL_ADMIN_EMAIL: ${COGNIS_LOCAL_ADMIN_EMAIL:-admin@cognis-e2e.localdev.me}
+      COGNIS_LOCAL_ADMIN_PASSWORD: ${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}
+    volumes:
+      - cognis-local-data:/data
+    command: ["python", "/app/scripts/seed_work_conformance.py"]

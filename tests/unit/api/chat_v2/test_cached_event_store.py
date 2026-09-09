@@ -52,6 +52,7 @@ from cognis.api.chat_v2.cached_event_store import (
 from cognis.api.chat_v2.event_store import (
     RawSessionEvent,
     SessionEventPage,
+    SessionHistoryAvailability,
     SessionWatermark,
 )
 from cognis.api.chat_v2.schemas import TimelineScope
@@ -70,6 +71,7 @@ from cognis.api.chat_v2.sync import (
     ConversationSessionRef,
     build_chat_snapshot,
     clear_chat_v2_read_caches,
+    current_projection_version,
 )
 from cognis.api.websocket import WebSocketConnectionManager
 from cognis.core.event_append_invalidation import EventAppendInvalidationDispatcher
@@ -400,8 +402,10 @@ class Delegate:
             return SessionEventPage(
                 store_id=self.store_id,
                 session_id=session_id,
-                last_seq=0,
                 verified_empty=self.empty_verified,
+                availability=(
+                    SessionHistoryAvailability(durable_last_seq=0) if self.empty_verified else None
+                ),
             )
         seq = self.last_seq
         if after_seq is not None and seq <= after_seq:
@@ -463,6 +467,28 @@ def make_cache(
         clock=clock,
         epoch_factory=lambda: next(epochs),
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("redis_configured", [False, True])
+async def test_authoritative_watermark_read_bypasses_cached_value(
+    redis_configured: bool,
+) -> None:
+    clock = FakeClock()
+    delegate = Delegate()
+    events = make_cache(delegate, FakeRedis(clock, configured=redis_configured), clock)
+    bound = events.bind(AUTHORITY)
+
+    cached = await bound.read_session_high_watermark(session_id="session-a")
+    delegate.last_seq = cached.last_seq + 1
+
+    authoritative = await bound.read_authoritative_session_high_watermark(session_id="session-a")
+    still_cached = await bound.read_session_high_watermark(session_id="session-a")
+
+    assert authoritative.last_seq == delegate.last_seq
+    assert still_cached.last_seq == cached.last_seq
+    assert delegate.watermark_calls == 2
+    await events.aclose()
 
 
 def make_snapshot_cache(
@@ -2077,6 +2103,84 @@ async def test_unverified_empty_is_not_cached() -> None:
     assert delegate.page_calls == 2
 
 
+def test_cache_validates_page_local_and_durable_bounds_independently() -> None:
+    clock = FakeClock()
+    cache = make_cache(Delegate(), FakeRedis(clock), clock)
+    valid_page = SessionEventPage(
+        store_id="intaris",
+        session_id="session-a",
+        events=[
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="session-a",
+                seq=2,
+                type="assistant_message",
+            )
+        ],
+        last_seq=2,
+        first_seq=2,
+        has_more_after=True,
+        availability=SessionHistoryAvailability(
+            durable_last_seq=10,
+            first_available_seq=1,
+        ),
+    )
+    watermark = SessionWatermark(
+        store_id="intaris",
+        session_id="session-a",
+        last_seq=2,
+        availability=SessionHistoryAvailability(durable_last_seq=1),
+    )
+
+    assert cache._validate_value(
+        valid_page,
+        operation="page",
+        session_id="session-a",
+        after_seq=1,
+        before_seq=None,
+        limit=500,
+        direction="forward",
+    )
+    invalid_page = valid_page.model_copy(
+        update={"availability": SessionHistoryAvailability(durable_last_seq=1)}
+    )
+    assert not cache._validate_value(
+        invalid_page,
+        operation="page",
+        session_id="session-a",
+        after_seq=1,
+        before_seq=None,
+        limit=500,
+        direction="forward",
+    )
+    assert not cache._validate_value(
+        watermark,
+        operation="watermark",
+        session_id="session-a",
+        after_seq=None,
+        before_seq=None,
+        limit=500,
+        direction="forward",
+    )
+
+
+def test_watermark_floor_discards_stale_availability() -> None:
+    watermark = SessionWatermark(
+        store_id="intaris",
+        session_id="session-a",
+        last_seq=1,
+        availability=SessionHistoryAvailability(
+            durable_last_seq=1,
+            first_available_seq=1,
+        ),
+    )
+
+    advanced = CachedSessionEventStore._watermark_with_floor(watermark, 2)
+
+    assert advanced.last_seq == 2
+    assert advanced.availability is None
+
+
 @pytest.mark.anyio
 async def test_redis_failure_falls_back_directly_to_upstream() -> None:
     clock = FakeClock()
@@ -3443,7 +3547,7 @@ def test_page_query_classes_are_fixed_and_content_free() -> None:
 
 
 @pytest.mark.anyio
-async def test_work_overview_fence_changes_snapshot_cache_identity() -> None:
+async def test_snapshot_cache_identity_uses_dedicated_schema_without_work_fence() -> None:
     clock = FakeClock()
     redis = FakeRedis(clock)
     events = make_cache(Delegate(), redis, clock)
@@ -3460,64 +3564,22 @@ async def test_work_overview_fence_changes_snapshot_cache_identity() -> None:
         "snapshot-conversation-authority",
         AUTHORITY.user_email,
     )
-    events._advance_local_watermark_floor(
-        events.session_token("intaris", "session-a"),
-        events._authority_digest(AUTHORITY),
-        1,
-    )
-
-    before = await cache._identity(
+    identity = await cache._identity(
         authority_token=authority,
         scope_key="conversation:conversation-a",
         session_refs=[session_ref],
-        overview_fence="covered:10",
-        overview_coverage=(("session-a", 0),),
     )
-    after = await cache._identity(
-        authority_token=authority,
-        scope_key="conversation:conversation-a",
-        session_refs=[session_ref],
-        overview_fence="covered:11",
-        overview_coverage=(("session-a", 1),),
+    old_digest = events.derived_key_digest(
+        "snapshot",
+        authority,
+        "conversation:conversation-a",
+        current_projection_version(),
+        "",
     )
 
-    assert before is not None and after is not None
-    assert before.value_key != after.value_key
-    assert before.lock_key != after.lock_key
-    assert before.overview_ready is False
-    assert after.overview_ready is True
-
-    builds = 0
-
-    async def forbidden_build() -> Any:
-        nonlocal builds
-        builds += 1
-        raise AssertionError("stale Work coverage must not build a warmed snapshot")
-
-    warm = await cache.get_or_build_result(
-        authority_token=authority,
-        scope_key="conversation:conversation-a",
-        session_refs=[session_ref],
-        cursor_secret="cursor-secret",
-        overview_fence="covered:10",
-        overview_coverage=(("session-a", 0),),
-        build=forbidden_build,
-        fail_open=False,
-    )
-    cached = await cache.get_cached_result(
-        authority_token=authority,
-        scope_key="conversation:conversation-a",
-        session_refs=[session_ref],
-        cursor_secret="cursor-secret",
-        overview_fence="covered:10",
-        overview_coverage=(("session-a", 0),),
-    )
-
-    assert warm.snapshot is None
-    assert warm.warm_failure == "context_changed"
-    assert cache.warm_outcome("conversation:conversation-a") == "skipped"
-    assert cached.status == "miss"
-    assert builds == 0
+    assert identity is not None
+    assert identity.value_key.startswith("cognis:chat-event-cache:v3:snapshot:")
+    assert identity.value_key != f"cognis:chat-event-cache:v2:snapshot:{old_digest}"
 
 
 @pytest.mark.parametrize(
@@ -3568,8 +3630,8 @@ def test_decode_failures_use_fixed_reasons(reason: str, payload_factory: Any) ->
         store_id="intaris",
         session_id="session-a",
         events=[],
-        last_seq=0,
         verified_empty=True,
+        availability=SessionHistoryAvailability(durable_last_seq=0),
     )
     envelope = {
         "version": cache_module.CACHE_SCHEMA_VERSION,

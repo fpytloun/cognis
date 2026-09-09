@@ -129,10 +129,11 @@ function convertToRenderItem(
       return notice(
         item.id,
         item.title ?? 'Question set',
-        `${item.questions.length} question${item.questions.length === 1 ? '' : 's'} pending`,
+        `${item.questions.length} question${item.questions.length === 1 ? '' : 's'} · ${item.status}`,
         item.sort_key,
         item.created_at ?? item.updated_at ?? null,
-        'warning'
+        item.status === 'waiting' ? 'warning' : 'info',
+        { status: item.status, actionRequired: item.status === 'waiting' }
       );
     case 'auth_challenge':
       return notice(
@@ -141,7 +142,8 @@ function convertToRenderItem(
         item.message,
         item.sort_key,
         item.created_at ?? item.updated_at ?? null,
-        'warning'
+        statusTone(item.status),
+        { status: item.status, actionRequired: item.status === 'waiting' }
       );
     case 'credential_request':
       return notice(
@@ -150,7 +152,8 @@ function convertToRenderItem(
         item.description ?? 'Action required',
         item.sort_key,
         item.created_at ?? item.updated_at ?? null,
-        'warning'
+        statusTone(item.status),
+        { status: item.status, actionRequired: item.status === 'waiting' }
       );
     case 'user_interaction':
       return {
@@ -466,7 +469,9 @@ function toRenderTask(item: TaskTimelineItem): NoticeTimelineItem {
     item.title,
     item.result_summary ?? item.status,
     item.sort_key,
-    item.created_at ?? item.updated_at ?? null
+    item.created_at ?? item.updated_at ?? null,
+    statusTone(item.status),
+    { status: item.status }
   );
 }
 
@@ -477,7 +482,8 @@ function toRenderNotice(item: ChatV2NoticeTimelineItem): NoticeTimelineItem {
     item.message ?? '',
     item.sort_key,
     item.created_at ?? item.updated_at ?? null,
-    item.level === 'warning' ? 'warning' : 'info'
+    item.level === 'warning' ? 'warning' : 'info',
+    { details: item.message ?? '' }
   );
 }
 
@@ -504,14 +510,31 @@ function toRenderCompaction(item: ChatV2CompactionTimelineItem): CompactionTimel
 }
 
 function toRenderError(item: ErrorTimelineItem): NoticeTimelineItem {
+  const details = [
+    item.error_code ? `Error code: ${item.error_code}` : null,
+    item.message ?? null,
+    item.error_detail ?? null
+  ].filter((value): value is string => Boolean(value)).join('\n\n');
   return notice(
     item.id,
     item.title ?? item.error_code ?? 'Error',
     item.message ?? '',
     item.sort_key,
     item.created_at ?? item.updated_at ?? null,
-    'error'
+    'error',
+    {
+      details,
+      status: item.recoverable ? 'recoverable' : 'failed',
+      code: item.error_code ?? null
+    }
   );
+}
+
+interface NoticeOptions {
+  details?: string | null;
+  status?: string | null;
+  code?: string | null;
+  actionRequired?: boolean;
 }
 
 function notice(
@@ -520,7 +543,8 @@ function notice(
   description: string,
   orderKey: string,
   timestamp: string | null,
-  tone: NoticeTimelineItem['tone'] = 'info'
+  tone: NoticeTimelineItem['tone'] = 'info',
+  options: NoticeOptions = {}
 ): NoticeTimelineItem {
   return {
     id,
@@ -528,9 +552,19 @@ function notice(
     title,
     description,
     tone,
+    details: options.details,
+    status: options.status,
+    code: options.code,
+    actionRequired: options.actionRequired,
     timestamp,
     orderKey
   };
+}
+
+function statusTone(status: string): NoticeTimelineItem['tone'] {
+  if (status === 'failed' || status === 'denied') return 'error';
+  if (status === 'waiting') return 'warning';
+  return 'info';
 }
 
 function normalizeDelegationStatus(value: string | undefined): DelegationTimelineItem['status'] {

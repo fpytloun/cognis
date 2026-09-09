@@ -26,10 +26,61 @@ class _Router:
         executor: object,
         *,
         output_chunk_callback: object = None,
+        before_executor_send: object = None,
+        after_executor_send: object = None,
     ) -> ToolResult:
-        del output_chunk_callback
+        del output_chunk_callback, before_executor_send, after_executor_send
         self.calls.append((tool_call, executor))
         return ToolResult(output="ok", metadata={"executor_id": "executor-b"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_id,tool_name",
+    [("gpt-6-astra", "edit"), ("gpt-5-codex", "write"), ("claude-sonnet-4-5", "apply_patch")],
+)
+async def test_dispatch_rejects_incompatible_editor(model_id: str, tool_name: str) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=NativeToolDefinition(
+                name=tool_name,
+                description="Edit a file.",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                read_only=False,
+            )
+        )
+    )
+    router = _Router()
+    loop = object.__new__(AgentLoop)
+    loop.tool_router = router
+    loop.providers = SimpleNamespace(executor=None)
+    loop.session_manager = SimpleNamespace(session_factory=None)
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+    ctx = StepContext(
+        step_definition=StepDefinition(name="edit", type="run"),
+        session=SimpleNamespace(
+            session_id="session-1",
+            user_email="user@example.com",
+            parent_session_id=None,
+            delegation_mode=None,
+        ),
+        conversation=SimpleNamespace(conversation_id="conversation-1", context=None),
+        agent=agent,
+        executor_agent=agent,
+        task_id="task-1",
+        step_run_id="step-run-1",
+        policy=WORKFLOW_POLICY,
+        tool_registry=registry,
+        current_model=model_id,
+    )
+    result = await loop.execute_controller_tool(
+        ctx, ToolCall(call_id="call-1", name=tool_name, arguments={})
+    )
+    assert result.is_error
+    assert "unavailable for the current model" in result.output
+    assert not router.calls
 
 
 @pytest.mark.asyncio
@@ -54,6 +105,7 @@ async def test_regular_agent_tool_uses_shared_dispatch_and_strips_target_executo
     loop = object.__new__(AgentLoop)
     loop.tool_router = router
     loop.providers = SimpleNamespace(executor=None)
+    loop.session_manager = SimpleNamespace(session_factory=None)
     loop._resolve_target_connection = (  # type: ignore[method-assign]
         lambda **kwargs: "connection-b" if kwargs["target_executor_id"] == "executor-b" else None
     )
@@ -131,6 +183,7 @@ async def test_shared_dispatch_rejects_target_executor_for_non_executor_tool() -
     loop = object.__new__(AgentLoop)
     loop.tool_router = router
     loop.providers = SimpleNamespace(executor=None)
+    loop.session_manager = SimpleNamespace(session_factory=None)
     agent = AgentDefinition(
         agent_id="agent-1",
         owner_email="user@example.com",

@@ -1,11 +1,16 @@
+from types import SimpleNamespace
+
 import pytest
 
+import cognis.core.managed_conversations as managed_conversations_module
 from cognis.core.managed_conversations import (
     ManagedConversationProgressObserver,
     _last_user_message_from_events,
     is_allowed_managed_conversation_target,
+    last_managed_conversation_user_message_for_retry,
     managed_conversation_target_error,
 )
+from cognis.models.session import EventReadResult
 from cognis.tools.builtin.orchestration import AGENT_CONVERSATION_CREATE_TOOL
 
 
@@ -77,6 +82,59 @@ def test_managed_conversation_retry_message_does_not_stick_non_one_shot_mode() -
     assert message is not None
     assert message.content == "retry this"
     assert message.one_shot_chat_mode is None
+
+
+@pytest.mark.asyncio
+async def test_managed_retry_reads_long_history_without_using_stream_high_water(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _candidates(*_: object, **__: object) -> list[SimpleNamespace]:
+        return [SimpleNamespace(session_id="session-1", intaris_session_id="intaris-1")]
+
+    monkeypatch.setattr(managed_conversations_module, "_candidate_sessions", _candidates)
+
+    class _Guardrails:
+        cursors: list[int] = []
+
+        async def read_events(self, **kwargs: object) -> EventReadResult:
+            after_seq = int(kwargs["after_seq"])
+            self.cursors.append(after_seq)
+            if after_seq == 0:
+                return EventReadResult(
+                    events=[
+                        {
+                            "seq": 500,
+                            "type": "user_message",
+                            "data": {"content": "older"},
+                        }
+                    ],
+                    last_seq=1201,
+                    has_more=True,
+                )
+            assert after_seq == 500
+            return EventReadResult(
+                events=[
+                    {
+                        "seq": 1201,
+                        "type": "user_message",
+                        "data": {"content": "latest"},
+                    }
+                ],
+                last_seq=1201,
+                has_more=False,
+            )
+
+    guardrails = _Guardrails()
+    message = await last_managed_conversation_user_message_for_retry(
+        session_cache=SimpleNamespace(get_cached_events=lambda _: []),
+        guardrails=guardrails,
+        session_factory=lambda: None,
+        link=SimpleNamespace(),
+    )
+
+    assert message is not None
+    assert message.content == "latest"
+    assert guardrails.cursors == [0, 500]
 
 
 @pytest.mark.asyncio

@@ -60,6 +60,24 @@ async def _session_factory(tmp_path: object):
     return engine, create_session_factory(engine)
 
 
+def test_llm_latency_histograms_cover_long_provider_requests() -> None:
+    expected_tail = (
+        15.0,
+        30.0,
+        60.0,
+        120.0,
+        300.0,
+    )
+    assert litellm_provider_module._LLM_LATENCY_BUCKETS[-5:] == expected_tail
+    for histogram in (
+        litellm_provider_module.LLM_REQUEST_DURATION,
+        litellm_provider_module.LLM_TIME_TO_FIRST_TOKEN,
+        litellm_provider_module.LLM_TIME_TO_FIRST_RAW_CHUNK,
+        litellm_provider_module.LLM_PROVIDER_PHASE_DURATION,
+    ):
+        assert tuple(histogram._upper_bounds[-6:-1]) == expected_tail
+
+
 class _MemorySecrets:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str, str], str] = {}
@@ -755,6 +773,24 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
     monkeypatch.setattr(litellm_provider_module.DirectCodexTransport, "responses", _fake_responses)
 
     provider = LLMService(session_factory)
+    prepare_calls: list[dict[str, Any]] = []
+
+    async def _prepare(self: Any, messages: Any, **identity: Any) -> list[dict[str, Any]]:
+        prepare_calls.append(identity)
+        return [
+            {"role": "system", "content": "Answer tersely."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,cG5n"},
+                    }
+                ],
+            },
+        ]
+
+    monkeypatch.setattr(LLMService, "_prepare_direct_codex_messages", _prepare)
     result = await provider.generate(
         messages=[
             {"role": "system", "content": "Answer tersely."},
@@ -762,12 +798,22 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
         ],
         model="gpt-5.3-codex",
         provider_id="chatgpt",
+        acting_user_email="owner@example.com",
+        cognis_conversation_id="conv_123",
+        cognis_agent_id="agent_123",
     )
 
     assert captured["model"] == "gpt-5.3-codex"
     assert captured["stream"] is True
     assert captured["instructions"] == "Answer tersely."
-    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["input"][0]["content"][0]["image_url"].startswith("data:image/png;base64,")
+    assert prepare_calls == [
+        {
+            "owner_email": "owner@example.com",
+            "conversation_id": "conv_123",
+            "agent_id": "agent_123",
+        }
+    ]
     assert result["choices"][0]["message"]["content"] == "hello"
     assert result["usage"]["prompt_tokens"] == 2
     await provider.aclose()
@@ -1022,6 +1068,23 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
     monkeypatch.setattr(litellm_provider_module.DirectCodexTransport, "responses", _fake_responses)
 
     provider = LLMService(session_factory)
+    prepare_calls: list[dict[str, Any]] = []
+
+    async def _prepare(self: Any, messages: Any, **identity: Any) -> list[dict[str, Any]]:
+        prepare_calls.append(identity)
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,cG5n"},
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr(LLMService, "_prepare_direct_codex_messages", _prepare)
     chunks = [
         chunk
         async for chunk in provider.stream_generate(
@@ -1029,12 +1092,22 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
             model="gpt-5.3-codex",
             provider_id="chatgpt",
             cognis_session_id="session-123",
+            acting_user_email="owner@example.com",
+            cognis_conversation_id="conv_123",
+            cognis_agent_id="agent_123",
         )
     ]
 
     assert captured["auth_provider_id"] == "chatgpt"
     assert captured["model"] == "gpt-5.3-codex"
-    assert captured["input"] == [{"role": "user", "content": "hi"}]
+    assert captured["input"][0]["content"][0]["image_url"].startswith("data:image/png;base64,")
+    assert prepare_calls == [
+        {
+            "owner_email": "owner@example.com",
+            "conversation_id": "conv_123",
+            "agent_id": "agent_123",
+        }
+    ]
     assert captured["stream"] is True
     assert captured["store"] is False
     assert chunks[0]["choices"][0]["delta"]["content"] == "hello"
@@ -2776,6 +2849,34 @@ def test_reasoning_translation_preserves_catalog_native_openai_ultra() -> None:
 
     assert prepared.request_kwargs["reasoning_effort"] == "ultra"
     assert prepared.effective_effort == "ultra"
+
+
+def test_reasoning_translation_supports_gpt6_astra() -> None:
+    model_info = DEFAULT_MODEL_INFO.model_copy(
+        update={
+            "model_id": "gpt-6-astra",
+            "supports_reasoning": True,
+            "reasoning_efforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+        }
+    )
+
+    prepared = apply_reasoning_config(
+        {
+            "reasoning_effort": "ultra",
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_tokens": 1_024,
+        },
+        model_id="gpt-6-astra",
+        provider_preset="chatgpt",
+        model_info=model_info,
+    )
+
+    assert prepared.request_kwargs["reasoning_effort"] == "ultra"
+    assert prepared.request_kwargs["max_completion_tokens"] == 1_024
+    assert "max_tokens" not in prepared.request_kwargs
+    assert "temperature" not in prepared.request_kwargs
+    assert "top_p" not in prepared.request_kwargs
 
 
 def test_reasoning_translation_uses_adaptive_default_for_claude_46() -> None:
@@ -5223,7 +5324,9 @@ async def test_litellm_provider_stream_generate_normalizes_responses_events(
         chunks[2]["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
         == '{"query":"docs"}'
     )
-    assert chunks[-1]["usage"]["total_tokens"] == 7
+    assert (
+        next(chunk["usage"] for chunk in reversed(chunks) if "usage" in chunk)["total_tokens"] == 7
+    )
     await engine.dispose()
 
 
@@ -5274,7 +5377,9 @@ async def test_litellm_provider_stream_generate_suppresses_unbound_responses_out
         for chunk in chunks
         for choice in chunk.get("choices", [])
     )
-    assert chunks[-1]["usage"]["total_tokens"] == 4
+    assert (
+        next(chunk["usage"] for chunk in reversed(chunks) if "usage" in chunk)["total_tokens"] == 4
+    )
     await engine.dispose()
 
 
@@ -5336,7 +5441,9 @@ async def test_litellm_provider_stream_generate_emits_message_item_text_without_
 
     choices_chunks = [chunk for chunk in chunks if chunk.get("choices")]
     assert choices_chunks[0]["choices"][0]["delta"]["content"] == "Hello from item"
-    assert chunks[-1]["usage"]["total_tokens"] == 5
+    assert (
+        next(chunk["usage"] for chunk in reversed(chunks) if "usage" in chunk)["total_tokens"] == 5
+    )
     assert len(choices_chunks) == 2
     await engine.dispose()
 
@@ -5391,7 +5498,9 @@ async def test_litellm_provider_stream_generate_emits_output_text_done_without_d
     ]
 
     assert chunks[0]["choices"][0]["delta"]["content"] == "Hello from done"
-    assert chunks[-1]["usage"]["total_tokens"] == 4
+    assert (
+        next(chunk["usage"] for chunk in reversed(chunks) if "usage" in chunk)["total_tokens"] == 4
+    )
     await engine.dispose()
 
 
@@ -5456,7 +5565,9 @@ async def test_litellm_provider_stream_generate_normalizes_enum_style_event_type
     ]
     assert len(text_chunks) == 1
     assert text_chunks[0]["choices"][0]["delta"]["content"] == "Hello"
-    assert chunks[-1]["usage"]["total_tokens"] == 4
+    assert (
+        next(chunk["usage"] for chunk in reversed(chunks) if "usage" in chunk)["total_tokens"] == 4
+    )
     await engine.dispose()
 
 

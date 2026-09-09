@@ -137,6 +137,21 @@ def test_timeline_window_rejects_volatile_items() -> None:
         TimelineWindow(items=[item])
 
 
+@pytest.mark.parametrize(
+    ("has_more_before", "before_cursor"),
+    [(True, None), (False, "before")],
+)
+def test_timeline_window_rejects_inconsistent_older_history_cursor(
+    has_more_before: bool,
+    before_cursor: str | None,
+) -> None:
+    with pytest.raises(ValidationError, match="older history"):
+        TimelineWindow(
+            has_more_before=has_more_before,
+            before_cursor=before_cursor,
+        )
+
+
 def test_upsert_op_rejects_volatile_items() -> None:
     item = MessageTimelineItem(
         id="runtime-message",
@@ -171,6 +186,27 @@ def test_backfill_response_rejects_volatile_items() -> None:
             ),
             conversation_id="conv-1",
             items=[item],
+            server_time="2026-06-29T10:00:00Z",
+        )
+
+
+@pytest.mark.parametrize(
+    ("has_more_before", "before_cursor"),
+    [(True, None), (False, "before")],
+)
+def test_backfill_response_rejects_inconsistent_older_history_cursor(
+    has_more_before: bool,
+    before_cursor: str | None,
+) -> None:
+    with pytest.raises(ValidationError, match="older history"):
+        TimelineBackfillResponse(
+            projection_version="chat-v2.1",
+            scope=TimelineScope(
+                key="conversation:conv-1", kind="conversation", conversation_id="conv-1"
+            ),
+            conversation_id="conv-1",
+            has_more_before=has_more_before,
+            before_cursor=before_cursor,
             server_time="2026-06-29T10:00:00Z",
         )
 

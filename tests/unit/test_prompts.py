@@ -27,20 +27,12 @@ def test_chat_prompt_reserves_durable_todos_for_multistep_work() -> None:
     rules = build_critical_rules()
     assert instructions is not None
     assert rules is not None
-    assert (
-        "Chat todos are durable first-class session state for genuine multistep work"
-        in instructions
-    )
-    assert "Do not create todos for work that can be completed in a single response" in instructions
-    assert "Use the available todo-writing tool only for genuine multistep" in rules
-    assert "straightforward questions, short answers, or simple clarification" in rules
+    assert "Use todos for genuine multistep work" in instructions
+    assert "Do not create them for work that can be completed in one response" in instructions
+    assert "todo-writing tool" not in rules
     assert "mandatory first-class session state" not in instructions
     assert "for all work, including" not in rules
-    assert "accurate across turns" in instructions
-    assert "Architect todos track durable workstreams and milestones" in instructions
-    assert (
-        "Developer todos track granular implementation, test, and acceptance steps" in instructions
-    )
+    assert "update or cancel stale items" in instructions
 
 
 def test_prompt_requires_proportional_delegation_contract() -> None:
@@ -58,8 +50,21 @@ def test_prompt_requires_proportional_delegation_contract() -> None:
     assert "Give reviewers the original objective" in instructions
     assert "Before creating a fresh child" in instructions
     assert "Continue that context by default" in instructions
-    assert "branch from it when you need an independent alternative" in instructions
-    assert "genuinely new scope" in instructions
+    assert "independent branch that requires inherited context" in instructions
+    assert "same bounded problem" in instructions
+    assert "responsibilities, tools, authority" in instructions
+    assert "retained context is materially useful" in instructions
+    assert "Send only the context delta" in instructions
+    assert "fresh isolated child" in instructions
+    assert "Never pass the parent transcript" in instructions
+    assert "Fork only an independent branch" in instructions
+    assert "relevant invariants" in instructions
+    assert "implementation reasoning transcript" in instructions
+    assert "prior findings and dispositions" in instructions
+    assert "compact evidence" in instructions
+    assert "detailed child log inspectable" in instructions
+    assert "architect owns decomposition" in instructions
+    assert "downgrade the architect" in instructions
 
 
 def test_delegation_contract_is_gated_to_chat_with_orchestration() -> None:
@@ -112,30 +117,48 @@ def test_orchestration_tools_expose_handoff_contract_guidance() -> None:
     assert "Before creating a fresh child" in DELEGATE_TOOL.description
     assert "not only code review" in DELEGATE_TOOL.description
     assert "Prefer this over a fresh delegate" in FOLLOW_UP_SUBSESSION_TOOL.description
-    assert "explore an alternative" in FORK_SUBSESSION_TOOL.description
-    assert "use agent_conversation_send" in AGENT_CONVERSATION_FORK_TOOL.description
+    assert "independent branch requiring inherited context" in FORK_SUBSESSION_TOOL.description
+    assert "Use agent_conversation_send" in AGENT_CONVERSATION_FORK_TOOL.description
+    assert "materially useful" in FOLLOW_UP_SUBSESSION_TOOL.description
+    assert "Send the delta only" in FOLLOW_UP_SUBSESSION_TOOL.description
+    assert "not for an ordinary handoff" in FORK_SUBSESSION_TOOL.description
+    assert "requiring inherited context" in FORK_SUBSESSION_TOOL.description
+    assert "context delta" in AGENT_CONVERSATION_SEND_TOOL.description
+    assert "parent transcript" in AGENT_CONVERSATION_CREATE_TOOL.description
 
 
 def test_chat_prompt_allows_proportional_and_parallel_todos() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     assert instructions is not None
-    assert "Create proportional todos before starting multistep work" in instructions
-    assert "hierarchy" in instructions
-    assert "Multiple in_progress items are valid only when" in instructions
-    assert "Do not present terminal completion" in instructions
+    assert "Create proportional todos before substantial execution" in instructions
+    assert "Mark work in_progress before starting it" in instructions
+    assert "completed immediately after it is done" in instructions
+    assert "do not batch completed updates" in instructions
+    assert "Keep one item in_progress unless independent workstreams" in instructions
+    assert "Do not finish while any todo remains pending or in_progress" in instructions
+
+
+def test_common_prompt_has_delivery_aware_progress_guidance_without_step_duplicate() -> None:
+    chat = build_system_instructions(PromptContext.CHAT)
+    step = build_system_instructions(PromptContext.TASK_STEP)
+    assert chat is not None
+    assert step is not None
+    marker = "Give brief user-facing updates at meaningful transitions"
+    assert marker in chat
+    assert marker in step
+    assert chat.count(marker) == 1
+    assert step.count(marker) == 1
+    assert "Narrate progress in free text between tool calls" not in step
+    assert "Do not narrate routine tool calls" in chat
 
 
 def test_todo_tool_contract_is_proportional_for_multistep_work() -> None:
     description = STEP_TODO_WRITE_TOOL.description
     assert "progress for genuine multistep work" in description
-    assert (
-        "Do not create a todo list for work that can be completed in a single response"
-        in description
-    )
-    assert "straightforward questions, short answers, or simple clarification" in description
-    assert "required progress for all work" not in description
-    assert "Multiple in_progress items are allowed" in description
-    assert "hierarchy are optional" in description
+    assert "Keep statuses current as work changes" in description
+    assert "complete or cancel every item before finishing" in description
+    assert "in_progress before starting" not in description
+    assert len(description) < 240
 
 
 def test_chat_prompt_sets_pragmatic_coding_expectations() -> None:
@@ -299,7 +322,7 @@ def test_coding_skill_has_generic_coordinator_contract_without_agent_special_cas
     assert "Working mode: execute" in content
     assert "Working mode: coordinate" in content
     assert "LaForge" not in content
-    assert "managed conversation" not in content
+    assert "LaForge managed conversation" not in content
 
 
 def test_chat_prompt_has_execution_bias() -> None:
@@ -430,13 +453,11 @@ def test_chat_prompt_guides_tavily_query_shape() -> None:
 def test_task_step_prompt_requires_todos_only_for_multistep_work() -> None:
     instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert instructions is not None
-    assert (
-        "Create a proportional step Todo only when the objective requires genuine" in instructions
-    )
-    assert "Do not create one for a short step that can be completed in a" in instructions
+    assert "Use todos for genuine multistep work" in instructions
+    assert "Do not create them for work that can be completed in one response" in instructions
     assert "before all work" not in instructions
-    assert "current across turns until terminal completion" in instructions
-    assert "Multiple in_progress items are allowed only" in instructions
+    assert "Mark work in_progress before starting it" in instructions
+    assert "Keep one item in_progress unless independent workstreams" in instructions
     assert "call `write_deliverable` with the canonical" in instructions
     assert (
         "Do not call `step_complete` until every remaining todo is `completed` or `cancelled`"

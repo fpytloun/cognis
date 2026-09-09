@@ -110,9 +110,7 @@ def _args_hash(tool_name: str, arguments: dict[str, Any] | None) -> str:
     return hashlib.sha256(f"{tool_name}::{canonical}".encode()).hexdigest()[:32]
 
 
-def tool_call_argument_fingerprint(
-    tool_name: str, arguments: dict[str, Any] | None
-) -> str:
+def tool_call_argument_fingerprint(tool_name: str, arguments: dict[str, Any] | None) -> str:
     """Return a content-safe stable identity for one canonical tool request."""
 
     return _args_hash(tool_name, arguments)
@@ -197,12 +195,20 @@ class SameTurnToolCallLedger:
       turn's ledger from its source turn's executed calls closes this gap
       because the executor's dedup is strictly turn-id scoped.
 
-    Only successful (non-error) executions are recorded, so a genuine retry
-    after a tool failure is never suppressed. Read-only tools are never
-    recorded: repeating a read is idempotent and sometimes intentional.
+    Only successful (non-error) executions are recorded as ``executed``, so a
+    genuine retry after a tool failure is never suppressed. Read-only tools are
+    never recorded: repeating a read is idempotent and sometimes intentional.
+
+    Calls whose outcome is genuinely unknown (an executor connection was lost
+    after the call was accepted and reconciliation could not resolve it) are
+    tracked separately in ``uncertain``. They are not successful executions, so
+    the duplicate guard must not claim they "already executed"; instead the
+    first identical re-issue receives an accurate warning and clears the entry,
+    letting a deliberate second re-issue execute normally.
     """
 
     executed: set[tuple[str, str]] = field(default_factory=set)
+    uncertain: set[tuple[str, str]] = field(default_factory=set)
 
     def record(self, tool_name: str, arguments: dict[str, Any] | None) -> None:
         self.record_fingerprint(
@@ -214,6 +220,22 @@ class SameTurnToolCallLedger:
         """Record a precomputed canonical fingerprint from a persisted event."""
 
         self.executed.add((tool_name, fingerprint))
+        # A confirmed execution supersedes any earlier uncertainty for the
+        # same call identity.
+        self.uncertain.discard((tool_name, fingerprint))
+
+    def record_uncertain(self, tool_name: str, arguments: dict[str, Any] | None) -> None:
+        self.record_uncertain_fingerprint(
+            tool_name,
+            tool_call_argument_fingerprint(tool_name, arguments),
+        )
+
+    def record_uncertain_fingerprint(self, tool_name: str, fingerprint: str) -> None:
+        """Record a call whose outcome stayed unknown after reconciliation."""
+
+        key = (tool_name, fingerprint)
+        if key not in self.executed:
+            self.uncertain.add(key)
 
     def already_executed(self, tool_name: str, arguments: dict[str, Any] | None) -> bool:
         return (
@@ -221,10 +243,33 @@ class SameTurnToolCallLedger:
             tool_call_argument_fingerprint(tool_name, arguments),
         ) in self.executed
 
+    def uncertain_outcome(self, tool_name: str, arguments: dict[str, Any] | None) -> bool:
+        """Whether an identical earlier call's outcome is still unknown."""
+
+        return (
+            tool_name,
+            tool_call_argument_fingerprint(tool_name, arguments),
+        ) in self.uncertain
+
+    def consume_uncertain(self, tool_name: str, arguments: dict[str, Any] | None) -> bool:
+        """Pop an uncertain entry so the next identical re-issue may execute.
+
+        Returns whether an entry was present. The warn-once contract: the first
+        re-issue is blocked with an accurate diagnostic, a deliberate second
+        re-issue runs.
+        """
+
+        key = (tool_name, tool_call_argument_fingerprint(tool_name, arguments))
+        if key in self.uncertain:
+            self.uncertain.discard(key)
+            return True
+        return False
+
     def seed_from(self, other: SameTurnToolCallLedger | None) -> None:
         """Seed this ledger from a source turn's executed calls (retry lineage)."""
         if other is not None:
             self.executed.update(other.executed)
+            self.uncertain.update(other.uncertain - self.executed)
 
 
 def same_turn_duplicate_rejection_payload(
@@ -243,6 +288,32 @@ def same_turn_duplicate_rejection_payload(
                 "earlier in this turn (or a turn it was retried/continued from) "
                 "and was NOT executed again to avoid a duplicate side effect. "
                 "Use the earlier result, or make a different concrete call."
+            ),
+            "tool": tool_name,
+        }
+    )
+
+
+def uncertain_outcome_rejection_payload(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> str:
+    """Build the tool-result payload for a re-issue of an uncertain-outcome call."""
+
+    _ = arguments
+    return json.dumps(
+        {
+            "status": "blocked_uncertain_outcome",
+            "reason": "previous_identical_call_outcome_unknown",
+            "message": (
+                f"An earlier identical '{tool_name}' call was accepted by the "
+                "executor but its outcome is UNKNOWN (the executor connection "
+                "was lost and the result could not be recovered). It was NOT "
+                "re-executed automatically because it may have performed side "
+                "effects. First verify whether the earlier call took effect "
+                "(inspect the expected outcome). If you then still need to run "
+                "it, re-issue the exact same call once more and it will "
+                "execute."
             ),
             "tool": tool_name,
         }

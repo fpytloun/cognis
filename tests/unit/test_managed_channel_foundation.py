@@ -22,6 +22,7 @@ from cognis.channels.managed import (
     release_managed_delivery_lease,
 )
 from cognis.channels.protocol import NonRetryableChannelError
+from cognis.channels.route_admission import active_channel_tool_delivery_blocker
 from cognis.core.artifact_inputs import (
     authorize_outbound_artifact_refs_in_session,
     outbound_artifact_grant_is_valid,
@@ -50,7 +51,10 @@ from cognis.store.models import (
     ManagedConversationSignal,
     NotificationRow,
 )
-from cognis.tools.builtin.orchestration import AGENT_CONVERSATION_CREATE_CHANNEL_TOOL
+from cognis.tools.builtin.orchestration import (
+    AGENT_CONVERSATION_CREATE_CHANNEL_TOOL,
+    AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL,
+)
 
 
 class _DeliveryManager:
@@ -462,10 +466,41 @@ async def test_managed_channel_defaults_cas_wait_resume_and_completion(tmp_path)
         assert notification.payload["signal_id"] == signal.signal_id
 
     async with factory() as session:
+        taken_wait = await queries.take_managed_channel_ownership(
+            session,
+            target_conversation_id=target.conversation_id,
+            user_email="owner@example.com",
+            expected_owner_epoch=2,
+            controller_agent_id="controller",
+            controller_conversation_id=link.controller_conversation_id,
+            controller_session_id="controller-return-session",
+        )
+        await session.commit()
+        assert taken_wait is not None
+        assert taken_wait.owner_epoch == 3
+        transferred_signal = await session.get(ManagedConversationSignal, signal.signal_id)
+        notification = await session.get(NotificationRow, f"notif_signal_{signal.signal_id}")
+        assert transferred_signal is not None
+        assert transferred_signal.owner_epoch == 3
+        assert notification is not None
+        assert notification.session_id == "controller-return-session"
+        assert notification.payload["owner_epoch"] == 3
+
+    async with factory() as session:
+        with pytest.raises(ValueError, match="ownership changed"):
+            await queries.consume_waiting_managed_conversation_signal(
+                session,
+                link_id=link.link_id,
+                owner_epoch=2,
+                resume_request_id="dtr-stale",
+                resume_turn_id="turn-stale",
+            )
+
+    async with factory() as session:
         consumed = await queries.consume_waiting_managed_conversation_signal(
             session,
             link_id=link.link_id,
-            owner_epoch=2,
+            owner_epoch=3,
             resume_request_id="dtr-resume-1",
             resume_turn_id="turn-resume-1",
         )
@@ -485,7 +520,7 @@ async def test_managed_channel_defaults_cas_wait_resume_and_completion(tmp_path)
         consumed = await queries.consume_waiting_managed_conversation_signal(
             session,
             link_id=link.link_id,
-            owner_epoch=2,
+            owner_epoch=3,
             resume_request_id="dtr-resume-1",
             resume_turn_id="turn-resume-1",
         )
@@ -504,7 +539,7 @@ async def test_managed_channel_defaults_cas_wait_resume_and_completion(tmp_path)
         completed = await queries.complete_managed_channel_conversation(
             session,
             link_id=link.link_id,
-            owner_epoch=2,
+            owner_epoch=3,
             status="completed",
             summary="Done",
         )
@@ -514,9 +549,39 @@ async def test_managed_channel_defaults_cas_wait_resume_and_completion(tmp_path)
         assert binding is not None
         assert binding.state == "completed"
         assert binding.active_route_key is None
-        notification = await session.get(NotificationRow, f"notif_managed_{link.link_id}_2")
+        notification = await session.get(NotificationRow, f"notif_managed_{link.link_id}_3")
         assert notification is not None
 
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_route", [False, True])
+async def test_takeover_rejects_expired_or_released_route(tmp_path, release_route: bool) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'takeover-fence.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        link, _, next_controller, target = await _seed_channel_link(session)
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        assert binding is not None
+        if release_route:
+            binding.active_route_key = None
+        else:
+            binding.expires_at = datetime.now(UTC) - timedelta(seconds=1)
+        await session.commit()
+    async with factory() as session:
+        taken = await queries.take_managed_channel_ownership(
+            session,
+            target_conversation_id=target.conversation_id,
+            user_email="owner@example.com",
+            expected_owner_epoch=1,
+            controller_agent_id="next-controller",
+            controller_conversation_id=next_controller.conversation_id,
+            controller_session_id="next-session",
+        )
+        assert taken is None
     await engine.dispose()
 
 
@@ -803,6 +868,458 @@ async def test_expiry_and_owner_epoch_fence_release_route(tmp_path) -> None:
     await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_expired_uncertain_delivery_releases_without_retrying_or_replaying(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'uncertain-expiry.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    now = datetime.now(UTC)
+    async with factory() as session:
+        link, _, _, target = await _seed_channel_link(session)
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        assert binding is not None
+        binding.state = "delivery_failed"
+        binding.expires_at = now - timedelta(seconds=1)
+        binding.last_error = "external_send_outcome_uncertain"
+        session.add(
+            ChannelDeliveryOutboxRow(
+                delivery_id="delivery-uncertain-expiry",
+                user_email="owner@example.com",
+                conversation_id=target.conversation_id,
+                source_type="managed_channel_final",
+                source_id="turn-uncertain",
+                channel_type="signal",
+                account_id="account-1",
+                chat_id="chat-1",
+                fallback_text="Outcome unknown",
+                status="uncertain",
+                last_error="external_send_outcome_uncertain",
+                managed_binding_id=binding.binding_id,
+                managed_binding_version=binding.version,
+                managed_owner_epoch=link.owner_epoch,
+            )
+        )
+        await session.commit()
+
+    scheduler = SimpleNamespace(submit_turn=AsyncMock())
+    service = ManagedChannelService(factory, turn_scheduler=scheduler)
+    held = InboundMessage(
+        message_id="message-held-across-expiry",
+        channel_type="signal",
+        account_id="account-1",
+        sender_id="sender-1",
+        sender_name="Participant",
+        chat_id="chat-1",
+        thread_id=None,
+        content="Keep for audit",
+        timestamp=now,
+    )
+    assert await service.admit_inbound(held, user_email="owner@example.com") is True
+    assert await service.expire_bindings(now=now) == 1
+    assert await service.expire_bindings(now=now) == 0
+    scheduler.submit_turn.assert_not_awaited()
+
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        stored_link = await queries.get_managed_conversation_link(session, link.link_id)
+        outbox = await queries.get_channel_delivery_outbox(session, "delivery-uncertain-expiry")
+        ledger = (
+            await session.execute(
+                select(ChannelInboundLedgerRow).where(
+                    ChannelInboundLedgerRow.message_id == "message-held-across-expiry"
+                )
+            )
+        ).scalar_one()
+        assert binding is not None and stored_link is not None and outbox is not None
+        assert binding.state == "expired"
+        assert binding.active_route_key is None
+        assert binding.last_error == "external_send_outcome_uncertain"
+        assert stored_link.conversation_state == "expired"
+        assert stored_link.last_error == "external_send_outcome_uncertain"
+        assert outbox.status == "uncertain"
+        assert outbox.last_error == "external_send_outcome_uncertain"
+        assert ledger.disposition == "held"
+        audit = stored_link.control_metadata["channel_route_release"]
+        assert audit["type"] == "maintenance"
+        assert audit["prior_state"] == "delivery_failed"
+        assert audit["outcome_uncertain"] is True
+        assert audit["delivery_retried"] is False
+        assert audit["held_messages_replayed"] is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_recovery_is_authority_checked_epoch_fenced_and_idempotent(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'agent-recovery.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    now = datetime.now(UTC)
+    async with factory() as session:
+        link, _, _, target = await _seed_channel_link(session)
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        assert binding is not None
+        binding.state = "delivery_failed"
+        binding.expires_at = now + timedelta(minutes=1)
+        binding.last_error = "external_send_outcome_uncertain"
+        await session.commit()
+
+    service = ManagedChannelService(factory)
+    common = {
+        "target_conversation_id": target.conversation_id,
+        "expected_owner_epoch": link.owner_epoch,
+        "actor_agent_id": "next-controller",
+        "actor_conversation_id": "next-controller-conversation",
+        "actor_session_id": "next-controller-session",
+        "reason": "The reconciliation boundary passed.",
+    }
+    unauthorized = await service.recover_expired_delivery_failure(
+        **common,
+        user_email="other@example.com",
+        now=now + timedelta(minutes=2),
+    )
+    assert unauthorized.status == "not_found"
+
+    too_early = await service.recover_expired_delivery_failure(
+        **common,
+        user_email="owner@example.com",
+        now=now,
+    )
+    assert too_early.status == "not_eligible"
+    assert too_early.route_reserved is True
+
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        assert binding is not None
+        binding.expires_at = now - timedelta(seconds=1)
+        await session.commit()
+
+    stale_epoch = await service.recover_expired_delivery_failure(
+        **{**common, "expected_owner_epoch": link.owner_epoch + 1},
+        user_email="owner@example.com",
+        now=now,
+    )
+    assert stale_epoch.status == "conflict"
+    assert stale_epoch.route_reserved is True
+
+    released = await service.recover_expired_delivery_failure(
+        **common,
+        user_email="owner@example.com",
+        now=now,
+    )
+    assert released.status == "released"
+    assert released.outcome_uncertain is True
+    assert released.route_reserved is False
+    assert released.audit is not None
+    assert released.audit["type"] == "agent"
+    assert released.audit["agent_id"] == "next-controller"
+    assert released.audit["reason"] == "The reconciliation boundary passed."
+
+    repeated = await service.recover_expired_delivery_failure(
+        **common,
+        user_email="owner@example.com",
+        now=now,
+    )
+    assert repeated.status == "already_released"
+    assert repeated.audit == released.audit
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_uncertain_one_shot_release_preserves_outcome_and_idempotency(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'one-shot-recovery.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        link, _, _, _ = await _seed_channel_link(session)
+        session.add(
+            ChannelDeliveryOutboxRow(
+                delivery_id="delivery-uncertain",
+                user_email="owner@example.com",
+                conversation_id=link.controller_conversation_id,
+                source_type="channel_tool_message",
+                source_id="idempotency-original",
+                channel_type="signal",
+                account_id="account-1",
+                chat_id="chat-1",
+                status="uncertain",
+                attempt_count=1,
+                last_error="external_send_outcome_uncertain",
+            )
+        )
+        await session.commit()
+
+    service = ManagedChannelService(factory)
+    unauthorized = await service.recover_uncertain_one_shot_route(
+        delivery_id="delivery-uncertain",
+        user_email="other@example.com",
+        actor_agent_id="other",
+        actor_conversation_id="other-conversation",
+        actor_session_id="other-session",
+        reason="Not authorized.",
+    )
+    assert unauthorized.status == "not_found"
+
+    common = {
+        "delivery_id": "delivery-uncertain",
+        "user_email": "owner@example.com",
+        "actor_agent_id": "controller",
+        "actor_conversation_id": link.controller_conversation_id,
+        "actor_session_id": "controller-session",
+        "reason": "Externally reconciled.",
+    }
+    first, second = await asyncio.gather(
+        service.recover_uncertain_one_shot_route(**common),
+        service.recover_uncertain_one_shot_route(**common),
+    )
+    assert {first.status, second.status} == {"released", "already_released"}
+
+    async with factory() as session:
+        row = await queries.get_channel_delivery_outbox(session, "delivery-uncertain")
+        blocker = await active_channel_tool_delivery_blocker(
+            session,
+            user_email="owner@example.com",
+            account_id="account-1",
+            chat_id="chat-1",
+            thread_id=None,
+        )
+        assert row is not None
+        assert row.status == "uncertain"
+        assert row.source_id == "idempotency-original"
+        assert row.attempt_count == 1
+        assert row.last_error == "external_send_outcome_uncertain"
+        assert row.route_released_at is not None
+        assert row.route_release_audit["delivery_retried"] is False
+        assert blocker is None
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_route_blocker_prefers_recoverable_uncertain_delivery(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'multiple-blockers.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    async with factory() as session:
+        link, _, _, _ = await _seed_channel_link(session)
+        for delivery_id, status in [
+            ("delivery-pending", "pending"),
+            ("delivery-uncertain", "uncertain"),
+        ]:
+            session.add(
+                ChannelDeliveryOutboxRow(
+                    delivery_id=delivery_id,
+                    user_email="owner@example.com",
+                    conversation_id=link.controller_conversation_id,
+                    source_type="channel_tool_message",
+                    source_id=f"source-{delivery_id}",
+                    channel_type="signal",
+                    account_id="account-1",
+                    chat_id="chat-1",
+                    status=status,
+                )
+            )
+        await session.commit()
+    async with factory() as session:
+        blocker = await active_channel_tool_delivery_blocker(
+            session,
+            user_email="owner@example.com",
+            account_id="account-1",
+            chat_id="chat-1",
+            thread_id=None,
+        )
+        assert blocker is not None
+        assert blocker.blocker_id == "delivery-uncertain"
+        assert blocker.recovery_tool == "agent_conversation_recover_channel"
+    service = ManagedChannelService(factory)
+
+    async def recover(delivery_id):
+        return await service.recover_uncertain_one_shot_route(
+            delivery_id=delivery_id,
+            user_email="owner@example.com",
+            actor_agent_id="controller",
+            actor_conversation_id=link.controller_conversation_id,
+            actor_session_id="controller-session",
+            reason="Externally reconciled.",
+        )
+
+    released = await recover("delivery-uncertain")
+    assert released.route_reserved
+    assert {b.blocker_type for b in released.remaining_blockers} == {
+        "managed_binding",
+        "one_shot_delivery",
+    }
+    duplicate = await recover("delivery-uncertain")
+    assert duplicate.route_reserved
+    assert duplicate.status == "already_released"
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        binding.active_route_key = None
+        pending = await queries.get_channel_delivery_outbox(session, "delivery-pending")
+        pending.status = "uncertain"
+        await session.commit()
+    last = await recover("delivery-pending")
+    assert not last.route_reserved
+    assert not last.remaining_blockers
+    assert not (await recover("delivery-uncertain")).route_reserved
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        binding.active_route_key = "new-route"
+        await session.commit()
+    assert (await recover("delivery-uncertain")).route_reserved
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        binding.active_route_key = None
+        pending = await queries.get_channel_delivery_outbox(session, "delivery-pending")
+        pending.route_released_at = None
+        pending.status = "sent"
+        await session.commit()
+    sent = await recover("delivery-pending")
+    assert sent.status == "not_eligible"
+    assert not sent.route_reserved
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expiry_and_agent_recovery_race_has_one_route_release(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'recovery-race.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    now = datetime.now(UTC)
+    async with factory() as session:
+        link, _, _, target = await _seed_channel_link(session)
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        assert binding is not None
+        binding.state = "delivery_failed"
+        binding.expires_at = now - timedelta(seconds=1)
+        binding.last_error = "external_send_outcome_uncertain"
+        await session.commit()
+
+    service = ManagedChannelService(factory)
+    expired_count, recovery = await asyncio.gather(
+        service.expire_bindings(now=now),
+        service.recover_expired_delivery_failure(
+            target_conversation_id=target.conversation_id,
+            user_email="owner@example.com",
+            expected_owner_epoch=link.owner_epoch,
+            actor_agent_id="next-controller",
+            actor_conversation_id="next-controller-conversation",
+            actor_session_id="next-controller-session",
+            reason="Resolve the expired route.",
+            now=now,
+        ),
+    )
+
+    assert (expired_count, recovery.status) in {
+        (1, "already_released"),
+        (1, "conflict"),
+        (0, "released"),
+    }
+    async with factory() as session:
+        binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        stored_link = await queries.get_managed_conversation_link(session, link.link_id)
+        notifications = (
+            await session.execute(
+                select(NotificationRow).where(
+                    NotificationRow.notification_type == "managed_conversation_completed"
+                )
+            )
+        ).scalars()
+        assert binding is not None and stored_link is not None
+        assert binding.state == "expired"
+        assert binding.active_route_key is None
+        assert len(list(notifications)) == 1
+        assert stored_link.control_metadata["channel_route_release"]["delivery_retried"] is False
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_expiry_batch_does_not_starve_failed_route_behind_pending_route(tmp_path) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'expiry-batch.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    now = datetime.now(UTC)
+    async with factory() as session:
+        first_link, _, _, _ = await _seed_channel_link(session)
+        first_binding = await queries.get_managed_channel_binding_for_link(
+            session, first_link.link_id
+        )
+        assert first_binding is not None
+        first_binding.state = "delivery_pending"
+        first_binding.expires_at = now - timedelta(minutes=2)
+
+        second_target = await queries.create_conversation(
+            session,
+            "owner@example.com",
+            "target",
+            "agent_work",
+        )
+        second_link = await queries.create_managed_conversation_link(
+            session,
+            user_email="owner@example.com",
+            controller_agent_id="controller",
+            controller_conversation_id=first_link.controller_conversation_id,
+            controller_session_id="controller-session",
+            target_agent_id="target",
+            target_conversation_id=second_target.conversation_id,
+            target_session_id="second-target-session",
+            title="Second external support",
+            kind="channel",
+            completion_policy="explicit",
+            creation_policy_snapshot={
+                "tool_ids": ["memory_search", "agent_conversation_send_controller"],
+                "explicit_tool_allowlist": [
+                    "memory_search",
+                    "agent_conversation_send_controller",
+                ],
+            },
+        )
+        session.add(
+            ManagedChannelBinding(
+                binding_id="binding-2",
+                link_id=second_link.link_id,
+                user_email="owner@example.com",
+                account_id="account-1",
+                channel_type="signal",
+                chat_id="chat-2",
+                thread_key="",
+                sender_id="sender-2",
+                active_route_key="owner@example.com:account-1:chat-2:",
+                state="delivery_failed",
+                version=1,
+                expires_at=now - timedelta(minutes=1),
+                objective="Resolve the second request.",
+                safety_guidance="Do not disclose private data.",
+                explicit_tool_allowlist=[
+                    "memory_search",
+                    "agent_conversation_send_controller",
+                ],
+                last_error="external_send_outcome_uncertain",
+            )
+        )
+        await session.commit()
+
+    service = ManagedChannelService(factory)
+    assert await service.expire_bindings(now=now, limit=1) == 1
+    async with factory() as session:
+        first_binding = await queries.get_managed_channel_binding_for_link(
+            session, first_link.link_id
+        )
+        second_binding = await queries.get_managed_channel_binding_for_link(
+            session, second_link.link_id
+        )
+        assert first_binding is not None and second_binding is not None
+        assert first_binding.state == "delivery_pending"
+        assert first_binding.active_route_key is not None
+        assert second_binding.state == "expired"
+        assert second_binding.active_route_key is None
+    await engine.dispose()
+
+
 def test_create_channel_tool_requires_explicit_finite_policy() -> None:
     schema = AGENT_CONVERSATION_CREATE_CHANNEL_TOOL.parameters
     assert set(schema["required"]) == {
@@ -815,6 +1332,20 @@ def test_create_channel_tool_requires_explicit_finite_policy() -> None:
     }
     assert schema["properties"]["allowed_tools"]["type"] == "array"
     assert "max_turns" not in schema["properties"]
+
+
+def test_recover_channel_tool_is_explicit_bounded_and_epoch_fenced() -> None:
+    schema = AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL.parameters
+    assert set(schema["required"]) == {"reason"}
+    assert len(schema["oneOf"]) == 2
+    assert "action" not in schema["properties"]
+    assert schema["properties"]["expected_owner_epoch"]["minimum"] == 1
+    assert schema["properties"]["reason"]["maxLength"] == 500
+    assert AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL.read_only is False
+    assert "reconcile" in AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL.description.lower()
+    assert "idempotency key remains reserved" in (
+        AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL.description.lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -1612,6 +2143,7 @@ async def test_managed_final_retry_blocks_turns_then_drains_fifo(
         )
     )
 
+    await delivery.recover_pending_deliveries()
     held = InboundMessage(
         message_id="message-held",
         channel_type="signal",
@@ -2097,12 +2629,14 @@ async def test_signal_uncertain_managed_final_notifies_without_draining(
         content="Do not lose this",
         timestamp=datetime.now(UTC),
     )
+    await delivery.recover_pending_deliveries()
     assert await managed.admit_inbound(held, user_email="owner@example.com") is True
     await managed.recover_stale_reservations(now=datetime.now(UTC) + timedelta(days=1))
 
     scheduler.submit_turn.assert_not_awaited()
     async with factory() as session:
         binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        stored_link = await queries.get_managed_conversation_link(session, link.link_id)
         outbox = (
             await session.execute(
                 select(ChannelDeliveryOutboxRow).where(
@@ -2117,9 +2651,13 @@ async def test_signal_uncertain_managed_final_notifies_without_draining(
                 )
             )
         ).scalar_one()
-        assert binding is not None and binding.state == "delivery_failed"
+        assert binding is not None and stored_link is not None
+        assert binding.state == "delivery_failed"
         assert outbox.status == "uncertain"
-        assert outbox.attempt_count == 0
+        assert outbox.attempt_count == 1
+        failure = stored_link.control_metadata["channel_delivery_failure"]
+        assert failure["outcome_uncertain"] is True
+        assert "reconcile externally" in failure["resend_guidance"].lower()
         assert notification.conversation_id == link.controller_conversation_id
         assert notification.payload["delivery_id"] == outbox.delivery_id
     restarted = ManagedChannelService(factory, turn_scheduler=scheduler)
@@ -2226,6 +2764,7 @@ async def test_nonretryable_managed_final_is_abandoned_once(
     scheduler.submit_turn.assert_not_awaited()
     async with factory() as session:
         binding = await queries.get_managed_channel_binding_for_link(session, link.link_id)
+        stored_link = await queries.get_managed_conversation_link(session, link.link_id)
         outbox = (
             await session.execute(
                 select(ChannelDeliveryOutboxRow).where(
@@ -2251,13 +2790,17 @@ async def test_nonretryable_managed_final_is_abandoned_once(
                 .where(ChannelInboundLedgerRow.disposition == "held")
             )
         ).scalar_one()
-        assert binding is not None and binding.state == "delivery_failed"
+        assert binding is not None and stored_link is not None
+        assert binding.state == "delivery_failed"
         assert outbox.status == "suppressed"
         assert outbox.attempt_count == 1
         assert outbox.last_error == "nonretryable_channel_failure"
         assert len(notifications) == 1
         assert notifications[0].conversation_id == link.controller_conversation_id
         assert held_count == 1
+        failure = stored_link.control_metadata["channel_delivery_failure"]
+        assert failure["outcome_uncertain"] is False
+        assert "without an uncertain external outcome" in failure["resend_guidance"].lower()
     await managed.reconcile_pending_deliveries()
     async with factory() as session:
         notification_count = (

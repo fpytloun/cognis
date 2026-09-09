@@ -112,7 +112,7 @@ async def secret_delete(
                 request.app,
                 reason=f"web_secret_delete:{name}",
             )
-        return deleted
+        return bool(deleted)
 
     if normalized_scope == "system" and agent_id is None and name in _WEB_SYSTEM_SECRET_NAMES:
         ok = await run_web_mutation_cancellation_safe(

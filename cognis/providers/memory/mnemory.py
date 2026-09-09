@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from time import perf_counter
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 import httpx
 from prometheus_client import Counter
@@ -14,7 +14,17 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ProviderHealth
 from cognis.ownership import SYSTEM_USER_EMAIL
-from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
+from cognis.providers.memory.evidence import (
+    USER_EVENT_PATH,
+    EvidenceBody,
+    EvidenceOutcome,
+    TrustedEventRejectedError,
+    TrustedEventRejection,
+    UserEventRememberRequest,
+    evidence_body_dict,
+    parse_trusted_rejection,
+)
 from cognis.providers.memory.protocol import RememberOutcomeUnknownError
 from cognis.providers.retry import with_retry
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
@@ -41,6 +51,44 @@ class MnemoryHTTPStatusError(httpx.HTTPStatusError):
             request=error.request,
             response=response,
         )
+
+
+class EvidenceRememberResult:
+    """Terminal or retryable result from the trusted evidence endpoint."""
+
+    def __init__(
+        self,
+        status: EvidenceOutcome,
+        *,
+        terminal: bool,
+        retryable: bool,
+        outcome_unknown: bool = False,
+        operation_id: str | None = None,
+        result: dict[str, Any] | None = None,
+        status_code: int | None = None,
+        detail: Any = None,
+    ) -> None:
+        self.status = status
+        self.terminal = terminal
+        self.retryable = retryable
+        self.outcome_unknown = outcome_unknown
+        self.operation_id = operation_id
+        self.result = result
+        self.status_code = status_code
+        self.detail = detail
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a queue-friendly JSON-compatible result."""
+        return {
+            "status": self.status,
+            "terminal": self.terminal,
+            "retryable": self.retryable,
+            "outcome_unknown": self.outcome_unknown,
+            "operation_id": self.operation_id,
+            "result": self.result,
+            "status_code": self.status_code,
+            "detail": self.detail,
+        }
 
 
 def _response_error_detail(response: httpx.Response) -> Any:
@@ -74,6 +122,14 @@ def _truncate_recall_text(text: str) -> tuple[str, bool]:
     if not normalized:
         return "", False
     return middle_truncate(normalized, _MAX_RECALL_QUERY_CHARS)
+
+
+def _trusted_response_rejection(response: httpx.Response) -> TrustedEventRejection | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    return parse_trusted_rejection(payload.get("detail")) if isinstance(payload, dict) else None
 
 
 class MnemoryProvider:
@@ -156,14 +212,18 @@ class MnemoryProvider:
         user_email: str | None = None,
         operation: str,
         max_retries: int = 2,
+        expected_revision: str | None = None,
     ) -> Any:
         async def _do() -> Any:
+            headers = self._headers(agent_id=agent_id, user_email=user_email)
+            if expected_revision is not None:
+                headers["If-Match"] = expected_revision
             response = await self.client.request(
                 method,
                 path,
                 json=json_body,
                 params=params,
-                headers=self._headers(agent_id=agent_id, user_email=user_email),
+                headers=headers,
             )
             try:
                 response.raise_for_status()
@@ -188,14 +248,18 @@ class MnemoryProvider:
         user_email: str | None = None,
         operation: str,
         max_retries: int = 2,
+        expected_revision: str | None = None,
     ) -> None:
         async def _do() -> None:
+            headers = self._headers(agent_id=agent_id, user_email=user_email)
+            if expected_revision is not None:
+                headers["If-Match"] = expected_revision
             response = await self.client.request(
                 method,
                 path,
                 json=json_body,
                 params=params,
-                headers=self._headers(agent_id=agent_id, user_email=user_email),
+                headers=headers,
             )
             try:
                 response.raise_for_status()
@@ -361,6 +425,123 @@ class MnemoryProvider:
             )
             raise
 
+    async def remember_evidence(
+        self,
+        body: EvidenceBody,
+        evidence_jwt: str,
+    ) -> EvidenceRememberResult:
+        """POST one strict user event without ordinary Mnemory authority."""
+        body_dict = evidence_body_dict(body)
+
+        async def _do() -> EvidenceRememberResult | TrustedEventRejectedError:
+            response = await self.client.post(
+                "/api/evidence/remember/v1",
+                json=body_dict,
+                headers={"Authorization": f"Bearer {evidence_jwt}"},
+            )
+            if 200 <= response.status_code < 300:
+                payload = response.json()
+                response_status = payload.get("status") if isinstance(payload, dict) else None
+                if response_status in {"accepted", "replayed", "recovered", "skipped"}:
+                    result = payload.get("result")
+                    return EvidenceRememberResult(
+                        cast(EvidenceOutcome, response_status),
+                        terminal=True,
+                        retryable=False,
+                        operation_id=payload.get("operation_id"),
+                        result=result if isinstance(result, dict) else None,
+                        status_code=response.status_code,
+                    )
+                return EvidenceRememberResult(
+                    "rejected",
+                    terminal=True,
+                    retryable=False,
+                    status_code=response.status_code,
+                )
+            detail = _response_error_detail(response)
+            if response.status_code == 422:
+                rejection = _trusted_response_rejection(response)
+                if rejection is not None:
+                    return TrustedEventRejectedError(rejection, body_dict)
+            if response.status_code == 409:
+                status: EvidenceOutcome = "conflict"
+                terminal, retryable, unknown = True, False, False
+            elif response.status_code in {400, 401, 403, 422}:
+                status = "rejected"
+                terminal, retryable, unknown = True, False, False
+            else:
+                status = "unavailable"
+                terminal, retryable, unknown = False, True, True
+            return EvidenceRememberResult(
+                status,
+                terminal=terminal,
+                retryable=retryable,
+                outcome_unknown=unknown,
+                status_code=response.status_code,
+                detail=detail,
+            )
+
+        try:
+            outcome = await self.breaker.call(_do, operation="mnemory evidence remember")
+            if isinstance(outcome, TrustedEventRejectedError):
+                raise outcome
+            return outcome
+        except (
+            CircuitBreakerError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            return EvidenceRememberResult(
+                "unavailable",
+                terminal=False,
+                retryable=True,
+                outcome_unknown=True,
+                detail=type(exc).__name__,
+            )
+
+    async def remember_user_event(
+        self,
+        body: EvidenceBody,
+        user_event_jwt: str,
+    ) -> dict[str, Any]:
+        """Persist one shared trusted user event through its dedicated route."""
+        body_dict = UserEventRememberRequest.model_validate(evidence_body_dict(body)).model_dump(
+            mode="json"
+        )
+
+        async def _do() -> dict[str, Any] | TrustedEventRejectedError:
+            response = await self.client.post(
+                USER_EVENT_PATH,
+                json=body_dict,
+                headers={"Authorization": f"Bearer {user_event_jwt}"},
+            )
+            try:
+                if response.status_code == 422:
+                    rejection = _trusted_response_rejection(response)
+                    if rejection is not None:
+                        return TrustedEventRejectedError(rejection, body_dict)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise MnemoryHTTPStatusError(exc) from exc
+            payload = response.json()
+            if not isinstance(payload, dict) or payload.get("status") not in {
+                "accepted",
+                "replayed",
+            }:
+                raise RuntimeError("Mnemory returned an invalid user-event response")
+            return dict(payload)
+
+        outcome = await self._call_with_retry(
+            _do,
+            max_retries=2,
+            operation="mnemory trusted user event",
+        )
+        if isinstance(outcome, TrustedEventRejectedError):
+            raise outcome
+        return outcome
+
     async def add_memory(
         self,
         content: str,
@@ -381,6 +562,9 @@ class MnemoryProvider:
             "role": role,
             "pinned": pinned,
             "labels": labels or {},
+            # Mnemory requires extraction for assistant-authored identity data.
+            # User-authored explicit memories can use deterministic direct create.
+            "infer": role != "user",
         }
 
         async def _do() -> str:
@@ -389,7 +573,13 @@ class MnemoryProvider:
             )
             response.raise_for_status()
             data = response.json()
-            return str(data.get("memory_id", ""))
+            memory_id = data.get("memory_id")
+            results = data.get("results")
+            if not memory_id and isinstance(results, list) and results:
+                first = results[0]
+                if isinstance(first, dict):
+                    memory_id = first.get("id")
+            return str(memory_id or "")
 
         return await self._call_with_retry(
             _do,
@@ -519,6 +709,7 @@ class MnemoryProvider:
         *,
         agent_id: str | None = None,
         user_email: str | None = None,
+        expected_revision: str | None = None,
     ) -> Any:
         return await self._request_json(
             "PUT",
@@ -527,6 +718,7 @@ class MnemoryProvider:
             agent_id=agent_id,
             user_email=user_email,
             operation="mnemory memory_update",
+            expected_revision=expected_revision,
         )
 
     async def delete_memory_tool(
@@ -535,6 +727,7 @@ class MnemoryProvider:
         *,
         agent_id: str | None = None,
         user_email: str | None = None,
+        expected_revision: str | None = None,
     ) -> None:
         await self._request_no_content(
             "DELETE",
@@ -542,6 +735,7 @@ class MnemoryProvider:
             agent_id=agent_id,
             user_email=user_email,
             operation="mnemory memory_delete_tool",
+            expected_revision=expected_revision,
         )
 
     async def list_memories_tool(
@@ -558,6 +752,24 @@ class MnemoryProvider:
             agent_id=agent_id,
             user_email=user_email,
             operation="mnemory memory_list",
+        )
+
+    async def get_memories_by_ids_tool(
+        self,
+        memory_ids: list[str],
+        *,
+        agent_id: str | None = None,
+        user_email: str | None = None,
+    ) -> Any:
+        """Fetch canonical memory snapshots for alias revision projection."""
+
+        return await self._request_json(
+            "POST",
+            "/api/memories/by-ids",
+            json_body={"ids": memory_ids},
+            agent_id=agent_id,
+            user_email=user_email,
+            operation="mnemory memory_get_by_ids",
         )
 
     async def memory_categories_tool(
@@ -597,6 +809,7 @@ class MnemoryProvider:
         *,
         agent_id: str | None = None,
         user_email: str | None = None,
+        expected_revision: str | None = None,
     ) -> Any:
         return await self._request_json(
             "POST",
@@ -605,6 +818,7 @@ class MnemoryProvider:
             agent_id=agent_id,
             user_email=user_email,
             operation="mnemory memory_save_artifact",
+            expected_revision=expected_revision,
         )
 
     async def get_memory_artifact_tool(
@@ -665,6 +879,7 @@ class MnemoryProvider:
         *,
         agent_id: str | None = None,
         user_email: str | None = None,
+        expected_revision: str | None = None,
     ) -> None:
         await self._request_no_content(
             "DELETE",
@@ -672,6 +887,7 @@ class MnemoryProvider:
             agent_id=agent_id,
             user_email=user_email,
             operation="mnemory memory_delete_artifact",
+            expected_revision=expected_revision,
         )
 
     async def list_memories(
@@ -742,7 +958,8 @@ class MnemoryProvider:
         labeled_bootstrap_ids: list[str] = []
         legacy_match_ids: list[str] = []
         for memory in existing:
-            labels = memory.get("labels") if isinstance(memory.get("labels"), dict) else {}
+            raw_labels = memory.get("labels")
+            labels: dict[str, Any] = raw_labels if isinstance(raw_labels, dict) else {}
             is_bootstrap = labels.get("cognis_bootstrap") == "agent_identity"
             matches_previous = (
                 previous_content is not None and memory.get("content") == previous_content

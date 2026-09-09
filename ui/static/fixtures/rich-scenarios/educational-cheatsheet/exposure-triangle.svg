@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 600" role="img" aria-labelledby="title desc">
+  <title id="title">Photography exposure triangle</title>
+  <desc id="desc">A triangular diagram connecting aperture, shutter speed, and ISO.</desc>
+  <rect width="900" height="600" fill="#f5f0e7"/>
+  <path d="M450 82 142 500h616z" fill="#e7ddd0" stroke="#243447" stroke-width="8"/>
+  <g font-family="system-ui, sans-serif" text-anchor="middle">
+    <circle cx="450" cy="82" r="65" fill="#c46b3b"/><text x="450" y="76" fill="white" font-size="25">APERTURE</text><text x="450" y="108" fill="white" font-size="18">f-stop</text>
+    <circle cx="142" cy="500" r="65" fill="#355c7d"/><text x="142" y="494" fill="white" font-size="23">SHUTTER</text><text x="142" y="526" fill="white" font-size="18">time</text>
+    <circle cx="758" cy="500" r="65" fill="#7f8c4f"/><text x="758" y="494" fill="white" font-size="28">ISO</text><text x="758" y="526" fill="white" font-size="18">gain</text>
+    <circle cx="450" cy="355" r="90" fill="#fffdf8" stroke="#243447" stroke-width="4"/><text x="450" y="348" fill="#243447" font-size="27">EXPOSURE</text><text x="450" y="380" fill="#243447" font-size="18">brightness</text>
+  </g>
+  <text x="450" y="570" fill="#5a6470" font-family="system-ui, sans-serif" font-size="18" text-anchor="middle">Change one side. Balance another side to keep the same brightness.</text>
+</svg>

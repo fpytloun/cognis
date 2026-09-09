@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="900" viewBox="0 0 800 900" role="img" aria-labelledby="title desc">
+  <title id="title">Harbor 390 refrigerator illustration</title>
+  <desc id="desc">A cream refrigerator with a lower freezer drawer and a small energy label.</desc>
+  <rect width="800" height="900" fill="#f6efe3"/>
+  <rect x="230" y="80" width="340" height="720" rx="24" fill="#e4ded2"/>
+  <rect x="251" y="105" width="298" height="425" rx="14" fill="#f1ece2"/>
+  <rect x="251" y="553" width="298" height="224" rx="14" fill="#ddd5c6"/>
+  <path d="M520 160V460M520 598V725" stroke="#9c988f" stroke-width="12" stroke-linecap="round"/>
+  <rect x="75" y="145" width="112" height="168" rx="12" fill="#fff"/>
+  <text x="103" y="195" fill="#c48a33" font-family="sans-serif" font-size="42" font-weight="700">C</text>
+  <text x="90" y="245" fill="#665f56" font-family="sans-serif" font-size="22">208 kWh</text>
+  <text x="86" y="278" fill="#665f56" font-family="sans-serif" font-size="22">39 dB</text>
+  <text x="400" y="855" text-anchor="middle" fill="#665f56" font-family="sans-serif" font-size="30">Harbor 390</text>
+</svg>

@@ -186,11 +186,15 @@ def build_task_continuation_tool_handlers(
                         "step_type": row.step_type,
                         "status": row.status,
                         "attempt": row.attempt,
+                        "attempt_number": row.attempt_number,
+                        "superseded_by_step_run_id": row.superseded_by_step_run_id,
                         "agent_id": row.agent_id,
                         "conversation_id": row.conversation_id,
                         "session_id": row.session_id,
                         "intaris_session_id": row.intaris_session_id,
                         "deliverable_id": row.deliverable_id,
+                        "started_at": row.started_at,
+                        "completed_at": row.completed_at,
                         "runtime_info": row.runtime_info or {},
                     }
                     for row in rows

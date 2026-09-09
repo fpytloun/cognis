@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "id": "menstrual-cycle",
+  "title": "Synthetic menstrual-cycle pattern review",
+  "description": "A synthetic six-cycle review that communicates uncertainty, context, and safe clinician-discussion prompts.",
+  "group": "health",
+  "sort_key": 1610,
+  "content": "Synthetic six-cycle menstrual-cycle pattern review. Predicted dates are estimates only and are not contraception, diagnosis, or fertility guidance.",
+  "payload": {
+    "title": "Synthetic menstrual-cycle pattern review",
+    "metadata": {"canvas": "wide", "density": "compact", "eyebrow": "Synthetic cycle export", "subtitle": "Six completed cycles · generated 2026-09-05 20:50 UTC · data through 2026-09-04"},
+    "blocks": [
+      {
+        "type": "section_header",
+        "eyebrow": "Cycle pattern review",
+        "title": "Current synthetic cycle is in the luteal phase",
+        "subtitle": "Cycle day 22 of an estimated 28–31 day pattern. Predictions are estimates, not contraception or a diagnosis.",
+        "status": "Data completeness: 91% · temperature 5/7 recent mornings",
+        "tone": "info"
+      },
+      {
+        "type": "dashboard",
+        "title": "Cycle summary metrics",
+        "metrics": [
+          {"type": "metric", "label": "Current phase", "value": "Luteal", "delta": "Cycle day 22", "description": "Phase estimate from synthetic dates and temperature context", "tone": "info"},
+          {"type": "metric", "label": "Cycle length", "value": "29 days", "delta": "Six-cycle median", "description": "Range 28–31 days", "tone": "neutral"},
+          {"type": "metric", "label": "Next period estimate", "value": "Sep 12–15", "delta": "4-day range", "description": "Estimated window only; timing can vary", "tone": "warning"},
+          {"type": "metric", "label": "Recent sleep", "value": "7 h 12 min", "delta": "-18 min vs cycle average", "description": "Synthetic wearable context", "tone": "neutral"},
+          {"type": "metric", "label": "Recent HRV", "value": "39 ms", "delta": "-3 ms vs cycle average", "description": "Synthetic nightly median", "tone": "neutral"},
+          {"type": "metric", "label": "Data completeness", "value": "91%", "delta": "160 of 176 expected fields", "description": "Missing entries limit pattern confidence", "tone": "info"}
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Cycle-length history",
+        "description": "Six synthetic completed cycles show a narrow 28–31 day range. This is descriptive history, not a prediction guarantee.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "bar",
+        "legend_position": "bottom",
+        "palette_token": "warm",
+        "series": [{"id": "cycle_length", "label": "Cycle length (days)", "points": [{"x": "Mar", "y": 29}, {"x": "Apr", "y": 28}, {"x": "May", "y": 30}, {"x": "Jun", "y": 29}, {"x": "Jul", "y": 31}, {"x": "Aug", "y": 29}]}],
+        "x_axis": {"type": "category", "label": "Completed cycle"},
+        "y_axis": {"type": "linear", "label": "Days", "min": 25, "max": 32},
+        "source": "Synthetic cycle and wearable export",
+        "source_url": "/fixtures/rich-scenarios/menstrual-cycle/source-export.json",
+        "observed_at": "2026-09-05T20:50:00Z"
+      },
+      {
+        "type": "chart",
+        "title": "Temperature, sleep, and HRV context",
+        "description": "Recent synthetic daily context. These measures can vary for many reasons and do not confirm ovulation or a health condition.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "legend_position": "bottom",
+        "palette_token": "cool",
+        "series": [
+          {"id": "temperature", "label": "Temperature deviation (°C)", "points": [{"x": "2026-08-28", "y": 0.08}, {"x": "2026-08-30", "y": 0.14}, {"x": "2026-09-01", "y": 0.22}, {"x": "2026-09-03", "y": 0.27}, {"x": "2026-09-04", "y": 0.24}]},
+          {"id": "sleep", "label": "Sleep duration (hours)", "points": [{"x": "2026-08-28", "y": 7.6}, {"x": "2026-08-30", "y": 7.2}, {"x": "2026-09-01", "y": 7.4}, {"x": "2026-09-03", "y": 6.9}, {"x": "2026-09-04", "y": 7.1}]},
+          {"id": "hrv", "label": "HRV (ms)", "points": [{"x": "2026-08-28", "y": 42}, {"x": "2026-08-30", "y": 40}, {"x": "2026-09-01", "y": 41}, {"x": "2026-09-03", "y": 38}, {"x": "2026-09-04", "y": 39}]}
+        ],
+        "x_axis": {"type": "time", "label": "Date"},
+        "y_axis": {"type": "linear", "label": "Synthetic value"},
+        "source": "Synthetic cycle and wearable export",
+        "source_url": "/fixtures/rich-scenarios/menstrual-cycle/source-export.json",
+        "observed_at": "2026-09-05T20:50:00Z"
+      },
+      {
+        "type": "table",
+        "title": "Symptom pattern representation",
+        "description": "Self-reported synthetic entries are summarized by phase. Blank or missing entries are not treated as absent symptoms.",
+        "columns": [{"key": "phase", "label": "Phase"}, {"key": "pattern", "label": "Reported pattern"}, {"key": "coverage", "label": "Entry coverage"}],
+        "rows": [
+          {"phase": "Menstrual", "pattern": "Low energy reported on 2 of 5 logged days", "coverage": "5/6 days"},
+          {"phase": "Follicular", "pattern": "No recurring symptom category in logged entries", "coverage": "24/28 days"},
+          {"phase": "Luteal", "pattern": "Bloating and mood change logged on 3 of 7 recent days", "coverage": "6/7 days"}
+        ]
+      },
+      {
+        "type": "callout",
+        "title": "Uncertainty and clinician discussion",
+        "content": "Predicted period dates and phase labels are estimates from synthetic data. They are not contraception, fertility guarantees, or a diagnosis. Questions to discuss with a clinician can include: Are cycle changes persistent? Are symptoms affecting daily life? Which observations are useful to track between visits?"
+      },
+      {
+        "type": "source_list",
+        "title": "Source and freshness",
+        "sources": [{"title": "Synthetic cycle diary and wearable export", "url": "/fixtures/rich-scenarios/menstrual-cycle/source-export.json", "description": "Fictional data generated for renderer acceptance. Exported 2026-09-05 20:50 UTC; latest synthetic entry 2026-09-04."}]
+      }
+    ],
+    "sources": [],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 from pydantic import BaseModel, field_serializer
 
 from cognis.core.agent_loop import StreamAccumulator
+from cognis.executor.providers.llm.responses_bridge import (
+    responses_stream_to_chat_chunks as executor_responses_stream_to_chat_chunks,
+)
+from cognis.executor.providers.llm.responses_bridge import (
+    responses_to_chat_response as executor_responses_to_chat_response,
+)
 from cognis.providers.llm.errors import ToolArgumentParseFailure
 from cognis.providers.llm.responses_bridge import (
     messages_to_responses_input,
@@ -147,6 +155,69 @@ async def test_responses_stream_failed_event_preserves_prior_error_event() -> No
         "param": "tools",
         "details": "tool schema exploded",
     }
+
+
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_stream_to_chat_chunks, executor_responses_stream_to_chat_chunks],
+)
+@pytest.mark.asyncio
+async def test_responses_stream_incomplete_event_preserves_terminal_metadata(
+    bridge: Callable[..., Any],
+) -> None:
+    async def _stream():
+        yield {
+            "type": "response.incomplete",
+            "response": {
+                "id": "resp_123",
+                "status": "incomplete",
+                "output": [],
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "incomplete_details": {"reason": "max_output_tokens"},
+            },
+        }
+
+    chunks = [chunk async for chunk in bridge(_stream())]
+
+    assert chunks == [
+        {
+            "provider_event": "responses",
+            "provider_event_type": "response.incomplete",
+            "choices": [{"delta": {}, "finish_reason": "length"}],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+            },
+            "response_status": "incomplete",
+            "response_instructions": None,
+            "response_incomplete_details": {"reason": "max_output_tokens"},
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "bridge",
+    [responses_to_chat_response, executor_responses_to_chat_response],
+)
+def test_responses_incomplete_payload_preserves_terminal_metadata(
+    bridge: Callable[..., dict[str, Any]],
+) -> None:
+    result = bridge(
+        {
+            "status": "incomplete",
+            "output": [{"type": "message", "content": []}],
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "incomplete_details": {"reason": "max_output_tokens"},
+        }
+    )
+
+    assert result["choices"][0]["finish_reason"] == "length"
+    assert result["response_status"] == "incomplete"
+    assert result["response_incomplete_details"] == {"reason": "max_output_tokens"}
+    assert result["usage"]["total_tokens"] == 150
 
 
 @pytest.mark.asyncio

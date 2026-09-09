@@ -7,7 +7,7 @@ import contextlib
 import hashlib
 import secrets
 import sys
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from time import monotonic
@@ -29,6 +29,7 @@ from cognis.api.chat_v2.e2e_control import router as chat_v2_e2e_control_router
 from cognis.api.chat_v2.event_store import IntarisSessionEventStore
 from cognis.api.chat_v2.routes import router as chat_v2_router
 from cognis.api.chat_v2.shared_snapshot_cache import SharedChatSnapshotCache
+from cognis.api.chat_v2.work_graph import AuthorizedWorkGraphResolver
 from cognis.api.common import error_response
 from cognis.api.executor_runtime import schedule_executor_reconfigure
 from cognis.api.mcp_reconfigure import (
@@ -44,6 +45,7 @@ from cognis.api.routes.auth import router as auth_router
 from cognis.api.routes.channels import router as channels_router
 from cognis.api.routes.conversations import router as conversations_router
 from cognis.api.routes.credentials import router as credentials_router
+from cognis.api.routes.dashboard import router as dashboard_router
 from cognis.api.routes.deliverables import router as deliverables_router
 from cognis.api.routes.escalations import router as escalations_router
 from cognis.api.routes.executors import router as executors_router
@@ -59,6 +61,7 @@ from cognis.api.routes.mcp_oauth import (
 from cognis.api.routes.mcp_oauth import (
     router as mcp_oauth_router,
 )
+from cognis.api.routes.notifications import attention_router
 from cognis.api.routes.notifications import router as notifications_router
 from cognis.api.routes.projects import router as projects_router
 from cognis.api.routes.push import router as push_router
@@ -74,6 +77,7 @@ from cognis.api.routes.tasks import router as tasks_router
 from cognis.api.routes.tools import router as tools_router
 from cognis.api.routes.tts import router as tts_router
 from cognis.api.routes.users import router as users_router
+from cognis.api.routes.work import router as work_router
 from cognis.api.routes.workflows import router as workflows_router
 from cognis.api.runtime_support import build_shared_runtime, build_step_runtime_factory
 from cognis.api.websocket import WebSocketConnectionManager, handle_websocket
@@ -96,12 +100,18 @@ from cognis.core.remember_queue import RememberRetryQueue
 from cognis.core.scheduler import Scheduler
 from cognis.core.session import SessionManager
 from cognis.core.session_cache import SessionCache
+from cognis.core.shutdown import (
+    ExecutorToolDrainer,
+    ShutdownCallbacks,
+    ShutdownCoordinator,
+)
 from cognis.core.step_evaluator import StepEvaluator
 from cognis.core.step_profiles import StepProfileRegistry
 from cognis.core.task_queue import TaskQueue
 from cognis.core.tool_classification_queue import ToolClassificationQueue
 from cognis.core.tool_output_store import ToolOutputStore
 from cognis.core.tool_router import ToolRouter
+from cognis.core.trusted_evidence import trusted_evidence_policy_fingerprint
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger, setup_logging
@@ -118,6 +128,12 @@ STARTUP_HEALTH_RETRY_DELAY_SECONDS = 0.5
 
 def _as_int(value: object, default: int) -> int:
     return value if isinstance(value, int) else default
+
+
+def _effective_api_limits(*, e2e_mode: bool, read: int, write: int) -> tuple[int, int]:
+    if e2e_mode:
+        return 60_000, 60_000
+    return read, write
 
 
 def _as_user_facing_host(host: str) -> str:
@@ -225,64 +241,53 @@ async def _print_startup_status(
     sys.stdout.flush()
 
 
+async def _start_optional_snapshot_warming(
+    session_factory: Any,
+    snapshot_warmer: Any,
+    active_snapshot_reconciler: Any,
+) -> None:
+    """Start best-effort snapshot warming without gating controller readiness."""
+
+    from cognis.api.chat_v2.snapshot_activity import iter_active_snapshot_conversation_ids
+
+    try:
+        async for conversation_id in iter_active_snapshot_conversation_ids(session_factory):
+            snapshot_warmer.enqueue(conversation_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("startup: initial chat snapshot warming skipped", exc_info=True)
+    try:
+        await active_snapshot_reconciler.start()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("startup: active chat snapshot reconciler unavailable", exc_info=True)
+
+
+def _schedule_optional_snapshot_warming(
+    session_factory: Any,
+    snapshot_warmer: Any,
+    active_snapshot_reconciler: Any,
+) -> asyncio.Task[None]:
+    return asyncio.create_task(
+        _start_optional_snapshot_warming(
+            session_factory,
+            snapshot_warmer,
+            active_snapshot_reconciler,
+        ),
+        name="chat-snapshot-initial-warming",
+    )
+
+
+async def _cancel_optional_snapshot_warming(task: asyncio.Task[None] | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 logger = get_logger(__name__)
-
-
-class _PendingAppendWarmState:
-    """Compare-and-remove state for overlapping event append resolutions."""
-
-    def __init__(self, max_sessions: int) -> None:
-        self._max_sessions = max_sessions
-        self._pending: dict[str, tuple[str, int, str]] = {}
-
-    def __len__(self) -> int:
-        return len(self._pending)
-
-    def claim(self, session_token: str) -> tuple[str, int, str] | None:
-        return self._pending.get(session_token)
-
-    def put(
-        self,
-        session_token: str,
-        value: tuple[str, int, str],
-    ) -> bool:
-        current = self._pending.get(session_token)
-        if current is not None and value[1] < current[1]:
-            return False
-        overflowed = session_token not in self._pending and len(self._pending) >= self._max_sessions
-        if overflowed:
-            self._pending.pop(next(iter(self._pending)))
-        self._pending[session_token] = value
-        return overflowed
-
-    def complete(
-        self,
-        session_token: str,
-        processed: tuple[str, int, str],
-    ) -> bool:
-        """Remove only the exact claim. Return True when newer work remains."""
-
-        current = self._pending.get(session_token)
-        if current == processed:
-            self._pending.pop(session_token, None)
-            return False
-        return current is not None
-
-    def finish(
-        self,
-        session_token: str,
-        processed: tuple[str, int, str],
-        *,
-        succeeded: bool,
-    ) -> bool:
-        """Keep failed exact claims; remove only successfully processed claims."""
-
-        if not succeeded:
-            return self._pending.get(session_token) is not None
-        return self.complete(session_token, processed)
-
-    def clear(self) -> None:
-        self._pending.clear()
 
 
 async def _drain_turn_scheduler(
@@ -302,8 +307,121 @@ async def _drain_turn_scheduler(
     return result
 
 
-def create_app() -> FastAPI:
+async def _begin_application_drain(
+    *,
+    controller_runtime: Any,
+    turn_scheduler: Any,
+    controller_directory: Any,
+    scheduler: Any,
+) -> None:
+    """Close local admission and continue best-effort shutdown preparation."""
+
+    try:
+        controller_runtime.begin_draining()
+    except Exception:
+        logger.exception(
+            "shutdown admission step failed",
+            extra={"extra_data": {"stage": "runtime_readiness"}},
+        )
+    for stage, operation in (
+        ("turn_admission", turn_scheduler.begin_drain),
+        ("directory_readiness", controller_directory.begin_draining),
+        ("scheduler", scheduler.stop),
+        ("follow_up_recovery", turn_scheduler.stop_follow_up_recovery),
+    ):
+        try:
+            await operation()
+        except Exception:
+            logger.exception(
+                "shutdown admission step failed",
+                extra={"extra_data": {"stage": stage}},
+            )
+
+
+def _snapshot_warm_conversation_id(event: Any) -> str | None:
+    """Return the conversation affected by a chat snapshot invalidation."""
+
+    if event.type != EventType.CLUSTER_SCOPE_INVALIDATED:
+        return None
+    if event.data.get("kind") not in {
+        "chat_scope_changed",
+        "task_progress_changed",
+    }:
+        return None
+    scope = event.data.get("scope")
+    conversation_id = scope.get("conversation_id") if isinstance(scope, dict) else None
+    return conversation_id if isinstance(conversation_id, str) else None
+
+
+def _create_work_projection_callback(
+    session_factory: Any,
+    cluster_signals: Any,
+) -> Callable[[str], Awaitable[None]]:
+    """Publish best-effort live Work invalidations after projection commits."""
+
+    async def publish_caught_up_work(conversation_id: str) -> None:
+        from cognis.store.models import Conversation
+        from cognis.store.work_live_invalidation import bump_live_work_revision
+
+        async with session_factory() as session:
+            conversation = await session.get(Conversation, conversation_id)
+            if conversation is None:
+                return
+            revision = await bump_live_work_revision(
+                session,
+                conversation.user_email,
+            )
+            await session.commit()
+        await cluster_signals.publish_work_invalidation(
+            scope_key=f"conversation:{conversation_id}",
+            user_email=conversation.user_email,
+            revision=revision,
+            materialized=True,
+        )
+
+    return publish_caught_up_work
+
+
+def _create_work_projection_runtime(
+    *,
+    session_factory: Any,
+    event_store: Any,
+    tool_definitions: Callable[[], dict[str, Any]],
+    event_read_admission: Any,
+    cluster_signals: Any,
+    max_pending: int,
+    on_queue_overflow: Callable[[], None],
+    source_preview_max_lifetime_seconds: int = 0,
+) -> tuple[Any, Any]:
+    """Construct Work projection publication without snapshot-warmer dependencies."""
+
+    from cognis.api.chat_v2.post_projection_warms import PostProjectionCallbackCoalescer
+    from cognis.api.chat_v2.work_materializer import WorkMaterializer
+
+    callback = _create_work_projection_callback(session_factory, cluster_signals)
+    coalescer = PostProjectionCallbackCoalescer(callback, max_entries=max_pending)
+
+    def enqueue_publication(conversation_id: str) -> None:
+        if not coalescer.enqueue(conversation_id):
+            on_queue_overflow()
+
+    materializer = WorkMaterializer(
+        session_factory=session_factory,
+        event_store=event_store,
+        tool_definitions=tool_definitions,
+        event_read_admission=event_read_admission,
+        on_projection_caught_up=enqueue_publication,
+        source_preview_max_lifetime_seconds=source_preview_max_lifetime_seconds,
+    )
+    return materializer, coalescer
+
+
+def create_app(
+    *,
+    shutdown_coordinator: ShutdownCoordinator | None = None,
+) -> FastAPI:
     config = load_config()
+    shutdown_coordinator = shutdown_coordinator or ShutdownCoordinator()
     setup_logging(config.log_level, config.log_format)
     ui_build_dir = resolve_ui_build_dir() if config.serve_ui else None
 
@@ -351,6 +469,16 @@ def create_app() -> FastAPI:
         auth_provider = JWTAuthProvider(
             config_runtime.jwt_private_key_path, config_runtime.jwt_public_key_path
         )
+        from cognis.mfa import MfaSecretCipher
+
+        mfa_cipher = MfaSecretCipher(config_runtime.secrets_key_path)
+        evidence_policy_fingerprint = trusted_evidence_policy_fingerprint(
+            key=mfa_cipher.key_material,
+            enabled=config_runtime.trusted_evidence_enabled,
+            max_attempts=config_runtime.trusted_evidence_max_attempts,
+            max_age_seconds=config_runtime.trusted_evidence_max_age_seconds,
+            owner_allowlist=config_runtime.trusted_evidence_owner_allowlist,
+        )
         providers = build_provider_registry(config_runtime, session_factory, auth_provider)
         await providers.executor.websocket.configure_cluster(
             enabled=config_runtime.runtime_mode == "ha",
@@ -368,12 +496,20 @@ def create_app() -> FastAPI:
             guardrails=providers.guardrails,
             event_bus=event_bus,
         )
-        providers.executor_pin_notice_dispatcher = executor_pin_notice_dispatcher
+        providers.executor_pin_notice_dispatcher = (  # type: ignore[attr-defined]
+            executor_pin_notice_dispatcher
+        )
         remember_queue = RememberRetryQueue(
             providers.memory,
             session_factory=session_factory,
             event_reader=providers.guardrails,
             event_bus=event_bus,
+            trusted_evidence_enabled=config_runtime.trusted_evidence_enabled,
+            trusted_evidence_owner_allowlist=config_runtime.trusted_evidence_owner_allowlist,
+            trusted_evidence_max_attempts=config_runtime.trusted_evidence_max_attempts,
+            trusted_evidence_max_age_seconds=config_runtime.trusted_evidence_max_age_seconds,
+            trusted_evidence_policy_fingerprint=evidence_policy_fingerprint,
+            trusted_evidence_admission_key=mfa_cipher.key_material,
         )
         await remember_queue.start()
         tool_classification_queue = ToolClassificationQueue(
@@ -384,12 +520,13 @@ def create_app() -> FastAPI:
         await _print_startup_status(config_runtime, providers, ui_build_dir)
 
         async with session_factory() as session:
+            from cognis.core.executor_availability import is_executor_type_available
             from cognis.store.queries import count_users, ensure_default_executor, get_setting_value
 
             allow_in_process = bool(
                 await get_setting_value(session, "executors.allow_in_process", True)
             )
-            if allow_in_process:
+            if allow_in_process and is_executor_type_available("in_process"):
                 await ensure_default_executor(session)
             await session.commit()
 
@@ -404,6 +541,13 @@ def create_app() -> FastAPI:
             )
             api_write_requests_per_minute = _as_int(
                 await get_setting_value(session, "security.api_write_requests_per_minute", 200), 200
+            )
+            # Browser workers share one seeded user. E2E mode uses finite
+            # runtime-only capacity and never persists weaker local settings.
+            api_read_requests_per_minute, api_write_requests_per_minute = _effective_api_limits(
+                e2e_mode=config_runtime.e2e_mode,
+                read=api_read_requests_per_minute,
+                write=api_write_requests_per_minute,
             )
             cache_max_entries = _as_int(
                 await get_setting_value(session, "session.cache_max_entries", 200), 200
@@ -425,6 +569,7 @@ def create_app() -> FastAPI:
         pause_waiter = PauseWaiter()
         session_lock = SessionLock()
         session_lock_sweeper_task: asyncio.Task[None] | None = None
+        optional_snapshot_warming_task: asyncio.Task[None] | None = None
         redis_service = RedisService(config_runtime.redis_url)
         session_cache = SessionCache(
             providers.guardrails,
@@ -453,7 +598,8 @@ def create_app() -> FastAPI:
             session_cache=session_cache,
         )
         providers.compaction_strategy = compaction_strategy  # type: ignore[attr-defined]
-        providers.executor.in_process.compaction_strategy = compaction_strategy
+        if providers.executor.in_process is not None:
+            providers.executor.in_process.compaction_strategy = compaction_strategy
         decision_engine = await DecisionEngine.from_session_factory(
             session_factory=session_factory,
             llm=providers.llm,
@@ -462,8 +608,10 @@ def create_app() -> FastAPI:
         from cognis.core.tool_output_store import (
             FilesystemToolOutputBackend,
             S3ToolOutputBackend,
+            ToolOutputBackend,
         )
 
+        tool_output_backend: ToolOutputBackend
         if config_runtime.tool_output_backend == "s3":
             tool_output_backend = S3ToolOutputBackend(
                 endpoint=config_runtime.tool_output_s3_endpoint,
@@ -509,6 +657,7 @@ def create_app() -> FastAPI:
             )
         )
         context_assembler.set_artifact_store(artifact_store)
+        providers.llm.set_artifact_store(artifact_store)
 
         from cognis.core.artifact_maintenance import ArtifactMaintenanceService
         from cognis.store.deliverable_chart_migration import (
@@ -529,9 +678,14 @@ def create_app() -> FastAPI:
 
         from cognis.knowledgebase.indexer import KnowledgebaseIndexer
         from cognis.knowledgebase.service import KnowledgebaseService
-        from cognis.knowledgebase.vector import DisabledVectorBackend, QdrantVectorBackend
+        from cognis.knowledgebase.vector import (
+            DisabledVectorBackend,
+            KnowledgebaseVectorBackend,
+            QdrantVectorBackend,
+        )
 
         kb_notes: list[str] = []
+        kb_vector_backend: KnowledgebaseVectorBackend
         if config_runtime.knowledgebase_vector_backend == "qdrant":
             kb_vector_backend = QdrantVectorBackend(
                 url=config_runtime.knowledgebase_qdrant_url,
@@ -599,6 +753,7 @@ def create_app() -> FastAPI:
             image_generation_provider=providers.image_generation,
             artifact_store=artifact_store,
             event_bus=event_bus,
+            session_cache=session_cache,
         )
         agent_registry = AgentRegistry(session_factory)
         workflow_registry = WorkflowRegistry(session_factory)
@@ -685,7 +840,14 @@ def create_app() -> FastAPI:
             ),
             tool_output_store=tool_output_store,
             step_runtime_factory=step_runtime_factory,
+            trusted_evidence_enabled=config_runtime.trusted_evidence_enabled,
+            trusted_evidence_owner_allowlist=config_runtime.trusted_evidence_owner_allowlist,
+            trusted_evidence_policy_fingerprint=evidence_policy_fingerprint,
+            trusted_evidence_admission_key=mfa_cipher.key_material,
+            trusted_evidence_max_attempts=config_runtime.trusted_evidence_max_attempts,
+            trusted_evidence_max_age_seconds=config_runtime.trusted_evidence_max_age_seconds,
         )
+        agent_loop.set_controller_recovery(controller_directory, controller_runtime)
         workflow_engine = WorkflowEngine(
             session_factory=session_factory,
             providers=providers,
@@ -773,18 +935,22 @@ def create_app() -> FastAPI:
                 app, server_id=server_id, reason=reason
             )
 
-        tool_router._mcp_reconfigure_server = _reconfigure_managed_mcp_server  # noqa: SLF001
+        tool_router._mcp_reconfigure_server = (  # type: ignore[attr-defined]  # noqa: SLF001
+            _reconfigure_managed_mcp_server
+        )
 
         async def _reconfigure_managed_executor(executor_id: str, _reason: str) -> None:
             schedule_executor_reconfigure(app, executor_id)
 
-        tool_router._mcp_reconfigure_executor = _reconfigure_managed_executor  # noqa: SLF001
-        tool_router._mcp_oauth_status = (  # noqa: SLF001
+        tool_router._mcp_reconfigure_executor = (  # type: ignore[attr-defined]  # noqa: SLF001
+            _reconfigure_managed_executor
+        )
+        tool_router._mcp_oauth_status = (  # type: ignore[attr-defined]  # noqa: SLF001
             lambda user_email, server_id: _mcp_oauth_status_payload_for_user(
                 app, user_email=user_email, server_id=server_id
             )
         )
-        tool_router._mcp_oauth_disconnect = (  # noqa: SLF001
+        tool_router._mcp_oauth_disconnect = (  # type: ignore[attr-defined]  # noqa: SLF001
             lambda user_email, server_id: disconnect_mcp_oauth_for_user(
                 app, user_email=user_email, server_id=server_id
             )
@@ -843,7 +1009,7 @@ def create_app() -> FastAPI:
 
         async def _executor_pin_notice_worker() -> None:
             while True:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(60.0)
                 try:
                     await executor_pin_notice_dispatcher.dispatch_pending(limit=50)
                 except Exception:
@@ -874,11 +1040,13 @@ def create_app() -> FastAPI:
             artifact_store=artifact_store,
             workflow_registry=workflow_registry,
             event_bus=event_bus,
+            evidence_append_callback=remember_queue.enqueue_after_user_append,
             tool_output_spool=tool_output_spool,
             controller_runtime=controller_runtime,
             runtime_mode=config_runtime.runtime_mode,
         )
         agent_loop.set_turn_scheduler(turn_scheduler)
+        task_queue.set_turn_scheduler(turn_scheduler)
 
         from cognis.channels.managed import ManagedChannelService
         from cognis.core.managed_conversation_maintenance import (
@@ -994,6 +1162,7 @@ def create_app() -> FastAPI:
             task_queue=task_queue,
             event_bus=event_bus,
             controller_owner_id=controller_runtime.owner_id,
+            notification_service=notification_service,
         )
         await scheduler.start()
         tool_router._scheduler = scheduler
@@ -1005,10 +1174,13 @@ def create_app() -> FastAPI:
         app.state.config = config_runtime
         app.state.engine = engine
         app.state.session_factory = session_factory
+        work_graph_resolver = AuthorizedWorkGraphResolver(session_factory)
+        app.state.work_graph_resolver = work_graph_resolver
         app.state.settings_update_lock = asyncio.Lock()
         app.state.setup_token_manager = setup_token_manager
         app.state.password_hasher = password_hasher
         app.state.auth_provider = auth_provider
+        app.state.mfa_cipher = mfa_cipher
         app.state.providers = providers
         app.state.local_model_catalog = local_model_catalog
         app.state.login_rate_limiter = LoginRateLimiter()
@@ -1028,6 +1200,7 @@ def create_app() -> FastAPI:
         )
         app.state.provider_test_results = {}
         app.state.provider_test_cooldowns = {}
+        app.state.mfa_cipher = mfa_cipher
         app.state.remember_queue = remember_queue
         app.state.tool_classification_queue = tool_classification_queue
         app.state.artifact_store = artifact_store
@@ -1124,10 +1297,25 @@ def create_app() -> FastAPI:
         )
         app.state.cluster_signals = cluster_signals
         notification_service.cluster_signals = cluster_signals
-        task_queue.cluster_signals = cluster_signals
-        workflow_engine.cluster_signals = cluster_signals
-        turn_scheduler.cluster_signals = cluster_signals
-        executor_pin_notice_dispatcher.cluster_signals = cluster_signals
+        task_queue.cluster_signals = cluster_signals  # type: ignore[attr-defined]
+        workflow_engine.cluster_signals = cluster_signals  # type: ignore[attr-defined]
+        turn_scheduler.cluster_signals = cluster_signals  # type: ignore[attr-defined]
+        executor_pin_notice_dispatcher.cluster_signals = cluster_signals  # type: ignore[attr-defined]
+
+        from cognis.store.work_live_invalidation import register_live_work_waker
+
+        def _publish_live_work_owners(revisions: dict[str, int]) -> None:
+            async def publish() -> None:
+                for owner_email, revision in revisions.items():
+                    await cluster_signals.publish_work_invalidation(
+                        scope_key="*",
+                        user_email=owner_email,
+                        revision=revision,
+                    )
+
+            asyncio.create_task(publish(), name="work-live-topology-invalidation")
+
+        unregister_live_work_waker = register_live_work_waker(_publish_live_work_owners)
 
         async def _publish_event_append_invalidation(session_token: str, revision: int) -> bool:
             return await cluster_signals.publish_event_store_invalidation(
@@ -1136,12 +1324,13 @@ def create_app() -> FastAPI:
                 revision=revision,
             )
 
+        from cognis.api.chat_v2.activity_overview_computation import (
+            ActivityOverviewComputationService,
+        )
         from cognis.api.chat_v2.background_event_reads import BackgroundEventReadAdmission
-        from cognis.api.chat_v2.post_projection_warms import PostProjectionWarmRevisions
         from cognis.api.chat_v2.snapshot_activity import (
             conversation_needs_snapshot_warm,
             iter_active_snapshot_conversation_ids,
-            resolve_event_session_conversation_id,
         )
         from cognis.api.chat_v2.snapshot_coordinator import (
             admit_background_snapshot_reads,
@@ -1156,26 +1345,23 @@ def create_app() -> FastAPI:
         )
         from cognis.store.models import Conversation
 
-        background_event_reads = BackgroundEventReadAdmission()
+        # This semaphore is process-local. PostgreSQL leases and fences provide
+        # cross-controller write safety.
+        background_event_reads = BackgroundEventReadAdmission(max_concurrency=8)
+        activity_overview_computation = ActivityOverviewComputationService()
+        app.state.activity_overview_computation = activity_overview_computation
         app.state.background_event_read_admission = background_event_reads
-        post_projection_warms = PostProjectionWarmRevisions(
-            event_cache_bounds.generation_max_sessions
-        )
 
         async def _warm_chat_snapshot(conversation_id: str) -> WarmResult:
-            forced_revision = post_projection_warms.current(conversation_id)
             if not shared_chat_snapshot_cache.warming_configured:
-                post_projection_warms.complete(conversation_id, forced_revision)
                 return "skipped", None
             if not shared_chat_snapshot_cache.warming_available:
                 return "retry", "redis_unavailable"
             async with session_factory() as session:
                 conversation = await session.get(Conversation, conversation_id)
             if conversation is None or conversation.status == "deleted":
-                post_projection_warms.complete(conversation_id, forced_revision)
                 return "skipped", "context_missing"
-            forced = forced_revision is not None
-            if not forced and not await conversation_needs_snapshot_warm(
+            if not await conversation_needs_snapshot_warm(
                 session_factory, shared_chat_snapshot_cache, conversation_id
             ):
                 return "skipped", None
@@ -1185,10 +1371,7 @@ def create_app() -> FastAPI:
                 conversation_id=conversation_id,
             )
             context = admit_background_snapshot_reads(context, background_event_reads)
-            result = await warm_chat_snapshot_coordinated(app, context)
-            if result[0] != "retry":
-                post_projection_warms.complete(conversation_id, forced_revision)
-            return result
+            return await warm_chat_snapshot_coordinated(app, context)
 
         snapshot_warmer = ChatSnapshotWarmer(
             _warm_chat_snapshot,
@@ -1198,128 +1381,33 @@ def create_app() -> FastAPI:
         app.state.chat_snapshot_warmer = snapshot_warmer
         app.state.enqueue_chat_snapshot_warm = snapshot_warmer.enqueue
 
-        def _enqueue_post_projection_warm(conversation_id: str) -> None:
-            if not post_projection_warms.admit(conversation_id, snapshot_warmer.enqueue):
-                SNAPSHOT_CACHE_METRICS.overflow("warmer")
-
-        pending_warm_sessions = _PendingAppendWarmState(event_cache_bounds.generation_max_sessions)
-        active_snapshot_resolvers = 0
-        snapshot_resolve_queue: asyncio.Queue[str] = asyncio.Queue(
-            maxsize=event_cache_bounds.generation_max_sessions
-        )
-
-        def _warm_after_generation_advanced(work: Any) -> None:
-            if pending_warm_sessions.claim(work.session_token) is None:
-                return
-            try:
-                snapshot_resolve_queue.put_nowait(work.session_token)
-            except asyncio.QueueFull:
-                SNAPSHOT_CACHE_METRICS.overflow("resolver")
-
-        async def _resolve_append_warms() -> None:
-            nonlocal active_snapshot_resolvers
-            while True:
-                session_token = await snapshot_resolve_queue.get()
-                active_snapshot_resolvers += 1
-                SNAPSHOT_CACHE_METRICS.resolver_active(active_snapshot_resolvers)
-                session_id: str | None = None
-                processed: tuple[str, int, str] | None = None
-                succeeded = False
-                try:
-                    processed = pending_warm_sessions.claim(session_token)
-                    if processed is None:
-                        continue
-                    session_id, last_seq, user_email = processed
-                    async with session_factory() as session:
-                        conversation_id = await resolve_event_session_conversation_id(
-                            session,
-                            session_id,
-                        )
-                        from cognis.api.chat_v2.work_revisions import (
-                            advance_work_revisions_for_stream,
-                        )
-
-                        work_invalidations = await advance_work_revisions_for_stream(
-                            session,
-                            user_email=user_email,
-                            event_store_id="intaris",
-                            event_store_session_id=session_id,
-                            last_seq=last_seq,
-                            include_current=True,
-                        )
-                        await session.commit()
-                    if conversation_id:
-                        snapshot_warmer.enqueue(str(conversation_id))
-                    for invalidation in work_invalidations:
-                        published = await cluster_signals.publish_work_invalidation(
-                            scope_key=invalidation.scope_key,
-                            user_email=invalidation.user_email,
-                            revision=invalidation.work_revision,
-                        )
-                        if not published:
-                            raise RuntimeError("Work invalidation publication failed")
-                    succeeded = True
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "chat_v2: append warm resolution failed",
-                        exc_info=True,
-                    )
-                finally:
-                    requeue = bool(
-                        processed is not None
-                        and pending_warm_sessions.finish(
-                            session_token,
-                            processed,
-                            succeeded=succeeded,
-                        )
-                    )
-                    SNAPSHOT_CACHE_METRICS.append_mapping(len(pending_warm_sessions))
-                    if requeue:
-                        try:
-                            snapshot_resolve_queue.put_nowait(session_token)
-                        except asyncio.QueueFull:
-                            SNAPSHOT_CACHE_METRICS.overflow("resolver")
-                    active_snapshot_resolvers -= 1
-                    SNAPSHOT_CACHE_METRICS.resolver_active(active_snapshot_resolvers)
-                    snapshot_resolve_queue.task_done()
-
-        snapshot_resolver_workers = [
-            asyncio.create_task(
-                _resolve_append_warms(),
-                name=f"chat-snapshot-append-resolver-{index}",
-            )
-            for index in range(4)
-        ]
         active_snapshot_reconciler = ChatSnapshotActiveReconciler(
             lambda: iter_active_snapshot_conversation_ids(session_factory),
             snapshot_warmer.enqueue,
             interval_seconds=event_cache_policy.ttl_seconds / 2,
         )
 
-        async def _stop_snapshot_background() -> None:
+        async def _stop_snapshot_background(*, drain_timeout_seconds: float) -> None:
             await active_snapshot_reconciler.stop()
-            for worker in snapshot_resolver_workers:
-                worker.cancel()
-            await asyncio.gather(*snapshot_resolver_workers, return_exceptions=True)
-            pending_warm_sessions.clear()
-            post_projection_warms.clear()
-            SNAPSHOT_CACHE_METRICS.append_mapping(0)
-            SNAPSHOT_CACHE_METRICS.resolver_active(0)
+            await post_projection_callbacks.stop(drain_timeout_seconds=drain_timeout_seconds)
 
         event_append_invalidation_dispatcher = EventAppendInvalidationDispatcher(
             event_store=cached_event_store,
             publish_invalidation=_publish_event_append_invalidation,
-            on_cache_advanced=_warm_after_generation_advanced,
         )
         await event_append_invalidation_dispatcher.start()
         app.state.event_append_invalidation_dispatcher = event_append_invalidation_dispatcher
 
         from cognis.api.chat_v2.event_store import IntarisSessionEventStore as WorkRepairEventStore
-        from cognis.api.chat_v2.work_materializer import WorkMaterializer
+        from cognis.store.queries import get_setting_value
 
-        work_materializer = WorkMaterializer(
+        async with session_factory() as session:
+            work_source_preview_lifetime = _as_int(
+                await get_setting_value(session, "work.source_preview_max_lifetime_seconds", 0),
+                0,
+            )
+
+        work_materializer, post_projection_callbacks = _create_work_projection_runtime(
             session_factory=session_factory,
             event_store=WorkRepairEventStore(providers.guardrails),
             tool_definitions=lambda: {
@@ -1327,33 +1415,25 @@ def create_app() -> FastAPI:
                 for definition in shared_runtime.tool_registry.list_tools()
             },
             event_read_admission=background_event_reads,
-            on_projection_caught_up=_enqueue_post_projection_warm,
+            cluster_signals=cluster_signals,
+            max_pending=event_cache_bounds.generation_max_sessions,
+            on_queue_overflow=lambda: SNAPSHOT_CACHE_METRICS.overflow("warmer"),
+            source_preview_max_lifetime_seconds=work_source_preview_lifetime,
         )
+        await post_projection_callbacks.start()
         work_materializer.start()
         app.state.work_materializer = work_materializer
-
         from cognis.api.chat_v2.append_listener import EventAppendListenerFastPath
 
         _handle_event_append = EventAppendListenerFastPath(
             event_store=cached_event_store,
-            pending_warms=pending_warm_sessions,
             invalidation_dispatcher=event_append_invalidation_dispatcher,
             work_materializer=work_materializer,
-            on_mapping_size=SNAPSHOT_CACHE_METRICS.append_mapping,
-            on_mapping_overflow=lambda: SNAPSHOT_CACHE_METRICS.overflow("append_mapping"),
         )
 
         async def _handle_cluster_chat_change(event: Any) -> None:
-            if event.type != EventType.CLUSTER_SCOPE_INVALIDATED:
-                return
-            if event.data.get("kind") not in {
-                "chat_scope_changed",
-                "task_progress_changed",
-            }:
-                return
-            scope = event.data.get("scope")
-            conversation_id = scope.get("conversation_id") if isinstance(scope, dict) else None
-            if isinstance(conversation_id, str):
+            conversation_id = _snapshot_warm_conversation_id(event)
+            if conversation_id is not None:
                 snapshot_warmer.enqueue(conversation_id)
 
         async def _handle_durable_activity(event: Any) -> None:
@@ -1457,7 +1537,7 @@ def create_app() -> FastAPI:
             else None,
         )
         _channel_manager_holder[0] = channel_manager
-        providers.channel_manager_ref = _get_channel_manager
+        providers.channel_manager_ref = _get_channel_manager  # type: ignore[attr-defined]
         from cognis.channels.recipients import RecipientResolutionService
         from cognis.channels.target_refs import ChannelTargetRefCodec
 
@@ -1490,11 +1570,6 @@ def create_app() -> FastAPI:
         except Exception:
             logger.exception("Failed to start channel adapters")
 
-        try:
-            await channel_delivery.recover_pending_deliveries()
-        except Exception:
-            logger.exception("Failed to recover pending channel deliveries")
-
         await channel_delivery.start()
 
         async def _session_lock_sweeper() -> None:
@@ -1520,12 +1595,15 @@ def create_app() -> FastAPI:
         try:
             controller_runtime.mark_schema_compatible()
             await turn_scheduler.start_direct_turn_runtime()
-            async for conversation_id in iter_active_snapshot_conversation_ids(session_factory):
-                snapshot_warmer.enqueue(conversation_id)
-            await active_snapshot_reconciler.start()
             controller_runtime.mark_ready()
             await controller_directory.mark_ready()
+            optional_snapshot_warming_task = _schedule_optional_snapshot_warming(
+                session_factory,
+                snapshot_warmer,
+                active_snapshot_reconciler,
+            )
         except BaseException:
+            await _cancel_optional_snapshot_warming(optional_snapshot_warming_task)
             event_bus.unsubscribe(
                 EventType.CLUSTER_SCOPE_INVALIDATED,
                 _handle_cluster_chat_change,
@@ -1536,39 +1614,75 @@ def create_app() -> FastAPI:
                 EventType.TASK_STARTED,
             ):
                 event_bus.unsubscribe(event_type, _handle_durable_activity)
-            await snapshot_warmer.stop(drain_timeout_seconds=0.25)
-            await _stop_snapshot_background()
-            _remove_event_append_listener()
             await work_materializer.stop(timeout_seconds=0.25)
+            await _stop_snapshot_background(drain_timeout_seconds=0.25)
+            await snapshot_warmer.stop(drain_timeout_seconds=0.25)
+            await activity_overview_computation.stop()
+            _remove_event_append_listener()
             await event_append_invalidation_dispatcher.stop(drain_timeout_seconds=0.25)
+            unregister_live_work_waker()
             await cluster_signals.stop()
             await controller_directory.stop()
             if chat_v2_runtime_relay is not None:
                 turn_scheduler.remove_global_observer(ws_manager._observer)
                 await chat_v2_runtime_relay.stop(drain_timeout_seconds=0.25)
             raise
-        yield
 
-        controller_runtime.begin_draining()
-        await controller_directory.begin_draining()
-        await turn_scheduler.begin_drain()
-        await scheduler.stop()
-        await turn_scheduler.stop_follow_up_recovery()
-        drain_result = await _drain_turn_scheduler(
-            turn_scheduler,
+        async def _begin_early_drain() -> None:
+            await _begin_application_drain(
+                controller_runtime=controller_runtime,
+                turn_scheduler=turn_scheduler,
+                controller_directory=controller_directory,
+                scheduler=scheduler,
+            )
+
+        async def _drain_early_turns(
+            drain_timeout_seconds: float,
+            cancel_timeout_seconds: float,
+        ) -> dict[str, int]:
+            drain_result = await _drain_turn_scheduler(
+                turn_scheduler,
+                drain_timeout_seconds=drain_timeout_seconds,
+                cancel_timeout_seconds=cancel_timeout_seconds,
+            )
+            if drain_result.get("cancellation_abandoned"):
+                logger.warning(
+                    "shutdown: forced abandonment after cancellation settlement timeout",
+                    extra={"extra_data": drain_result},
+                )
+            else:
+                logger.info(
+                    "shutdown: direct turn drain finished",
+                    extra={"extra_data": drain_result},
+                )
+            return drain_result
+
+        executor_provider = providers.executor.websocket
+        if not isinstance(executor_provider, ExecutorToolDrainer):
+            raise TypeError("WebSocket executor provider does not support tool-call drain")
+
+        async def _drain_early_tool_calls(timeout_seconds: float) -> bool:
+            settled = await executor_provider.drain_tool_calls(timeout_seconds=timeout_seconds)
+            if not settled:
+                logger.warning(
+                    "shutdown: executor tool drain timed out",
+                    extra={"extra_data": {"timeout_seconds": timeout_seconds}},
+                )
+            return settled
+
+        shutdown_coordinator.configure(
+            ShutdownCallbacks(
+                begin_drain=_begin_early_drain,
+                drain_turns=_drain_early_turns,
+                drain_tool_calls=_drain_early_tool_calls,
+            ),
             drain_timeout_seconds=config_runtime.shutdown_drain_timeout_seconds,
             cancel_timeout_seconds=config_runtime.shutdown_cancel_timeout_seconds,
         )
-        if drain_result.get("cancellation_abandoned"):
-            logger.warning(
-                "shutdown: forced abandonment after cancellation settlement timeout",
-                extra={"extra_data": drain_result},
-            )
-        else:
-            logger.info(
-                "shutdown: direct turn drain finished",
-                extra={"extra_data": drain_result},
-            )
+        app.state.shutdown_coordinator = shutdown_coordinator
+        yield
+
+        await shutdown_coordinator.drain()
         await turn_scheduler.stop_direct_turn_runtime()
         event_bus.unsubscribe(
             EventType.CLUSTER_SCOPE_INVALIDATED,
@@ -1580,10 +1694,12 @@ def create_app() -> FastAPI:
             EventType.TASK_STARTED,
         ):
             event_bus.unsubscribe(event_type, _handle_durable_activity)
-        await snapshot_warmer.stop(drain_timeout_seconds=2.0)
-        await _stop_snapshot_background()
-        _remove_event_append_listener()
+        await _cancel_optional_snapshot_warming(optional_snapshot_warming_task)
         await work_materializer.stop(timeout_seconds=2.0)
+        await _stop_snapshot_background(drain_timeout_seconds=2.0)
+        await snapshot_warmer.stop(drain_timeout_seconds=2.0)
+        await activity_overview_computation.stop()
+        _remove_event_append_listener()
         await event_append_invalidation_dispatcher.stop(drain_timeout_seconds=2.0)
         if chat_v2_runtime_relay is not None:
             turn_scheduler.remove_global_observer(ws_manager._observer)
@@ -1621,10 +1737,11 @@ def create_app() -> FastAPI:
         await providers.guardrails.client.aclose()
         await local_model_catalog.aclose()
         await controller_directory.stop()
+        await work_graph_resolver.stop()
         await engine.dispose()
         controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.13.0", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.14.0", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -1657,10 +1774,12 @@ def create_app() -> FastAPI:
     app.include_router(artifacts_router)
     app.include_router(channels_router)
     app.include_router(chat_v2_router)
+    app.include_router(work_router)
     if config.e2e_mode:
         app.include_router(chat_v2_e2e_control_router)
     app.include_router(conversations_router)
     app.include_router(credentials_router)
+    app.include_router(dashboard_router)
     app.include_router(deliverables_router)
     app.include_router(agents_router)
     app.include_router(images_router)
@@ -1679,6 +1798,7 @@ def create_app() -> FastAPI:
     app.include_router(executors_router)
     app.include_router(escalations_router)
     app.include_router(notifications_router)
+    app.include_router(attention_router)
     app.include_router(projects_router)
     app.include_router(push_router)
     app.include_router(tts_router)

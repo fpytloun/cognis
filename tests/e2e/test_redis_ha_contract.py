@@ -18,7 +18,7 @@ def test_remote_progress_contract_rejects_duplicate_items() -> None:
             "type": "chat_v2_frame",
             "runtime": {
                 "has_active_turn": True,
-                "items": [
+                "volatile_items": [
                     {"id": "thinking-1", "kind": "thinking"},
                     {"id": "thinking-1", "kind": "thinking"},
                 ],

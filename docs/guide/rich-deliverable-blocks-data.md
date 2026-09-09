@@ -6,8 +6,30 @@ an isolated fixture and a regenerated image.
 
 ## Analysis and evidence
 
+### Native dashboard metrics
+
+Use a dashboard when one status surface owns several related metrics.
+
+![Native dashboard metrics](../assets/screenshots/rich-deliverables/dashboard-native-metrics.png)
+
 ### Table
 Purpose: present structured rows and columns where exact lookup matters.
+
+Table cells can be scalars or typed objects:
+
+```text
+{ type: "text" | "number" | "code" | "badge" | "progress",
+  value,
+  label?,
+  tone?,
+  emphasis?: "normal" | "strong" | "muted",
+  align?: "start" | "center" | "end",
+  max? }
+```
+
+Use `progress` with numeric `value` and `max`. Sorting uses `value`, not the
+optional display `label`. Use semantic tones with text because color is not
+sufficient.
 
 ![Table block](../assets/screenshots/rich-deliverables/table.png)
 

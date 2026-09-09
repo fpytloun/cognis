@@ -21,7 +21,17 @@ from tests.integration.conftest import (
 def test_multi_turn_recall(live_stack: LiveStack, run_id: str) -> None:
     """After multiple turns, Mnemory should have context from earlier turns."""
     agent_id = f"recall-agent-{run_id}"
-    live_create_agent(live_stack, agent_id)
+    live_create_agent(
+        live_stack,
+        agent_id,
+        system_prompt=(
+            "You are a concise memory test assistant. Use supplied memory context "
+            "to answer questions about the user. If needed, use memory_search "
+            "to retrieve a preference. Answer only from available evidence."
+        ),
+        tool_permissions={"*": "deny", "memory_search": "allow"},
+        capabilities={"memory_backend": "mnemory", "guardrails_backend": "none"},
+    )
     conv = live_create_conversation(live_stack, agent_id)
     cid = conv["conversation_id"]
 
@@ -33,8 +43,7 @@ def test_multi_turn_recall(live_stack: LiveStack, run_id: str) -> None:
     events2 = live_chat_ws(live_stack, cid, "What is my favorite color?")
     assert any(e["type"] == "message_complete" for e in events2)
     chunks = (assistant_text_from_events(events2) or live_assistant_text(live_stack, cid)).lower()
-    if chunks:
-        assert "cerulean" in chunks or "blue" in chunks, f"Expected recall, got: {chunks[:200]}"
+    assert "cerulean" in chunks or "blue" in chunks, f"Expected recall, got: {chunks[:200]}"
 
 
 @pytest.mark.integration

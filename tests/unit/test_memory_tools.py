@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 
+from cognis.core.memory_aliases import MemoryAliasState
 from cognis.models.tool import ToolCapability, stable_tool_id
 from cognis.providers.memory.mnemory import MnemoryHTTPStatusError
 from cognis.tools.builtin.memory import (
@@ -129,8 +130,17 @@ class TestMemoryToolHandlers:
         provider.list_memory_artifacts_tool = AsyncMock(return_value=payload)
         provider.get_memory_artifact_url_tool = AsyncMock(return_value=payload)
         provider.delete_memory_artifact_tool = AsyncMock(return_value=None)
+        provider.get_memories_by_ids_tool = AsyncMock(return_value=payload)
 
         return provider
+
+    @staticmethod
+    def _aliases(memory_id: str, *, native: bool = False) -> MemoryAliasState:
+        aliases = MemoryAliasState()
+        metadata = {"revision_id": "revision-1"} if native else {}
+        _, delta = aliases.plan_records([{"id": memory_id, "memory": "Fact", "metadata": metadata}])
+        assert aliases.apply(delta)
+        return aliases
 
     @pytest.mark.asyncio()
     async def test_memory_search(self) -> None:
@@ -303,6 +313,392 @@ class TestMemoryToolHandlers:
         )
         assert result.is_error
         assert "failed" in result.output.lower()
+
+    @pytest.mark.asyncio()
+    async def test_memory_search_projects_ids_and_returns_durable_delta(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider(
+            {"results": [{"id": memory_id, "memory": "Fact", "score": 0.8}]}
+        )
+        aliases = MemoryAliasState()
+
+        result = await handle_memory_tool(
+            "memory_search",
+            {"query": "fact"},
+            provider,
+            "agent1",
+            "user@test.com",
+            aliases,
+        )
+
+        assert memory_id not in result.output
+        assert json.loads(result.output)["results"][0]["id"] == "m1"
+        assert result.metadata["memory_aliases"]["bindings"][0]["memory_id"] == memory_id
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "provider_method"),
+        [
+            ("memory_find", {"question": "fact"}, "find_memories_tool"),
+            (
+                "memory_ask",
+                {"question": "fact", "include_memories": True},
+                "ask_memories_tool",
+            ),
+            ("memory_list", {}, "list_memories_tool"),
+            ("memory_add", {"content": "Fact"}, "add_memory_tool"),
+            (
+                "memory_add_batch",
+                {"memories": [{"content": "Fact"}]},
+                "add_memory_batch_tool",
+            ),
+        ],
+    )
+    async def test_all_structured_record_results_project_ids(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        provider_method: str,
+    ) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider(
+            {"results": [{"id": memory_id, "memory": "Fact", "metadata": {}}]}
+        )
+
+        result = await handle_memory_tool(
+            tool_name,
+            arguments,
+            provider,
+            aliases=MemoryAliasState(),
+        )
+
+        assert not result.is_error
+        assert memory_id not in result.output
+        assert '"id": "m1"' in result.output
+        getattr(provider, provider_method).assert_awaited_once()
+
+    @pytest.mark.asyncio()
+    async def test_add_projects_legacy_memory_id_result_shape(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider({"memory_id": memory_id, "memory": "Fact"})
+        provider.get_memories_by_ids_tool.return_value = {
+            "results": [{"id": memory_id, "memory": "Fact", "metadata": {}}]
+        }
+
+        result = await handle_memory_tool(
+            "memory_add",
+            {"content": "Fact"},
+            provider,
+            aliases=MemoryAliasState(),
+        )
+
+        assert not result.is_error
+        assert memory_id not in result.output
+        assert json.loads(result.output)["memory_id"] == "m1"
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize("batch", [False, True])
+    async def test_add_refresh_failure_reports_success_without_canonical_ids(
+        self, batch: bool
+    ) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        payload = {"memory_id": memory_id, "memory": "Fact"}
+        provider = self._mock_provider([payload] if batch else payload)
+        provider.get_memories_by_ids_tool.side_effect = RuntimeError("unavailable")
+
+        result = await handle_memory_tool(
+            "memory_add_batch" if batch else "memory_add",
+            {"memories": [{"content": "Fact"}]} if batch else {"content": "Fact"},
+            provider,
+            aliases=MemoryAliasState(),
+        )
+
+        assert not result.is_error
+        assert memory_id not in result.output
+        assert "Search again" in result.output
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments"),
+        [
+            ("memory_update", {"content": "Changed"}),
+            ("memory_save_artifact", {"content": "Body"}),
+            ("memory_delete_artifact", {"artifact_id": "art_1"}),
+        ],
+    )
+    async def test_mutation_refresh_failure_invalidates_old_alias(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider({"memory_id": memory_id})
+        provider.get_memories_by_ids_tool.side_effect = [
+            {
+                "results": [
+                    {
+                        "id": memory_id,
+                        "memory": "Fact",
+                        "metadata": {"revision_id": "revision-1"},
+                    }
+                ]
+            },
+            RuntimeError("unavailable"),
+        ]
+        aliases = self._aliases(memory_id, native=True)
+
+        result = await handle_memory_tool(
+            tool_name,
+            {"memory_id": "m1", **arguments},
+            provider,
+            aliases=aliases,
+        )
+
+        assert not result.is_error
+        assert memory_id not in result.output
+        assert result.metadata["memory_aliases"]["invalidated"] == ["m1"]
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "provider_method"),
+        [
+            ("memory_update", {"content": "new"}, "update_memory_tool"),
+            ("memory_delete", {}, "delete_memory_tool"),
+            ("memory_save_artifact", {"content": "body"}, "save_memory_artifact_tool"),
+            (
+                "memory_get_artifact",
+                {"artifact_id": "art_1"},
+                "get_memory_artifact_tool",
+            ),
+            ("memory_list_artifacts", {}, "list_memory_artifacts_tool"),
+            (
+                "memory_get_artifact_url",
+                {"artifact_id": "art_1"},
+                "get_memory_artifact_url_tool",
+            ),
+            (
+                "memory_delete_artifact",
+                {"artifact_id": "art_1"},
+                "delete_memory_artifact_tool",
+            ),
+        ],
+    )
+    async def test_parent_memory_tools_resolve_aliases(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        provider_method: str,
+    ) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider(
+            {
+                "results": [
+                    {
+                        "id": memory_id,
+                        "memory": "Fact",
+                        "metadata": {"revision_id": "revision-1"},
+                    }
+                ]
+            }
+        )
+        aliases = self._aliases(memory_id, native=True)
+
+        result = await handle_memory_tool(
+            tool_name,
+            {"memory_id": "m1", **arguments},
+            provider,
+            "agent1",
+            "user@test.com",
+            aliases,
+        )
+
+        assert not result.is_error
+        assert getattr(provider, provider_method).await_args.args[0] == memory_id
+
+    @pytest.mark.asyncio()
+    async def test_stale_and_unknown_aliases_do_not_reach_provider(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider()
+        aliases = self._aliases(memory_id)
+        _, delta = aliases.plan_records([{"id": memory_id, "memory": "Changed", "metadata": {}}])
+        assert aliases.apply(delta)
+
+        stale = await handle_memory_tool(
+            "memory_update",
+            {"memory_id": "m1", "content": "x"},
+            provider,
+            aliases=aliases,
+        )
+        unknown = await handle_memory_tool(
+            "memory_update",
+            {"memory_id": "m99", "content": "x"},
+            provider,
+            aliases=aliases,
+        )
+
+        assert stale.is_error and "memory_alias_stale" in stale.output
+        assert unknown.is_error and "memory_alias_unknown" in unknown.output
+        provider.update_memory_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments", "provider_method"),
+        [
+            ("memory_update", {"content": "new"}, "update_memory_tool"),
+            ("memory_delete", {}, "delete_memory_tool"),
+            ("memory_save_artifact", {"content": "body"}, "save_memory_artifact_tool"),
+            (
+                "memory_delete_artifact",
+                {"artifact_id": "art_1"},
+                "delete_memory_artifact_tool",
+            ),
+        ],
+    )
+    async def test_external_revision_change_rejects_alias_mutation(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        provider_method: str,
+    ) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider()
+        provider.get_memories_by_ids_tool.return_value = {
+            "results": [{"id": memory_id, "memory": "Externally changed", "metadata": {}}]
+        }
+        aliases = self._aliases(memory_id)
+
+        result = await handle_memory_tool(
+            tool_name,
+            {"memory_id": "m1", **arguments},
+            provider,
+            aliases=aliases,
+        )
+
+        assert result.is_error
+        assert "memory_alias_stale" in result.output
+        getattr(provider, provider_method).assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    async def test_native_revision_is_verified_and_forwarded_as_precondition(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        record = {
+            "id": memory_id,
+            "memory": "Fact",
+            "metadata": {"revision_id": "revision-7"},
+        }
+        provider = self._mock_provider()
+        provider.get_memories_by_ids_tool.return_value = {"results": [record]}
+        aliases = MemoryAliasState()
+        _, delta = aliases.plan_records([record])
+        assert aliases.apply(delta)
+
+        result = await handle_memory_tool(
+            "memory_delete",
+            {"memory_id": "m1"},
+            provider,
+            aliases=aliases,
+        )
+
+        assert not result.is_error
+        assert provider.delete_memory_tool.await_args.kwargs["expected_revision"] == "revision-7"
+
+    @pytest.mark.asyncio()
+    async def test_snapshot_alias_mutation_fails_without_atomic_precondition(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        provider = self._mock_provider(
+            {"results": [{"id": memory_id, "memory": "Fact", "metadata": {}}]}
+        )
+        aliases = self._aliases(memory_id)
+
+        result = await handle_memory_tool(
+            "memory_delete",
+            {"memory_id": "m1"},
+            provider,
+            aliases=aliases,
+        )
+
+        assert result.is_error
+        assert "memory_alias_precondition_unavailable" in result.output
+        provider.delete_memory_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio()
+    async def test_nested_memory_references_are_aliased_or_omitted(self) -> None:
+        first_id = "01234567-89ab-4def-8123-456789abcdef"
+        second_id = "fedcba98-7654-4321-8123-456789abcdef"
+        unknown_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        payload = {
+            "results": [
+                {
+                    "id": first_id,
+                    "memory": "Fact",
+                    "metadata": {
+                        "lineage_id": second_id,
+                        "revision": 3,
+                        "revision_state": "active",
+                        "supersedes": second_id,
+                        "derived_from": [second_id, unknown_id],
+                        "provenance": {
+                            "source_memory_id": second_id,
+                            "target_memory_id": unknown_id,
+                            "related_memory_ids": [second_id, unknown_id],
+                            "artifact_id": unknown_id,
+                        },
+                    },
+                },
+                {
+                    "id": second_id,
+                    "memory": "Source",
+                    "metadata": {
+                        "lineage_id": unknown_id,
+                        "revision": 1,
+                        "revision_state": "active",
+                    },
+                },
+            ]
+        }
+        provider = self._mock_provider(payload)
+
+        result = await handle_memory_tool(
+            "memory_search",
+            {"query": "fact"},
+            provider,
+            aliases=MemoryAliasState(),
+        )
+
+        output = json.loads(result.output)
+        metadata = output["results"][0]["metadata"]
+        assert metadata["lineage_id"] == "m2"
+        assert metadata["revision"] == 3
+        assert metadata["revision_state"] == "active"
+        assert metadata["supersedes"] == "m2"
+        assert metadata["derived_from"] == ["m2"]
+        provenance = metadata["provenance"]
+        assert provenance["source_memory_id"] == "m2"
+        assert "target_memory_id" not in provenance
+        assert provenance["related_memory_ids"] == ["m2"]
+        assert provenance["artifact_id"] == unknown_id
+        assert "lineage_id" not in output["results"][1]["metadata"]
+        assert output["results"][1]["metadata"]["revision"] == 1
+        assert output["results"][1]["metadata"]["revision_state"] == "active"
+
+    @pytest.mark.asyncio()
+    async def test_artifact_url_preserves_signed_url_but_aliases_memory_field(self) -> None:
+        memory_id = "01234567-89ab-4def-8123-456789abcdef"
+        signed_url = f"https://mnemory.test/api/memories/{memory_id}/artifacts/art_1/raw?token=x"
+        provider = self._mock_provider(
+            {"memory_id": memory_id, "artifact_id": "art_1", "url": signed_url}
+        )
+        aliases = self._aliases(memory_id)
+
+        result = await handle_memory_tool(
+            "memory_get_artifact_url",
+            {"memory_id": "m1", "artifact_id": "art_1"},
+            provider,
+            aliases=aliases,
+        )
+
+        output = json.loads(result.output)
+        assert output["memory_id"] == "m1"
+        assert output["artifact_id"] == "art_1"
+        assert output["url"] == signed_url
 
     @pytest.mark.asyncio()
     async def test_validation_error_instructs_agent_to_correct_and_retry(self) -> None:

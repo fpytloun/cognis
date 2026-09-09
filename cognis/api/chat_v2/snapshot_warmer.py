@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from time import monotonic
 from typing import Literal
 
 from cognis.api.chat_v2.snapshot_metrics import (
     SNAPSHOT_CACHE_METRICS,
-    WARM_EVENTS,
-    WARM_LAG,
     WarmFailureReason,
 )
 from cognis.logging import get_logger
@@ -21,6 +20,13 @@ WarmStatus = Literal["succeeded", "skipped", "retry"]
 WarmResult = tuple[WarmStatus, WarmFailureReason | None]
 WarmCallback = Callable[[str], Awaitable[WarmResult]]
 ActiveDiscovery = Callable[[], AsyncIterator[str]]
+
+
+@dataclass(slots=True)
+class _PendingWarm:
+    requested_at: float
+    ready_at: float
+    deadline_at: float
 
 
 class ChatSnapshotWarmer:
@@ -33,20 +39,28 @@ class ChatSnapshotWarmer:
         worker_count: int = 4,
         clock: Callable[[], float] = monotonic,
         retry_seconds: float = 1.0,
+        debounce_seconds: float = 0.05,
+        max_debounce_seconds: float = 0.25,
         max_pending: int = 4096,
     ) -> None:
         if worker_count < 1 or worker_count > 16:
             raise ValueError("worker_count must be in 1..16")
         if retry_seconds <= 0:
             raise ValueError("retry_seconds must be positive")
+        if debounce_seconds < 0:
+            raise ValueError("debounce_seconds must be nonnegative")
+        if max_debounce_seconds < debounce_seconds:
+            raise ValueError("max_debounce_seconds must be at least debounce_seconds")
         if max_pending < worker_count or max_pending > 4096:
             raise ValueError("max_pending must be between worker_count and 4096")
         self._callback = callback
         self._worker_count = worker_count
         self._clock = clock
         self._retry_seconds = retry_seconds
+        self._debounce_seconds = debounce_seconds
+        self._max_debounce_seconds = max_debounce_seconds
         self._max_pending = max_pending
-        self._dirty: OrderedDict[str, float] = OrderedDict()
+        self._dirty: OrderedDict[str, _PendingWarm] = OrderedDict()
         self._active: set[str] = set()
         self._available = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
@@ -75,14 +89,24 @@ class ChatSnapshotWarmer:
     def enqueue(self, conversation_id: str) -> bool:
         if not self._accepting or not conversation_id:
             return False
-        WARM_EVENTS.labels(outcome="requested").inc()
-        if conversation_id in self._dirty or conversation_id in self._active:
-            WARM_EVENTS.labels(outcome="coalesced").inc()
+        SNAPSHOT_CACHE_METRICS.warm_event("requested")
+        now = self._clock()
+        pending = self._dirty.get(conversation_id)
+        if pending is not None:
+            pending.ready_at = min(
+                now + self._debounce_seconds,
+                pending.deadline_at,
+            )
+            SNAPSHOT_CACHE_METRICS.warm_event("coalesced")
+        elif conversation_id in self._active:
+            self._dirty[conversation_id] = self._pending(now)
+            SNAPSHOT_CACHE_METRICS.warm_event("coalesced")
         elif len(self._dirty) >= self._max_pending:
             SNAPSHOT_CACHE_METRICS.overflow("warmer")
-            WARM_EVENTS.labels(outcome="overflow").inc()
+            SNAPSHOT_CACHE_METRICS.warm_event("overflow")
             return False
-        self._dirty.setdefault(conversation_id, self._clock())
+        else:
+            self._dirty[conversation_id] = self._pending(now)
         self._update_gauges()
         self._available.set()
         return True
@@ -112,14 +136,24 @@ class ChatSnapshotWarmer:
     async def _run(self, worker_index: int) -> None:
         del worker_index
         while not self._stopping or self._dirty:
-            item = self._pop()
+            item, wait_seconds = self._pop()
             if item is None:
                 self._available.clear()
                 if self._stopping and not self._dirty:
                     return
-                await self._available.wait()
+                try:
+                    if wait_seconds is None:
+                        await self._available.wait()
+                    else:
+                        await asyncio.wait_for(
+                            self._available.wait(),
+                            timeout=wait_seconds,
+                        )
+                except TimeoutError:
+                    pass
                 continue
-            conversation_id, requested_at = item
+            conversation_id, pending, dispatch_outcome = item
+            SNAPSHOT_CACHE_METRICS.warm_event(dispatch_outcome)
             self._active.add(conversation_id)
             self._update_gauges()
             result: WarmResult = ("retry", "internal")
@@ -141,28 +175,66 @@ class ChatSnapshotWarmer:
             if reason is not None:
                 SNAPSHOT_CACHE_METRICS.warm_failure(reason)
             if status == "succeeded":
-                WARM_EVENTS.labels(outcome="succeeded").inc()
-                WARM_LAG.observe(max(0.0, self._clock() - requested_at))
+                SNAPSHOT_CACHE_METRICS.warm_event("succeeded")
+                SNAPSHOT_CACHE_METRICS.warm_lag(self._clock() - pending.requested_at)
             elif status == "skipped":
-                WARM_EVENTS.labels(outcome="skipped").inc()
+                SNAPSHOT_CACHE_METRICS.warm_event("skipped")
             else:
-                WARM_EVENTS.labels(outcome="failed").inc()
+                SNAPSHOT_CACHE_METRICS.warm_event("failed")
                 if reason is None:
                     SNAPSHOT_CACHE_METRICS.warm_failure("internal")
+                if self._stopping:
+                    continue
                 await asyncio.sleep(self._retry_seconds)
-                if not self._stopping:
-                    self._dirty.setdefault(conversation_id, requested_at)
-                    self._update_gauges()
-                    self._available.set()
+                now = self._clock()
+                self._dirty.setdefault(
+                    conversation_id,
+                    _PendingWarm(
+                        requested_at=pending.requested_at,
+                        ready_at=now,
+                        deadline_at=now,
+                    ),
+                )
+                self._update_gauges()
+                self._available.set()
 
-    def _pop(self) -> tuple[str, float] | None:
-        for conversation_id in tuple(self._dirty):
+    def _pending(self, now: float) -> _PendingWarm:
+        return _PendingWarm(
+            requested_at=now,
+            ready_at=now + self._debounce_seconds,
+            deadline_at=now + self._max_debounce_seconds,
+        )
+
+    def _pop(
+        self,
+    ) -> tuple[
+        tuple[str, _PendingWarm, Literal["debounced", "max_delay", "shutdown"]] | None,
+        float | None,
+    ]:
+        now = self._clock()
+        next_ready_at: float | None = None
+        for conversation_id, pending in tuple(self._dirty.items()):
             if conversation_id in self._active:
                 continue
-            requested_at = self._dirty.pop(conversation_id)
+            if not self._stopping and pending.ready_at > now:
+                next_ready_at = (
+                    pending.ready_at
+                    if next_ready_at is None
+                    else min(next_ready_at, pending.ready_at)
+                )
+                continue
+            self._dirty.pop(conversation_id)
             self._update_gauges()
-            return conversation_id, requested_at
-        return None
+            outcome: Literal["debounced", "max_delay", "shutdown"]
+            if self._stopping:
+                outcome = "shutdown"
+            elif now >= pending.deadline_at:
+                outcome = "max_delay"
+            else:
+                outcome = "debounced"
+            return (conversation_id, pending, outcome), None
+        wait_seconds = None if next_ready_at is None else max(0.0, next_ready_at - now)
+        return None, wait_seconds
 
 
 class ChatSnapshotActiveReconciler:

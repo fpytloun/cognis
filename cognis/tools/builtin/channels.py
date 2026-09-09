@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import typing
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import String, and_, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.channels.addressing import ADDRESS_KINDS
 from cognis.channels.bindings import ManagedChannelBindingLookup, NoManagedChannelBindingLookup
 from cognis.channels.constants import (
     CHANNEL_RECIPIENT_MESSAGE_SOURCE,
     CHANNEL_TOOL_CONVERSATION_PREFIX,
     CHANNEL_TOOL_MESSAGE_SOURCE,
 )
-from cognis.channels.recipients import ADDRESS_KINDS, RecipientResolutionService
+from cognis.channels.delivery_state import managed_delivery_outcome_uncertain
+from cognis.channels.recipients import RecipientResolutionService
 from cognis.channels.route_admission import (
     active_managed_binding_id,
     lock_channel_route,
@@ -360,6 +363,22 @@ def build_channel_tool_handlers(
                     {
                         "conversation_id": managed[1].target_conversation_id,
                         "status": managed[0].state,
+                        "owner_epoch": managed[1].owner_epoch,
+                        "expires_at": _as_utc(managed[0].expires_at).isoformat(),
+                        "outcome_uncertain": await managed_delivery_outcome_uncertain(
+                            session, managed[0]
+                        ),
+                        "recovery_eligible": (
+                            managed[0].state == "delivery_failed"
+                            and _as_utc(managed[0].expires_at) <= datetime.now(UTC)
+                            and not (
+                                managed[0].delivery_lease_token
+                                and managed[0].delivery_lease_expires_at
+                                and _as_utc(managed[0].delivery_lease_expires_at)
+                                > datetime.now(UTC)
+                            )
+                        ),
+                        "recovery_action": "agent_conversation_recover_channel",
                     }
                     if managed is not None
                     else None
@@ -448,6 +467,24 @@ def build_channel_tool_handlers(
         assert target.chat_id is not None
         async with session_factory() as session:
             account = await _owned_account(session, target, user_email)
+            delivery_id = _delivery_id(user_email, idempotency_key)
+            existing = await get_channel_delivery_outbox(session, delivery_id)
+            if existing is not None:
+                _validate_idempotent_reuse(
+                    existing,
+                    target=target,
+                    user_email=user_email,
+                    content=content,
+                    artifact_ids=requested_artifact_ids,
+                )
+                response = _delivery_response(existing)
+                response["created"] = False
+                response["active_binding"] = None
+                response["transport_identity"] = _transport_identity(account)
+                response["safe_retry"] = (
+                    "Reuse this idempotency key. A new key can duplicate an uncertain send."
+                )
+                return response
         advertised_binding = await bindings.find_active_binding(
             user_email=user_email,
             account_id=target.account_id,
@@ -491,7 +528,6 @@ def build_channel_tool_handlers(
                     advertised_binding=binding,
                     transport_identity=_transport_identity(account),
                 )
-            delivery_id = _delivery_id(user_email, idempotency_key)
             conversation_id = _synthetic_conversation_id(user_email)
             if await session.get(Conversation, conversation_id) is not None:
                 raise RuntimeError("Reserved channel delivery namespace collision")
@@ -508,6 +544,9 @@ def build_channel_tool_handlers(
                 response["created"] = False
                 response["active_binding"] = None
                 response["transport_identity"] = _transport_identity(account)
+                response["safe_retry"] = (
+                    "Reuse this idempotency key. A new key can duplicate an uncertain send."
+                )
                 return response
             attachments = await resolve_owned_artifact_refs(
                 session_factory,
@@ -552,6 +591,9 @@ def build_channel_tool_handlers(
         response["created"] = created
         response["active_binding"] = None
         response["transport_identity"] = _transport_identity(account)
+        response["safe_retry"] = (
+            "Reuse this idempotency key. A new key can duplicate an uncertain send."
+        )
         return response
 
     async def get_delivery_handler(
@@ -591,6 +633,9 @@ def build_channel_tool_handlers(
                     chat_id=row.chat_id,
                 )
                 if observed is not None:
+                    observed_chat_kind = (
+                        observed.chat_kind if observed.chat_kind in {"direct", "group"} else None
+                    )
                     response["target_ref"] = codec.encode(
                         ChannelTargetRef(
                             kind="target",
@@ -598,7 +643,9 @@ def build_channel_tool_handlers(
                             account_id=row.account_id,
                             channel_type=row.channel_type,
                             chat_id=observed.chat_id,
-                            chat_kind=observed.chat_kind,
+                            chat_kind=typing.cast(
+                                Literal["direct", "group"] | None, observed_chat_kind
+                            ),
                             thread_id=observed.thread_id,
                             sender_id=observed.sender_id,
                         )
@@ -821,7 +868,7 @@ async def _observed_targets(
                         account_id=row.account_id,
                         channel_type=account.channel_type,
                         chat_id=row.chat_id,
-                        chat_kind=row.chat_kind,
+                        chat_kind=typing.cast(Literal["direct", "group"], row.chat_kind),
                         thread_id=row.thread_id,
                         sender_id=row.sender_id,
                     )
@@ -922,6 +969,29 @@ def _validate_idempotent_reuse(
 
 
 def _delivery_response(row: ChannelDeliveryOutboxRow) -> dict[str, Any]:
+    structured_error: dict[str, Any] | None = None
+    public_last_error = row.last_error
+    if isinstance(row.last_error, str):
+        try:
+            decoded = json.loads(row.last_error)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict) and decoded.get("kind") == "signal_delivery_failure":
+            structured_error = {
+                key: decoded[key]
+                for key in (
+                    "provider",
+                    "classification",
+                    "provider_code",
+                    "retry_after_seconds",
+                    "challenge",
+                    "next_step",
+                    "retry_scheduled",
+                    "side_effect_certainty",
+                )
+                if key in decoded
+            }
+            public_last_error = "external_send_outcome_uncertain"
     return {
         "delivery_id": row.delivery_id,
         "status": row.status,
@@ -932,7 +1002,8 @@ def _delivery_response(row: ChannelDeliveryOutboxRow) -> dict[str, Any]:
         "updated_at": row.updated_at.isoformat(),
         "sent_at": row.sent_at.isoformat() if row.sent_at else None,
         "next_attempt_at": row.next_attempt_at.isoformat() if row.next_attempt_at else None,
-        "last_error": row.last_error,
+        "last_error": public_last_error,
+        "failure": structured_error,
         "attachments": safe_attachment_metadata(row.attachments_json),
     }
 
@@ -961,6 +1032,15 @@ def _active_binding_refusal(
             "agent_id": advertised_binding.agent_id,
             "title": advertised_binding.title,
             "status": advertised_binding.status,
+            "owner_epoch": advertised_binding.owner_epoch,
+            "expires_at": (
+                advertised_binding.expires_at.isoformat()
+                if advertised_binding.expires_at is not None
+                else None
+            ),
+            "outcome_uncertain": advertised_binding.outcome_uncertain,
+            "recovery_eligible": advertised_binding.recovery_eligible,
+            "recovery_action": "agent_conversation_recover_channel",
         }
         if advertised_binding is not None
         else None
@@ -973,12 +1053,18 @@ def _active_binding_refusal(
                 "message": (
                     "One-shot delivery is refused while this route has an active managed "
                     "conversation. The tool did not submit or deliver the requested content. "
-                    "Inspect or close that conversation before sending."
+                    "Inspect the conversation. After an expired failed route becomes recovery "
+                    "eligible, use agent_conversation_recover_channel. If the managed delivery "
+                    "outcome is uncertain, reconcile externally before any resend."
                 ),
                 "delivery_id": None,
                 "created": False,
                 "content_submitted": False,
                 "externally_delivered": False,
+                "resend_guidance": (
+                    "Reuse this request's idempotency key to deduplicate this refused one-shot "
+                    "request. It cannot deduplicate an uncertain managed delivery."
+                ),
                 "active_binding": active_binding,
                 "transport_identity": transport_identity,
             },
@@ -1049,7 +1135,7 @@ async def _query_channel_message_candidates(
     row_limit = min(limit * 2 + 2, 202)
     messages: list[dict[str, Any]] = []
     if direction != "outbound" and status_filter is None:
-        stmt = select(ChannelInboundLedgerRow).where(
+        inbound_stmt = select(ChannelInboundLedgerRow).where(
             ChannelInboundLedgerRow.user_email == user_email,
             ChannelInboundLedgerRow.account_id == target.account_id,
             ChannelInboundLedgerRow.chat_id == target.chat_id,
@@ -1061,12 +1147,12 @@ async def _query_channel_message_candidates(
             ),
         )
         if since is not None:
-            stmt = stmt.where(ChannelInboundLedgerRow.occurred_at >= since)
+            inbound_stmt = inbound_stmt.where(ChannelInboundLedgerRow.occurred_at >= since)
         if until is not None:
-            stmt = stmt.where(ChannelInboundLedgerRow.occurred_at <= until)
-        rows = await _bounded_channel_rows(
+            inbound_stmt = inbound_stmt.where(ChannelInboundLedgerRow.occurred_at <= until)
+        inbound_rows = await _bounded_channel_rows(
             session,
-            stmt,
+            inbound_stmt,
             time_column=ChannelInboundLedgerRow.occurred_at,
             ref_column=literal("inbound:") + ChannelInboundLedgerRow.inbound_id,
             kind=kind,
@@ -1074,7 +1160,7 @@ async def _query_channel_message_candidates(
             anchor_ref=anchor_ref,
             limit=row_limit,
         )
-        messages.extend(_inbound_message(row) for row in rows)
+        messages.extend(_inbound_message(row) for row in inbound_rows)
     if direction != "inbound":
         if status_filter is None:
             receipt_ref = (
@@ -1083,7 +1169,7 @@ async def _query_channel_message_candidates(
                 + literal(":chunk:")
                 + cast(ChannelDeliveryReceiptRow.chunk_index, String)
             )
-            stmt = (
+            receipt_stmt = (
                 select(ChannelDeliveryReceiptRow, ChannelDeliveryOutboxRow)
                 .join(
                     ChannelDeliveryOutboxRow,
@@ -1104,12 +1190,12 @@ async def _query_channel_message_candidates(
                 )
             )
             if since is not None:
-                stmt = stmt.where(ChannelDeliveryReceiptRow.sent_at >= since)
+                receipt_stmt = receipt_stmt.where(ChannelDeliveryReceiptRow.sent_at >= since)
             if until is not None:
-                stmt = stmt.where(ChannelDeliveryReceiptRow.sent_at <= until)
-            rows = await _bounded_channel_rows(
+                receipt_stmt = receipt_stmt.where(ChannelDeliveryReceiptRow.sent_at <= until)
+            receipt_rows = await _bounded_channel_rows(
                 session,
-                stmt,
+                receipt_stmt,
                 time_column=ChannelDeliveryReceiptRow.sent_at,
                 ref_column=receipt_ref,
                 kind=kind,
@@ -1118,7 +1204,7 @@ async def _query_channel_message_candidates(
                 limit=row_limit,
                 scalar=False,
             )
-            messages.extend(_delivered_chunk_message(receipt, row) for receipt, row in rows)
+            messages.extend(_delivered_chunk_message(receipt, row) for receipt, row in receipt_rows)
         else:
             timestamp_column = func.coalesce(
                 ChannelDeliveryOutboxRow.last_delivered_at,
@@ -1126,7 +1212,7 @@ async def _query_channel_message_candidates(
                 ChannelDeliveryOutboxRow.updated_at,
                 ChannelDeliveryOutboxRow.created_at,
             )
-            stmt = select(ChannelDeliveryOutboxRow).where(
+            outbox_stmt = select(ChannelDeliveryOutboxRow).where(
                 ChannelDeliveryOutboxRow.user_email == user_email,
                 ChannelDeliveryOutboxRow.account_id == target.account_id,
                 ChannelDeliveryOutboxRow.chat_id == target.chat_id,
@@ -1139,14 +1225,14 @@ async def _query_channel_message_candidates(
                     }
                 ),
             )
-            stmt = stmt.where(ChannelDeliveryOutboxRow.status == str(status_filter))
+            outbox_stmt = outbox_stmt.where(ChannelDeliveryOutboxRow.status == str(status_filter))
             if since is not None:
-                stmt = stmt.where(timestamp_column >= since)
+                outbox_stmt = outbox_stmt.where(timestamp_column >= since)
             if until is not None:
-                stmt = stmt.where(timestamp_column <= until)
-            rows = await _bounded_channel_rows(
+                outbox_stmt = outbox_stmt.where(timestamp_column <= until)
+            outbox_rows = await _bounded_channel_rows(
                 session,
-                stmt,
+                outbox_stmt,
                 time_column=timestamp_column,
                 ref_column=literal("attempt:") + ChannelDeliveryOutboxRow.delivery_id,
                 kind=kind,
@@ -1154,7 +1240,7 @@ async def _query_channel_message_candidates(
                 anchor_ref=anchor_ref,
                 limit=row_limit,
             )
-            messages.extend(_delivery_attempt(row) for row in rows)
+            messages.extend(_delivery_attempt(row) for row in outbox_rows)
     return messages
 
 
@@ -1225,9 +1311,13 @@ async def _channel_anchor_time(
     user_email: str,
 ) -> datetime | None:
     if message_ref.startswith("inbound:"):
-        row = await session.get(ChannelInboundLedgerRow, message_ref.removeprefix("inbound:"))
+        inbound_row = await session.get(
+            ChannelInboundLedgerRow, message_ref.removeprefix("inbound:")
+        )
         return (
-            _as_utc(row.occurred_at) if row is not None and row.user_email == user_email else None
+            _as_utc(inbound_row.occurred_at)
+            if inbound_row is not None and inbound_row.user_email == user_email
+            else None
         )
     if message_ref.startswith("attempt:"):
         delivery_id = message_ref.removeprefix("attempt:")
@@ -1235,8 +1325,8 @@ async def _channel_anchor_time(
         delivery_id = message_ref.split(":", 2)[1]
     else:
         return None
-    row = await session.get(ChannelDeliveryOutboxRow, delivery_id)
-    if row is None or row.user_email != user_email:
+    outbox_row = await session.get(ChannelDeliveryOutboxRow, delivery_id)
+    if outbox_row is None or outbox_row.user_email != user_email:
         return None
     if ":chunk:" in message_ref:
         chunk_index = int(message_ref.rsplit(":", 1)[1])
@@ -1245,7 +1335,12 @@ async def _channel_anchor_time(
             {"delivery_id": delivery_id, "chunk_index": chunk_index},
         )
         return _as_utc(receipt.sent_at) if receipt is not None else None
-    return _as_utc(row.last_delivered_at or row.sent_at or row.updated_at or row.created_at)
+    return _as_utc(
+        outbox_row.last_delivered_at
+        or outbox_row.sent_at
+        or outbox_row.updated_at
+        or outbox_row.created_at
+    )
 
 
 def _inbound_message(row: ChannelInboundLedgerRow) -> dict[str, Any]:
@@ -1298,7 +1393,7 @@ def _delivered_chunk_message(
 
 
 def _delivery_attempt(row: ChannelDeliveryOutboxRow) -> dict[str, Any]:
-    content, truncation = _truncate_channel_content(row.fallback_text)
+    content, truncation = _truncate_channel_content(row.fallback_text or "")
     timestamp = row.last_delivered_at or row.sent_at or row.updated_at or row.created_at
     return {
         "message_ref": f"attempt:{row.delivery_id}",

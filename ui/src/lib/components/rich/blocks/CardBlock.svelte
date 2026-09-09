@@ -9,7 +9,7 @@
     type RichBlock,
     type RichMediaUrlFor,
   } from '$lib/rich-deliverable';
-  import { blockTone } from '../block-helpers';
+  import { blockSpan, blockSurface, blockTone } from '../block-helpers';
   import RichBlockList from '../RichBlockList.svelte';
   import RichIcon from '../RichIcon.svelte';
   import RichMedia from '../RichMedia.svelte';
@@ -24,6 +24,8 @@
 
   $: children = blockChildren(block);
   $: tone = blockTone(block);
+  $: surface = blockSurface(block);
+  $: span = blockSpan(block);
   $: variant = ['editorial', 'feature', 'status', 'action', 'metric', 'compact', 'visual'].includes(String(block.variant))
     ? String(block.variant) : 'editorial';
   $: href = safeUrl(block.href);
@@ -47,6 +49,8 @@
   class:has-media={isVisualMedia}
   data-rich-block-type={dataBlockType}
   data-rich-card-variant={variant}
+  data-rich-surface={surface}
+  style:grid-column={span ? `span ${span}` : undefined}
 >
   <RichMedia
     {media}

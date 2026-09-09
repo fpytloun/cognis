@@ -6,6 +6,7 @@ import copy
 import hashlib
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -29,6 +30,7 @@ from cognis.core.session_fork import fork_session_events
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import (
+    TERMINAL_STATES,
     ConversationContext,
     ConversationLineage,
     ConversationModel,
@@ -272,6 +274,7 @@ def _intaris_session_policy(
     working_directory: str | None,
     *,
     project_paths: list[str] | None = None,
+    additional_allowed_paths: list[str] | None = None,
     executor_home: str | None = None,
     executor_tmpdir: str | None = None,
     interaction_mode: str | None = None,
@@ -308,6 +311,8 @@ def _intaris_session_policy(
         _add(f"{executor_home.rstrip('/')}/.local/share/cognis")
     _add(working_directory)
     for raw_path in project_paths or []:
+        _add(raw_path)
+    for raw_path in additional_allowed_paths or []:
         _add(raw_path)
 
     policy: dict[str, Any] = {"allow_paths": paths} if paths else {}
@@ -391,6 +396,7 @@ class SessionManager:
         session: SessionModel,
         *,
         session_policy_override: dict[str, Any] | None = None,
+        additional_allowed_paths: list[str] | None = None,
     ) -> None:
         """Refresh Intaris policy from runtime paths and any explicit inherited clauses."""
 
@@ -409,6 +415,7 @@ class SessionManager:
         new_policy = _intaris_session_policy(
             workdir,
             project_paths=project_paths,
+            additional_allowed_paths=additional_allowed_paths,
             interaction_mode=runtime_access.interaction_mode if runtime_access else None,
             session_policy=session_policy,
         )
@@ -1037,6 +1044,32 @@ class SessionManager:
         }
         async with self.session_factory() as db_session:
             try:
+                locked_conversation = await queries.get_conversation_for_update(
+                    db_session, conversation.conversation_id
+                )
+                if (
+                    locked_conversation is None
+                    or locked_conversation.active_session_id != current_session.session_id
+                ):
+                    raise RuntimeError("Active session changed during history rebase activation")
+                source_row = await queries.get_session_for_update(
+                    db_session, current_session.session_id
+                )
+                target_row = await queries.get_session_for_update(
+                    db_session, new_session.session_id
+                )
+                if source_row is None or target_row is None:
+                    raise RuntimeError("Session disappeared during history rebase activation")
+                for field in (
+                    "agent_profile_id",
+                    "model_override",
+                    "model_override_provider_id",
+                    "reasoning_effort_override",
+                    "fast_mode_override",
+                    "runtime_override_revision",
+                ):
+                    setattr(target_row, field, getattr(source_row, field))
+                new_session = _to_session_model(target_row)
                 await queries.update_conversation_active_session(
                     db_session, conversation.conversation_id, new_session.session_id
                 )
@@ -1048,7 +1081,6 @@ class SessionManager:
                 await db_session.rollback()
                 raise
 
-        self._copy_runtime_overrides(current_session.session_id, new_session.session_id)
         return HistoryRebaseResult(
             operation="undo",
             session=new_session,
@@ -1126,37 +1158,59 @@ class SessionManager:
         current_session: SessionModel,
         intention: str,
     ) -> SessionModel:
+        # Intaris creation precedes row locks; activation reconciles runtime state again.
+        async with self.session_factory() as db_session:
+            agent = await self._require_agent(db_session, current_session.agent_id)
+            project_id = await self._lookup_conversation_project_id(
+                db_session, current_session.conversation_id
+            )
+            project_paths = await _project_source_paths(db_session, project_id)
+        session_id = f"sess_{uuid.uuid4().hex}"
+        workdir = _resolve_runtime_workdir()
+        with scoped_runtime_context(
+            user_email=current_session.user_email,
+            agent_id=current_session.agent_id,
+            agent_owner_email=agent.owner_email,
+        ):
+            await self.providers.guardrails.create_session(
+                session_id=session_id,
+                intention=_normalize_intention(intention),
+                agent_id=current_session.agent_id,
+                user_id=current_session.user_email,
+                details=_intaris_session_details(workdir, source="cognis:undo"),
+                policy=_intaris_session_policy(workdir, project_paths=project_paths),
+            )
         async with self.session_factory() as db_session:
             try:
-                agent = await self._require_agent(db_session, current_session.agent_id)
-                session_row = await queries.create_session(
-                    db_session,
-                    conversation_id=current_session.conversation_id,
-                    user_email=current_session.user_email,
-                    agent_id=current_session.agent_id,
-                    previous_session_id=None,
-                    mnemory_session_id=None,
-                )
-                project_id = await self._lookup_conversation_project_id(
+                conversation_row = await queries.get_conversation_for_update(
                     db_session, current_session.conversation_id
                 )
-                project_paths = await _project_source_paths(db_session, project_id)
-                workdir = _resolve_runtime_workdir()
-                with scoped_runtime_context(
-                    user_email=current_session.user_email,
-                    agent_id=current_session.agent_id,
-                    agent_owner_email=agent.owner_email,
+                if (
+                    conversation_row is None
+                    or conversation_row.active_session_id != current_session.session_id
                 ):
-                    await self.providers.guardrails.create_session(
-                        session_id=session_row.session_id,
-                        intention=_normalize_intention(intention),
-                        agent_id=current_session.agent_id,
-                        user_id=current_session.user_email,
-                        details=_intaris_session_details(workdir, source="cognis:undo"),
-                        policy=_intaris_session_policy(workdir, project_paths=project_paths),
-                    )
-                await queries.set_session_intaris_session_id(
-                    db_session, session_row.session_id, session_row.session_id
+                    raise RuntimeError("Active session changed during history rebase")
+                source_row = await queries.get_session_for_update(
+                    db_session, current_session.session_id
+                )
+                if source_row is None:
+                    raise RuntimeError("Source session disappeared during history rebase")
+                source = _to_session_model(source_row)
+                session_row = await queries.create_session(
+                    db_session,
+                    session_id=session_id,
+                    intaris_session_id=session_id,
+                    conversation_id=source.conversation_id,
+                    user_email=source.user_email,
+                    agent_id=source.agent_id,
+                    agent_profile_id=source.agent_profile_id,
+                    model_override=source.model_override,
+                    model_override_provider_id=source.model_override_provider_id,
+                    reasoning_effort_override=source.reasoning_effort_override,
+                    fast_mode_override=source.fast_mode_override,
+                    runtime_override_revision=source.runtime_override_revision,
+                    previous_session_id=None,
+                    mnemory_session_id=None,
                 )
                 await db_session.commit()
             except Exception:
@@ -1191,9 +1245,9 @@ class SessionManager:
             last_n=last_n,
             allow_missing_stream=allow_missing_stream,
         )
-        events: list[CachedEvent] = []
+        fetched_events: list[CachedEvent] = []
         for raw_event in sorted(event_read.events, key=lambda event: int(event.get("seq", 0) or 0)):
-            events.append(
+            fetched_events.append(
                 CachedEvent(
                     seq=int(raw_event.get("seq", 0) or 0),
                     type=str(raw_event.get("type") or ""),
@@ -1202,7 +1256,7 @@ class SessionManager:
                     ts=raw_event.get("ts"),
                 )
             )
-        return events
+        return fetched_events
 
     @staticmethod
     def _find_last_real_user_event(
@@ -1229,21 +1283,6 @@ class SessionManager:
             if turn_event_seqs:
                 return min(turn_event_seqs), turn_id
         return undo_event.seq, turn_id
-
-    def _copy_runtime_overrides(self, source_session_id: str, target_session_id: str) -> None:
-        model_override = self.session_cache.get_model_override(source_session_id)
-        model_provider_override = self.session_cache.get_model_override_provider_id(
-            source_session_id
-        )
-        reasoning_override = self.session_cache.get_reasoning_effort_override(source_session_id)
-        if model_override is not None:
-            self.session_cache.set_model_override(
-                target_session_id,
-                model_override,
-                provider_id=model_provider_override,
-            )
-        if reasoning_override is not None:
-            self.session_cache.set_reasoning_effort_override(target_session_id, reasoning_override)
 
     async def create_child_session(
         self,
@@ -1463,6 +1502,7 @@ class SessionManager:
                     result_summary=result_summary,
                     result_content=result_content,
                     completion_reason=completion_reason,
+                    allowed_from={"active", "idle", "suspended"},
                 )
                 await db_session.commit()
             except Exception:
@@ -1495,6 +1535,7 @@ class SessionManager:
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
                     result_content=result_content,
+                    allowed_from={"active", "idle", "suspended"},
                 )
                 await db_session.commit()
             except Exception:
@@ -1516,6 +1557,7 @@ class SessionManager:
                     SessionStatus.CANCELLED,
                     completed_at=datetime.now(UTC),
                     result_summary=result_summary,
+                    allowed_from={"active", "idle", "suspended"},
                 )
                 await db_session.commit()
             except Exception:
@@ -1536,6 +1578,7 @@ class SessionManager:
                     session_id,
                     SessionStatus.SUSPENDED,
                     result_summary=reason,
+                    allowed_from={"active", "idle", "suspended"},
                 )
                 await db_session.commit()
             except Exception:
@@ -1556,6 +1599,7 @@ class SessionManager:
                     SessionStatus.TERMINATED,
                     completed_at=datetime.now(UTC),
                     result_summary=reason,
+                    allowed_from={"active", "idle", "suspended"},
                 )
                 await db_session.commit()
             except Exception:
@@ -1607,6 +1651,8 @@ class SessionManager:
         prefix_entries = (
             get_prefix_entries(current_session.session_id) if callable(get_prefix_entries) else []
         )
+        durable_summary_events: list[SessionEvent] = []
+        summary_result: Any | None = None
 
         async with self.session_factory() as db_session:
             try:
@@ -1621,6 +1667,15 @@ class SessionManager:
                         raise SessionRotationConflictError(
                             "Conversation active session changed during root rotation"
                         )
+                source_session = await queries.get_session_for_update(
+                    db_session,
+                    current_session.session_id,
+                )
+                if source_session is None or source_session.status in TERMINAL_STATES:
+                    raise SessionRotationConflictError(
+                        "Cannot rotate a terminal or missing session"
+                    )
+                authoritative_session = _to_session_model(source_session)
 
                 # 1. Create a successor in the same lane (fresh Mnemory session — the
                 #    first recall will create a new Mnemory session and
@@ -1630,7 +1685,32 @@ class SessionManager:
                     conversation_id=conversation_id,
                     user_email=current_session.user_email,
                     agent_id=current_session.agent_id,
-                    agent_profile_id=current_session.agent_profile_id,
+                    agent_profile_id=authoritative_session.agent_profile_id,
+                    model_override=(
+                        authoritative_session.model_override
+                        if transition is SessionTransition.COMPACT
+                        else None
+                    ),
+                    model_override_provider_id=(
+                        authoritative_session.model_override_provider_id
+                        if transition is SessionTransition.COMPACT
+                        else None
+                    ),
+                    reasoning_effort_override=(
+                        authoritative_session.reasoning_effort_override
+                        if transition is SessionTransition.COMPACT
+                        else None
+                    ),
+                    fast_mode_override=(
+                        authoritative_session.fast_mode_override
+                        if transition is SessionTransition.COMPACT
+                        else None
+                    ),
+                    runtime_override_revision=(
+                        authoritative_session.runtime_override_revision
+                        if transition is SessionTransition.COMPACT
+                        else 0
+                    ),
                     parent_session_id=current_session.parent_session_id,
                     previous_session_id=current_session.session_id,
                     delegation_mode=current_session.delegation_mode,
@@ -1688,6 +1768,32 @@ class SessionManager:
                     db_session, new_session_row.session_id, new_session_row.session_id
                 )
 
+                summary_event_data = dict(compaction_summary_event_data or {})
+                summary_event_data.update(
+                    {
+                        "summary": compaction_summary,
+                        "session_id": new_session_row.session_id,
+                        "source_session_id": current_session.session_id,
+                    }
+                )
+                summary_event_data.setdefault("method", "rotation")
+                summary_event_data.setdefault("marker_role", "context_seed")
+                summary_event_data.setdefault("timeline_visible", True)
+                summary_event_data.setdefault("trigger", completion_reason)
+                durable_summary_events = (
+                    with_session_events_turn_id(
+                        [
+                            SessionEvent(
+                                type="compaction_summary",
+                                data=summary_event_data,
+                            )
+                        ],
+                        None,
+                    )
+                    if transition is not SessionTransition.RESET and compaction_summary
+                    else []
+                )
+
                 # 3. Seed the Intaris stream before Cognis points the
                 #    conversation at the new session.  A created Intaris session
                 #    may not have a readable event stream until at least one
@@ -1726,6 +1832,26 @@ class SessionManager:
                     )
                 if not seed_result.ok:
                     raise RuntimeError("Could not seed rotated Intaris session stream")
+                if durable_summary_events:
+                    with scoped_runtime_context(
+                        user_email=current_session.user_email,
+                        agent_id=current_session.agent_id,
+                        agent_owner_email=agent_owner_email,
+                    ):
+                        summary_result = await self.providers.guardrails.record_events(
+                            session_id=new_session_row.session_id,
+                            events=durable_summary_events,
+                            source="cognis",
+                            idempotency_key=(
+                                f"{new_session_row.session_id}:compaction_summary:rotation"
+                            ),
+                            retry_missing_session=True,
+                            user_email=current_session.user_email,
+                            agent_id=current_session.agent_id,
+                            agent_owner_email=agent_owner_email,
+                        )
+                    if not summary_result.ok:
+                        raise RuntimeError("Could not seed rotated compaction summary")
 
                 # 4. Mark current session completed.  Do this only after the
                 #    replacement session has a durable Intaris stream so the
@@ -1733,7 +1859,7 @@ class SessionManager:
                 #    active session.
                 # NOTE: result_summary is metadata only — no LLM-generated content
                 # in the Cognis DB. The actual compaction summary lives in Intaris.
-                await queries.set_session_status(
+                transitioned = await queries.set_session_status(
                     db_session,
                     current_session.session_id,
                     SessionStatus.COMPLETED,
@@ -1741,6 +1867,8 @@ class SessionManager:
                     result_summary=f"Rotated ({completion_reason})",
                     completion_reason=completion_reason,
                 )
+                if not transitioned:
+                    raise SessionRotationConflictError("Session became terminal during rotation")
 
                 # 5. Only root-lane rotation advances the conversation pointer.
                 #    Compare-and-set prevents a stale concurrent rotation from
@@ -1796,59 +1924,12 @@ class SessionManager:
                     content=compaction_summary,
                 )
             )
-        summary_event_data = dict(compaction_summary_event_data or {})
-        summary_event_data.update(
-            {
-                "summary": compaction_summary,
-                "session_id": new_session.session_id,
-                "source_session_id": current_session.session_id,
-            }
-        )
-        summary_event_data.setdefault("method", "rotation")
-        summary_event_data.setdefault("marker_role", "context_seed")
-        # The rotated session owns the durable, user-visible compaction marker.
-        # Callers that provide no event metadata (manual or deferred rotation)
-        # must not lose it after a page reload.
-        summary_event_data.setdefault("timeline_visible", True)
-        summary_event_data.setdefault("trigger", completion_reason)
-
-        durable_summary_events = (
-            with_session_events_turn_id(
-                [
-                    SessionEvent(
-                        type="compaction_summary",
-                        data=summary_event_data,
-                    )
-                ],
-                None,
-            )
-            if transition is not SessionTransition.RESET and compaction_summary
-            else []
-        )
-        summary_result: Any | None = None
         try:
             with scoped_runtime_context(
                 user_email=current_session.user_email,
                 agent_id=current_session.agent_id,
                 agent_owner_email=agent_owner_email,
             ):
-                if durable_summary_events:
-                    summary_result = await self.providers.guardrails.record_events(
-                        session_id=new_session.intaris_session_id or new_session.session_id,
-                        events=durable_summary_events,
-                        source="cognis",
-                        idempotency_key=f"{new_session.session_id}:compaction_summary:rotation",
-                        retry_missing_session=True,
-                        user_email=current_session.user_email,
-                        agent_id=current_session.agent_id,
-                        agent_owner_email=agent_owner_email,
-                    )
-                    if not summary_result.ok:
-                        logger.warning(
-                            "session: failed to persist rotated compaction summary",
-                            extra={"extra_data": {"session_id": new_session.session_id}},
-                        )
-
                 if rotated_prefix:
                     message_events = with_session_events_turn_id(
                         build_prefix_message_events(rotated_prefix),
@@ -2038,6 +2119,7 @@ class SessionManager:
         updated_before = datetime.now(UTC) - timedelta(seconds=stale_after_seconds)
         recovered_ids: list[str] = []
         recovered_child_sessions: list[Any] = []
+        recovered_rows: dict[str, Any] = {}
         async with self.session_factory() as db_session:
             try:
                 stale_sessions = await queries.list_stale_active_sessions(
@@ -2054,6 +2136,7 @@ class SessionManager:
                         idle_since=datetime.now(UTC),
                     )
                     recovered_ids.append(stale_session.session_id)
+                    recovered_rows[stale_session.session_id] = stale_session
                     child_ids = await self._fail_active_descendants(
                         db_session,
                         parent_session_id=stale_session.session_id,
@@ -2061,10 +2144,71 @@ class SessionManager:
                         recovered_children=recovered_child_sessions,
                     )
                     recovered_ids.extend(child_ids)
+                    recovered_rows.update(
+                        {
+                            child.session_id: child
+                            for child in recovered_child_sessions
+                            if child.session_id in child_ids
+                        }
+                    )
                 await db_session.commit()
             except Exception:
                 await db_session.rollback()
                 raise
+
+        # Local recovery is authoritative. Recording the explanatory Intaris
+        # event is best-effort and must not roll back recovered rows or abort
+        # controller startup when a source session rejects further appends.
+        for recovered_id in recovered_ids:
+            recovered_row = recovered_rows[recovered_id]
+            target_session_id = recovered_row.intaris_session_id or recovered_id
+            notice_id = f"{target_session_id}:session-recovered:controller_restart"
+            try:
+                with scoped_runtime_context(
+                    user_email=recovered_row.user_email,
+                    agent_id=recovered_row.agent_id,
+                ):
+                    append_result = await self.providers.guardrails.record_events(
+                        session_id=target_session_id,
+                        events=[
+                            SessionEvent(
+                                type="lifecycle",
+                                data={
+                                    "event": "session_recovered",
+                                    "notice_id": notice_id,
+                                    "session_id": recovered_id,
+                                    "title": "Controller restarted",
+                                    "message": (
+                                        "The controller restarted while this session was active. "
+                                        "Saved work is preserved; resume the session if needed."
+                                    ),
+                                    "reason": "controller_restart",
+                                },
+                            )
+                        ],
+                        source="cognis",
+                        idempotency_key=notice_id,
+                        retry_missing_session=True,
+                        user_email=recovered_row.user_email,
+                        agent_id=recovered_row.agent_id,
+                    )
+                    if not getattr(append_result, "ok", False):
+                        raise RuntimeError(
+                            f"Intaris rejected recovery event for session {recovered_id}"
+                        )
+            except Exception as exc:
+                extra_data: dict[str, Any] = {
+                    "session_id": recovered_id,
+                    "target_session_id": target_session_id,
+                }
+                if isinstance(exc, httpx.HTTPStatusError):
+                    extra_data["response_status_code"] = exc.response.status_code
+                    extra_data["response_body"] = exc.response.text[:1000]
+                logger.warning(
+                    "session: failed to record recovery event",
+                    extra={"extra_data": extra_data},
+                    exc_info=True,
+                )
 
         for recovered_id in recovered_ids:
             await self._evict_session_state(recovered_id)
@@ -2250,6 +2394,9 @@ class SessionManager:
             tools=agent_row.tools,
             permissions=agent_row.permissions,
             llm_config=agent_row.llm_config,
+            capabilities=agent_row.capabilities,
+            agent_profiles=agent_row.agent_profiles,
+            default_agent_profile_id=agent_row.default_agent_profile_id,
             execution=agent_row.execution,
             avatar_url=agent_row.avatar_url,
             avatar_image_id=getattr(agent_row, "avatar_image_id", None),
@@ -2357,6 +2504,11 @@ def _to_session_model(row: Any) -> SessionModel:
         user_email=row.user_email,
         agent_id=row.agent_id,
         agent_profile_id=getattr(row, "agent_profile_id", None),
+        model_override=getattr(row, "model_override", None),
+        model_override_provider_id=getattr(row, "model_override_provider_id", None),
+        reasoning_effort_override=getattr(row, "reasoning_effort_override", None),
+        fast_mode_override=getattr(row, "fast_mode_override", None),
+        runtime_override_revision=int(getattr(row, "runtime_override_revision", 0) or 0),
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
         delegation_metadata=dict(getattr(row, "delegation_metadata", None) or {}),

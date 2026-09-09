@@ -29,6 +29,10 @@ from fastapi import WebSocket, WebSocketDisconnect
 from prometheus_client import Counter, Gauge
 from sqlalchemy import select
 
+from cognis.api.authentication import (
+    AccessTokenAuthenticationError,
+    authenticate_access_token,
+)
 from cognis.api.chat_v2.cursors import ChatCursorError, validate_cursor
 from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.normalizer import normalize_session_events
@@ -45,7 +49,7 @@ from cognis.api.chat_v2.realtime import (
     tool_call_runtime_item,
     tool_result_runtime_item,
 )
-from cognis.api.chat_v2.schemas import TimelineItem, TimelineScope
+from cognis.api.chat_v2.schemas import BoundaryReceipt, TimelineItem, TimelineScope
 from cognis.api.chat_v2.sync import current_projection_version
 from cognis.api.models import (
     WebSocketAuthenticated,
@@ -53,6 +57,7 @@ from cognis.api.models import (
     WebSocketError,
     WebSocketPong,
 )
+from cognis.api.proxy import trusted_request_scheme
 from cognis.api.serializers import conversation_to_response
 from cognis.api.timeline_visibility import (
     is_transient_compaction_start_notice,
@@ -74,6 +79,7 @@ from cognis.core.conversation_state import (
 from cognis.core.events import Event, EventType
 from cognis.core.notification_resolution import build_auth_challenge_resolution_data
 from cognis.core.question_sets import validate_reply_for_questions
+from cognis.core.trusted_evidence import authenticated_direct_user_origin
 from cognis.core.turn_scheduler import (
     SessionCreationFailedError as SessionCreationFailedError,  # noqa: F401 — re-export
 )
@@ -85,15 +91,23 @@ from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.providers.circuit_breaker import CircuitBreakerError
 from cognis.runtime_context import current_user_email
-from cognis.store.models import Conversation, ExecutorRow, NotificationRow, Session, Task
+from cognis.store.models import (
+    Conversation,
+    ExecutorRow,
+    NotificationRow,
+    Session,
+    Task,
+)
 from cognis.store.queries import (
     get_browser_session_by_token,
     get_conversation,
+    get_managed_conversation_link_for_target,
     get_task,
     get_user,
     list_pending_notification_types_by_conversation,
     mark_artifacts_attached,
 )
+from cognis.store.work_live_invalidation import read_live_work_revision
 
 logger = get_logger(__name__)
 
@@ -211,6 +225,19 @@ def _runtime_relay_cumulative_boundary(items: list[TimelineItem], *, has_active_
         )
         or getattr(item, "status", None) in {"completed", "failed", "cancelled", "compacted"}
         for item in items
+    )
+
+
+def _is_transient_runtime_notice(item: TimelineItem) -> bool:
+    """Return whether a runtime-only system notice must disappear after settlement."""
+
+    return bool(
+        item.kind == "message"
+        and item.role == "system"
+        and (
+            item.notice_scope == "transient_retry"
+            or (item.notice_kind == "model_recovery" and item.notice_scope == "retry")
+        )
     )
 
 
@@ -374,6 +401,7 @@ class AuthenticatedWebSocket:
     websocket: WebSocket
     user_email: str
     role: str
+    auth_version: int = 0
     subscriptions: set[str] = field(default_factory=set)
     recent_message_times: Any = field(default_factory=lambda: __import__("collections").deque())
     dropped_chunks: dict[str, int] = field(default_factory=dict)
@@ -386,9 +414,10 @@ class AuthenticatedWebSocket:
     tts_enabled: bool = False
     tts_voice: str | None = None
     send_timeout_seconds: float = DEFAULT_SEND_TIMEOUT_SECONDS
+    ready_for_fanout: bool = True
     _outbound_queue: asyncio.Queue[_OutboundFrame] = field(init=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False)
-    _enqueue_tail: asyncio.Task[None] | None = field(default=None, init=False)
+    _overflow_task: asyncio.Task[None] | None = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
@@ -410,21 +439,36 @@ class AuthenticatedWebSocket:
         await self._enqueue_payload(data, block=True)
         await asyncio.sleep(0)
 
+    async def send_authenticated(self, data: dict[str, Any]) -> None:
+        """Queue the authentication frame before this connection accepts fanout."""
+
+        await self._enqueue_payload(data, block=True, allow_unready=True)
+        self.ready_for_fanout = True
+        await asyncio.sleep(0)
+
     def send_scope_invalidation_nowait(self, data: dict[str, Any]) -> bool:
         """Coalesce and enqueue a droppable scope wakeup without blocking."""
+        if not self._can_enqueue():
+            return False
         conversation_id = data.get("conversation_id")
         scope_key = self._scope_invalidation_key(data)
-        queue = self._outbound_queue._queue  # noqa: SLF001
+        queue = cast(Any, self._outbound_queue)._queue
         for frame in reversed(queue):
             if (
-                frame.msg_type == "scope_invalidated"
+                frame.msg_type == data.get("type")
                 and frame.message_id == scope_key
                 and frame.payload is not None
             ):
+                if data.get("type") == "work_invalidated":
+                    try:
+                        if int(data.get("revision", 0)) <= int(frame.payload.get("revision", 0)):
+                            return True
+                    except (TypeError, ValueError):
+                        return True
                 frame.payload = data
                 return True
         frame = _OutboundFrame(
-            msg_type="scope_invalidated",
+            msg_type=str(data.get("type") or "scope_invalidated"),
             message_id=scope_key,
             conversation_id=str(conversation_id or ""),
             droppable=True,
@@ -435,6 +479,8 @@ class AuthenticatedWebSocket:
 
     @staticmethod
     def _scope_invalidation_key(data: dict[str, Any]) -> str:
+        if data.get("type") == "work_invalidated":
+            return f"work:{data.get('work_scope_key') or ''}"
         conversation_id = data.get("conversation_id")
         return (
             f"{data.get('reason')}:{conversation_id}"
@@ -469,11 +515,11 @@ class AuthenticatedWebSocket:
         """Cancel writer/enqueue tasks and drain queued frames for disconnect."""
 
         self._closed = True
-        if self._enqueue_tail is not None and not self._enqueue_tail.done():
-            self._enqueue_tail.cancel()
+        if self._overflow_task is not None and not self._overflow_task.done():
+            self._overflow_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._enqueue_tail
-        self._enqueue_tail = None
+                await self._overflow_task
+        self._overflow_task = None
         if self._writer_task is not None and not self._writer_task.done():
             self._writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -487,7 +533,13 @@ class AuthenticatedWebSocket:
         await self._outbound_queue.join()
         await asyncio.sleep(0)
 
-    async def _enqueue_payload(self, data: dict[str, Any], *, block: bool) -> None:
+    async def _enqueue_payload(
+        self,
+        data: dict[str, Any],
+        *,
+        block: bool,
+        allow_unready: bool = False,
+    ) -> None:
         msg_type = data.get("type")
         message_id = data.get("message_id")
         conversation_id = data.get("conversation_id")
@@ -500,35 +552,28 @@ class AuthenticatedWebSocket:
                 payload=data,
             ),
             block=block,
+            allow_unready=allow_unready,
         )
 
-    async def _enqueue_frame(self, frame: _OutboundFrame, *, block: bool) -> None:
-        if self._closed:
+    async def _enqueue_frame(
+        self,
+        frame: _OutboundFrame,
+        *,
+        block: bool,
+        allow_unready: bool = False,
+    ) -> None:
+        if not self._can_enqueue(allow_unready=allow_unready):
             return
         self._ensure_writer()
-        tail = self._enqueue_tail
-        if tail is not None and not tail.done():
-            if block:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await tail
-            else:
-                self._enqueue_tail = asyncio.create_task(self._enqueue_after_tail(tail, [frame]))
-                return
         if frame.droppable:
             self._enqueue_droppable_nowait(frame)
             return
         await self._enqueue_non_droppable(frame, block=block)
 
-    async def _enqueue_after_tail(
-        self, previous: asyncio.Task[None], frames: list[_OutboundFrame]
-    ) -> None:
-        with contextlib.suppress(asyncio.CancelledError):
-            await previous
-        for frame in frames:
-            if frame.droppable:
-                self._enqueue_droppable_nowait(frame)
-            else:
-                await self._enqueue_non_droppable(frame, block=True)
+    def _can_enqueue(self, *, allow_unready: bool = False) -> bool:
+        """Apply the closed/readiness gate for every public outbound path."""
+
+        return not self._closed and (self.ready_for_fanout or allow_unready)
 
     async def _enqueue_non_droppable(self, frame: _OutboundFrame, *, block: bool) -> None:
         frames = [*self._gap_frames_for(frame), frame]
@@ -544,20 +589,26 @@ class AuthenticatedWebSocket:
             remaining = frames[index:]
             break
         if remaining:
-            previous = self._enqueue_tail
-            if previous is not None and not previous.done():
-                self._enqueue_tail = asyncio.create_task(
-                    self._enqueue_after_tail(previous, remaining)
-                )
-            else:
-                self._enqueue_tail = asyncio.create_task(self._enqueue_frames_blocking(remaining))
+            self._schedule_overflow_abort()
 
-    async def _enqueue_frames_blocking(self, frames: list[_OutboundFrame]) -> None:
-        for frame in frames:
-            if frame.droppable:
-                self._enqueue_droppable_nowait(frame)
-            else:
-                await self._enqueue_non_droppable(frame, block=True)
+    def _schedule_overflow_abort(self) -> None:
+        """Bound non-blocking fanout by disconnecting a consumer that cannot resynchronize."""
+
+        if self._overflow_task is None or self._overflow_task.done():
+            self._overflow_task = asyncio.create_task(self._abort_outbound_overflow())
+
+    async def _abort_outbound_overflow(self) -> None:
+        self._closed = True
+        self._drain_outbound_queue()
+        logger.warning(
+            "WebSocket outbound buffer overflow",
+            extra={"connection_id": self.connection_id},
+        )
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                self.websocket.close(code=1013, reason="WebSocket outbound buffer overflow"),
+                timeout=self.send_timeout_seconds,
+            )
 
     def _gap_frames_for(self, frame: _OutboundFrame) -> list[_OutboundFrame]:
         if frame.message_id is None:
@@ -595,7 +646,7 @@ class AuthenticatedWebSocket:
             except TimeoutError:
                 continue
             if self._closed:
-                queue_items = self._outbound_queue._queue  # type: ignore[attr-defined]  # noqa: SLF001
+                queue_items = cast(Any, self._outbound_queue)._queue
                 with contextlib.suppress(ValueError):
                     queue_items.remove(frame)
                     self._outbound_queue.task_done()
@@ -668,12 +719,6 @@ class AuthenticatedWebSocket:
     async def _abort_stalled_transport(self) -> None:
         """Close a socket that stopped accepting outbound frames."""
         self._closed = True
-        tail = self._enqueue_tail
-        self._enqueue_tail = None
-        if tail is not None and not tail.done():
-            tail.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await tail
         self._drain_outbound_queue()
         logger.warning(
             "WebSocket send timed out",
@@ -930,11 +975,6 @@ class WebSocketTurnObserver:
             payload["last_message_at"] = last_message_at.isoformat()
             payload["updated_at"] = last_message_at.isoformat()
         await self._manager.send_to_conversation(conversation_id, payload)
-        # Fan out the same activity correction to owner tabs that are not
-        # subscribed to this conversation (e.g. a tab viewing a different chat
-        # or a second device). This keeps sidebar turn indicators and
-        # last_message_at timestamps accurate across all open clients.
-        await self._manager.send_sidebar_update_to_owner(conversation_id, payload)
 
     async def on_token(
         self,
@@ -1435,7 +1475,9 @@ class WebSocketConnectionManager:
         self._by_chat_v2_conversation: dict[str, set[str]] = defaultdict(set)
         self._by_chat_v2_scope: dict[str, set[str]] = defaultdict(set)
         self._by_user: dict[str, set[str]] = defaultdict(set)
+        self._auth_watchdogs: dict[str, asyncio.Task[None]] = {}
         self._chat_v2_runtime_revisions: dict[str, int] = defaultdict(int)
+        self._sidebar_update_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
@@ -1444,7 +1486,7 @@ class WebSocketConnectionManager:
         # Register as global EventBus subscriber for UI fanout
         event_bus = getattr(app.state, "event_bus", None)
         if event_bus is not None:
-            event_bus.subscribe_all(self._handle_event)
+            event_bus.subscribe_all(self._handle_event, resilient=True)
 
         # Register observer on the TurnScheduler for all conversations
         turn_scheduler = getattr(app.state, "turn_scheduler", None)
@@ -1461,16 +1503,36 @@ class WebSocketConnectionManager:
             websocket=websocket,
             user_email=claims["sub"],
             role=claims.get("role", "user"),
+            auth_version=int(claims.get("authv", 0)),
+            ready_for_fanout=False,
         )
         self._connections[connection.connection_id] = connection
         self._by_user[connection.user_email].add(connection.connection_id)
         WS_CONNECTIONS_ACTIVE.inc()
         WS_CONNECTIONS_TOTAL.inc()
+        self._auth_watchdogs[connection.connection_id] = asyncio.create_task(
+            self._watch_connection_auth(connection),
+            name=f"ws-auth-watchdog:{connection.connection_id}",
+        )
         return connection
 
-    async def disconnect(self, connection: AuthenticatedWebSocket) -> None:
+    async def disconnect(
+        self,
+        connection: AuthenticatedWebSocket,
+        *,
+        code: int | None = None,
+        reason: str = "",
+    ) -> None:
         """Unregister a WebSocket connection."""
-        self._connections.pop(connection.connection_id, None)
+        if not self._unregister(connection):
+            return
+        await self._finish_disconnect(connection, code=code, reason=reason)
+
+    def _unregister(self, connection: AuthenticatedWebSocket) -> bool:
+        """Remove one connection from every fanout index without awaiting."""
+
+        if self._connections.pop(connection.connection_id, None) is None:
+            return False
         user_connections = self._by_user.get(connection.user_email)
         if user_connections is not None:
             user_connections.discard(connection.connection_id)
@@ -1480,8 +1542,123 @@ class WebSocketConnectionManager:
             self._unsubscribe(connection, cid)
         for scope_key in list(connection.chat_v2_scopes):
             self.unsubscribe_chat_v2(connection, scope_key)
+        return True
+
+    async def _finish_disconnect(
+        self,
+        connection: AuthenticatedWebSocket,
+        *,
+        code: int | None,
+        reason: str,
+    ) -> None:
+        watchdog = self._auth_watchdogs.pop(connection.connection_id, None)
+        current_task = asyncio.current_task()
+        if watchdog is not None and watchdog is not current_task and not watchdog.done():
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+        if code is not None:
+            with contextlib.suppress(RuntimeError):
+                await connection.websocket.close(code=code, reason=reason)
         await connection.close()
         WS_CONNECTIONS_ACTIVE.dec()
+
+    async def disconnect_user(
+        self,
+        user_email: str,
+        *,
+        code: int = 4401,
+        reason: str = "Authentication revoked",
+    ) -> int:
+        """Remove and close all local connections for one authenticated user."""
+
+        connection_ids = list(self._by_user.get(user_email, set()))
+        connections = [
+            connection
+            for connection_id in connection_ids
+            if (connection := self._connections.get(connection_id)) is not None
+        ]
+        registered = [connection for connection in connections if self._unregister(connection)]
+        if registered:
+            await asyncio.gather(
+                *(
+                    self._finish_disconnect(connection, code=code, reason=reason)
+                    for connection in registered
+                )
+            )
+        return len(registered)
+
+    async def revalidate_registered_connection(
+        self,
+        connection: AuthenticatedWebSocket,
+    ) -> bool:
+        """Validate a newly registered connection before it becomes observable."""
+
+        async with self.app.state.session_factory() as session:
+            user = await get_user(session, connection.user_email)
+        if user is None or not user.is_active:
+            await self.disconnect(
+                connection,
+                code=4403 if user is not None else 4401,
+                reason="Account disabled" if user is not None else "Unknown user",
+            )
+            return False
+        if user.auth_version != connection.auth_version:
+            await self.disconnect(
+                connection,
+                code=4401,
+                reason="Authentication revoked",
+            )
+            return False
+        # A concurrent local eviction can remove the connection while the
+        # database query is in progress.
+        return self._connections.get(connection.connection_id) is connection
+
+    async def _watch_connection_auth(self, connection: AuthenticatedWebSocket) -> None:
+        interval = max(
+            0.01,
+            float(
+                getattr(
+                    self.app.state,
+                    "ws_auth_watchdog_interval_seconds",
+                    5.0,
+                )
+            ),
+        )
+        try:
+            while connection.connection_id in self._connections:
+                await asyncio.sleep(interval)
+                try:
+                    async with self.app.state.session_factory() as session:
+                        user = await get_user(session, connection.user_email)
+                except Exception:
+                    logger.warning(
+                        "ws_auth_watchdog_query_failed",
+                        extra={
+                            "extra_data": {
+                                "connection_id": connection.connection_id,
+                                "user_email": connection.user_email,
+                            }
+                        },
+                        exc_info=True,
+                    )
+                    continue
+                if user is None or not user.is_active:
+                    await self.disconnect(
+                        connection,
+                        code=4403 if user is not None else 4401,
+                        reason="Account disabled" if user is not None else "Unknown user",
+                    )
+                    return
+                if user.auth_version != connection.auth_version:
+                    await self.disconnect(
+                        connection,
+                        code=4401,
+                        reason="Authentication revoked",
+                    )
+                    return
+        except asyncio.CancelledError:
+            raise
 
     def _has_conversation_observers(self, conversation_id: str) -> bool:
         """Return True when any connection needs turn observer events."""
@@ -1952,6 +2129,19 @@ class WebSocketConnectionManager:
             if turn_scheduler is not None and hasattr(turn_scheduler, "relay_generation_context")
             else None
         )
+        boundary_receipts = (
+            [
+                BoundaryReceipt.model_validate(item)
+                for item in turn_scheduler.pending_boundary_receipts(
+                    conversation_id,
+                    context.turn_id,
+                )
+            ]
+            if context is not None
+            and turn_scheduler is not None
+            and hasattr(turn_scheduler, "pending_boundary_receipts")
+            else []
+        )
         effective_items = volatile_items
         if context is not None:
             turn_id, cumulative = self._relay_runtime_items.get(
@@ -1969,13 +2159,7 @@ class WebSocketConnectionManager:
                 effective_items = []
         if not has_active_turn:
             effective_items = [
-                item
-                for item in effective_items
-                if not (
-                    item.kind == "message"
-                    and item.role == "system"
-                    and item.notice_scope == "transient_retry"
-                )
+                item for item in effective_items if not _is_transient_runtime_notice(item)
             ]
         await self._fanout_chat_v2_runtime(
             conversation_id,
@@ -1984,8 +2168,20 @@ class WebSocketConnectionManager:
             active_session_id=active_session_id,
             context_usage=context_usage,
             last_generation=last_generation,
+            boundary_receipts=boundary_receipts,
         )
         if context is None or relay is None:
+            if (
+                context is not None
+                and boundary_receipts
+                and turn_scheduler is not None
+                and hasattr(turn_scheduler, "acknowledge_boundary_receipts")
+            ):
+                turn_scheduler.acknowledge_boundary_receipts(
+                    conversation_id,
+                    context.turn_id,
+                    [item.model_dump(mode="json") for item in boundary_receipts],
+                )
             if not has_active_turn:
                 self._relay_runtime_items.pop(conversation_id, None)
             return
@@ -2025,13 +2221,45 @@ class WebSocketConnectionManager:
                     if last_generation is not None
                     else None
                 ),
+                boundary_receipts=boundary_receipts,
             )
             cumulative_boundary = _runtime_relay_cumulative_boundary(
                 effective_items,
                 has_active_turn=has_active_turn,
-            )
-            relay.enqueue(envelope, cumulative_boundary=cumulative_boundary)
+            ) or bool(boundary_receipts)
+            accepted = relay.enqueue(envelope, cumulative_boundary=cumulative_boundary)
+            if (
+                accepted
+                and boundary_receipts
+                and turn_scheduler is not None
+                and hasattr(turn_scheduler, "acknowledge_boundary_receipts")
+            ):
+                turn_scheduler.acknowledge_boundary_receipts(
+                    conversation_id,
+                    context.turn_id,
+                    [item.model_dump(mode="json") for item in boundary_receipts],
+                )
+            if not accepted and not has_active_turn:
+                logger.error(
+                    "Chat v2 terminal runtime relay enqueue failed",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "turn_id": context.turn_id,
+                        }
+                    },
+                )
         except (TypeError, ValueError):
+            if not has_active_turn:
+                logger.exception(
+                    "Chat v2 terminal runtime relay construction failed",
+                    extra={
+                        "extra_data": {
+                            "conversation_id": conversation_id,
+                            "turn_id": getattr(context, "turn_id", None),
+                        }
+                    },
+                )
             return
         finally:
             if not has_active_turn:
@@ -2047,6 +2275,7 @@ class WebSocketConnectionManager:
         context_usage: dict[str, Any] | None,
         last_generation: dict[str, Any] | None,
         active_turn: dict[str, Any] | None = None,
+        boundary_receipts: list[BoundaryReceipt] | None = None,
     ) -> None:
         """Apply a runtime overlay to authorized local scopes only."""
 
@@ -2085,6 +2314,9 @@ class WebSocketConnectionManager:
                     volatile_items=volatile_items,
                     context_usage=context_usage,
                     last_generation=last_generation,
+                    boundary_receipts=[
+                        item.model_dump(mode="json") for item in boundary_receipts or []
+                    ],
                     generated_at=server_time,
                 )
                 serialized = _json_dumps_frame(
@@ -2164,6 +2396,10 @@ class WebSocketConnectionManager:
                 if envelope.active_turn is not None
                 else None
             ),
+            boundary_receipts=[
+                BoundaryReceipt.model_validate(item)
+                for item in ((envelope.context_usage or {}).get("__boundary_receipts") or [])
+            ],
         )
 
     def _chat_v2_active_turn_payload(
@@ -2233,6 +2469,20 @@ class WebSocketConnectionManager:
         *,
         include_subscribers: bool = False,
     ) -> None:
+        async with self._sidebar_update_locks[conversation_id]:
+            await self._send_sidebar_update_to_owner_unlocked(
+                conversation_id,
+                payload,
+                include_subscribers=include_subscribers,
+            )
+
+    async def _send_sidebar_update_to_owner_unlocked(
+        self,
+        conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        include_subscribers: bool = False,
+    ) -> None:
         """Fan out sidebar metadata to the conversation owner's sidebar clients.
 
         Conversation streams are subscription-scoped, but sidebar rows are user-scoped.
@@ -2253,6 +2503,16 @@ class WebSocketConnectionManager:
         needs_conversation_row = (
             payload.get("type") == "sidebar_conversation_upsert" and "conversation" not in payload
         )
+        if owner_email is not None:
+            owner_connection_ids = self._by_user.get(owner_email, set())
+            conversation_connection_ids = self._by_conversation.get(conversation_id, set())
+            target_connection_ids = (
+                set(owner_connection_ids)
+                if include_subscribers
+                else set(owner_connection_ids) - set(conversation_connection_ids)
+            )
+            if not target_connection_ids:
+                return
         session_factory = getattr(self.app.state, "session_factory", None)
         if session_factory is None and (owner_email is None or needs_conversation_row):
             return
@@ -2274,6 +2534,10 @@ class WebSocketConnectionManager:
                     else:
                         owner_email = conversation.user_email
                     if needs_conversation_row:
+                        revision_before = await read_live_work_revision(
+                            db_session,
+                            conversation.user_email,
+                        )
                         from cognis.store.queries import get_session_row
 
                         active_session = (
@@ -2295,15 +2559,32 @@ class WebSocketConnectionManager:
                             else None
                         )
                         running_turn_state = (
-                            await durable_running(conversation.conversation_id)
+                            await durable_running(
+                                conversation.conversation_id,
+                                session=db_session,
+                            )
                             if callable(durable_running)
                             else turn_scheduler.running_turn_state(conversation.conversation_id)
                             if turn_scheduler is not None
                             and hasattr(turn_scheduler, "running_turn_state")
                             else None
                         )
+                        platform_data = conversation.context_data or {}
+                        managed_link = (
+                            await get_managed_conversation_link_for_target(
+                                db_session,
+                                conversation.conversation_id,
+                                user_email=conversation.user_email,
+                            )
+                            if conversation.context_type
+                            in {"agent_work", "managed_agent_conversation"}
+                            or platform_data.get("kind")
+                            in {"agent_work", "managed_agent_conversation"}
+                            else None
+                        )
                         fanout_payload = {
                             **payload,
+                            "revision": str(revision_before),
                             "conversation": conversation_to_response(
                                 conversation,
                                 has_active_turn=running_turn_state is not None,
@@ -2313,8 +2594,37 @@ class WebSocketConnectionManager:
                                     conversation.conversation_id,
                                     [],
                                 ),
+                                managed_link=managed_link,
                             ).model_dump(mode="json"),
                         }
+                        activity_override = payload.get("has_active_turn_override")
+                        if isinstance(activity_override, bool):
+                            fanout_payload["conversation"]["has_active_turn"] = activity_override
+                            fanout_payload["conversation"]["active_turn_chat_mode"] = (
+                                payload.get("active_turn_chat_mode") if activity_override else None
+                            )
+                            fanout_payload["conversation"]["active_turn_chat_mode_source"] = (
+                                payload.get("active_turn_chat_mode_source")
+                                if activity_override
+                                else None
+                            )
+                        fanout_payload.pop("has_active_turn_override", None)
+                        fanout_payload.pop("active_turn_chat_mode", None)
+                        fanout_payload.pop("active_turn_chat_mode_source", None)
+                        revision_after = await read_live_work_revision(
+                            db_session,
+                            conversation.user_email,
+                        )
+                        if revision_after != revision_before:
+                            logger.debug(
+                                "Sidebar state changed during websocket hydration",
+                                extra={
+                                    "conversation_id": conversation_id,
+                                    "revision_before": revision_before,
+                                    "revision_after": revision_after,
+                                },
+                            )
+                            return
         except Exception as exc:
             logger.debug(
                 "Unable to resolve conversation owner for sidebar fanout",
@@ -2420,6 +2730,41 @@ class WebSocketConnectionManager:
 
     async def _handle_event(self, event: Event) -> None:
         """Convert EventBus events to WS payloads and fan out."""
+        if event.type == EventType.SCHEDULE_ACTION_CHANGED:
+            user_email = event.data.get("user_email")
+            raw_payload = event.data.get("payload")
+            schedule_id = raw_payload.get("schedule_id") if isinstance(raw_payload, dict) else None
+            if isinstance(user_email, str) and user_email:
+                conversation_id = event.data.get("conversation_id")
+                if isinstance(conversation_id, str) and conversation_id:
+                    async with self.app.state.session_factory() as session:
+                        pending_by_conversation = (
+                            await list_pending_notification_types_by_conversation(
+                                session,
+                                user_email,
+                                [conversation_id],
+                            )
+                        )
+                    await self.send_to_user(
+                        user_email,
+                        {
+                            "type": "conversation_updated",
+                            "conversation_id": conversation_id,
+                            "pending_notification_types": pending_by_conversation.get(
+                                conversation_id, []
+                            ),
+                        },
+                    )
+                await self.send_to_user(
+                    user_email,
+                    {
+                        "type": "schedule_action_changed",
+                        "schedule_id": schedule_id,
+                        "notification_id": event.data.get("notification_id"),
+                        "status": event.data.get("status"),
+                    },
+                )
+            return
         if event.type == EventType.CLUSTER_SCOPE_INVALIDATED:
             await self._handle_cluster_scope_invalidated(event)
             return
@@ -2444,8 +2789,7 @@ class WebSocketConnectionManager:
                 else None,
             )
 
-        is_idle_checkpoint = event.data.get("trigger") == "idle_checkpoint"
-        if event.type == EventType.SESSION_COMPACTION_STARTED and is_idle_checkpoint:
+        if event.type == EventType.SESSION_COMPACTION_STARTED:
             compaction_item = compaction_runtime_item(event.data)
             if compaction_item is not None:
                 await self.send_chat_v2_runtime_to_conversation(
@@ -2453,7 +2797,7 @@ class WebSocketConnectionManager:
                     volatile_items=[compaction_item],
                     active_session_id=compaction_item.session_id,
                 )
-        elif event.type == EventType.SESSION_COMPACTION_FINISHED and is_idle_checkpoint:
+        elif event.type == EventType.SESSION_COMPACTION_FINISHED:
             status = event.data.get("status")
             compaction_item = compaction_runtime_item(
                 event.data,
@@ -2465,7 +2809,7 @@ class WebSocketConnectionManager:
                     volatile_items=[compaction_item],
                     active_session_id=compaction_item.session_id,
                 )
-        elif event.type == EventType.SESSION_COMPACTED and is_idle_checkpoint:
+        elif event.type == EventType.SESSION_COMPACTED:
             compaction_item = compaction_runtime_item(event.data, status="compacted")
             if compaction_item is not None:
                 await self.send_chat_v2_runtime_to_conversation(
@@ -2476,7 +2820,14 @@ class WebSocketConnectionManager:
         elif event.type == EventType.SYSTEM_NOTICE:
             notice_id = event.data.get("notice_id")
             message = event.data.get("message")
-            if isinstance(notice_id, str) and notice_id and isinstance(message, str) and message:
+            hidden_notice = is_transient_compaction_start_notice(event.data)
+            if (
+                not hidden_notice
+                and isinstance(notice_id, str)
+                and notice_id
+                and isinstance(message, str)
+                and message
+            ):
                 session_id = event.data.get("session_id")
                 await self.send_chat_v2_runtime_to_conversation(
                     conversation_id,
@@ -2508,6 +2859,18 @@ class WebSocketConnectionManager:
             )
 
         payload = None if suppress_legacy_payload else _event_to_payload(event, conversation_id)
+        notification_origin_conversation_id = None
+        if event.type in {EventType.NOTIFICATION_CREATED, EventType.NOTIFICATION_RESOLVED}:
+            raw_origin = event.data.get("managed_origin_conversation_id")
+            if not isinstance(raw_origin, str):
+                raw_payload = event.data.get("payload")
+                raw_origin = (
+                    raw_payload.get("managed_origin_conversation_id")
+                    if isinstance(raw_payload, dict)
+                    else None
+                )
+            if isinstance(raw_origin, str) and raw_origin and raw_origin != conversation_id:
+                notification_origin_conversation_id = raw_origin
         if payload is not None:
             is_escalation = event.type in {
                 EventType.ESCALATION_CREATED,
@@ -2524,20 +2887,100 @@ class WebSocketConnectionManager:
                 )
             else:
                 await self.send_to_conversation(conversation_id, payload)
+            if notification_origin_conversation_id:
+                origin_payload = _event_to_payload(
+                    event,
+                    notification_origin_conversation_id,
+                )
+                if origin_payload is not None:
+                    if is_escalation:
+                        await self.send_to_conversation(
+                            notification_origin_conversation_id,
+                            origin_payload,
+                            include_chat_v2=True,
+                        )
+                    else:
+                        await self.send_to_conversation(
+                            notification_origin_conversation_id,
+                            origin_payload,
+                        )
         activity_payload = self._conversation_activity_payload(event, conversation_id)
         if activity_payload is not None:
             await self.send_to_conversation(conversation_id, activity_payload)
-            await self.send_sidebar_update_to_owner(conversation_id, activity_payload)
-        # Fan out CONVERSATION_UPDATED events to non-subscribed owner tabs so
-        # sidebar rows (title, unread state, last_message_at) stay current on
-        # all open clients without requiring a subscription to every conversation.
+            await self.send_sidebar_update_to_owner(
+                conversation_id,
+                {
+                    "type": "sidebar_conversation_upsert",
+                    "conversation_id": conversation_id,
+                    "revision": (
+                        event.timestamp.isoformat()
+                        if event.timestamp
+                        else datetime.now(UTC).isoformat()
+                    ),
+                    "has_active_turn_override": activity_payload["has_active_turn"],
+                    "active_turn_chat_mode": activity_payload.get("active_turn_chat_mode"),
+                    "active_turn_chat_mode_source": activity_payload.get(
+                        "active_turn_chat_mode_source"
+                    ),
+                },
+                include_subscribers=True,
+            )
+        # Sidebar rows are owner-scoped canonical projections. Conversation
+        # subscribers still receive the scoped event above; every owner tab
+        # receives one complete row for sidebar rendering.
         if event.type == EventType.CONVERSATION_UPDATED:
             conv_updated_payload = _event_to_payload(event, conversation_id)
             if conv_updated_payload is not None:
-                await self.send_sidebar_update_to_owner(conversation_id, conv_updated_payload)
+                await self.send_sidebar_update_to_owner(
+                    conversation_id,
+                    {
+                        "type": "sidebar_conversation_upsert",
+                        "conversation_id": conversation_id,
+                        "revision": (
+                            event.timestamp.isoformat()
+                            if event.timestamp
+                            else datetime.now(UTC).isoformat()
+                        ),
+                    },
+                    include_subscribers=True,
+                )
         attention_payload = await self._notification_attention_payload(event, conversation_id)
         if attention_payload is not None:
-            await self.send_to_user(attention_payload["user_email"], attention_payload["payload"])
+            if attention_payload["payload"]["type"] == "schedule_action_changed":
+                await self.send_to_user(
+                    attention_payload["user_email"],
+                    attention_payload["payload"],
+                )
+            else:
+                await self.send_sidebar_update_to_owner(
+                    conversation_id,
+                    {
+                        "type": "sidebar_conversation_upsert",
+                        "conversation_id": conversation_id,
+                        "revision": (
+                            event.timestamp.isoformat()
+                            if event.timestamp
+                            else datetime.now(UTC).isoformat()
+                        ),
+                        **(
+                            {"has_active_turn_override": True}
+                            if event.type == EventType.NOTIFICATION_RESOLVED
+                            and event.data.get("resumes_execution") is True
+                            and event.data.get("task_id") is None
+                            and event.data.get("notification_type")
+                            in {
+                                "auth_challenge",
+                                "credential_request",
+                                "escalation",
+                                "gate",
+                                "step_question",
+                                "workflow_gate",
+                            }
+                            else {}
+                        ),
+                    },
+                    include_subscribers=True,
+                )
         if event.type in {
             EventType.STEP_STARTED,
             EventType.STEP_COMPLETED,
@@ -2561,6 +3004,17 @@ class WebSocketConnectionManager:
                     data={**event.data, "source_kind": source_kind},
                 )
             )
+            if notification_origin_conversation_id:
+                await self._fanout_conversation_state_delta(
+                    Event(
+                        type=EventType.CONVERSATION_STATE_CHANGED,
+                        data={
+                            **event.data,
+                            "conversation_id": notification_origin_conversation_id,
+                            "source_kind": source_kind,
+                        },
+                    )
+                )
 
     def subscribed_cluster_scopes(self) -> list[dict[str, str]]:
         """Return unique server-authorized scopes for bounded reconciliation."""
@@ -2615,7 +3069,7 @@ class WebSocketConnectionManager:
                     event_session_token,
                     source="cluster_signal",
                 )
-                connection_ids = await self._chat_v2_connection_ids_for_event_session_token(
+                event_connection_ids = await self._chat_v2_connection_ids_for_event_session_token(
                     event_session_token,
                     cached_event_store,
                 )
@@ -2624,7 +3078,7 @@ class WebSocketConnectionManager:
                     "reason": str(kind),
                     "revision": revision,
                 }
-                for connection_id in connection_ids:
+                for connection_id in event_connection_ids:
                     connection = self._connections.get(connection_id)
                     if connection is not None:
                         connection.send_scope_invalidation_nowait(payload)
@@ -2657,6 +3111,17 @@ class WebSocketConnectionManager:
             if relay is not None:
                 relay.invalidate(conversation_id)
             self._relay_runtime_items.pop(conversation_id, None)
+            if kind == "sidebar_changed":
+                await self.send_sidebar_update_to_owner(
+                    conversation_id,
+                    {
+                        "type": "sidebar_conversation_upsert",
+                        "conversation_id": conversation_id,
+                        "revision": datetime.now(UTC).isoformat(),
+                    },
+                    include_subscribers=True,
+                )
+                return
 
         connection_ids: set[str] = set()
         for scope_key, subscribed in self._by_chat_v2_scope.items():
@@ -2675,19 +3140,37 @@ class WebSocketConnectionManager:
                 or (isinstance(session_id, str) and sample.session_id == session_id)
                 or (isinstance(task_id, str) and sample.task_id == task_id)
                 or (isinstance(step_run_id, str) and sample.step_run_id == step_run_id)
-                or (isinstance(work_scope_key, str) and sample.key == work_scope_key)
+                or (
+                    isinstance(work_scope_key, str)
+                    and (work_scope_key == "*" or sample.key == work_scope_key)
+                )
             )
             if matches:
                 connection_ids.update(subscribed)
 
         if (
-            kind in {"sidebar_changed", "executor_state_changed", "chat_scope_changed"}
+            kind
+            in {
+                "sidebar_changed",
+                "executor_state_changed",
+                "chat_scope_changed",
+                "notification_state_changed",
+                "task_progress_changed",
+                "work_invalidated",
+                "schedule_action_changed",
+            }
             and owner_email is not None
         ):
             connection_ids.update(self._by_user.get(owner_email, set()))
 
         payload = {
-            "type": "work_invalidated" if kind == "work_invalidated" else "scope_invalidated",
+            "type": (
+                "work_invalidated"
+                if kind == "work_invalidated"
+                else "schedule_action_changed"
+                if kind == "schedule_action_changed"
+                else "scope_invalidated"
+            ),
             "reason": str(kind),
             "revision": revision,
             **{
@@ -2698,6 +3181,7 @@ class WebSocketConnectionManager:
                     "conversation_id",
                     "session_id",
                     "task_id",
+                    "schedule_id",
                     "step_run_id",
                     "work_scope_key",
                 }
@@ -2946,6 +3430,7 @@ class WebSocketConnectionManager:
             payload = {
                 "type": "conversation_updated",
                 "conversation_id": conversation_id,
+                "turn_id": event.data.get("turn_id"),
                 "has_active_turn": True,
                 "active_turn_chat_mode": event.data.get("chat_mode"),
                 "active_turn_chat_mode_source": event.data.get("chat_mode_source"),
@@ -2963,6 +3448,7 @@ class WebSocketConnectionManager:
             completion_payload: dict[str, Any] = {
                 "type": "conversation_updated",
                 "conversation_id": conversation_id,
+                "turn_id": event.data.get("turn_id"),
                 "has_active_turn": continuation_pending,
                 "active_turn_chat_mode": event.data.get("chat_mode")
                 if continuation_pending
@@ -2977,13 +3463,21 @@ class WebSocketConnectionManager:
             return completion_payload
 
         if event.type in (EventType.TURN_ERROR, EventType.TASK_PAUSED):
-            return {
+            completed_at = event.data.get("completed_at") or (
+                event.timestamp.isoformat() if event.timestamp else None
+            )
+            payload = {
                 "type": "conversation_updated",
                 "conversation_id": conversation_id,
+                "turn_id": event.data.get("turn_id"),
                 "has_active_turn": False,
                 "active_turn_chat_mode": None,
                 "active_turn_chat_mode_source": None,
             }
+            if completed_at is not None:
+                payload["last_message_at"] = completed_at
+                payload["updated_at"] = completed_at
+            return payload
 
         return None
 
@@ -2999,39 +3493,25 @@ class WebSocketConnectionManager:
         if not isinstance(user_email, str) or not user_email:
             return None
 
-        async with self.app.state.session_factory() as session:
-            pending_by_conversation = await list_pending_notification_types_by_conversation(
-                session,
-                user_email,
-                [conversation_id],
-            )
-        scheduler = getattr(self.app.state, "turn_scheduler", None)
-        durable_running = (
-            getattr(scheduler, "durable_running_turn_state", None)
-            if scheduler is not None
-            else None
-        )
-        running_turn_state = (
-            await durable_running(conversation_id)
-            if callable(durable_running)
-            else scheduler.running_turn_state(conversation_id)
-            if scheduler is not None and hasattr(scheduler, "running_turn_state")
-            else None
-        )
-        has_active_turn = running_turn_state is not None
+        if event.data.get("notification_type") == "schedule_action":
+            raw_payload = event.data.get("payload")
+            schedule_id = raw_payload.get("schedule_id") if isinstance(raw_payload, dict) else None
+            return {
+                "user_email": user_email,
+                "payload": {
+                    "type": "schedule_action_changed",
+                    "schedule_id": schedule_id,
+                    "notification_id": event.data.get("notification_id"),
+                    "status": (
+                        "resolved" if event.type == EventType.NOTIFICATION_RESOLVED else "pending"
+                    ),
+                },
+            }
         return {
             "user_email": user_email,
             "payload": {
-                "type": "conversation_updated",
+                "type": "sidebar_conversation_upsert",
                 "conversation_id": conversation_id,
-                "pending_notification_types": pending_by_conversation.get(conversation_id, []),
-                "has_active_turn": has_active_turn,
-                "active_turn_chat_mode": (
-                    running_turn_state.get("chat_mode") if running_turn_state else None
-                ),
-                "active_turn_chat_mode_source": (
-                    running_turn_state.get("chat_mode_source") if running_turn_state else None
-                ),
             },
         }
 
@@ -3462,8 +3942,7 @@ def _allowed_websocket_origins(websocket: WebSocket) -> set[str]:
         allowed.add(public_base_url)
     host = websocket.headers.get("host", "").strip()
     if host:
-        forwarded = websocket.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
-        scheme = forwarded or ("https" if websocket.url.scheme == "wss" else "http")
+        scheme = trusted_request_scheme(websocket)
         allowed.add(f"{scheme}://{host}".rstrip("/"))
     return allowed
 
@@ -3500,7 +3979,16 @@ async def _authenticate_browser_session(websocket: WebSocket) -> dict[str, Any] 
         if not user.is_active:
             await websocket.close(code=4403, reason="Account disabled")
             return None
-        return {"sub": user.email, "role": user.role, "name": user.name, "typ": "session"}
+        if browser_session.auth_version != user.auth_version:
+            await websocket.close(code=4401, reason="Authentication revoked")
+            return None
+        return {
+            "sub": user.email,
+            "role": user.role,
+            "name": user.name,
+            "typ": "session",
+            "authv": browser_session.auth_version,
+        }
 
 
 async def _authenticate_websocket(websocket: WebSocket) -> dict[str, Any] | None:
@@ -3522,15 +4010,22 @@ async def _authenticate_websocket(websocket: WebSocket) -> dict[str, Any] | None
         return None
 
     try:
-        return cast(
-            dict[str, Any],
-            websocket.app.state.auth_provider.verify_jwt(
-                first_message["token"],
-                audience=["cognis"],
-            ),
+        user, claims = await authenticate_access_token(
+            token=first_message["token"],
+            auth_provider=websocket.app.state.auth_provider,
+            session_factory=websocket.app.state.session_factory,
         )
-    except Exception:
-        await websocket.close(code=4401, reason="Invalid token")
+        return {
+            **claims,
+            "sub": user.email,
+            "role": user.role,
+            "name": user.name,
+        }
+    except AccessTokenAuthenticationError as exc:
+        await websocket.close(
+            code=4403 if exc.account_disabled else 4401,
+            reason="Account disabled" if exc.account_disabled else "Invalid token",
+        )
         return None
 
 
@@ -3547,7 +4042,9 @@ async def handle_websocket(websocket: WebSocket) -> None:
         websocket.app.state.ws_manager = manager
 
     connection = await manager.connect(websocket, claims=claims)
-    await connection.send_json(WebSocketAuthenticated().model_dump())
+    if not await manager.revalidate_registered_connection(connection):
+        return
+    await connection.send_authenticated(WebSocketAuthenticated().model_dump())
 
     try:
         while True:
@@ -3632,8 +4129,8 @@ async def _handle_chat_v2_subscribe(
             recoverable=True,
         )
         return
-    scope = await _rehydrate_chat_v2_scope(app, scope)
-    if scope is None:
+    rehydrated_scope = await _rehydrate_chat_v2_scope(app, scope)
+    if rehydrated_scope is None:
         await manager.send_error(
             connection,
             code="forbidden",
@@ -3641,6 +4138,7 @@ async def _handle_chat_v2_subscribe(
             recoverable=False,
         )
         return
+    scope = rehydrated_scope
     scope._server_authoritative = True
     if not await _authorize_chat_v2_scope(app, manager, connection, scope):
         return
@@ -3679,6 +4177,15 @@ async def _handle_chat_v2_subscribe(
     if not scope.conversation_id:
         return
     manager.subscribe_chat_v2(connection, scope, cursor=cursor)
+    connection.send_scope_invalidation_nowait(
+        {
+            "type": "work_invalidated",
+            "reason": "work_invalidated",
+            "work_scope_key": scope.key,
+            "revision": "0",
+            "graph_revision": 0,
+        }
+    )
     await manager.send_chat_v2_scope_runtime_snapshot(connection, scope)
 
 
@@ -3850,6 +4357,7 @@ async def _handle_message(
             conversation_id,
             content,
             user_email=connection.user_email,
+            admission_origin=authenticated_direct_user_origin(),
             attachments=[item for item in attachments if isinstance(item, dict)],
             client_message_id=client_message_id,
         )
@@ -4286,21 +4794,6 @@ async def _handle_step_response(
 
     if notification is not None and notification.task_id is None:
         pause = app.state.pause_waiter.get(notification.notification_id)
-        expected_pause_type = notification.notification_type
-        if (
-            pause is None
-            or pause.pause_type != expected_pause_type
-            or pause.task_id is not None
-            or pause.conversation_id != notification.conversation_id
-            or pause.session_id != notification.session_id
-        ):
-            await manager.send_error(
-                connection,
-                code="conflict",
-                message="Input request can no longer be resumed",
-                recoverable=True,
-            )
-            return
         if notification.notification_type == "auth_challenge":
             try:
                 data = await build_auth_challenge_resolution_data(
@@ -4333,7 +4826,16 @@ async def _handle_step_response(
                 )
             return
         try:
-            reply = validate_reply_for_questions(raw_reply, pause.questions or [])
+            questions = (
+                pause.questions
+                if pause is not None
+                and pause.pause_type == "step_question"
+                and pause.task_id is None
+                and pause.conversation_id == notification.conversation_id
+                and pause.session_id == notification.session_id
+                else (notification.payload or {}).get("questions") or []
+            )
+            reply = validate_reply_for_questions(raw_reply, questions)
         except ValueError as exc:
             await manager.send_error(
                 connection,
@@ -4645,37 +5147,43 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 payload[key] = event.data.get(key)
         return payload
     if event.type == EventType.CONVERSATION_UPDATED:
-        payload: dict[str, Any] = {
+        conversation_payload: dict[str, Any] = {
             "type": "conversation_updated",
             "conversation_id": conversation_id,
         }
         if event.data.get("title") is not None:
-            payload["title"] = event.data.get("title")
+            conversation_payload["title"] = event.data.get("title")
         if isinstance(event.data.get("has_active_turn"), bool):
-            payload["has_active_turn"] = event.data.get("has_active_turn")
+            conversation_payload["has_active_turn"] = event.data.get("has_active_turn")
         if "active_turn_chat_mode" in event.data:
-            payload["active_turn_chat_mode"] = event.data.get("active_turn_chat_mode")
+            conversation_payload["active_turn_chat_mode"] = event.data.get("active_turn_chat_mode")
         if "active_turn_chat_mode_source" in event.data:
-            payload["active_turn_chat_mode_source"] = event.data.get("active_turn_chat_mode_source")
+            conversation_payload["active_turn_chat_mode_source"] = event.data.get(
+                "active_turn_chat_mode_source"
+            )
         if "active_session_status" in event.data:
-            payload["active_session_status"] = event.data.get("active_session_status")
+            conversation_payload["active_session_status"] = event.data.get("active_session_status")
         if "active_session_completion_reason" in event.data:
-            payload["active_session_completion_reason"] = event.data.get(
+            conversation_payload["active_session_completion_reason"] = event.data.get(
                 "active_session_completion_reason"
             )
         if isinstance(event.data.get("pending_notification_types"), list):
-            payload["pending_notification_types"] = event.data.get("pending_notification_types")
+            conversation_payload["pending_notification_types"] = event.data.get(
+                "pending_notification_types"
+            )
         if isinstance(event.data.get("has_unread"), bool):
-            payload["has_unread"] = event.data.get("has_unread")
+            conversation_payload["has_unread"] = event.data.get("has_unread")
         if event.data.get("last_read_at") is not None:
-            payload["last_read_at"] = event.data.get("last_read_at")
+            conversation_payload["last_read_at"] = event.data.get("last_read_at")
         if event.data.get("last_message_at") is not None:
-            payload["last_message_at"] = event.data.get("last_message_at")
+            conversation_payload["last_message_at"] = event.data.get("last_message_at")
         if event.data.get("updated_at") is not None:
-            payload["updated_at"] = event.data.get("updated_at")
+            conversation_payload["updated_at"] = event.data.get("updated_at")
         if isinstance(event.data.get("created_conversation_id"), str):
-            payload["created_conversation_id"] = event.data.get("created_conversation_id")
-        return payload
+            conversation_payload["created_conversation_id"] = event.data.get(
+                "created_conversation_id"
+            )
+        return conversation_payload
     if event.type == EventType.WORKFLOW_PROGRESS and event.data.get("event") in {
         "tool_call_started",
         "tool_call_completed",
@@ -4723,6 +5231,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "session_id": event.data.get("session_id"),
             "message_id": event.data.get("message_id"),
+            "turn_id": event.data.get("turn_id"),
             "queued_count": event.data.get("queued_count", 0),
             "chat_mode": event.data.get("chat_mode"),
             "chat_mode_source": event.data.get("chat_mode_source"),
@@ -4743,6 +5252,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "task_title": event.data.get("task_title"),
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.TASK_COMPLETED:
         return {
@@ -4750,6 +5260,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "result": event.data.get("result_summary"),
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.TASK_FAILED:
         return {
@@ -4757,6 +5268,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "reason": event.data.get("result_summary"),
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.TASK_CANCELLED:
         return {
@@ -4764,6 +5276,7 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
             "conversation_id": conversation_id,
             "task_id": event.data.get("task_id"),
             "reason": event.data.get("result_summary") or "cancelled",
+            "turn_id": event.data.get("turn_id"),
         }
     if event.type == EventType.DELEGATION_STARTED:
         return {
@@ -4946,6 +5459,9 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "reasoning": payload.get("reasoning"),
                 "timeout_seconds": payload.get("timeout_seconds"),
                 "task_id": event.data.get("task_id"),
+                "managed_conversation_title": payload.get("managed_conversation_title"),
+                "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                "managed_origin_conversation_id": payload.get("managed_origin_conversation_id"),
             }
         if ntype == "gate":
             return {
@@ -4967,6 +5483,9 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "step_name": event.data.get("step_name"),
                 "questions": payload.get("questions"),
                 "context": payload.get("context"),
+                "managed_conversation_title": payload.get("managed_conversation_title"),
+                "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                "managed_origin_conversation_id": payload.get("managed_origin_conversation_id"),
             }
         if ntype == "auth_challenge":
             return {
@@ -4981,6 +5500,9 @@ def _event_to_payload(event: Event, conversation_id: str) -> dict[str, Any] | No
                 "metadata": payload.get("metadata"),
                 "required_fields": payload.get("required_fields"),
                 "expires_at": payload.get("expires_at"),
+                "managed_conversation_title": payload.get("managed_conversation_title"),
+                "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                "managed_origin_conversation_id": payload.get("managed_origin_conversation_id"),
             }
         if ntype == "credential_request":
             return {
@@ -5226,20 +5748,21 @@ async def _rehydrate_chat_v2_scope(app: Any, scope: TimelineScope) -> TimelineSc
         if scope.kind == "session":
             if not scope.session_id:
                 return None
-            row = await get_session_row(db_session, scope.session_id)
-            if row is None:
+            session_row = await get_session_row(db_session, scope.session_id)
+            if session_row is None:
                 return None
-            conversation = await get_conversation(db_session, row.conversation_id)
+            conversation = await get_conversation(db_session, session_row.conversation_id)
             if conversation is None:
                 return None
             return TimelineScope(
-                key=f"session:{row.session_id}",
+                key=f"session:{session_row.session_id}",
                 kind="session",
-                conversation_id=row.conversation_id,
-                session_id=row.session_id,
-                parent_session_id=getattr(row, "parent_session_id", None),
-                label=getattr(row, "delegation_task", None) or getattr(row, "agent_id", None),
-                status=getattr(row, "status", None),
+                conversation_id=session_row.conversation_id,
+                session_id=session_row.session_id,
+                parent_session_id=getattr(session_row, "parent_session_id", None),
+                label=getattr(session_row, "delegation_task", None)
+                or getattr(session_row, "agent_id", None),
+                status=getattr(session_row, "status", None),
             )
 
         if not scope.step_run_id:
@@ -5356,6 +5879,11 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                             "step_name": notif.step_name,
                             "questions": payload.get("questions"),
                             "context": payload.get("context"),
+                            "managed_conversation_title": payload.get("managed_conversation_title"),
+                            "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                            "managed_origin_conversation_id": payload.get(
+                                "managed_origin_conversation_id"
+                            ),
                         }
                     )
                 elif notif.notification_type == "credential_request":
@@ -5386,6 +5914,11 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                             "metadata": payload.get("metadata"),
                             "required_fields": payload.get("required_fields"),
                             "expires_at": payload.get("expires_at"),
+                            "managed_conversation_title": payload.get("managed_conversation_title"),
+                            "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                            "managed_origin_conversation_id": payload.get(
+                                "managed_origin_conversation_id"
+                            ),
                         }
                     )
                 elif notif.notification_type == "escalation":
@@ -5399,6 +5932,11 @@ async def _load_pending_task_prompts(app: Any, conversation_id: str) -> list[dic
                             "reasoning": payload.get("reasoning"),
                             "timeout_seconds": payload.get("timeout_seconds"),
                             "task_id": notif.task_id,
+                            "managed_conversation_title": payload.get("managed_conversation_title"),
+                            "managed_target_agent_id": payload.get("managed_target_agent_id"),
+                            "managed_origin_conversation_id": payload.get(
+                                "managed_origin_conversation_id"
+                            ),
                         }
                     )
             if payloads:

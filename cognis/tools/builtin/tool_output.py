@@ -7,11 +7,14 @@ disk by the :class:`~cognis.core.tool_output_store.ToolOutputStore`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from typing import Any
 
 from prometheus_client import Counter
 
+from cognis.core.agent_registry import AgentRegistry
+from cognis.core.historical_tool_output import resolve_historical_tool_event, tool_event_storage_id
 from cognis.core.tool_output_store import ToolOutputStore
 from cognis.logging import get_logger
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
@@ -50,11 +53,27 @@ READ_TOOL_OUTPUT = ToolDefinition(
         "similar to the file read tool. For structured outputs with anchors, "
         "prefer list_tool_output_anchors and read_tool_output_anchor first. "
         "Only call this when you have a real call_id from a prior tool_call "
-        "event; never invent or use placeholder values."
+        "event; never invent or use placeholder values. For historical content, pass "
+        "reference from read_conversation_messages and part=arguments (tool_call) or "
+        "result (tool_result). Persisted arguments can be bounded, not original exact arguments."
     ),
     parameters={
         "type": "object",
         "properties": {
+            "reference": {
+                "type": "object",
+                "description": "Historical event locator, verified again on every read.",
+                "properties": {
+                    "conversation_id": {"type": "string"},
+                    "session_id": {"type": "string"},
+                    "seq": {"type": "integer", "minimum": 1},
+                    "kind": {"type": "string", "enum": ["tool_call", "tool_result"]},
+                    "call_id": {"type": "string"},
+                },
+                "required": ["conversation_id", "session_id", "seq", "kind", "call_id"],
+                "additionalProperties": False,
+            },
+            "part": {"type": "string", "enum": ["arguments", "result"], "default": "result"},
             "call_id": {
                 "type": "string",
                 "description": (
@@ -222,13 +241,31 @@ def _recovery_metadata(call_id: str, output: str) -> dict[str, Any]:
 async def handle_tool_output_tool(
     tool_name: str,
     arguments: dict[str, Any],
-    store: ToolOutputStore,
+    store: ToolOutputStore | None,
     *,
     pressure_mode: Any = None,
+    session_factory: Any = None,
+    intaris: Any = None,
+    user_email: str | None = None,
 ) -> ToolResult:
     """Dispatch a tool output exploration call."""
 
+    if tool_name == "read_tool_output" and "reference" in arguments:
+        return await _handle_historical_read(
+            arguments,
+            store,
+            session_factory=session_factory,
+            intaris=intaris,
+            user_email=user_email,
+            pressure_mode=pressure_mode,
+        )
+    if store is None:
+        return ToolResult(output="Tool output store not available.", is_error=True)
     if tool_name == "read_tool_output":
+        if arguments.get("part", "result") != "result":
+            return ToolResult(
+                output="Historical reference is required for arguments.", is_error=True
+            )
         return await _handle_read(arguments, store, pressure_mode=pressure_mode)
     if tool_name == "search_tool_output":
         return await _handle_search(arguments, store, pressure_mode=pressure_mode)
@@ -237,6 +274,158 @@ async def handle_tool_output_tool(
     if tool_name == "read_tool_output_anchor":
         return await _handle_read_anchor(arguments, store, pressure_mode=pressure_mode)
     return ToolResult(output=f"Unknown tool output tool: {tool_name}", is_error=True)
+
+
+async def _handle_historical_read(
+    arguments: dict[str, Any],
+    store: ToolOutputStore | None,
+    *,
+    session_factory: Any,
+    intaris: Any,
+    user_email: str | None,
+    pressure_mode: Any,
+) -> ToolResult:
+    if session_factory is None or intaris is None or not user_email:
+        return ToolResult(output="Historical reader is unavailable.", is_error=True)
+    call_id = arguments.get("call_id")
+    part = arguments.get("part", "result")
+    reference = arguments["reference"]
+    if (
+        not isinstance(call_id, str)
+        or not call_id
+        or part not in ("arguments", "result")
+        or not isinstance(reference, dict)
+        or reference.get("kind") != ("tool_call" if part == "arguments" else "tool_result")
+    ):
+        return ToolResult(output="Reference kind must match the requested part.", is_error=True)
+    try:
+        offset = max(1, int(arguments.get("offset", 1)))
+        limit = min(2000, max(1, int(arguments.get("limit", 200))))
+        data = await resolve_historical_tool_event(
+            reference,
+            call_id=call_id,
+            user_email=user_email,
+            session_factory=session_factory,
+            registry=AgentRegistry(session_factory),
+            intaris=intaris,
+        )
+    except (ValueError, TypeError):
+        return ToolResult(output="Historical event not found or unavailable.", is_error=True)
+    metadata: dict[str, Any] = {
+        "reference": reference,
+        "part": part,
+        "content_trust": "untrusted",
+    }
+    if part == "result" and data.get("has_full_output") and store is not None:
+        storage_id = tool_event_storage_id(data, call_id)
+        if storage_id is None:
+            return ToolResult(output="Historical event not found or unavailable.", is_error=True)
+        stored = await store.read(storage_id, offset=offset, limit=limit)
+        if stored is not None:
+            metadata.update(
+                source="stored_output",
+                source_call_id=storage_id,
+            )
+            return _historical_page(
+                stored.content.splitlines(),
+                offset=stored.offset,
+                limit=stored.limit,
+                total_lines=stored.total_lines,
+                metadata=metadata,
+                notice="",
+                pressure_mode=pressure_mode,
+            )
+        metadata["store_status"] = "missing_or_expired"
+    elif part == "result" and store is None:
+        metadata["store_status"] = "unavailable"
+    value = data.get("arguments" if part == "arguments" else "result")
+    if value is None:
+        metadata.update(source="unavailable", available=False)
+        return ToolResult(
+            output="Requested persisted content is unavailable.", metadata=metadata, is_error=True
+        )
+    decoded = value
+    if part == "arguments" and isinstance(value, str):
+        with contextlib.suppress(ValueError):
+            decoded = json.loads(value)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+    lines = text.splitlines() or [""]
+    selected = lines[offset - 1 : offset - 1 + limit]
+    numbered = [f"{offset + i}: {line}" for i, line in enumerate(selected)]
+    source = "persisted_arguments" if part == "arguments" else "event_preview"
+    persisted_truncated = (
+        bool(decoded.get("_truncated"))
+        if part == "arguments" and isinstance(decoded, dict)
+        else bool(data.get("truncated") or data.get("agent_visible_truncated"))
+    )
+    metadata.update(
+        source=source,
+        available=True,
+        persisted_truncated=persisted_truncated,
+    )
+    if part == "arguments":
+        metadata["original_arguments_exact"] = False
+    notice = (
+        "Persisted arguments (possibly bounded; not original exact arguments)."
+        if part == "arguments"
+        else "Persisted event preview (not recovered full output)."
+    )
+    return _historical_page(
+        numbered,
+        offset=offset,
+        limit=limit,
+        total_lines=len(lines),
+        metadata=metadata,
+        notice=notice,
+        pressure_mode=pressure_mode,
+    )
+
+
+def _historical_page(
+    lines: list[str],
+    *,
+    offset: int,
+    limit: int,
+    total_lines: int,
+    metadata: dict[str, Any],
+    notice: str,
+    pressure_mode: Any,
+) -> ToolResult:
+    """Apply character pressure before choosing the next unconsumed line."""
+    budget = _RECOVERY_OUTPUT_CAPS[_normalize_pressure_mode(pressure_mode)] - 1000
+    retained: list[str] = []
+    used = len(notice)
+    partial_line = False
+    for line in lines:
+        if used + len(line) + 1 > budget:
+            if not retained:
+                retained.append(line[: max(0, budget - used)])
+                partial_line = True
+            break
+        retained.append(line)
+        used += len(line) + 1
+    consumed = len(retained)
+    has_more = offset - 1 + consumed < total_lines
+    metadata.update(
+        offset=offset,
+        limit=limit,
+        total_lines=total_lines,
+        returned_lines=consumed,
+        has_more=has_more,
+        next_offset=offset + consumed if has_more else None,
+        content_truncated=partial_line,
+        page_limited=len(retained) < len(lines),
+    )
+    parts = [notice] if notice else []
+    parts.extend(retained)
+    if partial_line:
+        parts.append(
+            "[This line exceeds the character limit and is truncated. "
+            "Line pagination cannot recover the omitted part of this line.]"
+        )
+    if has_more:
+        parts.append(f"[Continue with offset={offset + consumed}.]")
+    return ToolResult(output="\n".join(parts), metadata=metadata)
 
 
 def _normalize_pressure_mode(value: Any) -> str:

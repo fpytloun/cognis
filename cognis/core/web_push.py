@@ -124,7 +124,7 @@ def _load_py_vapid_key(private_key_pem: str) -> Any:
     """Load a VAPID object for pywebpush; PEM strings are not accepted by webpush()."""
 
     try:
-        from py_vapid import Vapid
+        from py_vapid import Vapid  # type: ignore[import-untyped]
     except Exception as exc:
         raise RuntimeError(f"py_vapid unavailable: {type(exc).__name__}") from exc
     return Vapid.from_pem(private_key_pem.encode("utf-8"))
@@ -356,6 +356,8 @@ class WebPushService:
         event_bus.subscribe(EventType.TASK_FAILED, self._handle_event)
         event_bus.subscribe(EventType.TASK_CANCELLED, self._handle_event)
         event_bus.subscribe(EventType.NOTIFICATION_CREATED, self._handle_event)
+        event_bus.subscribe(EventType.SCHEDULE_ERROR, self._handle_event)
+        event_bus.subscribe(EventType.SCHEDULE_DISABLED, self._handle_event)
         if config.enabled:
             logger.info("web_push: service enabled")
         else:
@@ -458,6 +460,7 @@ class WebPushService:
         kind: str,
         icon: str | None = None,
         conversation_id: str | None = None,
+        occurred_at: str | None = None,
     ) -> dict[str, int]:
         """Send a push payload to all enabled browser subscriptions for a user."""
 
@@ -496,6 +499,8 @@ class WebPushService:
             payload_data["icon"] = icon
         if conversation_id:
             payload_data["conversation_id"] = conversation_id
+        if occurred_at:
+            payload_data["occurred_at"] = occurred_at
         payload = json.dumps(payload_data, separators=(",", ":"))
         statuses = await asyncio.gather(
             *(self._send_one(row, payload) for row in rows), return_exceptions=True
@@ -555,6 +560,10 @@ class WebPushService:
                 "tag": tag,
                 "kind": "message",
                 "conversation_id": conversation_id,
+                "occurred_at": str(
+                    event.data.get("completed_at")
+                    or (event.timestamp.isoformat() if event.timestamp else "")
+                ),
                 **({"icon": icon} if icon else {}),
             }
 
@@ -620,8 +629,8 @@ class WebPushService:
             }
 
         if event.type in {EventType.SCHEDULE_ERROR, EventType.SCHEDULE_DISABLED}:
-            user_email = event.data.get("created_by")
-            if not isinstance(user_email, str) or not user_email:
+            schedule_owner_email = event.data.get("created_by")
+            if not isinstance(schedule_owner_email, str) or not schedule_owner_email:
                 return None
             agent_id = event.data.get("agent_id")
             agent = None
@@ -637,10 +646,10 @@ class WebPushService:
             else:
                 body = f'Schedule "{schedule_name}" failed to start.'
             return {
-                "user_email": user_email,
+                "user_email": schedule_owner_email,
                 "title": title,
                 "body": body,
-                "url": "/tasks",
+                "url": f"/schedules/{schedule_id}",
                 "tag": f"schedule:{schedule_id}",
                 "kind": "schedule",
                 "conversation_id": "",
@@ -694,12 +703,13 @@ class WebPushService:
                     return None
                 if not str(getattr(meta, "content_type", "")).startswith("image/"):
                     return None
-                return await self._artifact_store.async_get_public_url(
+                public_url = await self._artifact_store.async_get_public_url(
                     "avatars",
                     agent.avatar_image_id,
                     "image",
                     ttl_seconds=3600,
                 )
+                return public_url if isinstance(public_url, str) else None
             except Exception:
                 logger.debug(
                     "web_push: unable to sign agent avatar for notification", exc_info=True

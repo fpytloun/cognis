@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -294,6 +295,7 @@ def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_p
             return await service._event_payload(  # noqa: SLF001
                 Event(
                     type=EventType.TURN_COMPLETED,
+                    timestamp=datetime(2026, 8, 31, 18, 0, tzinfo=UTC),
                     data={
                         "conversation_id": "conv_1",
                         "session_id": "session_1",
@@ -304,6 +306,8 @@ def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_p
 
         payload = asyncio.run(_run())
 
+        assert payload is not None
+        assert payload.pop("occurred_at") == "2026-08-31T18:00:00+00:00"
         assert payload == {
             "user_email": "user@example.com",
             "title": "Research Agent",

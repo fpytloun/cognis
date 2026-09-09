@@ -15,6 +15,10 @@ from cognis.models.executor_inference import executor_local_inference_routable
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
 from cognis.providers.llm.ollama import ollama_model_name
+from cognis.providers.llm.terminal import (
+    ResponseIncompleteDetails,
+    response_incomplete_details,
+)
 from cognis.store.models import (
     ExecutorRow,
     LocalModelDeployment,
@@ -222,6 +226,11 @@ class InferenceRouter:
                             else None
                         ),
                     }
+                    incomplete_details = response_incomplete_details(
+                        chunk.get("response_incomplete_details")
+                    )
+                    if incomplete_details is not None:
+                        final_chunk["response_incomplete_details"] = incomplete_details
                     performance = (
                         metadata.get("performance") if isinstance(metadata, dict) else None
                     )
@@ -311,6 +320,7 @@ class InferenceRouter:
         usage: dict[str, Any] = {}
         finish_reason = "stop"
         response_status = "completed"
+        incomplete_details: ResponseIncompleteDetails | None = None
         response_backend_metadata: dict[str, Any] | None = None
         anthropic_native_envelope: dict[str, Any] | None = None
         async for chunk in self.route_stream(
@@ -387,6 +397,9 @@ class InferenceRouter:
                 usage = chunk["usage"]
             if chunk.get("response_status"):
                 response_status = str(chunk["response_status"])
+            terminal_details = response_incomplete_details(chunk.get("response_incomplete_details"))
+            if terminal_details is not None:
+                incomplete_details = terminal_details
             envelope = chunk.get("anthropic_native_envelope")
             if isinstance(envelope, dict):
                 anthropic_native_envelope = envelope
@@ -399,7 +412,7 @@ class InferenceRouter:
             for _index, tool_call in sorted(tool_calls.items())
             if (tool_call.get("function") or {}).get("name")
         ]
-        return {
+        response = {
             "choices": [
                 {
                     "message": {
@@ -421,6 +434,9 @@ class InferenceRouter:
                 else {}
             ),
         }
+        if incomplete_details is not None:
+            response["response_incomplete_details"] = incomplete_details
+        return response
 
     async def route_image_generate(
         self,

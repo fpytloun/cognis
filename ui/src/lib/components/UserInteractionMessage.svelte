@@ -12,7 +12,11 @@
       ? 'border-emerald-400/35 bg-emerald-500/15 text-emerald-50'
       : item.status === 'denied'
         ? 'border-amber-400/35 bg-amber-500/15 text-amber-50'
-        : 'border-slate-600 bg-slate-800/80 text-slate-100'
+        : item.status === 'failed'
+          ? 'border-rose-400/35 bg-rose-500/15 text-rose-50'
+          : item.status === 'cancelled'
+            ? 'border-slate-600 bg-slate-900/70 text-slate-300'
+            : 'border-slate-600 bg-slate-800/80 text-slate-100'
   );
   const approvalDetails = $derived.by(() => {
     if (item.interactionType !== 'escalation') return null;
@@ -74,7 +78,7 @@
       {/if}
     </div>
   </div>
-  <div class="mt-2.5 flex justify-end text-[11px] opacity-70">
+  <div class="mt-2.5 flex justify-end text-[11px] opacity-70" data-copy-exclude>
     <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
   </div>
 </article>

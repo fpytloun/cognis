@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "id": "implementation-plan",
+  "title": "Implementation plan",
+  "description": "Engineering handoff with plan, sequence diagram, code/config snippet, and risks.",
+  "group": "engineering",
+  "sort_key": 500,
+  "content": "Implementation plan fallback content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Engineering plan",
+      "subtitle": "Readable by humans, actionable by engineers, and compact enough for chat.",
+      "badges": [
+        "Architecture",
+        "Tasks",
+        "Validation"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Plan",
+        "title": "Ship rich deliverables as canonical content references",
+        "subtitle": "Keep Intaris generic, keep payloads in Cognis deliverables, and let the UI own rich presentation."
+      },
+      {
+        "type": "steps",
+        "title": "Execution sequence",
+        "items": [
+          {
+            "step": "01",
+            "title": "Persist payload",
+            "content": "Write canonical rich payload to deliverables table."
+          },
+          {
+            "step": "02",
+            "title": "Emit lifecycle reference",
+            "content": "Store generic lifecycle event with deliverable_id."
+          },
+          {
+            "step": "03",
+            "title": "Hydrate in UI",
+            "content": "Fetch payload by ID and render rich blocks."
+          },
+          {
+            "step": "04",
+            "title": "Visual QA",
+            "content": "Run Playwright fixture across scenarios and viewports."
+          }
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Validation coverage",
+        "description": "Covered validation paths in the implementation fixture.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "bar",
+        "series": [
+          {
+            "id": "coverage",
+            "label": "Coverage",
+            "points": [
+              {
+                "x": "Covered paths",
+                "y": 3
+              }
+            ]
+          }
+        ],
+        "x_axis": {
+          "type": "category",
+          "label": "Validation status"
+        },
+        "y_axis": {
+          "type": "linear",
+          "label": "Paths",
+          "unit": "paths",
+          "min": 0,
+          "max": 4
+        },
+        "legend_position": "none",
+        "palette_token": "default"
+      },
+      {
+        "type": "markdown",
+        "content": "Chart child content is visible exactly once."
+      },
+      {
+        "type": "mermaid",
+        "title": "Data flow",
+        "source": "flowchart LR\n  A[write_deliverable] --> B[(deliverables table)]\n  A --> C[Intaris lifecycle event]\n  C --> D[Chat timeline]\n  D --> E[UI fetch by deliverable_id]\n  E --> F[Rich renderer]",
+        "children": [
+          {
+            "type": "markdown",
+            "content": "Mermaid child content is visible exactly once."
+          }
+        ]
+      },
+      {
+        "type": "code",
+        "title": "Reference event shape",
+        "content": "SessionEvent(type=\"lifecycle\", data={\"event\": \"assistant_deliverable\", \"deliverable_id\": \"dlv_...\"})"
+      },
+      {
+        "type": "divider",
+        "children": [
+          {
+            "type": "markdown",
+            "content": "Divider child content follows the divider exactly once."
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

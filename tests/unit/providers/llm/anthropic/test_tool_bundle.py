@@ -610,29 +610,27 @@ def test_write_deliverable_object_union_compiles_for_anthropic() -> None:
 
     assert bundle.wire_tools[0]["input_schema"]["type"] == "object"
     assert not ({"allOf", "anyOf", "oneOf"} & bundle.wire_tools[0]["input_schema"].keys())
-    assert bundle.wire_tools[0]["input_schema"]["required"] == ("action", "content")
+    assert "required" not in bundle.wire_tools[0]["input_schema"]
     assert set(bundle.wire_tools[0]["input_schema"]["properties"]) == {
         "action",
         "content",
         "format",
         "outputs",
-        "rich",
-        "target",
+        "payload",
+        "payload_artifact",
         "title",
     }
     assert "strict" not in bundle.wire_tools[0]
     assert "top-level oneOf lowered" in bundle.strict_diagnostics[0]
     lowered_schema = _plain(bundle.wire_tools[0]["input_schema"])
     assert isinstance(lowered_schema, dict)
-    Draft7Validator(lowered_schema).validate({"action": "write_deliverable", "content": "fallback"})
+    Draft7Validator(lowered_schema).validate({"content": "fallback"})
     Draft7Validator(lowered_schema).validate(
         {
             "action": "rich:pulse",
-            "content": "fallback",
-            "format": "rich",
-            "rich": {
-                "blocks": [{"type": "markdown", "content": "section"}] * 7,
-                "metadata": {"presentation": "pulse", "pulse_version": 2},
+            "payload": {
+                "title": "Daily pulse",
+                "blocks": [{"type": "markdown", "content": "section"}],
             },
         }
     )

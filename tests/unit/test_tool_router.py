@@ -13,13 +13,14 @@ import pytest
 from sqlalchemy import select
 
 from cognis.core import tool_router as tool_router_module
-from cognis.core.chat_modes import is_plan_hidden_tool
+from cognis.core.chat_modes import is_plan_hidden_tool, is_plan_mutating_tool_call
 from cognis.core.tool_router import (
     ToolRoute,
     ToolRouter,
     _extract_output_anchor_names,
     caller_assignable_tools,
 )
+from cognis.mcp_runtime import MCPClientError
 from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord
 from cognis.models.session import SessionModel
@@ -34,9 +35,10 @@ from cognis.models.tool import (
     sanitize_mcp_tool_name,
 )
 from cognis.store.models import ArtifactRecordRow, AuditLog
+from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
+from cognis.tools.builtin.mcp_management import MANAGE_MCP_TOOL
 from cognis.tools.builtin.schedule import MANAGE_SCHEDULES_TOOL
 from cognis.tools.builtin.skill_management import SKILL_PATCH_TOOL
-from cognis.tools.mcp import MCPClientError
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 pytest_plugins = ("tests.unit.test_task_continuation_tools",)
@@ -171,12 +173,15 @@ async def test_remote_mcp_401_refreshes_reconfigures_and_retries_once() -> None:
     router = object.__new__(ToolRouter)
     oauth_service = SimpleNamespace(
         refresh_token_for_server_id=AsyncMock(return_value=True),
+        credential_revision_for_server_id=AsyncMock(
+            return_value={"token_id": "token-1", "token_version": 2}
+        ),
         mark_token_invalid_for_server=AsyncMock(return_value=True),
         require_reauthorization_for_server=AsyncMock(return_value=None),
     )
     router._mcp_oauth_service = oauth_service
     router._session_factory = None
-    router._wait_for_executor_reconfigure = AsyncMock(return_value=True)
+    router._wait_for_mcp_credential_revision = AsyncMock(return_value=True)
     executor = _RemoteExecutor(result=ToolResult(output="recovered"))
     registered_tool = SimpleNamespace(
         definition=SimpleNamespace(
@@ -215,7 +220,11 @@ async def test_remote_mcp_401_refreshes_reconfigures_and_retries_once() -> None:
         force=True,
         reason="mcp_tool_401",
     )
-    router._wait_for_executor_reconfigure.assert_awaited_once_with("remote-exec")
+    router._wait_for_mcp_credential_revision.assert_awaited_once_with(
+        "remote-exec",
+        "mcp-1",
+        {"token_id": "token-1", "token_version": 2},
+    )
     oauth_service.mark_token_invalid_for_server.assert_not_awaited()
     oauth_service.require_reauthorization_for_server.assert_not_awaited()
 
@@ -225,10 +234,13 @@ async def test_remote_mcp_401_does_not_auto_replay_mutating_tool() -> None:
     router = object.__new__(ToolRouter)
     oauth_service = SimpleNamespace(
         refresh_token_for_server_id=AsyncMock(return_value=True),
+        credential_revision_for_server_id=AsyncMock(
+            return_value={"token_id": "token-1", "token_version": 2}
+        ),
     )
     router._mcp_oauth_service = oauth_service
     router._session_factory = None
-    router._wait_for_executor_reconfigure = AsyncMock(return_value=True)
+    router._wait_for_mcp_credential_revision = AsyncMock(return_value=True)
     executor = _RemoteExecutor(result=ToolResult(output="must not execute"))
     registered_tool = SimpleNamespace(
         definition=SimpleNamespace(
@@ -614,6 +626,55 @@ def _session() -> SessionModel:
         user_email="user@example.com",
         agent_id="agent-a",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission", [Permission.ALLOW, Permission.DENY])
+async def test_self_mutation_floor_preserves_policy(permission: Permission) -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails)
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_AGENTS_TOOL))
+    agent = _agent({"manage_agents": permission})
+    call = ToolCall(
+        call_id="self-mutation-test",
+        name="manage_agents",
+        arguments={"action": "update", "agent_id": agent.agent_id, "name": "Changed"},
+    )
+    decision = await router.evaluate_tool_call(call, agent, _session(), registry)
+    if permission is Permission.DENY:
+        assert decision.decision == "deny"
+        assert guardrails.evaluate_calls == 0
+    else:
+        assert guardrails.last_evaluate_call is not None
+        assert guardrails.last_evaluate_call[3]["minimum_outcome"] == "escalate"
+        assert guardrails.last_evaluate_call[3]["approval_call_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_builtin_self_mutation_dispatch_escalates() -> None:
+    from cognis.models.tool import EvaluationResult
+
+    guardrails = _Guardrails()
+    guardrails.evaluate = AsyncMock(
+        return_value=EvaluationResult(
+            decision="escalate", call_id="review-self-mutation", reasoning="User review required"
+        )
+    )
+    router = ToolRouter(guardrails=guardrails)
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_AGENTS_TOOL))
+    agent = _agent()
+    agent.tools = {"opt_in_builtin_tools": ["manage_agents"]}
+    call = ToolCall(
+        call_id="self-dispatch",
+        name="manage_agents",
+        arguments={"action": "update", "agent_id": agent.agent_id, "name": "Changed"},
+    )
+    result = await router.execute(call, _session(), agent, registry, _Executor())
+    assert result.metadata["evaluation"]["decision"] == "escalate"
+    assert result.metadata["evaluation"]["call_id"] == "review-self-mutation"
+    assert guardrails.evaluate.await_args.kwargs["context"]["minimum_outcome"] == "escalate"
 
 
 def _session_factory() -> object:
@@ -1218,6 +1279,116 @@ def test_plan_hidden_tool_policy_blocks_writes_but_not_unknown_or_readonly() -> 
         classification_status="unknown",
     )
     assert is_plan_hidden_tool(ambiguous) is False
+
+
+@pytest.mark.parametrize(
+    ("definition", "read_action", "write_action"),
+    [
+        (MANAGE_AGENTS_TOOL, "get", "update"),
+        (MANAGE_MCP_TOOL, "servers_get", "servers_update"),
+        (MANAGE_SCHEDULES_TOOL, "get", "update"),
+    ],
+)
+def test_plan_mode_uses_native_operation_mutation_kind_for_mixed_tools(
+    definition: ToolDefinition,
+    read_action: str,
+    write_action: str,
+) -> None:
+    assert is_plan_hidden_tool(definition) is False
+    assert is_plan_mutating_tool_call(definition, {"action": read_action}) is False
+    assert is_plan_mutating_tool_call(definition, {"action": write_action}) is True
+    assert is_plan_mutating_tool_call(definition, {"action": "unsupported"}) is True
+
+
+@pytest.mark.parametrize(
+    ("definition", "read_action", "write_action"),
+    [
+        (MANAGE_AGENTS_TOOL, "get", "update"),
+        (MANAGE_MCP_TOOL, "servers_get", "servers_update"),
+        (MANAGE_SCHEDULES_TOOL, "get", "update"),
+    ],
+)
+def test_plan_mode_execution_gate_allows_reads_and_denies_writes_for_mixed_tools(
+    definition: ToolDefinition,
+    read_action: str,
+    write_action: str,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=definition))
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    metadata = {"read_only_required": True, "chat_mode": "plan"}
+
+    read_result = router._plan_mode_denial_result(
+        ToolCall(
+            call_id="plan-read",
+            name=definition.name,
+            arguments={"action": read_action},
+            runtime_metadata=metadata,
+        ),
+        registry,
+    )
+    write_result = router._plan_mode_denial_result(
+        ToolCall(
+            call_id="plan-write",
+            name=definition.name,
+            arguments={"action": write_action},
+            runtime_metadata=metadata,
+        ),
+        registry,
+    )
+
+    assert read_result is None
+    assert write_result is not None
+    assert write_result.metadata and write_result.metadata["code"] == "plan_mode_mutation_denied"
+
+
+@pytest.mark.asyncio
+async def test_plan_mode_permission_evaluation_allows_agent_get_and_denies_other_actions() -> None:
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=MANAGE_AGENTS_TOOL))
+    router = ToolRouter(guardrails=_Guardrails(), non_bypassable_patterns=[])
+    metadata = {"read_only_required": True, "chat_mode": "plan"}
+
+    read_decision = await router.evaluate_tool_call(
+        ToolCall(
+            call_id="plan-agent-get",
+            name="manage_agents",
+            arguments={"action": "get", "agent_id": "current-agent"},
+            runtime_metadata=metadata,
+        ),
+        _agent(),
+        _session(),
+        registry,
+    )
+    write_decision = await router.evaluate_tool_call(
+        ToolCall(
+            call_id="plan-agent-update",
+            name="manage_agents",
+            arguments={"action": "update", "agent_id": "current-agent", "name": "Changed"},
+            runtime_metadata=metadata,
+        ),
+        _agent(),
+        _session(),
+        registry,
+    )
+    unknown_decision = await router.evaluate_tool_call(
+        ToolCall(
+            call_id="plan-agent-unknown",
+            name="manage_agents",
+            arguments={"action": "unsupported"},
+            runtime_metadata=metadata,
+        ),
+        _agent(),
+        _session(),
+        registry,
+    )
+
+    assert read_decision.decision == "approve"
+    assert read_decision.source != "chat_mode"
+    assert write_decision.decision == "deny"
+    assert write_decision.source == "chat_mode"
+    assert unknown_decision.decision == "deny"
+    assert unknown_decision.source == "chat_mode"
 
 
 @pytest.mark.asyncio
@@ -2313,6 +2484,105 @@ async def test_tool_router_returns_recoverable_result_for_credential_resolution_
 
 
 @pytest.mark.asyncio
+async def test_tool_router_preserves_external_mcp_value_ref() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        non_bypassable_patterns=[],
+        credentials_provider=_CredentialProvider(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="windmill_update_app",
+                description="update app",
+                parameters={
+                    "type": "object",
+                    "properties": {"value_ref": {"type": "string"}},
+                    "required": ["value_ref"],
+                },
+                source=ToolSource(
+                    type="local_mcp",
+                    server_name="windmill",
+                    raw_tool_name="update_app",
+                ),
+                non_bypassable=True,
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingExecutor()
+    external_ref = "eyJhbGciOiJIUzI1NiJ9.external-artifact-reference"
+
+    result = await router.execute(
+        ToolCall(
+            call_id="external-value-ref-1",
+            name="windmill_update_app",
+            arguments={"value_ref": external_ref},
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    assert guardrails.last_evaluate_call[2]["value_ref"] == external_ref
+    assert executor.tool_calls[0].arguments == {"value_ref": external_ref}
+
+
+@pytest.mark.asyncio
+async def test_tool_router_resolves_auth_challenge_value_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    resolve_auth_challenge = AsyncMock(return_value="654321")
+    monkeypatch.setattr(router, "_resolve_auth_challenge_value_ref", resolve_auth_challenge)
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="auth_challenge_tool",
+                description="use challenge",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(
+                    type="local_mcp",
+                    server_name="auth",
+                    raw_tool_name="use_challenge",
+                ),
+                non_bypassable=True,
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingExecutor()
+
+    result = await router.execute(
+        ToolCall(
+            call_id="auth-challenge-value-ref-1",
+            name="auth_challenge_tool",
+            arguments={
+                "value_ref": "$auth_challenge:challenge-1.code",
+                "auth_challenge": {"kind": "otp_code"},
+            },
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    assert guardrails.last_evaluate_call[2]["value_ref"] == "<resolved-at-execution>"
+    assert executor.tool_calls[0].arguments["value"] == "654321"
+    resolve_auth_challenge.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_tool_router_persist_browser_auth_state_grants_new_credential_to_agent() -> None:
     provider = _BrowserAuthStateCredentialProvider()
     router = ToolRouter(guardrails=_Guardrails(), credentials_provider=provider)
@@ -2413,6 +2683,52 @@ async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None
     assert guardrails.last_evaluate_call is not None
     assert guardrails.last_evaluate_call[2]["args"] == ["<resolved-at-execution>"]
     assert executor.tool_calls[0].arguments["args"] == ["123456"]
+
+
+@pytest.mark.asyncio
+async def test_tool_router_preserves_nested_external_value_ref() -> None:
+    guardrails = _Guardrails()
+    router = ToolRouter(
+        guardrails=guardrails,
+        non_bypassable_patterns=[],
+        credentials_provider=_CredentialProvider(),
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="browser_eval",
+                description="eval",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="local_mcp", server_name="browser", raw_tool_name="eval"),
+                non_bypassable=True,
+                timeout_seconds=1,
+            )
+        )
+    )
+    executor = _CapturingExecutor()
+    external_ref = "windmill-artifact-42"
+
+    result = await router.execute(
+        ToolCall(
+            call_id="browser-eval-external-ref",
+            name="browser_eval",
+            arguments={
+                "session_id": "browser-1",
+                "script": "(item) => item",
+                "args": [{"value_ref": external_ref}],
+            },
+        ),
+        _session(),
+        _agent(),
+        registry,
+        executor,
+    )
+
+    assert result.is_error is False
+    assert guardrails.last_evaluate_call is not None
+    assert guardrails.last_evaluate_call[2]["args"] == [{"value_ref": external_ref}]
+    assert executor.tool_calls[0].arguments["args"] == [{"value_ref": external_ref}]
 
 
 @pytest.mark.asyncio
@@ -2554,10 +2870,16 @@ async def test_tool_router_materializes_inline_attachments(monkeypatch: pytest.M
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "expected_conversation_id", "expected_session_id"),
+    (
+        "tool_name",
+        "expected_conversation_id",
+        "expected_session_id",
+        "expected_artifact_id",
+        "expected_namespace",
+    ),
     [
-        ("artifact_publish", None, None),
-        ("document_generate", "conv-a", "session-a"),
+        ("artifact_publish", None, None, "art_1", "artifacts"),
+        ("document_generate", "conv-a", "session-a", "doc_1", "documents"),
     ],
 )
 async def test_inline_attachment_scope_follows_publication_intent(
@@ -2565,6 +2887,8 @@ async def test_inline_attachment_scope_follows_publication_intent(
     tool_name: str,
     expected_conversation_id: str | None,
     expected_session_id: str | None,
+    expected_artifact_id: str,
+    expected_namespace: str,
 ) -> None:
     create_record = AsyncMock()
     monkeypatch.setattr("cognis.core.tool_router.create_artifact_record", create_record)
@@ -2574,7 +2898,7 @@ async def test_inline_attachment_scope_follows_publication_intent(
         session_factory=_session_factory(),
     )
 
-    await router._persist_inline_attachment(  # noqa: SLF001
+    result = await router._persist_inline_attachment(  # noqa: SLF001
         {
             "filename": "report.pdf",
             "mime_type": "application/pdf",
@@ -2587,6 +2911,12 @@ async def test_inline_attachment_scope_follows_publication_intent(
     kwargs = create_record.await_args.kwargs
     assert kwargs["conversation_id"] == expected_conversation_id
     assert kwargs["session_id"] == expected_session_id
+    assert kwargs["artifact_id"] == expected_artifact_id
+    assert kwargs["namespace"] == expected_namespace
+    assert result["artifact_id"] == expected_artifact_id
+    assert kwargs["content_hash"] == hashlib.sha256(b"pdf").hexdigest()
+    if tool_name == "artifact_publish":
+        assert kwargs["purpose"] == "artifact_publish"
 
 
 @pytest.mark.asyncio
@@ -2834,6 +3164,39 @@ async def test_tool_router_enriches_image_tool_output() -> None:
     raw_output = result.metadata["_raw_output"]
     assert '"artifact_id": "img_1"' in raw_output
     assert '"mime_type": "image/png"' in raw_output
+
+
+@pytest.mark.asyncio
+async def test_tool_router_passes_tool_output_store_to_image_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_output_store = object()
+    handle_image_tool = AsyncMock(return_value=ToolResult(output="generated"))
+    monkeypatch.setattr("cognis.core.tool_router.handle_image_tool", handle_image_tool)
+    router = ToolRouter(
+        guardrails=_Guardrails(),
+        artifact_store=_ArtifactStore(),
+        image_generation_provider=object(),
+        tool_output_store=tool_output_store,
+    )
+
+    await router.execute(
+        ToolCall(
+            call_id="image-with-reference",
+            name="image_generate",
+            arguments={
+                "prompt": "Use the reference.",
+                "references": ["tool_artifact:call-web:media:1"],
+            },
+        ),
+        _session(),
+        _agent(),
+        ToolRegistry(),
+        None,
+    )
+
+    runtime_metadata = handle_image_tool.await_args.kwargs["runtime_metadata"]
+    assert runtime_metadata["tool_output_store"] is tool_output_store
 
 
 @pytest.mark.asyncio

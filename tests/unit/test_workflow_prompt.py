@@ -309,6 +309,47 @@ def test_retry_and_routed_revision_do_not_replay_task_or_deliverable() -> None:
     assert retry_message.count("ROUTED_REVISION_SENTINEL") == 1
     assert retry_message.count("HUMAN_INSTRUCTION_SENTINEL") == 1
     assert state.last_revision_context is None
+    assert ctx.user_visible_message is None
+
+
+def test_human_revision_is_the_visible_part_of_internal_step_prompt() -> None:
+    step = next(item for item in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if item.name == "implement")
+    state = WorkflowState(
+        last_revision_context="Keep the API compatible.",
+        last_operator_instruction="Keep the API compatible.",
+    )
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=step,
+        session=SimpleNamespace(session_id="sess", user_email="user@example.com"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(
+            agent_id="system:implement",
+            owner_email="system@example.com",
+            name="Implement",
+            agent_type="secondary",
+        ),
+        policy=WORKFLOW_POLICY,
+        task_title="Task",
+        task_description="Description",
+        workflow_id=SOFTWARE_DEVELOPMENT_WORKFLOW.workflow_id,
+        workflow_name=SOFTWARE_DEVELOPMENT_WORKFLOW.name,
+        step_run_id="sr_implement",
+        workflow_state=state,
+        workflow_steps=SOFTWARE_DEVELOPMENT_WORKFLOW.steps,
+        step_index=SOFTWARE_DEVELOPMENT_WORKFLOW.steps.index(step),
+    )
+
+    loop._compose_step_prompt(ctx)
+
+    assert ctx.user_visible_message == "Keep the API compatible."
+    assert state.last_revision_context is None
+
+
+def test_workflow_state_normalizes_legacy_terminal_current_step_status() -> None:
+    for status in ("completed", "failed", "cancelled"):
+        state = WorkflowState.model_validate({"status": status, "current_step_status": status})
+        assert state.current_step_status is None
 
 
 def test_full_software_chain_references_each_shared_session_source_without_replay() -> None:

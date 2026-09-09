@@ -10,7 +10,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal, NoReturn
+from typing import Any, Literal, NoReturn, cast
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -33,6 +33,12 @@ RICH_DELIVERABLE_PROJECTION_MAX_BYTES = 64_000
 RICH_DELIVERABLE_MAX_BLOCKS = 64
 RICH_DELIVERABLE_MAX_DATASET_ROWS = 2_000
 RICH_DELIVERABLE_MAX_STRING_LENGTH = 16_384
+RICH_SURFACES = ("plain", "subtle", "outlined", "raised", "accent")
+RICH_GRID_LAYOUTS = ("auto", "equal", "split-2-1", "split-1-2")
+RICH_SEMANTIC_TONES = ("neutral", "positive", "warning", "critical", "info")
+RICH_TABLE_CELL_TYPES = ("text", "number", "code", "badge", "progress")
+RICH_TABLE_CELL_EMPHASIS = ("normal", "strong", "muted")
+RICH_TABLE_CELL_ALIGNMENTS = ("start", "center", "end")
 CANONICAL_CHART_TYPES = {
     "line",
     "area",
@@ -237,12 +243,70 @@ PULSE_RICH_BLOCK_INPUT_SCHEMA: dict[str, Any] = {
 }
 
 RICH_DELIVERABLE_VALID_EXAMPLE: dict[str, Any] = {
+    "title": "Summary",
     "blocks": [{"type": "markdown", "content": "## Summary\n\nDeliverable body."}],
     "assets": [],
     "sources": [],
     "datasets": [],
     "exports": [],
     "metadata": {},
+}
+
+DASHBOARD_SKELETON: dict[str, Any] = {
+    "title": "Operations dashboard",
+    "blocks": [
+        {
+            "type": "section_header",
+            "eyebrow": "Overview",
+            "title": "Current state",
+            "subtitle": "Key operational signals",
+        },
+        {
+            "type": "grid",
+            "layout": "equal",
+            "blocks": [
+                {"type": "metric", "label": "Availability", "value": "99.9%"},
+                {"type": "status", "title": "Deployments", "status": "Healthy"},
+            ],
+        },
+        {
+            "type": "table",
+            "title": "Services",
+            "rows": [{"service": "API", "state": {"type": "badge", "value": "Healthy"}}],
+        },
+    ],
+    "assets": [],
+    "sources": [],
+    "datasets": [],
+    "exports": [],
+    "metadata": {
+        "presentation": "dashboard",
+        "canvas": "wide",
+        "density": "compact",
+    },
+}
+
+DASHBOARD_PRESENTATION_DESCRIPTOR: dict[str, Any] = {
+    "schema_version": "cognis.rich.dashboard.v1",
+    "presentation": "dashboard",
+    "summary": "Strict operational dashboard preset over renderer-neutral Rich primitives.",
+    "selector": "$.action == 'rich:dashboard'",
+    "requirements": {
+        "title": "non-empty",
+        "signal_items_min": 2,
+        "data_blocks_min": 1,
+        "preferred_canvas": "wide",
+        "preferred_density": "compact",
+    },
+    "retry_guidance": (
+        "Use a concise dashboard with a title, at least two metric/status items, "
+        "and at least one table or chart."
+    ),
+    "errors": [
+        {"reason": "invalid_dashboard_composition", "path": "$.blocks"},
+        {"reason": "invalid_dashboard_title", "path": "$.title"},
+    ],
+    "valid_skeleton": DASHBOARD_SKELETON,
 }
 
 PULSE_V1_DAILY_SKELETON: dict[str, Any] = {
@@ -528,7 +592,7 @@ PULSE_PRESENTATION_DESCRIPTOR: dict[str, Any] = {
         "Decision-oriented Pulse v2 composition for new writes. Persisted Pulse v1 "
         "payloads remain renderable and valid under the legacy grammar."
     ),
-    "selector": "$.rich.metadata.presentation == 'pulse'",
+    "selector": "$.action == 'rich:pulse'",
     "versions": {
         "1": {
             "status": "legacy_rendering",
@@ -640,6 +704,7 @@ PULSE_WRITE_DELIVERABLE_SCHEMA: dict[str, Any] = {
 
 SUPPORTED_RICH_BLOCK_TYPES = {
     "hero",
+    "section_header",
     "section",
     "stack",
     "columns",
@@ -1617,6 +1682,90 @@ register_rich_presentation(
 )
 
 
+def _validate_dashboard(payload: dict[str, Any]) -> None:
+    title = payload.get("title")
+    if not _nonempty_text(title):
+        raise RichPayloadValidationError(
+            reason="invalid_dashboard_title",
+            path="$.title",
+            expected="non-empty dashboard title",
+            received=title,
+            descriptor=DASHBOARD_PRESENTATION_DESCRIPTOR,
+        )
+    walked = _walk_rendered_blocks(payload["blocks"])
+    signal_count = sum(
+        block.get("type") in {"metric", "status"} for block, _path, _inside_agenda in walked
+    )
+    data_count = sum(
+        block.get("type") in {"table", "chart"} for block, _path, _inside_agenda in walked
+    )
+    card_count = sum(block.get("type") == "card" for block, _path, _inside_agenda in walked)
+    markdown_count = sum(block.get("type") == "markdown" for block, _path, _inside_agenda in walked)
+    issues: list[dict[str, str]] = []
+    if signal_count < 2:
+        issues.append(
+            {
+                "reason": "invalid_dashboard_composition",
+                "path": "$.blocks",
+                "expected": "at least two metric or status blocks",
+            }
+        )
+    if data_count < 1:
+        issues.append(
+            {
+                "reason": "invalid_dashboard_composition",
+                "path": "$.blocks",
+                "expected": "at least one table or chart block",
+            }
+        )
+    if card_count >= 4 and card_count > signal_count:
+        issues.append(
+            {
+                "reason": "invalid_dashboard_composition",
+                "path": "$.blocks",
+                "expected": "dashboard signals and data instead of a card-dominated composition",
+            }
+        )
+    if markdown_count > 2 or any(
+        len(_block_text_for_validation(block)) > 2_400
+        for block, _path, _inside_agenda in walked
+        if block.get("type") in {"markdown", "section"}
+    ):
+        issues.append(
+            {
+                "reason": "invalid_dashboard_composition",
+                "path": "$.blocks",
+                "expected": "concise dashboard content instead of long-form prose",
+            }
+        )
+    if issues:
+        raise RichPayloadValidationError(
+            reason=issues[0]["reason"],
+            path=issues[0]["path"],
+            expected=issues[0]["expected"],
+            issues=issues,
+            descriptor=DASHBOARD_PRESENTATION_DESCRIPTOR,
+        )
+    payload["metadata"]["presentation"] = "dashboard"
+    payload["metadata"]["canvas"] = "wide"
+    payload["metadata"]["density"] = "compact"
+
+
+def _block_text_for_validation(block: dict[str, Any]) -> str:
+    return " ".join(
+        value for key in ("content", "text", "body") if isinstance((value := block.get(key)), str)
+    )
+
+
+register_rich_presentation(
+    RichPresentationContract(
+        name="dashboard",
+        descriptor=DASHBOARD_PRESENTATION_DESCRIPTOR,
+        validator=_validate_dashboard,
+    )
+)
+
+
 def _validate_string_caps(value: Any, path: str) -> None:
     if isinstance(value, str):
         if len(value) > RICH_DELIVERABLE_MAX_STRING_LENGTH:
@@ -1823,6 +1972,154 @@ def _is_finite_chart_number(value: Any) -> bool:
         return math.isfinite(float(value))
     except OverflowError:
         return False
+
+
+def _validate_progress(value: Any, path: str) -> None:
+    if not isinstance(value, dict):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress",
+            path=path,
+            expected="object with numeric value, positive numeric max, and optional label",
+            received=value,
+        )
+    unknown = set(value) - {"value", "max", "label"}
+    if unknown:
+        key = min(unknown)
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_field",
+            path=_json_path(path, key),
+            expected="one of value, max, label",
+            received=value[key],
+        )
+    progress_value = value.get("value")
+    maximum = value.get("max")
+    if not _is_finite_chart_number(progress_value):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_value",
+            path=_json_path(path, "value"),
+            expected="finite number in range 0..max",
+            received=progress_value,
+        )
+    if not _is_finite_chart_number(maximum):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_max",
+            path=_json_path(path, "max"),
+            expected="positive finite number",
+            received=maximum,
+        )
+    numeric_value = float(cast(int | float, progress_value))
+    numeric_maximum = float(cast(int | float, maximum))
+    if numeric_maximum <= 0:
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_max",
+            path=_json_path(path, "max"),
+            expected="positive finite number",
+            received=maximum,
+        )
+    if numeric_value < 0 or numeric_value > numeric_maximum:
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_value",
+            path=_json_path(path, "value"),
+            expected="finite number in range 0..max",
+            received=progress_value,
+        )
+    label = value.get("label")
+    if label is not None and not isinstance(label, str):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_progress_label",
+            path=_json_path(path, "label"),
+            expected="string or omitted",
+            received=label,
+        )
+
+
+def _validate_table_cell(value: Any, path: str) -> None:
+    if not isinstance(value, dict):
+        return
+    cell_type = value.get("type")
+    if cell_type not in RICH_TABLE_CELL_TYPES:
+        raise RichPayloadValidationError(
+            reason="invalid_rich_table_cell_type",
+            path=_json_path(path, "type"),
+            expected=f"one of {list(RICH_TABLE_CELL_TYPES)}",
+            received=cell_type,
+        )
+    allowed = {"type", "value", "label", "tone", "emphasis", "align"}
+    if cell_type == "progress":
+        allowed.add("max")
+    unknown = set(value) - allowed
+    if unknown:
+        key = min(unknown)
+        raise RichPayloadValidationError(
+            reason="invalid_rich_table_cell_field",
+            path=_json_path(path, key),
+            expected=f"one of {sorted(allowed)}",
+            received=value[key],
+        )
+    if "value" not in value:
+        raise RichPayloadValidationError(
+            reason="missing_rich_table_cell_value",
+            path=_json_path(path, "value"),
+            expected="canonical scalar value",
+            received=None,
+        )
+    canonical = value["value"]
+    if cell_type in {"number", "progress"}:
+        valid_value = _is_finite_chart_number(canonical)
+        expected_value = "finite number"
+    else:
+        valid_value = isinstance(canonical, (str, int, float, bool)) and (
+            not isinstance(canonical, float) or math.isfinite(canonical)
+        )
+        expected_value = "JSON scalar"
+    if not valid_value:
+        raise RichPayloadValidationError(
+            reason="invalid_rich_table_cell_value",
+            path=_json_path(path, "value"),
+            expected=expected_value,
+            received=canonical,
+        )
+    for key, values in (
+        ("tone", RICH_SEMANTIC_TONES),
+        ("emphasis", RICH_TABLE_CELL_EMPHASIS),
+        ("align", RICH_TABLE_CELL_ALIGNMENTS),
+    ):
+        field = value.get(key)
+        if field is not None and field not in values:
+            raise RichPayloadValidationError(
+                reason=f"invalid_rich_table_cell_{key}",
+                path=_json_path(path, key),
+                expected=f"one of {list(values)} or omitted",
+                received=field,
+            )
+    label = value.get("label")
+    if label is not None and not isinstance(label, str):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_table_cell_label",
+            path=_json_path(path, "label"),
+            expected="string or omitted",
+            received=label,
+        )
+    if cell_type == "progress":
+        _validate_progress(
+            {"value": canonical, "max": value.get("max"), **({"label": label} if label else {})},
+            path,
+        )
+
+
+def _validate_table_cells(block: dict[str, Any], path: str) -> None:
+    row_key = "rows" if block.get("rows") else "data"
+    rows = block.get(row_key)
+    if not isinstance(rows, list):
+        return
+    for row_index, row in enumerate(rows):
+        row_path = _json_path(_json_path(path, row_key), row_index)
+        if isinstance(row, dict):
+            for key, cell in row.items():
+                _validate_table_cell(cell, _json_path(row_path, str(key)))
+        elif isinstance(row, list):
+            for cell_index, cell in enumerate(row):
+                _validate_table_cell(cell, _json_path(row_path, cell_index))
 
 
 def _validate_chart_optional_string(block: dict[str, Any], path: str, key: str) -> None:
@@ -2114,6 +2411,82 @@ def _normalize_block(block: Any, path: str, block_count: list[int]) -> dict[str,
 
     normalized = dict(block)
     normalized["type"] = block_type
+    surface = normalized.get("surface")
+    if surface is not None and surface not in RICH_SURFACES:
+        raise RichPayloadValidationError(
+            reason="invalid_rich_surface",
+            path=_json_path(path, "surface"),
+            expected=f"one of {list(RICH_SURFACES)} or omitted",
+            received=surface,
+        )
+    span = normalized.get("span")
+    if span is not None and (
+        not isinstance(span, int) or isinstance(span, bool) or not 1 <= span <= 4
+    ):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_span",
+            path=_json_path(path, "span"),
+            expected="integer in range 1..4 or omitted",
+            received=span,
+        )
+    if block_type in {"columns", "grid", "card_grid"}:
+        columns = normalized.get("columns")
+        if columns is not None and (
+            not isinstance(columns, int) or isinstance(columns, bool) or not 1 <= columns <= 4
+        ):
+            raise RichPayloadValidationError(
+                reason="invalid_rich_columns",
+                path=_json_path(path, "columns"),
+                expected="integer in range 1..4 or omitted",
+                received=columns,
+            )
+    if block_type == "grid":
+        layout = normalized.get("layout")
+        if layout is not None and not (
+            layout in RICH_GRID_LAYOUTS
+            or (
+                isinstance(layout, dict)
+                and set(layout) == {"columns"}
+                and isinstance(layout["columns"], int)
+                and not isinstance(layout["columns"], bool)
+                and 1 <= layout["columns"] <= 4
+            )
+        ):
+            raise RichPayloadValidationError(
+                reason="invalid_rich_grid_layout",
+                path=_json_path(path, "layout"),
+                expected=f"one of {list(RICH_GRID_LAYOUTS)}, legacy columns object, or omitted",
+                received=layout,
+            )
+    if block_type == "section_header":
+        for key in ("eyebrow", "title", "subtitle"):
+            if not _nonempty_text(normalized.get(key)):
+                raise RichPayloadValidationError(
+                    reason="invalid_section_header",
+                    path=_json_path(path, key),
+                    expected="non-empty string",
+                    received=normalized.get(key),
+                )
+        status = normalized.get("status")
+        if status is not None and not isinstance(status, (str, int, float, bool)):
+            raise RichPayloadValidationError(
+                reason="invalid_section_header_status",
+                path=_json_path(path, "status"),
+                expected="JSON scalar or omitted",
+                received=status,
+            )
+        tone = normalized.get("tone")
+        if tone is not None and tone not in RICH_SEMANTIC_TONES:
+            raise RichPayloadValidationError(
+                reason="invalid_section_header_tone",
+                path=_json_path(path, "tone"),
+                expected=f"one of {list(RICH_SEMANTIC_TONES)} or omitted",
+                received=tone,
+            )
+    if block_type == "metric" and "progress" in normalized:
+        _validate_progress(normalized["progress"], _json_path(path, "progress"))
+    if block_type == "table":
+        _validate_table_cells(normalized, path)
     if block_type == "chart":
         _validate_canonical_chart(normalized, path)
     if block_type == "markdown":
@@ -2320,7 +2693,7 @@ def _validate_source_list_references(
                 None,
             )
             refs = block.get(ref_key) if ref_key is not None else None
-            if refs is not None:
+            if refs is not None and ref_key is not None:
                 values = refs if isinstance(refs, list) else [refs]
                 for ref_index, ref in enumerate(values):
                     ref_path = _json_path(_json_path(block_path, ref_key), ref_index)
@@ -2430,10 +2803,38 @@ def normalize_rich_payload(value: Any) -> tuple[dict[str, Any] | None, list[str]
         _validate_string_caps(raw_metadata, "$.metadata")
         normalized["metadata"] = dict(raw_metadata)
 
-    for key in set(normalized) - {"blocks", "assets", "sources", "datasets", "exports", "metadata"}:
+    title = normalized.get("title")
+    if title is not None and not isinstance(title, str):
+        raise RichPayloadValidationError(
+            reason="invalid_rich_title",
+            path="$.title",
+            expected="string or omitted",
+            received=title,
+        )
+    for key in set(normalized) - {
+        "title",
+        "blocks",
+        "assets",
+        "sources",
+        "datasets",
+        "exports",
+        "metadata",
+    }:
         raw = normalized.get(key)
         _validate_string_caps(raw, f"$.{key}")
     metadata = normalized["metadata"]
+    for key, values in (
+        ("canvas", ("standard", "wide")),
+        ("density", ("compact", "comfortable", "dense", "airy")),
+    ):
+        field = metadata.get(key)
+        if field is not None and field not in values:
+            raise RichPayloadValidationError(
+                reason=f"invalid_rich_{key}",
+                path=_json_path("$.metadata", key),
+                expected=f"one of {list(values)} or omitted",
+                received=field,
+            )
     presentation_present = "presentation" in metadata
     presentation = metadata.get("presentation")
     pulse_variant_present = "pulse_variant" in metadata
@@ -2501,6 +2902,8 @@ def rich_render_metadata(
         "block_count": len(blocks) if isinstance(blocks, list) else 0,
         "media_count": len(media_manifest) if isinstance(media_manifest, dict) else 0,
         "presentation": presentation,
+        "canvas": metadata.get("canvas") if isinstance(metadata, dict) else None,
+        "density": metadata.get("density") if isinstance(metadata, dict) else None,
         "pulse_schema": (
             f"cognis.rich.pulse.v{pulse_version}" if pulse_version is not None else None
         ),
@@ -2531,6 +2934,7 @@ def rich_render_metadata(
 
 def rich_export_metadata(payload: dict[str, Any] | None = None) -> dict[str, Any]:
     exports = payload.get("exports", []) if isinstance(payload, dict) else []
+    metadata = payload.get("metadata", {}) if isinstance(payload, dict) else {}
     return {
         "available": [
             "copy",
@@ -2540,6 +2944,8 @@ def rich_export_metadata(payload: dict[str, Any] | None = None) -> dict[str, Any
             "share_link",
         ],
         "declared_exports": exports if isinstance(exports, list) else [],
+        "presentation": metadata.get("presentation") if isinstance(metadata, dict) else None,
+        "canvas": metadata.get("canvas") if isinstance(metadata, dict) else None,
         "standalone": {
             "html": {"available": True, "cached": True},
             "pdf": {"available": True, "cached": True},

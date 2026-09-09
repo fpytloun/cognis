@@ -216,7 +216,10 @@ export interface DelegationRuntime {
 export type { TodoSnapshotItem };
 
 export function isTerminalToolStatus(status: string | null | undefined): boolean {
-  return ['completed', 'failed', 'cancelled'].includes(status ?? '');
+  // `denied` is a terminal rejected outcome (an escalation approval was
+  // declined), distinct from `failed` (execution error) and from `waiting`
+  // (still active, blocked on a pending approval decision).
+  return ['completed', 'failed', 'cancelled', 'denied'].includes(status ?? '');
 }
 
 export function isActiveToolStatus(status: string | null | undefined): boolean {
@@ -262,6 +265,10 @@ export interface NoticeTimelineItem {
   title: string;
   description: string;
   tone: 'info' | 'warning' | 'error';
+  details?: string | null;
+  status?: string | null;
+  code?: string | null;
+  actionRequired?: boolean;
   timestamp: string | null;
   /** Backend-assigned stable sort key. Lexicographically comparable. */
   orderKey?: string;

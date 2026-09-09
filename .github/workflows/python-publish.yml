@@ -8,8 +8,51 @@ permissions:
   contents: read
 
 jobs:
+  common-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build common release distributions
+        run: |
+          python -m pip install build
+          python -m build --wheel --sdist packages/common --outdir dist-common
+
+      - name: Upload common distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: common-release-dists
+          path: dist-common/
+
+  common-publish:
+    runs-on: ubuntu-latest
+    needs: common-build
+    permissions:
+      id-token: write
+
+    environment:
+      name: pypi
+
+    steps:
+      - name: Retrieve common distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: common-release-dists
+          path: dist/
+
+      - name: Publish common distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
   controller-build:
     runs-on: ubuntu-latest
+    needs: common-publish
 
     steps:
       - uses: actions/checkout@v4
@@ -28,7 +71,7 @@ jobs:
           pyproject-build
 
       - name: Verify controller runtime assets
-        run: python scripts/verify_controller_dist_assets.py dist
+        run: python scripts/verify_controller_dist_assets.py dist --dockerfile Dockerfile
 
       - name: Upload controller distributions
         uses: actions/upload-artifact@v4
@@ -40,6 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - controller-build
+      - executor-publish
     permissions:
       id-token: write
 
@@ -60,6 +104,7 @@ jobs:
 
   executor-build:
     runs-on: ubuntu-latest
+    needs: common-publish
 
     steps:
       - uses: actions/checkout@v4
@@ -72,8 +117,8 @@ jobs:
         env:
           COGNIS_SKIP_UI_BUILD: "1"
         run: |
-          python -m pip install build
-          python scripts/build_executor_package.py --out-dir dist-executor
+          python -m pip install uv
+          uv build --package cognis-executor --out-dir dist-executor
 
       - name: Upload executor distributions
         uses: actions/upload-artifact@v4

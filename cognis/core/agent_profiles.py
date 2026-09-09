@@ -11,7 +11,7 @@ from cognis.models.agent import AgentDefinition, AgentRuntimeProfile
 def agent_profile_options(agent: AgentDefinition) -> list[dict[str, str | bool]]:
     """Return enabled runtime profiles in a tool-friendly discovery shape."""
 
-    options = [
+    options: list[dict[str, str | bool]] = [
         {
             "profile_id": profile_id,
             "description": profile.description,

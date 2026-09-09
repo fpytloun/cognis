@@ -30,12 +30,31 @@ def test_time_to_first_token_follow_up(live_stack: LiveStack, run_id: str) -> No
     # Warm-up turn
     events1 = live_chat_ws(live_stack, cid, "Hello, I am warming up the context.")
     assert any(e["type"] == "message_complete" for e in events1)
+    first = next(e["snapshot"] for e in events1 if e["type"] == "chat_v2_snapshot")
+    first_generation = first["runtime"]["last_generation"]
+    assert first_generation and first_generation["completion_tokens"] > 0
+    first_messages = {
+        item["id"]
+        for item in first["timeline"]["items"]
+        if item.get("kind") == "message" and item.get("role") == "assistant"
+    }
 
     time.sleep(1)
 
     # Measure follow-up turn
     start = time.monotonic()
     events2 = live_chat_ws(live_stack, cid, "What is 1 + 1?")
+    second = next(e["snapshot"] for e in events2 if e["type"] == "chat_v2_snapshot")
+    second_generation = second["runtime"]["last_generation"]
+    assert second_generation and second_generation["completion_tokens"] > 0
+    assert second_generation["measured_at"] > first_generation["measured_at"]
+    assert not second["runtime"]["has_active_turn"]
+    assert any(
+        item.get("kind") == "message"
+        and item.get("role") == "assistant"
+        and item["id"] not in first_messages
+        for item in second["timeline"]["items"]
+    )
     first_chunk = next((e for e in events2 if e.get("type") == "chunk"), None)
     if first_chunk:
         # Approximate TTFT from the events list

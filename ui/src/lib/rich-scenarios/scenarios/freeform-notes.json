@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "id": "freeform-notes",
+  "title": "Freeform working notes",
+  "description": "A reflective, prose-heavy note where the content shapes the layout instead of forcing dashboard-style blocks.",
+  "group": "narrative",
+  "sort_key": 900,
+  "content": "Working notes fallback on renderer convergence and the cost of over-carding content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Working notes",
+      "subtitle": "Prose stays prose: not every deliverable needs metrics or cards."
+    },
+    "blocks": [
+      {
+        "type": "markdown",
+        "title": "On not over-carding everything",
+        "content": "The instinct once a renderer supports cards is to put everything in a card. That is a mistake for reflective or narrative content.\n\nA working note, a design rationale, or a retrospective reads better as ordinary paragraphs with real hierarchy than as a grid of same-weight tiles. The reader benefits from continuity of thought, not from scanning fragments."
+      },
+      {
+        "type": "section",
+        "title": "Where structure earns its place",
+        "content": "Structure should appear only where the content actually has that shape.",
+        "blocks": [
+          {
+            "type": "timeline",
+            "title": "How this view evolved",
+            "items": [
+              {
+                "time": "Draft 1",
+                "title": "Dashboard-first",
+                "content": "Everything was a metric or a status card. It looked busy and said little."
+              },
+              {
+                "time": "Draft 2",
+                "title": "Narrative-first",
+                "content": "Rewrote as prose with one callout for the actual conclusion."
+              },
+              {
+                "time": "Draft 3",
+                "title": "This version",
+                "content": "Kept the prose, added a timeline only because there really was a sequence to show."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "quote",
+        "content": "If a fact does not need a chart, do not give it one. If a thought does not need a card, do not give it one."
+      },
+      {
+        "type": "markdown",
+        "content": "The rest of this note is intentionally plain: a closing reflection rather than a summary card, because a one-line status pill would flatten the point being made."
+      }
+    ],
+    "sources": [],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

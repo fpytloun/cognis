@@ -57,6 +57,34 @@ async def test_credentials_provider_roundtrip_and_resolution(
         payload={"token": "abc"},
     )
     assert created.field_names == ["token"]
+    idempotent_first = await provider.upsert_credential(
+        credential_id="idempotent_token",
+        user_email="user@example.com",
+        kind="token",
+        label="Idempotent token",
+        payload={"token": "first"},
+        metadata={"idempotency_key": "submission-1"},
+    )
+    idempotent_retry = await provider.upsert_credential(
+        credential_id="idempotent_token",
+        user_email="user@example.com",
+        kind="token",
+        label="Idempotent token",
+        payload={"token": "second"},
+        metadata={"idempotency_key": "submission-1"},
+    )
+    assert idempotent_retry.version == idempotent_first.version
+    assert idempotent_retry.metadata["idempotency_key"] == "submission-1"
+    distinct_action = await provider.upsert_credential(
+        credential_id="idempotent_token",
+        user_email="user@example.com",
+        kind="token",
+        label="Idempotent token",
+        payload={"token": "second"},
+        metadata={"idempotency_key": "other-action:submission-1"},
+    )
+    assert distinct_action.version == idempotent_first.version + 1
+    assert distinct_action.metadata["idempotency_key"] == "other-action:submission-1"
 
     record = await provider.get_credential("github_work", "user@example.com")
     assert record is not None

@@ -21,14 +21,14 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _seed_user(app: object, email: str = "user@example.com") -> None:
+async def _seed_user(app: object, email: str = "user@example.com", role: str = "user") -> None:
     async with app.state.session_factory() as session:  # type: ignore[attr-defined]
         await create_user(
             session,
             email=email,
             name="User",
             password_hash=app.state.password_hasher.hash("password123"),  # type: ignore[attr-defined]
-            role="user",
+            role=role,
         )
         await session.commit()
 
@@ -184,7 +184,7 @@ def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         asyncio.run(_seed_user(client.app, email="owner@example.com"))
-        asyncio.run(_seed_user(client.app, email="admin@example.com"))
+        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
 
         async def _seed_workflow() -> None:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]

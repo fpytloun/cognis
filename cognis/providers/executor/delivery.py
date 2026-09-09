@@ -27,6 +27,7 @@ class ExecutorDeliveryError(RuntimeError):
         epoch: int | None = None,
         same_executor_only: bool = True,
         retry_after: float | None = None,
+        executor_instance_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.delivery_state = DeliveryState(delivery_state)
@@ -37,6 +38,9 @@ class ExecutorDeliveryError(RuntimeError):
         self.epoch = epoch
         self.same_executor_only = same_executor_only
         self.retry_after = retry_after
+        # Identity of the executor process that accepted the call, when known.
+        # Outcome reconciliation requires it and must not guess.
+        self.executor_instance_id = executor_instance_id
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -48,6 +52,7 @@ class ExecutorDeliveryError(RuntimeError):
             "epoch": self.epoch,
             "same_executor_only": self.same_executor_only,
             "retry_after": self.retry_after,
+            "executor_instance_id": self.executor_instance_id,
         }
 
 
@@ -57,6 +62,7 @@ class AmbiguousToolOutcome(RuntimeError):
     def __init__(
         self,
         *,
+        call_id: str | None = None,
         tool_name: str,
         argument_fingerprint: str,
         executor_id: str | None,
@@ -67,6 +73,7 @@ class AmbiguousToolOutcome(RuntimeError):
             f"Outcome of tool '{tool_name}' is ambiguous; it was not replayed automatically."
         )
         self.tool_name = tool_name
+        self.call_id = call_id
         self.argument_fingerprint = argument_fingerprint
         self.executor_id = executor_id
         self.generation = generation
@@ -89,6 +96,7 @@ class AmbiguousToolOutcome(RuntimeError):
     def detail(self) -> dict[str, Any]:
         detail: dict[str, Any] = {
             "tool_name": self.tool_name,
+            "call_id": self.call_id,
             "argument_fingerprint": self.argument_fingerprint,
             "executor_id": self.executor_id,
             "generation": self.generation,

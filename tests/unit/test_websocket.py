@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import httpx
+import pyotp
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import cognis.api.websocket as websocket_module
 from cognis.api.chat_v2.realtime import (
@@ -52,6 +55,7 @@ from cognis.api.websocket import (
     _handle_message,
     _handle_update_queued_message,
     _has_unread_from_payload,
+    _is_transient_runtime_notice,
     _render_command_result,
     _runtime_relay_cumulative_boundary,
     _workflow_composed_payload,
@@ -276,7 +280,7 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
     envelope = object()
     relay = SimpleNamespace(
         make_envelope=Mock(return_value=envelope),
-        enqueue=Mock(),
+        enqueue=Mock(return_value=True),
     )
     manager = WebSocketConnectionManager(
         SimpleNamespace(
@@ -303,6 +307,46 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
     )
 
     relay.enqueue.assert_called_once_with(envelope, cumulative_boundary=False)
+
+
+@pytest.mark.asyncio
+async def test_terminal_runtime_relay_logs_enqueue_rejection(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    context = RelayGenerationContext(
+        direct_request_id="request-1",
+        turn_id="turn-1",
+        session_id="session-1",
+        conversation_id="conversation-1",
+        owner_controller_id="controller-a",
+        owner_incarnation_id="boot-a",
+        fencing_token=7,
+    )
+    scheduler = SimpleNamespace(
+        relay_generation_context=Mock(return_value=context),
+        running_turn_state=Mock(return_value=None),
+    )
+    relay = SimpleNamespace(
+        make_envelope=Mock(return_value=object()),
+        enqueue=Mock(return_value=False),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                turn_scheduler=scheduler,
+                chat_v2_runtime_relay=relay,
+            )
+        )
+    )
+
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conversation-1",
+        volatile_items=[],
+        active_session_id="session-1",
+        has_active_turn=False,
+    )
+
+    assert "Chat v2 terminal runtime relay enqueue failed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -372,7 +416,7 @@ async def test_cluster_invalidation_reaches_only_authorized_scope_owner_and_mark
 
 
 @pytest.mark.asyncio
-async def test_work_invalidation_reaches_only_matching_authorized_scope() -> None:
+async def test_work_invalidation_reaches_all_owner_connections_only() -> None:
     manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
     manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
         return_value="owner@example.com"
@@ -399,7 +443,17 @@ async def test_work_invalidation_reaches_only_matching_authorized_scope() -> Non
         },
         send_scope_invalidation_nowait=Mock(return_value=True),
     )
-    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    generic_owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {  # noqa: SLF001
+        "owner": owner,
+        "generic-owner": generic_owner,
+        "foreign": foreign,
+    }
+    manager._by_user["owner@example.com"].update({"owner", "generic-owner"})  # noqa: SLF001
     manager._by_chat_v2_scope["conversation:conv-1"].add("owner")  # noqa: SLF001
     manager._by_chat_v2_scope["conversation:conv-2"].add("foreign")  # noqa: SLF001
 
@@ -425,7 +479,124 @@ async def test_work_invalidation_reaches_only_matching_authorized_scope() -> Non
             "work_scope_key": "conversation:conv-1",
         }
     )
+    generic_owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "work_invalidated",
+            "reason": "work_invalidated",
+            "revision": "9",
+            "work_scope_key": "conversation:conv-1",
+        }
+    )
     foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_owner_wildcard_work_invalidation_reaches_all_visible_owner_scopes_only() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value="owner@example.com"
+    )
+    conversation = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={
+            "conversation:conv-1": TimelineScope(
+                key="conversation:conv-1",
+                kind="conversation",
+                conversation_id="conv-1",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    task_step = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={
+            "task_step:step-1": TimelineScope(
+                key="task_step:step-1",
+                kind="task_step",
+                task_id="task-1",
+                step_run_id="step-1",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={
+            "conversation:conv-2": TimelineScope(
+                key="conversation:conv-2",
+                kind="conversation",
+                conversation_id="conv-2",
+            )
+        },
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {  # noqa: SLF001
+        "conversation": conversation,
+        "task-step": task_step,
+        "foreign": foreign,
+    }
+    manager._by_user["owner@example.com"].update({"conversation", "task-step"})  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-1"].add("conversation")  # noqa: SLF001
+    manager._by_chat_v2_scope["task_step:step-1"].add("task-step")  # noqa: SLF001
+    manager._by_chat_v2_scope["conversation:conv-2"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "work_invalidated",
+                "revision": "10",
+                "scope": {
+                    "owner_token": "a" * 64,
+                    "work_scope_key": "*",
+                },
+            },
+        )
+    )
+
+    expected = {
+        "type": "work_invalidated",
+        "reason": "work_invalidated",
+        "revision": "10",
+        "work_scope_key": "*",
+    }
+    conversation.send_scope_invalidation_nowait.assert_called_once_with(expected)
+    task_step.send_scope_invalidation_nowait.assert_called_once_with(expected)
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_work_invalidation_coalescing_never_regresses_revision() -> None:
+    connection = AuthenticatedWebSocket(
+        connection_id="connection-1",
+        websocket=AsyncMock(),
+        user_email="owner@example.com",
+        role="user",
+    )
+    connection._writer_task = asyncio.create_task(asyncio.Event().wait())  # noqa: SLF001
+    try:
+        assert connection.send_scope_invalidation_nowait(
+            {
+                "type": "work_invalidated",
+                "reason": "work_invalidated",
+                "revision": "12",
+                "work_scope_key": "conversation:conv-1",
+            }
+        )
+        assert connection.send_scope_invalidation_nowait(
+            {
+                "type": "work_invalidated",
+                "reason": "work_invalidated",
+                "revision": "9",
+                "work_scope_key": "conversation:conv-1",
+            }
+        )
+        frame = connection._outbound_queue.get_nowait()  # noqa: SLF001
+        assert frame.payload is not None
+        assert frame.payload["revision"] == "12"
+        connection._outbound_queue.task_done()  # noqa: SLF001
+    finally:
+        await connection.close()
 
 
 @pytest.mark.asyncio
@@ -624,6 +795,121 @@ async def test_sidebar_owner_token_routes_without_exposing_email() -> None:
             "type": "scope_invalidated",
             "reason": "sidebar_changed",
             "revision": "44",
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "scope", "expected_fields"),
+    [
+        (
+            "notification_state_changed",
+            {"owner_token": "a" * 64, "conversation_id": "conv-1"},
+            {"conversation_id": "conv-1"},
+        ),
+        (
+            "task_progress_changed",
+            {"owner_token": "a" * 64, "task_id": "task-1"},
+            {"task_id": "task-1"},
+        ),
+    ],
+)
+async def test_owner_wide_cluster_state_invalidation_is_owner_isolated(
+    kind: str,
+    scope: dict[str, str],
+    expected_fields: dict[str, str],
+) -> None:
+    cluster_signals = SimpleNamespace(
+        owner_token_matches=lambda email, token: email == "owner@example.com" and token == "a" * 64
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                session_cache=None,
+                cluster_signals=cluster_signals,
+            )
+        )
+    )
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value=None
+    )
+    owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    manager._by_user["owner@example.com"].add("owner")  # noqa: SLF001
+    manager._by_user["foreign@example.com"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={"kind": kind, "revision": "45", "scope": scope},
+        )
+    )
+
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "scope_invalidated",
+            "reason": kind,
+            "revision": "45",
+            **expected_fields,
+        }
+    )
+    foreign.send_scope_invalidation_nowait.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_action_cluster_invalidation_forwards_schedule_id_to_owner() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    manager._resolve_cluster_signal_owner = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+        return_value="owner@example.com"
+    )
+    owner = SimpleNamespace(
+        user_email="owner@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    foreign = SimpleNamespace(
+        user_email="foreign@example.com",
+        chat_v2_scopes={},
+        send_scope_invalidation_nowait=Mock(return_value=True),
+    )
+    manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
+    manager._by_user["owner@example.com"].add("owner")  # noqa: SLF001
+    manager._by_user["foreign@example.com"].add("foreign")  # noqa: SLF001
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.CLUSTER_SCOPE_INVALIDATED,
+            data={
+                "kind": "schedule_action_changed",
+                "revision": "2026-08-25T22:00:00Z:notif_schedule_sched-1",
+                "scope": {
+                    "owner_token": "a" * 64,
+                    "conversation_id": "schedule:sched-1",
+                    "schedule_id": "sched-1",
+                    "notification_id": "notif_schedule_sched-1",
+                },
+            },
+        )
+    )
+
+    owner.send_scope_invalidation_nowait.assert_called_once_with(
+        {
+            "type": "schedule_action_changed",
+            "reason": "schedule_action_changed",
+            "revision": "2026-08-25T22:00:00Z:notif_schedule_sched-1",
+            "conversation_id": "schedule:sched-1",
+            "schedule_id": "sched-1",
         }
     )
     foreign.send_scope_invalidation_nowait.assert_not_called()
@@ -1348,6 +1634,7 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
             context_usage: dict[str, Any] | None,
             last_generation: dict[str, Any] | None,
             active_turn: dict[str, Any] | None = None,
+            boundary_receipts: list[Any] | None = None,
         ) -> None:
             del (
                 conversation_id,
@@ -1356,6 +1643,7 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
                 context_usage,
                 last_generation,
                 active_turn,
+                boundary_receipts,
             )
             runtime_frames.append(volatile_items)
 
@@ -1408,6 +1696,77 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
     assert {item.id for item in runtime_frames[-1]} == {
         assistant.id,
         notice.id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_settlement_removes_only_transient_recovery_notices() -> None:
+    runtime_frames: list[list[TimelineItem]] = []
+
+    class _LocalRuntimeManager(WebSocketConnectionManager):
+        async def _fanout_chat_v2_runtime(  # noqa: PLR0913
+            self,
+            conversation_id: str,
+            *,
+            volatile_items: list[TimelineItem],
+            has_active_turn: bool,
+            active_session_id: str | None,
+            context_usage: dict[str, Any] | None,
+            last_generation: dict[str, Any] | None,
+            active_turn: dict[str, Any] | None = None,
+            boundary_receipts: list[Any] | None = None,
+        ) -> None:
+            del (
+                conversation_id,
+                has_active_turn,
+                active_session_id,
+                context_usage,
+                last_generation,
+                active_turn,
+                boundary_receipts,
+            )
+            runtime_frames.append(volatile_items)
+
+    manager = _LocalRuntimeManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                chat_v2_runtime_relay=None,
+                turn_scheduler=SimpleNamespace(
+                    relay_generation_context=lambda _conversation_id: SimpleNamespace(
+                        turn_id="turn-1"
+                    )
+                ),
+            )
+        )
+    )
+    notices = [
+        system_message_runtime_item(
+            notice_id=f"recovery:{scope}",
+            content=f"Recovery {scope}",
+            turn_id="turn-1",
+            session_id="sess-1",
+            timestamp=datetime.now(UTC).isoformat(),
+            notice_kind="model_recovery" if scope != "transient_retry" else "intaris_recovery",
+            notice_scope=scope,
+        )
+        for scope in ("retry", "transient_retry", "turn", "continuation")
+    ]
+
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1",
+        volatile_items=notices,
+        active_session_id="sess-1",
+    )
+    await manager.send_chat_v2_runtime_to_conversation(
+        "conv-1",
+        volatile_items=notices,
+        has_active_turn=False,
+        active_session_id="sess-1",
+    )
+
+    assert {item.notice_scope for item in runtime_frames[-1]} == {
+        "turn",
+        "continuation",
     }
 
 
@@ -1661,10 +2020,81 @@ class _NullSession:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         return None
 
+    async def scalar(self, _statement: Any) -> int:
+        return 1
+
 
 # ---------------------------------------------------------------------------
 # Event-to-payload mapping tests
 # ---------------------------------------------------------------------------
+
+
+def test_managed_question_payload_includes_safe_origin_fields() -> None:
+    event = Event(
+        type=EventType.NOTIFICATION_CREATED,
+        data={
+            "notification_id": "question-1",
+            "notification_type": "step_question",
+            "conversation_id": "conversation-parent",
+            "payload": {
+                "questions": [{"id": "scope", "question": "Which scope?"}],
+                "context": {"context": "Choose a scope."},
+                "managed_conversation_title": "Research helper",
+                "managed_target_agent_id": "lumi",
+                "managed_origin_conversation_id": "conversation-child",
+            },
+        },
+    )
+
+    payload = _event_to_payload(event, "conversation-parent")
+
+    assert payload is not None
+    assert payload["type"] == "workflow_step_question"
+    assert payload["managed_conversation_title"] == "Research helper"
+    assert payload["managed_target_agent_id"] == "lumi"
+    assert payload["managed_origin_conversation_id"] == "conversation-child"
+
+
+@pytest.mark.asyncio
+async def test_managed_notification_fans_out_to_parent_and_origin() -> None:
+    class _DualScopeManager(_RecordingWebSocketManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.state_scopes: list[str] = []
+
+        async def _fanout_conversation_state_delta(self, event: Event) -> None:
+            self.state_scopes.append(str(event.data["conversation_id"]))
+
+        async def _notification_attention_payload(
+            self,
+            event: Event,
+            conversation_id: str,
+        ) -> None:
+            del event, conversation_id
+            return None
+
+    manager = _DualScopeManager()
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.NOTIFICATION_CREATED,
+            data={
+                "notification_id": "question-1",
+                "notification_type": "step_question",
+                "conversation_id": "conversation-parent",
+                "user_email": "user@example.com",
+                "payload": {
+                    "questions": [{"id": "scope", "question": "Which scope?"}],
+                    "managed_origin_conversation_id": "conversation-child",
+                },
+            },
+        )
+    )
+
+    assert [scope for scope, _payload in manager.sent_payloads] == [
+        "conversation-parent",
+        "conversation-child",
+    ]
+    assert manager.state_scopes == ["conversation-parent", "conversation-child"]
 
 
 def test_delegation_completed_payload_includes_durable_result_fields() -> None:
@@ -1774,7 +2204,18 @@ def test_session_compaction_finished_payload_clears_runtime_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item() -> None:
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "idle_checkpoint",
+        "pre_turn_auto",
+        "pre_model_pressure",
+        "tool_loop_pressure",
+        "post_turn_auto",
+        "provider_context_overflow",
+    ],
+)
+async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item(trigger: str) -> None:
     manager = _RecordingWebSocketManager()
 
     await manager._handle_event(  # noqa: SLF001
@@ -1783,7 +2224,7 @@ async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item() -> None:
             data={
                 "conversation_id": "conversation-1",
                 "session_id": "session-old",
-                "trigger": "idle_checkpoint",
+                "trigger": trigger,
                 "reason": "long_lived_chat_idle",
             },
         )
@@ -1798,7 +2239,7 @@ async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item() -> None:
                 "summary_preview": "Older context was compacted.",
                 "method": "llm",
                 "turns_compacted": 12,
-                "trigger": "idle_checkpoint",
+                "trigger": trigger,
                 "reason": "long_lived_chat_idle",
             },
         )
@@ -1818,6 +2259,33 @@ async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item() -> None:
     assert compacted_item.session_id == "session-new"
     assert compacted_item.previous_session_id == "session-old"
     assert compacted_item.summary_preview == "Older context was compacted."
+
+
+@pytest.mark.asyncio
+async def test_turn_initiated_system_notice_is_added_before_active_turn_runtime() -> None:
+    manager = _RecordingWebSocketManager()
+
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=EventType.SYSTEM_NOTICE,
+            data={
+                "conversation_id": "conversation-1",
+                "session_id": "session-1",
+                "notice_id": "turn-init:follow-up-1",
+                "kind": "turn_initiated",
+                "scope": "turn",
+                "turn_id": "turn-follow-up-1",
+                "message": "Turn initiated by background tool completion.",
+            },
+        )
+    )
+
+    assert len(manager.chat_v2_runtime_items) == 1
+    item = manager.chat_v2_runtime_items[0][0]
+    assert item.id == "system:turn-init:follow-up-1"
+    assert item.notice_kind == "turn_initiated"
+    assert item.turn_id == "turn-follow-up-1"
+    assert item.sort_key.startswith("9997:")
 
 
 # ---------------------------------------------------------------------------
@@ -1933,16 +2401,34 @@ async def test_connection_manager_sends_user_payload_to_all_user_connections() -
     user_ws_1 = AsyncMock()
     user_ws_2 = AsyncMock()
     other_ws = AsyncMock()
-    await manager.connect(user_ws_1, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(user_ws_2, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(other_ws, claims={"sub": "other@example.com", "role": "user"})
+    user_connection_1 = await manager.connect(
+        user_ws_1, claims={"sub": "user@example.com", "role": "user"}
+    )
+    user_connection_2 = await manager.connect(
+        user_ws_2, claims={"sub": "user@example.com", "role": "user"}
+    )
+    other_connection = await manager.connect(
+        other_ws, claims={"sub": "other@example.com", "role": "user"}
+    )
+    for connection in (user_connection_1, user_connection_2, other_connection):
+        connection.ready_for_fanout = True
 
     payload = {"type": "conversation_updated", "conversation_id": "conv-1"}
     await manager.send_to_user("user@example.com", payload)
+    await asyncio.gather(
+        user_connection_1.wait_outbound_drained(),
+        user_connection_2.wait_outbound_drained(),
+        other_connection.wait_outbound_drained(),
+    )
 
     user_ws_1.send_json.assert_awaited_once_with(payload)
     user_ws_2.send_json.assert_awaited_once_with(payload)
     other_ws.send_json.assert_not_called()
+    await asyncio.gather(
+        manager.disconnect(user_connection_1),
+        manager.disconnect(user_connection_2),
+        manager.disconnect(other_connection),
+    )
 
 
 @pytest.mark.asyncio
@@ -1957,26 +2443,29 @@ async def test_conversation_fanout_does_not_wait_for_slow_consumer() -> None:
     fast = await manager.connect(
         cast(Any, fast_ws), claims={"sub": "user@example.com", "role": "user"}
     )
+    slow.ready_for_fanout = True
+    fast.ready_for_fanout = True
     manager.subscribe(slow, "conv-1")
     manager.subscribe(fast, "conv-1")
 
-    await asyncio.wait_for(
-        manager.send_to_conversation(
-            "conv-1",
-            {"type": "message_delta", "conversation_id": "conv-1", "message_id": "msg-1"},
-        ),
-        timeout=0.05,
-    )
+    try:
+        await asyncio.wait_for(
+            manager.send_to_conversation(
+                "conv-1",
+                {"type": "message_delta", "conversation_id": "conv-1", "message_id": "msg-1"},
+            ),
+            timeout=0.05,
+        )
 
-    assert slow_ws.started.is_set()
-    assert fast_ws.payloads == [
-        {"type": "message_delta", "conversation_id": "conv-1", "message_id": "msg-1"}
-    ]
-    slow_ws.release.set()
-    await slow.wait_outbound_drained()
-    await fast.wait_outbound_drained()
-    await manager.disconnect(slow)
-    await manager.disconnect(fast)
+        await asyncio.wait_for(slow_ws.started.wait(), timeout=1)
+        await fast.wait_outbound_drained()
+        assert fast_ws.payloads == [
+            {"type": "message_delta", "conversation_id": "conv-1", "message_id": "msg-1"}
+        ]
+    finally:
+        slow_ws.release.set()
+        await asyncio.gather(slow.wait_outbound_drained(), fast.wait_outbound_drained())
+        await asyncio.gather(manager.disconnect(slow), manager.disconnect(fast))
 
 
 @pytest.mark.asyncio
@@ -2032,6 +2521,8 @@ async def test_conversation_fanout_includes_chat_v2_subscribers_when_requested()
     chat_v2 = await manager.connect(
         cast(Any, chat_v2_ws), claims={"sub": "user@example.com", "role": "user"}
     )
+    legacy.ready_for_fanout = True
+    chat_v2.ready_for_fanout = True
     manager.subscribe(legacy, "conv-1")
     manager.subscribe_chat_v2(
         chat_v2,
@@ -2051,8 +2542,7 @@ async def test_conversation_fanout_includes_chat_v2_subscribers_when_requested()
         {"type": "escalation", "conversation_id": "conv-1", "call_id": "call-1"}
     ]
     assert chat_v2_ws.payloads == legacy_ws.payloads
-    await manager.disconnect(legacy)
-    await manager.disconnect(chat_v2)
+    await asyncio.gather(manager.disconnect(legacy), manager.disconnect(chat_v2))
 
 
 @pytest.mark.asyncio
@@ -2737,6 +3227,33 @@ def test_event_bus_system_notice_preserves_retry_metadata() -> None:
     assert payload["recoverable"] is True
 
 
+@pytest.mark.parametrize(
+    ("notice_kind", "notice_scope", "expected"),
+    [
+        ("model_recovery", "retry", True),
+        ("intaris_recovery", "transient_retry", True),
+        ("model_recovery", "turn", False),
+        ("model_recovery", "continuation", False),
+    ],
+)
+def test_transient_runtime_notice_classification(
+    notice_kind: str,
+    notice_scope: str,
+    expected: bool,
+) -> None:
+    item = system_message_runtime_item(
+        notice_id=f"{notice_kind}:{notice_scope}",
+        content="Recovery notice",
+        turn_id="turn-1",
+        session_id="sess-1",
+        timestamp="2026-01-01T00:00:00Z",
+        notice_kind=notice_kind,
+        notice_scope=notice_scope,
+    )
+
+    assert _is_transient_runtime_notice(item) is expected
+
+
 def test_assistant_runtime_payload_accepts_only_dict_metadata() -> None:
     runtime = {"agent_id": "laforge", "model": "gpt-5.1", "reasoning_effort": "high"}
 
@@ -2800,20 +3317,7 @@ async def test_conversation_updated_fanout_enriches_read_timestamps(
 async def test_notification_events_emit_user_wide_attention_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    pending_calls: list[tuple[str, list[str]]] = []
-
-    async def _fake_pending_types(
-        _session: Any, user_email: str, conversation_ids: list[str]
-    ) -> dict[str, list[str]]:
-        assert user_email == "user@example.com"
-        assert conversation_ids == ["conv-1"]
-        pending_calls.append((user_email, conversation_ids))
-        return {"conv-1": ["gate"]} if len(pending_calls) == 1 else {"conv-1": []}
-
-    monkeypatch.setattr(
-        "cognis.api.websocket.list_pending_notification_types_by_conversation",
-        _fake_pending_types,
-    )
+    del monkeypatch
     app = SimpleNamespace(
         state=SimpleNamespace(
             event_bus=None,
@@ -2825,14 +3329,30 @@ async def test_notification_events_emit_user_wide_attention_refresh(
         )
     )
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     user_ws_1 = AsyncMock()
     user_ws_2 = AsyncMock()
     other_ws = AsyncMock()
     admin_ws = AsyncMock()
-    await manager.connect(user_ws_1, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(user_ws_2, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(other_ws, claims={"sub": "other@example.com", "role": "user"})
-    await manager.connect(admin_ws, claims={"sub": "admin@example.com", "role": "admin"})
+    user_connection_1 = await manager.connect(
+        user_ws_1, claims={"sub": "user@example.com", "role": "user"}
+    )
+    user_connection_2 = await manager.connect(
+        user_ws_2, claims={"sub": "user@example.com", "role": "user"}
+    )
+    other_connection = await manager.connect(
+        other_ws, claims={"sub": "other@example.com", "role": "user"}
+    )
+    admin_connection = await manager.connect(
+        admin_ws, claims={"sub": "admin@example.com", "role": "admin"}
+    )
+    for connection in (
+        user_connection_1,
+        user_connection_2,
+        other_connection,
+        admin_connection,
+    ):
+        connection.ready_for_fanout = True
 
     await manager._handle_event(
         Event(
@@ -2846,17 +3366,24 @@ async def test_notification_events_emit_user_wide_attention_refresh(
             },
         )
     )
+    await asyncio.gather(
+        user_connection_1.wait_outbound_drained(),
+        user_connection_2.wait_outbound_drained(),
+        other_connection.wait_outbound_drained(),
+        admin_connection.wait_outbound_drained(),
+    )
 
-    pending_payload = {
-        "type": "conversation_updated",
-        "conversation_id": "conv-1",
-        "pending_notification_types": ["gate"],
-        "has_active_turn": False,
-        "active_turn_chat_mode": None,
-        "active_turn_chat_mode_source": None,
-    }
-    user_ws_1.send_json.assert_awaited_once_with(pending_payload)
-    user_ws_2.send_json.assert_awaited_once_with(pending_payload)
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+        },
+        include_subscribers=True,
+    )
+    user_ws_1.send_json.assert_not_awaited()
+    user_ws_2.send_json.assert_not_awaited()
     other_ws.send_json.assert_not_called()
     admin_ws.send_json.assert_not_called()
 
@@ -2869,22 +3396,53 @@ async def test_notification_events_emit_user_wide_attention_refresh(
                 "user_email": "user@example.com",
                 "conversation_id": "conv-1",
                 "decision": "approve",
+                "resumes_execution": True,
             },
         )
     )
+    await asyncio.gather(
+        user_connection_1.wait_outbound_drained(),
+        user_connection_2.wait_outbound_drained(),
+    )
 
-    resolved_payload = {
-        "type": "conversation_updated",
-        "conversation_id": "conv-1",
-        "pending_notification_types": [],
-        "has_active_turn": False,
-        "active_turn_chat_mode": None,
-        "active_turn_chat_mode_source": None,
+    assert manager.send_sidebar_update_to_owner.await_count == 2
+    assert manager.send_sidebar_update_to_owner.await_args_list[-1].args == (
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+            "has_active_turn_override": True,
+        },
+    )
+    assert manager.send_sidebar_update_to_owner.await_args_list[-1].kwargs == {
+        "include_subscribers": True
     }
-    assert user_ws_1.send_json.await_args_list[-1].args == (resolved_payload,)
-    assert user_ws_2.send_json.await_args_list[-1].args == (resolved_payload,)
+    manager.send_sidebar_update_to_owner.reset_mock()
+    await manager._handle_event(
+        Event(
+            type=EventType.NOTIFICATION_RESOLVED,
+            data={
+                "notification_id": "notif-orphaned",
+                "notification_type": "gate",
+                "user_email": "user@example.com",
+                "conversation_id": "conv-1",
+                "decision": "cancelled",
+            },
+        )
+    )
+    assert (
+        manager.send_sidebar_update_to_owner.await_args.args[1].get("has_active_turn_override")
+        is None
+    )
     other_ws.send_json.assert_not_called()
     admin_ws.send_json.assert_not_called()
+    await asyncio.gather(
+        manager.disconnect(user_connection_1),
+        manager.disconnect(user_connection_2),
+        manager.disconnect(other_connection),
+        manager.disconnect(admin_connection),
+    )
 
 
 @pytest.mark.asyncio
@@ -3103,6 +3661,42 @@ async def test_writer_send_timeout_releases_more_waiters_than_queue_capacity() -
 
 
 @pytest.mark.asyncio
+async def test_nonblocking_fanout_overflow_uses_one_bounded_abort_task() -> None:
+    blocked_ws = _BlockedWebSocket()
+    connection = AuthenticatedWebSocket(
+        connection_id="slow-fanout",
+        websocket=cast(Any, blocked_ws),
+        user_email="user@test.com",
+        role="user",
+    )
+    await connection.send_text(
+        "{}",
+        msg_type="chat_v2_frame",
+        message_id=None,
+        conversation_id="conv-1",
+        block=False,
+    )
+    await blocked_ws.started.wait()
+
+    for index in range(DEFAULT_OUTBOUND_BUFFER + 50):
+        await connection.send_text(
+            f'{{"index":{index}}}',
+            msg_type="chat_v2_frame",
+            message_id=None,
+            conversation_id="conv-1",
+            block=False,
+        )
+
+    overflow_task = connection._overflow_task  # noqa: SLF001
+    assert overflow_task is not None
+    await asyncio.wait_for(overflow_task, timeout=1)
+    assert connection._closed  # noqa: SLF001
+    assert blocked_ws.closed == (1013, "WebSocket outbound buffer overflow")
+    assert connection._outbound_queue.empty()  # noqa: SLF001
+    await connection.close()
+
+
+@pytest.mark.asyncio
 async def test_critical_message_not_dropped_when_buffer_full() -> None:
     """Non-droppable messages are delivered in order through the writer queue."""
     mock_ws = AsyncMock()
@@ -3155,14 +3749,17 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
             event_bus=None,
             turn_scheduler=SimpleNamespace(
                 add_observer=lambda _conversation_id, _observer: None,
+                remove_observer=lambda _conversation_id, _observer: None,
                 running_turn_state=lambda _conversation_id: None,
             ),
             session_factory=lambda: _NullSession(),
         )
     )
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     user_ws = AsyncMock()
     connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    connection.ready_for_fanout = True
     manager.subscribe(connection, "conv-1")
 
     completed_at = "2026-01-02T03:04:00+00:00"
@@ -3173,16 +3770,20 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
                 "conversation_id": "conv-1",
                 "session_id": "sess-1",
                 "message_id": "msg-1",
+                "turn_id": "turn-1",
                 "completed_at": completed_at,
             },
         )
     )
 
+    await connection.wait_outbound_drained()
     payloads = [json.loads(call.args[0]) for call in user_ws.send_text.await_args_list]
     assert payloads[0]["type"] == "turn_settled"
+    assert payloads[0]["turn_id"] == "turn-1"
     assert payloads[1] == {
         "type": "conversation_updated",
         "conversation_id": "conv-1",
+        "turn_id": "turn-1",
         "has_active_turn": False,
         "active_turn_chat_mode": None,
         "active_turn_chat_mode_source": None,
@@ -3190,6 +3791,19 @@ async def test_turn_completion_event_emits_activity_correction() -> None:
         "last_message_at": completed_at,
         "updated_at": completed_at,
     }
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+            "has_active_turn_override": False,
+            "active_turn_chat_mode": None,
+            "active_turn_chat_mode_source": None,
+        },
+        include_subscribers=True,
+    )
+    await manager.disconnect(connection)
 
 
 @pytest.mark.asyncio
@@ -3199,14 +3813,17 @@ async def test_turn_completion_event_preserves_activity_for_pending_continuation
             event_bus=None,
             turn_scheduler=SimpleNamespace(
                 add_observer=lambda _conversation_id, _observer: None,
+                remove_observer=lambda _conversation_id, _observer: None,
                 running_turn_state=lambda _conversation_id: None,
             ),
             session_factory=lambda: _NullSession(),
         )
     )
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     user_ws = AsyncMock()
     connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    connection.ready_for_fanout = True
     manager.subscribe(connection, "conv-1")
 
     completed_at = "2026-01-02T03:04:00+00:00"
@@ -3217,6 +3834,7 @@ async def test_turn_completion_event_preserves_activity_for_pending_continuation
                 "conversation_id": "conv-1",
                 "session_id": "sess-1",
                 "message_id": "msg-1",
+                "turn_id": "turn-1",
                 "completed_at": completed_at,
                 "chat_mode": "build",
                 "chat_mode_source": "user_explicit",
@@ -3225,11 +3843,13 @@ async def test_turn_completion_event_preserves_activity_for_pending_continuation
         )
     )
 
+    await connection.wait_outbound_drained()
     payloads = [json.loads(call.args[0]) for call in user_ws.send_text.await_args_list]
     assert payloads[0]["type"] == "turn_settled"
     assert payloads[1] == {
         "type": "conversation_updated",
         "conversation_id": "conv-1",
+        "turn_id": "turn-1",
         "has_active_turn": True,
         "active_turn_chat_mode": "build",
         "active_turn_chat_mode_source": "user_explicit",
@@ -3237,6 +3857,19 @@ async def test_turn_completion_event_preserves_activity_for_pending_continuation
         "last_message_at": completed_at,
         "updated_at": completed_at,
     }
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+            "has_active_turn_override": True,
+            "active_turn_chat_mode": "build",
+            "active_turn_chat_mode_source": "user_explicit",
+        },
+        include_subscribers=True,
+    )
+    await manager.disconnect(connection)
 
 
 @pytest.mark.asyncio
@@ -3246,14 +3879,17 @@ async def test_turn_started_event_emits_activity_correction() -> None:
             event_bus=None,
             turn_scheduler=SimpleNamespace(
                 add_observer=lambda _conversation_id, _observer: None,
+                remove_observer=lambda _conversation_id, _observer: None,
                 running_turn_state=lambda _conversation_id: None,
             ),
             session_factory=lambda: _NullSession(),
         )
     )
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     user_ws = AsyncMock()
     connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    connection.ready_for_fanout = True
     manager.subscribe(connection, "conv-1")
 
     started_at = "2026-01-02T03:03:00+00:00"
@@ -3264,6 +3900,7 @@ async def test_turn_started_event_emits_activity_correction() -> None:
                 "conversation_id": "conv-1",
                 "session_id": "sess-1",
                 "message_id": "msg-1",
+                "turn_id": "turn-1",
                 "started_at": started_at,
                 "chat_mode": "plan",
                 "chat_mode_source": "user",
@@ -3271,11 +3908,13 @@ async def test_turn_started_event_emits_activity_correction() -> None:
         )
     )
 
+    await connection.wait_outbound_drained()
     payloads = [json.loads(call.args[0]) for call in user_ws.send_text.await_args_list]
     assert payloads[0]["type"] == "turn_started"
     assert payloads[1] == {
         "type": "conversation_updated",
         "conversation_id": "conv-1",
+        "turn_id": "turn-1",
         "has_active_turn": True,
         "active_turn_chat_mode": "plan",
         "active_turn_chat_mode_source": "user",
@@ -3283,6 +3922,38 @@ async def test_turn_started_event_emits_activity_correction() -> None:
         "last_message_at": started_at,
         "updated_at": started_at,
     }
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+            "has_active_turn_override": True,
+            "active_turn_chat_mode": "plan",
+            "active_turn_chat_mode_source": "user",
+        },
+        include_subscribers=True,
+    )
+    await manager.disconnect(connection)
+
+
+def test_task_paused_activity_correction_is_inactive() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace(event_bus=None)))
+    payload = manager._conversation_activity_payload(  # noqa: SLF001
+        Event(
+            type=EventType.TASK_PAUSED,
+            data={
+                "conversation_id": "conv-1",
+                "turn_id": "turn-1",
+            },
+        ),
+        "conv-1",
+    )
+
+    assert payload is not None
+    assert payload["has_active_turn"] is False
+    assert payload["active_turn_chat_mode"] is None
+    assert payload["active_turn_chat_mode_source"] is None
 
 
 @pytest.mark.asyncio
@@ -3298,25 +3969,37 @@ async def test_turn_error_event_fans_out_sidebar_correction_to_owner_window(
 
     app = SimpleNamespace(state=SimpleNamespace(session_factory=lambda: _NullSession()))
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     sidebar_ws = AsyncMock()
-    await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
+    sidebar_connection = await manager.connect(
+        sidebar_ws, claims={"sub": "user@example.com", "role": "user"}
+    )
+    sidebar_connection.ready_for_fanout = True
 
     await manager._handle_event(
         Event(
             type=EventType.TURN_ERROR,
-            data={"conversation_id": "conv-error"},
+            data={
+                "conversation_id": "conv-error",
+                "turn_id": "turn-error",
+                "completed_at": "2026-01-02T03:05:00+00:00",
+            },
         )
     )
 
-    sidebar_ws.send_json.assert_awaited_once_with(
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-error",
         {
-            "type": "conversation_updated",
+            "type": "sidebar_conversation_upsert",
             "conversation_id": "conv-error",
-            "has_active_turn": False,
+            "revision": ANY,
+            "has_active_turn_override": False,
             "active_turn_chat_mode": None,
             "active_turn_chat_mode_source": None,
-        }
+        },
+        include_subscribers=True,
     )
+    await manager.disconnect(sidebar_connection)
 
 
 @pytest.mark.asyncio
@@ -3332,8 +4015,12 @@ async def test_sidebar_update_fans_out_to_owner_windows_outside_conversation(
         subscribed_ws,
         claims={"sub": "user@example.com", "role": "user"},
     )
-    await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(other_user_ws, claims={"sub": "other@example.com", "role": "user"})
+    sidebar = await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
+    other_user = await manager.connect(
+        other_user_ws, claims={"sub": "other@example.com", "role": "user"}
+    )
+    for connection in (subscribed, sidebar, other_user):
+        connection.ready_for_fanout = True
     manager.subscribe(subscribed, "conv-1")
 
     async def _fake_get_conversation(_session: Any, conversation_id: str) -> Any:
@@ -3348,10 +4035,20 @@ async def test_sidebar_update_fans_out_to_owner_windows_outside_conversation(
         "has_active_turn": False,
     }
     await manager.send_sidebar_update_to_owner("conv-1", payload)
+    await asyncio.gather(
+        subscribed.wait_outbound_drained(),
+        sidebar.wait_outbound_drained(),
+        other_user.wait_outbound_drained(),
+    )
 
     subscribed_ws.send_json.assert_not_awaited()
     sidebar_ws.send_json.assert_awaited_once_with(payload)
     other_user_ws.send_json.assert_not_awaited()
+    await asyncio.gather(
+        manager.disconnect(subscribed),
+        manager.disconnect(sidebar),
+        manager.disconnect(other_user),
+    )
 
 
 @pytest.mark.asyncio
@@ -3369,8 +4066,12 @@ async def test_send_sidebar_update_to_owner_can_include_subscribed_owner_tabs(
         subscribed_ws,
         claims={"sub": "user@example.com", "role": "user"},
     )
-    await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
-    await manager.connect(other_user_ws, claims={"sub": "other@example.com", "role": "user"})
+    sidebar = await manager.connect(sidebar_ws, claims={"sub": "user@example.com", "role": "user"})
+    other_user = await manager.connect(
+        other_user_ws, claims={"sub": "other@example.com", "role": "user"}
+    )
+    for connection in (subscribed, sidebar, other_user):
+        connection.ready_for_fanout = True
     manager.subscribe(subscribed, "conv-1")
 
     async def _fake_get_conversation(_session: Any, conversation_id: str) -> Any:
@@ -3381,25 +4082,246 @@ async def test_send_sidebar_update_to_owner_can_include_subscribed_owner_tabs(
 
     payload = {"type": "sidebar_conversation_removed", "conversation_id": "conv-1"}
     await manager.send_sidebar_update_to_owner("conv-1", payload, include_subscribers=True)
+    await asyncio.gather(
+        subscribed.wait_outbound_drained(),
+        sidebar.wait_outbound_drained(),
+        other_user.wait_outbound_drained(),
+    )
 
     subscribed_ws.send_json.assert_awaited_once_with(payload)
     sidebar_ws.send_json.assert_awaited_once_with(payload)
     other_user_ws.send_json.assert_not_awaited()
+    await asyncio.gather(
+        manager.disconnect(subscribed),
+        manager.disconnect(sidebar),
+        manager.disconnect(other_user),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sidebar_upsert_hydrates_canonical_runtime_and_attention(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.store.models import Conversation
+
+    now = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    conversation = Conversation(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        title="Realtime",
+        title_source="unset",
+        context_type="web",
+        context_ref="web:topic:1",
+        context_data={},
+        memory_labels={},
+        status="active",
+        last_message_at=now,
+        last_read_at=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    async def _fake_get_conversation(_session: Any, conversation_id: str) -> Conversation:
+        assert conversation_id == "conv-1"
+        return conversation
+
+    async def _fake_pending_types(
+        _session: Any, user_email: str, conversation_ids: list[str]
+    ) -> dict[str, list[str]]:
+        assert user_email == "user@example.com"
+        assert conversation_ids == ["conv-1"]
+        return {"conv-1": ["step_question"]}
+
+    monkeypatch.setattr("cognis.api.websocket.get_conversation", _fake_get_conversation)
+    monkeypatch.setattr(
+        "cognis.api.websocket.list_pending_notification_types_by_conversation",
+        _fake_pending_types,
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            event_bus=None,
+            session_factory=lambda: _NullSession(),
+            turn_scheduler=SimpleNamespace(
+                running_turn_state=lambda _conversation_id: {
+                    "turn_id": "turn-1",
+                    "chat_mode": "build",
+                    "chat_mode_source": "user",
+                }
+            ),
+        )
+    )
+    manager = WebSocketConnectionManager(app)
+    user_ws = AsyncMock()
+    connection = await manager.connect(
+        user_ws,
+        claims={"sub": "user@example.com", "role": "user"},
+    )
+    connection.ready_for_fanout = True
+
+    await manager.send_sidebar_update_to_owner(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": ANY,
+        },
+        include_subscribers=True,
+    )
+    await connection.wait_outbound_drained()
+
+    payload = user_ws.send_json.await_args.args[0]
+    assert payload["type"] == "sidebar_conversation_upsert"
+    row = payload["conversation"]
+    assert row["conversation_id"] == "conv-1"
+    assert row["has_active_turn"] is True
+    assert row["active_turn_chat_mode"] == "build"
+    assert row["active_turn_chat_mode_source"] == "user"
+    assert row["pending_notification_types"] == ["step_question"]
+    assert row["has_unread"] is True
+    await manager.disconnect(connection)
+
+
+@pytest.mark.asyncio
+async def test_sidebar_activity_override_wins_scheduler_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.store.models import Conversation
+
+    now = datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+    conversation = Conversation(
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+        title="Resume",
+        title_source="unset",
+        context_type="web",
+        context_ref="web:topic:1",
+        context_data={},
+        memory_labels={},
+        status="active",
+        last_message_at=now,
+        last_read_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+
+    async def _fake_get_conversation(_session: Any, _conversation_id: str) -> Conversation:
+        return conversation
+
+    monkeypatch.setattr("cognis.api.websocket.get_conversation", _fake_get_conversation)
+    monkeypatch.setattr(
+        "cognis.api.websocket.list_pending_notification_types_by_conversation",
+        AsyncMock(return_value={"conv-1": []}),
+    )
+    manager = WebSocketConnectionManager(
+        SimpleNamespace(
+            state=SimpleNamespace(
+                event_bus=None,
+                session_factory=lambda: _NullSession(),
+                turn_scheduler=SimpleNamespace(
+                    running_turn_state=lambda _conversation_id: {
+                        "turn_id": "turn-still-registered",
+                        "chat_mode": "build",
+                        "chat_mode_source": "user",
+                    }
+                ),
+            )
+        )
+    )
+    user_ws = AsyncMock()
+    connection = await manager.connect(
+        user_ws,
+        claims={"sub": "user@example.com", "role": "user"},
+    )
+    connection.ready_for_fanout = True
+
+    await manager.send_sidebar_update_to_owner(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": now.isoformat(),
+            "has_active_turn_override": False,
+            "active_turn_chat_mode": None,
+            "active_turn_chat_mode_source": None,
+        },
+        include_subscribers=True,
+    )
+    await connection.wait_outbound_drained()
+    settled_payload = user_ws.send_json.await_args.args[0]
+    assert settled_payload["revision"] == "1"
+    assert settled_payload["conversation"]["has_active_turn"] is False
+    assert settled_payload["conversation"]["active_turn_chat_mode"] is None
+    assert "has_active_turn_override" not in settled_payload
+
+    user_ws.send_json.reset_mock()
+    await manager.send_sidebar_update_to_owner(
+        "conv-1",
+        {
+            "type": "sidebar_conversation_upsert",
+            "conversation_id": "conv-1",
+            "revision": "2026-01-02T03:04:01+00:00",
+            "has_active_turn_override": True,
+        },
+        include_subscribers=True,
+    )
+    await connection.wait_outbound_drained()
+
+    payload = user_ws.send_json.await_args.args[0]
+    assert payload["conversation"]["has_active_turn"] is True
+    assert payload["conversation"]["pending_notification_types"] == []
+    assert "has_active_turn_override" not in payload
+    await manager.disconnect(connection)
+
+
+@pytest.mark.asyncio
+async def test_sidebar_upserts_serialize_per_conversation() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace(event_bus=None)))
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    order: list[str] = []
+
+    async def _record(
+        _conversation_id: str,
+        payload: dict[str, Any],
+        *,
+        include_subscribers: bool = False,
+    ) -> None:
+        del include_subscribers
+        order.append(f"start:{payload['revision']}")
+        if payload["revision"] == "first":
+            first_started.set()
+            await release_first.wait()
+        order.append(f"end:{payload['revision']}")
+
+    manager._send_sidebar_update_to_owner_unlocked = _record  # type: ignore[method-assign]
+    first = asyncio.create_task(
+        manager.send_sidebar_update_to_owner(
+            "conv-1",
+            {"revision": "first"},
+        )
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        manager.send_sidebar_update_to_owner(
+            "conv-1",
+            {"revision": "second"},
+        )
+    )
+    await asyncio.sleep(0)
+    assert order == ["start:first"]
+
+    release_first.set()
+    await asyncio.gather(first, second)
+    assert order == ["start:first", "end:first", "start:second", "end:second"]
 
 
 @pytest.mark.asyncio
 async def test_notification_attention_refresh_preserves_running_turn_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _fake_pending_types(
-        _session: Any, _user_email: str, _conversation_ids: list[str]
-    ) -> dict[str, list[str]]:
-        return {"conv-1": ["step_question"]}
-
-    monkeypatch.setattr(
-        "cognis.api.websocket.list_pending_notification_types_by_conversation",
-        _fake_pending_types,
-    )
+    del monkeypatch
     app = SimpleNamespace(
         state=SimpleNamespace(
             event_bus=None,
@@ -3413,8 +4335,10 @@ async def test_notification_attention_refresh_preserves_running_turn_state(
         )
     )
     manager = WebSocketConnectionManager(app)
+    manager.send_sidebar_update_to_owner = AsyncMock()
     user_ws = AsyncMock()
-    await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    connection = await manager.connect(user_ws, claims={"sub": "user@example.com", "role": "user"})
+    connection.ready_for_fanout = True
 
     await manager._handle_event(
         Event(
@@ -3428,16 +4352,16 @@ async def test_notification_attention_refresh_preserves_running_turn_state(
         )
     )
 
-    user_ws.send_json.assert_awaited_once_with(
+    manager.send_sidebar_update_to_owner.assert_awaited_once_with(
+        "conv-1",
         {
-            "type": "conversation_updated",
+            "type": "sidebar_conversation_upsert",
             "conversation_id": "conv-1",
-            "pending_notification_types": ["step_question"],
-            "has_active_turn": True,
-            "active_turn_chat_mode": "build",
-            "active_turn_chat_mode_source": "user_explicit",
-        }
+            "revision": ANY,
+        },
+        include_subscribers=True,
     )
+    await manager.disconnect(connection)
 
 
 @pytest.mark.asyncio
@@ -3589,6 +4513,36 @@ async def test_turn_observer_preserves_activity_for_pending_continuation() -> No
         "updated_at": completed_at.isoformat(),
     }
     assert ("conv-1", True, 1) in manager.chat_v2_runtime_payloads
+
+
+def test_terminal_payloads_include_turn_identity() -> None:
+    completed = _event_to_payload(
+        Event(
+            type=EventType.TURN_COMPLETED,
+            data={
+                "conversation_id": "conv-1",
+                "session_id": "sess-1",
+                "turn_id": "turn-1",
+            },
+        ),
+        "conv-1",
+    )
+    paused = _event_to_payload(
+        Event(
+            type=EventType.TASK_PAUSED,
+            data={
+                "conversation_id": "conv-1",
+                "task_id": "task-1",
+                "turn_id": "turn-1",
+            },
+        ),
+        "conv-1",
+    )
+
+    assert completed is not None
+    assert completed["turn_id"] == "turn-1"
+    assert paused is not None
+    assert paused["turn_id"] == "turn-1"
 
 
 @pytest.mark.asyncio
@@ -3994,6 +4948,552 @@ def test_ws_auth_valid_token_authenticates(monkeypatch: object, tmp_path: Path) 
             ws.send_json({"type": "auth", "token": token})
             response = ws.receive_json()
             assert response["type"] == "authenticated"
+
+
+def test_ws_auth_rejects_refresh_token(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        token = client.app.state.auth_provider.sign_refresh_token("wstest@example.com")
+        with (
+            pytest.raises(WebSocketDisconnect),
+            client.websocket_connect("/api/ws") as ws,
+        ):
+            ws.send_json({"type": "auth", "token": token})
+            ws.receive_json()
+
+
+def test_ws_auth_rejects_unknown_user(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        token = client.app.state.auth_provider.sign_access_token(
+            "missing@example.com", "Missing", "admin"
+        )
+        with (
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            client.websocket_connect("/api/ws") as ws,
+        ):
+            ws.send_json({"type": "auth", "token": token})
+            ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
+def test_ws_auth_rejects_disabled_user(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="disabled@example.com",
+                    name="Disabled",
+                    password_hash="hash",
+                    role="user",
+                )
+                user.is_active = False
+                await session.commit()
+            return str(
+                app.state.auth_provider.sign_access_token(
+                    "disabled@example.com", "Disabled", "user"
+                )
+            )
+
+        token = asyncio.run(_seed())
+        with (
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            client.websocket_connect("/api/ws") as ws,
+        ):
+            ws.send_json({"type": "auth", "token": token})
+            ws.receive_json()
+        assert exc_info.value.code == 4403
+
+
+def test_ws_auth_uses_current_database_role_and_name(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _authenticate() -> dict[str, Any] | None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="current@example.com",
+                    name="Current Name",
+                    password_hash="hash",
+                    role="user",
+                )
+                await session.commit()
+            token = app.state.auth_provider.sign_access_token(
+                "current@example.com", "Stale Name", "admin"
+            )
+            socket = SimpleNamespace(
+                app=app,
+                cookies={},
+                receive_json=AsyncMock(return_value={"type": "auth", "token": token}),
+                close=AsyncMock(),
+            )
+            return await websocket_module._authenticate_websocket(socket)
+
+        claims = asyncio.run(_authenticate())
+        assert claims is not None
+        assert claims["role"] == "user"
+        assert claims["name"] == "Current Name"
+
+
+def test_ws_auth_rejects_stale_user_auth_version(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="versioned@example.com",
+                    name="Versioned",
+                    password_hash="hash",
+                    role="user",
+                )
+                token = app.state.auth_provider.sign_access_token(
+                    user.email,
+                    user.name,
+                    user.role,
+                    auth_version=user.auth_version,
+                )
+                user.auth_version += 1
+                await session.commit()
+                return str(token)
+
+        token = asyncio.run(_seed())
+        with (
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            client.websocket_connect("/api/ws") as ws,
+        ):
+            ws.send_json({"type": "auth", "token": token})
+            ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
+def test_authenticated_ws_closes_before_ping_after_auth_version_change(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        app.state.ws_auth_watchdog_interval_seconds = 0.01
+
+        async def _seed() -> str:
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="active-version@example.com",
+                    name="Active Version",
+                    password_hash="hash",
+                    role="user",
+                )
+                await session.commit()
+                return str(
+                    app.state.auth_provider.sign_access_token(
+                        user.email,
+                        user.name,
+                        user.role,
+                        auth_version=user.auth_version,
+                    )
+                )
+
+        token = asyncio.run(_seed())
+        with client.websocket_connect("/api/ws") as ws:
+            ws.send_json({"type": "auth", "token": token})
+            assert ws.receive_json()["type"] == "authenticated"
+
+            async def _revoke() -> None:
+                from cognis.store.queries import get_user
+
+                async with app.state.session_factory() as session:
+                    user = await get_user(session, "active-version@example.com")
+                    assert user is not None
+                    user.auth_version += 1
+                    await session.commit()
+
+            asyncio.run(_revoke())
+            time.sleep(0.08)
+            ws.send_json({"type": "ping"})
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+        assert exc_info.value.code == 4401
+
+
+def test_app_local_factor_enrollment_removes_ws_before_outbound_fanout(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="local-disconnect@example.com",
+                    name="Local Disconnect",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        login = client.post(
+            "/api/auth/login",
+            json={
+                "email": "local-disconnect@example.com",
+                "password": "password123",
+            },
+        )
+        assert login.status_code == 200
+        with client.websocket_connect("/api/ws") as ws:
+            assert ws.receive_json()["type"] == "authenticated"
+            setup = client.post(
+                "/api/auth/mfa/enroll/start",
+                json={"current_password": "password123"},
+            )
+            assert setup.status_code == 200
+            setup_body = setup.json()
+            enabled = client.post(
+                "/api/auth/mfa/enroll/confirm",
+                json={
+                    "challenge_token": setup_body["challenge_token"],
+                    "code": pyotp.TOTP(setup_body["secret"]).now(),
+                },
+            )
+            assert enabled.status_code == 200
+            client.portal.call(
+                client.app.state.ws_manager.send_to_user,
+                "local-disconnect@example.com",
+                {"type": "security_event"},
+            )
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4401
+        assert client.app.state.ws_manager._by_user.get("local-disconnect@example.com") is None
+        assert client.app.state.ws_manager._auth_watchdogs == {}
+
+
+@pytest.mark.asyncio
+async def test_disconnect_user_unregisters_all_connections_before_close_await() -> None:
+    manager = WebSocketConnectionManager(SimpleNamespace(state=SimpleNamespace()))
+    first = AuthenticatedWebSocket(
+        connection_id="first",
+        websocket=AsyncMock(),
+        user_email="multi@example.com",
+        role="user",
+    )
+    second = AuthenticatedWebSocket(
+        connection_id="second",
+        websocket=AsyncMock(),
+        user_email="multi@example.com",
+        role="user",
+    )
+    manager._connections = {first.connection_id: first, second.connection_id: second}
+    manager._by_user["multi@example.com"] = {first.connection_id, second.connection_id}
+    finish_gate = asyncio.Event()
+
+    async def _blocked_finish(
+        connection: AuthenticatedWebSocket,
+        *,
+        code: int | None,
+        reason: str,
+    ) -> None:
+        del connection, code, reason
+        await finish_gate.wait()
+
+    manager._finish_disconnect = _blocked_finish  # type: ignore[method-assign]
+    disconnect_task = asyncio.create_task(manager.disconnect_user("multi@example.com"))
+    await asyncio.sleep(0)
+    assert manager._connections == {}
+    assert manager._by_user.get("multi@example.com") is None
+    await manager.send_to_user("multi@example.com", {"type": "must_not_send"})
+    first.websocket.send_json.assert_not_awaited()
+    second.websocket.send_json.assert_not_awaited()
+    finish_gate.set()
+    assert await disconnect_task == 2
+
+
+def test_ws_auth_watchdog_removes_stale_connection_before_outbound_fanout(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        client.app.state.ws_auth_watchdog_interval_seconds = 0.01
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="watchdog@example.com",
+                    name="Watchdog",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        login = client.post(
+            "/api/auth/login",
+            json={"email": "watchdog@example.com", "password": "password123"},
+        )
+        assert login.status_code == 200
+        with client.websocket_connect("/api/ws") as ws:
+            assert ws.receive_json()["type"] == "authenticated"
+
+            async def _revoke_from_replica() -> None:
+                from cognis.store.queries import get_user
+
+                async with client.app.state.session_factory() as session:
+                    user = await get_user(session, "watchdog@example.com")
+                    assert user is not None
+                    user.auth_version += 1
+                    await session.commit()
+
+            client.portal.call(_revoke_from_replica)
+            time.sleep(0.08)
+            client.portal.call(
+                client.app.state.ws_manager.send_to_user,
+                "watchdog@example.com",
+                {"type": "replica_security_event"},
+            )
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4401
+        assert client.app.state.ws_manager._by_user.get("watchdog@example.com") is None
+        assert client.app.state.ws_manager._auth_watchdogs == {}
+
+
+def test_post_registration_validation_closes_authentication_race(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _race() -> None:
+            from cognis.store.queries import get_user
+
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="registration-race@example.com",
+                    name="Registration Race",
+                    password_hash="hash",
+                    role="user",
+                )
+                await session.commit()
+                claims = {
+                    "sub": user.email,
+                    "role": user.role,
+                    "name": user.name,
+                    "typ": "access",
+                    "authv": user.auth_version,
+                }
+
+            authenticated = asyncio.Event()
+            continue_registration = asyncio.Event()
+
+            async def _paused_authentication(websocket: object) -> dict[str, Any]:
+                del websocket
+                authenticated.set()
+                await continue_registration.wait()
+                return claims
+
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                websocket_module,
+                "_authenticate_websocket",
+                _paused_authentication,
+            )
+            socket = SimpleNamespace(
+                app=app,
+                accept=AsyncMock(),
+                close=AsyncMock(),
+                send_text=AsyncMock(),
+                receive_json=AsyncMock(),
+            )
+            handler = asyncio.create_task(websocket_module.handle_websocket(socket))
+            await authenticated.wait()
+
+            async with app.state.session_factory() as session:
+                current = await get_user(session, "registration-race@example.com")
+                assert current is not None
+                current.auth_version += 1
+                await session.commit()
+            # The local eviction snapshot occurs before registration.
+            assert await app.state.ws_manager.disconnect_user("registration-race@example.com") == 0
+
+            continue_registration.set()
+            await handler
+            await app.state.ws_manager.send_to_user(
+                "registration-race@example.com",
+                {"type": "must_not_deliver"},
+            )
+
+            socket.send_text.assert_not_awaited()
+            socket.close.assert_awaited_once_with(
+                code=4401,
+                reason="Authentication revoked",
+            )
+            assert app.state.ws_manager._by_user.get("registration-race@example.com") is None
+            assert app.state.ws_manager._auth_watchdogs == {}
+
+        client.portal.call(_race)
+
+
+def test_owner_scope_invalidation_waits_for_post_registration_validation(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _race() -> None:
+            from cognis.store.queries import get_user
+
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="scope-race@example.com",
+                    name="Scope Race",
+                    password_hash="hash",
+                    role="user",
+                )
+                await session.commit()
+                claims = {
+                    "sub": user.email,
+                    "role": user.role,
+                    "name": user.name,
+                    "typ": "access",
+                    "authv": user.auth_version,
+                }
+
+            async def _authenticated(websocket: object) -> dict[str, Any]:
+                del websocket
+                return claims
+
+            registered = asyncio.Event()
+            continue_validation = asyncio.Event()
+            original_revalidate = app.state.ws_manager.revalidate_registered_connection
+
+            async def _paused_revalidate(connection: AuthenticatedWebSocket) -> bool:
+                registered.set()
+                await continue_validation.wait()
+                return await original_revalidate(connection)
+
+            monkeypatch.setattr(  # type: ignore[attr-defined]
+                websocket_module,
+                "_authenticate_websocket",
+                _authenticated,
+            )
+            monkeypatch.setattr(
+                app.state.ws_manager,
+                "revalidate_registered_connection",
+                _paused_revalidate,
+            )
+            socket = SimpleNamespace(
+                app=app,
+                accept=AsyncMock(),
+                close=AsyncMock(),
+                send_text=AsyncMock(),
+                receive_json=AsyncMock(),
+            )
+            handler = asyncio.create_task(websocket_module.handle_websocket(socket))
+            await registered.wait()
+            connection_id = next(iter(app.state.ws_manager._by_user["scope-race@example.com"]))
+            connection = app.state.ws_manager._connections[connection_id]
+            assert connection.ready_for_fanout is False
+
+            await app.state.ws_manager._handle_event(  # noqa: SLF001
+                Event(
+                    type=EventType.CLUSTER_SCOPE_INVALIDATED,
+                    data={
+                        "kind": "sidebar_changed",
+                        "revision": "registration-race",
+                        "scope": {"user_email": "scope-race@example.com"},
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+            assert connection._outbound_queue.empty()
+            socket.send_text.assert_not_awaited()
+
+            async with app.state.session_factory() as session:
+                current = await get_user(session, "scope-race@example.com")
+                assert current is not None
+                current.auth_version += 1
+                await session.commit()
+            continue_validation.set()
+            await handler
+
+            socket.send_text.assert_not_awaited()
+            socket.close.assert_awaited_once_with(
+                code=4401,
+                reason="Authentication revoked",
+            )
+            assert app.state.ws_manager._by_user.get("scope-race@example.com") is None
+            assert app.state.ws_manager._auth_watchdogs == {}
+
+        client.portal.call(_race)
+
+
+@pytest.mark.asyncio
+async def test_scope_invalidation_respects_closed_and_readiness_gate() -> None:
+    connection = AuthenticatedWebSocket(
+        connection_id="readiness-gate",
+        websocket=AsyncMock(),
+        user_email="gate@example.com",
+        role="user",
+        ready_for_fanout=False,
+    )
+    payload = {
+        "type": "scope_invalidated",
+        "reason": "sidebar_changed",
+        "revision": "1",
+    }
+    assert connection.send_scope_invalidation_nowait(payload) is False
+    assert connection._outbound_queue.empty()
+    assert connection._writer_task is None
+
+    connection.ready_for_fanout = True
+    connection._closed = True
+    assert connection.send_scope_invalidation_nowait(payload) is False
+    assert connection._outbound_queue.empty()
+    assert connection._writer_task is None
+
+
+def test_ws_browser_session_rejects_stale_bound_version(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_ws_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> str:
+            from datetime import timedelta
+
+            from cognis.store.queries import create_browser_session
+
+            async with app.state.session_factory() as session:
+                user = await create_user(
+                    session,
+                    email="browser-version@example.com",
+                    name="Browser Version",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                _, raw_token = await create_browser_session(
+                    session,
+                    user_email=user.email,
+                    expires_at=datetime.now(UTC) + timedelta(days=1),
+                    auth_version=user.auth_version,
+                )
+                user.auth_version += 1
+                await session.commit()
+                return raw_token
+
+        client.cookies.set("cognis_session", asyncio.run(_seed()))
+        with (
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            client.websocket_connect("/api/ws") as ws,
+        ):
+            ws.receive_json()
+        assert exc_info.value.code == 4401
 
 
 def test_ws_ping_returns_pong(monkeypatch: object, tmp_path: Path) -> None:

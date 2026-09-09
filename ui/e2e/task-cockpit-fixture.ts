@@ -1,6 +1,7 @@
 import type { Page, Request } from '@playwright/test';
+import type { ActivityOverviewResponse } from '../src/lib/chat-v2/types';
 
-export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed';
+export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed' | 'cancelled';
 
 const NOW = '2026-07-30T12:00:00Z';
 export const TASK_ID = 'task-stage39-cockpit';
@@ -11,7 +12,7 @@ function projectionSteps(status: CockpitStatus): Record<string, unknown>[] {
   const draft = status === 'draft';
   const running = status === 'running';
   const paused = status === 'paused';
-  const completed = status === 'completed';
+  const completed = status === 'completed' || status === 'cancelled';
   return [
     step('scope', 'run', draft ? 'pending' : 'completed', {
       summary: draft ? null : 'Objective and constraints established.'
@@ -106,7 +107,7 @@ function projectedRun(
     deliverables: [],
     todos: [],
     started_at: NOW,
-    completed_at: status === 'completed' ? NOW : null,
+    completed_at: status === 'completed' || status === 'cancelled' ? NOW : null,
     updated_at: NOW,
     duration_seconds: 1.2,
     accumulated_duration_seconds: 1.2,
@@ -150,7 +151,7 @@ function task(status: CockpitStatus): Record<string, unknown> {
   const draft = status === 'draft';
   const paused = status === 'paused';
   const running = status === 'running';
-  const terminal = status === 'completed';
+  const terminal = status === 'completed' || status === 'cancelled';
   const currentStep = paused ? 'approve' : running ? 'fetch' : terminal ? null : 'scope';
   const steps = projectionSteps(status);
   return {
@@ -194,7 +195,10 @@ function task(status: CockpitStatus): Record<string, unknown> {
     applied_completion_mode: null,
     applied_completion_reason: null,
     dependencies: [],
-    step_runs: [],
+    // TaskDetail includes lightweight step-run projections. Dashboard task
+    // Activity consumes these scopes directly instead of the control-chat
+    // conversation scope.
+    step_runs: projectedRuns(status),
     workflow_run: {
       task_id: TASK_ID,
       workflow_id: 'wf-stage39',
@@ -382,6 +386,79 @@ function taskWork(stepRunId: string, status: CockpitStatus): Record<string, unkn
   };
 }
 
+function taskActivityOverview(stepRunId: string): ActivityOverviewResponse {
+  const projection = taskWork(stepRunId, 'completed');
+  return {
+    schema_version: 2,
+    projection_version: 'stage39-task-activity-overview',
+    overview_revision: 'overview:1',
+    work_revision: 1,
+    graph_revision: 1,
+    server_time: NOW,
+    detail: 'full',
+    scope: {
+      key: `task_step:${stepRunId}`,
+      kind: 'task_step',
+      step_run_id: stepRunId,
+      conversation_id: 'conv-fetch',
+      session_id: 'sess-fetch'
+    },
+    summary: {
+      mutations: 1,
+      commands: 1,
+      changed_files: 2,
+      additions: 18,
+      deletions: 4,
+      artifacts: 0,
+      deliverables: 1
+    },
+    materialization: { state: 'live' },
+    recent: {
+      commands: [{
+        id: `recent-command-${stepRunId}`,
+        category: 'commands',
+        session_id: 'sess-fetch',
+        occurred_at: NOW,
+        title: 'Run release checks'
+      }]
+    },
+    recent_work: {
+      commands: [],
+      files: [],
+      mutations: [],
+      artifacts: [],
+      deliverables: []
+    },
+    workstreams: [{
+      key: 'session:fetch',
+      kind: 'task',
+      root_key: 'session:fetch',
+      edge_kind: 'root',
+      ordinal: 0,
+      conversation_id: 'conv-fetch',
+      session_id: 'sess-fetch',
+      event_store_session_id: 'sess-fetch',
+      title: 'Fetch release evidence',
+      agent_id: 'agent-stage39',
+      status: 'completed',
+      current: true,
+      superseded: false,
+      activity_state: 'closed',
+      summary: {
+        changed_files: 2,
+        additions: 18,
+        deletions: 4,
+        commands: 1,
+        mutations: 1,
+        artifacts: 0,
+        deliverables: 1
+      }
+    }],
+    graph_fingerprint: `stage39-${stepRunId}`,
+    graph_truncated: false
+  };
+}
+
 function pendingPause(): Record<string, unknown> {
   return {
     pause_id: 'pause-approve',
@@ -506,32 +583,44 @@ const taskChatSessionB = {
   intaris_session_id: 'intaris-task-chat-b'
 };
 
-const taskChatTimeline = [
-  {
-    id: 'message:task-control-user',
+const taskChatTimeline = Array.from({ length: 12 }, (_, index) => {
+  const sequence = index + 1;
+  const role = sequence % 2 === 0 ? 'assistant' : 'user';
+  const content = sequence === 1
+    ? 'What is blocking this release?'
+    : sequence === 2
+      ? 'The release is waiting for your approval. Deterministic evidence passed, and no implementation error remains.'
+      : role === 'user'
+        ? `Release evidence question ${Math.ceil(sequence / 2)}: what remains before approval?`
+        : `Release evidence answer ${sequence / 2}: deterministic check ${sequence / 2} passed. The approval gate remains the only blocker.`;
+  return {
+    id: `message:task-control-${sequence}`,
     kind: 'message',
-    sort_key: '0000:000000000000001:000000:02:000000000',
-    source_refs: [{ store: 'intaris', session_id: 'sess-task-chat', seq: 1, event_type: 'user_message' }],
+    sort_key: `0000:${String(sequence).padStart(15, '0')}:000000:02:000000000`,
+    source_refs: [{ store: 'intaris', session_id: 'sess-task-chat', seq: sequence, event_type: `${role}_message` }],
     stable: true,
-    role: 'user',
-    content: 'What is blocking this release?',
-    message_id: 'msg-task-control-user',
+    role,
+    content,
+    message_id: `msg-task-control-${sequence}`,
     attachments: [],
     partial: false
-  },
-  {
-    id: 'message:task-control-assistant',
-    kind: 'message',
-    sort_key: '0000:000000000000002:000000:02:000000000',
-    source_refs: [{ store: 'intaris', session_id: 'sess-task-chat', seq: 2, event_type: 'assistant_message' }],
-    stable: true,
-    role: 'assistant',
-    content: 'The release is waiting for your approval. Deterministic evidence passed, and no implementation error remains.',
-    message_id: 'msg-task-control-assistant',
-    attachments: [],
-    partial: false
-  }
-];
+  };
+});
+
+export interface CockpitCommandRequest {
+  method: string;
+  path: string;
+  conversationId: string;
+  clientTxnId: string;
+  body: Record<string, unknown>;
+}
+
+export interface CockpitMessageRequest {
+  method: string;
+  path: string;
+  clientTxnId: string;
+  body: Record<string, unknown>;
+}
 
 export interface CockpitFixture {
   setStatus(status: CockpitStatus): void;
@@ -539,23 +628,33 @@ export interface CockpitFixture {
   actionRequests(): string[];
   navigationRequests(): string[];
   detailResponses(): Array<Record<string, unknown>>;
+  commandRequests(): CockpitCommandRequest[];
+  messageRequests(): CockpitMessageRequest[];
   unmockedRequests(): string[];
 }
 
-export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixture> {
+export async function installTaskCockpitFixture(
+  page: Page,
+  options: { dashboardWorkspaceWindows?: boolean } = {},
+): Promise<CockpitFixture> {
   let status: CockpitStatus = 'paused';
   let heavyRequestCount = 0;
   const actionRequests: string[] = [];
   const navigationRequests: string[] = [];
   const detailResponses: Array<Record<string, unknown>> = [];
+  const commandRequests: CockpitCommandRequest[] = [];
+  const messageRequests: CockpitMessageRequest[] = [];
   const unmockedRequests: string[] = [];
+  const completedCommandTransactions = new Map<string, string>();
+  let appendedTimelineMessage: Record<string, unknown> | null = null;
+  let appendedTimelineMessageDelivered = false;
   await page.route('**/api/v1/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
     const method = request.method();
-    const json = (body: unknown) => route.fulfill({
-      status: 200,
+    const json = (body: unknown, status = 200) => route.fulfill({
+      status,
       contentType: 'application/json',
       body: JSON.stringify(body)
     });
@@ -575,8 +674,17 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
         config: {}
       });
     }
+    if (path === '/api/v1/chat/v2/client-performance' && method === 'POST') {
+      return json({ accepted: true });
+    }
+    if (path === '/api/v1/dashboard/issues') {
+      return json({ items: [], next_cursor: null, has_more: false });
+    }
     if (path === `/api/v1/tasks/${TASK_ID}/summary`) return json(task(status));
-    if (path === '/api/v1/deliverables/dlv-stage39-final') {
+    if (
+      path === '/api/v1/deliverables/dlv-stage39-final' ||
+      path === `/api/v1/step-runs/${HEAVY_STEP_RUN_ID}/deliverables/dlv-stage39-final`
+    ) {
       return json({
         deliverable_id: 'dlv-stage39-final',
         step_run_id: HEAVY_STEP_RUN_ID,
@@ -628,6 +736,77 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
       const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
       return json(taskWork(stepRunId, status));
     }
+    if (path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/activity-overview$/)) {
+      const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
+      return json(taskActivityOverview(stepRunId));
+    }
+    if (path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/snapshot$/)) {
+      const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
+      return json({
+        schema_version: 2,
+        projection_version: 'stage39-task-step-logs',
+        scope: {
+          key: `task_step:${stepRunId}`,
+          kind: 'task_step',
+          conversation_id: 'conv-fetch',
+          session_id: 'sess-fetch',
+          task_id: TASK_ID,
+          step_run_id: stepRunId,
+          label: 'fetch'
+        },
+        conversation: { ...taskChatConversation, conversation_id: 'conv-fetch' },
+        timeline: { items: [], has_more_before: false, before_cursor: null },
+        state: {
+          state_version: 1,
+          snapshot_generated_at: NOW,
+          capabilities: [],
+          active_turn: {},
+          pending: {},
+          active_session: {
+            session_id: 'sess-fetch',
+            status: 'completed',
+            completion_reason: 'completed',
+            todos: []
+          }
+        },
+        queue: { messages: [], queued_count: 0 },
+        runtime: {
+          runtime_epoch: 'stage39-task-step-logs',
+          runtime_revision: 1,
+          generated_at: NOW,
+          has_active_turn: false,
+          volatile_items: []
+        },
+        cursor: `cursor:${stepRunId}`,
+        server_time: NOW
+      });
+    }
+    if (path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/sync$/)) {
+      const stepRunId = path.split('/')[6] ?? HEAVY_STEP_RUN_ID;
+      const cursor = url.searchParams.get('cursor') ?? `cursor:${stepRunId}`;
+      return json({
+        schema_version: 2,
+        projection_version: 'stage39-task-step-logs',
+        scope: {
+          key: `task_step:${stepRunId}`,
+          kind: 'task_step',
+          conversation_id: 'conv-fetch',
+          session_id: 'sess-fetch',
+          task_id: TASK_ID,
+          step_run_id: stepRunId,
+          label: 'fetch'
+        },
+        conversation_id: 'conv-fetch',
+        cursor_before: cursor,
+        cursor_after: cursor,
+        ops: [],
+        runtime: null,
+        reset_required: false,
+        reset_reason: null,
+        has_more: false,
+        server_time: NOW
+      });
+    }
     if (path === '/api/v1/chat/v2/conversations/conv-task-chat/work') {
       const projection = taskWork(HEAVY_STEP_RUN_ID, 'completed');
       if (url.searchParams.get('before') === 'work-older-1') {
@@ -662,6 +841,17 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
         has_more_before: true,
         before_cursor: 'work-older-1',
         scope: { key: 'conversation:conv-task-chat', kind: 'conversation', conversation_id: 'conv-task-chat' }
+      });
+    }
+    if (path === '/api/v1/chat/v2/conversations/conv-task-chat/activity-overview') {
+      const overview = taskActivityOverview(HEAVY_STEP_RUN_ID);
+      return json({
+        ...overview,
+        scope: {
+          key: 'conversation:conv-task-chat',
+          kind: 'conversation',
+          conversation_id: 'conv-task-chat'
+        }
       });
     }
     if (path === `/api/v1/tasks/${TASK_ID}/steps/summary`) {
@@ -716,6 +906,9 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
     if (path === '/api/v1/tasks') return json({ items: [task(status)], next_cursor: null, has_more: false });
     if (path === '/api/v1/projects') return json([]);
     if (path === '/api/v1/notifications') return json([]);
+    if (path === '/api/v1/conversations/resolve' && method === 'POST') {
+      return json(taskChatConversation);
+    }
     if (path === `/api/v1/tasks/${TASK_ID}/control-chat`) {
       navigationRequests.push(`${method} ${path}`);
       return json({
@@ -801,22 +994,82 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
       return json({ items: [], queued_count: 0 });
     }
     if (
+      path.match(/^\/api\/v1\/chat\/v2\/conversations\/conv-task-chat\/commands\/[^/]+$/)
+      && method === 'PUT'
+    ) {
+      const parts = path.split('/');
+      const clientTxnId = parts[parts.length - 1] ?? '';
+      const body = request.postDataJSON() as Record<string, unknown>;
+      commandRequests.push({
+        method,
+        path,
+        conversationId: 'conv-task-chat',
+        clientTxnId,
+        body
+      });
+      const content = typeof body.content === 'string' ? body.content : '';
+      const previousContent = completedCommandTransactions.get(clientTxnId);
+      if (previousContent !== undefined && previousContent !== content) {
+        return json({
+          detail: {
+            code: 'client_txn_conflict',
+            message: 'Client transaction id was already used with a different payload'
+          }
+        }, 409);
+      }
+      const duplicate = previousContent !== undefined;
+      completedCommandTransactions.set(clientTxnId, content);
+      return json({
+        conversation_id: 'conv-task-chat',
+        client_txn_id: clientTxnId,
+        status: duplicate ? 'duplicate' : 'completed',
+        result_type: 'system_message',
+        text: 'Available commands: /help, /new, /model, /profile.',
+        data: {
+          command: '/help',
+          notice_id: 'notice-task-control-help'
+        },
+        server_time: NOW
+      });
+    }
+    if (
       path.match(/^\/api\/v1\/chat\/v2\/conversations\/conv-task-chat\/messages\/[^/]+$/)
       && method === 'PUT'
     ) {
       const parts = path.split('/');
       const clientTxnId = parts[parts.length - 1] ?? '';
-      const payload = request.postDataJSON() as { client_message_id?: string };
+      const payload = request.postDataJSON() as { client_message_id?: string; content?: string };
+      messageRequests.push({
+        method,
+        path,
+        clientTxnId,
+        body: payload as Record<string, unknown>
+      });
+      const clientMessageId = payload.client_message_id ?? clientTxnId;
+      appendedTimelineMessage = {
+        id: `message:${clientMessageId}`,
+        kind: 'message',
+        sort_key: '0000:000000000000013:000000:02:000000000',
+        source_refs: [{ store: 'intaris', session_id: 'sess-task-chat', seq: 13, event_type: 'user_message' }],
+        stable: true,
+        role: 'user',
+        content: payload.content ?? '',
+        message_id: 'msg-task-control-appended',
+        client_message_id: clientMessageId,
+        attachments: [],
+        partial: false
+      };
+      appendedTimelineMessageDelivered = false;
       return json({
         status: 'accepted',
         client_txn_id: clientTxnId,
-        client_message_id: payload.client_message_id ?? clientTxnId,
+        client_message_id: clientMessageId,
         conversation_id: 'conv-task-chat',
         message_id: 'message-task-control',
         queue_id: null,
         cursor: 'cursor:conv-task-chat',
         server_time: NOW
-      });
+      }, 202);
     }
     if (path === '/api/v1/conversations/conv-task-chat/sessions') return json([taskChatSession]);
     if (path === '/api/v1/sessions/sess-task-chat/intaris') {
@@ -883,6 +1136,8 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
     }
     if (path === '/api/v1/chat/v2/conversations/conv-task-chat/sync') {
       const cursor = url.searchParams.get('cursor') ?? 'cursor:conv-task-chat';
+      const appendMessage = appendedTimelineMessage !== null && !appendedTimelineMessageDelivered;
+      if (appendMessage) appendedTimelineMessageDelivered = true;
       return json({
         schema_version: 2,
         projection_version: 'stage39-cockpit-e2e',
@@ -893,8 +1148,8 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
         },
         conversation_id: 'conv-task-chat',
         cursor_before: cursor,
-        cursor_after: cursor,
-        ops: [],
+        cursor_after: appendMessage ? 'cursor:conv-task-chat:appended' : cursor,
+        ops: appendMessage ? [{ op: 'upsert_item', item: appendedTimelineMessage }] : [],
         runtime: null,
         reset_required: false,
         reset_reason: null,
@@ -904,7 +1159,11 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
     }
     if (path === '/api/v1/user-preferences') {
       return json({
-        display: { theme: 'dark', language: 'en' },
+        display: {
+          theme: 'dark',
+          language: 'en',
+          dashboard_workspace_windows: options.dashboardWorkspaceWindows ?? false,
+        },
         chat: {
           show_thinking_blocks: true,
           group_tool_calls: true,
@@ -913,7 +1172,35 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
         }
       });
     }
+    if (path === '/api/v1/tasks/board') {
+      const boardItem = {
+        task_id: TASK_ID,
+        title: 'Release safety review',
+        agent_id: 'riker',
+        status,
+        priority: 1,
+        created_at: NOW,
+        updated_at: NOW,
+        started_at: NOW,
+        completed_at: status === 'completed' || status === 'cancelled' ? NOW : null,
+        progress_summary: null,
+      };
+      const terminal = status === 'completed' || status === 'cancelled';
+      return json({
+        columns: {
+          running: {
+            total_count: terminal ? 0 : 1,
+            has_more: false,
+            items: terminal ? [] : [boardItem],
+          },
+          done: { total_count: terminal ? 1 : 0, has_more: false, items: terminal ? [boardItem] : [] },
+        },
+      });
+    }
     if (path === '/api/v1/search/health') return json({ enabled: false });
+    if (path === '/api/v1/work/refresh' && method === 'POST') {
+      return json({ accepted: true, session_count: 1, scope_count: 1 }, 202);
+    }
     if (path === '/api/v1/conversations/sidebar') {
       const isTaskFilter = url.searchParams.get('status') === 'task';
       return json({
@@ -942,6 +1229,7 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
     }
     if (path.match(new RegExp(`/api/v1/tasks/${TASK_ID}/(submit|pause|resume|cancel)$`)) && method === 'POST') {
       actionRequests.push(`${method} ${path}`);
+      if (path.endsWith('/cancel')) status = 'cancelled';
       return json({ ok: true, task_id: TASK_ID, status });
     }
     if (path === `/api/v1/tasks/${TASK_ID}` && method === 'GET') return json(task(status));
@@ -969,6 +1257,12 @@ export async function installTaskCockpitFixture(page: Page): Promise<CockpitFixt
     },
     detailResponses() {
       return [...detailResponses];
+    },
+    commandRequests() {
+      return commandRequests.map((request) => ({ ...request, body: { ...request.body } }));
+    },
+    messageRequests() {
+      return messageRequests.map((request) => ({ ...request, body: { ...request.body } }));
     },
     unmockedRequests() {
       return [...unmockedRequests];

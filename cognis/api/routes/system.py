@@ -27,6 +27,7 @@ from cognis.api.models import (
     SystemDiagnosticsResponse,
 )
 from cognis.core.controller_runtime import ControllerLifecycleState
+from cognis.core.trusted_evidence import TRUSTED_EVIDENCE_POLICY_VERSION
 from cognis.store.database import check_connection
 from cognis.store.direct_turns import (
     DirectTurnRecoveryConflict,
@@ -259,7 +260,12 @@ async def health(request: Request) -> HealthResponse:
     return HealthResponse(
         status=status,
         providers={name: provider.model_dump() for name, provider in providers.items()},
-        remember_queue={"depth": len(request.app.state.remember_queue._items)},
+        remember_queue={"depth": request.app.state.remember_queue.active_depth},
+        trusted_evidence_policy={
+            "version": TRUSTED_EVIDENCE_POLICY_VERSION,
+            "admission_enabled": request.app.state.remember_queue.trusted_evidence_enabled,
+            "active_policy_mismatch": request.app.state.remember_queue.policy_mismatch_active,
+        },
     )
 
 

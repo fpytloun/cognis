@@ -25,6 +25,7 @@ from cognis.executor.runner import (
     _same_turn_tool_call_key,
     _SameTurnToolCallDeduplicator,
 )
+from cognis.mcp_runtime import MCPClientError
 from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.tool import (
     ExecutorConfig,
@@ -33,6 +34,7 @@ from cognis.models.tool import (
     ToolSource,
 )
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
+from cognis.providers.circuit_breaker import CircuitBreakerError, CircuitState
 from cognis.tools.executor.browser.manager import (
     BROWSER_MANAGER_KEY,
     BrowserManager,
@@ -40,7 +42,6 @@ from cognis.tools.executor.browser.manager import (
 )
 from cognis.tools.executor.lsp import LSP_MANAGER_KEY, LSP_STATUS_CAPABILITY
 from cognis.tools.executor.shell import set_background_shell_completion_callback
-from cognis.tools.mcp import MCPClientError
 
 
 class DummyWebSocket:
@@ -49,6 +50,18 @@ class DummyWebSocket:
 
     async def send(self, raw: str) -> None:
         self.sent.append(json.loads(raw))
+
+
+class RetirableBlockingWebSocket(DummyWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, raw: str) -> None:
+        self.started.set()
+        await self.release.wait()
+        await super().send(raw)
 
 
 class IncomingWebSocket(DummyWebSocket):
@@ -62,6 +75,25 @@ class IncomingWebSocket(DummyWebSocket):
                 yield json.dumps(message)
 
         return _iterate()
+
+
+@pytest.mark.asyncio
+async def test_retired_connection_send_cannot_block_replacement_sender() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    old_ws = RetirableBlockingWebSocket()
+    old_send = asyncio.create_task(runner._send_ws(old_ws, '{"old":true}'))
+    await asyncio.wait_for(old_ws.started.wait(), timeout=1)
+
+    old_sender = runner._connection_senders.pop(id(old_ws))
+    old_sender.retire()
+    runner._retired_sender_ids.add(id(old_ws))
+    new_ws = DummyWebSocket()
+
+    await asyncio.wait_for(runner._send_ws(new_ws, '{"new":true}'), timeout=1)
+    assert new_ws.sent == [{"new": True}]
+
+    old_ws.release.set()
+    await old_send
 
 
 def test_same_turn_tool_call_key_is_provider_neutral_and_cycle_scoped() -> None:
@@ -944,6 +976,7 @@ async def test_handle_tool_list_returns_configured_definitions() -> None:
 async def test_handle_tool_execute_requires_configuration() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
+    runner._register_call("call-1", "read", turn_id=None)
 
     await runner._handle_tool_execute(
         ws,
@@ -957,6 +990,8 @@ async def test_handle_tool_execute_requires_configuration() -> None:
 
     assert ws.sent[-1]["result"]["is_error"] is True
     assert "not configured" in ws.sent[-1]["result"]["output"].lower()
+    assert "call-1" not in runner._call_records
+    assert runner._terminal_call_records["call-1"]["state"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -1065,6 +1100,35 @@ async def test_handle_llm_complete_streams_chunks() -> None:
     assert ws.sent[0]["result"]["status"] == "streaming"
     assert ws.sent[1]["method"] == "llm.chunk"
     assert ws.sent[2]["method"] == "llm.done"
+
+
+@pytest.mark.asyncio
+async def test_handle_llm_complete_preserves_incomplete_terminal_details() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": [], "config": {}})
+    runner._inference_handler = AsyncMock()
+
+    async def _stream_complete(**_: object):
+        yield {
+            "done": True,
+            "usage": {"prompt_tokens": 100, "completion_tokens": 50},
+            "finish_reason": "length",
+            "response_status": "incomplete",
+            "response_incomplete_details": {"reason": "max_output_tokens"},
+        }
+
+    runner._inference_handler.stream_complete = _stream_complete
+    ws.sent.clear()
+
+    await runner._handle_llm_complete(
+        ws,
+        "rpc-1",
+        {"request_id": "req-1", "model": "openai/gpt-5.4", "messages": []},
+    )
+
+    assert ws.sent[1]["method"] == "llm.done"
+    assert ws.sent[1]["params"]["response_incomplete_details"] == {"reason": "max_output_tokens"}
 
 
 @pytest.mark.asyncio
@@ -1262,6 +1326,167 @@ async def test_handle_configure_reports_degraded_when_some_mcp_servers_fail(
     degraded_server = ws.sent[-1]["result"]["runtime_metadata"]["mcp_servers"][1]
     assert degraded_server["message"] == "github startup timed out"
     assert degraded_server["stderr_summary"] == "npm error: missing token"
+
+
+@pytest.mark.asyncio
+async def test_mcp_credential_reload_swaps_only_target_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._configured = True
+    runner._runtime_state = "active"
+    runner._config_version = 7
+    ws = DummyWebSocket()
+    old_client = AsyncMock()
+    new_client = AsyncMock()
+    tool = ToolDefinition(
+        name="mcp_todoist__list_tasks",
+        description="List tasks",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_id="mcp-1",
+            server_name="todoist",
+            raw_tool_name="list_tasks",
+        ),
+        category="mcp",
+    )
+    runner._mcp_clients = {"mcp-1": old_client}
+    runner._configured_tool_definitions = [tool]
+    runner._mcp_credential_revisions = {"mcp-1": {"token_id": "token-1", "token_version": 1}}
+
+    async def _prepare(
+        servers: list[MCPServerConfig],
+        secrets: dict[str, str],
+    ) -> tuple[dict[str, object], list[ToolDefinition], list[dict[str, object]], list[str]]:
+        assert [server.server_id for server in servers] == ["mcp-1"]
+        assert secrets == {}
+        return {"mcp-1": new_client}, [tool], [], []
+
+    monkeypatch.setattr(runner, "_prepare_mcp_runtime", _prepare)
+
+    await runner._handle_mcp_credential_reload(
+        ws,
+        "reload-1",
+        {
+            "server": MCPServerConfig(
+                name="todoist",
+                transport="streamable_http",
+                url="https://mcp.example.test",
+                server_id="mcp-1",
+            ).model_dump(mode="json"),
+            "credential_revision": {"token_id": "token-1", "token_version": 2},
+        },
+    )
+
+    assert ws.sent[-1]["result"]["state"] == "applied"
+    assert runner._runtime_state == "active"
+    assert runner._config_version == 7
+    assert runner._mcp_clients == {"mcp-1": new_client}
+    assert runner._mcp_credential_revisions["mcp-1"]["token_version"] == 2
+    old_client.close.assert_awaited_once_with(suppress_cancelled=True)
+
+
+@pytest.mark.asyncio
+async def test_mcp_credential_reload_failure_preserves_serving_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._configured = True
+    runner._runtime_state = "active"
+    ws = DummyWebSocket()
+    old_client = AsyncMock()
+    runner._mcp_clients = {"mcp-1": old_client}
+
+    async def _prepare(
+        servers: list[MCPServerConfig],
+        secrets: dict[str, str],
+    ) -> tuple[dict[str, object], list[ToolDefinition], list[dict[str, object]], list[str]]:
+        del servers, secrets
+        return (
+            {},
+            [],
+            [{"error_class": "httpstatuserror"}],
+            ["MCP server failed during initialize."],
+        )
+
+    monkeypatch.setattr(runner, "_prepare_mcp_runtime", _prepare)
+
+    await runner._handle_mcp_credential_reload(
+        ws,
+        "reload-1",
+        {
+            "server": MCPServerConfig(
+                name="todoist",
+                transport="streamable_http",
+                url="https://mcp.example.test",
+                server_id="mcp-1",
+            ).model_dump(mode="json"),
+            "credential_revision": {"token_id": "token-1", "token_version": 2},
+        },
+    )
+
+    assert ws.sent[-1]["result"]["state"] == "failed"
+    assert runner._runtime_state == "active"
+    assert runner._mcp_clients == {"mcp-1": old_client}
+    old_client.close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mcp_credential_reload_waits_for_in_flight_target_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    runner._configured = True
+    runner._runtime_state = "active"
+    ws = DummyWebSocket()
+    old_client = AsyncMock()
+    new_client = AsyncMock()
+    tool = ToolDefinition(
+        name="mcp_todoist__list_tasks",
+        description="List tasks",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_id="mcp-1",
+            server_name="todoist",
+            raw_tool_name="list_tasks",
+        ),
+        category="mcp",
+    )
+    runner._mcp_clients = {"mcp-1": old_client}
+    runner._configured_tool_definitions = [tool]
+    runner._mcp_client_active_calls["mcp-1"] = 1
+    monkeypatch.setattr(
+        runner,
+        "_prepare_mcp_runtime",
+        AsyncMock(return_value=({"mcp-1": new_client}, [tool], [], [])),
+    )
+
+    reload_task = asyncio.create_task(
+        runner._handle_mcp_credential_reload(
+            ws,
+            "reload-1",
+            {
+                "server": MCPServerConfig(
+                    name="todoist",
+                    transport="streamable_http",
+                    url="https://mcp.example.test",
+                    server_id="mcp-1",
+                ).model_dump(mode="json"),
+                "credential_revision": {"token_id": "token-1", "token_version": 2},
+            },
+        )
+    )
+    await asyncio.sleep(0)
+    assert reload_task.done() is False
+    assert runner._mcp_clients["mcp-1"] is old_client
+
+    runner._mcp_client_active_calls.pop("mcp-1")
+    await asyncio.wait_for(reload_task, timeout=1)
+
+    assert runner._mcp_clients["mcp-1"] is new_client
+    old_client.close.assert_awaited_once_with(suppress_cancelled=True)
 
 
 @pytest.mark.asyncio
@@ -1487,6 +1712,106 @@ async def test_handle_tool_execute_allows_degraded_runtime() -> None:
     assert ws.sent[-1]["result"]["is_error"] is False
     assert ws.sent[-1]["result"]["output"] == "ok"
     assert ws.sent[-1]["result"]["metadata"] == {"analysis": "ok"}
+
+
+@pytest.mark.asyncio
+async def test_handle_tool_execute_classifies_dependency_circuit_error() -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+
+    async def _handler(_: dict[str, object], context: object) -> ToolResult:
+        del context
+        raise CircuitBreakerError(
+            name="dependency.safe-name",
+            state=CircuitState.OPEN,
+            retry_after_seconds=12.5,
+            operation="read",
+            last_error_type="TimeoutError",
+            last_failure_at=None,
+        )
+
+    runner._tool_handlers["read"] = _handler
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "tool-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/sensitive-path", "offset": 1, "limit": 1},
+            "runtime_metadata": _contract_metadata(runner, "read"),
+        },
+    )
+
+    result = ws.sent[-1]["result"]
+    assert result["is_error"] is True
+    assert result["metadata"]["code"] == "tool_dependency_circuit_open"
+    assert result["metadata"]["retryable"] is True
+    assert result["metadata"]["circuit"] == {
+        "name": "dependency.safe-name",
+        "state": "open",
+        "retry_after_seconds": 12.5,
+        "operation": "read",
+        "last_error_type": "TimeoutError",
+        "last_failure_at": None,
+    }
+    assert "Tool execution failed:" not in result["output"]
+    assert "/tmp/sensitive-path" not in result["output"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "auth_error", "expected_output", "authorization_required"),
+    [
+        (404, None, "MCP request failed: HTTP 404", False),
+        (401, "authorization_required", "MCP authentication failed: authorization_required", True),
+        (403, "forbidden", "MCP authentication failed: forbidden", True),
+    ],
+)
+async def test_handle_tool_execute_classifies_mcp_errors(
+    status_code: int,
+    auth_error: str | None,
+    expected_output: str,
+    authorization_required: bool,
+) -> None:
+    runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
+    ws = DummyWebSocket()
+    await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+
+    async def _handler(_: dict[str, object], context: object) -> ToolResult:
+        del context
+        raise MCPClientError(
+            "googleworkspace",
+            "call_tool",
+            f"HTTP {status_code}",
+            error_class="mcperror",
+            status_code=status_code,
+            auth_error=auth_error,
+        )
+
+    runner._tool_handlers["read"] = _handler
+    ws.sent.clear()
+
+    await runner._handle_tool_execute(
+        ws,
+        "tool-1",
+        {
+            "call_id": "call-1",
+            "tool_name": "read",
+            "arguments": {"file_path": "/tmp/file", "offset": 1, "limit": 1},
+            "runtime_metadata": _contract_metadata(runner, "read"),
+        },
+    )
+
+    result = ws.sent[-1]["result"]
+    assert result["is_error"] is True
+    assert result["output"] == expected_output
+    assert result["metadata"]["mcp_error"] is True
+    assert result["metadata"]["mcp_auth_error"] is authorization_required
+    assert result["metadata"]["authorization_required"] is authorization_required
+    assert result["metadata"]["status_code"] == status_code
 
 
 @pytest.mark.asyncio

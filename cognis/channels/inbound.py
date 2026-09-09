@@ -12,16 +12,18 @@ Handles the flow from a normalized ``InboundMessage`` to a
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.audio.preprocessing import (  # noqa: F401 — re-exported for back-compat
     STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES as _STT_DEFAULT_SUPPORTED_AUDIO_MIME_TYPES,
 )
@@ -50,6 +52,7 @@ from cognis.channels.group_context import (
 from cognis.channels.protocol import CHANNEL_OUTBOUND_TOTAL, BaseChannelAdapter
 from cognis.core.attachment_utils import attachment_placeholder_text
 from cognis.core.message_envelope import message_metadata
+from cognis.core.trusted_evidence import authenticated_direct_user_origin
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import (
@@ -741,6 +744,9 @@ class InboundPipeline:
             user_email=user_email,
             intention_eligible=sender_trusted,
             user_message_metadata=primary_metadata,
+            admission_origin=(
+                authenticated_direct_user_origin(primary_metadata) if sender_trusted else None
+            ),
             contextual_messages=contextual_messages,
             attachments=[item.model_dump(mode="json") for item in turn_attachments],
             turn_observers=[observer],
@@ -998,7 +1004,7 @@ class InboundPipeline:
                 executor_connection_owner=executor_connection_owner,
             )
             message.platform_data["_sender_verified_owner"] = user_email == config.user_email
-            return user_email
+            return user_email if isinstance(user_email, str) else None
 
         message.platform_data["_sender_verified_owner"] = False
         return config.user_email
@@ -1282,6 +1288,8 @@ class InboundPipeline:
         source_seq_value = data.get("source_seq")
         if not isinstance(source_session_id, str) or source_session_id not in chain_by_id:
             return None
+        if not isinstance(source_seq_value, (int, str)):
+            return None
         try:
             source_seq = int(source_seq_value)
             if source_seq <= 0:
@@ -1318,13 +1326,18 @@ class InboundPipeline:
 
     @staticmethod
     def _thread_match_cutoff_seq(matched_event: Any, events: list[Any]) -> int:
+        matched_seq = matched_event.seq if isinstance(matched_event.seq, int) else 0
         turn_id = (matched_event.data or {}).get("turn_id")
         if isinstance(turn_id, str) and turn_id:
             return max(
-                (event.seq for event in events if (event.data or {}).get("turn_id") == turn_id),
-                default=matched_event.seq,
+                (
+                    event.seq
+                    for event in events
+                    if isinstance(event.seq, int) and (event.data or {}).get("turn_id") == turn_id
+                ),
+                default=matched_seq,
             )
-        return matched_event.seq
+        return matched_seq
 
     @staticmethod
     def _prefer_thread_fork_match(
@@ -1392,7 +1405,7 @@ class InboundPipeline:
             },
             admission_guard=self._executor_admission_guard(executor_connection_owner),
         )
-        return conversation.conversation_id
+        return cast(str, conversation.conversation_id)
 
     async def _resolve_conversation(
         self,
@@ -1487,7 +1500,7 @@ class InboundPipeline:
                     if not fork_admitted:
                         return None
                     if forked_id is not None:
-                        return forked_id
+                        return cast(str, forked_id)
                 logger.info(
                     "channel inbound: thread source event not found; using fresh thread context",
                     extra={
@@ -1514,7 +1527,7 @@ class InboundPipeline:
                 title_source="channel_seed",
                 admission_guard=self._executor_admission_guard(executor_connection_owner),
             )
-            return conversation.conversation_id
+            return cast(str, conversation.conversation_id)
         except Exception:
             logger.exception(
                 "channel inbound: failed to create conversation",
@@ -1555,6 +1568,7 @@ class InboundPipeline:
                     chat_id=message.chat_id,
                     content=content,
                     reply_to_id=message.message_id,
+                    thread_id=message.thread_id,
                 )
             )
 
@@ -1579,6 +1593,7 @@ class InboundPipeline:
                     chat_id=message.chat_id,
                     content=_format_system_message_for_channel(message.channel_type, text),
                     reply_to_id=message.message_id,
+                    thread_id=message.thread_id,
                 )
             )
 
@@ -1694,10 +1709,15 @@ class InboundPipeline:
             from cognis.core.question_sets import plain_text_reply_for_questions
 
             try:
-                data = plain_text_reply_for_questions(
-                    content,
-                    target.payload.get("questions") if isinstance(target.payload, dict) else [],
+                raw_questions = (
+                    target.payload.get("questions") if isinstance(target.payload, dict) else []
                 )
+                questions = (
+                    [item for item in raw_questions if isinstance(item, dict)]
+                    if isinstance(raw_questions, list)
+                    else []
+                )
+                data = plain_text_reply_for_questions(content, questions)
             except ValueError:
                 return False
             resolved = await self._notification_service.resolve(
@@ -1706,7 +1726,7 @@ class InboundPipeline:
                 data,
                 user_email=user_email,
             )
-        return resolved
+        return cast(bool | None, resolved)
 
     async def _normalize_media_attachments(
         self,
@@ -1759,6 +1779,7 @@ class InboundPipeline:
                         failed_count += 1
                         continue
                     content, content_type, filename = fetched
+                    filename = sanitize_artifact_filename(filename)
                     kind = _kind_for_media(content_type)
                     artifact_id = manager._artifact_store.generate_id("att")  # noqa: SLF001
                     guard = self._executor_admission_guard(executor_connection_owner)
@@ -1875,6 +1896,11 @@ class ChannelTurnObserver:
         self._turn_active = False
         self._assistant_delivery_mode = _normalize_assistant_delivery_mode(assistant_delivery_mode)
         self._channel_delivery = channel_delivery
+        self._sent_system_notice_ids: set[str] = set()
+        self._system_notice_lock = asyncio.Lock()
+        self._source_turn: tuple[str, str] | None = None
+        self._pending_predecessors = ""
+        self._sent_turn_text = ""
 
     async def on_token(
         self,
@@ -1891,6 +1917,8 @@ class ChannelTurnObserver:
             delta = turn_id
             turn_id = None
         self._turn_active = True
+        if turn_id:
+            self._source_turn = (session_id, turn_id)
         self._accumulated_text += delta
 
         # Send typing indicator on first token
@@ -1931,11 +1959,17 @@ class ChannelTurnObserver:
                     return
             adapter = self._get_adapter()
             if adapter is not None:
-                await self._send_text(
-                    self._accumulated_text,
-                    adapter=adapter,
-                    delivery_result=SimpleNamespace(session_id=session_id, turn_id=turn_id),
-                )
+                if turn_id:
+                    self._source_turn = (session_id, turn_id)
+                if self._channel_delivery is not None:
+                    await self._send_committed_text(adapter)
+                else:
+                    await self._send_text(
+                        self._accumulated_text,
+                        adapter=adapter,
+                        delivery_result=SimpleNamespace(session_id=session_id, turn_id=turn_id),
+                    )
+                    self._sent_turn_text += self._accumulated_text
                 self._accumulated_text = ""
                 return  # typing indicator is implicit after a sent message
 
@@ -2007,11 +2041,32 @@ class ChannelTurnObserver:
         adapter = self._get_adapter()
         if adapter is None:
             return
-        await self._send_text(self._accumulated_text, adapter=adapter)
+        if self._channel_delivery is not None:
+            await self._send_committed_text(adapter)
+        else:
+            await self._send_text(self._accumulated_text, adapter=adapter)
+            self._sent_turn_text += self._accumulated_text
         self._accumulated_text = ""
 
     async def on_turn_complete(self, result: Any) -> None:
         """Send the accumulated response to the channel."""
+        if getattr(result, "managed_continuation_pending", False):
+            # Legacy observers preserve only locally known committed unsent text.
+            # Durable terminal delivery belongs to the scheduler and outbox.
+            if self._channel_delivery is None:
+                committed = getattr(result, "final_content", None) or ""
+                if committed.startswith(self._sent_turn_text):
+                    unsent = committed[len(self._sent_turn_text) :]
+                    self._pending_predecessors = "\n\n".join(
+                        part for part in (self._pending_predecessors, unsent) if part
+                    )
+            self._sent_turn_text = ""
+            self._accumulated_text = ""
+            return
+        if self._channel_delivery is not None:
+            self._turn_scheduler_remove()
+            self._accumulated_text = ""
+            return
         raw_result_attachments: list[dict[str, Any]] = []
         if result is not None:
             result_attachments = getattr(result, "attachments", None)
@@ -2071,7 +2126,9 @@ class ChannelTurnObserver:
         if adapter is None:
             return
 
-        content = self._completion_content(result)
+        content = "\n\n".join(
+            part for part in (self._pending_predecessors, self._completion_content(result)) if part
+        )
         content = _append_attachment_fallback(content, attachment_fallback_lines)
         chat_mode = getattr(result, "chat_mode", None)
         chat_mode_source = getattr(result, "chat_mode_source", None)
@@ -2292,6 +2349,8 @@ class ChannelTurnObserver:
         error_text = (
             f"Sorry, something went wrong: {error.message}" if error else "An error occurred."
         )
+        if self._pending_predecessors:
+            error_text = f"{self._pending_predecessors}\n\n{error_text}"
         with contextlib.suppress(Exception):
             await adapter.send_message(
                 OutboundMessage(
@@ -2320,16 +2379,26 @@ class ChannelTurnObserver:
         adapter = self._get_adapter()
         if adapter is None:
             return
-        with contextlib.suppress(Exception):
-            await adapter.send_message(
-                OutboundMessage(
-                    channel_type=self._channel_type,
-                    account_id=self._account_id,
-                    chat_id=self._chat_id,
-                    content=text,
-                    thread_id=self._thread_id,
+        async with self._system_notice_lock:
+            if notice_id is not None and notice_id in self._sent_system_notice_ids:
+                return
+            try:
+                await adapter.send_message(
+                    OutboundMessage(
+                        channel_type=self._channel_type,
+                        account_id=self._account_id,
+                        chat_id=self._chat_id,
+                        content=text,
+                        thread_id=self._thread_id,
+                        platform_data=(
+                            {"idempotency_key": notice_id} if notice_id is not None else {}
+                        ),
+                    )
                 )
-            )
+            except Exception:
+                return
+            if notice_id is not None:
+                self._sent_system_notice_ids.add(notice_id)
 
     async def on_thinking(
         self,
@@ -2370,17 +2439,69 @@ class ChannelTurnObserver:
             return False
         if observer._reply_to_id:  # noqa: SLF001
             self._reply_to_id = observer._reply_to_id  # noqa: SLF001
+        self._sent_system_notice_ids.update(  # noqa: SLF001
+            observer._sent_system_notice_ids  # noqa: SLF001
+        )
         return True
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    async def _send_committed_text(self, adapter: BaseChannelAdapter) -> None:
+        from cognis.channels.source_delivery import record_state
+
+        if self._source_turn is None:
+            return
+        session_id, turn_id = self._source_turn
+        content, sources = await self._turn_scheduler.channel_pending_sources(
+            self._conversation_id, session_id, turn_id
+        )
+        if not sources:
+            return
+        guardrails = self._turn_scheduler._providers.guardrails  # noqa: SLF001
+        reference_session_id = sources[-1]["session_id"]
+        await record_state(
+            guardrails, reference_session_id, state="intended", turn_id=turn_id, sources=sources
+        )
+        from cognis.channels.formatting import split_message
+
+        try:
+            for chunk in split_message(content, adapter.capabilities.max_message_length):
+                delivery_id = await adapter.send_message(
+                    OutboundMessage(
+                        channel_type=self._channel_type,
+                        account_id=self._account_id,
+                        chat_id=self._chat_id,
+                        content=chunk,
+                        reply_to_id=self._reply_to_id,
+                        thread_id=self._thread_id,
+                    )
+                )
+                await self._record_delivery_mapping(
+                    SimpleNamespace(session_id=session_id, turn_id=turn_id), delivery_id
+                )
+                self._reply_to_id = None
+        except BaseException:
+            # The durable intended state already blocks uncertain replay.
+            with contextlib.suppress(Exception):
+                await record_state(
+                    guardrails,
+                    reference_session_id,
+                    state="uncertain",
+                    turn_id=turn_id,
+                    sources=sources,
+                )
+            raise
+        await record_state(
+            guardrails, reference_session_id, state="sent", turn_id=turn_id, sources=sources
+        )
+
     def _get_adapter(self) -> BaseChannelAdapter | None:
         manager = self._channel_manager_ref()
         if manager is None:
             return None
-        return manager.get_adapter(self._account_id)
+        return cast(BaseChannelAdapter | None, manager.get_adapter(self._account_id))
 
     async def _send_text(
         self,

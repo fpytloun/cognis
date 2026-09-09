@@ -98,15 +98,12 @@ async def test_search_parses_results_and_answer() -> None:
 @pytest.mark.parametrize(
     ("options", "expected_category"),
     [
-        ({"result_type": "repository"}, "it"),
-        ({"result_type": "discussion"}, "it"),
-        ({"result_type": "paper"}, "science"),
         ({"search_mode": "videos"}, "videos"),
         ({"search_mode": "images"}, "images"),
         ({"search_mode": "news"}, "news"),
     ],
 )
-async def test_search_maps_semantic_result_types_to_categories(
+async def test_search_maps_explicit_modes_to_categories(
     options: dict[str, Any],
     expected_category: str,
 ) -> None:
@@ -129,6 +126,19 @@ async def test_search_maps_semantic_result_types_to_categories(
     params = backend._request.await_args.args[0]
     assert params["categories"] == expected_category
     assert "engines" not in params
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_type", ["repository", "discussion", "paper", "document"])
+async def test_search_keeps_semantic_result_types_on_general_engines(result_type: str) -> None:
+    backend = SearxngBackend(base_url="http://localhost:8888")
+    backend._request = AsyncMock(
+        return_value={"results": [{"title": "Result", "url": "https://example.com/result"}]}
+    )
+
+    await backend.search("query", options={"result_type": result_type})
+
+    assert "categories" not in backend._request.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -180,26 +190,18 @@ async def test_configured_default_category_overrides_semantic_category() -> None
 
 
 @pytest.mark.asyncio
-async def test_semantic_category_falls_back_to_general_and_preserves_domain_filters() -> None:
+async def test_search_pushes_domain_filter_into_upstream_query() -> None:
     backend = SearxngBackend(base_url="http://localhost:8888")
     backend._request = AsyncMock(
-        side_effect=[
-            {"results": [], "unresponsive_engines": [["github", "timeout"]]},
-            {
-                "results": [
-                    {
-                        "title": "Wrong domain",
-                        "url": "https://example.com/repository",
-                    },
-                    {
-                        "title": "pallets/flask",
-                        "url": "https://github.com/pallets/flask",
-                        "engine": "braveapi",
-                    },
-                ],
-                "unresponsive_engines": [["github", "timeout"]],
-            },
-        ]
+        return_value={
+            "results": [
+                {
+                    "title": "pallets/flask",
+                    "url": "https://github.com/pallets/flask",
+                    "engine": "github",
+                }
+            ]
+        }
     )
 
     result = await backend.search(
@@ -207,19 +209,11 @@ async def test_semantic_category_falls_back_to_general_and_preserves_domain_filt
         options={"result_type": "repository", "include_domains": ["github.com"]},
     )
 
-    assert backend._request.await_count == 2
-    first_params = backend._request.await_args_list[0].args[0]
-    fallback_params = backend._request.await_args_list[1].args[0]
-    assert first_params["categories"] == "it"
-    assert "categories" not in fallback_params
+    assert backend._request.await_count == 1
+    params = backend._request.await_args.args[0]
+    assert params["q"] == "site:github.com pallets flask"
+    assert "categories" not in params
     assert "pallets/flask" in result.output
-    assert "Wrong domain" not in result.output
-    assert result.metadata["requested_category"] == "it"
-    assert result.metadata["effective_category"] is None
-    assert result.metadata["category_fallback_attempted"] is True
-    assert result.metadata["category_fallback_used"] is True
-    assert result.metadata["search_quality"] == "degraded"
-    assert result.metadata["engine_failures"] == [["github", "timeout"]]
 
 
 @pytest.mark.asyncio
@@ -462,10 +456,10 @@ async def test_search_does_not_relax_freshness_when_engine_failed() -> None:
         options={"result_type": "repository", "time_range": "year"},
     )
 
-    assert backend._request.await_count == 2
+    assert backend._request.await_count == 1
     assert result.metadata["search_quality"] == "degraded"
     assert result.metadata["freshness_relaxation_attempted"] is False
-    assert result.metadata["category_fallback_attempted"] is True
+    assert result.metadata["category_fallback_attempted"] is False
 
 
 @pytest.mark.asyncio

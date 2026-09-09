@@ -31,6 +31,21 @@ Whether an agent can actually use a tool depends on:
 - which restrictions the agent applies on top
 - whether Intaris allows, escalates, or denies the runtime call
 
+## Model-specific file editors
+
+Cognis selects file editors from the authorized inventory before tool discovery:
+
+- GPT-5, GPT-6, and Codex models use `apply_patch`.
+- Anthropic models use `edit`, `multiedit`, and `write`.
+
+The selected editors are directly visible without `search_tools`, including under
+tool-slot pressure. An insufficient slot limit produces an error instead of
+silently hiding the editing surface.
+
+Discovery and indirect calls cannot restore incompatible editors. This policy
+does not grant missing tools or bypass read-only restrictions. External MCP tools
+with similar names retain their own authorization.
+
 ## Skills
 
 Skills are reusable instruction bundles stored in the database and exposed through the `Tools` workspace and skill APIs.
@@ -113,9 +128,14 @@ All mutation tools are non-bypassable and evaluated by Intaris guardrails. When 
 
 When a skill already has saved decomposition and its decomposition-driving inputs change, Cognis refreshes that decomposition before publishing the new current version. If the refresh fails, the update fails rather than leaving the latest saved version stale.
 
-### Built-in Cognis management skills
+### Built-in Cognis skills
 
 Cognis also ships global management skills for Cognis-native operations such as task and workflow management. These skills are intended for the main chat agent and are discoverable through the normal skill tools (`skill_list`, `skill_load`). They guide the agent to inspect state first, use the correct management tools, and avoid mutating protected resources such as system workflows.
+
+Cognis also ships reusable execution guidance. `Cognis Coding` defines the
+software delivery workflow. `Cognis Frontend Engineering` adds product judgment,
+interaction completeness, visual restraint, and cross-surface validation for
+product pages, web and mobile apps, dashboards, and control centers.
 
 ### Importing skills
 

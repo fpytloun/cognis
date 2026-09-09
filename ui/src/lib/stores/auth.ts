@@ -4,7 +4,15 @@ import { get, writable } from 'svelte/store';
 import { apiUrl } from '$lib/config';
 import { fetchWithTimeout } from '$lib/api/fetch';
 import { reportError } from '$lib/errors';
-import type { ApiErrorResponse, AuthSessionResponse, AuthStatus, UserSummary } from '$lib/types/api';
+import type {
+  ApiErrorResponse,
+  AuthLoginResponse,
+  AuthSessionResponse,
+  AuthStatus,
+  MfaChallengeResponse,
+  MfaSetupResponse,
+  UserSummary
+} from '$lib/types/api';
 import { toErrorMessage } from '$lib/utils';
 
 export interface AuthState {
@@ -189,7 +197,7 @@ export const auth = {
     }
   },
 
-  async login(email: string, password: string): Promise<void> {
+  async login(email: string, password: string): Promise<MfaChallengeResponse | null> {
     store.update((state) => ({ ...state, status: 'loading', error: null }));
 
     try {
@@ -206,13 +214,54 @@ export const auth = {
         throw new Error(await readApiMessage(response, 'Unable to log in.'));
       }
 
-      const payload = await parseAuthSessionResponse(response);
+      const payload = (await response.json()) as AuthLoginResponse;
+      if (payload.status !== 'authenticated') {
+        setAnonymous(null);
+        return payload;
+      }
       setAuthenticated(payload.user, Date.parse(payload.expires_at));
+      return null;
     } catch (error) {
       const message = toErrorMessage(error, 'Unable to log in.');
       setAnonymous(message);
       throw new Error(message);
     }
+  },
+
+  async startMfaSetup(challengeToken: string): Promise<MfaSetupResponse> {
+    const response = await fetchWithTimeout(apiUrl('/api/auth/mfa/setup/start'), {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ challenge_token: challengeToken })
+    }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
+    if (!response.ok) {
+      throw new Error(await readApiMessage(response, 'Unable to start MFA setup.'));
+    }
+    return (await response.json()) as MfaSetupResponse;
+  },
+
+  async completeMfa(
+    challengeToken: string,
+    code: string,
+    setup: boolean
+  ): Promise<AuthSessionResponse> {
+    const response = await fetchWithTimeout(
+      apiUrl(setup ? '/api/auth/mfa/setup/confirm' : '/api/auth/mfa/verify'),
+      {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challenge_token: challengeToken, code })
+      },
+      { timeoutMs: AUTH_REQUEST_TIMEOUT_MS }
+    );
+    if (!response.ok) {
+      throw new Error(await readApiMessage(response, 'Invalid authentication code.'));
+    }
+    const payload = await parseAuthSessionResponse(response);
+    setAuthenticated(payload.user, Date.parse(payload.expires_at));
+    return payload;
   },
 
   async logout(): Promise<void> {

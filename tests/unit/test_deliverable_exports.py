@@ -559,7 +559,11 @@ def test_pulse_presentation_suppresses_toc_and_numbering_with_editorial_chrome()
         )
     )
 
-    assert '<body class="presentation-pulse" data-rich-density="airy">' in rendered
+    soup = BeautifulSoup(rendered, "html.parser")
+    assert soup.body is not None
+    assert soup.body["class"] == ["presentation-pulse"]
+    assert soup.body["data-rich-canvas"] == "standard"
+    assert soup.body["data-rich-density"] == "comfortable"
     assert rendered.count("<h1>") == 1
     assert "<h1>Ranní pulse</h1>" in rendered
     assert 'aria-label="Table of contents"' not in rendered
@@ -1886,10 +1890,7 @@ def test_standalone_html_grid_block_respects_explicit_column_count() -> None:
     assert 'style="grid-template-columns: repeat(3, minmax(0, 1fr))"' in rendered
 
 
-def test_standalone_html_grid_block_without_explicit_columns_has_no_inline_override() -> None:
-    """Without an explicit column count, no inline `grid-template-columns`
-    style should be emitted on the block -- the CSS auto-fit default must be
-    free to engage."""
+def test_standalone_html_equal_grid_derives_columns_from_children() -> None:
 
     rendered = render_standalone_html(
         _row(
@@ -1897,13 +1898,40 @@ def test_standalone_html_grid_block_without_explicit_columns_has_no_inline_overr
                 "blocks": [
                     {
                         "type": "grid",
-                        "blocks": [{"type": "metric", "label": "A", "value": 1}],
+                        "layout": "equal",
+                        "blocks": [
+                            {"type": "metric", "label": "A", "value": 1},
+                            {"type": "metric", "label": "B", "value": 2},
+                        ],
                     }
                 ]
             }
         )
     )
 
+    assert 'style="grid-template-columns: repeat(2, minmax(0, 1fr))"' in rendered
+
+
+def test_standalone_html_split_grid_ignores_explicit_equal_columns() -> None:
+    rendered = render_standalone_html(
+        _row(
+            rich_payload={
+                "blocks": [
+                    {
+                        "type": "grid",
+                        "layout": "split-2-1",
+                        "columns": 3,
+                        "blocks": [
+                            {"type": "metric", "label": "A", "value": 1},
+                            {"type": "metric", "label": "B", "value": 2},
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    assert 'data-layout="split-2-1"' in rendered
     assert 'style="grid-template-columns' not in rendered
 
 
@@ -1927,6 +1955,16 @@ async def test_pdf_grid_block_with_explicit_columns_renders_without_error() -> N
         },
         {
             "type": "grid",
+            "layout": "equal",
+            "blocks": [
+                {"type": "metric", "label": "A", "value": 1},
+                {"type": "metric", "label": "B", "value": 2},
+            ],
+        },
+        {
+            "type": "grid",
+            "layout": "split-2-1",
+            "columns": 3,
             "blocks": [
                 {"type": "metric", "label": "A", "value": 1},
                 {"type": "metric", "label": "B", "value": 2},
@@ -1936,6 +1974,39 @@ async def test_pdf_grid_block_with_explicit_columns_renders_without_error() -> N
         rendered = render_standalone_html(_row(rich_payload={"blocks": [block]}))
         pdf = await render_pdf_bytes(rendered)
         assert pdf.content.startswith(b"%PDF")
+
+
+def test_standalone_html_typed_cells_use_display_labels_once() -> None:
+    rendered = render_standalone_html(
+        _row(
+            rich_payload={
+                "blocks": [
+                    {
+                        "type": "table",
+                        "rows": [
+                            {
+                                "latency": {
+                                    "type": "text",
+                                    "value": 118,
+                                    "label": "~118 s",
+                                },
+                                "scan": {
+                                    "type": "badge",
+                                    "value": "critical",
+                                    "label": "1.08M → 0",
+                                    "tone": "critical",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+
+    assert "~118 s" in rendered
+    assert "~118 s: 118" not in rendered
+    assert "1.08M → 0 (critical)" in rendered
 
 
 @pytest.mark.parametrize("data_field", ["metrics", "items", "cards"])
@@ -3304,6 +3375,36 @@ def test_emoji_substitution_is_exact_safe_and_preserves_text_presentation() -> N
     assert str(emoji[0]) == (
         '<span aria-label="©️" class="emoji" role="img">'
         '<span aria-hidden="true" class="emoji-glyph">©️</span></span>'
+    )
+
+
+def test_pdf_parser_uses_local_alias_only_for_exact_bundled_font(monkeypatch) -> None:
+    import weasyprint
+
+    from cognis.rendering import deliverables
+
+    captured = {}
+
+    class Html:
+        def __init__(self, *, string, url_fetcher):
+            captured["html"] = string
+            captured["fetcher"] = url_fetcher
+
+        def write_pdf(self, *, font_config):
+            return b"%PDF-test"
+
+    monkeypatch.setattr(weasyprint, "HTML", Html)
+    font_url = deliverables._emoji_font_data_url()
+    other_url = "data:font/ttf;base64,YWJj"
+    document = f"<style>a{{src:url({font_url})}}b{{src:url({other_url})}}</style>"
+    deliverables._render_pdf_sync(document)
+    assert captured["html"] == (
+        f"<style>a{{src:url(cognis-asset:emoji-font)}}b{{src:url({other_url})}}</style>"
+    )
+    assert font_url in document
+    assert captured["fetcher"] is deliverables._blocked_url_fetcher
+    assert deliverables._blocked_url_fetcher("cognis-asset:emoji-font") == (
+        deliverables._blocked_url_fetcher(font_url)
     )
 
 

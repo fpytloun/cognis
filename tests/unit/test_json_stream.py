@@ -43,15 +43,13 @@ def test_plain_delta_chunks_concatenate() -> None:
     # fragment of a much larger tool call. Neither fragment parses as JSON on
     # its own, and neither is a prefix/suffix of the other.
     existing = '{"action": "write_deliverable", "content": "Lorem ipsum '
-    incoming = 'dolor sit amet longer body continues here'
+    incoming = "dolor sit amet longer body continues here"
     result = merge_incremental_json_fragment(existing, incoming)
     assert result.merged == existing + incoming
     assert result.replaced is False
 
 
-def test_large_in_progress_accumulation_is_never_dropped_for_a_smaller_complete_fragment() -> (
-    None
-):
+def test_large_in_progress_accumulation_is_never_dropped_for_a_smaller_complete_fragment() -> None:
     """Regression test for the "write_deliverable large content" truncation bug.
 
     A large in-progress tool-call accumulation (e.g. a long `write_deliverable`

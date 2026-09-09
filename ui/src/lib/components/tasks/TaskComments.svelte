@@ -119,6 +119,21 @@
     return intentBadge[value]?.cls ?? 'border-slate-700 bg-slate-900/80 text-slate-300';
   }
 
+  function appliedRevisionAttempt(comment: TaskComment): number | null {
+    const actionResult = comment.metadata?.action_result;
+    if (
+      actionResult
+      && typeof actionResult === 'object'
+      && !Array.isArray(actionResult)
+      && typeof (actionResult as Record<string, unknown>).new_attempt === 'number'
+    ) {
+      return (actionResult as Record<string, unknown>).new_attempt as number;
+    }
+    return typeof comment.metadata?.new_attempt === 'number'
+      ? comment.metadata.new_attempt
+      : null;
+  }
+
   function pickDefaultIntent(): CommentIntent {
     if (canAnswerPause) return 'answer_pause';
     return 'record_only';
@@ -276,6 +291,7 @@
       };
       if (requiresTargetStep && targetStep) {
         payload.target_step = targetStep;
+        payload.expected_attempt = task.attempt_number;
       }
       const created = await api.tasks.addComment(task.task_id, payload);
       comments = [created, ...comments];
@@ -372,6 +388,7 @@
         <p class="text-sm text-slate-400">No comments yet.</p>
       {:else}
         {#each comments as comment (comment.comment_id)}
+          {@const openedAttempt = appliedRevisionAttempt(comment)}
           <article class="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3">
             <header class="flex flex-wrap items-center gap-2 text-xs">
               <span class={`rounded-full border px-2 py-0.5 font-semibold uppercase tracking-wider ${intentClass(comment.intent)}`}>{intentLabel(comment.intent)}</span>
@@ -387,6 +404,9 @@
                 <span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-200">→ {comment.target_step}</span>
               {/if}
               <span class="text-slate-500">created during attempt #{comment.attempt_number}</span>
+              {#if comment.applied && openedAttempt !== null}
+                <span class="text-emerald-300">opened attempt #{openedAttempt}</span>
+              {/if}
               <span class="ml-auto text-slate-500" title={formatAbsoluteTime(comment.created_at)}>{formatRelativeTime(comment.created_at)}</span>
             </header>
             <p class="mt-1 text-xs text-slate-500">{comment.author_email}</p>

@@ -1,17 +1,74 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+import cognis.core.remember_queue as remember_queue_module
 from cognis.core.events import EventBus, EventType
 from cognis.core.remember_queue import RememberRetryQueue
 from cognis.providers.memory.protocol import RememberOutcomeUnknownError
 from cognis.store.models import Agent, Base, RememberQueueRow, User
 from cognis.store.queries import create_conversation, create_session
+
+
+@pytest.mark.asyncio
+async def test_capacity_metric_is_not_observed_after_integrity_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.bind = None
+            self.get = AsyncMock(return_value=None)
+            database_time = Mock()
+            database_time.scalar_one.return_value = datetime.now(UTC)
+            self.execute = AsyncMock(return_value=database_time)
+            self.commit = AsyncMock(
+                side_effect=IntegrityError("insert", {}, RuntimeError("duplicate"))
+            )
+            self.rollback = AsyncMock()
+
+        def add(self, _row: object) -> None:
+            return None
+
+    session = Session()
+
+    @asynccontextmanager
+    async def session_factory() -> object:
+        yield session
+
+    queue = RememberRetryQueue(
+        _Worker(),
+        session_factory=session_factory,  # type: ignore[arg-type]
+        max_depth=1,
+    )
+    monkeypatch.setattr(queue, "_serialize_capacity_transaction", AsyncMock())
+    monkeypatch.setattr(queue, "_active_depth", AsyncMock(return_value=1))
+    monkeypatch.setattr(queue, "_update_durable_depth_metric", AsyncMock())
+    monkeypatch.setattr(
+        remember_queue_module, "database_now", AsyncMock(return_value=datetime.now(UTC))
+    )
+    metric_inc = Mock()
+    monkeypatch.setattr(remember_queue_module.EVIDENCE_CAPACITY_UNAVAILABLE, "inc", metric_inc)
+
+    await queue.enqueue(
+        {
+            "item_id": "evidence-rollback",
+            "queue_kind": remember_queue_module.EVIDENCE_QUEUE_KIND,
+            "session_id": "session",
+            "user_email": "user@example.com",
+        }
+    )
+
+    session.rollback.assert_awaited_once()
+    metric_inc.assert_not_called()
 
 
 class _Worker:
@@ -257,7 +314,13 @@ async def test_expired_pre_dispatch_claim_is_recovered_not_marked_ambiguous(tmp_
         }
     )
     assert len(await queue._claim_due_durable_items(1)) == 1
-    await asyncio.sleep(0.05)
+    # SQLite's clock has second precision. Set the durable lease in the past
+    # rather than treating a short wall-clock sleep as a database lease boundary.
+    async with session_factory() as session:
+        row = await session.scalar(sa.select(RememberQueueRow))
+        assert row is not None
+        row.lease_expires_at = datetime.now(UTC) - timedelta(seconds=2)
+        await session.commit()
 
     assert await queue._claim_due_durable_items(1) == []
     claimed_after_recovery = await queue._claim_due_durable_items(1)

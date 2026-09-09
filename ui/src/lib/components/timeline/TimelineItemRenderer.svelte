@@ -7,6 +7,7 @@
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import UserInteractionMessage from '$lib/components/UserInteractionMessage.svelte';
   import WorkflowComposedCard from '$lib/components/WorkflowComposedCard.svelte';
+  import TimelineActivityNotice from '$lib/components/timeline/TimelineActivityNotice.svelte';
   import type { AssistantDeliverableTimelineItem, MessageTimelineItem, SystemMessageTimelineItem, TimelineItem, ToolCallTimelineItem, UserInteractionTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineScope } from '$lib/chat-v2/types';
   import type { Agent } from '$lib/types/api';
@@ -20,6 +21,7 @@
     searchSelected = false,
     getToolCall = () => null,
     onViewSession,
+    pinnedTransient = false,
     scope
   } = $props<{
     item: TimelineItem;
@@ -30,6 +32,7 @@
     searchSelected?: boolean;
     getToolCall?: (callId: string) => ToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    pinnedTransient?: boolean;
     scope?: TimelineScope | undefined;
   }>();
 
@@ -67,6 +70,14 @@
     return retryRemainingSeconds > 0
       ? `Retrying in ${formatDuration(retryRemainingSeconds)}`
       : 'Retrying now';
+  });
+  const retrySummary = $derived.by(() => {
+    const parts = [
+      retryCountdownLabel,
+      retryAttemptLabel,
+      [systemItem?.providerId, systemItem?.model].filter(Boolean).join(' · ')
+    ].filter(Boolean);
+    return parts.join(' · ') || 'Retrying the model call.';
   });
 
   $effect(() => {
@@ -148,39 +159,41 @@
       {/if}
     </div>
   {:else if item.noticeKind === 'model_recovery' && item.noticeScope === 'retry'}
-    <div class="mx-auto max-w-2xl rounded-2xl border border-slate-700/80 bg-slate-900/80 px-4 py-3 text-xs text-slate-300 shadow-card">
-      <div class="flex items-start gap-3">
-        <span class={`mt-1 h-2 w-2 shrink-0 rounded-full ${retryNoticeActive ? 'animate-pulse bg-sky-300' : 'bg-slate-500'}`}></span>
-        <div class="min-w-0 flex-1">
-          <p class="whitespace-pre-line leading-5">{item.text}</p>
-          <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px] not-italic">
-            {#if retryCountdownLabel}
-              <span class="rounded-full border border-sky-400/30 bg-sky-500/10 px-2 py-0.5 font-medium text-sky-100">
-                {retryCountdownLabel}
-              </span>
-            {/if}
-            {#if retryAttemptLabel}
-              <span class="rounded-full border border-slate-600 bg-slate-800 px-2 py-0.5 text-slate-300">
-                {retryAttemptLabel}
-              </span>
-            {/if}
-            {#if item.providerId || item.model}
-              <span class="rounded-full border border-slate-700 bg-slate-950/40 px-2 py-0.5 text-slate-400">
-                {[item.providerId, item.model].filter(Boolean).join(' · ')}
-              </span>
-            {/if}
-          </div>
-        </div>
-      </div>
-    </div>
+    {#if pinnedTransient || retryNoticeActive}
+      <TimelineActivityNotice
+        title="Connection interrupted"
+        text={retrySummary}
+        details={item.text}
+        active={retryNoticeActive}
+      />
+    {/if}
+  {:else if item.noticeKind === 'model_error'}
+    <TimelineActivityNotice
+      title="Model request failed"
+      text={item.recoverable ? 'The request can be retried.' : 'The request did not complete.'}
+      details={item.text}
+      tone="error"
+      code={item.reasonClass}
+    />
+  {:else if item.noticeKind === 'model_recovery'}
+    <TimelineActivityNotice
+      title={item.noticeScope === 'continuation' ? 'Continuing from saved work' : 'Model recovered'}
+      text={item.text}
+      details={item.text}
+    />
+  {:else if item.noticeKind === 'turn_initiated'}
+    <TimelineActivityNotice title="Turn initiated" text={item.text} details={item.text} />
   {:else}
-    <p class="py-1 text-center text-xs italic text-slate-500 whitespace-pre-line">{item.text}</p>
+    <TimelineActivityNotice title="System notice" text={item.text} details={item.text} />
   {/if}
 {:else}
-  <article class={`rounded-3xl border px-4 py-4 text-sm shadow-card ${item.tone === 'warning' ? 'border-sky-500/30 bg-sky-500/10 text-sky-100' : item.tone === 'error' ? 'border-rose-500/30 bg-rose-500/10 text-rose-100' : 'border-slate-700 bg-slate-900 text-slate-200'}`}>
-    <h3 class="font-semibold">{item.title}</h3>
-    {#if item.description}
-      <p class="mt-2 leading-6">{item.description}</p>
-    {/if}
-  </article>
+  <TimelineActivityNotice
+    title={item.title}
+    text={item.description}
+    details={item.details ?? item.description}
+    tone={item.tone}
+    actionRequired={item.actionRequired ?? false}
+    code={item.code}
+    active={item.status === 'running' || item.status === 'pending' || item.status === 'waiting' || (item.actionRequired ?? false)}
+  />
 {/if}

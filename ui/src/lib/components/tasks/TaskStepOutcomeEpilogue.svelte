@@ -7,7 +7,7 @@
 
   let { stepRun } = $props<{ stepRun: StepRun }>();
 
-  const deliverable = $derived(stepRun.deliverables[0] ?? null);
+  const deliverable = $derived(stepRun.deliverables?.[0] ?? null);
   const deliverableItem = $derived.by<AssistantDeliverableTimelineItem | null>(() => {
     if (!deliverable) return null;
     return {

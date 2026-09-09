@@ -13,13 +13,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from cognis.store.coordination import DatabaseLeaseStore
 from cognis.store.database import create_session_factory
 from cognis.store.direct_turns import (
+    DirectTurnAdmissionRejected,
     DirectTurnRecoveryConflict,
     DirectTurnRecoverySnapshot,
     DirectTurnStatus,
     DirectTurnStore,
     conversation_lease_key,
 )
-from cognis.store.models import AuditLog, Base
+from cognis.store.models import AuditLog, Base, Conversation, DirectTurnRequestRow
 from cognis.store.queries import create_agent, create_conversation, create_user
 
 pytestmark = [
@@ -38,6 +39,115 @@ def _asyncpg_url() -> str:
     if not url.startswith("postgresql+asyncpg://"):
         raise ValueError("COGNIS_TEST_POSTGRES_URL must use PostgreSQL with asyncpg")
     return url
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [True, False])
+async def test_postgres_stop_serializes_with_successor_handoff(cancel_first):
+    from datetime import UTC
+
+    url = _asyncpg_url()
+    schema_name = f"cognis_handoff_{uuid.uuid4().hex}"
+    admin = create_async_engine(url)
+    async with admin.begin() as connection:
+        await connection.execute(sa_schema.CreateSchema(schema_name))
+    engine = create_async_engine(
+        url, connect_args={"server_settings": {"search_path": f'"{schema_name}"'}}
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        factory = create_session_factory(engine)
+        async with factory() as session:
+            await create_user(session, email="user@example.com", name="User", password_hash="hash")
+            await create_agent(
+                session,
+                agent_id="agent-1",
+                owner_email="user@example.com",
+                name="Agent",
+                status="active",
+            )
+            await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                conversation_id="conv-a",
+            )
+            await session.commit()
+        store = DirectTurnStore(factory)
+        args = dict(
+            conversation_id="conv-a",
+            session_id=None,
+            agent_id="agent-1",
+            user_id="user@example.com",
+            idempotency_scope="handoff-test",
+            payload={"schema_version": 1, "content": "", "attachments": []},
+        )
+        parent = (await store.admit(**args, idempotency_key="parent")).request
+        lease = await DatabaseLeaseStore(factory).acquire(
+            conversation_lease_key("conv-a"), owner_id="controller-a:boot-a", ttl_seconds=60
+        )
+        assert lease is not None
+        assert await store.claim(
+            parent.request_id, lease=lease, controller_id="controller-a", incarnation_id="boot-a"
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def participant(session, successor, created):
+            entered.set()
+            if not cancel_first:
+                await release.wait()
+            await store.handoff(
+                session,
+                request_id=parent.request_id,
+                turn_id=parent.turn_id,
+                lease=lease,
+                successor=successor,
+            )
+
+        async def admit():
+            return await store.admit(
+                **args, idempotency_key="successor", transaction_participant=participant
+            )
+
+        if cancel_first:
+            async with factory() as session:
+                await session.execute(
+                    select(Conversation)
+                    .where(Conversation.conversation_id == "conv-a")
+                    .with_for_update()
+                )
+                row = await session.scalar(
+                    select(DirectTurnRequestRow).where(
+                        DirectTurnRequestRow.request_id == parent.request_id
+                    )
+                )
+                row.cancel_requested_at = datetime.now(UTC)
+                await session.flush()
+                task = asyncio.create_task(admit())
+                await asyncio.sleep(0.1)
+                assert not entered.is_set()
+                await session.commit()
+            with pytest.raises(DirectTurnAdmissionRejected):
+                await task
+            assert len(await store.list_conversation_pending("conv-a")) == 1
+        else:
+            task = asyncio.create_task(admit())
+            await entered.wait()
+            stop = asyncio.create_task(store.cancel_conversation("conv-a", clear_queue=False))
+            await asyncio.sleep(0.1)
+            assert not stop.done()
+            release.set()
+            successor = (await task).request
+            await stop
+            assert (await store.get(parent.request_id)).status == "completed"
+            assert (await store.get(successor.request_id)).status == "cancelled"
+    finally:
+        await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(sa_schema.DropSchema(schema_name, cascade=True))
+        await admin.dispose()
 
 
 @pytest.mark.asyncio
@@ -109,9 +219,38 @@ async def test_postgres_concurrent_admission_and_fencing() -> None:
                 context_type="web",
                 conversation_id="conv-operator",
             )
+            await create_conversation(
+                session,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+                conversation_id="conv-disposition",
+            )
             await session.commit()
 
         store = DirectTurnStore(session_factory)
+
+        async def admit_disposition(key: str):
+            # Separate store instances model admission through different HA
+            # controllers while the database remains the shared authority.
+            return await DirectTurnStore(session_factory).admit(
+                conversation_id="conv-disposition",
+                session_id=None,
+                agent_id="agent-1",
+                user_id="user@example.com",
+                idempotency_scope="web:conv-disposition:user@example.com",
+                idempotency_key=key,
+                payload={"schema_version": 1, "content": key, "attachments": []},
+            )
+
+        disposition_results = await asyncio.gather(
+            admit_disposition("message-a"),
+            admit_disposition("message-b"),
+        )
+        assert sorted(result.queued_behind_predecessor for result in disposition_results) == [
+            False,
+            True,
+        ]
 
         async def admit():
             return await store.admit(

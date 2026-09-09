@@ -1,0 +1,99 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cognis-executor"
+version = "0.14.0"
+description = "Standalone remote executor for Cognis"
+readme = "README.md"
+license = { text = "TBD" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Filip Pytloun", email = "filip@pytloun.cz" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "cognis-common==0.14.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "prometheus-client>=0.20.0",
+    "jsonschema>=4.0.0",
+    "psutil>=6.1.0",
+    "platformdirs>=4.3.0",
+    "websockets>=14.0",
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.53.0",
+    "playwright-stealth>=2.0.0",
+    "patchright>=1.55.0",
+]
+mcp = []
+web = [
+    "ddgs==9.15.0",
+    "trafilatura>=2.0.0",
+    "aiolimiter>=1.2.1",
+    "extruct>=0.18.0",
+    "w3lib>=2.4.1",
+    "beautifulsoup4>=4.14.3",
+    "readability-lxml>=0.8.4.1",
+    "youtube-transcript-api>=1.2.0",
+    "Markdown>=3.7",
+    "markdownify>=0.14.0",
+    "playwright>=1.53.0",
+    "playwright-stealth>=2.0.0",
+    "patchright>=1.55.0",
+]
+documents = [
+    "pypdf>=5.4.0",
+    "Pillow>=11.0.0",
+    "weasyprint>=63.0",
+    "Markdown>=3.7",
+    "jinja2>=3.1.6",
+    "markdownify>=0.14.0",
+]
+inference = [
+    "litellm>=1.82.0",
+    "tiktoken>=0.8.0",
+]
+channels = []
+full = [
+    "playwright>=1.53.0",
+    "playwright-stealth>=2.0.0",
+    "patchright>=1.55.0",
+    "ddgs==9.15.0",
+    "trafilatura>=2.0.0",
+    "aiolimiter>=1.2.1",
+    "extruct>=0.18.0",
+    "w3lib>=2.4.1",
+    "beautifulsoup4>=4.14.3",
+    "readability-lxml>=0.8.4.1",
+    "youtube-transcript-api>=1.2.0",
+    "Markdown>=3.7",
+    "markdownify>=0.14.0",
+    "pypdf>=5.4.0",
+    "Pillow>=11.0.0",
+    "weasyprint>=63.0",
+    "jinja2>=3.1.6",
+    "litellm>=1.82.0",
+    "tiktoken>=0.8.0",
+]
+
+[project.scripts]
+cognis-executor = "cognis.executor.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cognis"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/src/cognis/**/*",
+]

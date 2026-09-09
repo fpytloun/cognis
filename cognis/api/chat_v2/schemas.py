@@ -13,6 +13,12 @@ SchemaVersion = Literal[2]
 ChatMode = Literal["default", "plan", "build"]
 TimelineScopeKind = Literal["conversation", "session", "task_step"]
 WorkCategory = Literal["files", "commands", "mutations", "artifacts", "deliverables"]
+FilePreviewOmissionReason = Literal[
+    "not_persisted",
+    "retention_expired",
+    "projection_budget",
+    "sensitive",
+]
 ActivityOverviewDetail = Literal["lightweight", "full"]
 TimelineItemStatus = Literal[
     "pending",
@@ -51,7 +57,17 @@ class ClientPerformanceRequest(StrictModel):
         allow_inf_nan=False,
     )
 
-    metric: Literal["cached_restore_ms", "timeline_fresh_ms"]
+    metric: Literal[
+        "cached_restore_ms",
+        "timeline_fresh_ms",
+        "activity_overview_cache_fresh_ms",
+        "activity_overview_cache_stale_ms",
+        "activity_overview_cache_miss_ms",
+        "activity_overview_request_success_ms",
+        "activity_overview_request_error_ms",
+        "activity_overview_request_aborted_ms",
+        "activity_overview_request_deduplicated_ms",
+    ]
     duration_ms: float = Field(ge=0, le=300_000)
 
 
@@ -119,7 +135,11 @@ class FileDiffRef(StrictModel):
     generated: bool = False
     truncated: bool = False
     preview_omitted: bool = False
+    preview_omission_reason: FilePreviewOmissionReason | None = None
     path_id: str | None = None
+    path_generation_id: str | None = None
+    occurred_at: str | None = None
+    source_item_id: str | None = None
     relative_path: str | None = None
     root_label: str | None = None
     root_name: str | None = None
@@ -398,6 +418,7 @@ class ErrorTimelineItem(TimelineItemBase):
     level: Literal["error"] = "error"
     title: str
     message: str | None = None
+    error_detail: str | None = None
     error_code: str | None = None
     recoverable: bool = False
 
@@ -440,6 +461,10 @@ class TimelineWindow(StrictModel):
     @model_validator(mode="after")
     def _validate_canonical_items(self) -> TimelineWindow:
         _ensure_canonical_timeline_items(self.items)
+        if self.has_more_before and self.before_cursor is None:
+            raise ValueError("timeline with older history must include a before cursor")
+        if not self.has_more_before and self.before_cursor is not None:
+            raise ValueError("timeline without older history must not include a before cursor")
         return self
 
 
@@ -453,6 +478,13 @@ class RuntimeActiveTurn(StrictModel):
     updated_at: str | None = None
 
 
+class BoundaryReceipt(StrictModel):
+    session_id: str
+    seq: int = Field(ge=1)
+    queue_id: str
+    client_message_id: str
+
+
 class RuntimeOverlaySnapshot(StrictModel):
     runtime_epoch: str
     runtime_revision: int = Field(ge=0)
@@ -463,6 +495,7 @@ class RuntimeOverlaySnapshot(StrictModel):
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
     context_usage: dict[str, Any] | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
+    boundary_receipts: list[BoundaryReceipt] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _validate_active_turn_consistency(self) -> RuntimeOverlaySnapshot:
@@ -484,6 +517,7 @@ class ConversationSummary(StrictModel):
     active_session_id: str | None = None
     last_message_at: str | None = None
     last_read_at: str | None = None
+    has_message_history: bool = False
 
 
 class QueueMessage(StrictModel):
@@ -491,10 +525,14 @@ class QueueMessage(StrictModel):
     client_message_id: str | None = None
     client_txn_id: str | None = None
     content: str
+    kind: Literal["automatic_continuation"] | None = None
+    continuation_reason: str | None = None
     attachments: list[AttachmentRef] = Field(default_factory=list)
     position: int = Field(ge=0)
     created_at: str | None = None
     updated_at: str | None = None
+    status: Literal["queued", "recoverable", "committing"] = "queued"
+    cancel_requested: bool = False
 
 
 class QueueState(StrictModel):
@@ -532,6 +570,12 @@ class ChatSnapshot(StrictModel):
     server_time: str
 
 
+class TodoProgress(StrictModel):
+    total: int = Field(ge=0)
+    completed: int = Field(ge=0)
+    in_progress: int = Field(ge=0)
+
+
 class WorkstreamRef(StrictModel):
     key: str
     kind: str
@@ -562,10 +606,28 @@ class WorkstreamRef(StrictModel):
     completed_at: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    active_turn_id: str | None = None
+    execution_turn_id: str | None = None
+    runtime_selection_revision: int | None = None
+    runtime_recorded_at: str | None = None
     agent_display_name: str | None = None
     agent_avatar_url: str | None = None
     backing_session_count: int = Field(default=1, ge=1)
     backing_session_ids: list[str] = Field(default_factory=list)
+    todo_progress: TodoProgress | None = None
+    execution_state: (
+        Literal[
+            "idle",
+            "queued",
+            "running",
+            "waiting",
+            "recovering",
+            "completed",
+            "failed",
+            "cancelled",
+        ]
+        | None
+    ) = None
 
 
 class WorkDeliverable(StrictModel):
@@ -576,6 +638,7 @@ class WorkDeliverable(StrictModel):
     content: str | None = None
     content_preview_truncated: bool = False
     recoverable: bool = True
+    display_only: bool = False
     render_metadata: dict[str, Any] | None = None
     export_metadata: dict[str, Any] | None = None
     source_workstream: WorkstreamRef | None = None
@@ -584,6 +647,7 @@ class WorkDeliverable(StrictModel):
 class WorkFileStat(StrictModel):
     path: str
     path_id: str
+    path_generation_id: str | None = None
     relative_path: str | None = None
     root_label: str | None = None
     root_name: str | None = None
@@ -676,8 +740,70 @@ class WorkSummary(StrictModel):
     omitted_files: int = Field(default=0, ge=0)
 
 
+class WorkActivityRootRef(StrictModel):
+    kind: Literal["conversation", "task"]
+    conversation_id: str | None = None
+    task_id: str | None = None
+    step_run_id: str | None = None
+    title: str | None = None
+
+
+class WorkActivityAgentRef(StrictModel):
+    agent_id: str
+    display_name: str
+    avatar_url: str | None = None
+
+
+class WorkActivityProjectRef(StrictModel):
+    project_id: str
+    name: str
+
+
+class WorkActivityItem(StrictModel):
+    activity_scope_id: str
+    scope: TimelineScope
+    root: WorkActivityRootRef
+    agent: WorkActivityAgentRef
+    project: WorkActivityProjectRef | None = None
+    status: str
+    last_activity_at: str
+    summary: WorkSummary | None = None
+    materialization: Literal["live", "catching_up", "partial", "failed"]
+
+
+class WorkActivityListResponse(StrictModel):
+    items: list[WorkActivityItem] = Field(default_factory=list)
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class WorkFileHistoryRequest(StrictModel):
+    scope: TimelineScope
+    path_generation_id: str = Field(min_length=1, max_length=128)
+    before: str | None = Field(default=None, max_length=4096)
+    limit: int = Field(default=50, ge=1, le=100)
+
+
+class WorkRefreshRequest(StrictModel):
+    scope: TimelineScope
+
+
+class WorkRefreshResponse(StrictModel):
+    accepted: Literal[True] = True
+    scope: TimelineScope
+    session_count: int = Field(ge=0)
+
+
+class WorkFileHistoryResponse(StrictModel):
+    scope: TimelineScope
+    path_generation_id: str
+    items: list[FileDiffRef] = Field(default_factory=list)
+    before_cursor: str | None = None
+    has_more_before: bool = False
+
+
 class WorkMaterialization(StrictModel):
-    state: Literal["materializing", "caught_up", "repair", "failed"] = "caught_up"
+    state: Literal["live", "catching_up", "partial", "failed"] = "live"
     completed_streams: int = Field(default=0, ge=0)
     total_streams: int = Field(default=0, ge=0)
     covered_events: int = Field(default=0, ge=0)
@@ -714,6 +840,8 @@ class ActivityOverviewResponse(StrictModel):
     recent: dict[WorkCategory, list[ActivityRecentItem]] = Field(default_factory=dict)
     recent_work: ActivityRecentWork = Field(default_factory=ActivityRecentWork)
     graph_fingerprint: str
+    work_revision: int = Field(default=0, ge=0)
+    graph_revision: int = Field(default=0, ge=0)
     overview_revision: str
     graph_truncated: bool = False
     server_time: str
@@ -721,6 +849,7 @@ class ActivityOverviewResponse(StrictModel):
 
 class WorkProjectionResponse(StrictModel):
     schema_version: SchemaVersion = 2
+    detail: ActivityOverviewDetail = "full"
     projection_version: str
     scope: TimelineScope
     final_deliverable: WorkDeliverable | None = None
@@ -930,6 +1059,10 @@ class TimelineBackfillResponse(StrictModel):
     @model_validator(mode="after")
     def _validate_canonical_items(self) -> TimelineBackfillResponse:
         _ensure_canonical_timeline_items(self.items)
+        if self.has_more_before and self.before_cursor is None:
+            raise ValueError("timeline with older history must include a before cursor")
+        if not self.has_more_before and self.before_cursor is not None:
+            raise ValueError("timeline without older history must not include a before cursor")
         return self
 
 

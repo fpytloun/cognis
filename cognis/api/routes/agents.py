@@ -194,15 +194,15 @@ def _validate_agent_execution(execution: object) -> None:
             raise api_exception(400, "validation_error", f"{path} must be an object")
         entry_id = entry.get("executor_id")
         entry_selector = entry.get("executor_selector")
-        has_id = bool(isinstance(entry_id, str) and entry_id.strip())
-        has_selector = bool(isinstance(entry_selector, dict) and bool(entry_selector))
+        has_id = isinstance(entry_id, str) and bool(entry_id.strip())
+        has_selector = isinstance(entry_selector, dict) and bool(entry_selector)
         if has_id == has_selector:
             raise api_exception(
                 400,
                 "validation_error",
                 f"{path} must specify exactly one of executor_id or executor_selector",
             )
-        if has_id:
+        if isinstance(entry_id, str) and has_id:
             normalized_id = entry_id.strip()
             if normalized_id in seen_ids:
                 raise api_exception(
@@ -212,7 +212,7 @@ def _validate_agent_execution(execution: object) -> None:
                     "(also a primary or earlier additional binding)",
                 )
             seen_ids.add(normalized_id)
-        if has_selector:
+        if isinstance(entry_selector, dict) and has_selector:
             for k, v in entry_selector.items():
                 if not isinstance(k, str) or not k.strip():
                     raise api_exception(
@@ -332,7 +332,7 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         "agent_type": payload.agent_type,
         "status": payload.status,
     }
-    definition = _validate_agent_definition_payload(definition_payload)
+    definition = _validate_agent_definition_payload(dict(definition_payload))
 
     async with request.app.state.session_factory() as session:
         existing = await get_agent(session, agent_id)
@@ -776,34 +776,38 @@ async def duplicate_agent_route(request: Request, agent_id: str) -> AgentRespons
         return agent_to_response(row)
 
     async with request.app.state.session_factory() as session:
-        row = await get_agent(session, agent_id)
-        if row is None:
+        source_row = await get_agent(session, agent_id)
+        if source_row is None:
             raise api_exception(404, "not_found", "Agent not found")
-        await check_agent_access(request, row, required="edit")
-        source_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
-        new_agent_id = f"{slugify(row.display_name or row.name)}-{uuid.uuid4().hex[:6]}"
+        await check_agent_access(request, source_row, required="edit")
+        source_definition = AgentDefinition.model_validate(
+            agent_to_response(source_row).model_dump()
+        )
+        new_agent_id = (
+            f"{slugify(source_row.display_name or source_row.name)}-{uuid.uuid4().hex[:6]}"
+        )
         new_row = await create_agent(
             session,
             agent_id=new_agent_id,
             owner_email=user.email,
-            name=f"{row.display_name or row.name} Copy",
-            display_name=f"{row.display_name or row.name} Copy",
-            description=row.description,
-            system_prompt=row.system_prompt,
-            personality=row.personality,
-            skills=row.skills,
-            tools=row.tools,
-            permissions=row.permissions,
-            llm_config=row.llm_config,
+            name=f"{source_row.display_name or source_row.name} Copy",
+            display_name=f"{source_row.display_name or source_row.name} Copy",
+            description=source_row.description,
+            system_prompt=source_row.system_prompt,
+            personality=source_row.personality,
+            skills=source_row.skills,
+            tools=source_row.tools,
+            permissions=source_row.permissions,
+            llm_config=source_row.llm_config,
             capabilities=source_definition.capabilities.model_dump(mode="json"),
             agent_profiles={
                 profile_id: profile.model_dump(mode="json", exclude_none=True)
                 for profile_id, profile in source_definition.agent_profiles.items()
             },
             default_agent_profile_id=source_definition.default_agent_profile_id,
-            execution=row.execution,
-            avatar_image_id=row.avatar_image_id,
-            agent_type=row.agent_type,
+            execution=source_row.execution,
+            avatar_image_id=source_row.avatar_image_id,
+            agent_type=source_row.agent_type,
             status="draft",
         )
         await session.commit()

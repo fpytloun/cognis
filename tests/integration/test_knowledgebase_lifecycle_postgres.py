@@ -73,6 +73,7 @@ async def test_postgres_canonical_delete_wins_concurrent_replacement(
         factory = create_session_factory(engine)
         async with factory() as session:
             session.add(User(email="owner@example.com", name="Owner", role="user"))
+            await session.flush()
             session.add(
                 KnowledgebaseRow(
                     knowledgebase_id="kb-1",
@@ -104,6 +105,7 @@ async def test_postgres_canonical_delete_wins_concurrent_replacement(
                     ),
                 ]
             )
+            await session.flush()
             session.add(
                 KnowledgebaseArtifactRow(
                     kb_artifact_id="kba-1",

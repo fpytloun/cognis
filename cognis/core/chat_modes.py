@@ -7,7 +7,12 @@ from typing import Literal
 
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationModel
-from cognis.models.tool import ToolCapability, ToolDefinition, tool_capabilities
+from cognis.models.tool import (
+    ToolCapability,
+    ToolDefinition,
+    ToolMutationKind,
+    tool_capabilities,
+)
 
 type ChatMode = Literal["default", "plan", "build"]
 type ChatModeSource = Literal[
@@ -164,6 +169,11 @@ def plan_mode_reminder(*, source: ChatModeSource) -> str:
 def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
     """Return whether a tool is clearly mutating and should be hidden in plan mode."""
 
+    operations = tool.native_operations or []
+    if operations and any(
+        operation.mutation_kind is ToolMutationKind.READ for operation in operations
+    ):
+        return False
     capabilities = tool_capabilities(tool)
     if ToolCapability.DESTRUCTIVE in capabilities or ToolCapability.PRIVILEGED in capabilities:
         return True
@@ -198,3 +208,17 @@ def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
         "apply_patch",
         "artifact_save",
     }
+
+
+def is_plan_mutating_tool_call(tool: ToolDefinition, arguments: dict[str, object]) -> bool:
+    """Return whether a concrete tool call can mutate state in plan mode."""
+
+    operations = tool.native_operations or []
+    if len(operations) > 1:
+        requested = arguments.get("action") or arguments.get("operation")
+        for operation in operations:
+            if operation.operation == requested:
+                return operation.mutation_kind is not ToolMutationKind.READ
+        # An unknown operation must not bypass the plan-mode mutation boundary.
+        return True
+    return is_plan_hidden_tool(tool)

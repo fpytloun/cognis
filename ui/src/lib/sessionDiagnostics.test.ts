@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acceptsSessionDiagnostics,
   diagnosticsForSession,
+  mergeContextUsage,
 } from './sessionDiagnostics';
 import type { SessionInfoData } from './sessionInfoCache';
 
@@ -52,5 +53,32 @@ describe('session diagnostics ownership', () => {
     expect(acceptsSessionDiagnostics('session-b', 'root-session', 'session-a')).toBe(false);
     expect(acceptsSessionDiagnostics('session-b', 'root-session', 'session-b')).toBe(true);
     expect(acceptsSessionDiagnostics(null, 'root-session', 'root-session')).toBe(true);
+  });
+
+  it('keeps the newest context snapshot for one session', () => {
+    const current = {
+      ...detail('session-a', 225).context_usage!,
+      runtime_metadata_revision: 14,
+    };
+    const stale = {
+      ...detail('session-a', 59).context_usage!,
+      runtime_metadata_revision: 5,
+    };
+    expect(mergeContextUsage(current, stale)?.prompt_tokens).toBe(225);
+    expect(mergeContextUsage(
+      current,
+      { ...current, prompt_tokens: 238, runtime_metadata_revision: 15 },
+    )?.prompt_tokens).toBe(238);
+  });
+
+  it('does not let an unversioned response replace versioned context', () => {
+    const current = {
+      ...detail('session-a', 225).context_usage!,
+      runtime_metadata_revision: 14,
+    };
+    expect(mergeContextUsage(
+      current,
+      detail('session-a', 59).context_usage ?? null,
+    )?.prompt_tokens).toBe(225);
   });
 });

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import sys
 from builtins import BaseExceptionGroup, ExceptionGroup
 from pathlib import Path
@@ -11,9 +12,11 @@ import httpx
 import pytest
 
 from cognis import __version__ as COGNIS_VERSION
-from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
-from cognis.tools import mcp as mcp_module
-from cognis.tools.mcp import (
+from cognis import mcp_runtime as mcp_module
+from cognis.api.mcp_policy import canonicalize_mcp_headers, invalid_mcp_config_reason
+from cognis.api.mcp_runtime import MCPClientError as ControllerMCPClientError
+from cognis.executor.mcp_runtime import MCPClientError as ExecutorMCPClientError
+from cognis.mcp_runtime import (
     AsyncExitStack,
     MCPClientError,
     SSEMCPClient,
@@ -27,6 +30,7 @@ from cognis.tools.mcp import (
     normalize_streamable_http_url,
     runtime_mcp_server_key,
 )
+from cognis.models.tool import MCPServerConfig, ToolSource, sanitize_mcp_tool_name
 
 
 def _server_script() -> str:
@@ -96,7 +100,41 @@ while True:
         )
     else:
         write_message({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "Unknown method"}})
-"""
+    """
+
+
+def test_compatibility_modules_alias_common_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller_module = importlib.import_module("cognis.api.mcp_runtime")
+    executor_module = importlib.import_module("cognis.executor.mcp_runtime")
+    tools_module = importlib.import_module("cognis.tools.mcp")
+
+    assert ControllerMCPClientError is MCPClientError
+    assert ExecutorMCPClientError is MCPClientError
+    assert controller_module is mcp_module
+    assert executor_module is mcp_module
+    assert tools_module is mcp_module
+    assert tools_module._strip_empty_optionals is _strip_empty_optionals
+    assert tools_module._coerce_client_error is mcp_module._coerce_client_error
+
+    replacement = object()
+    monkeypatch.setattr(tools_module, "ClientSession", replacement)
+    assert mcp_module.ClientSession is replacement
+
+
+def test_controller_mcp_policy_remains_controller_owned() -> None:
+    assert (
+        invalid_mcp_config_reason(
+            transport="stdio",
+            command=None,
+            url=None,
+            env=None,
+            headers=None,
+        )
+        == "Stdio MCP servers must define a command."
+    )
+    assert canonicalize_mcp_headers({"x-api-key": "secret"}) == {"X-Api-Key": "secret"}
 
 
 @pytest.mark.asyncio
@@ -211,7 +249,7 @@ def test_mcp_tools_to_definitions_clamps_descriptions_and_strips_schema_metadata
 
 
 @pytest.mark.asyncio
-async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
+async def test_streamable_http_client_accepts_two_streams_and_uses_canonical_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: dict[str, Any] = {}
@@ -239,7 +277,7 @@ async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
     def _streamable_http_client(url: str, *, http_client: object) -> _AsyncContext:
         calls["url"] = url
         calls["http_client"] = http_client
-        return _AsyncContext((object(), object(), lambda: None))
+        return _AsyncContext((object(), object()))
 
     monkeypatch.setattr(mcp_module.httpx, "AsyncClient", _HTTPClient)
     monkeypatch.setattr(mcp_module, "streamable_http_client", _streamable_http_client)
@@ -253,8 +291,9 @@ async def test_streamable_http_client_follows_redirects_and_uses_canonical_url(
     )
 
     async with mcp_module.AsyncExitStack() as stack:
-        await client._enter_transport(stack)
+        streams = await client._enter_transport(stack)
 
+    assert len(streams) == 2
     assert calls["url"] == "http://mcp-gws.openwebui.svc.cluster.local/mcp"
     assert calls["http_kwargs"]["follow_redirects"] is True
     assert calls["http_kwargs"]["headers"]["User-Agent"] == f"Cognis/{COGNIS_VERSION}"

@@ -2173,7 +2173,7 @@ async def test_legacy_null_selector_source_resolves_and_canonicalizes_on_sqlite(
 
 
 @pytest.mark.asyncio
-async def test_legacy_missing_selector_grace_reconnect_and_failover_on_sqlite(
+async def test_legacy_missing_selector_reconnect_preserves_pin_on_sqlite(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -2255,6 +2255,14 @@ async def test_legacy_missing_selector_grace_reconnect_and_failover_on_sqlite(
 
     with pytest.raises(TransientExecutorUnavailable):
         await resolve(source=None)
+    from cognis.core.executor_recovery import begin_executor_recovery
+
+    await begin_executor_recovery(
+        factory,
+        conversation_id="runtime-missing-conv",
+        task_id="runtime-missing-task",
+        executor_id="missing-selector",
+    )
     async with factory() as session:
         task = await store_queries.get_task(session, "runtime-missing-task")
         conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
@@ -2285,11 +2293,11 @@ async def test_legacy_missing_selector_grace_reconnect_and_failover_on_sqlite(
 
     rows.pop(0)
     ready_ids.remove("missing-selector")
-    failed_over = await resolve(
-        source="selector_primary",
-        unavailable_since=old_observation,
-    )
-    assert failed_over["executor_id"] == "replacement"
+    with pytest.raises(TransientExecutorUnavailable):
+        await resolve(
+            source="selector_primary",
+            unavailable_since=old_observation,
+        )
     async with factory() as session:
         task = await store_queries.get_task(session, "runtime-missing-task")
         conversation = await store_queries.get_conversation(session, "runtime-missing-conv")
@@ -2300,7 +2308,7 @@ async def test_legacy_missing_selector_grace_reconnect_and_failover_on_sqlite(
             select(func.count()).select_from(ExecutorPinNoticeOutboxRow)
         )
         assert task is not None and conversation is not None
-        assert task.active_executor_id == conversation.active_executor_id == "replacement"
-        assert task.active_executor_generation == conversation.active_executor_generation == 3
-        assert transition_count == outbox_count == 1
+        assert task.active_executor_id == conversation.active_executor_id == "missing-selector"
+        assert task.active_executor_generation == conversation.active_executor_generation == 2
+        assert transition_count == outbox_count == 0
     await engine.dispose()

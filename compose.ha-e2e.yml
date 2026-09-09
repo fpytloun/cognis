@@ -198,7 +198,7 @@ services:
     command:
       - sh
       - -lc
-      - python /app/scripts/local_compose_seed.py && python /app/scripts/seed_e2e.py
+      - /opt/venv/bin/python /app/scripts/local_compose_seed.py && /opt/venv/bin/python /app/scripts/seed_e2e.py
 
   cognis-executor:
     depends_on:

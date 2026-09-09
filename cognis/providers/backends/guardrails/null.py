@@ -72,6 +72,8 @@ class NoGuardrailsProvider:
         context: dict[str, Any] | None = None,
     ) -> EvaluationResult:
         """Auto-approve all tool calls — no LLM evaluation."""
+        if context and context.get("minimum_outcome") is not None:
+            return await self._intaris.evaluate(session_id, tool_name, arguments, context)
         logger.debug(
             "guardrails=none: auto-approving tool %s (session=%s)",
             tool_name,
@@ -132,9 +134,7 @@ class NoGuardrailsProvider:
     async def get_session_summaries(self, session_id: str) -> IntarisSessionSummaries:
         return await self._intaris.get_session_summaries(session_id)
 
-    async def submit_decision(
-        self, call_id: str, decision: str, note: str | None = None
-    ) -> None:
+    async def submit_decision(self, call_id: str, decision: str, note: str | None = None) -> None:
         return await self._intaris.submit_decision(call_id, decision, note)
 
     async def list_pending_escalations(
@@ -189,9 +189,7 @@ class NoGuardrailsProvider:
             allow_missing_stream=allow_missing_stream,
         )
 
-    async def get_last_seq(
-        self, session_id: str, *, allow_missing_stream: bool = False
-    ) -> int:
+    async def get_last_seq(self, session_id: str, *, allow_missing_stream: bool = False) -> int:
         return await self._intaris.get_last_seq(
             session_id,
             allow_missing_stream=allow_missing_stream,

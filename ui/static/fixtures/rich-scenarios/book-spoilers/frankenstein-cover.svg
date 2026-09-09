@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 1080" role="img" aria-labelledby="title desc">
+  <title id="title">Frankenstein cover illustration</title>
+  <desc id="desc">A moonlit alpine laboratory and a solitary figure, inspired by Mary Shelley's Frankenstein.</desc>
+  <rect width="720" height="1080" fill="#15253a"/>
+  <circle cx="540" cy="178" r="92" fill="#e9dfbd"/>
+  <path d="M0 730 130 525l90 150 155-280 130 255 100-110 115 190v350H0z" fill="#0c1726"/>
+  <path d="M0 820 180 650l105 120 118-195 155 190 162-65v380H0z" fill="#203f4f"/>
+  <rect x="105" y="490" width="190" height="250" fill="#2d2525"/>
+  <path d="M92 490h216l-108-102z" fill="#593d35"/>
+  <rect x="160" y="580" width="56" height="82" fill="#e3b75f"/>
+  <circle cx="449" cy="574" r="24" fill="#c7ad8b"/>
+  <path d="M399 732c0-82 24-130 50-130s50 48 50 130z" fill="#0a1018"/>
+  <path d="M405 630 362 700M493 630l43 70" fill="none" stroke="#0a1018" stroke-width="16" stroke-linecap="round"/>
+  <text x="360" y="110" fill="#f5f1e5" font-family="Georgia, serif" font-size="38" text-anchor="middle">FRANKENSTEIN</text>
+  <text x="360" y="155" fill="#b8c7ca" font-family="system-ui, sans-serif" font-size="20" text-anchor="middle">Mary Shelley · 1818</text>
+  <text x="360" y="1015" fill="#d7c59d" font-family="Georgia, serif" font-size="22" text-anchor="middle">A public-domain classic</text>
+</svg>

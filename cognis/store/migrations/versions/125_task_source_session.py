@@ -12,7 +12,10 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.add_column("tasks", sa.Column("source_session_id", sa.String(), nullable=True))
+    inspector = sa.inspect(op.get_bind())
+    columns = {str(column["name"]) for column in inspector.get_columns("tasks")}
+    if "source_session_id" not in columns:
+        op.add_column("tasks", sa.Column("source_session_id", sa.String(), nullable=True))
     op.execute(
         """
         UPDATE tasks
@@ -40,11 +43,17 @@ def upgrade() -> None:
           ) = 1
         """
     )
-    op.create_index(
-        "ix_tasks_owner_source_session",
-        "tasks",
-        ["created_by", "source_session_id", "task_id"],
-    )
+    indexes = {
+        str(index["name"])
+        for index in sa.inspect(op.get_bind()).get_indexes("tasks")
+        if index.get("name")
+    }
+    if "ix_tasks_owner_source_session" not in indexes:
+        op.create_index(
+            "ix_tasks_owner_source_session",
+            "tasks",
+            ["created_by", "source_session_id", "task_id"],
+        )
 
 
 def downgrade() -> None:

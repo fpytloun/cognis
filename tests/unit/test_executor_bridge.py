@@ -5,6 +5,8 @@ import base64
 import hashlib
 import json
 import math
+import threading
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -30,7 +32,10 @@ from cognis.providers.executor.forwarding import (
     ForwardedExecutorConnection,
     _PendingCall,
 )
-from cognis.providers.executor.websocket import WebSocketExecutorProvider
+from cognis.providers.executor.websocket import (
+    WebSocketExecutorConnection,
+    WebSocketExecutorProvider,
+)
 from cognis.store.coordination import Lease
 
 
@@ -53,9 +58,11 @@ class _Ownership:
 class _LocalConnection:
     def __init__(self, owner: ExecutorConnectionOwner) -> None:
         self.connection_owner = owner
+        self.executor_instance_id = "executor-instance-a"
         self.cancelled: list[str] = []
         self.received: list[tuple[str, Any]] = []
         self.replay_metadata: list[tuple[str | None, bool]] = []
+        self.tool_timeouts: list[int | None] = []
 
     async def rpc_call(
         self,
@@ -75,6 +82,8 @@ class _LocalConnection:
             from cognis.providers.executor.websocket import ExecutorDeliveryError
 
             raise ExecutorDeliveryError("physical timeout")
+        if method == "secret_failure":
+            raise RuntimeError("SECRET_SENTINEL_MUST_NOT_BE_LOGGED")
         return {"method": method, "params": params}
 
     async def tool_execute(
@@ -85,8 +94,8 @@ class _LocalConnection:
         *,
         on_sent: Any = None,
     ) -> ToolResult:
-        del timeout_seconds
-        await on_sent()
+        self.tool_timeouts.append(timeout_seconds)
+        await on_sent(self.connection_owner.executor_id, self.executor_instance_id)
         await output_chunk_callback(f"{tool_call.call_id}:out", "stdout")
         return ToolResult(output=tool_call.name, is_error=False)
 
@@ -128,7 +137,17 @@ def _bridge_app(auth: Any, *, epoch: int = 7) -> tuple[FastAPI, _LocalConnection
     owner = _owner(epoch)
     connection = _LocalConnection(owner)
     ownership = _Ownership()
-    provider = SimpleNamespace(get_local_connection=lambda executor_id: connection)
+    detached_tasks: set[asyncio.Task[Any]] = set()
+
+    def track_detached_tool_call(task: asyncio.Task[Any]) -> None:
+        detached_tasks.add(task)
+        task.add_done_callback(detached_tasks.discard)
+
+    provider = SimpleNamespace(
+        get_local_connection=lambda executor_id: connection,
+        track_detached_tool_call=track_detached_tool_call,
+        detached_tasks=detached_tasks,
+    )
     app.state.providers = SimpleNamespace(
         auth=auth,
         executor=SimpleNamespace(websocket=provider),
@@ -239,6 +258,253 @@ def test_bridge_remote_unary_progress_inference_and_callback_isolation() -> None
                 break
         assert chunks == ["a", "b"]
         assert all("executor-token" not in json.dumps(item) for item in connection.received)
+
+
+def test_bridge_tool_acceptance_uses_physical_callback_and_preserves_timeout() -> None:
+    auth = SimpleNamespace(
+        verify_controller_jwt=lambda _token: {
+            "typ": "controller",
+            "sub": "controller-a:boot-a",
+        }
+    )
+    app, connection, _ownership = _bridge_app(auth)
+
+    with TestClient(app) as client, client.websocket_connect("/api/internal/executor-bridge") as ws:
+        assert _open(ws)["type"] == "opened"
+        ws.send_json(
+            {
+                "type": "call",
+                "call_id": "long-tool",
+                "operation": "tool",
+                "payload": {
+                    "tool_call": {
+                        "call_id": "long-tool",
+                        "name": "bash",
+                        "arguments": {"command": "true"},
+                    }
+                },
+                "timeout_seconds": 3605,
+            }
+        )
+
+        assert ws.receive_json() == {"type": "accepted", "call_id": "long-tool"}
+        assert ws.receive_json()["type"] == "event"
+        assert ws.receive_json()["result"]["is_error"] is False
+
+    assert connection.tool_timeouts == [3605]
+
+
+def test_bridge_real_physical_connection_acknowledges_and_returns_once() -> None:
+    auth = SimpleNamespace(
+        verify_controller_jwt=lambda _token: {
+            "typ": "controller",
+            "sub": "controller-a:boot-a",
+        }
+    )
+    app, stub, _ownership = _bridge_app(auth)
+
+    class PhysicalSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+
+        async def send_json(self, request: dict[str, Any]) -> None:
+            self.sent.append(request)
+            physical._pending[request["id"]].set_result(
+                {"output": "physical success", "is_error": False}
+            )
+
+    socket = PhysicalSocket()
+    physical = WebSocketExecutorConnection(
+        socket,  # type: ignore[arg-type]
+        stub.connection_owner.executor_id,
+        ExecutorCapabilities(),
+        connection_owner=stub.connection_owner,
+    )
+    physical.executor_instance_id = stub.executor_instance_id
+    app.state.providers.executor.websocket.get_local_connection = lambda _executor_id: physical
+
+    with TestClient(app) as client, client.websocket_connect("/api/internal/executor-bridge") as ws:
+        assert _open(ws)["type"] == "opened"
+        ws.send_json(
+            {
+                "type": "call",
+                "call_id": "physical-tool",
+                "operation": "tool",
+                "payload": {
+                    "tool_call": {
+                        "call_id": "physical-tool",
+                        "name": "bash",
+                        "arguments": {"command": "true"},
+                    }
+                },
+                "timeout_seconds": 2,
+            }
+        )
+        assert ws.receive_json() == {"type": "accepted", "call_id": "physical-tool"}
+        result = ws.receive_json()
+
+    assert result["result"]["output"] == "physical success"
+    assert len(socket.sent) == 1
+
+
+def test_bridge_disconnect_detaches_accepted_tool_without_cancelling() -> None:
+    auth = SimpleNamespace(
+        verify_controller_jwt=lambda _token: {
+            "typ": "controller",
+            "sub": "controller-a:boot-a",
+        }
+    )
+    app, connection, _ownership = _bridge_app(auth)
+    release = threading.Event()
+    completed = threading.Event()
+
+    async def tool_execute(
+        tool_call: Any,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: Any = None,
+        *,
+        on_sent: Any = None,
+    ) -> ToolResult:
+        del tool_call, timeout_seconds, output_chunk_callback
+        await on_sent(connection.connection_owner.executor_id, connection.executor_instance_id)
+        await asyncio.to_thread(release.wait)
+        completed.set()
+        return ToolResult(output="finished", is_error=False)
+
+    connection.tool_execute = tool_execute  # type: ignore[method-assign]
+    provider = app.state.providers.executor.websocket
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/internal/executor-bridge") as ws:
+            assert _open(ws)["type"] == "opened"
+            ws.send_json(
+                {
+                    "type": "call",
+                    "call_id": "detached-tool",
+                    "operation": "tool",
+                    "payload": {
+                        "tool_call": {
+                            "call_id": "executor-call",
+                            "name": "bash",
+                            "arguments": {"command": "true"},
+                        }
+                    },
+                    "timeout_seconds": 2,
+                }
+            )
+            assert ws.receive_json() == {"type": "accepted", "call_id": "detached-tool"}
+
+        for _ in range(100):
+            if provider.detached_tasks:
+                break
+            time.sleep(0.01)
+        assert provider.detached_tasks
+        assert connection.cancelled == []
+        release.set()
+        assert completed.wait(timeout=1)
+        for _ in range(100):
+            if not provider.detached_tasks:
+                break
+            time.sleep(0.01)
+        assert provider.detached_tasks == set()
+
+
+def test_replacement_bridge_cancels_detached_physical_tool() -> None:
+    auth = SimpleNamespace(
+        verify_controller_jwt=lambda _token: {
+            "typ": "controller",
+            "sub": "controller-a:boot-a",
+        }
+    )
+    app, stub, _ownership = _bridge_app(auth)
+
+    class PhysicalSocket:
+        def __init__(self) -> None:
+            self.sent: list[dict[str, Any]] = []
+            self.execute_request_id: str | None = None
+
+        async def send_json(self, request: dict[str, Any]) -> None:
+            self.sent.append(request)
+            if request["method"] == "tool.execute":
+                self.execute_request_id = request["id"]
+                return
+            if request["method"] == "tool.cancel":
+                physical._pending[request["id"]].set_result({"cancelled": True})
+                assert self.execute_request_id is not None
+                physical._pending[self.execute_request_id].set_result(
+                    {
+                        "output": "Tool execution cancelled.",
+                        "is_error": True,
+                        "metadata": {"code": "tool_cancelled"},
+                    }
+                )
+
+    socket = PhysicalSocket()
+    physical = WebSocketExecutorConnection(
+        socket,  # type: ignore[arg-type]
+        stub.connection_owner.executor_id,
+        ExecutorCapabilities(),
+        connection_owner=stub.connection_owner,
+    )
+    physical.executor_instance_id = stub.executor_instance_id
+    app.state.providers.executor.websocket.get_local_connection = lambda _executor_id: physical
+    provider = app.state.providers.executor.websocket
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/api/internal/executor-bridge") as original:
+            assert _open(original)["type"] == "opened"
+            original.send_json(
+                {
+                    "type": "call",
+                    "call_id": "original-bridge-call",
+                    "operation": "tool",
+                    "payload": {
+                        "tool_call": {
+                            "call_id": "stable-executor-call",
+                            "name": "bash",
+                            "arguments": {"command": "sleep 1"},
+                        }
+                    },
+                    "timeout_seconds": 30,
+                }
+            )
+            assert original.receive_json() == {
+                "type": "accepted",
+                "call_id": "original-bridge-call",
+            }
+
+        for _ in range(100):
+            if provider.detached_tasks:
+                break
+            time.sleep(0.01)
+        assert provider.detached_tasks
+
+        with client.websocket_connect("/api/internal/executor-bridge") as replacement:
+            assert _open(replacement)["type"] == "opened"
+            replacement.send_json(
+                {
+                    "type": "call",
+                    "call_id": "replacement-cancel",
+                    "operation": "rpc",
+                    "payload": {
+                        "method": "tool.cancel",
+                        "params": {"call_id": "stable-executor-call"},
+                    },
+                    "timeout_seconds": 2,
+                }
+            )
+            assert replacement.receive_json() == {
+                "type": "accepted",
+                "call_id": "replacement-cancel",
+            }
+            assert replacement.receive_json()["result"] == {"cancelled": True}
+
+        for _ in range(100):
+            if not provider.detached_tasks:
+                break
+            time.sleep(0.01)
+        assert provider.detached_tasks == set()
+
+    assert [request["method"] for request in socket.sent] == ["tool.execute", "tool.cancel"]
 
 
 def test_bridge_negotiates_and_chunks_oversized_result() -> None:
@@ -466,7 +732,7 @@ def test_bridge_rejects_auth_and_wrong_owner_epoch(claims: dict[str, Any], epoch
         assert frame["delivery_state"] == "not_sent"
 
 
-def test_bridge_bounds_and_owner_change_before_send() -> None:
+def test_bridge_bounds_and_owner_change_before_send(caplog: pytest.LogCaptureFixture) -> None:
     auth = SimpleNamespace(
         verify_controller_jwt=lambda token: {
             "typ": "controller",
@@ -491,6 +757,22 @@ def test_bridge_bounds_and_owner_change_before_send() -> None:
         assert frame["type"] == "error"
         assert frame["delivery_state"] == "not_sent"
 
+        ownership.current = True
+        ws.send_json(
+            {
+                "type": "call",
+                "call_id": "secret-1",
+                "operation": "rpc",
+                "payload": {"method": "secret_failure", "params": {}},
+            }
+        )
+        frame = ws.receive_json()
+        assert frame["type"] == "accepted"
+        frame = ws.receive_json()
+        assert frame["type"] == "error"
+
+    assert "SECRET_SENTINEL_MUST_NOT_BE_LOGGED" not in caplog.text
+
     with pytest.raises(ValueError, match="maximum size"):
         _bounded_frame({"payload": "x" * (BRIDGE_MAX_FRAME_BYTES + 1)})
 
@@ -505,6 +787,32 @@ def test_bridge_first_frame_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         frame = ws.receive_json()
         assert frame["delivery_state"] == "not_sent"
         assert frame["message"] == ""
+
+
+def test_bridge_capacity_rejection_has_stable_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    import cognis.api.controller_ws as controller_ws
+
+    monkeypatch.setattr(controller_ws, "BRIDGE_MAX_CALLS", 0)
+    auth = SimpleNamespace(
+        verify_controller_jwt=lambda _token: {
+            "typ": "controller",
+            "sub": "controller-a:boot-a",
+        }
+    )
+    app, _connection, _ownership = _bridge_app(auth)
+    with TestClient(app) as client, client.websocket_connect("/api/internal/executor-bridge") as ws:
+        assert _open(ws)["type"] == "opened"
+        ws.send_json(
+            {
+                "type": "call",
+                "call_id": "capacity-1",
+                "operation": "tool",
+                "payload": {"tool_call": {}},
+            }
+        )
+        frame = ws.receive_json()
+        assert frame["delivery_state"] == "not_sent"
+        assert frame["code"] == "executor_bridge_capacity"
 
 
 def test_controller_jwt_exact_contract(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -557,6 +865,7 @@ class _FakeClientBridge:
             if not self.old_controller:
                 opened.update(
                     {
+                        "executor_instance_id": "executor-instance-a",
                         "protocol_version": 1,
                         "capabilities": ["result_chunks_v1"],
                         "negotiated_capabilities": ["result_chunks_v1"],
@@ -687,6 +996,29 @@ class _FakeClientBridge:
             ):
                 return
             if frame["operation"] == "tool":
+                if frame["payload"]["tool_call"].get("name") == "circuit":
+                    result = {
+                        "output": "Executor 'exec-1' circuit breaker is open.",
+                        "is_error": True,
+                        "metadata": {
+                            "code": "executor_circuit_open",
+                            "delivery_state": "not_sent",
+                            "executor_id": "exec-1",
+                            "retryable": True,
+                            "circuit": {
+                                "name": "executor.websocket:exec-1",
+                                "state": "open",
+                                "retry_after_seconds": 12.5,
+                                "operation": "tool.execute",
+                                "last_error_type": "ConnectionError",
+                                "last_failure_at": "2026-08-30T16:03:21+00:00",
+                            },
+                        },
+                    }
+                    self.incoming.put_nowait(
+                        json.dumps({"type": "result", "call_id": call_id, "result": result})
+                    )
+                    return
                 self.incoming.put_nowait(
                     json.dumps(
                         {
@@ -739,6 +1071,14 @@ class _FakeClientBridge:
 
 async def _append_chunk(chunks: list[str], chunk: str) -> None:
     chunks.append(chunk)
+
+
+async def _append_identity(
+    identities: list[tuple[str, str | None]],
+    executor_id: str,
+    instance_id: str | None,
+) -> None:
+    identities.append((executor_id, instance_id))
 
 
 def _assembly_connection() -> tuple[ForwardedExecutorConnection, _PendingCall]:
@@ -824,6 +1164,8 @@ async def test_forwarded_connection_surfaces_and_delivery_state(
     assert delivery_exc.value.generation == 4
     assert delivery_exc.value.epoch == 9
     assert delivery_exc.value.retry_after == 0.25
+    assert delivery_exc.value.executor_instance_id == "executor-instance-a"
+    assert connection.executor_instance_id == "executor-instance-a"
     assert await connection.rpc_call("chunked", {}, timeout=1) == {"value": "chunked"}
     catalog = await connection.rpc_call("catalog", {}, timeout=2)
     assert len(catalog["tools"]) == 273
@@ -832,13 +1174,33 @@ async def test_forwarded_connection_surfaces_and_delivery_state(
         base_url="http://model-api",
     ) == [{"id": "remote-model"}]
     chunks: list[str] = []
+    dispatch_identities: list[tuple[str, str | None]] = []
     result = await connection.tool_execute(
         ToolCall(call_id="tool-1", name="bash", arguments={}),
         timeout_seconds=1,
         output_chunk_callback=lambda chunk, stream: _append_chunk(chunks, chunk),
+        before_send=lambda executor_id, instance_id: _append_identity(
+            dispatch_identities, executor_id, instance_id
+        ),
+        on_sent=lambda executor_id, instance_id: _append_identity(
+            dispatch_identities, executor_id, instance_id
+        ),
     )
     assert result.output == "ok"
     assert chunks == ["progress"]
+    assert dispatch_identities == [
+        ("exec-1", "executor-instance-a"),
+        ("exec-1", "executor-instance-a"),
+    ]
+    circuit_result = await connection.tool_execute(
+        ToolCall(call_id="tool-circuit", name="circuit", arguments={}),
+        timeout_seconds=1,
+    )
+    assert circuit_result.is_error is True
+    assert circuit_result.metadata is not None
+    assert circuit_result.metadata["code"] == "executor_circuit_open"
+    assert circuit_result.metadata["delivery_state"] == "not_sent"
+    assert circuit_result.metadata["circuit"]["name"] == "executor.websocket:exec-1"
     inference = [chunk async for chunk in connection.llm_complete_stream("request-1", [], "model")]
     assert inference == [{"content": "partial"}]
 
@@ -866,7 +1228,49 @@ async def test_forwarded_connection_surfaces_and_delivery_state(
     assert any(frame.get("type") == "cancel" for frame in bridge.sent)
 
     await connection.close()
-    assert bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_forwarded_event_overflow_isolated_to_one_call() -> None:
+    """One slow progress consumer must not abort sibling sessions."""
+
+    bridge = _FakeClientBridge()
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    connection._ws = bridge
+    connection._connected = True
+    connection.executor_instance_id = "executor-instance-a"
+    overflow = _PendingCall(asyncio.get_running_loop().create_future(), submitted=True)
+    sibling = _PendingCall(asyncio.get_running_loop().create_future(), submitted=True)
+    for index in range(overflow.events.maxsize):
+        overflow.events.put_nowait({"sequence": index})
+    connection._pending = {"overflow": overflow, "sibling": sibling}
+    bridge.incoming.put_nowait(json.dumps({"type": "event", "call_id": "overflow", "payload": {}}))
+    bridge.incoming.put_nowait(
+        json.dumps(
+            {
+                "type": "result",
+                "call_id": "sibling",
+                "result": {"output": "ok", "is_error": False},
+            }
+        )
+    )
+    bridge.incoming.put_nowait(None)
+
+    await connection._receive_loop()
+
+    with pytest.raises(ForwardedDeliveryError) as exc:
+        overflow.future.result()
+    assert exc.value.executor_instance_id == "executor-instance-a"
+    assert sibling.future.result()["output"] == "ok"
+    await asyncio.gather(*tuple(connection._cancel_tasks), return_exceptions=True)
     assert connection.connected is False
 
 
@@ -891,6 +1295,7 @@ async def test_forwarded_new_requester_old_controller_preserves_small_result(
     )
     assert await connection.rpc_call("tool.list", {}, timeout=1) == {"ok": True}
     assert connection._negotiated_capabilities == set()
+    assert connection.executor_instance_id is None
     await connection.close()
 
 
@@ -984,6 +1389,212 @@ async def test_forwarded_disconnect_after_submission_is_ambiguous(
     with pytest.raises(ForwardedDeliveryError) as exc:
         await connection.rpc_call("preaccept_disconnect", {}, timeout=1)
     assert exc.value.delivery_state == "accepted_unknown"
+
+
+@pytest.mark.asyncio
+async def test_replacement_forwarded_bridge_cancels_by_executor_call_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = _FakeClientBridge()
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> _FakeClientBridge:
+        return bridge
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", fake_connect)
+    replacement = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+
+    await replacement.cancel_call("stable-executor-call")
+
+    cancel_calls = [
+        frame
+        for frame in bridge.sent
+        if frame.get("type") == "call" and frame.get("payload", {}).get("method") == "tool.cancel"
+    ]
+    assert cancel_calls[0]["payload"]["params"] == {"call_id": "stable-executor-call"}
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_call_send_rejection_is_not_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _RejectingBridge(_FakeClientBridge):
+        async def send(self, raw: str) -> None:
+            if json.loads(raw).get("type") == "call":
+                raise RuntimeError('Cannot call "send" once a close message has been sent.')
+            await super().send(raw)
+
+    bridge = _RejectingBridge()
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> _RejectingBridge:
+        return bridge
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", fake_connect)
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+
+    with pytest.raises(ForwardedDeliveryError) as exc:
+        await connection.rpc_call("rejected_call", {}, timeout=1)
+
+    assert exc.value.delivery_state == "not_sent"
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_uncertain_submission_does_not_claim_physical_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _UncertainBridge(_FakeClientBridge):
+        async def send(self, raw: str) -> None:
+            if json.loads(raw).get("type") == "call":
+                raise OSError("transport write failed")
+            await super().send(raw)
+
+    bridge = _UncertainBridge()
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> _UncertainBridge:
+        return bridge
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", fake_connect)
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+
+    with pytest.raises(ForwardedDeliveryError) as exc:
+        await connection.rpc_call("uncertain_call", {}, timeout=1)
+
+    assert exc.value.delivery_state == "accepted_unknown"
+    assert exc.value.executor_instance_id is None
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_cancellation_while_awaiting_acceptance_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = _FakeClientBridge()
+
+    async def send_without_accepting(raw: str) -> None:
+        frame = json.loads(raw)
+        bridge.sent.append(frame)
+        if frame["type"] == "open":
+            bridge.incoming.put_nowait(
+                json.dumps(
+                    {
+                        "type": "opened",
+                        "owner_id": frame["target_owner_id"],
+                        "epoch": frame["target_epoch"],
+                        "executor_instance_id": "executor-instance-a",
+                    }
+                )
+            )
+
+    bridge.send = send_without_accepting  # type: ignore[method-assign]
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> _FakeClientBridge:
+        return bridge
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", fake_connect)
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    task = asyncio.create_task(
+        connection.tool_execute(
+            ToolCall(call_id="tool-cancel", name="bash", arguments={}),
+            timeout_seconds=30,
+            on_sent=lambda *_args: asyncio.sleep(0),
+        )
+    )
+    for _ in range(100):
+        if any(frame.get("type") == "call" for frame in bridge.sent):
+            break
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert any(frame.get("type") == "cancel" for frame in bridge.sent)
+    assert connection._pending == {}
+    assert connection._tool_bridge_ids == {}
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_forwarded_acceptance_timeout_is_accepted_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bridge = _FakeClientBridge()
+
+    async def send_without_accepting(raw: str) -> None:
+        frame = json.loads(raw)
+        bridge.sent.append(frame)
+        if frame["type"] == "open":
+            bridge.incoming.put_nowait(
+                json.dumps(
+                    {
+                        "type": "opened",
+                        "owner_id": frame["target_owner_id"],
+                        "epoch": frame["target_epoch"],
+                        "executor_instance_id": "executor-instance-a",
+                    }
+                )
+            )
+
+    bridge.send = send_without_accepting  # type: ignore[method-assign]
+
+    async def fake_connect(*_args: Any, **_kwargs: Any) -> _FakeClientBridge:
+        return bridge
+
+    monkeypatch.setattr("cognis.providers.executor.forwarding.connect", fake_connect)
+    connection = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://controller-b:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+
+    with pytest.raises(ForwardedDeliveryError) as exc:
+        await connection.tool_execute(
+            ToolCall(call_id="tool-timeout", name="bash", arguments={}),
+            timeout_seconds=0.01,  # type: ignore[arg-type]
+            on_sent=lambda *_args: asyncio.sleep(0),
+        )
+
+    assert exc.value.delivery_state == "accepted_unknown"
+    assert exc.value.executor_instance_id is None
+    assert connection._pending == {}
+    assert connection._tool_bridge_ids == {}
+    await connection.close()
 
 
 @pytest.mark.asyncio
@@ -1731,6 +2342,160 @@ async def test_proxy_refresh_updates_forwarded_capabilities() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cluster_refresh_releases_stale_self_owned_lease_after_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WebSocketExecutorProvider()
+    lease = SimpleNamespace(
+        resource_key="executor_connection:exec-1",
+        owner_id="controller-a:boot-a",
+        fencing_token=7,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+
+    class _Session:
+        bind = None
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def scalars(self, _query: Any) -> Any:
+            return SimpleNamespace(all=lambda: [lease])
+
+    released: list[Lease] = []
+
+    async def release(current: Lease) -> bool:
+        released.append(current)
+        return True
+
+    provider._cluster_enabled = True
+    provider._cluster_session_factory = lambda: _Session()
+    provider._cluster_directory = SimpleNamespace()
+    provider._cluster_runtime = SimpleNamespace(owner_id="controller-a:boot-a")
+    provider._cluster_auth = SimpleNamespace()
+    provider._cluster_lease_store = SimpleNamespace(release=release)
+    observed_times = iter((100.0, 104.9, 105.0))
+    monkeypatch.setattr(
+        "cognis.providers.executor.websocket.perf_counter",
+        lambda: next(observed_times),
+    )
+
+    await provider.refresh_cluster_directory()
+    assert released == []
+    assert provider._missing_self_owned_connections == {"exec-1": 100.0}
+
+    await provider.refresh_cluster_directory()
+    assert released == []
+    assert provider._missing_self_owned_connections == {"exec-1": 100.0}
+
+    await provider.refresh_cluster_directory()
+    assert released == [
+        Lease(
+            resource_key=lease.resource_key,
+            owner_id=lease.owner_id,
+            fencing_token=lease.fencing_token,
+            lease_expires_at=lease.lease_expires_at,
+        )
+    ]
+    assert provider._missing_self_owned_connections == {}
+
+
+@pytest.mark.asyncio
+async def test_cluster_refresh_does_not_release_self_owned_lease_with_local_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WebSocketExecutorProvider()
+    lease = SimpleNamespace(
+        resource_key="executor_connection:exec-1",
+        owner_id="controller-a:boot-a",
+        fencing_token=7,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+
+    class _Session:
+        bind = None
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def scalars(self, _query: Any) -> Any:
+            return SimpleNamespace(all=lambda: [lease])
+
+    async def release(_current: Lease) -> bool:
+        raise AssertionError("live local ownership must not be released")
+
+    provider._connections["exec-1"] = SimpleNamespace(connected=True)
+    provider._cluster_enabled = True
+    provider._cluster_session_factory = lambda: _Session()
+    provider._cluster_directory = SimpleNamespace()
+    provider._cluster_runtime = SimpleNamespace(owner_id="controller-a:boot-a")
+    provider._cluster_auth = SimpleNamespace()
+    provider._cluster_lease_store = SimpleNamespace(release=release)
+    monkeypatch.setattr(
+        "cognis.providers.executor.websocket.SELF_OWNED_MISSING_CONNECTION_GRACE_SECONDS",
+        0.0,
+    )
+
+    await provider.refresh_cluster_directory()
+
+    assert provider._missing_self_owned_connections == {}
+
+
+@pytest.mark.asyncio
+async def test_cluster_refresh_releases_self_owned_lease_for_disconnected_local_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WebSocketExecutorProvider()
+    lease = SimpleNamespace(
+        resource_key="executor_connection:exec-1",
+        owner_id="controller-a:boot-a",
+        fencing_token=7,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+
+    class _Session:
+        bind = None
+
+        async def __aenter__(self) -> _Session:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def scalars(self, _query: Any) -> Any:
+            return SimpleNamespace(all=lambda: [lease])
+
+    released: list[Lease] = []
+
+    async def release(current: Lease) -> bool:
+        released.append(current)
+        return True
+
+    provider._connections["exec-1"] = SimpleNamespace(connected=False)
+    provider._cluster_enabled = True
+    provider._cluster_session_factory = lambda: _Session()
+    provider._cluster_directory = SimpleNamespace()
+    provider._cluster_runtime = SimpleNamespace(owner_id="controller-a:boot-a")
+    provider._cluster_auth = SimpleNamespace()
+    provider._cluster_lease_store = SimpleNamespace(release=release)
+    monkeypatch.setattr(
+        "cognis.providers.executor.websocket.SELF_OWNED_MISSING_CONNECTION_GRACE_SECONDS",
+        0.0,
+    )
+
+    await provider.refresh_cluster_directory()
+
+    assert len(released) == 1
+    assert released[0].fencing_token == 7
+
+
+@pytest.mark.asyncio
 async def test_cluster_directory_refresh_is_serialized(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1910,6 +2675,98 @@ async def test_wait_for_connection_discovers_new_remote_epoch_before_timeout(
     await old.close()
     await same_epoch.close()
     await new.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_connection_accepts_distinct_replay_safe_same_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = WebSocketExecutorProvider()
+    old = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://peer:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    replacement = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id=old.owner_id,
+        epoch=old.epoch,
+        owner_internal_url="http://peer:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    provider._cluster_enabled = True
+    provider._forwarded_by_executor["exec-1"] = old
+    provider._forwarded_connections[("exec-1", old.owner_id, old.epoch)] = old
+    provider._handles["exec-1"] = ExecutorHandle(
+        executor_id="exec-1",
+        executor_type="websocket",
+        capabilities=ExecutorCapabilities(),
+        status="ready",
+        metadata={
+            "forwarded": True,
+            "owner_id": old.owner_id,
+            "connection_epoch": old.epoch,
+        },
+    )
+
+    async def publish_replacement() -> None:
+        provider._forwarded_connections = {
+            ("exec-1", replacement.owner_id, replacement.epoch): replacement
+        }
+        provider._forwarded_by_executor["exec-1"] = replacement
+
+    monkeypatch.setattr(provider, "refresh_cluster_directory", publish_replacement)
+    await provider.invalidate_forwarded_connection("exec-1", old)
+
+    resolved = await provider.wait_for_connection(
+        "exec-1",
+        timeout=1.0,
+        failed_connection=old,
+        delivery_state="accepted_unknown",
+        accepted_unknown_replay_safe=True,
+        failed_owner_id=old.owner_id,
+        failed_epoch=old.epoch,
+    )
+
+    assert resolved is replacement
+    assert old.closing
+    assert provider._handles["exec-1"].metadata.get("generation") is None
+    await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_for_connection_never_reuses_failed_physical_connection() -> None:
+    provider = WebSocketExecutorProvider()
+    failed = ForwardedExecutorConnection(
+        executor_id="exec-1",
+        capabilities=ExecutorCapabilities(),
+        owner_id="controller-b:boot-b",
+        epoch=7,
+        owner_internal_url="http://peer:8000",
+        requester_owner_id="controller-a:boot-a",
+        auth_provider=SimpleNamespace(sign_controller_jwt=lambda *_args: "jwt"),
+    )
+    provider._forwarded_by_executor["exec-1"] = failed
+    provider._forwarded_connections[("exec-1", failed.owner_id, failed.epoch)] = failed
+
+    resolved = await provider.wait_for_connection(
+        "exec-1",
+        timeout=0.01,
+        failed_connection=failed,
+        delivery_state="accepted_unknown",
+        accepted_unknown_replay_safe=True,
+        failed_owner_id=failed.owner_id,
+        failed_epoch=failed.epoch,
+    )
+
+    assert resolved is None
+    await failed.close()
 
 
 @pytest.mark.asyncio

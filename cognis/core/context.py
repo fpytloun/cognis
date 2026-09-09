@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime
 import html
 import json
@@ -10,7 +11,6 @@ import re
 from hashlib import sha256
 from pathlib import Path
 from time import monotonic
-from types import SimpleNamespace
 from typing import Any, cast
 
 from prometheus_client import Counter
@@ -93,6 +93,7 @@ from cognis.core.tool_output_presentation import (
 from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
 )
+from cognis.core.tool_result_settlement import CanonicalToolHistoryError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
@@ -165,6 +166,7 @@ _DEFAULT_MEMORY_INSTRUCTIONS_MAX_TOKENS = 2000
 _DEFAULT_CORE_MEMORIES_MAX_TOKENS = 2000
 _DEFAULT_IMMUTABLE_PREFIX_REPAIR_COOLDOWN_SECONDS = 300
 _DEFAULT_RECALL_TTL_SECONDS = 86400
+_DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS = 5.0
 _VISIBLE_HISTORY_EVENT_TYPES = {
     "system_message",
     "developer_message",
@@ -324,7 +326,15 @@ def _native_attachment_blocks(
             mime_type,
             filename=filename,
         ):
-            blocks.append({"type": "image_url", "image_url": {"url": url}})
+            image_url: dict[str, Any] = {"url": url}
+            if isinstance(artifact_id, str) and artifact_id:
+                image_url["cognis_artifact"] = {
+                    "artifact_id": artifact_id,
+                    "filename": filename,
+                    "mime_type": str(mime_type or ""),
+                    "size_bytes": int(attachment.get("size_bytes") or 0),
+                }
+            blocks.append({"type": "image_url", "image_url": image_url})
             continue
         if kind == ArtifactKind.PDF.value and (
             getattr(model_info, "supports_pdf_input", False)
@@ -581,8 +591,8 @@ def _build_channel_context_info(context: ConversationContext | None) -> str | No
                 "Assistant delivery mode:",
                 "- Mode: final_only.",
                 "- The channel user will receive only the final assistant message for this "
-                "turn. Intermediate assistant messages, progress notes, and pre-tool "
-                "explanations are not delivered.",
+                "turn. Do not write intermediate assistant messages, progress notes, or "
+                "pre-tool explanations.",
                 "- Make the final message self-contained enough for the request: include "
                 "the answer or result, important actions taken, relevant findings, "
                 "blockers or errors, and concrete next steps when useful.",
@@ -916,6 +926,92 @@ def _load_project_instructions(
     return []
 
 
+_MAX_HISTORY_NATIVE_ATTACHMENTS = 8
+_MAX_HISTORY_NATIVE_ATTACHMENT_BYTES = 32 * 1024 * 1024
+
+
+def _limit_history_native_attachment_replay(
+    events: list[Any],
+) -> tuple[list[Any], set[tuple[int, int]]]:
+    """Keep newest native image payloads within the cross-turn attachment budget."""
+
+    replay_positions: set[tuple[int, int]] = set()
+    newest_non_image_event_index: int | None = None
+    replay_count = 0
+    replay_bytes = 0
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        event_type = (
+            event.get("type", "") if isinstance(event, dict) else getattr(event, "type", "")
+        )
+        data = event.get("data", {}) if isinstance(event, dict) else getattr(event, "data", {})
+        if event_type != "user_message" or not isinstance(data, dict):
+            continue
+        attachments = data.get("attachments")
+        if not isinstance(attachments, list):
+            continue
+        if newest_non_image_event_index is None and any(
+            isinstance(attachment, dict) and attachment.get("kind") != ArtifactKind.IMAGE.value
+            for attachment in attachments[:20]
+        ):
+            newest_non_image_event_index = index
+        for attachment_index in range(min(len(attachments), 20) - 1, -1, -1):
+            attachment = attachments[attachment_index]
+            if not isinstance(attachment, dict):
+                continue
+            if attachment.get("kind") != ArtifactKind.IMAGE.value:
+                continue
+            artifact_id = attachment.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                continue
+            image_bytes = max(0, int(attachment.get("size_bytes") or 0))
+            if (
+                replay_count >= _MAX_HISTORY_NATIVE_ATTACHMENTS
+                or replay_bytes + image_bytes > _MAX_HISTORY_NATIVE_ATTACHMENT_BYTES
+            ):
+                continue
+            replay_positions.add((index, attachment_index))
+            replay_count += 1
+            replay_bytes += image_bytes
+
+    bounded_events: list[Any] = []
+    omitted_native_payloads = 0
+    for index, event in enumerate(events):
+        data = event.get("data", {}) if isinstance(event, dict) else getattr(event, "data", {})
+        if not isinstance(data, dict) or not isinstance(data.get("attachments"), list):
+            bounded_events.append(event)
+            continue
+
+        next_data = dict(data)
+        next_attachments: list[dict[str, Any]] = []
+        for attachment_index, attachment in enumerate(data["attachments"][:20]):
+            if not isinstance(attachment, dict):
+                continue
+            next_attachment = dict(attachment)
+            kind = str(next_attachment.get("kind") or ArtifactKind.FILE.value)
+            keep_native = (
+                (index, attachment_index) in replay_positions
+                if kind == ArtifactKind.IMAGE.value
+                else index == newest_non_image_event_index
+            )
+            if not keep_native and next_attachment.pop("url", None):
+                omitted_native_payloads += 1
+            next_attachments.append(next_attachment)
+        next_data["attachments"] = next_attachments
+        if isinstance(event, dict):
+            bounded_events.append({**event, "data": next_data})
+        else:
+            next_event = copy.copy(event)
+            next_event.data = next_data
+            bounded_events.append(next_event)
+
+    if omitted_native_payloads:
+        HISTORY_ATTACHMENT_REPLAY_TOTAL.labels(outcome="text_fallback_budget").inc(
+            omitted_native_payloads
+        )
+    return bounded_events, replay_positions
+
+
 class ContextAssembler:
     """Assemble LLM prompt context from cache, memory, and session state."""
 
@@ -937,6 +1033,7 @@ class ContextAssembler:
             _DEFAULT_IMMUTABLE_PREFIX_REPAIR_COOLDOWN_SECONDS
         ),
         recall_ttl_seconds: int = _DEFAULT_RECALL_TTL_SECONDS,
+        optional_recall_timeout_seconds: float = _DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS,
     ) -> None:
         self.memory = memory
         self.guardrails = guardrails
@@ -954,6 +1051,7 @@ class ContextAssembler:
             int(immutable_prefix_repair_cooldown_seconds),
         )
         self.recall_ttl_seconds = max(1, int(recall_ttl_seconds))
+        self.optional_recall_timeout_seconds = max(0.1, float(optional_recall_timeout_seconds))
 
     @classmethod
     async def from_session_factory(
@@ -993,6 +1091,11 @@ class ContextAssembler:
                 "session.recall_ttl_seconds",
                 _DEFAULT_RECALL_TTL_SECONDS,
             )
+            optional_recall_timeout_seconds = await get_setting_value(
+                db_session,
+                "session.optional_recall_timeout_seconds",
+                _DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS,
+            )
         return cls(
             memory=memory,
             guardrails=guardrails,
@@ -1023,6 +1126,11 @@ class ContextAssembler:
                 int(recall_ttl_seconds)
                 if isinstance(recall_ttl_seconds, int)
                 else _DEFAULT_RECALL_TTL_SECONDS
+            ),
+            optional_recall_timeout_seconds=(
+                float(optional_recall_timeout_seconds)
+                if isinstance(optional_recall_timeout_seconds, (int, float))
+                else _DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS
             ),
         )
 
@@ -1149,16 +1257,19 @@ class ContextAssembler:
             agent_owner_email=agent.owner_email,
         ):
             if memory_policy.auto_recall:
-                recall_task = self.memory.recall(
-                    query=user_message,
-                    session_id=session.mnemory_session_id,
-                    labels=conversation.context.memory_labels,
-                    context=cached_intention,
-                    search_mode="search",
-                    include_instructions=False,
-                    managed=True,
-                    instruction_mode=None,
-                    ttl=self.recall_ttl_seconds,
+                recall_task = asyncio.wait_for(
+                    self.memory.recall(
+                        query=user_message,
+                        session_id=session.mnemory_session_id,
+                        labels=conversation.context.memory_labels,
+                        context=cached_intention,
+                        search_mode="search",
+                        include_instructions=False,
+                        managed=True,
+                        instruction_mode=None,
+                        ttl=self.recall_ttl_seconds,
+                    ),
+                    timeout=self.optional_recall_timeout_seconds,
                 )
             else:
                 recall_task = asyncio.sleep(0, result={"search_results": []})
@@ -1193,14 +1304,30 @@ class ContextAssembler:
         # continue with an empty recall payload and surface a visible
         # system notice so the user knows memories were skipped.
         if isinstance(recall_result, Exception):
+            recall_timed_out = isinstance(recall_result, TimeoutError)
             logger.warning(
-                "context: Mnemory recall failed (degraded, continuing without recalled memories)",
-                extra={"extra_data": {"session_id": session.session_id}},
-                exc_info=recall_result,
+                (
+                    "context: optional Mnemory recall timed out"
+                    if recall_timed_out
+                    else "context: Mnemory recall failed"
+                ),
+                extra={
+                    "extra_data": {
+                        "session_id": session.session_id,
+                        "degraded": True,
+                        "timeout_seconds": (
+                            self.optional_recall_timeout_seconds if recall_timed_out else None
+                        ),
+                    }
+                },
+                exc_info=None if recall_timed_out else recall_result,
             )
             degraded_sources.append("memory")
             system_notices.append(
-                "Memory recall failed for this turn; continuing without recalled memories."
+                "Optional memory recall timed out for this turn; "
+                "continuing without recalled memories."
+                if recall_timed_out
+                else "Memory recall failed for this turn; continuing without recalled memories."
             )
             recall_result = {"search_results": []}
 
@@ -1231,6 +1358,15 @@ class ContextAssembler:
             )
             degraded_sources.append("intention")
         else:
+            if intention_result.status == "terminated":
+                reason = str(
+                    getattr(intention_result, "status_reason", None) or "terminated by Intaris"
+                )[:500]
+                await self.session_manager.mark_terminated(
+                    session.session_id,
+                    reason=reason,
+                )
+                session.status = "terminated"
             cached_updated_at = getattr(cache_entry, "intention_updated_at", None)
             if _is_newer_timestamp(intention_result.updated_at, cached_updated_at):
                 await self.session_cache.update_intention(
@@ -1275,6 +1411,7 @@ class ContextAssembler:
 
         # ----- Memory handling: split into immutable and mutable parts -----
         mutable_search_results: str | None = None
+        recall_alias_delta: dict[str, Any] | None = None
 
         # recall_result is guaranteed to be a dict here (Exception branch above
         # replaces it with an empty payload).
@@ -1298,26 +1435,22 @@ class ContextAssembler:
                 if adopted:
                     await self.session_cache.mark_prefix_repair_needed(session.session_id)
 
-        # Format mutable search results
-        mutable_search_results = _format_search_results(recall_payload.get("search_results"))
+        # Format mutable search results. Alias allocation is planned here and
+        # becomes state only when its developer_message is durably recorded.
+        raw_search_results = recall_payload.get("search_results")
+        get_memory_aliases = getattr(self.session_cache, "get_memory_aliases", None)
+        aliases = get_memory_aliases(session.session_id) if callable(get_memory_aliases) else None
+        if aliases is not None and isinstance(raw_search_results, list):
+            records = [item for item in raw_search_results if isinstance(item, dict)]
+            raw_search_results, recall_alias_delta = aliases.plan_records(records)
+        mutable_search_results = _format_search_results(raw_search_results)
+
+        from cognis.core.runtime_selection import resolve_runtime_selection
 
         resolved_agent_profile = resolve_conversation_agent_profile(agent, session, conversation)
-
-        # Model resolution chain: session override → agent profile → agent config → system default
-        model_override = self.session_cache.get_model_override(session.session_id)
-        model_override_provider_id = self.session_cache.get_model_override_provider_id(
-            session.session_id
-        )
-        if model_override:
-            explicit_model = model_override
-            explicit_provider_id = model_override_provider_id
-        else:
-            explicit_model = resolved_agent_profile.model or (
-                agent.llm_config.model if agent.llm_config else None
-            )
-            explicit_provider_id = resolved_agent_profile.provider_id or (
-                agent.llm_config.provider_id if agent.llm_config else None
-            )
+        runtime_selection = resolve_runtime_selection(agent, session, conversation)
+        explicit_model = runtime_selection.model
+        explicit_provider_id = runtime_selection.provider_id
         provider_id: str | None = None
         if hasattr(self.llm, "resolve_model_target"):
             try:
@@ -1630,6 +1763,11 @@ class ContextAssembler:
                         "visibility": "agent_context",
                         "model_role": "system",
                         "trust": "untrusted",
+                        **(
+                            {"memory_aliases": recall_alias_delta}
+                            if recall_alias_delta is not None
+                            else {}
+                        ),
                     },
                 }
             )
@@ -1851,23 +1989,12 @@ class ContextAssembler:
         else:
             cache_entry = cache_result
 
-        resolved_agent_profile = resolve_conversation_agent_profile(agent, session, conversation)
+        from cognis.core.runtime_selection import resolve_runtime_selection
 
-        # Model resolution
-        model_override = self.session_cache.get_model_override(session.session_id)
-        model_override_provider_id = self.session_cache.get_model_override_provider_id(
-            session.session_id
-        )
-        if model_override:
-            explicit_model = model_override
-            explicit_provider_id = model_override_provider_id
-        else:
-            explicit_model = resolved_agent_profile.model or (
-                agent.llm_config.model if agent.llm_config else None
-            )
-            explicit_provider_id = resolved_agent_profile.provider_id or (
-                agent.llm_config.provider_id if agent.llm_config else None
-            )
+        resolved_agent_profile = resolve_conversation_agent_profile(agent, session, conversation)
+        runtime_selection = resolve_runtime_selection(agent, session, conversation)
+        explicit_model = runtime_selection.model
+        explicit_provider_id = runtime_selection.provider_id
         provider_id: str | None = None
         if hasattr(self.llm, "resolve_model_target"):
             try:
@@ -2987,22 +3114,29 @@ class ContextAssembler:
         *,
         owner_email: str | None,
     ) -> list[Any]:
+        events, replay_positions = _limit_history_native_attachment_replay(events)
         if self.artifact_store is None or self.session_factory is None:
             return events
 
         artifact_ids: set[str] = set()
-        for event in events:
+        for event_index, event in enumerate(events):
             data = event.get("data", {}) if isinstance(event, dict) else getattr(event, "data", {})
             if not isinstance(data, dict):
                 continue
             attachments = data.get("attachments")
             if not isinstance(attachments, list):
                 continue
-            for attachment in attachments[:20]:
+            for attachment_index, attachment in enumerate(attachments[:20]):
                 if not isinstance(attachment, dict):
                     continue
                 artifact_id = attachment.get("artifact_id")
-                if isinstance(artifact_id, str) and artifact_id:
+                if (
+                    isinstance(artifact_id, str)
+                    and artifact_id
+                    and (
+                        (event_index, attachment_index) in replay_positions or attachment.get("url")
+                    )
+                ):
                     artifact_ids.add(artifact_id)
         if not artifact_ids:
             return events
@@ -3056,7 +3190,7 @@ class ContextAssembler:
             }
 
         hydrated_events: list[Any] = []
-        for event in events:
+        for event_index, event in enumerate(events):
             next_event: Any
             if isinstance(event, dict):
                 event_type = event.get("type", "")
@@ -3073,17 +3207,24 @@ class ContextAssembler:
                     continue
                 next_data = dict(event_data)
 
-                next_event = SimpleNamespace(type=str(getattr(event, "type", "")), data=next_data)
+                next_event = copy.copy(event)
+                next_event.data = next_data
 
             attachments = next_data.get("attachments")
             if isinstance(attachments, list):
                 next_attachments: list[dict[str, Any]] = []
-                for attachment in attachments[:20]:
+                for attachment_index, attachment in enumerate(attachments[:20]):
                     if not isinstance(attachment, dict):
                         continue
                     artifact_id = attachment.get("artifact_id")
                     hydrated = (
-                        hydrated_by_id.get(artifact_id) if isinstance(artifact_id, str) else None
+                        hydrated_by_id.get(artifact_id)
+                        if isinstance(artifact_id, str)
+                        and (
+                            (event_index, attachment_index) in replay_positions
+                            or attachment.get("url")
+                        )
+                        else None
                     )
                     next_attachments.append(
                         {**attachment, **hydrated} if hydrated else dict(attachment)
@@ -3323,8 +3464,87 @@ def events_to_messages(
     pending_responses_output_items: list[dict[str, Any]] = []
     pending_anthropic_native_envelope: dict[str, Any] | None = None
     open_tool_call_ids: list[str] = []
+    canonical_tool_calls: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
     native_open_tool_call_ids: set[str] = set()
     native_tool_batch_by_call_id: dict[str, set[str]] = {}
+
+    normalized_events = list(events)
+    seen_call_ids: set[tuple[Any, Any, Any]] = set()
+
+    def _tool_identity(item: Any) -> tuple[Any, Any, Any] | None:
+        item_data = item.get("data", {}) if isinstance(item, dict) else item.data
+        if not isinstance(item_data, dict) or not isinstance(item_data.get("call_id"), str):
+            return None
+        return (
+            item_data.get("turn_id"),
+            item_data.get("call_id"),
+            item_data.get("name") or item_data.get("tool_name"),
+        )
+
+    def _event_type(item: Any) -> str:
+        return str(item.get("type", "")) if isinstance(item, dict) else str(item.type)
+
+    canonical_tool_events: dict[tuple[str, tuple[Any, Any, Any]], dict[str, Any]] = {}
+    for item in normalized_events:
+        item_type = _event_type(item)
+        identity = _tool_identity(item)
+        if item_type not in {"tool_call", "tool_result"} or identity is None:
+            continue
+        item_data = item.get("data", {}) if isinstance(item, dict) else item.data
+        event_identity = (item_type, identity)
+        canonical_data = canonical_tool_events.get(event_identity)
+        if canonical_data is not None and canonical_data != item_data:
+            raise CanonicalToolHistoryError(f"conflicting duplicate canonical {item_type}")
+        canonical_tool_events.setdefault(event_identity, dict(item_data))
+
+    index = 0
+    while index < len(normalized_events):
+        item = normalized_events[index]
+        item_type = _event_type(item)
+        identity = _tool_identity(item)
+        if item_type == "tool_call" and identity is not None:
+            seen_call_ids.add(identity)
+        elif item_type == "tool_result" and identity is not None and identity not in seen_call_ids:
+            orphan_identities: list[tuple[Any, Any, Any]] = []
+            result_end = index
+            while result_end < len(normalized_events):
+                candidate = normalized_events[result_end]
+                candidate_identity = _tool_identity(candidate)
+                if (
+                    _event_type(candidate) != "tool_result"
+                    or candidate_identity is None
+                    or candidate_identity in seen_call_ids
+                ):
+                    break
+                if candidate_identity not in orphan_identities:
+                    orphan_identities.append(candidate_identity)
+                result_end += 1
+            repaired_calls: list[Any] = []
+            repaired_indexes: list[int] = []
+            for orphan_identity in orphan_identities:
+                repaired_index = next(
+                    (
+                        candidate_index
+                        for candidate_index in range(result_end, len(normalized_events))
+                        if _event_type(normalized_events[candidate_index]) == "tool_call"
+                        and _tool_identity(normalized_events[candidate_index]) == orphan_identity
+                    ),
+                    None,
+                )
+                if repaired_index is not None:
+                    repaired_indexes.append(repaired_index)
+                    repaired_calls.append(normalized_events[repaired_index])
+            for repaired_index in reversed(repaired_indexes):
+                normalized_events.pop(repaired_index)
+            if repaired_calls:
+                normalized_events[index:index] = repaired_calls
+                seen_call_ids.update(
+                    identity
+                    for call in repaired_calls
+                    if (identity := _tool_identity(call)) is not None
+                )
+                index += len(repaired_calls)
+        index += 1
 
     def _flush_tool_calls() -> None:
         """Flush buffered tool_call events into an assistant message."""
@@ -3416,7 +3636,7 @@ def events_to_messages(
                 }
             )
 
-    for event in events:
+    for event in normalized_events:
         if isinstance(event, dict):
             event_type = str(event.get("type", ""))
             event_data: dict[str, Any] = event.get("data", {})
@@ -3431,7 +3651,17 @@ def events_to_messages(
                 or event_data.get("name")
             )
             call_id = event_data.get("call_id", "")
-            arguments = event_data.get("arguments")
+            identity = _tool_identity(event)
+            if isinstance(call_id, str) and call_id and identity is not None:
+                canonical = canonical_tool_calls.get(identity)
+                if canonical == event_data:
+                    continue
+                canonical_tool_calls.setdefault(identity, dict(event_data))
+            arguments = (
+                event_data.get("visible_arguments")
+                if event_data.get("visible_name") and "visible_arguments" in event_data
+                else event_data.get("arguments")
+            )
             if isinstance(tool_name, str):
                 # Serialize arguments to JSON string as required by the format
                 if isinstance(arguments, dict):
@@ -3973,7 +4203,13 @@ def _format_search_results(search_results: Any) -> str | None:
         if not isinstance(memory, str) or not memory.strip():
             continue
         score = result.get("score")
-        prefix = f"- ({score:.2f}) " if isinstance(score, (int, float)) else "- "
+        alias = result.get("id")
+        alias_prefix = f"[{alias}] " if isinstance(alias, str) and alias else ""
+        prefix = (
+            f"- {alias_prefix}({score:.2f}) "
+            if isinstance(score, (int, float))
+            else f"- {alias_prefix}"
+        )
         lines.append(prefix + memory.strip())
     return "\n".join(lines) if lines else None
 

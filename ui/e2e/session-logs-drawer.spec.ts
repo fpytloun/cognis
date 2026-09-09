@@ -14,22 +14,33 @@ test.describe('Session logs drawer parity', () => {
 
   test('locks the page, shows activity, contains boundary scrolling, and restores focus', async ({ page }) => {
     const trigger = page.getByTestId('open-session-drawer');
+    // overlays.ts locks the app scroller, not document.body.
+    await page.evaluate(() => {
+      const owner = document.querySelector<HTMLElement>('[data-app-content="true"]')
+        ?? document.scrollingElement as HTMLElement;
+      owner.dataset.testScrollOwner = 'true';
+    });
+    const scroller = page.locator('[data-test-scroll-owner="true"]');
+    const originalOverflow = await scroller.evaluate((node) => (node as HTMLElement).style.overflow);
+    const originalScroll = await scroller.evaluate((node) => node.scrollTop);
     await trigger.focus();
     await trigger.click();
     const drawer = page.getByRole('dialog', { name: 'Session logs' });
     await expect(drawer).toBeVisible();
     await expect(drawer.getByTestId('session-activity-status')).toContainText('Agent is working');
-    await expect.poll(() => page.evaluate(() => document.body.style.position)).toBe('fixed');
+    await expect(scroller).toHaveCSS('overflow', 'hidden');
 
     const viewport = drawer.getByTestId('scoped-timeline-viewport');
     await viewport.hover();
     const pageY = await page.evaluate(() => window.scrollY);
     await page.mouse.wheel(0, -500);
     expect(await page.evaluate(() => window.scrollY)).toBe(pageY);
+    expect(await scroller.evaluate((node) => node.scrollTop)).toBe(originalScroll);
 
     await drawer.getByRole('button', { name: 'Close' }).click();
     await expect(drawer).toHaveCount(0);
-    await expect.poll(() => page.evaluate(() => document.body.style.position)).toBe('');
+    await expect.poll(() => scroller.evaluate((node) => (node as HTMLElement).style.overflow)).toBe(originalOverflow);
+    expect(await scroller.evaluate((node) => node.scrollTop)).toBe(originalScroll);
     await expect(trigger).toBeFocused();
   });
 

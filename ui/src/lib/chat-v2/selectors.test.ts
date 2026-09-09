@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  isPinnedTransientNotice,
+  selectActivePinnedTransientNotice,
   selectActiveTurnId,
   selectHasActiveTurn,
   selectNeedsRecovery,
   selectLatestTodoState,
   selectPendingInputItem,
   selectPendingInputToolCall,
+  selectPinnedTransientNotice,
   selectQueuedCount
 } from './selectors';
 import { emptyChatV2State, type ChatV2ClientState } from './sync-engine';
@@ -47,6 +50,72 @@ describe('runtime selectors', () => {
     expect(selectNeedsRecovery(state({ syncStatus: 'ready' }))).toBe(false);
     expect(selectQueuedCount(state({ queue: { messages: [], queued_count: 3 } }))).toBe(3);
     expect(selectQueuedCount(state())).toBe(0);
+  });
+});
+
+describe('pinned transient notices', () => {
+  const systemNotice = (overrides: Partial<TimelineItem> = {}): TimelineItem => ({
+    id: 'system:retry',
+    kind: 'message',
+    sort_key: '9998',
+    source_refs: [],
+    stable: false,
+    role: 'system',
+    content: 'Retrying.',
+    message_id: 'retry',
+    attachments: [],
+    partial: false,
+    notice_kind: 'model_recovery',
+    notice_scope: 'retry',
+    ...overrides,
+  } as TimelineItem);
+
+  it('selects only volatile connection and error notices', () => {
+    const retry = systemNotice();
+    const durableRetry = systemNotice({ id: 'system:durable', stable: true });
+    const error = {
+      id: 'error:runtime',
+      kind: 'error',
+      sort_key: '9999',
+      source_refs: [],
+      stable: false,
+      level: 'error',
+      title: 'Connection failed',
+      recoverable: true,
+    } as TimelineItem;
+
+    expect(isPinnedTransientNotice(retry)).toBe(true);
+    expect(isPinnedTransientNotice(durableRetry)).toBe(false);
+    expect(isPinnedTransientNotice(error)).toBe(true);
+    expect(selectPinnedTransientNotice([retry, durableRetry, error])).toBe(error);
+  });
+
+  it('does not extract durable model errors or ordinary system messages', () => {
+    expect(isPinnedTransientNotice(systemNotice({
+      notice_kind: 'model_error',
+      notice_scope: 'failed_turn',
+      stable: true,
+    }))).toBe(false);
+    expect(isPinnedTransientNotice(systemNotice({
+      notice_kind: 'managed_takeover',
+      notice_scope: 'turn',
+    }))).toBe(false);
+  });
+
+  it('does not pin stale runtime notices after the active turn settles', () => {
+    const retry = systemNotice();
+    const runtime = activeRuntime({
+      has_active_turn: false,
+      active_turn: null,
+      volatile_items: [retry],
+    });
+
+    expect(selectActivePinnedTransientNotice(runtime)).toBeNull();
+    expect(selectActivePinnedTransientNotice({
+      ...runtime,
+      has_active_turn: true,
+      active_turn: activeRuntime().active_turn,
+    })).toBe(retry);
   });
 });
 

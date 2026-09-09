@@ -367,7 +367,7 @@ def build_knowledgebase_tool_handlers(service: Any | None) -> dict[str, Any]:
             settings=payload.settings,
             access_context=_access_context(context),
         )
-        return row.model_dump(mode="json")
+        return dict(row.model_dump(mode="json"))
 
     async def list_(
         arguments: dict[str, Any], context: ToolExecutionContext

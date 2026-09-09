@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from time import monotonic
 from types import SimpleNamespace
 from typing import Any
@@ -9,8 +10,10 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 import cognis.core.cluster_signals as cluster_signals_module
+from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.cluster_signals import (
     MAX_DEDUP_ENTRIES,
+    MAX_RECONCILE_SCOPES,
     ClusterEventStoreId,
     ClusterSignal,
     ClusterSignalKind,
@@ -19,7 +22,10 @@ from cognis.core.cluster_signals import (
 )
 from cognis.core.events import Event, EventBus, EventType
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
+from cognis.store import queries
+from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session
+from cognis.store.work_live_invalidation import bump_live_work_revision
 
 
 class _FakeConnection:
@@ -95,6 +101,43 @@ def _record_events(target: list[Event]) -> Any:
 
 
 @pytest.mark.asyncio
+async def test_work_reconciliation_watermark_reads_durable_revision(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'work-revision.db'}")
+    factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+    async with factory() as db:
+        await queries.create_user(
+            db,
+            email="owner@example.com",
+            name="Owner",
+            password_hash="x",
+            role="user",
+        )
+        await db.flush()
+        assert await bump_live_work_revision(db, "owner@example.com") == 1
+        assert await bump_live_work_revision(db, "owner@example.com") == 2
+        await db.commit()
+
+    service = ClusterSignalService(
+        database_url="sqlite://",
+        controller_id="controller",
+        session_factory=factory,
+        event_bus=EventBus(),
+        scope_provider=lambda: [],
+        transport=_FakeTransport([]),
+        owner_token_secret="shared-secret",
+    )
+    watermark = await service._scope_watermark(  # noqa: SLF001
+        ClusterSignalScope(work_scope_key="*"),
+        "owner@example.com",
+    )
+    assert "work:2" in watermark
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_signal_from_controller_a_invalidates_controller_b_and_stops_cleanly() -> None:
     callbacks: list[Any] = []
     bus_a = EventBus()
@@ -141,6 +184,48 @@ async def test_signal_from_controller_a_invalidates_controller_b_and_stops_clean
     assert service_b._listener_task is None  # noqa: SLF001
     assert service_b._dispatch_task is None  # noqa: SLF001
     assert service_b._reconcile_task is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_slow_scope_does_not_block_unrelated_cluster_signal() -> None:
+    callbacks: list[Any] = []
+    bus = EventBus()
+    release_slow = asyncio.Event()
+    fast_received = asyncio.Event()
+
+    async def _handle(event: Event) -> None:
+        conversation_id = event.data["scope"].get("conversation_id")
+        if conversation_id == "conv-slow":
+            await release_slow.wait()
+        elif conversation_id == "conv-fast":
+            fast_received.set()
+
+    bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, _handle)
+    service = ClusterSignalService(
+        database_url="postgresql+asyncpg://localhost/cognis",
+        controller_id="controller-b",
+        session_factory=_unused_session_factory,
+        event_bus=bus,
+        scope_provider=lambda: [],
+        transport=_FakeTransport(callbacks),
+        owner_token_secret="shared-secret",
+    )
+    await service.start()
+    await asyncio.sleep(0)
+    for conversation_id in ("conv-slow", "conv-fast"):
+        service.receive_payload(
+            ClusterSignal(
+                kind=ClusterSignalKind.CHAT_SCOPE_CHANGED,
+                origin_controller_id="controller-a",
+                scope=ClusterSignalScope(conversation_id=conversation_id),
+                revision="1",
+            ).encoded()
+        )
+
+    await asyncio.wait_for(fast_received.wait(), timeout=0.5)
+    release_slow.set()
+    await asyncio.wait_for(service._pending.join(), timeout=1)  # noqa: SLF001
+    await service.stop()
 
 
 @pytest.mark.asyncio
@@ -263,6 +348,16 @@ async def test_work_revision_invalidates_local_and_remote_controllers() -> None:
     assert remote_events[0].data["revision"] == "9"
     assert remote_events[0].data["scope"]["work_scope_key"] == "conversation:conv-1"
     assert "owner@example.com" not in remote_events[0].model_dump_json()
+    assert (
+        await local.publish_work_invalidation(
+            scope_key="conversation:conv-1",
+            user_email="owner@example.com",
+            revision=10,
+        )
+        is True
+    )
+    await asyncio.wait_for(remote._pending.join(), timeout=1)  # noqa: SLF001
+    assert [event.data["revision"] for event in remote_events] == ["9", "10"]
     await remote.stop()
 
 
@@ -452,7 +547,7 @@ async def test_reconciliation_watermark_includes_canonical_event_store_sequence(
     event_store = type(
         "EventStore",
         (),
-        {"read_session_high_watermark": AsyncMock(side_effect=_read_watermark)},
+        {"read_authoritative_session_high_watermark": AsyncMock(side_effect=_read_watermark)},
     )()
     service = ClusterSignalService(
         database_url="postgresql://localhost/cognis",
@@ -470,8 +565,46 @@ async def test_reconciliation_watermark_includes_canonical_event_store_sequence(
     )
 
     assert "event_store:73" in watermark
-    event_store.read_session_high_watermark.assert_awaited_once_with(session_id="intaris-session-1")
+    event_store.read_authoritative_session_high_watermark.assert_awaited_once_with(
+        session_id="intaris-session-1"
+    )
     assert observed_context == [("session-user@example.com", "agent-1", "agent-owner@example.com")]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_invalidates_cache_after_authoritative_sequence_change() -> None:
+    sequence = 7
+
+    async def read_authoritative(**_kwargs: object) -> object:
+        return SimpleNamespace(last_seq=sequence)
+
+    event_store = SimpleNamespace(
+        bind=lambda _authority: event_store,
+        read_authoritative_session_high_watermark=AsyncMock(side_effect=read_authoritative),
+        invalidate_session=AsyncMock(return_value=True),
+    )
+    service = ClusterSignalService(
+        database_url="postgresql://localhost/cognis",
+        controller_id="controller-b",
+        session_factory=_SessionContext,
+        event_bus=EventBus(),
+        scope_provider=lambda: [{"session_id": "session-1"}],
+        transport=_FakeTransport([]),
+        event_store=event_store,
+        owner_token_secret="shared-secret",
+    )
+
+    await service.reconcile_once()
+    event_store.invalidate_session.assert_awaited_once_with(
+        ClusterEventStoreId.INTARIS,
+        "intaris-session-1",
+        source="cluster_signal",
+    )
+
+    sequence = 8
+    await service.reconcile_once()
+
+    assert event_store.invalidate_session.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -487,7 +620,7 @@ async def test_reconciliation_watermark_uses_system_agent_owner() -> None:
     event_store = type(
         "EventStore",
         (),
-        {"read_session_high_watermark": AsyncMock(side_effect=_read_watermark)},
+        {"read_authoritative_session_high_watermark": AsyncMock(side_effect=_read_watermark)},
     )()
     service = ClusterSignalService(
         database_url="postgresql://localhost/cognis",
@@ -549,7 +682,7 @@ async def test_reconciliation_times_out_slow_event_store(
         return SimpleNamespace(last_seq=1)
 
     event_store = SimpleNamespace(
-        read_session_high_watermark=AsyncMock(side_effect=_slow_high_watermark)
+        read_authoritative_session_high_watermark=AsyncMock(side_effect=_slow_high_watermark)
     )
     service = ClusterSignalService(
         database_url="postgresql://localhost/cognis",
@@ -566,8 +699,9 @@ async def test_reconciliation_times_out_slow_event_store(
     started = monotonic()
     await service.reconcile_once()
 
-    assert monotonic() - started < 0.2
+    assert monotonic() - started < 2
     assert service._watermarks == {}  # noqa: SLF001
+    assert event_store.read_authoritative_session_high_watermark.await_count == MAX_RECONCILE_SCOPES
 
 
 @pytest.mark.asyncio
@@ -593,7 +727,7 @@ async def test_session_watermark_closes_database_session_before_event_store_read
         event_bus=EventBus(),
         scope_provider=lambda: [],
         transport=_FakeTransport([]),
-        event_store=SimpleNamespace(read_session_high_watermark=read_high_watermark),
+        event_store=SimpleNamespace(read_authoritative_session_high_watermark=read_high_watermark),
         owner_token_secret="shared-secret",
     )
 

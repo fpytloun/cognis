@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { clearSessionInfoCache, getSessionInfo, setSessionInfo, type SessionInfoData } from './sessionInfoCache';
+import {
+  clearSessionInfoCache,
+  getSessionInfo,
+  mergeRuntimeSelection,
+  setSessionInfo,
+  type SessionInfoData
+} from './sessionInfoCache';
 
 function detail(id: string): SessionInfoData {
   return {
@@ -10,6 +16,30 @@ function detail(id: string): SessionInfoData {
 
 describe('sessionInfoCache', () => {
   beforeEach(() => clearSessionInfoCache());
+
+  it('rejects an older runtime selection', () => {
+    const current = {
+      ...detail('session'),
+      runtime_selection: {
+        revision: 3,
+        profile_id: 'developer',
+        profile_source: 'session',
+        model: 'new-model',
+        provider_id: 'codex',
+        model_source: 'session_override',
+        reasoning_effort: 'high',
+        reasoning_effort_source: 'session_override',
+        fast_mode: null,
+        fast_mode_source: 'agent_profile'
+      }
+    };
+    const merged = mergeRuntimeSelection(current, {
+      ...current.runtime_selection,
+      revision: 2,
+      model: 'old-model'
+    });
+    expect(merged).toBe(current);
+  });
 
   it('retains details for two minutes and expires them by five minutes', () => {
     vi.useFakeTimers();

@@ -13,6 +13,7 @@ _API_KEY_PATTERNS = [
     re.compile(r"sk-[A-Za-z0-9_-]+"),
     re.compile(r"key-[A-Za-z0-9_-]+"),
     re.compile(r"(?i)(api[_ -]?key\s*[=:]\s*)([^\s,;]+)"),
+    re.compile(r"(?i)((?:access[_ -]?token|token|password|secret)\s*[=:]\s*)([^\s,;]+)"),
     re.compile(r"https?://[^\s:@]+:[^\s@]+@"),
 ]
 _LONG_QUOTED_CONTENT = re.compile(r'(["\'])([^"\']{51,})\1')

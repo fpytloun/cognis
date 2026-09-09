@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "id": "wearable-recovery",
+  "title": "Synthetic wearable recovery review",
+  "description": "A synthetic 30-day Oura-style recovery review with baseline context, coverage, and non-diagnostic observations.",
+  "group": "health",
+  "sort_key": 1600,
+  "content": "Synthetic wearable recovery review with 30 days of readiness, sleep, activity, HRV, and resting-heart-rate data. It is a planning aid, not medical advice or a diagnosis.",
+  "payload": {
+    "title": "Synthetic wearable recovery review",
+    "metadata": {
+      "canvas": "wide",
+      "density": "compact",
+      "eyebrow": "Synthetic Oura-style export",
+      "subtitle": "30-day review · generated 2026-09-05 20:45 UTC · data through 2026-09-04"
+    },
+    "blocks": [
+      {
+        "type": "section_header",
+        "eyebrow": "Recovery review",
+        "title": "Recovery is near the personal baseline after a short low-readiness interval",
+        "subtitle": "Synthetic wearable data only. This view supports reflection on routine and recovery, not diagnosis or treatment.",
+        "status": "Freshness: 1 day old · 29/30 nights complete",
+        "tone": "info"
+      },
+      {
+        "type": "dashboard",
+        "title": "30-day recovery metrics",
+        "metrics": [
+          {
+            "type": "metric",
+            "label": "Readiness",
+            "value": "78",
+            "delta": "+3 vs 30-day baseline",
+            "description": "Personal baseline 75 · last 7 days 77",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Sleep score",
+            "value": "81",
+            "delta": "+1 vs baseline",
+            "description": "Personal baseline 80 · 7 h 24 min average duration",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Activity score",
+            "value": "73",
+            "delta": "-2 vs baseline",
+            "description": "Personal baseline 75 · 4 moderate activity days this week",
+            "tone": "neutral"
+          },
+          {
+            "type": "metric",
+            "label": "Night HRV",
+            "value": "46 ms",
+            "delta": "+4 ms vs baseline",
+            "description": "Personal baseline 42 ms · nightly median",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Resting heart rate",
+            "value": "54 bpm",
+            "delta": "-1 bpm vs baseline",
+            "description": "Personal baseline 55 bpm · nightly average",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Data coverage",
+            "value": "97%",
+            "delta": "29 of 30 nights",
+            "description": "One missing overnight sample on 2026-08-19",
+            "tone": "info"
+          }
+        ]
+      },
+      {
+        "type": "chart",
+        "title": "Readiness and sleep score",
+        "description": "Daily synthetic scores. The dip on 2026-08-25 to 2026-08-27 is visible in both series.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "legend_position": "bottom",
+        "palette_token": "cool",
+        "series": [
+          {
+            "id": "readiness",
+            "label": "Readiness",
+            "points": [
+              {"x": "2026-08-06", "y": 76}, {"x": "2026-08-09", "y": 78}, {"x": "2026-08-12", "y": 74},
+              {"x": "2026-08-15", "y": 77}, {"x": "2026-08-18", "y": 79}, {"x": "2026-08-21", "y": 75},
+              {"x": "2026-08-24", "y": 73}, {"x": "2026-08-25", "y": 66}, {"x": "2026-08-26", "y": 64},
+              {"x": "2026-08-27", "y": 68}, {"x": "2026-08-29", "y": 74}, {"x": "2026-08-31", "y": 76},
+              {"x": "2026-09-02", "y": 80}, {"x": "2026-09-04", "y": 78}
+            ]
+          },
+          {
+            "id": "sleep",
+            "label": "Sleep score",
+            "points": [
+              {"x": "2026-08-06", "y": 80}, {"x": "2026-08-09", "y": 82}, {"x": "2026-08-12", "y": 78},
+              {"x": "2026-08-15", "y": 81}, {"x": "2026-08-18", "y": 83}, {"x": "2026-08-21", "y": 79},
+              {"x": "2026-08-24", "y": 77}, {"x": "2026-08-25", "y": 70}, {"x": "2026-08-26", "y": 69},
+              {"x": "2026-08-27", "y": 72}, {"x": "2026-08-29", "y": 78}, {"x": "2026-08-31", "y": 81},
+              {"x": "2026-09-02", "y": 83}, {"x": "2026-09-04", "y": 81}
+            ]
+          }
+        ],
+        "x_axis": {"type": "time", "label": "Date"},
+        "y_axis": {"type": "linear", "label": "Score", "min": 50, "max": 100},
+        "source": "Synthetic wearable export",
+        "source_url": "/fixtures/rich-scenarios/wearable-recovery/source-export.json",
+        "observed_at": "2026-09-05T20:45:00Z"
+      },
+      {
+        "type": "chart",
+        "title": "Night HRV and resting heart rate",
+        "description": "Two different units are shown together as directional context. Compare each series with its own baseline, not directly with the other.",
+        "spec_version": "cognis.chart.v1",
+        "chart_type": "line",
+        "legend_position": "bottom",
+        "palette_token": "warm",
+        "series": [
+          {
+            "id": "hrv",
+            "label": "Night HRV (ms)",
+            "points": [
+              {"x": "2026-08-06", "y": 41}, {"x": "2026-08-09", "y": 44}, {"x": "2026-08-12", "y": 40},
+              {"x": "2026-08-15", "y": 43}, {"x": "2026-08-18", "y": 45}, {"x": "2026-08-21", "y": 41},
+              {"x": "2026-08-24", "y": 38}, {"x": "2026-08-25", "y": 32}, {"x": "2026-08-26", "y": 30},
+              {"x": "2026-08-27", "y": 35}, {"x": "2026-08-29", "y": 41}, {"x": "2026-08-31", "y": 44},
+              {"x": "2026-09-02", "y": 48}, {"x": "2026-09-04", "y": 46}
+            ]
+          },
+          {
+            "id": "rhr",
+            "label": "Resting heart rate (bpm)",
+            "points": [
+              {"x": "2026-08-06", "y": 55}, {"x": "2026-08-09", "y": 54}, {"x": "2026-08-12", "y": 56},
+              {"x": "2026-08-15", "y": 55}, {"x": "2026-08-18", "y": 54}, {"x": "2026-08-21", "y": 56},
+              {"x": "2026-08-24", "y": 57}, {"x": "2026-08-25", "y": 61}, {"x": "2026-08-26", "y": 62},
+              {"x": "2026-08-27", "y": 59}, {"x": "2026-08-29", "y": 56}, {"x": "2026-08-31", "y": 55},
+              {"x": "2026-09-02", "y": 53}, {"x": "2026-09-04", "y": 54}
+            ]
+          }
+        ],
+        "x_axis": {"type": "time", "label": "Date"},
+        "y_axis": {"type": "linear", "label": "Synthetic nightly value"},
+        "source": "Synthetic wearable export",
+        "source_url": "/fixtures/rich-scenarios/wearable-recovery/source-export.json",
+        "observed_at": "2026-09-05T20:45:00Z"
+      },
+      {
+        "type": "table",
+        "title": "Notable changes",
+        "description": "Observed patterns in the synthetic sample, with limited interpretation.",
+        "columns": [{"key": "window", "label": "Window"}, {"key": "signal", "label": "Signal"}, {"key": "practical_note", "label": "Practical observation"}],
+        "rows": [
+          {"window": "Aug 25–27", "signal": "Readiness 64–68; HRV 30–35 ms; resting heart rate 59–62 bpm", "practical_note": "A short cluster below the personal baseline; note workload, sleep timing, and alcohol or travel context if relevant."},
+          {"window": "Aug 29–Sep 4", "signal": "Readiness returned to 74–80; HRV returned above baseline", "practical_note": "The synthetic values recovered without a persistent downward trend."},
+          {"window": "Coverage", "signal": "One missing overnight sample", "practical_note": "Do not interpret the missing date as a physiological change."}
+        ]
+      },
+      {
+        "type": "callout",
+        "title": "Use this as trend context, not a diagnosis",
+        "content": "This is synthetic source data and does not diagnose illness, sleep disorders, or training readiness. If symptoms are concerning or persistent, discuss them with a qualified clinician."
+      },
+      {
+        "type": "source_list",
+        "title": "Source and freshness",
+        "sources": [{"title": "Synthetic Oura-style CSV export", "url": "/fixtures/rich-scenarios/wearable-recovery/source-export.json", "description": "Fictional data generated for renderer acceptance. Exported 2026-09-05 20:45 UTC; latest synthetic night 2026-09-04."}]
+      }
+    ],
+    "sources": [],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

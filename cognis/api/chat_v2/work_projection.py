@@ -15,9 +15,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
-from typing import Any
+from typing import Any, Literal
 
 from cognis.api.chat_v2.schemas import (
+    ActivityOverviewDetail,
     ArtifactTimelineItem,
     AssistantDeliverableTimelineItem,
     FileDiffRef,
@@ -271,8 +272,15 @@ def build_work_projection(
     summary: WorkSummary | None = None,
     newest_first: bool = False,
     complete_files: bool = False,
+    canonical_deliverable_ids: frozenset[str] | None = None,
+    detail: ActivityOverviewDetail = "full",
+    preserve_input_order: bool = False,
 ) -> WorkProjectionResponse:
-    ordered = sorted(items, key=lambda item: item.sort_key, reverse=newest_first)
+    ordered = (
+        list(items)
+        if preserve_input_order
+        else sorted(items, key=lambda item: item.sort_key, reverse=newest_first)
+    )
     if complete_files:
         ordered = [_resolve_item_file_paths(item) for item in ordered]
     workstream_list = list(workstreams)
@@ -306,6 +314,10 @@ def build_work_projection(
                 continue
             seen_deliverable_ids.add(item.deliverable_id)
             source_workstream = _source_workstream(item, workstream_by_stream)
+            actionable = (
+                canonical_deliverable_ids is None
+                or item.deliverable_id in canonical_deliverable_ids
+            )
             content, content_truncated = budget.take_text(
                 item.content,
                 _MAX_DELIVERABLE_PREVIEW,
@@ -317,7 +329,8 @@ def build_work_projection(
                 title=item.title,
                 content=content,
                 content_preview_truncated=content_truncated,
-                recoverable=True,
+                recoverable=actionable,
+                display_only=not actionable,
                 render_metadata=budget.take_structured(item.render_metadata),
                 export_metadata=budget.take_structured(item.export_metadata),
                 source_workstream=source_workstream,
@@ -328,15 +341,19 @@ def build_work_projection(
                 if existing.deliverable_id != deliverable.deliverable_id
             ]
             deliverables.append(deliverable)
-            if final_deliverable is None or not newest_first:
+            if actionable and (final_deliverable is None or not newest_first):
                 final_deliverable = deliverable
             if (
-                not workstream_list
-                or (
-                    source_workstream is not None
-                    and source_workstream.key == source_workstream.root_key
+                (
+                    not workstream_list
+                    or (
+                        source_workstream is not None
+                        and source_workstream.key == source_workstream.root_key
+                    )
                 )
-            ) and (primary_deliverable is None or not newest_first):
+                and actionable
+                and (primary_deliverable is None or not newest_first)
+            ):
                 primary_deliverable = deliverable
             continue
         if isinstance(item, ArtifactTimelineItem):
@@ -363,7 +380,13 @@ def build_work_projection(
             continue
 
         definition = tool_definitions.get(item.tool_name)
-        if not is_work_evidence_item(item, tool_definitions):
+        cached_current_files = (
+            complete_files
+            and item.tool_name == "files"
+            and bool(item.file_diffs)
+            and _is_completed_tool_execution(item)
+        )
+        if not cached_current_files and not is_work_evidence_item(item, tool_definitions):
             continue
         if item.tool_name == "bash":
             commands.append(
@@ -377,7 +400,7 @@ def build_work_projection(
             continue
 
         if item.file_diffs:
-            if not _is_completed_file_mutation(item, definition):
+            if not cached_current_files and not _is_completed_file_mutation(item, definition):
                 continue
             event = _mutation_event(
                 item,
@@ -388,7 +411,7 @@ def build_work_projection(
             )
             changed_path_ids.update(stat.path_id for stat in event.file_stats)
             changed_path_ids.update(
-                _safe_path(diff.path, roots).path_id for diff in item.file_diffs
+                diff.path_id or _safe_path(diff.path, roots).path_id for diff in item.file_diffs
             )
             mutations.append(event)
             continue
@@ -419,6 +442,7 @@ def build_work_projection(
     deletions = sum(event.deletions for event in mutations)
     generic_mutations = sum(1 for event in mutations if not event.file_diffs)
     return WorkProjectionResponse(
+        detail=detail,
         projection_version=projection_version,
         scope=scope,
         final_deliverable=primary_deliverable or final_deliverable,
@@ -450,7 +474,21 @@ def build_work_projection(
     )
 
 
-def _status(item: ToolCallTimelineItem) -> str:
+def _status(
+    item: ToolCallTimelineItem,
+) -> Literal[
+    "pending",
+    "running",
+    "waiting",
+    "complete",
+    "failed",
+    "cancelled",
+    "denied",
+    "compacted",
+    "skipped",
+]:
+    if item.status == "denied":
+        return "denied"
     if item.is_error:
         return "failed"
     return item.status or ("complete" if item.result_preview is not None else "running")
@@ -654,17 +692,17 @@ def _safe_path(value: str | None, roots: tuple[_WorkRoot, ...]) -> _SafePath:
             root_id=root.root_id,
         )
     if not absolute:
-        relative = _normalized_relative_path(normalized)
-        if relative is None:
+        normalized_relative = _normalized_relative_path(normalized)
+        if normalized_relative is None:
             basename = normalized.rsplit("/", 1)[-1]
             return _SafePath(
                 display=_bounded(basename, _MAX_ARGUMENT_TEXT) or "",
                 path_id=_path_id("unsafe-relative", normalized),
             )
         return _SafePath(
-            display=_bounded(f"Unscoped/{relative}", _MAX_ARGUMENT_TEXT) or "Unscoped",
-            path_id=f"unbound:{_path_id('relative', relative)}",
-            relative_path=relative,
+            display=_bounded(f"Unscoped/{normalized_relative}", _MAX_ARGUMENT_TEXT) or "Unscoped",
+            path_id=f"unbound:{_path_id('relative', normalized_relative)}",
+            relative_path=normalized_relative,
             root_label="Unscoped",
         )
     basename = normalized.rsplit("/", 1)[-1]
@@ -691,7 +729,10 @@ def _bounded_diffs(
             bounded.append(
                 FileDiffRef(
                     path=safe_path.display,
-                    path_id=safe_path.path_id,
+                    occurred_at=diff.occurred_at,
+                    path_id=diff.path_id or safe_path.path_id,
+                    path_generation_id=diff.path_generation_id,
+                    source_item_id=diff.source_item_id,
                     relative_path=safe_path.relative_path,
                     root_label=safe_path.root_label,
                     root_name=safe_path.root_name,
@@ -699,6 +740,13 @@ def _bounded_diffs(
                     additions=additions,
                     deletions=deletions,
                     diff=placeholder,
+                    status=diff.status,
+                    old_path=_safe_path(diff.old_path, roots).display if diff.old_path else None,
+                    binary=diff.binary,
+                    generated=diff.generated,
+                    truncated=diff.truncated,
+                    preview_omitted=False,
+                    preview_omission_reason="sensitive",
                     content_truncated=True,
                 )
             )
@@ -706,13 +754,44 @@ def _bounded_diffs(
         text = _safe_text(diff.diff) or ""
         text, content_truncated = budget.take_diff(text)
         if not text:
+            if diff.preview_omitted or diff.content_truncated:
+                bounded.append(
+                    FileDiffRef(
+                        path=safe_path.display,
+                        occurred_at=diff.occurred_at,
+                        path_id=diff.path_id or safe_path.path_id,
+                        path_generation_id=diff.path_generation_id,
+                        source_item_id=diff.source_item_id,
+                        relative_path=safe_path.relative_path,
+                        root_label=safe_path.root_label,
+                        root_name=safe_path.root_name,
+                        root_id=safe_path.root_id,
+                        additions=additions,
+                        deletions=deletions,
+                        diff="",
+                        status=diff.status,
+                        old_path=_safe_path(diff.old_path, roots).display
+                        if diff.old_path
+                        else None,
+                        binary=diff.binary,
+                        generated=diff.generated,
+                        truncated=diff.truncated,
+                        preview_omitted=diff.preview_omitted,
+                        preview_omission_reason=diff.preview_omission_reason,
+                        content_truncated=diff.content_truncated,
+                    )
+                )
+                continue
             break
         if content_truncated:
             text += "\n… diff content truncated …"
         bounded.append(
             FileDiffRef(
                 path=safe_path.display,
-                path_id=safe_path.path_id,
+                occurred_at=diff.occurred_at,
+                path_id=diff.path_id or safe_path.path_id,
+                path_generation_id=diff.path_generation_id,
+                source_item_id=diff.source_item_id,
                 relative_path=safe_path.relative_path,
                 root_label=safe_path.root_label,
                 root_name=safe_path.root_name,
@@ -720,6 +799,17 @@ def _bounded_diffs(
                 additions=additions,
                 deletions=deletions,
                 diff=text,
+                status=diff.status,
+                old_path=_safe_path(diff.old_path, roots).display if diff.old_path else None,
+                binary=diff.binary,
+                generated=diff.generated,
+                truncated=diff.truncated,
+                preview_omitted=diff.preview_omitted,
+                preview_omission_reason=(
+                    "projection_budget"
+                    if content_truncated and not diff.preview_omitted
+                    else diff.preview_omission_reason
+                ),
                 content_truncated=content_truncated,
             )
         )
@@ -736,14 +826,15 @@ def _file_stat(
     additions, deletions = _diff_totals([diff])
     return WorkFileStat(
         path=safe_path.display,
-        path_id=safe_path.path_id,
+        path_id=diff.path_id or safe_path.path_id,
+        path_generation_id=diff.path_generation_id,
         relative_path=safe_path.relative_path,
         root_label=safe_path.root_label,
         root_name=safe_path.root_name,
         root_id=safe_path.root_id,
         additions=additions,
         deletions=deletions,
-        preview_available=safe_path.path_id in preview_ids,
+        preview_available=(diff.path_id or safe_path.path_id) in preview_ids,
     )
 
 
@@ -838,16 +929,16 @@ def _secret_value_bounds(value: str, start: int) -> tuple[int, str, str]:
             token,
         )
     if value[start] in "\"'":
-        quote = value[start]
+        quote_char = value[start]
         index = start + 1
         while index < len(value):
             if value[index] == "\\":
                 index += 2
                 continue
-            if value[index] == quote:
-                return index + 1, quote, quote
+            if value[index] == quote_char:
+                return index + 1, quote_char, quote_char
             index += 1
-        return len(value), quote, quote
+        return len(value), quote_char, quote_char
     if value[start] in "[{":
         opening = value[start]
         closing = "]" if opening == "[" else "}"
@@ -936,11 +1027,15 @@ def _diff_totals(diffs: Iterable[FileDiffRef]) -> tuple[int, int]:
     additions = 0
     deletions = 0
     for diff in diffs:
+        counted_additions = 0
+        counted_deletions = 0
         for line in diff.diff.splitlines():
             if line.startswith("+") and not line.startswith("+++"):
-                additions += 1
+                counted_additions += 1
             elif line.startswith("-") and not line.startswith("---"):
-                deletions += 1
+                counted_deletions += 1
+        additions += diff.additions if diff.additions is not None else counted_additions
+        deletions += diff.deletions if diff.deletions is not None else counted_deletions
     return additions, deletions
 
 
@@ -1109,14 +1204,36 @@ def _resolve_item_file_paths(item: TimelineItem) -> TimelineItem:
         return item
     resolved: list[FileDiffRef] = []
     for diff in item.file_diffs:
+        old_path = diff.old_path
+        if old_path:
+            if _is_absolute_path(old_path):
+                old_path = _normalized_absolute_path(old_path)
+            else:
+                old_relative = _normalized_resolvable_relative_path(old_path)
+                if old_relative is not None:
+                    old_path = f"{normalized_workdir}/{old_relative}"
         if _is_absolute_path(diff.path):
-            resolved.append(diff.model_copy(update={"path": _normalized_absolute_path(diff.path)}))
+            resolved.append(
+                diff.model_copy(
+                    update={
+                        "path": _normalized_absolute_path(diff.path),
+                        "old_path": old_path,
+                    }
+                )
+            )
             continue
         relative = _normalized_resolvable_relative_path(diff.path)
         if relative is None:
-            resolved.append(diff)
+            resolved.append(diff.model_copy(update={"old_path": old_path}))
             continue
-        resolved.append(diff.model_copy(update={"path": f"{normalized_workdir}/{relative}"}))
+        resolved.append(
+            diff.model_copy(
+                update={
+                    "path": f"{normalized_workdir}/{relative}",
+                    "old_path": old_path,
+                }
+            )
+        )
     return item.model_copy(update={"file_diffs": resolved})
 
 

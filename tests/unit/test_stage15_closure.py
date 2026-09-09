@@ -647,8 +647,15 @@ def test_session_manager_recover_stale_sessions_publishes_event(tmp_path: Path) 
             async def evict(self, _: str) -> None:
                 return None
 
+        class _Guardrails:
+            async def record_events(self, **_: object) -> object:
+                return type("AppendResult", (), {"ok": True})()
+
+        class _Providers:
+            guardrails = _Guardrails()
+
         manager = SessionManager(
-            session_factory, providers=object(), session_cache=_Cache(), event_bus=event_bus
+            session_factory, providers=_Providers(), session_cache=_Cache(), event_bus=event_bus
         )
         await manager.recover_stale_sessions(stale_after_seconds=300)
         await engine.dispose()

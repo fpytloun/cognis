@@ -4,6 +4,7 @@
   import ExternalLink from 'lucide-svelte/icons/external-link';
   import LoaderCircle from 'lucide-svelte/icons/loader-circle';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import { backgroundWorkItemIsRunning, sortBackgroundWorkByActivity } from '$lib/ongoing-work';
   import type { TodoSnapshotItem } from '$lib/todos';
   import type { BackgroundWorkItem } from '$lib/types/api';
@@ -24,20 +25,18 @@
 
   const activeTodos = $derived(todos.filter((todo: TodoSnapshotItem) => !['completed', 'cancelled'].includes(todo.status)));
   const runningWork = $derived(work.filter(backgroundWorkItemIsRunning));
-  const orderedWork = $derived(sortBackgroundWorkByActivity(work));
+  const commandWork = $derived(sortBackgroundWorkByActivity(
+    work.filter((item: BackgroundWorkItem) => item.kind === 'background_command'),
+  ));
+  const sessionWork = $derived(sortBackgroundWorkByActivity(
+    work.filter((item: BackgroundWorkItem) => item.kind !== 'background_command'),
+  ));
 
   function statusClass(status: string): string {
     if (status === 'complete' || status === 'completed') return 'text-emerald-300';
     if (status === 'error' || status === 'failed' || status === 'cancelled' || status === 'interrupted') return 'text-rose-300';
     if (status === 'active' || status === 'idle') return 'text-slate-400';
     return 'text-violet-300';
-  }
-
-  function todoDot(status: string): string {
-    if (status === 'completed') return 'bg-emerald-400';
-    if (status === 'cancelled') return 'bg-slate-600';
-    if (status === 'in_progress') return 'bg-sky-400';
-    return 'bg-slate-400';
   }
 
   function viewSession(sessionId: string | null | undefined): void {
@@ -57,7 +56,8 @@
         <span class="font-medium text-slate-200">Ongoing work</span>
         <span class="text-slate-500">
           {#if runningWork.length > 0} · {runningWork.length} running{/if}
-          {#if work.length > 0} · {work.length} session{work.length === 1 ? '' : 's'}{/if}
+          {#if sessionWork.length > 0} · {sessionWork.length} session{sessionWork.length === 1 ? '' : 's'}{/if}
+          {#if commandWork.length > 0} · {commandWork.length} command{commandWork.length === 1 ? '' : 's'}{/if}
           {#if activeTodos.length > 0} · {activeTodos.length} todo{activeTodos.length === 1 ? '' : 's'}{/if}
         </span>
       </span>
@@ -81,7 +81,7 @@
             <ul class="min-w-0 divide-y divide-slate-800/40 overflow-x-hidden overflow-y-auto rounded-lg border border-slate-800/50 lg:max-h-60">
               {#each todos as todo}
                 <li class="flex items-center gap-2 px-3 py-2 text-sm text-slate-200">
-                  <span class={`h-2 w-2 shrink-0 rounded-full ${todoDot(todo.status)}`}></span>
+                  <TodoStatusDot status={todo.status} />
                   <span class="scrollbar-hidden-x min-w-0 flex-1" title={todo.content}>{todo.content}</span>
                 </li>
               {/each}
@@ -94,17 +94,21 @@
         {#if work.length > 0}
         <div class="min-h-0 min-w-0">
           <div class="mb-2 flex items-center justify-between gap-2">
-            <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">Sessions</p>
+            <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
+              {commandWork.length > 0 && sessionWork.length === 0 ? 'Commands' : 'Sessions and commands'}
+            </p>
             {#if truncated}<span class="text-[10px] text-amber-300">Some global work is omitted</span>{/if}
           </div>
           <div class="min-w-0 space-y-1.5 overflow-x-hidden overflow-y-auto lg:max-h-60">
-            {#each orderedWork as item (item.work_id)}
+            {#each [...sessionWork, ...commandWork] as item (item.work_id)}
               <article class="w-full max-w-full min-w-0 overflow-hidden rounded-lg border border-slate-800/60 bg-slate-950/35 px-3 py-2">
                 <p class="scrollbar-hidden-x w-full min-w-0 text-sm font-medium text-slate-100" title={item.title}>
                   {item.title}
                 </p>
                 <div class="mt-1 flex w-full max-w-full min-w-0 items-center gap-2">
-                  <TodoProgressPopover todos={item.todos} size="sm" class="shrink-0 text-emerald-300" label={`${item.title} todo progress`} />
+                  {#if item.kind !== 'background_command'}
+                    <TodoProgressPopover todos={item.todos} size="sm" class="shrink-0 text-emerald-300" label={`${item.title} todo progress`} />
+                  {/if}
                   <p class="scrollbar-hidden-x min-w-0 flex-1 text-xs text-slate-500" title={`${item.agent_id}${item.agent_profile_id ? ` · ${item.agent_profile_id}` : ''}`}>
                     {item.agent_id}{#if item.agent_profile_id}<span> · {item.agent_profile_id}</span>{/if}
                   </p>

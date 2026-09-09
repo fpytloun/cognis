@@ -57,9 +57,9 @@ def test_searxng_deduplicates_reranks_and_preserves_diagnostics() -> None:
 
 
 def test_search_intent_routing_uses_portable_searxng_categories() -> None:
-    assert _automatic_category("web", "repository") == "it"
-    assert _automatic_category("web", "discussion") == "it"
-    assert _automatic_category("web", "paper") == "science"
+    assert _automatic_category("web", "repository") is None
+    assert _automatic_category("web", "discussion") is None
+    assert _automatic_category("web", "paper") is None
     assert _automatic_category("videos", None) == "videos"
     assert _automatic_category("images", None) == "images"
     assert _automatic_category("news", None) == "news"

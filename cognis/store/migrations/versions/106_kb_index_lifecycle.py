@@ -13,7 +13,8 @@ depends_on: str | Sequence[str] | None = None
 
 def _columns(table_name: str) -> dict[str, dict[str, object]]:
     return {
-        str(column["name"]): column for column in sa.inspect(op.get_bind()).get_columns(table_name)
+        str(column["name"]): dict(column)
+        for column in sa.inspect(op.get_bind()).get_columns(table_name)
     }
 
 

@@ -1,21 +1,76 @@
 <script lang="ts">
   import ToolCallBlock from './ToolCallBlock.svelte';
-  import FileDiffViewer from './FileDiffViewer.svelte';
+  import RecentFileEditRow from './RecentFileEditRow.svelte';
   import MessageAttachments from './MessageAttachments.svelte';
   import AssistantDeliverableBlock from './AssistantDeliverableBlock.svelte';
   import { commandToToolCall, mutationToToolCall } from '$lib/work/workEventAdapter';
-  import type { ActivityOverviewResponse, AssistantDeliverableTimelineItem, FileDiffRef, TimelineScope, WorkCategory, WorkDeliverable, WorkMutationEvent } from '$lib/chat-v2/types';
-  import type { FileDiff } from '$lib/diff';
+  import type { ActivityOverviewResponse, AssistantDeliverableTimelineItem, FileDiffRef, TimelineScope, WorkCategory, WorkCommandEvent, WorkDeliverable, WorkMutationEvent } from '$lib/chat-v2/types';
+  import type { WorkInitialFocus } from '$lib/work/workFocus';
 
-  let { overview, scope, limit = 10, onSeeAll }: {
+  let { overview, scope, limit = 10, onSeeAll, onOpenWork }: {
     overview: ActivityOverviewResponse;
     scope: TimelineScope;
     limit?: number;
     onSeeAll?: (category: WorkCategory) => void;
+    onOpenWork?: (scope: TimelineScope, focus: WorkInitialFocus) => void;
   } = $props();
 
   const recentWork = $derived(overview.recent_work ?? null);
-  const MAX_FILE_EDITS_PER_EVENT = 20;
+  function eventFiles(event: WorkMutationEvent): FileDiffRef[] {
+    const result: FileDiffRef[] = [];
+    const insert = (incoming: FileDiffRef): void => {
+      const index = result.findIndex((item) =>
+        (incoming.path_generation_id && item.path_generation_id === incoming.path_generation_id)
+        || (incoming.path_id && item.path_id === incoming.path_id)
+        || (item.relative_path ?? item.path) === (incoming.relative_path ?? incoming.path)
+      );
+      if (index < 0) result.push(incoming);
+      else result[index] = { ...incoming, ...result[index], diff: result[index]!.diff || incoming.diff };
+    };
+    for (const diff of event.file_diffs ?? []) insert(diff);
+    for (const stat of event.file_stats ?? []) insert({ ...stat, diff: '', preview_omitted: true });
+    for (const path of event.paths ?? []) insert({ path, diff: '', preview_omitted: true });
+    return result;
+  }
+  function fileEventTimestamp(event: WorkMutationEvent): string | null {
+    return event.created_at
+      ?? event.updated_at
+      ?? overview.recent.files?.find((item) => item.id === event.id)?.occurred_at
+      ?? null;
+  }
+  const recentFiles = $derived(
+    (recentWork?.files ?? []).flatMap((event) =>
+      eventFiles(event).map((file, fileOrdinal) => ({
+        event,
+        file: {
+          ...file,
+          occurred_at: file.occurred_at ?? fileEventTimestamp(event),
+        },
+        key: `${event.id}:${file.path_generation_id ?? file.path_id ?? file.path}:${fileOrdinal}`,
+      }))
+    ),
+  );
+  const COMMAND_LABEL_MODE_KEY = 'cognis:work-command-label-mode';
+  let commandLabelMode = $state<'command' | 'description'>('command');
+
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    const stored = window.localStorage.getItem(COMMAND_LABEL_MODE_KEY);
+    if (stored === 'command' || stored === 'description') commandLabelMode = stored;
+  });
+
+  function setCommandLabelMode(mode: 'command' | 'description'): void {
+    commandLabelMode = mode;
+    window.localStorage.setItem(COMMAND_LABEL_MODE_KEY, mode);
+  }
+
+  function commandItem(command: WorkCommandEvent) {
+    const fallbackTimestamp = overview.recent.commands?.find(
+      (item) => item.id === command.id,
+    )?.occurred_at ?? null;
+    return commandToToolCall(command, fallbackTimestamp);
+  }
+
   function deliverableItem(item: WorkDeliverable): AssistantDeliverableTimelineItem {
     return {
       id: `deliverable:${item.deliverable_id}`, kind: 'assistant_deliverable',
@@ -25,82 +80,33 @@
       source_refs: [], stable: true,
     };
   }
-  function displayPath(edit: Pick<FileDiffRef, 'path' | 'relative_path'>): string {
-    return edit.relative_path || edit.path;
-  }
-  function mergeFileEdit(edits: FileDiffRef[], incoming: FileDiffRef): void {
-    const path = displayPath(incoming);
-    if (!path) return;
-    const existingIndex = edits.findIndex((candidate) => {
-      if (incoming.path_id && candidate.path_id) return candidate.path_id === incoming.path_id;
-      return displayPath(candidate) === path || candidate.path === incoming.path;
-    });
-    if (existingIndex < 0) {
-      edits.push(incoming);
-      return;
-    }
-    const existing = edits[existingIndex]!;
-    edits[existingIndex] = {
-      ...incoming,
-      ...existing,
-      path_id: existing.path_id ?? incoming.path_id,
-      relative_path: existing.relative_path ?? incoming.relative_path,
-      root_label: existing.root_label ?? incoming.root_label,
-      root_name: existing.root_name ?? incoming.root_name,
-      root_id: existing.root_id ?? incoming.root_id,
-      additions: existing.additions ?? incoming.additions,
-      deletions: existing.deletions ?? incoming.deletions,
-      diff: existing.diff || incoming.diff,
-    };
-  }
-  function fileEdits(event: WorkMutationEvent): FileDiff[] {
-    const edits: FileDiffRef[] = [];
-    for (const diff of Array.isArray(event.file_diffs) ? event.file_diffs : []) {
-      mergeFileEdit(edits, diff);
-    }
-    for (const stat of Array.isArray(event.file_stats) ? event.file_stats : []) {
-      mergeFileEdit(edits, {
-        path: stat.relative_path || stat.path,
-        path_id: stat.path_id,
-        relative_path: stat.relative_path,
-        root_label: stat.root_label,
-        root_name: stat.root_name,
-        root_id: stat.root_id,
-        additions: stat.additions,
-        deletions: stat.deletions,
-        diff: '',
-        content_truncated: true,
-      });
-    }
-    for (const path of Array.isArray(event.paths) ? event.paths : []) {
-      mergeFileEdit(edits, { path, diff: '', content_truncated: true });
-    }
-    const visible = edits.slice(0, MAX_FILE_EDITS_PER_EVENT).map((edit) => ({
-      path: displayPath(edit),
-      diff: edit.diff,
-      additions: edit.additions,
-      deletions: edit.deletions,
-      content_truncated: edit.content_truncated,
-      truncated: edit.truncated,
-    }));
-    const total = Math.max(event.total_file_count ?? 0, edits.length);
-    const omitted = Math.max(event.omitted_file_count ?? 0, total - visible.length);
-    return omitted > 0
-      ? [...visible, { path: '', diff: '', omitted_count: omitted, truncated: true }]
-      : visible;
-  }
 </script>
 
 <div class="space-y-5" data-testid="recent-work-activity">
   {#if recentWork?.commands.length}
-    <section><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Commands</h3>
-      <div class="space-y-1">{#each recentWork.commands.slice(0, limit) as command (command.id)}<ToolCallBlock item={commandToToolCall(command)} {scope} density="compact" summaryMode="command" />{/each}</div>
+    <section>
+      <div class="mb-2 flex items-center justify-between gap-2">
+        <h3 class="text-xs font-semibold uppercase tracking-wide text-slate-400">Commands</h3>
+        <div class="inline-flex rounded-md border border-white/10 bg-slate-950/40 p-px" role="group" aria-label="Command label">
+          {#each ['command', 'description'] as mode}
+            <button
+              type="button"
+              class={`rounded px-1.5 py-0.5 text-[10px] leading-4 transition-colors ${commandLabelMode === mode ? 'bg-slate-700/80 text-white' : 'text-slate-500 hover:text-slate-300'}`}
+              aria-pressed={commandLabelMode === mode}
+              onclick={() => setCommandLabelMode(mode as 'command' | 'description')}
+            >
+              {mode === 'command' ? 'Command' : 'Description'}
+            </button>
+          {/each}
+        </div>
+      </div>
+      <div class="space-y-1">{#each recentWork.commands.slice(0, limit) as command (command.id)}<ToolCallBlock item={commandItem(command)} {scope} density="compact" summaryMode="command" compactLabelMode={commandLabelMode} />{/each}</div>
       <button type="button" class="mt-2 text-xs text-sky-300" onclick={() => onSeeAll?.('commands')}>See all commands</button>
     </section>
   {/if}
-  {#if recentWork?.files.length}
+  {#if recentFiles.length}
     <section><h3 class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-400">Files</h3>
-      <div class="space-y-2">{#each recentWork.files.slice(0, limit) as event (event.id)}{@const diffs = fileEdits(event)}{#if diffs.length}<FileDiffViewer {diffs} collapsedByDefault onExpand={() => onSeeAll?.('files')} />{/if}{/each}</div>
+      <div class="space-y-1">{#each recentFiles.slice(0, limit) as row (row.key)}<RecentFileEditRow event={row.event} file={row.file} {scope} {onOpenWork} />{/each}</div>
       <button type="button" class="mt-2 text-xs text-sky-300" onclick={() => onSeeAll?.('files')}>See all files</button>
     </section>
   {/if}

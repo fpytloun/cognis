@@ -6,6 +6,11 @@ import {
   executorRuntimeBadgeStatus,
   executorRuntimeLabel,
   executorRuntimeSummary,
+  executorCapabilityFreshness,
+  executorTypeChoices,
+  executorUnavailable,
+  executorToolSelectionGuard,
+  localExecutorTypesUnavailable,
   providerInferenceExecutors,
   providerSelectorCapabilityWarning,
   validateStdioCommand
@@ -17,6 +22,8 @@ function executor(overrides: Partial<ExecutorConfig> = {}): ExecutorConfig {
     executor_id: 'exec-1',
     name: 'Exec',
     executor_type: 'websocket',
+    available: true,
+    unavailable_reason: null,
     labels: {},
     enabled_tools: [],
     enabled_tool_groups: [],
@@ -43,6 +50,149 @@ function executor(overrides: Partial<ExecutorConfig> = {}): ExecutorConfig {
 }
 
 describe('executor helpers', () => {
+  const report = (overrides: Record<string, unknown> = {}) => ({
+    schema_version: 1 as const,
+    observed_at: '2026-07-13T10:00:00Z',
+    executor_version: '2.0.0',
+    image_variant: 'general' as const,
+    desired_tools: [],
+    observed_tools: [],
+    supported_tools: [],
+    supported_components: [],
+    components: {},
+    browser: { runtimes: {}, engines: {}, channels: {} },
+    officecli: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    mcp_launch: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    git: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    node: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    uv: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    lsp: { state: 'unknown' as const, reason_code: 'unknown', message: 'Unknown' },
+    ...overrides
+  });
+
+  it('uses advertised executor types for new executor choices', () => {
+    expect(executorTypeChoices({ available_executor_types: ['websocket'] }, true)).toEqual(['websocket']);
+    expect(executorTypeChoices({ available_executor_types: ['in_process', 'subprocess', 'websocket'] }, true)).toEqual([
+      'in_process',
+      'subprocess',
+      'websocket'
+    ]);
+    expect(localExecutorTypesUnavailable({ available_executor_types: ['websocket'] })).toBe(true);
+  });
+
+  it('retains legacy choices when the availability field is absent', () => {
+    expect(executorTypeChoices({}, true)).toEqual(['websocket', 'subprocess', 'in_process']);
+    expect(executorTypeChoices(undefined, true)).toEqual(['websocket', 'subprocess', 'in_process']);
+    expect(executorTypeChoices({ available_executor_types: ['websocket', 'in_process', 'subprocess'] }, false)).toEqual([
+      'websocket'
+    ]);
+    expect(localExecutorTypesUnavailable(undefined)).toBe(false);
+  });
+
+  it('identifies unavailable persisted local rows without affecting WebSocket rows', () => {
+    expect(executorUnavailable(executor({
+      executor_type: 'in_process',
+      available: false,
+      unavailable_reason: 'Install cognis-executor.'
+    }))).toBe(true);
+    expect(executorHealth(executor({
+      executor_type: 'in_process',
+      available: false,
+      unavailable_reason: 'Install cognis-executor.'
+    })).label).toBe('Unavailable');
+    expect(executorUnavailable(executor({ executor_type: 'websocket', available: true }))).toBe(false);
+    expect(executorRuntimeLabel(executor({ executor_type: 'websocket', available: true }))).toBe('connected');
+  });
+
+  it('soft-guards unavailable and installable new explicit tools only', () => {
+    const unavailable = executor({
+      observed_capabilities: report({
+        components: {
+          browser: { state: 'unavailable', reason_code: 'missing_dependency', message: 'Install a browser runtime.' }
+        }
+      })
+    });
+    const installable = executor({
+      observed_capabilities: report({
+        components: {
+          browser: { state: 'installable', reason_code: 'missing_dependency', message: 'Browser can be installed.' }
+        }
+      })
+    });
+
+    expect(executorToolSelectionGuard(unavailable, 'browse', 'browser')).toMatchObject({
+      blocked: true,
+      state: 'unavailable',
+      reason: 'Install a browser runtime.'
+    });
+    expect(executorToolSelectionGuard(installable, 'browse', 'browser').blocked).toBe(true);
+  });
+
+  it('keeps configured tools removable and unknown or portable selections available', () => {
+    const configured = executor({
+      enabled_tools: ['browse'],
+      enabled_tool_groups: ['browser'],
+      observed_capabilities: report({
+        components: {
+          browser: { state: 'unavailable', reason_code: 'missing_dependency', message: 'Not installed.' }
+        }
+      })
+    });
+    expect(executorToolSelectionGuard(configured, 'browse', 'browser')).toMatchObject({
+      blocked: false,
+      configured: true
+    });
+    expect(executorToolSelectionGuard(executor(), 'new_tool', 'browser').blocked).toBe(false);
+    expect(
+      executorToolSelectionGuard(
+        executor({ runtime_state: 'offline', observed_capabilities: report({
+          components: {
+            browser: { state: 'unavailable', reason_code: 'missing_dependency', message: 'Not installed.' }
+          }
+        }) }),
+        'new_tool',
+        'browser'
+      ).blocked
+    ).toBe(false);
+    expect(
+      executorToolSelectionGuard(
+        executor({
+          runtime_metadata: { legacy_metadata: true },
+          observed_capabilities: report({
+            components: {
+              browser: { state: 'unavailable', reason_code: 'missing_dependency', message: 'Not installed.' }
+            }
+          })
+        }),
+        'new_tool',
+        'browser'
+      ).blocked
+    ).toBe(false);
+    expect(executorToolSelectionGuard(configured, '*').portable).toBe(true);
+    expect(executorToolSelectionGuard(configured, 'other_tool', 'browser').portable).toBe(true);
+  });
+
+  it('does not treat supported definitions as active observations', () => {
+    const withSupport = executor({
+      observed_capabilities: report({
+        supported_tools: ['supported_only'],
+        observed_tools: ['active_tool']
+      })
+    });
+
+    expect(executorToolSelectionGuard(withSupport, 'supported_only', 'browser').blocked).toBe(false);
+    expect(withSupport.observed_capabilities?.observed_tools).not.toContain('supported_only');
+  });
+
+  it('classifies capability report freshness without making missing data unavailable', () => {
+    expect(executorCapabilityFreshness(undefined)).toMatchObject({ state: 'unknown', ageSeconds: null });
+    expect(executorCapabilityFreshness(report(), Date.parse('2026-07-13T10:00:30Z'), 60)).toMatchObject({
+      state: 'fresh',
+      ageSeconds: 30
+    });
+    expect(executorCapabilityFreshness(report(), Date.parse('2026-07-13T10:02:01Z'), 60).state).toBe('stale');
+  });
+
   it('excludes local-inference-disabled executors except an existing saved reference', () => {
     const enabled = executor({ executor_id: 'enabled' });
     const disabled = executor({ executor_id: 'disabled', local_inference_enabled: false });

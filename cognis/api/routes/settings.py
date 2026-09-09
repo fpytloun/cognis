@@ -55,13 +55,12 @@ from cognis.core.step_profiles import (
     STEP_PROFILE_CUSTOM_SETTING_KEY,
     STEP_PROFILE_OVERRIDES_SETTING_KEY,
     StepProfileDefinition,
-    StepProfileMode,
     serialize_step_profile_override,
 )
 from cognis.logging import get_logger
 from cognis.models.config import normalize_reasoning_level
 from cognis.models.executor_inference import executor_local_inference_configured
-from cognis.models.workflow import StepProfileConfig
+from cognis.models.workflow import StepProfileConfig, StepProfileMode
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.message_projection import VALID_MESSAGE_PROJECTION_POLICIES
 from cognis.runtime_settings import apply_runtime_setting
@@ -658,7 +657,7 @@ async def _persist_and_apply_setting(
                             updated_by=previous_updated_by,
                         )
                     )
-                    if result.rowcount == 1:  # type: ignore[attr-defined]
+                    if result.rowcount == 1:
                         await session.commit()
                         recovery_value = previous_value
                     else:
@@ -947,8 +946,12 @@ async def web_backend_update(
         api_key = (payload.api_key or "").strip()
     else:
         api_key = ""
+    if secrets_provider is None and secret_name is not None:
+        raise api_exception(503, "provider_unavailable", "Secrets provider is unavailable")
 
     async def _update() -> None:
+        if secret_name is not None:
+            assert secrets_provider is not None
         settings_committed = False
         secret_mutated = False
         try:
@@ -960,6 +963,7 @@ async def web_backend_update(
                 from cognis.store.queries import get_setting_value
 
                 if secret_name is not None:
+                    assert secrets_provider is not None
                     secret_configured = False
                     try:
                         await secrets_provider.get_secret(secret_name, SYSTEM_USER_EMAIL)
@@ -1029,6 +1033,7 @@ async def web_backend_update(
                 settings_committed = True
 
                 if secret_name is not None and payload.remove_configuration:
+                    assert secrets_provider is not None
                     await secrets_provider.delete_secret(
                         secret_name,
                         SYSTEM_USER_EMAIL,
@@ -1064,7 +1069,7 @@ def _provider_owner_for_create(user: Any, config: dict[str, Any]) -> str:
     scope = str(config.get("scope") or config.get("owner_scope") or "").strip().lower()
     if user.role == "admin" and scope in {"system", "shared"}:
         return SYSTEM_USER_EMAIL
-    return user.email
+    return str(user.email)
 
 
 def _provider_owner_for_update(

@@ -83,7 +83,7 @@ async def test_schedule_fire_bootstrap_matches_migration_and_is_idempotent(
     config = Config("cognis/store/migrations/alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite:///{migration_path}")
     with _preserve_logging_state():
-        command.upgrade(config, "120_schedule_fire_kinds")
+        command.upgrade(config, "head")
 
     assert _schema(bootstrap_path) == _schema(migration_path)
     schema = _schema(bootstrap_path)

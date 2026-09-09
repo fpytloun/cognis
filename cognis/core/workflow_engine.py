@@ -19,7 +19,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from prometheus_client import Counter, Histogram
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -43,6 +43,7 @@ from cognis.core.agent_loop import (
 from cognis.core.agent_profiles import resolve_agent_profile
 from cognis.core.chat_modes import ResolvedChatMode
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.executor_recovery import ExecutorRecoveryTimeout
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.gate_conditions import evaluate_gate_conditions_detailed
 from cognis.core.harness_guards import SameTurnToolCallLedger
@@ -60,7 +61,6 @@ from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.core.workflow_rendering import (
     MAX_CONTEXT_STRING_BYTES,
     MAX_DETERMINISTIC_JUMPS,
-    DeterministicOutputConfig,
     WorkflowRenderer,
     build_render_audit_record,
     normalize_deterministic_output,
@@ -75,6 +75,8 @@ from cognis.models.tool import ToolCall, ToolResult
 from cognis.models.workflow import (
     CompletionConfig,
     CompletionDeliveryPolicy,
+    DeterministicOutputConfig,
+    StepCompletionNotification,
     StepDefinition,
     StepEvaluation,
     StepOutput,
@@ -107,6 +109,7 @@ from cognis.store.queries import (
     get_latest_step_run_for_task_step,
     get_preferred_channel_account_for_agent,
     get_project,
+    get_step_run,
     list_pending_context_task_comments,
     list_project_sources,
     list_project_workflow_ids,
@@ -205,7 +208,6 @@ WORKFLOWS_TOTAL = Counter(
 
 DEFAULT_MAX_WORKFLOW_SECONDS = 14400.0
 TRANSIENT_EXECUTOR_BACKOFF_SECONDS = 5
-TRANSIENT_EXECUTOR_MAX_DEFERRALS = 12
 WORKFLOW_DURATION = Histogram(
     "cognis_workflow_duration_seconds",
     "Workflow duration",
@@ -319,6 +321,9 @@ class WorkflowEngine:
         is_retry: bool = False,
         user_message_already_recorded: bool = False,
         user_message_event_seq: int | None = None,
+        remember_evidence_event_hash: str | None = None,
+        user_origin: Any | None = None,
+        trusted_evidence_admission: Any | None = None,
         consume_boundary_batch: Callable[[str], Any] | None = None,
         wait_for_boundary_input: Callable[[int | None], Any] | None = None,
         get_boundary_action_generation: Callable[[], int] | None = None,
@@ -328,8 +333,10 @@ class WorkflowEngine:
         same_turn_tool_call_ledger: SameTurnToolCallLedger | None = None,
         execution_fence: Any | None = None,
         recovery_context: str | None = None,
-        on_absorbed_append_start: Callable[[str, str], Any] | None = None,
+        on_absorbed_append_start: Callable[[str, str, list[str]], Any] | None = None,
         on_absorbed_persisted: Callable[[str], Any] | None = None,
+        on_boundary_committed: Callable[[dict[str, Any]], Any] | None = None,
+        advance_boundary_phase: Callable[[], int] | None = None,
     ) -> StepOutput | None:
         """Run the hot-path direct workflow through a workflow-engine entrypoint.
 
@@ -387,6 +394,8 @@ class WorkflowEngine:
             user_email=session.user_email,
             access_context=access_context,
             conversation_id=conversation.conversation_id,
+            cancel_event=cancel_event,
+            execution_fence=execution_fence,
         )
 
         continuation_profile_id = None
@@ -413,6 +422,9 @@ class WorkflowEngine:
             is_retry=is_retry,
             user_message_already_recorded=user_message_already_recorded,
             remember_user_event_seq=user_message_event_seq,
+            remember_evidence_event_hash=remember_evidence_event_hash,
+            user_origin=user_origin,
+            trusted_evidence_admission=trusted_evidence_admission,
             user_message=user_message,
             intention_eligible=intention_eligible,
             user_message_metadata=user_message_metadata,
@@ -463,6 +475,8 @@ class WorkflowEngine:
             execution_fence=execution_fence,
             on_absorbed_append_start=on_absorbed_append_start,
             on_absorbed_persisted=on_absorbed_persisted,
+            on_boundary_committed=on_boundary_committed,
+            advance_boundary_phase=advance_boundary_phase,
         )
         ctx.workspace_root, ctx.working_directory = _resolve_execution_paths(
             workspace_root=ctx.workspace_root,
@@ -1108,7 +1122,7 @@ class WorkflowEngine:
             WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
         except StaleTaskExecutionOwner:
             raise
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Workflow execution failed",
                 extra={"extra_data": {"task_id": task.task_id}},
@@ -1116,6 +1130,9 @@ class WorkflowEngine:
             state.status = "failed"
             task.status = TaskStatus.FAILED
             task.completed_at = datetime.now(UTC)
+            if isinstance(exc, ExecutorRecoveryTimeout):
+                task.result_summary = str(exc)
+                task.result_data = dict(exc.detail)
             async with self._session_factory() as db_session:
                 await assert_task_execution_fence(db_session)
                 await fail_running_step_runs_for_task(
@@ -1247,7 +1264,13 @@ class WorkflowEngine:
             )
 
             renderer = WorkflowRenderer()
-            context = self._deterministic_render_context(task, state, workflow, step_def)
+            context = self._deterministic_render_context(
+                task,
+                state,
+                workflow,
+                step_def,
+                trigger_context=await self._task_trigger_context(task),
+            )
             if step_def.when is not None:
                 when_result = renderer.render_expression(step_def.when, context)
                 runtime_info["when"] = build_render_audit_record(
@@ -1315,7 +1338,12 @@ class WorkflowEngine:
                 context,
                 cancel_event=cancel_event,
             )
-        except (StaleTaskExecutionOwner, StepInterrupted, TransientExecutorUnavailable):
+        except (
+            StaleTaskExecutionOwner,
+            StepInterrupted,
+            TransientExecutorUnavailable,
+            ExecutorRecoveryTimeout,
+        ):
             raise
         except Exception as exc:
             logger.exception(
@@ -1562,10 +1590,10 @@ class WorkflowEngine:
         complete = step_def.complete
         notification = complete.notification
         if complete.delivery_mode_override == "silent" and notification is None:
-            notification = {
-                "mode": "silent",
-                "reason": renderer.render_text(complete.summary, context),
-            }
+            notification = StepCompletionNotification(
+                mode="silent",
+                reason=renderer.render_text(complete.summary, context),
+            )
         output = StepOutput(
             summary=renderer.render_text(complete.summary, context),
             content=renderer.render_text(complete.content, context) if complete.content else "",
@@ -1674,6 +1702,8 @@ class WorkflowEngine:
             access_context=access_context,
             conversation_id=conversation.conversation_id,
             task_id=task.task_id,
+            cancel_event=cancel_event,
+            execution_fence=current_task_execution_fence(),
         )
         try:
             registry = runtime.tool_registry
@@ -1705,6 +1735,7 @@ class WorkflowEngine:
                 intaris_session_id=session.intaris_session_id,
             )
 
+            trigger_context = await self._task_trigger_context(task)
             ctx = StepContext(
                 step_definition=step_def,
                 session=session,
@@ -1715,6 +1746,9 @@ class WorkflowEngine:
                 task_title=task.title,
                 task_description=task.description,
                 task_expected_output=task.expected_output,
+                task_source_type=task.source_type,
+                task_source_ref=task.source_ref,
+                task_trigger_context=trigger_context,
                 completion_delivery=task.completion_delivery,
                 step_run_id=step_run_id,
                 policy=WORKFLOW_POLICY,
@@ -2033,6 +2067,8 @@ class WorkflowEngine:
         state: WorkflowState,
         workflow: Workflow,
         step_def: StepDefinition,
+        *,
+        trigger_context: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         steps: dict[str, Any] = {}
         for name, raw in state.step_outputs.items():
@@ -2062,6 +2098,7 @@ class WorkflowEngine:
                 "source_type": task.source_type,
                 "source_ref": task.source_ref,
                 "attempt_number": task.attempt_number,
+                "trigger": trigger_context,
             },
             "workflow": {
                 "id": workflow.workflow_id,
@@ -2221,9 +2258,8 @@ class WorkflowEngine:
     ) -> bool:
         """Defer a task when its selected executor is temporarily unavailable.
 
-        Returns True when the task was requeued for a later run. Returns False
-        after the bounded deferral budget is exhausted; callers pause the task
-        as infrastructure-blocked instead of failing the workflow.
+        Returns True when the task was requeued for a later run. Production
+        runtimes normally await readiness before this compatibility path runs.
         """
 
         attempt_key = f"transient_executor_unavailable:{step_def.name}"
@@ -2233,42 +2269,11 @@ class WorkflowEngine:
         state.last_retry_reason = None
         state.last_evaluation_feedback = None
 
-        if deferrals > TRANSIENT_EXECUTOR_MAX_DEFERRALS:
-            message = (
-                "Workflow paused: selected executor is still unavailable after "
-                f"{TRANSIENT_EXECUTOR_MAX_DEFERRALS} deferrals. Last error: {exc}"
-            )
-            logger.warning(
-                "Pausing workflow because selected executor stayed unavailable",
-                extra={
-                    "extra_data": {
-                        "task_id": task.task_id,
-                        "step": step_def.name,
-                        "executor_id": exc.executor_id,
-                        "deferrals": deferrals,
-                    }
-                },
-            )
-            state.status = "paused"
-            state.current_step_status = "paused"
-            state.pending_pause_payload = {
-                "kind": "infrastructure_blocked",
-                "message": message,
-                "executor_id": exc.executor_id,
-                "step_name": step_def.name,
-                "deferrals": deferrals,
-            }
-            task.result_summary = message
-            return False
-
         retry_after_seconds = max(1, int(exc.retry_after_seconds or 0))
         scheduled_for = datetime.now(UTC) + timedelta(seconds=retry_after_seconds)
         task.status = TaskStatus.READY
         task.scheduled_for = scheduled_for
-        task.result_summary = (
-            "Workflow deferred: selected executor is not connected or not ready "
-            f"(retry {deferrals}/{TRANSIENT_EXECUTOR_MAX_DEFERRALS})."
-        )
+        task.result_summary = "Workflow is waiting for the selected executor to become ready."
         state.status = "running"
         state.pending_pause_type = None
         state.pending_pause_payload = None
@@ -2553,6 +2558,8 @@ class WorkflowEngine:
                     if conversation is not None
                     else None,
                     task_id=task.task_id,
+                    cancel_event=cancel_event,
+                    execution_fence=current_task_execution_fence(),
                 )
             runtime_workspace_root, runtime_working_directory = _resolve_task_execution_paths(
                 task,
@@ -2798,6 +2805,7 @@ class WorkflowEngine:
 
         # Build step context. Primary task steps can coordinate restricted,
         # task-owned workstreams; secondary reviewer steps cannot orchestrate.
+        trigger_context = await self._task_trigger_context(task)
         ctx = StepContext(
             step_definition=step_def,
             session=session,
@@ -2810,6 +2818,7 @@ class WorkflowEngine:
             task_expected_output=task.expected_output,
             task_source_type=task.source_type,
             task_source_ref=task.source_ref,
+            task_trigger_context=trigger_context,
             workflow_id=workflow.workflow_id,
             workflow_name=workflow.name,
             project_context=project_context,
@@ -3215,7 +3224,8 @@ class WorkflowEngine:
             if not isinstance(raw_event, dict):
                 continue
             event_type = str(raw_event.get("type") or "")
-            data = raw_event.get("data") if isinstance(raw_event.get("data"), dict) else {}
+            raw_data = raw_event.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
             seq = raw_event.get("seq")
             if event_type == "tool_call":
                 arguments = data.get("arguments")
@@ -3442,6 +3452,9 @@ class WorkflowEngine:
                     "context": gate_context,
                     "options": gate_options,
                     "question": gate.message,
+                    "expires_at": (
+                        datetime.now(UTC) + timedelta(seconds=max(1, gate.timeout_seconds))
+                    ).isoformat(),
                 },
             )
         elif self._pause_waiter.get(pause_id) is None:
@@ -3685,7 +3698,9 @@ class WorkflowEngine:
         """
         completion = self._resolve_completion(step_def, workflow)
         max_attempts = completion.max_attempts if completion else 3
-        reason = "evaluation_rejected" if evaluation else "execution_failed"
+        reason: Literal["execution_failed", "evaluation_rejected"] = (
+            "evaluation_rejected" if evaluation else "execution_failed"
+        )
 
         # Count attempts for this step
         attempt_key = f"attempts:{step_def.name}"
@@ -4097,11 +4112,8 @@ class WorkflowEngine:
                         artifact_store = getattr(self._agent_loop, "artifact_store", None)
                         if artifact_store is not None:
                             await hydrate_deliverable_payload(rejected_deliverable, artifact_store)
-                        latest_output = (
-                            dict(prior_run.output)
-                            if isinstance(getattr(prior_run, "output", None), dict)
-                            else {}
-                        )
+                        raw_output = getattr(prior_run, "output", None)
+                        latest_output = dict(raw_output) if isinstance(raw_output, dict) else {}
                         latest_output["deliverable_id"] = rejected_deliverable.deliverable_id
                         latest_output["deliverable_version"] = rejected_deliverable.version
                         latest_output["deliverable_format"] = rejected_deliverable.format
@@ -4398,7 +4410,7 @@ class WorkflowEngine:
                 user_email=task.created_by,
                 agent_id=task.agent_id,
             )
-            return direct_model.conversation_id
+            return str(direct_model.conversation_id)
         return None
 
     async def _deliver_task_result_direct(
@@ -4812,6 +4824,9 @@ class WorkflowEngine:
 
     async def _persist_task_final(self, task: TaskModel) -> None:
         """Persist final task state (completed/failed)."""
+        fence = current_task_execution_fence()
+        if fence is not None:
+            fence.mark_terminal(str(task.status))
         async with self._session_factory() as db_session:
             await assert_task_execution_fence(db_session)
             updated = await update_task_status(
@@ -4824,6 +4839,7 @@ class WorkflowEngine:
                 applied_completion_mode=task.applied_completion_mode,
                 applied_completion_reason=task.applied_completion_reason,
                 delivery_mode=task.delivery.mode,
+                expected_attempt=task.attempt_number,
             )
             if not updated:
                 await db_session.rollback()
@@ -4919,6 +4935,16 @@ class WorkflowEngine:
             return TaskStatus.FAILED
         return TaskStatus(str(row.status))
 
+    async def _task_trigger_context(self, task: TaskModel) -> dict[str, str] | None:
+        """Read immutable scheduler trigger metadata for a workflow task."""
+
+        if task.source_type != "scheduler":
+            return None
+        from cognis.store.schedule_fires import get_task_schedule_trigger_context
+
+        async with self._session_factory() as db_session:
+            return await get_task_schedule_trigger_context(db_session, task.task_id)
+
     async def _fork_source_events(
         self,
         source_name: str | None,
@@ -4992,6 +5018,8 @@ class WorkflowEngine:
         access_context: RuntimeAccessContext | None = None,
         conversation_id: str | None = None,
         task_id: str | None = None,
+        cancel_event: asyncio.Event | None = None,
+        execution_fence: Any | None = None,
     ) -> ResolvedStepRuntime:
         """Resolve the tool registry and executor connection for one step/turn."""
         if callable(self._step_runtime_factory):
@@ -5003,6 +5031,8 @@ class WorkflowEngine:
                     "access_context": access_context,
                     "conversation_id": conversation_id,
                     "task_id": task_id,
+                    "cancel_event": cancel_event,
+                    "execution_fence": execution_fence,
                 },
                 # Compat: factory without task_id
                 {
@@ -5783,10 +5813,23 @@ class WorkflowEngine:
             if isinstance(deliverable_id, str) and deliverable_id:
                 async with self._session_factory() as db_session:
                     row = await get_deliverable(db_session, deliverable_id)
-                if row is not None and row.status in {
-                    DeliverableStatus.APPROVED,
-                    DeliverableStatus.DELIVERED,
-                }:
+                    step_run = (
+                        await get_step_run(db_session, row.step_run_id)
+                        if row is not None and row.step_run_id is not None
+                        else None
+                    )
+                if (
+                    row is not None
+                    and step_run is not None
+                    and step_run.task_id == task.task_id
+                    and step_run.attempt_number == task.attempt_number
+                    and row.attempt_number == task.attempt_number
+                    and row.status
+                    in {
+                        DeliverableStatus.APPROVED,
+                        DeliverableStatus.DELIVERED,
+                    }
+                ):
                     artifact_store = getattr(self._agent_loop, "artifact_store", None)
                     if artifact_store is not None:
                         await hydrate_deliverable_payload(row, artifact_store)

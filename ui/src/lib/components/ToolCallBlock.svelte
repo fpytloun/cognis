@@ -1,5 +1,6 @@
 <script lang="ts">
   import Check from 'lucide-svelte/icons/check';
+  import Clock from 'lucide-svelte/icons/clock';
   import Copy from 'lucide-svelte/icons/copy';
   import { onMount } from 'svelte';
   import { isActiveToolStatus, type ToolCallTimelineItem } from '$lib/timeline-render-model';
@@ -9,6 +10,7 @@
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import ToolOutputDrawer from '$lib/components/ToolOutputDrawer.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import { visibleTodos as activeVisibleTodos } from '$lib/todos';
   import { addToast } from '$lib/stores/toasts';
   import { highlightJson, looksLikeJson, prettyPrintJson } from '$lib/syntax/json';
@@ -67,8 +69,8 @@
   let bashCollapseTimer: number | null = null;
   let bashAutoExpanded = false;
   let copyResetTimer: number | null = null;
-  let delegateDurationNowMs = $state(Date.now());
-  const nowDate = new Date();
+  let timingNowMs = $state(Date.now());
+  let nowDate = $state(new Date());
   const drawerItem = $derived(outputDrawerTarget ?? item);
 
   const LINES_PER_PAGE = 50;
@@ -102,10 +104,15 @@
   });
 
   $effect(() => {
-    if (!(delegationRunning || managedConversationRunning())) return;
-    delegateDurationNowMs = Date.now();
+    if (!(isActiveToolStatus(item.status) || delegationRunning || managedConversationRunning())) return;
+    const updateNow = () => {
+      const now = Date.now();
+      timingNowMs = now;
+      nowDate = new Date(now);
+    };
+    updateNow();
     const timer = window.setInterval(() => {
-      delegateDurationNowMs = Date.now();
+      updateNow();
     }, 1000);
     return () => window.clearInterval(timer);
   });
@@ -417,7 +424,7 @@
     if (typeof item.durationMs === 'number' && isDelegationTerminal()) return item.durationMs;
     const start = parseTimeMs(delegation?.startedAt ?? item.timestamp);
     if (start == null) return null;
-    const end = delegationRunning ? delegateDurationNowMs : parseTimeMs(item.timestamp) ?? Date.now();
+    const end = delegationRunning ? timingNowMs : parseTimeMs(item.timestamp) ?? Date.now();
     return Math.max(0, end - start);
   }
 
@@ -618,20 +625,49 @@
     return toolCallSubtitle(item);
   }
 
+  function isWaitingToolStatus(): boolean {
+    return item.status === 'waiting';
+  }
+
   function statusIcon(): string {
     if (item.status === 'completed') return '\u2713';
     if (item.status === 'failed') return '\u2717';
+    // `denied` is a terminal rejected outcome (declined escalation
+    // approval), distinct from a `failed` execution error — use a
+    // different glyph so the two are not visually conflated.
+    if (item.status === 'denied') return '\u2298';
     return '';
   }
 
   function statusColor(): string {
     if (item.status === 'completed') return 'text-emerald-400';
     if (item.status === 'failed') return 'text-rose-400';
+    if (item.status === 'denied') return 'text-amber-400';
+    if (isWaitingToolStatus()) return 'text-amber-300';
     return 'text-sky-400';
   }
 
+  function executionStatusLabel(): 'Running' | 'Waiting' | 'Success' | 'Failure' | 'Denied' {
+    if (item.status === 'denied') return 'Denied';
+    if (isWaitingToolStatus()) return 'Waiting';
+    if (isActiveToolStatus(item.status)) return 'Running';
+    return item.isError || item.status === 'failed' ? 'Failure' : 'Success';
+  }
+
+  function executionStatusColor(): string {
+    const status = executionStatusLabel();
+    if (status === 'Failure') return 'text-rose-300';
+    if (status === 'Denied') return 'text-amber-300';
+    if (status === 'Waiting') return 'text-amber-300';
+    if (status === 'Success') return 'text-emerald-300';
+    return 'text-sky-300';
+  }
+
   function durationText(): string {
-    return formatDurationMs(item.durationMs);
+    if (item.durationMs != null) return formatDurationMs(item.durationMs);
+    if (!isActiveToolStatus(item.status)) return '';
+    const startedAt = parseTimeMs(item.timestamp);
+    return startedAt == null ? '' : formatDurationMs(Math.max(0, timingNowMs - startedAt));
   }
 
   function isPreparingPatch(): boolean {
@@ -967,15 +1003,21 @@
       </span>
     {/if}
     <span class={`flex shrink-0 items-center gap-1.5 self-start text-xs font-medium ${statusColor()} sm:self-auto`}>
-      {#if isActiveToolStatus(item.status)}
+      {#if isWaitingToolStatus()}
+        <!-- Blocked on a pending approval decision: distinct from the
+             generic running spinner so it reads as "waiting for a human",
+             not "in progress". -->
+        <Clock class="h-3.5 w-3.5" aria-hidden="true" />
+        <span>Waiting for approval</span>
+      {:else if isActiveToolStatus(item.status)}
         <LiveDots inline={true} size="sm" tone="sky" />
         <span class="sr-only">{isPreparingPatch() ? 'Preparing' : 'Running'}</span>
       {:else}
         <span>{statusIcon()}</span>
         {#if density === 'compact'}
-          <span class="sr-only">{item.status}</span>
+          <span class="sr-only">{item.status === 'denied' ? 'Denied' : item.status}</span>
         {:else}
-          <span>{item.status}</span>
+          <span>{item.status === 'denied' ? 'Denied' : item.status}</span>
         {/if}
       {/if}
       {#if isDelegateTool() && delegationDurationText()}
@@ -1008,7 +1050,7 @@
       {/if}
       {#if item.timestamp}
         <div class="flex items-center justify-between gap-3 text-[11px] text-slate-500">
-          <span>Executed</span>
+          <span class={executionStatusColor()} data-testid="tool-execution-status">{executionStatusLabel()}</span>
           <span title={formatAbsoluteTime(item.timestamp)}>{formatCompactTime(item.timestamp, nowDate)}</span>
         </div>
       {/if}
@@ -2221,7 +2263,10 @@
                     <div class="min-w-0 flex-1">
                       <p class="text-sm leading-5 text-slate-100">{todo.content}</p>
                     </div>
-                    <span class={`h-fit rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${todoStatusClass(todo.status)}`}>{todo.status}</span>
+                    <span class={`inline-flex h-fit items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider ${todoStatusClass(todo.status)}`}>
+                      <TodoStatusDot status={todo.status} class="h-1.5 w-1.5" labelled={false} />
+                      {todo.status}
+                    </span>
                   </li>
                 {/each}
               </ul>
@@ -2302,8 +2347,6 @@
                 <span class="command-scroll min-w-0 flex-1 overflow-x-auto whitespace-nowrap font-medium text-slate-300" data-testid="tool-terminal-description-scroll">{terminalTitle()}</span>
                 {#if isActiveToolStatus(item.status)}
                   <LiveDots inline={true} size="sm" tone="emerald" />
-                {:else}
-                  <span>{item.status}</span>
                 {/if}
               </div>
               <pre bind:this={terminalEl} onscroll={onTerminalScroll} onpointerdown={pinTerminal} class={`max-h-[50vh] overflow-auto p-3 pr-10 font-mono text-xs leading-5 ${item.isError ? 'text-rose-200' : 'text-emerald-100'}`}><span class="text-sky-300">{terminalPrompt()}</span>{#if outputText}

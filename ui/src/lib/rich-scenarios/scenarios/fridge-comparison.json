@@ -1,0 +1,148 @@
+{
+  "schema_version": 1,
+  "id": "fridge-comparison",
+  "title": "Fridge shortlist: fit first, then cost and quiet",
+  "description": "A synthetic but realistic appliance comparison that makes kitchen constraints and rejected models explicit.",
+  "group": "comparison",
+  "sort_key": 1610,
+  "content": "Synthetic refrigerator comparison with kitchen constraints, fit gates, installed costs, recommendation, alternative, and provenance.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Kitchen purchase decision · synthetic data",
+      "subtitle": "Shortlist refreshed 2026-09-05 10:30 CEST · prices and models are illustrative only",
+      "toc": false,
+      "badges": ["Fit gate", "Installed cost", "Synthetic fixture"]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Decision ready",
+        "title": "Buy the quiet model that actually clears the cabinet",
+        "subtitle": "Nordhaven 430 is the best fit. Harbor 390 keeps the essential capacity at a lower installed cost.",
+        "media": {
+          "artifact_id": "fixture-kitchen-opening",
+          "src": "/fixtures/rich-scenarios/fridge-comparison/kitchen-opening.svg",
+          "alt": "Illustrated kitchen opening with width, height, and depth measurements for a refrigerator",
+          "credit": "Cognis local fixture · original SVG measurement illustration",
+          "source_url": "https://example.test/fixtures/kitchen-opening",
+          "width": 1600,
+          "height": 900
+        }
+      },
+      {
+        "type": "section",
+        "title": "Kitchen constraints are the first filter",
+        "blocks": [
+          {
+            "type": "grid",
+            "layout": "equal",
+            "blocks": [
+              {"type": "metric", "label": "Opening width", "value": "610 mm", "delta": "Minimum 8 mm side clearance"},
+              {"type": "metric", "label": "Opening height", "value": "1,900 mm", "delta": "Maximum appliance height 1,860 mm"},
+              {"type": "metric", "label": "Depth limit", "value": "660 mm", "delta": "Door must clear the island"},
+              {"type": "metric", "label": "Need", "value": "≥ 350 L", "delta": "No louder than 40 dB"}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Shortlist: visual, name, and decision stay together",
+        "blocks": [
+          {
+            "type": "card_grid",
+            "blocks": [
+              {
+                "type": "card",
+                "variant": "visual",
+                "tone": "success",
+                "eyebrow": "Recommended · passes every gate",
+                "title": "Nordhaven 430 Graphite",
+                "summary": "430 L · 59.5 × 185 × 64 cm · 38 dB · energy class B",
+                "content": "The quietest qualifying model with enough capacity and a clean door-clearance margin. Installed cost: **31,780 Kč**.",
+                "media": {
+                  "artifact_id": "fixture-nordhaven-430",
+                  "src": "/fixtures/rich-scenarios/fridge-comparison/nordhaven-430.svg",
+                  "alt": "Illustration of the graphite Nordhaven 430 refrigerator with two doors and a B energy label",
+                  "credit": "Cognis local fixture · original SVG product illustration",
+                  "source_url": "https://example.test/fixtures/nordhaven-430",
+                  "width": 800,
+                  "height": 900
+                }
+              },
+              {
+                "type": "card",
+                "variant": "visual",
+                "tone": "default",
+                "eyebrow": "Cheaper alternative · passes every gate",
+                "title": "Harbor 390 Cream",
+                "summary": "390 L · 59.5 × 186 × 65 cm · 39 dB · energy class C",
+                "content": "Saves **4,700 Kč** installed. It gives up 40 L and uses more electricity, but still meets the hard constraints.",
+                "media": {
+                  "artifact_id": "fixture-harbor-390",
+                  "src": "/fixtures/rich-scenarios/fridge-comparison/harbor-390.svg",
+                  "alt": "Illustration of the cream Harbor 390 refrigerator with a lower freezer door and a C energy label",
+                  "credit": "Cognis local fixture · original SVG product illustration",
+                  "source_url": "https://example.test/fixtures/harbor-390",
+                  "width": 800,
+                  "height": 900
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Fit gate: rejected models stay visible",
+        "blocks": [
+          {
+            "type": "table",
+            "title": "Physical fit and rejection reasons",
+            "columns": [{"key": "model", "label": "Model"}, {"key": "fit", "label": "Fit gate"}, {"key": "reason", "label": "Reason"}],
+            "rows": [
+              {"model": "Nordhaven 430 Graphite", "fit": {"type": "badge", "value": "PASS", "tone": "positive"}, "reason": "595 mm wide, 1,850 mm tall, 640 mm deep"},
+              {"model": "Harbor 390 Cream", "fit": {"type": "badge", "value": "PASS", "tone": "positive"}, "reason": "595 mm wide, 1,860 mm tall, 650 mm deep"},
+              {"model": "Polar Arc 510 Steel", "fit": {"type": "badge", "value": "FAIL", "tone": "critical"}, "reason": "680 mm deep; door conflicts with the island"},
+              {"model": "Vela Compact 340", "fit": {"type": "badge", "value": "FAIL", "tone": "critical"}, "reason": "340 L capacity; below the 350 L minimum"}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "comparison_matrix",
+        "title": "Decision comparison",
+        "columns": [{"key": "criterion", "label": "Criterion"}, {"key": "nordhaven", "label": "Nordhaven 430"}, {"key": "harbor", "label": "Harbor 390"}],
+        "rows": [
+          {"criterion": "Dimensions (W × H × D)", "nordhaven": "59.5 × 185 × 64 cm", "harbor": "59.5 × 186 × 65 cm"},
+          {"criterion": "Total capacity", "nordhaven": "430 L", "harbor": "390 L"},
+          {"criterion": "Annual energy", "nordhaven": "171 kWh", "harbor": "208 kWh"},
+          {"criterion": "Noise", "nordhaven": "38 dB", "harbor": "39 dB"},
+          {"criterion": "Warranty", "nordhaven": "5 years", "harbor": "3 years"},
+          {"criterion": "Installed cost", "nordhaven": "31,780 Kč", "harbor": "27,080 Kč"}
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {"type": "card", "variant": "recommendation", "tone": "success", "eyebrow": "Recommendation", "title": "Nordhaven 430 Graphite", "summary": "Pay the premium for quieter operation, extra capacity, lower energy use, and two more warranty years.", "content": "Order only after the installer confirms the measured 640 mm depth clearance."},
+          {"type": "card", "variant": "status", "eyebrow": "Value choice", "title": "Harbor 390 Cream", "summary": "Choose this model when the 4,700 Kč saving matters more than capacity and energy class.", "content": "It is a valid fit, not a compromise on the hard constraints."}
+        ]
+      },
+      {"type": "callout", "title": "Before ordering", "content": "Measure the deepest hinge point and the door swing again. The fixture recommendation assumes 8 mm side clearance and 20 mm rear ventilation."},
+      {"type": "source_list", "title": "Synthetic sources and provenance", "numbered": true}
+    ],
+    "sources": [
+      {"id": "catalog", "number": 1, "title": "Synthetic appliance catalog snapshot", "url": "https://example.test/fixtures/fridge-catalog", "publisher": "Cognis synthetic fixture", "date": "2026-09-05T10:30:00+02:00"},
+      {"id": "measurements", "number": 2, "title": "Synthetic kitchen measurement sheet", "url": "https://example.test/fixtures/kitchen-measurements", "publisher": "Cognis synthetic fixture", "date": "2026-09-05T10:15:00+02:00"},
+      {"id": "installation", "number": 3, "title": "Synthetic installation estimate", "url": "https://example.test/fixtures/fridge-installation", "publisher": "Cognis synthetic fixture", "date": "2026-09-05T10:20:00+02:00"}
+    ],
+    "assets": [
+      {"id": "kitchen-opening", "path": "/fixtures/rich-scenarios/fridge-comparison/kitchen-opening.svg", "alt": "Illustrated kitchen opening with refrigerator measurements", "attribution": "Cognis local fixture · original SVG measurement illustration"},
+      {"id": "nordhaven-430", "path": "/fixtures/rich-scenarios/fridge-comparison/nordhaven-430.svg", "alt": "Illustration of the graphite Nordhaven 430 refrigerator", "attribution": "Cognis local fixture · original SVG product illustration"},
+      {"id": "harbor-390", "path": "/fixtures/rich-scenarios/fridge-comparison/harbor-390.svg", "alt": "Illustration of the cream Harbor 390 refrigerator", "attribution": "Cognis local fixture · original SVG product illustration"}
+    ],
+    "datasets": [],
+    "exports": []
+  }
+}

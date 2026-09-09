@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import markdown  # type: ignore[import-untyped]
 from bs4 import BeautifulSoup, Comment
+from bs4.element import PageElement
 
 from cognis.rendering.rich_visuals import (
     MediaResolver,
@@ -32,7 +33,7 @@ from cognis.rendering.rich_visuals import (
 )
 from cognis.ui_assets import resolve_standalone_manifest, standalone_asset_url
 
-RENDERER_VERSION = "standalone-deliverable-v11"
+RENDERER_VERSION = "standalone-deliverable-v12"
 HTML_CACHE_FILENAME = "render.html"
 PDF_CACHE_FILENAME = "render.pdf"
 PDF_INPUT_MAX_BYTES = 20 * 1024 * 1024
@@ -74,6 +75,7 @@ _ALLOWED_TAGS = {
     "ol",
     "p",
     "pre",
+    "progress",
     "q",
     "s",
     "section",
@@ -100,6 +102,7 @@ _ALLOWED_ATTRS = {
     "th": {"colspan", "rowspan"},
     "td": {"colspan", "rowspan"},
     "svg": {"viewbox", "role", "aria-label"},
+    "progress": {"value", "max", "aria-label"},
     "*": {"class"},
 }
 _ALLOWED_HREF_PROTOCOLS = ("http://", "https://", "mailto:", "#")
@@ -228,7 +231,7 @@ class PublicationContext:
     ) -> None:
         metadata = payload.get("metadata")
         self.metadata = metadata if isinstance(metadata, dict) else {}
-        self.presentation = "pulse" if self.metadata.get("presentation") == "pulse" else "default"
+        self.presentation = _class_token(self.metadata.get("presentation"), fallback="default")
         self.blocks = _object_list(payload.get("blocks"))
         self.assets = _object_list(payload.get("assets"))
         self.media_resolver = media_resolver
@@ -441,12 +444,10 @@ def render_standalone_html(
 
     title = str(getattr(row, "title", None) or "Deliverable")
     rich_payload = getattr(row, "rich_payload", None)
-    metadata = (
-        rich_payload.get("metadata")
-        if isinstance(rich_payload, dict) and isinstance(rich_payload.get("metadata"), dict)
-        else {}
-    )
-    presentation = "pulse" if metadata.get("presentation") == "pulse" else "default"
+    metadata_value = rich_payload.get("metadata") if isinstance(rich_payload, dict) else None
+    metadata: dict[str, Any] = metadata_value if isinstance(metadata_value, dict) else {}
+    presentation = _class_token(metadata.get("presentation"), fallback="default")
+    canvas = _class_token(metadata.get("canvas"), fallback="standard")
     raw_blocks = rich_payload.get("blocks") if isinstance(rich_payload, dict) else None
     density_blocks: list[dict[str, Any]] = (
         [block for block in raw_blocks if isinstance(block, dict)]
@@ -495,7 +496,7 @@ def render_standalone_html(
   <script data-cognis-runtime="theme-bootstrap">{_STANDALONE_THEME_BOOTSTRAP}</script>
   <style>{stylesheet}</style>
 </head>
-<body class="presentation-{presentation}" data-rich-density="{density}">
+<body class="presentation-{presentation}" data-rich-density="{density}" data-rich-canvas="{canvas}">
   <main class="page">
     <article class="document">
       <header class="document-header">
@@ -629,6 +630,10 @@ def _render_pdf_sync(html_document: str) -> bytes:
     from weasyprint import HTML  # type: ignore[import-untyped]
     from weasyprint.text.fonts import FontConfiguration  # type: ignore[import-untyped]
 
+    # The standalone fallback embeds the full font for offline browsers. PDF
+    # already resolves these exact bytes locally; avoid parsing 14 MB of CSS URL.
+    if "data:font/ttf;base64," in html_document:
+        html_document = html_document.replace(_emoji_font_data_url(), "cognis-asset:emoji-font")
     font_config = FontConfiguration()
     return cast(
         bytes,
@@ -697,10 +702,10 @@ def _document_density(metadata: object, blocks: list[dict[str, Any]]) -> str:
     (the default, more generous rhythm)."""
     meta = metadata if isinstance(metadata, dict) else {}
     explicit = meta.get("density")
-    if explicit == "dense":
-        return "dense"
-    if explicit == "airy":
-        return "airy"
+    if explicit in {"compact", "dense"}:
+        return "compact"
+    if explicit in {"comfortable", "airy"}:
+        return "comfortable"
     total = 0
     signals = 0
 
@@ -728,8 +733,8 @@ def _document_density(metadata: object, blocks: list[dict[str, Any]]) -> str:
         if isinstance(block, dict):
             visit(block)
     if total == 0:
-        return "airy"
-    return "dense" if signals >= 3 and signals / total >= 0.35 else "airy"
+        return "comfortable"
+    return "compact" if signals >= 3 and signals / total >= 0.35 else "comfortable"
 
 
 def _render_document(
@@ -823,6 +828,19 @@ def _render_block(
     sources: list[dict[str, Any]] | None = None,
     context: PublicationContext | None = None,
 ) -> str:
+    rendered = _render_block_content(block, sources=sources, context=context)
+    attributes = _block_presentation_attributes(block)
+    if not attributes:
+        return rendered
+    return f'<div class="block-presentation"{attributes}>{rendered}</div>'
+
+
+def _render_block_content(
+    block: dict[str, Any],
+    *,
+    sources: list[dict[str, Any]] | None = None,
+    context: PublicationContext | None = None,
+) -> str:
     available_sources = sources or []
     block_type = str(block.get("type") or "section")
     title = _block_title(block)
@@ -837,6 +855,16 @@ def _render_block(
         else:
             markdown_html = _markdown_to_html(content)
         return f'<section class="block block-{html.escape(block_type)}">{heading}{markdown_html}{child_html}</section>'
+    if block_type == "section_header":
+        subtitle = _text(block, "subtitle")
+        status = _scalar_text(block.get("status"))
+        tone = _class_token(block.get("tone"), fallback="neutral")
+        return (
+            f'<header class="block block-section-header tone-{tone}">'
+            f'{_eyebrow(block)}{heading}<p class="subtitle">{html.escape(subtitle)}</p>'
+            f"{f'<p class="status-value">Status: {html.escape(status)}</p>' if status else ''}"
+            "</header>"
+        )
     if block_type == "research_answer":
         return _render_research_answer(
             block, sources=available_sources, child_html=child_html, context=context
@@ -910,11 +938,12 @@ def _render_block(
         description_html = (
             f'<p class="metric-description">{html.escape(description)}</p>' if description else ""
         )
+        progress_html = _render_progress(block.get("progress"), class_name="metric-progress")
         return (
             '<section class="block block-metric">'
             f'<p class="metric-label">{html.escape(label)}</p>'
             f'<p class="metric-value">{html.escape(value)}{unit_html}</p>'
-            f"{delta_html}{description_html}{child_html}</section>"
+            f"{delta_html}{progress_html}{description_html}{child_html}</section>"
         )
     if block_type == "quote":
         byline = _text(block, "byline") or _text(block, "author")
@@ -1069,6 +1098,40 @@ def _class_token(value: object, *, fallback: str) -> str:
     return token or fallback
 
 
+def _block_presentation_attributes(block: dict[str, Any]) -> str:
+    attributes: list[str] = []
+    if surface := _text(block, "surface"):
+        attributes.append(f'data-surface="{html.escape(surface, quote=True)}"')
+    span = block.get("span")
+    if isinstance(span, int) and not isinstance(span, bool):
+        attributes.append(f'data-span="{span}"')
+    if layout := _text(block, "layout"):
+        attributes.append(f'data-layout="{html.escape(layout, quote=True)}"')
+    return (" " + " ".join(attributes)) if attributes else ""
+
+
+def _render_progress(value: object, *, class_name: str) -> str:
+    if not isinstance(value, dict):
+        return ""
+    current = value.get("value")
+    maximum = value.get("max")
+    if (
+        not isinstance(current, (int, float))
+        or isinstance(current, bool)
+        or not isinstance(maximum, (int, float))
+        or isinstance(maximum, bool)
+        or maximum <= 0
+    ):
+        return ""
+    label = _text(value, "label") or "Progress"
+    text = f"{label}: {_scalar_text(current)} of {_scalar_text(maximum)}"
+    return (
+        f'<div class="{class_name}"><span>{html.escape(text)}</span>'
+        f'<progress value="{current}" max="{maximum}" aria-label="{html.escape(text, quote=True)}">'
+        f"{html.escape(text)}</progress></div>"
+    )
+
+
 def _explicit_columns(block: dict[str, Any]) -> int:
     """Return an author-specified column count (1-4), or 0 for auto-fit.
 
@@ -1099,7 +1162,16 @@ def _explicit_columns_style(block: dict[str, Any]) -> str:
     effect in both the static/web HTML and the PDF export.
     """
 
+    layout = block.get("layout")
+    if layout in {"split-2-1", "split-1-2"}:
+        return ""
     columns = _explicit_columns(block)
+    if layout == "equal" and not columns:
+        for key in ("blocks", "items", "cards"):
+            children = block.get(key)
+            if isinstance(children, list) and children:
+                columns = max(1, min(4, len(children)))
+                break
     if not columns:
         return ""
     return f' style="grid-template-columns: repeat({columns}, minmax(0, 1fr))"'
@@ -1579,7 +1651,7 @@ def _substitute_emoji(fragment: str) -> str:
         spans = _emoji_spans(source)
         if not spans:
             continue
-        parts: list[object] = []
+        parts: list[PageElement | str] = []
         cursor = 0
         for start, end, text_presentation in spans:
             if start > cursor:
@@ -2046,14 +2118,12 @@ def _render_badges(values: object) -> str:
 
 
 def _render_dashboard_items(block: dict[str, Any]) -> str:
-    values = next(
-        (
-            block.get(key)
-            for key in ("metrics", "items", "cards", "data")
-            if isinstance(block.get(key), list)
-        ),
-        [],
-    )
+    values: list[Any] = []
+    for key in ("metrics", "items", "cards", "data"):
+        candidate_values = block.get(key)
+        if isinstance(candidate_values, list):
+            values = candidate_values
+            break
     cards = []
     for index, value in enumerate(values, start=1):
         if not isinstance(value, dict):
@@ -2121,11 +2191,11 @@ def _resolve_sources(
     if source_values is None:
         return []
     by_id: dict[str, dict[str, Any]] = {}
-    for source in available_sources:
+    for available_source in available_sources:
         for key in ("id", "key", "citation_id", "title", "name", "url", "href"):
-            value = source.get(key)
+            value = available_source.get(key)
             if value is not None:
-                by_id[str(value).strip()] = source
+                by_id[str(value).strip()] = available_source
     resolved: list[dict[str, Any]] = []
     seen: set[str] = set()
     for value in values:
@@ -2302,7 +2372,7 @@ def _render_table(block: dict[str, Any], *, number: int | None = None) -> str:
             cells = row
         else:
             cells = [row]
-        body_rows.append("".join(f"<td>{html.escape(str(cell))}</td>" for cell in cells))
+        body_rows.append("".join(_render_table_cell(cell) for cell in cells))
     caption = _text(block, "caption") or _text(block, "description")
     label = f"Table {number}. " if number is not None else ""
     caption_html = (
@@ -2311,6 +2381,32 @@ def _render_table(block: dict[str, Any], *, number: int | None = None) -> str:
         else ""
     )
     return f"<table>{caption_html}<thead><tr>{head}</tr></thead><tbody>{''.join(f'<tr>{row}</tr>' for row in body_rows)}</tbody></table>"
+
+
+def _render_table_cell(cell: object) -> str:
+    if not isinstance(cell, dict) or "type" not in cell:
+        return f"<td>{html.escape(_scalar_text(cell))}</td>"
+    cell_type = _class_token(cell.get("type"), fallback="text")
+    tone = _class_token(cell.get("tone"), fallback="neutral")
+    emphasis = _class_token(cell.get("emphasis"), fallback="normal")
+    align = _class_token(cell.get("align"), fallback="start")
+    value = cell.get("value")
+    label = _text(cell, "label")
+    canonical = _scalar_text(value)
+    text = label or canonical
+    if cell_type == "code":
+        content = f"<code>{html.escape(_scalar_text(value))}</code>"
+    elif cell_type == "badge":
+        semantic = f"{text} ({tone})" if tone != "neutral" else text
+        content = f'<span class="table-badge tone-{tone}">{html.escape(semantic)}</span>'
+    elif cell_type == "progress":
+        content = _render_progress(
+            {"value": value, "max": cell.get("max"), **({"label": label} if label else {})},
+            class_name="table-progress",
+        )
+    else:
+        content = html.escape(text)
+    return f'<td class="cell-{cell_type} emphasis-{emphasis}" data-align="{align}">{content}</td>'
 
 
 def _render_matrix(
@@ -2942,7 +3038,7 @@ _CSS = """
   --rich-density-block-gap: 1.65rem;
   --rich-density-page-pad: clamp(1.25rem, 3vw, 2.25rem);
 }
-body[data-rich-density="dense"] {
+body[data-rich-density="dense"], body[data-rich-density="compact"] {
   --rich-density-block-gap: 1.15rem;
   --rich-density-page-pad: clamp(1rem, 2.4vw, 1.7rem);
 }
@@ -2964,6 +3060,7 @@ body[data-rich-density="dense"] {
 html, body { max-width: 100%; }
 body { margin: 0; background: var(--page-bg); color: var(--text); overflow-wrap: anywhere; transition: background-color .18s ease, color .18s ease; }
 .page { width: min(calc(100% - 2rem), 72rem); margin: 0 auto; padding: 1.25rem 0 4rem; }
+body[data-rich-canvas="wide"] .page { width: min(calc(100% - 2rem), 92rem); }
 .document-header { display: flex; gap: 1.5rem; align-items: flex-start; justify-content: space-between; margin: 0 0 1.5rem; padding: 0 0 1.1rem; border-bottom: 1px solid var(--strong-line); }
 .document-header > div { min-width: 0; }
 .document-header nav { display: flex; flex: none; gap: .5rem; }
@@ -2996,6 +3093,14 @@ h1 { max-width: 48rem; margin: 0; font-family: inherit; font-size: var(--rich-fs
 .document-toc a:hover, .document-toc a.active { background: var(--soft); color: var(--accent); }
 .document-toc a::after { content: leader(".") target-counter(attr(href), page); color: var(--subtle); }
 .block { margin: 0 0 var(--rich-density-block-gap); }
+.block[data-surface="subtle"], .block-presentation[data-surface="subtle"] { background: var(--soft); padding: var(--rich-space-3); }
+.block[data-surface="outlined"], .block-presentation[data-surface="outlined"] { border: 1px solid var(--line); border-radius: var(--rich-radius-sm); padding: var(--rich-space-3); }
+.block[data-surface="raised"], .block-presentation[data-surface="raised"] { background: var(--surface-raised); border-radius: var(--rich-radius-sm); padding: var(--rich-space-3); box-shadow: 0 8px 24px var(--shadow); }
+.block[data-surface="accent"], .block-presentation[data-surface="accent"] { border-left: .25rem solid var(--accent); background: var(--surface-accent); padding: var(--rich-space-3); }
+[data-span="2"] { grid-column: span 2; }
+[data-span="3"] { grid-column: span 3; }
+[data-span="4"] { grid-column: span 4; }
+.block-section-header { border-bottom: 1px solid var(--line); padding-bottom: var(--rich-space-3); }
 .block > h2 { margin: 0 0 .7rem; font-family: inherit; font-size: var(--rich-fs-2xl); line-height: var(--rich-lh-snug); }
 .block-callout, .block-status { border-left: .25rem solid var(--decorative); background: var(--soft); padding: var(--rich-space-3) var(--rich-space-4); }
 .block-card { position: relative; padding: .35rem 0 .8rem; }
@@ -3032,6 +3137,13 @@ h1 { max-width: 48rem; margin: 0; font-family: inherit; font-size: var(--rich-fs
 .metric-value { margin: .18rem 0; font-size: 1.8rem; font-weight: var(--rich-fw-bold); letter-spacing: var(--rich-ls-tighter); }
 .metric-unit, .dashboard-value span { margin-left: .25rem; font-size: .48em; font-weight: var(--rich-fw-semibold); letter-spacing: 0; }
 .metric-description { max-width: 22rem; margin: .45rem 0 0; color: var(--muted); font-size: var(--rich-fs-sm); }
+.metric-progress, .table-progress { display: grid; gap: .25rem; color: var(--subtle); font-size: var(--rich-fs-xs); }
+.metric-progress progress, .table-progress progress { width: 100%; accent-color: var(--accent); }
+.table-badge { display: inline-block; border: 1px solid var(--badge-line); border-radius: var(--rich-radius-pill); padding: .1rem .45rem; }
+td[data-align="center"] { text-align: center; }
+td[data-align="end"] { text-align: right; }
+td.emphasis-strong { font-weight: var(--rich-fw-bold); }
+td.emphasis-muted { color: var(--muted); }
 .status-value { display: inline-block; margin: 0 0 .8rem; border: 1px solid var(--badge-line); border-radius: var(--rich-radius-pill); padding: .2rem .55rem; color: var(--label); font-size: var(--rich-fs-2xs); font-weight: var(--rich-fw-semibold); }
 .dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: var(--rich-space-3) var(--rich-space-4); margin-top: var(--rich-space-3); }
 .dashboard-blocks { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: var(--rich-space-3) var(--rich-space-4); margin-top: var(--rich-space-3); }
@@ -3182,8 +3294,11 @@ img, svg { max-width: 100%; height: auto; }
    subscriptable`) on `repeat(var(...), minmax(...))`, so `var()` must never
    appear inside `repeat()`/`minmax()` here. */
 .block-grid, .block-card_grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .75rem 1rem; }
+.block-presentation[data-layout="split-2-1"] > .block-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); }
+.block-presentation[data-layout="split-1-2"] > .block-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); }
+.block-presentation[data-layout="equal"] > .block-grid { grid-template-columns: 1fr; }
 .block-columns { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: .75rem 1rem; }
-.block-grid > .block, .block-columns > .block, .block-card_grid > .block { min-width: 0; margin-bottom: 0; }
+.block-grid > .block, .block-grid > .block-presentation, .block-columns > .block, .block-columns > .block-presentation, .block-card_grid > .block, .block-card_grid > .block-presentation { min-width: 0; margin-bottom: 0; }
 /* Generic (non-pulse) deliverables use sans-serif throughout (h1 { font-family:
    inherit } above), matching the app shell and the web renderer's generic
    default -- serif display type is reserved for the pulse presentation's
@@ -3218,6 +3333,8 @@ img, svg { max-width: 100%; height: auto; }
 .presentation-pulse .block-sources { margin-top: 1.5rem; border-top: 1.5px solid var(--strong-line); padding-top: .6rem; }
 @media (max-width: 720px) {
   .page { width: 100%; padding: 0; }
+  [data-span] { grid-column: auto; }
+  .block-presentation[data-layout] > .block-grid { grid-template-columns: 1fr; }
   body.toc-open { overflow: hidden; }
   .document-header { margin: 0 0 1rem; padding: 0 0 .8rem; border-bottom-width: 1px; }
   .document-header nav { margin-left: auto; gap: .35rem; }

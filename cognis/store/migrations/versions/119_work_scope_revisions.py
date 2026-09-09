@@ -12,24 +12,32 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.create_index(
-        "ix_sessions_owner_parent_session",
-        "sessions",
-        ["user_email", "parent_session_id", "session_id"],
-        unique=False,
-    )
-    op.create_index(
-        "ix_sessions_owner_previous_session",
-        "sessions",
-        ["user_email", "previous_session_id", "session_id"],
-        unique=False,
-    )
-    op.create_index(
-        "ix_managed_conversation_links_owner_controller_session",
-        "managed_conversation_links",
-        ["user_email", "controller_session_id", "link_id"],
-        unique=False,
-    )
+    inspector = sa.inspect(op.get_bind())
+    indexes = {
+        str(index["name"])
+        for table_name in ("sessions", "managed_conversation_links")
+        for index in inspector.get_indexes(table_name)
+        if index.get("name")
+    }
+    for name, table_name, columns in (
+        (
+            "ix_sessions_owner_parent_session",
+            "sessions",
+            ["user_email", "parent_session_id", "session_id"],
+        ),
+        (
+            "ix_sessions_owner_previous_session",
+            "sessions",
+            ["user_email", "previous_session_id", "session_id"],
+        ),
+        (
+            "ix_managed_conversation_links_owner_controller_session",
+            "managed_conversation_links",
+            ["user_email", "controller_session_id", "link_id"],
+        ),
+    ):
+        if name not in indexes:
+            op.create_index(name, table_name, columns, unique=False)
     op.create_table(
         "work_scope_states",
         sa.Column("scope_key", sa.String(), nullable=False),

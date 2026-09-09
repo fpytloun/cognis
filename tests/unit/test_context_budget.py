@@ -54,6 +54,12 @@ def test_context_budget_uses_larger_responses_serialization_margin() -> None:
     assert budget.available_prompt_tokens == 250_240
 
 
+def test_context_budget_recognizes_gpt6_as_responses_without_metadata() -> None:
+    ratio = prompt_serialization_margin_ratio_for_model(None, "gpt-6-astra")
+
+    assert ratio == 0.08
+
+
 def test_context_budget_can_disable_serialization_margin_for_legacy_callers() -> None:
     budget = resolve_context_budget(
         max_context_tokens=400_000,

@@ -10,7 +10,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import Field
 
@@ -157,15 +157,24 @@ _SnapshotProjectionKey = tuple[
     int,
     str,
 ]
-_SNAPSHOT_PROJECTION_CACHE: OrderedDict[_SnapshotProjectionKey, tuple[TimelineWindow, bool]] = (
-    OrderedDict()
-)
+_SNAPSHOT_PROJECTION_CACHE: OrderedDict[
+    _SnapshotProjectionKey,
+    tuple[TimelineWindow, bool, CursorSessionWatermark | None],
+] = OrderedDict()
 
 
 def clear_chat_v2_read_caches() -> None:
     """Clear process-local Chat v2 read/projection caches."""
 
     _SNAPSHOT_PROJECTION_CACHE.clear()
+
+
+def invalidate_chat_v2_snapshot_projection(scope_key: str) -> None:
+    """Evict process-local snapshot projections for one conversation scope."""
+
+    for key in tuple(_SNAPSHOT_PROJECTION_CACHE):
+        if key[0] == scope_key:
+            _SNAPSHOT_PROJECTION_CACHE.pop(key, None)
 
 
 async def build_chat_snapshot(
@@ -181,12 +190,16 @@ async def build_chat_snapshot(
     event_post_processor: EventPostProcessor | None = None,
     event_post_processor_cache_key: str | None = None,
     session_cache: Any = None,
+    initial_read_window: int | None = None,
     now: datetime | None = None,
 ) -> ChatSnapshot:
     """Build an authoritative Chat v2 snapshot from current session events."""
 
     snapshot_started = time.perf_counter()
     current_time = now or datetime.now(UTC)
+    read_window = (
+        SNAPSHOT_WINDOW_EVENT_LIMIT if initial_read_window is None else initial_read_window
+    )
     SNAPSHOT_SYNC_METRICS.observe_lineage(len(session_refs))
     stage_started = time.perf_counter()
     watermarks = await _read_high_watermarks(
@@ -204,7 +217,7 @@ async def build_chat_snapshot(
         conversation_id=scope.key,
         session_refs=session_refs,
         watermarks=watermarks,
-        limit=SNAPSHOT_WINDOW_EVENT_LIMIT,
+        limit=read_window,
         event_post_processor_cache_key=processor_cache_key,
     )
     cached_projection = (
@@ -213,17 +226,18 @@ async def build_chat_snapshot(
         else None
     )
     if cached_projection is not None:
-        projected_window, has_more_before = cached_projection
+        projected_window, has_more_before, before_position = cached_projection
     else:
         stage_started = time.perf_counter()
         window = await _read_latest_window(
             session_refs=session_refs,
             event_store=event_store,
-            limit=SNAPSHOT_WINDOW_EVENT_LIMIT,
+            initial_read_window=read_window,
             session_cache=session_cache,
             record_metrics=True,
         )
         SNAPSHOT_SYNC_METRICS.observe_stage("window_read", time.perf_counter() - stage_started)
+        before_position = _earliest_event_position(window.events)
         if event_post_processor is not None:
             stage_started = time.perf_counter()
             window = window.model_copy(update={"events": await event_post_processor(window.events)})
@@ -241,14 +255,17 @@ async def build_chat_snapshot(
         SNAPSHOT_SYNC_METRICS.observe_stage("projection", time.perf_counter() - stage_started)
         has_more_before = window.has_more_before
         if event_post_processor is None or event_post_processor_cache_key is not None:
-            _snapshot_projection_cache_put(cache_key, (projected_window, has_more_before))
+            _snapshot_projection_cache_put(
+                cache_key,
+                (projected_window, has_more_before, before_position),
+            )
     timeline = projected_window.model_copy(
         update={
             "has_more_before": has_more_before,
-            "before_cursor": _encode_before_cursor_for_items(
+            "before_cursor": _encode_before_cursor(
                 conversation_id=scope.key,
                 session_refs=session_refs,
-                items=projected_window.items,
+                source_position=before_position,
                 cursor_secret=cursor_secret,
                 now=current_time,
             )
@@ -425,6 +442,7 @@ async def build_timeline_backfill_response(
         session_cache=session_cache,
         now=current_time,
     )
+    before_position = _earliest_event_position(window.events)
     if event_post_processor is not None:
         window = window.model_copy(update={"events": await event_post_processor(window.events)})
     hydrated_events = await _hydrate_window_pairings(
@@ -442,10 +460,10 @@ async def build_timeline_backfill_response(
         items=page_items,
         cycle_states=page.cycle_states,
         has_more_before=window.has_more_before,
-        before_cursor=_encode_before_cursor_for_items(
+        before_cursor=_encode_before_cursor(
             conversation_id=scope.key,
             session_refs=session_refs,
-            items=page_items,
+            source_position=before_position,
             cursor_secret=cursor_secret,
             now=current_time,
             before_positions=window.before_positions,
@@ -467,6 +485,8 @@ def validate_backfill_limit(limit: int) -> int:
 def conversation_summary_from_row(row: Any) -> ConversationSummary:
     """Convert a store conversation row into a Chat v2 conversation summary."""
 
+    created_at = getattr(row, "created_at", None)
+    last_message_at = getattr(row, "last_message_at", None)
     return ConversationSummary(
         conversation_id=str(row.conversation_id),
         title=_str_or_none(getattr(row, "title", None)),
@@ -475,8 +495,11 @@ def conversation_summary_from_row(row: Any) -> ConversationSummary:
         project_id=_str_or_none(getattr(row, "project_id", None)),
         status=str(getattr(row, "status", "active")),
         active_session_id=_str_or_none(getattr(row, "active_session_id", None)),
-        last_message_at=_iso_or_none(getattr(row, "last_message_at", None)),
+        last_message_at=_iso_or_none(last_message_at),
         last_read_at=_iso_or_none(getattr(row, "last_read_at", None)),
+        has_message_history=bool(
+            created_at is not None and last_message_at is not None and last_message_at > created_at
+        ),
     )
 
 
@@ -489,10 +512,21 @@ def queue_state_from_messages(messages: Sequence[dict[str, Any]]) -> QueueState:
             client_message_id=_str_or_none(item.get("client_message_id")),
             client_txn_id=_str_or_none(item.get("client_txn_id")),
             content=str(item.get("content") or ""),
+            kind=(
+                "automatic_continuation" if item.get("kind") == "automatic_continuation" else None
+            ),
+            continuation_reason=_str_or_none(item.get("continuation_reason")),
             attachments=list(item.get("attachments") or []),
             position=int(item.get("position") or index),
             created_at=_str_or_none(item.get("created_at")),
             updated_at=_str_or_none(item.get("updated_at")),
+            status=cast(
+                Literal["queued", "recoverable", "committing"],
+                item.get("status")
+                if item.get("status") in {"queued", "recoverable", "committing"}
+                else "queued",
+            ),
+            cancel_requested=bool(item.get("cancel_requested")),
         )
         for index, item in enumerate(messages, start=1)
         if item.get("queue_id")
@@ -615,6 +649,19 @@ def _runtime_overlay(
     )
 
 
+def runtime_overlay_from_input(
+    runtime_input: RuntimeOverlayInput | None,
+    *,
+    generated_at: datetime | None = None,
+) -> RuntimeOverlaySnapshot:
+    """Build a runtime snapshot for a mutation acknowledgement."""
+
+    return _runtime_overlay(
+        runtime_input,
+        generated_at=generated_at or datetime.now(UTC),
+    )
+
+
 async def _read_all_events(
     *,
     session_refs: Sequence[ConversationSessionRef],
@@ -682,10 +729,11 @@ async def _read_latest_window(
     *,
     session_refs: Sequence[ConversationSessionRef],
     event_store: SessionEventStore,
-    limit: int,
+    initial_read_window: int | None = None,
     session_cache: Any = None,
     record_metrics: bool = False,
 ) -> _EventWindow:
+    limit = SNAPSHOT_WINDOW_EVENT_LIMIT if initial_read_window is None else initial_read_window
     raw_events: list[RawSessionEvent] = []
     remaining = limit
     has_more_before = False
@@ -837,7 +885,7 @@ async def _read_backfill_window(
         return await _read_latest_window(
             session_refs=session_refs,
             event_store=event_store,
-            limit=limit,
+            initial_read_window=limit,
             session_cache=session_cache,
         )
 
@@ -1121,7 +1169,7 @@ def _snapshot_projection_cache_key(
 
 def _snapshot_projection_cache_get(
     key: _SnapshotProjectionKey,
-) -> tuple[TimelineWindow, bool] | None:
+) -> tuple[TimelineWindow, bool, CursorSessionWatermark | None] | None:
     value = _SNAPSHOT_PROJECTION_CACHE.get(key)
     if value is not None:
         _SNAPSHOT_PROJECTION_CACHE.move_to_end(key)
@@ -1130,7 +1178,7 @@ def _snapshot_projection_cache_get(
 
 def _snapshot_projection_cache_put(
     key: _SnapshotProjectionKey,
-    value: tuple[TimelineWindow, bool],
+    value: tuple[TimelineWindow, bool, CursorSessionWatermark | None],
 ) -> None:
     _SNAPSHOT_PROJECTION_CACHE[key] = value
     _bounded_lru_prune(
@@ -1320,29 +1368,28 @@ def _encode_cursor(
     return encode_cursor(payload, cursor_secret)
 
 
-def _encode_before_cursor_for_items(
+def _encode_before_cursor(
     *,
     conversation_id: str,
     session_refs: Sequence[ConversationSessionRef],
-    items: Sequence[TimelineItem],
+    source_position: CursorSessionWatermark | None,
     cursor_secret: str,
     now: datetime,
     before_positions: Sequence[CursorSessionWatermark] = (),
 ) -> str | None:
-    source_ref = _earliest_item_source_ref(items, session_refs=session_refs)
-    if source_ref is None and not before_positions:
+    if source_position is None and not before_positions:
         return None
     payload = InternalChatCursorPayload(
         scope_key=conversation_id,
         projection_version=current_projection_version(),
         session_watermarks=[
             CursorSessionWatermark(
-                store=source_ref.store,
-                session_id=source_ref.session_id,
-                last_seq=source_ref.seq,
+                store=source_position.store,
+                session_id=source_position.session_id,
+                last_seq=source_position.last_seq,
             )
         ]
-        if source_ref is not None
+        if source_position is not None
         else [],
         before_positions=[],
         ordinal_frontiers=[
@@ -1355,27 +1402,30 @@ def _encode_before_cursor_for_items(
         else [],
         lineage=[] if before_positions else _lineage_entries(session_refs),
         graph_fingerprint=_lineage_fingerprint(session_refs) if before_positions else None,
-        view_revision=source_ref.seq if source_ref is not None else 0,
+        view_revision=source_position.last_seq if source_position is not None else 0,
         issued_at=now.isoformat(),
         expires_at=(now + CURSOR_TTL).isoformat(),
     )
     return encode_cursor(payload, cursor_secret)
 
 
-def _earliest_item_source_ref(
-    items: Sequence[TimelineItem],
-    *,
-    session_refs: Sequence[ConversationSessionRef],
-) -> Any | None:
-    lineage_ordinals = {
-        (ref.store, ref.event_store_session_id): ref.ordinal for ref in session_refs
-    }
-    refs = [ref for item in items for ref in item.source_refs]
-    if not refs:
+def _earliest_event_position(
+    events: Sequence[RawSessionEvent],
+) -> CursorSessionWatermark | None:
+    if not events:
         return None
-    return min(
-        refs,
-        key=lambda ref: (lineage_ordinals.get((ref.store, ref.session_id), 0), ref.seq),
+    event = min(
+        events,
+        key=lambda candidate: (
+            int(candidate.data.get("_lineage_index") or 0),
+            candidate.seq,
+            candidate.event_id or "",
+        ),
+    )
+    return CursorSessionWatermark(
+        store=event.store_id,
+        session_id=event.session_id,
+        last_seq=event.seq,
     )
 
 

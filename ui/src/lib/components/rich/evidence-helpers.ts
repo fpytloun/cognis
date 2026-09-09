@@ -1,5 +1,5 @@
 import { safeUrl } from '$lib/rich-deliverable';
-import { humanize, objectList, tableColumns, tableRows, valueText, type ColumnDef } from './block-helpers';
+import { asTypedCell, humanize, objectList, tableColumns, tableRows, valueText, type ColumnDef } from './block-helpers';
 import type { RichBlock } from '$lib/rich-deliverable';
 
 export interface NormalizedSource {
@@ -146,6 +146,8 @@ export function rowEvidence(row: Record<string, unknown>): Record<string, unknow
 }
 
 export function sortableValue(value: unknown): string | number {
+  const typedCell = asTypedCell(value);
+  if (typedCell) return sortableValue(typedCell.value);
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'string') {
     const numeric = Number(value.replace(/[%,$\s]/g, ''));

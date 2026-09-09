@@ -114,6 +114,7 @@ def conversation_to_response(
     active_session: Any | None = None,
     active_turn_state: dict[str, Any] | None = None,
     pending_notification_types: list[str] | None = None,
+    attention_actions: list[Any] | None = None,
     conversation_state: ConversationStateEnvelope | None = None,
     managed_link: Any | None = None,
     root_controller_conversation_id: str | None = None,
@@ -160,6 +161,7 @@ def conversation_to_response(
         active_turn_chat_mode=(active_turn_state or {}).get("chat_mode"),
         active_turn_chat_mode_source=(active_turn_state or {}).get("chat_mode_source"),
         pending_notification_types=pending_notification_types or [],
+        attention_actions=attention_actions or [],
         starred_at=getattr(row, "starred_at", None),
         status=row.status,
         last_message_at=last_message_at,
@@ -238,6 +240,11 @@ def session_to_response(row: Any, *, include_result_content: bool = False) -> Se
         user_email=row.user_email,
         agent_id=row.agent_id,
         agent_profile_id=getattr(row, "agent_profile_id", None),
+        model_override=getattr(row, "model_override", None),
+        model_override_provider_id=getattr(row, "model_override_provider_id", None),
+        reasoning_effort_override=getattr(row, "reasoning_effort_override", None),
+        fast_mode_override=getattr(row, "fast_mode_override", None),
+        runtime_override_revision=int(getattr(row, "runtime_override_revision", 0) or 0),
         delegation_mode=row.delegation_mode,
         delegation_task=row.delegation_task,
         status=row.status,
@@ -266,7 +273,7 @@ def agent_to_response(row: Any) -> AgentResponse:
         with contextlib.suppress(ValueError):
             checked_at = datetime.fromisoformat(checked_at)
     llm_config = getattr(row, "llm_config", None)
-    if hasattr(llm_config, "model_dump"):
+    if llm_config is not None and hasattr(llm_config, "model_dump"):
         llm_config = llm_config.model_dump(mode="json", exclude_none=True)
     agent_profiles = getattr(row, "agent_profiles", None) or {}
     if isinstance(agent_profiles, dict):
@@ -285,10 +292,10 @@ def agent_to_response(row: Any) -> AgentResponse:
             serialized_profiles[key] = serialized
         agent_profiles = serialized_profiles
     permissions = getattr(row, "permissions", None)
-    if hasattr(permissions, "model_dump"):
+    if permissions is not None and hasattr(permissions, "model_dump"):
         permissions = permissions.model_dump(mode="json", exclude_none=True)
     capabilities = getattr(row, "capabilities", None)
-    if hasattr(capabilities, "model_dump"):
+    if capabilities is not None and hasattr(capabilities, "model_dump"):
         capabilities = capabilities.model_dump(mode="json", exclude_none=True)
     return AgentResponse(
         agent_id=row.agent_id,
@@ -615,7 +622,7 @@ def _duration_seconds(started_at: Any, completed_at: Any) -> float | None:
     if started_at is None or completed_at is None:
         return None
     try:
-        return max(0.0, (completed_at - started_at).total_seconds())
+        return float(max(0.0, (completed_at - started_at).total_seconds()))
     except Exception:
         return None
 

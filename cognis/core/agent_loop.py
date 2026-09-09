@@ -22,7 +22,7 @@ import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -89,8 +89,17 @@ from cognis.core.daily_brief_contract import (
     tool_call_fingerprint,
 )
 from cognis.core.decision import build_routing_reminder
+from cognis.core.deliverable_authoring import (
+    DeliverableAuthoringError,
+    ResolvedDeliverableAuthoring,
+    is_rich_authoring_action,
+    resolve_deliverable_authoring,
+    rich_action_for_presentation,
+)
+from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
 from cognis.core.errors import ImmutablePrefixUnavailable
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.executor_recovery import ExecutorRecoveryTimeout
 from cognis.core.external_managed_policy import (
     external_tool_allowed,
     filter_external_controller_schemas,
@@ -99,6 +108,8 @@ from cognis.core.external_managed_policy import (
 )
 from cognis.core.followups import (
     LLM_CYCLE_CEILING_CONTINUATION_REASON,
+    MID_STREAM_FAILURE_CONTINUATION_REASON,
+    MISSING_STEP_COMPLETE_CONTINUATION_REASON,
     STEP_TIMEOUT_CONTINUATION_REASON,
     TOOL_CALL_CEILING_CONTINUATION_REASON,
     ContinuationFollowUp,
@@ -119,6 +130,7 @@ from cognis.core.harness_guards import (
     record_tool_result,
     same_turn_duplicate_rejection_payload,
     tool_call_argument_fingerprint,
+    uncertain_outcome_rejection_payload,
 )
 from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
@@ -155,6 +167,7 @@ from cognis.core.orchestration_targets import (
 )
 from cognis.core.output_anchor_registry import build_anchor_manifest
 from cognis.core.project_context import (
+    INTERNAL_PROJECT_CONTEXT_PROBE_TOOL,
     PROJECT_CONTEXT_STATUS_LOADED,
     ProjectContextEntry,
     ProjectMetadataEntry,
@@ -181,6 +194,7 @@ from cognis.core.runtime import (
 )
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
 from cognis.core.step_profiles import (
+    ResolvedStepProfile,
     resolve_step_profile,
     step_profile_allows_tool,
     step_profile_visible_by_default,
@@ -188,12 +202,16 @@ from cognis.core.step_profiles import (
 from cognis.core.task_execution import StaleTaskExecutionOwner
 from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
+from cognis.core.tool_deferral import is_default_deferred_builtin
 from cognis.core.tool_exposure import (
     LLMApiMode,
     ToolDiscoveryMode,
     ToolExposureContract,
+    ToolExposureResult,
+    filter_edit_tools_for_model,
     prepare_tool_exposure,
     reverse_tool_argument_aliases,
+    validate_direct_schema_sizes,
 )
 from cognis.core.tool_output_presentation import (
     artifact_anchor_names,
@@ -205,7 +223,31 @@ from cognis.core.tool_output_presentation import (
 from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
 )
+from cognis.core.tool_result_settlement import (
+    CanonicalToolHistoryError,
+    CanonicalToolRepairUnavailable,
+    ToolResultSettlement,
+    append_tool_result_once,
+    canonical_tool_continuation_events,
+    tool_call_idempotency_key,
+)
 from cognis.core.truncation import middle_truncate
+from cognis.core.trusted_evidence import (
+    EVIDENCE_QUEUE_KIND,
+    ORDINARY_ASSISTANT_QUEUE_KIND,
+    TRUSTED_EVIDENCE_MARKER_KEY,
+    EvidenceOrigin,
+    TrustedEvidenceAdmission,
+    build_evidence_admission,
+    build_evidence_event_binding,
+    build_marker,
+    deterministic_queue_id,
+    event_hash,
+    evidence_admission_authorizes,
+    is_eligible_user_event,
+    is_evidence_enabled_for_owner,
+    serialize_evidence_admission,
+)
 from cognis.core.workflow_prompt import (
     ComposedWorkflowPrompt,
     WorkflowPromptBlockKind,
@@ -225,6 +267,7 @@ from cognis.models.session import (
     SessionEvent,
     SessionModel,
     SessionTransition,
+    next_event_page_after_seq,
     with_session_events_turn_id,
 )
 from cognis.models.tool import (
@@ -241,6 +284,7 @@ from cognis.models.tool import (
     tool_input_schema,
     tool_matches_identifier,
     tool_profile_group,
+    tool_provider_exposure_schema,
     tool_with_input_schema,
 )
 from cognis.models.workflow import (
@@ -253,6 +297,7 @@ from cognis.models.workflow import (
     Workflow,
     WorkflowState,
 )
+from cognis.providers.circuit_breaker import CircuitBreakerError
 from cognis.providers.executor.delivery import AmbiguousToolOutcome, DeliveryState
 from cognis.providers.llm.anthropic.contracts import (
     CONTRACT_VERSION as ANTHROPIC_NATIVE_CONTRACT_VERSION,
@@ -292,13 +337,15 @@ from cognis.providers.memory.policy import (
     resolve_memory_policy,
 )
 from cognis.providers.retry import is_retryable_http_error
-from cognis.runtime_context import (  # noqa: F401 — used in delegation
+from cognis.runtime_context import (
     RuntimeAccessContext,
     current_effective_working_directory,
+    current_executor_environment,
     current_workspace_root,
     scoped_runtime_context,
 )
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
+from cognis.store.models import DirectTurnRequestRow
 from cognis.store.queries import (
     create_deliverable,
     get_artifact_record,
@@ -324,13 +371,14 @@ from cognis.tools.builtin.orchestration import (
 )
 from cognis.tools.builtin.tool_output import is_tool_output_tool
 from cognis.tools.builtin.tool_search import (
+    CALL_TOOL_TOOL,
     DESCRIBE_TOOL_TOOL,
     SEARCH_TOOLS_TOOL,
     VALIDATE_TOOL_CALL_TOOL,
+    resolve_inventory_tool,
     search_inventory,
 )
 from cognis.tools.classification import classify_tool_definitions_sync, resolve_tool_classifications
-from cognis.tools.executor.project_context import INTERNAL_PROJECT_CONTEXT_PROBE_TOOL
 from cognis.tools.introspection import (
     describe_available_tool,
     resolve_descriptor_dynamic_options,
@@ -393,6 +441,29 @@ def _write_deliverable_revalidation_reason(
     return None
 
 
+def _write_deliverable_execution_rejection_reason(
+    arguments: dict[str, Any],
+    receipts: dict[str, str],
+    *,
+    payload_fingerprint: str,
+    current_state_fingerprint: object,
+    execution_valid: bool,
+) -> str | None:
+    """Require validation receipts for Rich actions without affecting text writes."""
+
+    if not is_rich_authoring_action(arguments.get("action")):
+        return None if execution_valid else "invalid_tool_call"
+    reason = _write_deliverable_revalidation_reason(
+        receipts,
+        payload_fingerprint=payload_fingerprint,
+        current_state_fingerprint=current_state_fingerprint,
+        execution_valid=execution_valid,
+    )
+    if payload_fingerprint not in receipts and reason is None:
+        return "missing_validation"
+    return reason
+
+
 def _replayed_write_deliverable_validation_fingerprints(
     messages: list[dict[str, Any]],
 ) -> set[str]:
@@ -433,7 +504,7 @@ def _replayed_write_deliverable_validation_fingerprints(
                 continue
             if (
                 isinstance(arguments, dict)
-                and arguments.get("tool") == "write_deliverable"
+                and arguments.get("tool") in {"write_deliverable", "builtin:write_deliverable"}
                 and isinstance(arguments.get("arguments"), dict)
             ):
                 fingerprints.add(tool_call_fingerprint("write_deliverable", arguments["arguments"]))
@@ -481,7 +552,8 @@ def _replayed_write_deliverable_validation_receipts(
                 continue
             if (
                 not isinstance(validation_arguments, dict)
-                or validation_arguments.get("tool") != WRITE_DELIVERABLE
+                or validation_arguments.get("tool")
+                not in {WRITE_DELIVERABLE, "builtin:write_deliverable"}
                 or not isinstance(validation_arguments.get("arguments"), dict)
             ):
                 continue
@@ -537,6 +609,32 @@ _SAME_EXECUTOR_AUTO_RETRY_TOOL_ALLOWLIST = frozenset(
         "web_search",
     }
 )
+# Poll interval while waiting for a reconnected executor to finish a call whose
+# outcome the controller lost with the previous socket.
+_TOOL_RECONCILE_POLL_SECONDS = 2.0
+# Bounded retries when an outcome lookup itself fails (for example a forwarded
+# proxy still bound to a superseded owner epoch).
+_TOOL_RECONCILE_MAX_FETCH_FAILURES = 3
+# Once the accepting executor process confirms the lost call is still ACTIVE,
+# reconciliation may wait for its terminal result within the tool's own
+# completion budget (the call would have run this long had the socket never
+# dropped). Used when the tool has no explicit timeout, plus as delivery grace.
+_TOOL_RECONCILE_DEFAULT_COMPLETION_BUDGET_SECONDS = 300.0
+_TOOL_RECONCILE_COMPLETION_GRACE_SECONDS = 30.0
+# Reconciliation of an accepted call always gets at least this window, even if
+# the surrounding recovery budget is exhausted. Skipping the outcome query
+# guarantees a false ambiguity; asking costs one fetch on a live socket.
+# Bounded: reconciliation runs at most once per dispatch attempt and attempts
+# are capped by _SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS.
+_TOOL_RECONCILE_MIN_WINDOW_SECONDS = 30.0
+# Total dispatch attempts for one tool call across same-executor transport
+# failures. A single retry is not enough in HA: retiring a shared forwarded
+# proxy can fail the immediately following attempt too, while the executor
+# itself stays healthy.
+_SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS = 3
+# Backoff before each additional attempt, bounded by the reconnect budget.
+_SAME_EXECUTOR_RETRY_BACKOFF_SECONDS = 0.5
+_SAME_EXECUTOR_RETRY_BACKOFF_MAX_SECONDS = 4.0
 
 
 def _artifact_url_pattern() -> re.Pattern[str]:
@@ -589,6 +687,12 @@ TASK_CONTROL_CONTROLLER_TOOL_NAMES = frozenset(
 CONTROLLER_TOOL_REQUEST_USER_INPUT = "request_user_input"
 CONTROLLER_TOOL_TODO_WRITE = "todo_write"
 CONTROLLER_TOOL_TODO_LIST = "todo_list"
+_TODO_REMINDER_CYCLES_SINCE_WRITE = 10
+_TODO_REMINDER_CYCLES_BETWEEN_REMINDERS = 10
+_TODO_FRESHNESS_REMINDER = (
+    "Todo tracking has not changed recently. Update it if the current work "
+    "benefits from progress tracking. Clean up stale items if needed."
+)
 
 
 @dataclass(slots=True)
@@ -730,9 +834,15 @@ _BOOTSTRAP_INTENTION_WAIT_MS = 1500
 _INTARIS_RETRY_POLL_SECONDS = 5.0
 _INTARIS_MAX_RECOVERY_WAIT_SECONDS = 60.0
 _INTARIS_ESCALATION_REMOTE_POLL_SECONDS = 2.0
+_BOUNDARY_BATCH_QUIET_SECONDS = 0.075
+_BOUNDARY_BATCH_MAX_WAIT_SECONDS = 0.25
+_BOUNDARY_BATCH_MAX_DRAIN_PASSES = 32
 
 
-def _user_message_for_recording(content: str, attachments: list[AttachmentRef]) -> str:
+def _user_message_for_recording(
+    content: str,
+    attachments: list[AttachmentRef] | list[dict[str, Any]],
+) -> str:
     """Return the content to persist for a user message event.
 
     The original content is always preserved as-is so that attachment-only
@@ -801,6 +911,12 @@ STEP_DURATION = Histogram(
     "cognis_step_duration_seconds",
     "Step execution duration",
     labelnames=("phase",),
+)
+BOUNDARY_USER_APPEND_DURATION = Histogram(
+    "cognis_boundary_user_append_duration_seconds",
+    "Duration of canonical Intaris persistence for absorbed user messages.",
+    ["outcome"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120),
 )
 STEP_TOOL_CALLS = Counter(
     "cognis_step_tool_calls_total",
@@ -1011,10 +1127,12 @@ def _observe_web_tool_execution(
             backend=backend,
             outcome=search_outcome,
         ).inc()
-    quality = metadata.get("extracted_document", {})
-    quality = quality.get("semantic_quality") if isinstance(quality, dict) else None
-    if isinstance(quality, dict):
-        status = str(quality.get("status") or "unavailable")
+    extracted_document = metadata.get("extracted_document", {})
+    semantic_quality = (
+        extracted_document.get("semantic_quality") if isinstance(extracted_document, dict) else None
+    )
+    if isinstance(semantic_quality, dict):
+        status = str(semantic_quality.get("status") or "unavailable")
         if status not in {
             "complete",
             "partial",
@@ -1127,6 +1245,7 @@ CONTROLLER_TOOLS = {
     SWITCH_AGENT_PROFILE,
     SEARCH_TOOLS_TOOL.name,
     DESCRIBE_TOOL_TOOL.name,
+    CALL_TOOL_TOOL.name,
     VALIDATE_TOOL_CALL_TOOL.name,
 }
 
@@ -1147,6 +1266,76 @@ _DELEGATED_CHILD_FORBIDDEN_TOOLS: frozenset[str] = frozenset(
         CONTROLLER_TOOL_REQUEST_USER_INPUT,
     }
 )
+_DEFAULT_DEFERRED_SOURCE_TYPES = frozenset({"local_mcp", "intaris_mcp", "skill"})
+_DEFAULT_DEFERRED_ADMIN_TOOL_NAMES = frozenset(
+    {
+        "manage_agents",
+        "manage_mcp",
+        "skill_write",
+        "skill_patch",
+        "skill_asset_write",
+        "skill_asset_delete",
+        "skill_delete",
+        "skill_import_url",
+        "skill_restore_version",
+    }
+)
+
+
+def _tool_visible_by_default(
+    tool: ToolDefinition,
+    profile: ResolvedStepProfile,
+    *,
+    activated_tool_ids: set[str],
+) -> bool:
+    """Apply source-aware default deferral after step-profile eligibility."""
+
+    tool_id = stable_tool_id(tool)
+    if tool_id in activated_tool_ids:
+        return True
+    config = profile.config
+    if config is not None and any(
+        tool_matches_identifier(tool, identifier) for identifier in config.tool_overrides.include
+    ):
+        return True
+    if (
+        tool.source.type in _DEFAULT_DEFERRED_SOURCE_TYPES
+        or tool.name in _DEFAULT_DEFERRED_ADMIN_TOOL_NAMES
+        or is_default_deferred_builtin(tool.name)
+    ):
+        return False
+    return step_profile_visible_by_default(tool, profile)
+
+
+def _deferred_integration_hint(
+    tools: list[ToolDefinition],
+    hidden_tool_ids: set[str],
+) -> str | None:
+    """Return a bounded list of authorized hidden MCP integration names."""
+
+    names = sorted(
+        {
+            str(tool.source.server_name or tool.source.server_id).strip()
+            for tool in tools
+            if stable_tool_id(tool) in hidden_tool_ids
+            and tool.source.type in {"local_mcp", "intaris_mcp"}
+            and (tool.source.server_name or tool.source.server_id)
+        },
+        key=str.casefold,
+    )[:20]
+    return f"Available deferred integrations: {', '.join(names)}." if names else None
+
+
+def _effective_tool_discovery_mode(exposure: ToolExposureResult) -> ToolDiscoveryMode:
+    if exposure.debug_metadata.get("native_anthropic_search_enabled") is True:
+        return ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH
+    if any(
+        tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
+        for tool in exposure.tools
+        if isinstance(tool, dict)
+    ):
+        return ToolDiscoveryMode.CONTROLLER_SEARCH
+    return ToolDiscoveryMode.NONE
 
 
 def _allowed_finalization_tools(instruction: dict[str, str]) -> frozenset[str]:
@@ -1506,7 +1695,7 @@ def _artifact_failures_from_provider_fetch_error(error_text: str) -> list[_Artif
 
 
 def _artifact_failures_from_error_payload(
-    payload: dict[str, Any] | None,
+    payload: Mapping[str, Any] | None,
 ) -> list[_ArtifactFetchFailure]:
     """Extract Cognis artifact references from a structured stream error payload."""
 
@@ -1541,12 +1730,12 @@ def _artifact_failures_from_error_payload(
     return failures
 
 
-def _native_image_failures_from_messages(
+def _native_attachment_failures_from_messages(
     messages: list[dict[str, Any]],
     *,
     artifact_ids: set[str] | None = None,
 ) -> list[_ArtifactFetchFailure]:
-    """Extract native image attachment URLs from assembled prompt messages."""
+    """Extract native attachment references from assembled prompt messages."""
 
     failures: list[_ArtifactFetchFailure] = []
     seen_urls: set[str] = set()
@@ -1555,11 +1744,17 @@ def _native_image_failures_from_messages(
         if not isinstance(content, list):
             continue
         for part in content:
-            if not isinstance(part, dict) or part.get("type") != "image_url":
+            if not isinstance(part, dict) or part.get("type") not in {"image_url", "file"}:
                 continue
+            file_part = part.get("file")
             image_part = part.get("image_url")
-            if isinstance(image_part, dict):
+            metadata: Any = None
+            if isinstance(file_part, dict):
+                url = file_part.get("file_url")
+                metadata = file_part.get("cognis_artifact")
+            elif isinstance(image_part, dict):
                 url = image_part.get("url")
+                metadata = image_part.get("cognis_artifact")
             elif isinstance(image_part, str):
                 url = image_part
             else:
@@ -1567,8 +1762,16 @@ def _native_image_failures_from_messages(
             if not isinstance(url, str) or not url or url in seen_urls:
                 continue
             seen_urls.add(url)
-            artifact_id: str | None = None
-            filename: str | None = None
+            artifact_id = (
+                metadata.get("artifact_id")
+                if isinstance(metadata, dict) and isinstance(metadata.get("artifact_id"), str)
+                else None
+            )
+            filename = (
+                metadata.get("filename")
+                if isinstance(metadata, dict) and isinstance(metadata.get("filename"), str)
+                else None
+            )
             path_parts = [unquote(item) for item in urlparse(url).path.split("/") if item]
             with contextlib.suppress(ValueError):
                 content_index = path_parts.index("content")
@@ -1613,10 +1816,12 @@ def _artifact_fetch_failure_notice(failures: list[_ArtifactFetchFailure]) -> str
 def _strip_disabled_artifact_urls_from_messages(
     messages: list[dict[str, Any]],
     disabled_urls: set[str],
+    disabled_ids: set[str] | None = None,
 ) -> None:
     """Remove failed provider-fetch artifact URLs from already assembled prompt messages."""
 
-    if not disabled_urls:
+    disabled_ids = disabled_ids or set()
+    if not disabled_urls and not disabled_ids:
         return
     for message in messages:
         content = message.get("content")
@@ -1632,11 +1837,19 @@ def _strip_disabled_artifact_urls_from_messages(
             url = None
             if isinstance(file_part, dict):
                 url = file_part.get("file_url")
+                metadata = file_part.get("cognis_artifact")
             elif isinstance(image_part, dict):
                 url = image_part.get("url")
+                metadata = image_part.get("cognis_artifact")
             elif isinstance(image_part, str):
                 url = image_part
-            if isinstance(url, str) and url in disabled_urls:
+                metadata = None
+            else:
+                metadata = None
+            artifact_id = metadata.get("artifact_id") if isinstance(metadata, dict) else None
+            if (isinstance(url, str) and url in disabled_urls) or (
+                isinstance(artifact_id, str) and artifact_id in disabled_ids
+            ):
                 continue
             replacement.append(part)
         if len(replacement) != len(content):
@@ -1802,7 +2015,7 @@ def _llm_stream_value_has_activity(value: Any) -> bool:
     return False
 
 
-def _idle_timeout_payload(message: str, phase: str) -> dict[str, Any]:
+def _idle_timeout_payload(message: str, phase: str) -> MidStreamErrorPayload:
     category = {
         "raw": MidStreamErrorCategory.IDLE_TIMEOUT_RAW.value,
         "reasoning": MidStreamErrorCategory.IDLE_TIMEOUT_REASONING.value,
@@ -1851,7 +2064,28 @@ async def _iterate_llm_stream_with_idle_timeout(
                     payload=_idle_timeout_payload(message, stats.timeout_phase),
                 )
             try:
-                chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
+                if cancel_event is None:
+                    chunk = await asyncio.wait_for(anext(iterator), timeout=remaining)
+                else:
+                    next_chunk = asyncio.ensure_future(anext(iterator))
+                    cancellation = asyncio.create_task(cancel_event.wait())
+                    done, pending = await asyncio.wait(
+                        {next_chunk, cancellation},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        raise TimeoutError
+                    if cancellation in done and cancellation.result():
+                        next_chunk.cancel()
+                        await asyncio.gather(next_chunk, return_exceptions=True)
+                        raise asyncio.CancelledError
+                    cancellation.cancel()
+                    await asyncio.gather(cancellation, return_exceptions=True)
+                    chunk = next_chunk.result()
             except StopAsyncIteration:
                 break
             except asyncio.CancelledError:
@@ -1940,6 +2174,8 @@ def _should_auto_continue_after_mid_stream_failure(message: str) -> bool:
 
 _MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS = 2
 _MAX_LLM_CYCLES_PER_TURN = 150
+_MANAGED_DRAINING_RECOVERY_TIMEOUT_SECONDS = 300.0
+_MANAGED_DRAINING_RECOVERY_POLL_SECONDS = 0.25
 _IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS = 3
 _IDLE_TIMEOUT_CATEGORIES = {
     MidStreamErrorCategory.IDLE_TIMEOUT_RAW.value,
@@ -1949,6 +2185,7 @@ _IDLE_TIMEOUT_CATEGORIES = {
 _RECOVERY_RETRYABLE_CATEGORIES = {
     MidStreamErrorCategory.ARTIFACT_FETCH.value,
     MidStreamErrorCategory.ATTACHMENT_INPUT.value,
+    MidStreamErrorCategory.RATE_LIMIT.value,
     MidStreamErrorCategory.PROVIDER_5XX.value,
     MidStreamErrorCategory.CONNECTION.value,
     *_IDLE_TIMEOUT_CATEGORIES,
@@ -2049,7 +2286,7 @@ def _mid_stream_retry_notice(
     else:
         reason = f"{provider_label} stream failed mid-generation"
     message = _mid_stream_provider_message(details, error)
-    suffix = f" Provider message: {message[:220]}" if message else ""
+    suffix = f" Provider message: {message}" if message else ""
     return (
         f"{reason} while using {model_label}. Cognis will wait {wait_text} and retry "
         f"the LLM call ({attempt}/{max_attempts}).{suffix}"
@@ -2094,7 +2331,7 @@ def _mid_stream_exhausted_failure_notice(
     )
     model_label = model or _mid_stream_detail_text(details, "model") or "unknown model"
     message = _mid_stream_provider_message(details, error)
-    suffix = f" Provider message: {message[:220]}" if message else ""
+    suffix = f" Provider message: {message}" if message else ""
     attempts_text = f"{max(1, attempts)} attempt(s)"
     retry_hint = ""
     if provider_retry_after_seconds is not None:
@@ -2180,7 +2417,7 @@ def _should_continue_after_exhausted_mid_stream_failure(
     if not _should_auto_continue_after_mid_stream_failure(message):
         return False
     reason_class = _mid_stream_reason_class(details, "other")
-    return reason_class in _RECOVERY_RETRYABLE_CATEGORIES
+    return reason_class not in _RECOVERY_NON_RETRYABLE_CATEGORIES
 
 
 _TODO_ECHO_CONTENT_MAX = 280
@@ -2385,6 +2622,10 @@ def _has_compactable_pre_turn_history(
         return True
     if cache_entry is None:
         return True
+    if getattr(cache_entry, "initialized", None) is False or bool(
+        getattr(cache_entry, "canonical_stale", False)
+    ):
+        return True
     try:
         raw_events = cache_get_events(ctx.session.session_id)
     except Exception:
@@ -2481,11 +2722,14 @@ def _delegate_continuation(
             "preferred_tool": "follow_up_subsession",
             "guidance": (
                 "For same-problem continuation, corrections, deeper analysis, or "
-                "rechecks, use follow_up_subsession only when this child's specialist "
-                "role, tool/authority scope, and expected output remain compatible. "
-                "Follow-up and fork preserve this child's agent identity and "
-                "capabilities; create a fresh delegate for a different specialist. "
-                "Use fork_subsession only for a compatible independent branch."
+                "rechecks, use follow_up_subsession only when this child's bounded "
+                "problem, specialist role, responsibilities, tool/authority scope, "
+                "and expected output remain compatible and retained context is "
+                "materially useful. Send the context delta only. Follow-up preserves "
+                "this child's identity and capabilities; create a fresh isolated "
+                "delegate for changed compatibility or an independent workstream. "
+                "Use fork_subsession only for an independent branch requiring "
+                "inherited context, not an ordinary handoff or review."
             ),
         }
     return {
@@ -2493,8 +2737,10 @@ def _delegate_continuation(
         "preferred_tool": "retry_subsession",
         "guidance": (
             "To rerun the original task, call retry_subsession with this session_id. "
-            "For a changed instruction that should retain the failed child's context, "
-            "call follow_up_subsession instead of creating a fresh delegate."
+            "For a changed instruction, call follow_up_subsession instead of creating "
+            "a fresh delegate only when the same bounded problem, role, responsibilities, "
+            "tool/authority scope, and output remain compatible and retained context is "
+            "materially useful; send the context delta only."
         ),
     }
 
@@ -2516,6 +2762,23 @@ def _parent_visible_tool_arguments(tool_name: str, arguments: dict[str, Any]) ->
         f"{tool_name} input limited to {_DELEGATION_INPUT_PREVIEW_CHARS} chars per string field"
     )
     return bounded
+
+
+def _runtime_tool_presentation(
+    tc: ToolCall,
+    visible_names: dict[str, str],
+    visible_arguments: dict[str, dict[str, Any]] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Return the canonical UI identity for a resolved deferred-tool call."""
+
+    visible_name = visible_names.get(tc.call_id, tc.name)
+    if visible_name == CALL_TOOL_TOOL.name and tc.name != CALL_TOOL_TOOL.name:
+        return tc.name, _parent_visible_tool_arguments(tc.name, tc.arguments)
+    arguments = (visible_arguments or {}).get(
+        tc.call_id,
+        _parent_visible_tool_arguments(tc.name, tc.arguments),
+    )
+    return visible_name, arguments
 
 
 class StepMetadataContractError(ValueError):
@@ -2690,9 +2953,10 @@ def _validate_step_completion_notification(
     if notification.mode == "silent" and not ctx.completion_delivery.allow_silent_completion:
         raise ValueError("notification.mode='silent' is not allowed for this step")
     if outcome_status != "success":
-        if notification.mode == "direct":
-            raise ValueError("notification.mode='direct' is only valid for successful completion")
-        raise ValueError("notification.mode='silent' is only valid for successful completion")
+        # Failure and blocked outcomes use the normal task-result path. Do not
+        # reject a terminal output because it contains a success-only override.
+        step_output.notification = None
+        return
     effective_content = (
         deliverable_content if deliverable_content is not None else step_output.content
     )
@@ -2762,6 +3026,12 @@ def _append_tool_call_event(
     if visible_name and visible_name != tc.name:
         data["visible_name"] = visible_name
         data["canonical_name"] = tc.name
+        visible_arguments = getattr(tc, "runtime_metadata", {}).get("visible_arguments")
+        if isinstance(visible_arguments, dict):
+            data["visible_arguments"] = _parent_visible_tool_arguments(
+                visible_name,
+                visible_arguments,
+            )
     data["turn_cycle_index"] = turn_cycle_index
     # Persist the assistant phase the live runtime overlay used for this call
     # so the canonical projection groups the tool under the same assistant
@@ -3288,6 +3558,73 @@ def _reattach_responses_output_items(
     return restored
 
 
+def _project_hidden_history_calls_through_bridge(
+    messages: list[dict[str, Any]],
+    *,
+    inventory_tools: list[ToolDefinition],
+    visible_tool_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Project historical hidden calls through call_tool without changing call IDs."""
+
+    def _envelope(name: Any, arguments: Any) -> tuple[str, str] | None:
+        if not isinstance(name, str) or name in {CALL_TOOL_TOOL.name, SEARCH_TOOLS_TOOL.name}:
+            return None
+        target = resolve_inventory_tool(
+            cast(list[NativeToolDefinition], inventory_tools),
+            name,
+        )
+        if target is None or stable_tool_id(target) in visible_tool_ids:
+            return None
+        if isinstance(arguments, str):
+            try:
+                parsed_arguments = json.loads(arguments)
+            except (TypeError, ValueError):
+                return None
+        else:
+            parsed_arguments = arguments
+        if not isinstance(parsed_arguments, dict):
+            return None
+        return (
+            CALL_TOOL_TOOL.name,
+            json.dumps(
+                {"tool": stable_tool_id(target), "arguments": parsed_arguments},
+                separators=(",", ":"),
+            ),
+        )
+
+    projected: list[dict[str, Any]] = []
+    for message in messages:
+        copied = dict(message)
+        if copied.get("role") == "assistant":
+            tool_calls = copied.get("tool_calls")
+            if isinstance(tool_calls, list):
+                projected_calls: list[Any] = []
+                for call in tool_calls:
+                    next_call = dict(call) if isinstance(call, dict) else call
+                    function = next_call.get("function") if isinstance(next_call, dict) else None
+                    if isinstance(function, dict):
+                        bridge = _envelope(function.get("name"), function.get("arguments"))
+                        if bridge is not None:
+                            next_function = dict(function)
+                            next_function["name"], next_function["arguments"] = bridge
+                            next_call["function"] = next_function
+                    projected_calls.append(next_call)
+                copied["tool_calls"] = projected_calls
+            raw_items = copied.get(RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD)
+            if isinstance(raw_items, list):
+                projected_items: list[Any] = []
+                for item in raw_items:
+                    next_item = dict(item) if isinstance(item, dict) else item
+                    if isinstance(next_item, dict) and next_item.get("type") == "function_call":
+                        bridge = _envelope(next_item.get("name"), next_item.get("arguments"))
+                        if bridge is not None:
+                            next_item["name"], next_item["arguments"] = bridge
+                    projected_items.append(next_item)
+                copied[RESPONSES_OUTPUT_ITEMS_INTERNAL_FIELD] = projected_items
+        projected.append(copied)
+    return projected
+
+
 def _copy_anthropic_thinking_blocks(value: Any) -> list[dict[str, Any]]:
     """Return sanitized Anthropic thinking blocks for same-turn provider replay."""
 
@@ -3509,6 +3846,20 @@ def _regular_tool_call_event_data(
     if canonical_name != item.tool_call.name:
         data["canonical_name"] = canonical_name
     runtime_metadata = getattr(item.tool_call, "runtime_metadata", {}) or {}
+    visible_name = runtime_metadata.get("visible_name")
+    visible_arguments = runtime_metadata.get("visible_arguments")
+    if (
+        isinstance(visible_name, str)
+        and visible_name
+        and visible_name != item.tool_call.name
+        and isinstance(visible_arguments, dict)
+    ):
+        data["visible_name"] = visible_name
+        data["canonical_name"] = canonical_name
+        data["visible_arguments"] = _parent_visible_tool_arguments(
+            visible_name,
+            visible_arguments,
+        )
     cycle_index = runtime_metadata.get("turn_cycle_index")
     data["turn_cycle_index"] = (
         cycle_index
@@ -3611,7 +3962,11 @@ def _same_cycle_duplicate_tool_call_sources(tool_calls: list[ToolCall]) -> dict[
     return duplicate_sources
 
 
-def _record_tool_call_ledger_events(ctx: StepContext, events: list[SessionEvent]) -> None:
+def _record_tool_call_ledger_events(
+    ctx: StepContext,
+    events: list[SessionEvent],
+    registry: Any | None = None,
+) -> None:
     """Update the duplicate ledger from canonical persisted tool events.
 
     The Intaris event contract is authoritative for execution outcome: every
@@ -3622,6 +3977,7 @@ def _record_tool_call_ledger_events(ctx: StepContext, events: list[SessionEvent]
     absent or incorrect.
     """
 
+    effective_registry = registry if registry is not None else ctx.tool_registry
     for event in events:
         data = event.data
         call_id = data.get("call_id") if isinstance(data, dict) else None
@@ -3645,11 +4001,18 @@ def _record_tool_call_ledger_events(ctx: StepContext, events: list[SessionEvent]
         if event.type != "tool_result":
             continue
         candidate = ctx.tool_call_ledger_candidates.pop(call_id, None)
-        if candidate is None or data.get("is_error") is not False:
+        if candidate is None:
             continue
         name, fingerprint = candidate
-        if not _tool_is_read_only(name, ctx.tool_registry):
+        if _tool_is_read_only(name, effective_registry):
+            continue
+        if data.get("is_error") is False:
             ctx.same_turn_tool_call_ledger.record_fingerprint(name, fingerprint)
+        elif data.get("ambiguity") is not None or data.get("uncertain") is True:
+            # A persisted ambiguous outcome is uncertainty, not success. Both
+            # producer shapes count: agent-loop ambiguity payloads carry an
+            # "ambiguity" object, startup-recovery results carry "uncertain".
+            ctx.same_turn_tool_call_ledger.record_uncertain_fingerprint(name, fingerprint)
 
 
 def _same_turn_duplicate_tool_call_indexes(
@@ -3658,23 +4021,52 @@ def _same_turn_duplicate_tool_call_indexes(
     registry: Any | None,
     *,
     excluded_indexes: set[int] | None = None,
-) -> set[int]:
-    """Return exact successful non-read-only calls repeated in a turn lineage."""
+) -> tuple[set[int], set[int]]:
+    """Classify non-read-only calls repeated in a turn lineage.
+
+    Returns ``(executed, uncertain)`` index sets: ``executed`` for exact calls
+    that already completed successfully, ``uncertain`` for exact calls whose
+    earlier outcome is unknown (accepted by an executor whose connection was
+    lost before the result could be recovered). The two classes get different
+    model-facing rejections — claiming an uncertain call "already executed
+    successfully" would be false and misleads the model.
+    """
 
     excluded = excluded_indexes or set()
     duplicates: set[int] = set()
+    uncertain: set[int] = set()
     for index, tool_call in enumerate(tool_calls):
+        if index in excluded or _tool_is_read_only(tool_call.name, registry):
+            continue
         canonical_name = _canonical_registered_tool_name(tool_call.name, registry)
-        if (
-            index not in excluded
-            and not _tool_is_read_only(tool_call.name, registry)
-            and ledger.already_executed(
-                canonical_name,
-                _canonical_tool_arguments(tool_call.arguments),
-            )
-        ):
+        canonical_arguments = _canonical_tool_arguments(tool_call.arguments)
+        if ledger.already_executed(canonical_name, canonical_arguments):
             duplicates.add(index)
-    return duplicates
+        elif ledger.uncertain_outcome(canonical_name, canonical_arguments):
+            uncertain.add(index)
+    return duplicates, uncertain
+
+
+def _record_tool_outcome_in_same_turn_ledger(
+    ctx: StepContext,
+    tc: ToolCall,
+    result: ToolResult,
+) -> None:
+    """Record one finalized tool outcome in the same-turn duplicate ledger.
+
+    Same-process fast path: recorded before the next LLM cycle. The canonical
+    Intaris tool events record the same fingerprint after persistence and
+    support restart/retry reconstruction. An ambiguous outcome is tracked as
+    uncertain, never as a confirmed execution — claiming success for it would
+    both mislead the model and permanently wedge a legitimate re-issue.
+    """
+
+    if _tool_is_read_only(tc.name, ctx.tool_registry):
+        return
+    if not result.is_error:
+        ctx.same_turn_tool_call_ledger.record(tc.name, tc.arguments)
+    elif bool(result.metadata and result.metadata.get("uncertain")):
+        ctx.same_turn_tool_call_ledger.record_uncertain(tc.name, tc.arguments)
 
 
 def _canonical_registered_tool_name(tool_name: str, registry: Any | None) -> str:
@@ -3686,6 +4078,33 @@ def _canonical_registered_tool_name(tool_name: str, registry: Any | None) -> str
 
 def _canonical_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in arguments.items() if key != "target_executor"}
+
+
+def _resolve_call_tool_envelope(
+    tc: ToolCall,
+    inventory_tools: list[ToolDefinition],
+) -> tuple[ToolDefinition, dict[str, Any]] | None:
+    """Resolve a call_tool envelope to its canonical target without changing call identity."""
+
+    if tc.name != CALL_TOOL_TOOL.name:
+        return None
+    target_identifier = tc.arguments.get("tool")
+    target_arguments = tc.arguments.get("arguments")
+    target = (
+        resolve_inventory_tool(
+            cast(list[NativeToolDefinition], inventory_tools),
+            target_identifier,
+        )
+        if isinstance(target_identifier, str)
+        else None
+    )
+    if (
+        target is None
+        or target.name in {CALL_TOOL_TOOL.name, SEARCH_TOOLS_TOOL.name}
+        or not isinstance(target_arguments, dict)
+    ):
+        return None
+    return target, dict(target_arguments)
 
 
 def _controller_tool_definition(tool_name: str) -> ToolDefinition:
@@ -3731,7 +4150,7 @@ def _filter_model_inventory_tools(
 ) -> list[ToolDefinition]:
     filtered: list[ToolDefinition] = []
     permissions = agent.permissions
-    visible_skill_tool_ids = _attached_skill_tool_ids(agent)
+    visible_skill_tool_ids: set[str] = set()
     if promoted_tool_ids:
         visible_skill_tool_ids.update(promoted_tool_ids)
     if activated_tool_ids:
@@ -4763,6 +5182,7 @@ class ControllerToolExposure:
     schemas: list[dict[str, Any]]
     alias_map: dict[str, str] = field(default_factory=dict)
     definitions: list[ToolDefinition] = field(default_factory=list)
+    deferred_definitions: list[ToolDefinition] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -4999,6 +5419,7 @@ class StepContext:
     task_expected_output: str | None = None
     task_source_type: str | None = None
     task_source_ref: str | None = None
+    task_trigger_context: dict[str, Any] | None = None
     workflow_id: str | None = None
     workflow_name: str | None = None
     project_context: str | None = None
@@ -5013,6 +5434,7 @@ class StepContext:
     is_retry: bool = False  # True for re-attempt within the same step
     user_message_already_recorded: bool = False
     user_message: str = ""
+    user_visible_message: str | None = None
     intention_eligible: bool = True
     user_message_metadata: dict[str, Any] | None = None
     contextual_messages: list[dict[str, Any]] = field(default_factory=list)
@@ -5076,10 +5498,13 @@ class StepContext:
         default_factory=SameTurnToolCallLedger
     )
     execution_fence: Any | None = None
-    on_absorbed_append_start: Callable[[str, str], Any] | None = None
+    on_absorbed_append_start: Callable[[str, str, list[str]], Any] | None = None
     on_absorbed_persisted: Callable[[str], Any] | None = None
     on_boundary_persisted: Callable[[dict[str, Any]], Any] | None = None
+    on_boundary_committed: Callable[[dict[str, Any]], Any] | None = None
+    advance_boundary_phase: Callable[[], int] | None = None
     tool_call_ledger_candidates: dict[str, tuple[str, str]] = field(default_factory=dict)
+    canonical_tool_call_snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_events: list[SessionEvent] | None = None
     pending_tool_calls: dict[str, PendingToolCallState] = field(default_factory=dict)
     timeout_continuation_message: str | None = None
@@ -5096,6 +5521,10 @@ class StepContext:
     last_projection_snapshot: ContextPressureSnapshot | None = None
     last_projection_exceeded_selected_budget: bool | None = None
     remember_user_event_seq: int | None = None
+    remember_evidence_event_hash: str | None = None
+    remember_assistant_event_hash: str | None = None
+    user_origin: EvidenceOrigin | None = None
+    trusted_evidence_admission: TrustedEvidenceAdmission | None = None
     current_deliverable_id: str | None = None
     current_deliverable_version: int | None = None
     current_deliverable_content: str | None = None
@@ -5156,6 +5585,8 @@ class StepContext:
     profile_switch_continuation: bool = False
     profile_switch_tool_call_count: int = 0
     profile_switch_agentic_step_count: int = 0
+    profile_switch_todo_last_write_cycle: int = 0
+    profile_switch_todo_last_reminder_cycle: int = 0
     profile_switch_assistant_content_parts: list[str] = field(default_factory=list)
     profile_switch_assistant_memory_parts: list[str] = field(default_factory=list)
     profile_switch_collected_attachments: list[dict[str, Any]] = field(default_factory=list)
@@ -5225,6 +5656,7 @@ class CompactionRunContext:
 
     trigger: str
     reason: str
+    compaction_id: str = field(default_factory=lambda: f"compact_{uuid.uuid4().hex[:12]}")
     prompt_tokens: int = 0
     max_context_tokens: int = 0
     max_input_tokens: int = 0
@@ -5279,6 +5711,7 @@ class CompactionRunContext:
 
     def event_data(self) -> dict[str, Any]:
         return {
+            "compaction_id": self.compaction_id,
             "trigger": self.trigger,
             "reason": self.reason,
             "prompt_tokens": self.prompt_tokens,
@@ -5333,6 +5766,12 @@ class AgentLoop:
         tool_output_store: Any = None,
         step_context_assembler: Any = None,  # DEPRECATED — kept for backward compat
         step_runtime_factory: Any = None,
+        trusted_evidence_enabled: bool = False,
+        trusted_evidence_owner_allowlist: tuple[str, ...] = (),
+        trusted_evidence_policy_fingerprint: str = "",
+        trusted_evidence_admission_key: bytes = b"",
+        trusted_evidence_max_attempts: int = 8,
+        trusted_evidence_max_age_seconds: int = 3600,
     ) -> None:
         self.providers = providers
         self.session_manager = session_manager
@@ -5362,12 +5801,25 @@ class AgentLoop:
         self.notification_service: Any = None
         self._task_queue: Any = None
         self._turn_scheduler: Any = None
+        self._controller_directory: Any = None
+        self._controller_runtime: Any = None
         self._step_runtime_factory = step_runtime_factory
+        self.trusted_evidence_enabled = trusted_evidence_enabled
+        self._trusted_evidence_owner_allowlist = tuple(trusted_evidence_owner_allowlist)
+        self.trusted_evidence_policy_fingerprint = trusted_evidence_policy_fingerprint
+        self.trusted_evidence_admission_key = trusted_evidence_admission_key
+        self.trusted_evidence_max_attempts = trusted_evidence_max_attempts
+        self.trusted_evidence_max_age_seconds = trusted_evidence_max_age_seconds
         self._follow_up_policy = FollowUpPolicy(llm=getattr(providers, "llm", None))
         # Track active child sessions per parent session for /stop cancellation
         self._active_children: dict[str, dict[str, asyncio.Task[Any]]] = {}
         self._children_lock = asyncio.Lock()
         self._wire_background_shell_completion_callbacks()
+
+    @property
+    def trusted_evidence_owner_allowlist(self) -> tuple[str, ...]:
+        """Return the process-start owner selection without a runtime setter."""
+        return self._trusted_evidence_owner_allowlist
 
     def set_task_queue(self, task_queue: Any) -> None:
         """Wire the task queue after construction (breaks circular dependency).
@@ -5381,6 +5833,41 @@ class AgentLoop:
         """Wire the turn scheduler after construction for managed conversations."""
 
         self._turn_scheduler = turn_scheduler
+
+    def set_controller_recovery(self, controller_directory: Any, controller_runtime: Any) -> None:
+        """Wire replacement-controller discovery for managed turn admission."""
+
+        self._controller_directory = controller_directory
+        self._controller_runtime = controller_runtime
+
+    async def _submit_managed_turn(self, conversation_id: str, content: str, **kwargs: Any) -> Any:
+        """Retry one draining managed admission through the durable turn store."""
+
+        error = await self._turn_scheduler.submit_turn(conversation_id, content, **kwargs)
+        if error is None or error.code != "controller_draining":
+            return error
+        if self._controller_directory is None or self._controller_runtime is None:
+            return error
+
+        deadline = monotonic() + _MANAGED_DRAINING_RECOVERY_TIMEOUT_SECONDS
+        while monotonic() < deadline:
+            replacement = await self._controller_directory.get_ready_replacement(
+                self._controller_runtime.owner_id
+            )
+            if replacement is not None:
+                return await self._turn_scheduler.submit_turn(
+                    conversation_id,
+                    content,
+                    **kwargs,
+                    _replacement_admission=True,
+                )
+            await asyncio.sleep(
+                min(
+                    _MANAGED_DRAINING_RECOVERY_POLL_SECONDS,
+                    max(0.0, deadline - monotonic()),
+                )
+            )
+        return error
 
     @contextlib.asynccontextmanager
     async def hold_session_lock(self, session_id: str) -> AsyncIterator[None]:
@@ -6019,8 +6506,12 @@ class AgentLoop:
         """Resolve a fresh runtime for delegated child sessions when possible."""
 
         if callable(self._step_runtime_factory):
+            factory = cast(
+                Callable[..., Coroutine[Any, Any, ResolvedStepRuntime]],
+                self._step_runtime_factory,
+            )
             try:
-                return await self._step_runtime_factory(
+                return await factory(
                     agent=agent,
                     user_email=user_email,
                     executor_agent=executor_agent,
@@ -6031,7 +6522,7 @@ class AgentLoop:
                 if "conversation_id" in str(exc):
                     # Older factory without conversation_id support
                     try:
-                        return await self._step_runtime_factory(
+                        return await factory(
                             agent=agent,
                             user_email=user_email,
                             executor_agent=executor_agent,
@@ -6040,14 +6531,14 @@ class AgentLoop:
                     except TypeError as exc2:
                         if "access_context" not in str(exc2):
                             raise
-                        return await self._step_runtime_factory(
+                        return await factory(
                             agent=agent,
                             user_email=user_email,
                             executor_agent=executor_agent,
                         )
                 if "access_context" not in str(exc):
                     raise
-                return await self._step_runtime_factory(
+                return await factory(
                     agent=agent,
                     user_email=user_email,
                     executor_agent=executor_agent,
@@ -6123,6 +6614,7 @@ class AgentLoop:
         child_ctx.last_projection_exceeded_selected_budget = None
         child_ctx.remember_user_event_seq = None
         child_ctx.remember_assistant_event_seq = None
+        child_ctx.remember_assistant_event_hash = None
 
     async def _record_parent_session_events(
         self,
@@ -6146,7 +6638,11 @@ class AgentLoop:
             source="cognis",
             idempotency_key=idempotency_key,
         )
-        if parent_session is None or not getattr(append_result, "ok", False):
+        if not getattr(append_result, "ok", False):
+            raise RuntimeError(
+                f"Intaris rejected parent-session append for {parent_intaris_session_id}"
+            )
+        if parent_session is None:
             return
         try:
             await self.session_cache.append_recorded_events(parent_session, events, append_result)
@@ -6393,6 +6889,8 @@ class AgentLoop:
                         )
                     else:
                         raise RuntimeError(f"Delegation step failed: {error_text}")
+                if (output.metadata or {}).get("continuation_reason") == "session_terminal":
+                    raise RuntimeError("Delegation session became terminal during execution")
                 # Build durable child output from deliverables or all assistant
                 # messages, so a short cleanup tail cannot replace the report.
                 result_summary = output.summary if output and output.summary else "Completed."
@@ -6448,6 +6946,7 @@ class AgentLoop:
                 delegation_title = _delegation_title({"task": task_description})
                 duration_ms = _delegation_duration_ms()
                 # Record result in parent Intaris session — guarded
+                completion_persisted = False
                 try:
                     await self._record_parent_session_events(
                         parent_session=parent_session,
@@ -6493,6 +6992,7 @@ class AgentLoop:
                             f"{parent_intaris_session_id}:delegation_completed_{child_session_id}"
                         ),
                     )
+                    completion_persisted = True
                 except Exception:
                     logger.warning(
                         "delegation: failed to record completion in parent session",
@@ -6501,38 +7001,39 @@ class AgentLoop:
                     )
 
                 # Publish event bus event for frontend
-                await self.event_bus.publish(
-                    Event(
-                        type=EventType.DELEGATION_COMPLETED,
-                        data={
-                            "conversation_id": conversation_id,
-                            "child_session_id": child_session_id,
-                            "parent_session_id": parent_intaris_session_id,
-                            "agent_id": child_session.agent_id,
-                            "title": delegation_title,
-                            "task_title": delegation_title,
-                            "input_redacted": True,
-                            "call_id": parent_tool_call_id,
-                            "turn_id": parent_turn_id,
-                            "assistant_phase_index": parent_assistant_phase_index,
-                            "turn_cycle_index": parent_turn_cycle_index,
-                            "wait": wait,
-                            "started_at": delegation_started_at,
-                            "duration_ms": duration_ms,
-                            "result_summary": result_summary,
-                            "result_content": result_content,
-                            "result_source": result_selection.source,
-                            "result_anchors": result_selection.anchors,
-                            "result_truncated": result_selection.truncated,
-                            "delegation_metadata": delegation_metadata,
-                            "continuation": _delegate_continuation(
-                                child_session_id,
-                                status="completed",
-                            ),
-                            "todos": _delegation_progress_todos(child_ctx),
-                        },
+                if completion_persisted:
+                    await self.event_bus.publish(
+                        Event(
+                            type=EventType.DELEGATION_COMPLETED,
+                            data={
+                                "conversation_id": conversation_id,
+                                "child_session_id": child_session_id,
+                                "parent_session_id": parent_intaris_session_id,
+                                "agent_id": child_session.agent_id,
+                                "title": delegation_title,
+                                "task_title": delegation_title,
+                                "input_redacted": True,
+                                "call_id": parent_tool_call_id,
+                                "turn_id": parent_turn_id,
+                                "assistant_phase_index": parent_assistant_phase_index,
+                                "turn_cycle_index": parent_turn_cycle_index,
+                                "wait": wait,
+                                "started_at": delegation_started_at,
+                                "duration_ms": duration_ms,
+                                "result_summary": result_summary,
+                                "result_content": result_content,
+                                "result_source": result_selection.source,
+                                "result_anchors": result_selection.anchors,
+                                "result_truncated": result_selection.truncated,
+                                "delegation_metadata": delegation_metadata,
+                                "continuation": _delegate_continuation(
+                                    child_session_id,
+                                    status="completed",
+                                ),
+                                "todos": _delegation_progress_todos(child_ctx),
+                            },
+                        )
                     )
-                )
                 DELEGATIONS_TOTAL.labels(status="completed").inc()
                 logger.info(
                     "delegation: child session completed",
@@ -6567,6 +7068,7 @@ class AgentLoop:
             except Exception:
                 logger.warning("delegation: failed to mark child session cancelled", exc_info=True)
 
+            cancellation_persisted = False
             try:
                 await self._record_parent_session_events(
                     parent_session=parent_session,
@@ -6593,7 +7095,7 @@ class AgentLoop:
                                     "used_agent_id": child_session.agent_id,
                                     "delegation_metadata": delegation_metadata,
                                 },
-                            )
+                            ),
                         ],
                         None,
                     ),
@@ -6601,36 +7103,38 @@ class AgentLoop:
                         f"{parent_intaris_session_id}:delegation_cancelled_{child_session_id}"
                     ),
                 )
+                cancellation_persisted = True
             except Exception:
                 logger.warning(
                     "delegation: failed to record cancellation in parent session",
                     exc_info=True,
                 )
 
-            await self.event_bus.publish(
-                Event(
-                    type=EventType.DELEGATION_FAILED,
-                    data={
-                        "conversation_id": conversation_id,
-                        "child_session_id": child_session_id,
-                        "parent_session_id": parent_intaris_session_id,
-                        "agent_id": child_session.agent_id,
-                        "used_agent_id": child_session.agent_id,
-                        "title": _delegation_title({"task": task_description}),
-                        "task_title": _delegation_title({"task": task_description}),
-                        "input_redacted": True,
-                        "call_id": parent_tool_call_id,
-                        "turn_id": parent_turn_id,
-                        "assistant_phase_index": parent_assistant_phase_index,
-                        "turn_cycle_index": parent_turn_cycle_index,
-                        "wait": wait,
-                        "started_at": delegation_started_at,
-                        "duration_ms": duration_ms,
-                        "reason": "Cancelled",
-                        "delegation_metadata": delegation_metadata,
-                    },
+            if cancellation_persisted:
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.DELEGATION_FAILED,
+                        data={
+                            "conversation_id": conversation_id,
+                            "child_session_id": child_session_id,
+                            "parent_session_id": parent_intaris_session_id,
+                            "agent_id": child_session.agent_id,
+                            "used_agent_id": child_session.agent_id,
+                            "title": _delegation_title({"task": task_description}),
+                            "task_title": _delegation_title({"task": task_description}),
+                            "input_redacted": True,
+                            "call_id": parent_tool_call_id,
+                            "turn_id": parent_turn_id,
+                            "assistant_phase_index": parent_assistant_phase_index,
+                            "turn_cycle_index": parent_turn_cycle_index,
+                            "wait": wait,
+                            "started_at": delegation_started_at,
+                            "duration_ms": duration_ms,
+                            "reason": "Cancelled",
+                            "delegation_metadata": delegation_metadata,
+                        },
+                    )
                 )
-            )
             DELEGATIONS_TOTAL.labels(status="cancelled").inc()
             raise  # Re-raise so the parent coroutine also gets cancelled
         except Exception as exc:
@@ -6647,6 +7151,13 @@ class AgentLoop:
                 },
             )
             # Each operation guarded independently
+            failure_notice = (
+                "Delegated sub-session hit a failure; saved work remains attached "
+                "to the child session and can be used for recovery."
+            )
+            failure_notice_id = (
+                f"{parent_intaris_session_id}:{child_session_id}:delegation_recovery:child_session"
+            )
             try:
                 physical_child_session_id = (
                     child_ctx.session.session_id if child_ctx is not None else child_session_id
@@ -6658,6 +7169,7 @@ class AgentLoop:
             except Exception:
                 logger.warning("delegation: failed to mark child session as failed", exc_info=True)
 
+            failure_persisted = False
             try:
                 await self._record_parent_session_events(
                     parent_session=parent_session,
@@ -6690,7 +7202,27 @@ class AgentLoop:
                                         status="failed",
                                     ),
                                 },
-                            )
+                            ),
+                            SessionEvent(
+                                type="lifecycle",
+                                data=_system_notice_data(
+                                    failure_notice,
+                                    kind="delegation_recovery",
+                                    turn_id=parent_turn_id,
+                                    notice_id=failure_notice_id,
+                                    metadata={
+                                        "scope": "child_session",
+                                        "child_session_id": child_session_id,
+                                        "reason": error_summary,
+                                        "recoverable": True,
+                                        "delegation_metadata": delegation_metadata,
+                                        "continuation": _delegate_continuation(
+                                            child_session_id,
+                                            status="failed",
+                                        ),
+                                    },
+                                ),
+                            ),
                         ],
                         None,
                     ),
@@ -6698,72 +7230,68 @@ class AgentLoop:
                         f"{parent_intaris_session_id}:delegation_failed_{child_session_id}"
                     ),
                 )
+                failure_persisted = True
             except Exception:
                 logger.warning(
                     "delegation: failed to record failure in parent session",
                     exc_info=True,
                 )
 
-            failure_notice = (
-                "Delegated sub-session hit a failure; saved work remains attached "
-                "to the child session and can be used for recovery."
-            )
-            await self.event_bus.publish(
-                Event(
-                    type=EventType.SYSTEM_NOTICE,
-                    data={
-                        "conversation_id": conversation_id,
-                        "session_id": parent_intaris_session_id,
-                        "child_session_id": child_session_id,
-                        "message": failure_notice,
-                        "text": failure_notice,
-                        "kind": "delegation_recovery",
-                        "scope": "child_session",
-                        "notice_id": (
-                            f"{parent_intaris_session_id}:{child_session_id}:"
-                            "delegation_recovery:child_session"
-                        ),
-                        "reason": error_summary,
-                        "recoverable": True,
-                        "delegation_metadata": delegation_metadata,
-                        "continuation": _delegate_continuation(
-                            child_session_id,
-                            status="failed",
-                        ),
-                    },
+            if failure_persisted:
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.SYSTEM_NOTICE,
+                        data={
+                            "conversation_id": conversation_id,
+                            "session_id": parent_intaris_session_id,
+                            "child_session_id": child_session_id,
+                            "message": failure_notice,
+                            "text": failure_notice,
+                            "kind": "delegation_recovery",
+                            "scope": "child_session",
+                            "notice_id": failure_notice_id,
+                            "reason": error_summary,
+                            "recoverable": True,
+                            "delegation_metadata": delegation_metadata,
+                            "continuation": _delegate_continuation(
+                                child_session_id,
+                                status="failed",
+                            ),
+                        },
+                    )
                 )
-            )
 
-            # Publish event bus event for frontend
-            await self.event_bus.publish(
-                Event(
-                    type=EventType.DELEGATION_FAILED,
-                    data={
-                        "conversation_id": conversation_id,
-                        "child_session_id": child_session_id,
-                        "parent_session_id": parent_intaris_session_id,
-                        "agent_id": child_session.agent_id,
-                        "used_agent_id": child_session.agent_id,
-                        "title": _delegation_title({"task": task_description}),
-                        "task_title": _delegation_title({"task": task_description}),
-                        "input_redacted": True,
-                        "call_id": parent_tool_call_id,
-                        "turn_id": parent_turn_id,
-                        "assistant_phase_index": parent_assistant_phase_index,
-                        "turn_cycle_index": parent_turn_cycle_index,
-                        "wait": wait,
-                        "started_at": delegation_started_at,
-                        "duration_ms": duration_ms,
-                        "reason": error_summary,
-                        "recoverable": True,
-                        "delegation_metadata": delegation_metadata,
-                        "continuation": _delegate_continuation(
-                            child_session_id,
-                            status="failed",
-                        ),
-                    },
+            # Publish terminal runtime state only after the canonical batch exists.
+            if failure_persisted:
+                await self.event_bus.publish(
+                    Event(
+                        type=EventType.DELEGATION_FAILED,
+                        data={
+                            "conversation_id": conversation_id,
+                            "child_session_id": child_session_id,
+                            "parent_session_id": parent_intaris_session_id,
+                            "agent_id": child_session.agent_id,
+                            "used_agent_id": child_session.agent_id,
+                            "title": _delegation_title({"task": task_description}),
+                            "task_title": _delegation_title({"task": task_description}),
+                            "input_redacted": True,
+                            "call_id": parent_tool_call_id,
+                            "turn_id": parent_turn_id,
+                            "assistant_phase_index": parent_assistant_phase_index,
+                            "turn_cycle_index": parent_turn_cycle_index,
+                            "wait": wait,
+                            "started_at": delegation_started_at,
+                            "duration_ms": duration_ms,
+                            "reason": error_summary,
+                            "recoverable": True,
+                            "delegation_metadata": delegation_metadata,
+                            "continuation": _delegate_continuation(
+                                child_session_id,
+                                status="failed",
+                            ),
+                        },
+                    )
                 )
-            )
             DELEGATIONS_TOTAL.labels(status="failed").inc()
             output = None
         finally:
@@ -7037,9 +7565,10 @@ class AgentLoop:
                         allow_missing_stream=True,
                     )
                     events.extend(event for event in event_result.events if isinstance(event, dict))
-                    if not event_result.has_more or event_result.last_seq <= after_seq:
+                    next_after_seq = next_event_page_after_seq(event_result, after_seq)
+                    if next_after_seq is None:
                         break
-                    after_seq = event_result.last_seq
+                    after_seq = next_after_seq
         except Exception:
             logger.warning(
                 "delegation: failed to read child session events for result selection",
@@ -7065,10 +7594,10 @@ class AgentLoop:
             if event.get("type") != "assistant_message":
                 continue
             data = event.get("data") or {}
-            content = data.get("content")
-            if not isinstance(content, str) or not content.strip():
+            event_content = data.get("content")
+            if not isinstance(event_content, str) or not event_content.strip():
                 continue
-            messages.append(content.strip())
+            messages.append(event_content.strip())
 
         final_text = text.strip()
         output_failed = bool(step_output and step_output.error)
@@ -7414,6 +7943,8 @@ class AgentLoop:
         profile_switch_reentry = ctx.profile_switch_continuation
         tool_call_count = ctx.profile_switch_tool_call_count
         agentic_step_count = ctx.profile_switch_agentic_step_count
+        todo_last_write_cycle = ctx.profile_switch_todo_last_write_cycle
+        todo_last_reminder_cycle = ctx.profile_switch_todo_last_reminder_cycle
         todo_reprompt_count = 0
         todo_cleanup_only_allowed = False
         step_output: StepOutput | None = None
@@ -7430,6 +7961,7 @@ class AgentLoop:
         if not ctx.turn_id:
             ctx.turn_id = f"turn_{uuid.uuid4().hex[:12]}"
         tool_call_visible_names: dict[str, str] = {}
+        tool_call_visible_arguments: dict[str, dict[str, Any]] = {}
         messages: list[dict[str, Any]] = []
         assistant_content_parts = list(ctx.profile_switch_assistant_content_parts)
         assistant_memory_parts = list(ctx.profile_switch_assistant_memory_parts)
@@ -7437,8 +7969,21 @@ class AgentLoop:
 
         # Build tool definitions for LLM (controller-injected tools).
         controller_tool_exposure = self._build_controller_tool_exposure(ctx)
+        todo_write_available = bool(
+            _visible_allowed_tool_names(
+                frozenset({STEP_TODO_WRITE}),
+                controller_tool_exposure,
+            )
+        )
         controller_tool_schemas = filter_external_controller_schemas(
             controller_tool_exposure.schemas,
+            context=getattr(ctx.conversation, "context", None),
+            memory_backend_configured=bool(
+                isinstance(ctx.memory_policy, MemoryRuntimePolicy) and ctx.memory_policy.enabled
+            ),
+        )
+        authorized_deferred_controller_tools = filter_external_tool_definitions(
+            controller_tool_exposure.deferred_definitions,
             context=getattr(ctx.conversation, "context", None),
             memory_backend_configured=bool(
                 isinstance(ctx.memory_policy, MemoryRuntimePolicy) and ctx.memory_policy.enabled
@@ -7489,8 +8034,103 @@ class AgentLoop:
             ctx.system_initiated and getattr(ctx.session, "parent_session_id", None) is not None
         )
         recorded_user_source = "delegation_input" if record_system_user_message else "user_input"
+        internal_workflow_prompt = (
+            ctx.policy.require_step_complete and not record_system_user_message
+        )
         if recorded_user_message and ctx.user_message_metadata is None:
             ctx.user_message_metadata = message_metadata()
+        evidence_marker: dict[str, Any] | None = None
+        user_visible_content = ctx.user_message
+        evidence_eligible = bool(
+            ctx.turn_id
+            and is_eligible_user_event(
+                content=recorded_user_message,
+                user_visible_content=user_visible_content,
+                source=recorded_user_source,
+                role="user",
+                prompt_visibility="user_visible",
+                prompt_provenance={
+                    "kind": (
+                        ctx.user_origin.prompt_provenance
+                        if ctx.user_origin is not None
+                        else "user_authored"
+                    )
+                },
+                system_initiated=ctx.system_initiated,
+                is_retry=ctx.is_retry,
+                internal_workflow_prompt=internal_workflow_prompt,
+                delegated=_is_delegated_child_context(ctx),
+                profile_switch_reentry=profile_switch_reentry,
+                origin=ctx.user_origin,
+            )
+        )
+        if ctx.trusted_evidence_admission is None:
+            ctx.trusted_evidence_admission = build_evidence_admission(
+                key=self.trusted_evidence_admission_key,
+                admitted=evidence_eligible
+                and is_evidence_enabled_for_owner(
+                    enabled=self.trusted_evidence_enabled,
+                    owner_id=ctx.agent.owner_email,
+                    owner_allowlist=self.trusted_evidence_owner_allowlist,
+                ),
+                owner_id=ctx.agent.owner_email,
+                policy_fingerprint=self.trusted_evidence_policy_fingerprint,
+                event_binding=build_evidence_event_binding(
+                    intaris_session_id=(ctx.session.intaris_session_id or ctx.session.session_id),
+                    cognis_session_id=ctx.session.session_id,
+                    conversation_id=ctx.conversation.conversation_id,
+                    turn_id=ctx.turn_id,
+                    user_id=ctx.session.user_email,
+                    owner_id=ctx.agent.owner_email,
+                    source=recorded_user_source,
+                    role="user",
+                    prompt_visibility="user_visible",
+                    prompt_provenance={
+                        "kind": (
+                            ctx.user_origin.prompt_provenance
+                            if ctx.user_origin is not None
+                            else "user_authored"
+                        )
+                    },
+                    content_hash=hashlib.sha256(
+                        str(user_visible_content or "").encode("utf-8")
+                    ).hexdigest(),
+                    attachment_refs_value=attachment_refs_to_dicts(
+                        ctx.user_attachments,
+                        include_url=False,
+                    ),
+                ),
+                max_attempts=self.trusted_evidence_max_attempts,
+                max_age_seconds=self.trusted_evidence_max_age_seconds,
+            )
+        if (
+            evidence_admission_authorizes(
+                ctx.trusted_evidence_admission,
+                key=self.trusted_evidence_admission_key,
+                owner_id=ctx.agent.owner_email,
+            )
+            and evidence_eligible
+        ):
+            assert ctx.trusted_evidence_admission is not None
+            evidence_marker = build_marker(
+                content=user_visible_content,
+                source=recorded_user_source,
+                role="user",
+                prompt_visibility="user_visible",
+                prompt_provenance={"kind": "user_authored"},
+                user_id=ctx.session.user_email,
+                owner_id=ctx.agent.owner_email,
+                intaris_session_id=(ctx.session.intaris_session_id or ctx.session.session_id),
+                cognis_session_id=ctx.session.session_id,
+                conversation_id=ctx.conversation.conversation_id,
+                turn_id=ctx.turn_id,
+                attachment_refs_value=attachment_refs_to_dicts(
+                    ctx.user_attachments,
+                    include_url=False,
+                ),
+                admission=ctx.trusted_evidence_admission,
+                admission_key=self.trusted_evidence_admission_key,
+            )
         if (
             recorded_user_message
             and (not ctx.system_initiated or record_system_user_message)
@@ -7505,6 +8145,31 @@ class AgentLoop:
                         "content": recorded_user_message,
                         "content_type": "text",
                         "source": recorded_user_source,
+                        "prompt_visibility": (
+                            "model_only" if internal_workflow_prompt else "user_visible"
+                        ),
+                        "user_visible_content": (
+                            user_visible_content
+                            if not internal_workflow_prompt
+                            else ctx.user_visible_message
+                        ),
+                        "prompt_provenance": (
+                            {
+                                "kind": "internal_workflow_prompt",
+                                "task_id": ctx.task_id,
+                                "step_run_id": ctx.step_run_id,
+                                "workflow_id": ctx.workflow_id,
+                            }
+                            if internal_workflow_prompt
+                            else (
+                                {
+                                    "kind": "delegation_input",
+                                    "parent_session_id": ctx.session.parent_session_id,
+                                }
+                                if record_system_user_message
+                                else {"kind": "user_authored"}
+                            )
+                        ),
                         "intention_eligible": ctx.intention_eligible,
                         "message_metadata": ctx.user_message_metadata,
                         "turn_id": ctx.turn_id,
@@ -7532,6 +8197,8 @@ class AgentLoop:
                         ),
                     },
                 )
+                if evidence_marker is not None:
+                    user_msg_event.data[TRUSTED_EVIDENCE_MARKER_KEY] = evidence_marker
                 try:
                     await self._record_events_strict(
                         ctx,
@@ -7879,16 +8546,6 @@ class AgentLoop:
                             run=compaction_run,
                         )
                         if new_session is not None:
-                            await self._emit_compaction_notice(
-                                ctx,
-                                (
-                                    "Automatic compaction completed. Continuing your turn in a "
-                                    "fresh compacted session."
-                                ),
-                                on_token=on_token,
-                                persist=False,
-                                metadata=compaction_run.event_data(),
-                            )
                             ctx.session = new_session
                             ctx.is_retry = True
                             ctx.prior_context = None
@@ -7976,14 +8633,12 @@ class AgentLoop:
         max_model_error_continuations = _MODEL_ERROR_CONTINUATION_MAX_ATTEMPTS
         idle_timeout_continuation_count = 0
         max_idle_timeout_continuations = _IDLE_TIMEOUT_CONTINUATION_MAX_ATTEMPTS
-        saved_partial_tool_calls: dict[int, dict[str, Any]] | None = None
         # True when a failed stream attempt already emitted visible text to
         # clients; the retried stream then needs a leading separator because
         # the partial is dropped server-side but remains on screen live.
         mid_stream_partial_streamed = False
         promoted_tool_ids = self._get_initial_promoted_tool_ids(ctx)
         activated_tool_ids = self._get_initial_activated_tool_ids(ctx)
-        queued_discovery_guidance_mode: ToolDiscoveryMode | None = None
         collected_attachments = list(ctx.profile_switch_collected_attachments)
         pending_assistant_attachments = list(ctx.profile_switch_pending_assistant_attachments)
         assistant_content_by_phase: dict[int, str] = {}
@@ -8108,6 +8763,7 @@ class AgentLoop:
         while True:
             self._raise_if_cancelled(ctx)
             agentic_step_count += 1
+            ctx.profile_switch_agentic_step_count = agentic_step_count
             ctx.current_turn_cycle_index = agentic_step_count - 1
             if agentic_step_count > max_llm_cycles:
                 queue_terminal_attachment_event()
@@ -8163,6 +8819,28 @@ class AgentLoop:
                 )
             if _is_delegation and delegation_max_steps is not None:
                 _force_summary_mode = agentic_step_count >= delegation_max_steps
+
+            messages[:] = [
+                message for message in messages if not message.get("_todo_freshness_reminder")
+            ]
+            completed_cycles = agentic_step_count - 1
+            if (
+                todo_write_available
+                and not _force_summary_mode
+                and not todo_cleanup_only_allowed
+                and completed_cycles - todo_last_write_cycle >= _TODO_REMINDER_CYCLES_SINCE_WRITE
+                and completed_cycles - todo_last_reminder_cycle
+                >= _TODO_REMINDER_CYCLES_BETWEEN_REMINDERS
+            ):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": _TODO_FRESHNESS_REMINDER,
+                        "_todo_freshness_reminder": True,
+                    }
+                )
+                todo_last_reminder_cycle = completed_cycles
+                ctx.profile_switch_todo_last_reminder_cycle = todo_last_reminder_cycle
 
             if not workflow_step_reminder_added:
                 workflow_step_reminder = self._build_workflow_step_reminder(ctx)
@@ -8273,47 +8951,23 @@ class AgentLoop:
             )
             ctx.runtime_info.update(resolved_agent_profile.audit_metadata())
 
-            # Resolve model and reasoning effort for this turn.
-            # Chain: session override → agent profile → agent config → provider default.
-            model_override = self.session_cache.get_model_override(ctx.session.session_id)
-            get_model_override_provider_id = getattr(
-                self.session_cache, "get_model_override_provider_id", None
-            )
-            model_override_provider_id = (
-                get_model_override_provider_id(ctx.session.session_id)
-                if callable(get_model_override_provider_id)
-                else None
-            )
-            if model_override:
-                model_for_llm = model_override
-                provider_for_llm = model_override_provider_id
-            else:
-                model_for_llm = resolved_agent_profile.model or (
-                    ctx.agent.llm_config.model if ctx.agent.llm_config else None
-                )
-                provider_for_llm = resolved_agent_profile.provider_id or (
-                    ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
-                )
+            # Capture one authoritative selection for the whole admitted turn.
+            from cognis.core.runtime_selection import resolve_runtime_selection
+
+            runtime_selection = resolve_runtime_selection(ctx.agent, ctx.session, ctx.conversation)
+            model_for_llm = runtime_selection.model
+            provider_for_llm = runtime_selection.provider_id
 
             reasoning_effort = (
-                self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
-                or getattr(ctx.step_definition, "reasoning_effort", None)
-                or resolved_agent_profile.reasoning_effort
-                or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
+                runtime_selection.reasoning_effort
+                if runtime_selection.reasoning_effort_source == "session_override"
+                else (
+                    getattr(ctx.step_definition, "reasoning_effort", None)
+                    or runtime_selection.reasoning_effort
+                )
             )
             ctx.runtime_info["current_reasoning_effort"] = reasoning_effort
-            get_fast_mode_override = getattr(self.session_cache, "get_fast_mode_override", None)
-            fast_mode = (
-                get_fast_mode_override(ctx.session.session_id)
-                if callable(get_fast_mode_override)
-                else None
-            )
-            if fast_mode is None:
-                fast_mode = (
-                    resolved_agent_profile.fast_mode
-                    if resolved_agent_profile.fast_mode is not None
-                    else (ctx.agent.llm_config.fast_mode if ctx.agent.llm_config else None)
-                )
+            fast_mode = runtime_selection.fast_mode
             ctx.runtime_info["current_fast_mode"] = fast_mode
 
             llm_kwargs: dict[str, Any] = {}
@@ -8396,6 +9050,20 @@ class AgentLoop:
                 ctx.runtime_info["reasoning_mode"] = reasoning_mode
             else:
                 ctx.runtime_info.pop("reasoning_mode", None)
+            from cognis.core.execution_metadata import persist_execution_metadata
+
+            await persist_execution_metadata(
+                self.session_manager.session_factory,
+                session_id=ctx.session.session_id,
+                user_email=ctx.session.user_email,
+                model=current_model,
+                provider_id=current_provider_id,
+                profile_id=resolved_agent_profile.profile_id,
+                reasoning_effort=reasoning_effort,
+                reasoning_mode=reasoning_mode,
+                turn_id=ctx.turn_id,
+                runtime_selection_revision=runtime_selection.revision,
+            )
             registry = self._get_tool_registry(ctx)
             searchable_inventory_tools: list[ToolDefinition] = []
             default_visible_tool_ids: set[str] = set()
@@ -8488,13 +9156,21 @@ class AgentLoop:
                         and ctx.memory_policy.enabled
                     ),
                 )
+                searchable_inventory_tools.extend(authorized_deferred_controller_tools)
+                searchable_inventory_tools = filter_edit_tools_for_model(
+                    searchable_inventory_tools, getattr(model_info, "model_id", None)
+                )
+                deferred_controller_ids = {
+                    stable_tool_id(tool) for tool in authorized_deferred_controller_tools
+                }
                 default_visible_tool_ids = {
                     stable_tool_id(tool)
                     for tool in searchable_inventory_tools
-                    if step_profile_visible_by_default(tool, resolved_profile)
-                    or (
-                        resolved_profile.mode != StepProfileMode.HARD
-                        and stable_tool_id(tool) in activated_tool_ids
+                    if stable_tool_id(tool) not in deferred_controller_ids
+                    if _tool_visible_by_default(
+                        tool,
+                        resolved_profile,
+                        activated_tool_ids=activated_tool_ids,
                     )
                 }
             exposure = prepare_tool_exposure(
@@ -8507,6 +9183,7 @@ class AgentLoop:
                 allow_tool_search=allow_tool_search,
                 anthropic_cache_ttl=self.default_anthropic_cache_ttl,
             )
+            effective_discovery_mode = _effective_tool_discovery_mode(exposure)
             if controller_tool_exposure.alias_map:
                 exposure.alias_map.update(controller_tool_exposure.alias_map)
             prepare_anthropic_chain = getattr(
@@ -8581,6 +9258,11 @@ class AgentLoop:
                 "hidden_searchable_count": exposure.debug_metadata.get("hidden_searchable_count"),
                 "promoted_requested_count": exposure.debug_metadata.get("promoted_requested_count"),
                 "promoted_visible_count": exposure.debug_metadata.get("promoted_visible_count"),
+                "visible_source_counts": exposure.debug_metadata.get("visible_source_counts"),
+                "hidden_source_counts": exposure.debug_metadata.get("hidden_source_counts"),
+                "exposure_manifest": list(exposure.debug_metadata.get("exposure_manifest") or [])[
+                    :200
+                ],
             }
             assistant_runtime = assistant_message_runtime_metadata(ctx.agent, tool_runtime_info)
             if callable(update_tool_runtime_info):
@@ -8622,50 +9304,19 @@ class AgentLoop:
                     }
                 },
             )
-            search_tools_visible = any(
-                tool.get("function", {}).get("name") == SEARCH_TOOLS_TOOL.name
-                for tool in exposure.tools
-                if isinstance(tool, dict)
-            )
-            effective_discovery_mode = (
-                ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH
-                if exposure.debug_metadata.get("native_anthropic_search_enabled") is True
-                else ToolDiscoveryMode.CONTROLLER_SEARCH
-                if search_tools_visible
-                else ToolDiscoveryMode.NONE
-            )
-            if queued_discovery_guidance_mode != effective_discovery_mode:
-                if effective_discovery_mode == ToolDiscoveryMode.CONTROLLER_SEARCH:
-                    _queue_audit_message(
-                        role="system",
-                        source="tool_discovery_guidance",
-                        content=(
-                            "Additional tools may be available but hidden by the current step profile. "
-                            "You MUST call search_tools when you need a capability not currently visible, "
-                            "including Slack, Alertmanager, Mimir/Loki, skill_load, browser, filesystem, "
-                            "shell, or other MCP/external-service tools."
-                        ),
-                    )
-                elif effective_discovery_mode == ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH:
-                    _queue_audit_message(
-                        role="system",
-                        source="tool_discovery_guidance",
-                        content=(
-                            "Additional tools may be deferred from the current tool surface. "
-                            "Use the available Anthropic native tool-search server tool when "
-                            "you need a capability that is not currently loaded."
-                        ),
-                    )
-                else:
-                    _queue_audit_message(
-                        role="system",
-                        source="tool_discovery_guidance",
-                        content=(
-                            "Only the currently visible tools are available for this turn. "
-                            "Do not assume hidden tools can be searched or loaded."
-                        ),
-                    )
-                queued_discovery_guidance_mode = effective_discovery_mode
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "tool exposure manifest",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            **self._step_log_metadata(ctx),
+                            "entries": list(exposure.debug_metadata.get("exposure_manifest") or [])[
+                                :200
+                            ],
+                        }
+                    },
+                )
             visible_tool_names: set[str] = set()
             for tool_schema in exposure.tools:
                 if not isinstance(tool_schema, dict):
@@ -8802,6 +9453,12 @@ class AgentLoop:
             else:
                 model_messages = _reattach_anthropic_thinking_blocks(model_messages, messages)
                 model_messages = _reattach_anthropic_native_envelopes(model_messages, messages)
+            if effective_discovery_mode == ToolDiscoveryMode.CONTROLLER_SEARCH:
+                model_messages = _project_hidden_history_calls_through_bridge(
+                    model_messages,
+                    inventory_tools=searchable_inventory_tools,
+                    visible_tool_ids=exposure.visible_tool_ids,
+                )
             pre_call_snapshot = projected_model.snapshot
             if pre_call_snapshot is not None and pre_call_snapshot.available_prompt_tokens > 0:
                 context_used_percent = round(
@@ -8987,10 +9644,8 @@ class AgentLoop:
 
             # Stream LLM response
             accumulator = StreamAccumulator(block_id_prefix=llm_request_id)
-            if mid_stream_retries > 0:
-                accumulator.restore_tool_call_state(saved_partial_tool_calls)
             mid_stream_error: str | None = None
-            mid_stream_error_details: dict[str, Any] | None = None
+            mid_stream_error_details: dict[str, Any] | MidStreamErrorPayload | None = None
             llm_stream_max_retries_for_error = llm_stream_max_retries
             # Multiple assistant_message segments can be produced within a single turn
             # (for example after tool calls or reprompts). The live WebSocket stream
@@ -9050,6 +9705,8 @@ class AgentLoop:
                     acting_user_email=ctx.session.user_email,
                     cognis_llm_request_id=llm_request_id,
                     cognis_session_id=ctx.session.session_id,
+                    cognis_conversation_id=ctx.conversation.conversation_id,
+                    cognis_agent_id=ctx.session.agent_id,
                     tools=_effective_tools,
                     cache_breakpoint_index=projected_model.cache_breakpoints,
                     cognis_openai_apply_patch_tool_type=exposure_contract.native_apply_patch_tool_type,
@@ -9177,7 +9834,9 @@ class AgentLoop:
                 LLM_MID_STREAM_ERRORS_TOTAL.labels(
                     provider_id=current_provider_id or "default",
                     model=current_model or "unknown",
-                    category=str(mid_stream_error_details.get("category") or "idle_timeout"),
+                    category=str(
+                        (mid_stream_error_details or {}).get("category") or "idle_timeout"
+                    ),
                 ).inc()
                 logger.warning(
                     "agent: LLM stream idle timeout",
@@ -9212,7 +9871,9 @@ class AgentLoop:
                         on_tool_call=on_tool_call,
                         on_tool_result=on_tool_result,
                     )
-                    if step_output.metadata.get("finalized_by_recovery"):
+                    if step_output is not None and step_output.metadata.get(
+                        "finalized_by_recovery"
+                    ):
                         ctx.finalized_by_recovery = True
                     break
                 llm_status = "provider_error"
@@ -9220,7 +9881,7 @@ class AgentLoop:
                 LLM_MID_STREAM_ERRORS_TOTAL.labels(
                     provider_id=current_provider_id or "default",
                     model=current_model or "unknown",
-                    category=str(mid_stream_error_details.get("category") or "other"),
+                    category=str((mid_stream_error_details or {}).get("category") or "other"),
                 ).inc()
                 logger.warning(
                     "agent: LLM stream failed",
@@ -9251,7 +9912,7 @@ class AgentLoop:
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )
-                if step_output.metadata.get("finalized_by_recovery"):
+                if step_output is not None and step_output.metadata.get("finalized_by_recovery"):
                     ctx.finalized_by_recovery = True
                 break
             except Exception as exc:
@@ -9272,7 +9933,7 @@ class AgentLoop:
                     on_tool_call=on_tool_call,
                     on_tool_result=on_tool_result,
                 )
-                if step_output.metadata.get("finalized_by_recovery"):
+                if step_output is not None and step_output.metadata.get("finalized_by_recovery"):
                     ctx.finalized_by_recovery = True
                 break
 
@@ -9333,7 +9994,7 @@ class AgentLoop:
                         for failure in artifact_fetch_failures
                         if failure.artifact_id
                     }
-                    message_failures = _native_image_failures_from_messages(
+                    message_failures = _native_attachment_failures_from_messages(
                         messages,
                         artifact_ids=payload_artifact_ids or None,
                     )
@@ -9365,19 +10026,24 @@ class AgentLoop:
                         for artifact_id in sorted(artifact_fetch_failure_ids):
                             if artifact_id not in disabled_ids:
                                 disabled_ids.append(artifact_id)
-                    notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
-                    if notice:
+                    failure_notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
+                    if failure_notice:
                         disabled_notices = ctx.runtime_info.setdefault(
                             "disabled_artifact_notices", []
                         )
-                        if isinstance(disabled_notices, list) and notice not in disabled_notices:
-                            disabled_notices.append(notice)
+                        if (
+                            isinstance(disabled_notices, list)
+                            and failure_notice not in disabled_notices
+                        ):
+                            disabled_notices.append(failure_notice)
                     _strip_disabled_artifact_urls_from_messages(
-                        messages, artifact_fetch_failure_urls
+                        messages,
+                        artifact_fetch_failure_urls,
+                        artifact_fetch_failure_ids,
                     )
-                    notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
-                    if notice:
-                        messages.append({"role": "system", "content": notice})
+                    failure_notice = _artifact_fetch_failure_notice(artifact_fetch_failures)
+                    if failure_notice:
+                        messages.append({"role": "system", "content": failure_notice})
                 error_category = _mid_stream_reason_class(mid_stream_error_details, "other")
                 if error_category in _RECOVERY_NON_RETRYABLE_CATEGORIES:
                     llm_stream_max_retries_for_error = 0
@@ -9396,7 +10062,6 @@ class AgentLoop:
                     retry_projected_model = (
                         None if transcript_mutated_for_retry else projected_model
                     )
-                    saved_partial_tool_calls = accumulator.clone_tool_call_state()
                     if accumulator.get_content():
                         mid_stream_partial_streamed = True
                     # Discard the failed attempt's incomplete live thinking
@@ -9488,9 +10153,10 @@ class AgentLoop:
                                 exc_info=True,
                             )
                     await asyncio.sleep(delay)
-                    continue  # retry — keep partial tool-call state, drop partial text
+                    continue  # retry the request with all partial generation state discarded
 
-                # Retries exhausted — do not record partial assistant text.
+                # This call cannot be replayed safely. Do not record partial
+                # assistant text, thinking, or tool-call state.
                 # Partial free text pollutes history more than it helps.
                 partial_content = accumulator.get_content()
                 if partial_content:
@@ -9505,7 +10171,7 @@ class AgentLoop:
                     )
 
                 logger.warning(
-                    "agent: mid-stream failure after retries exhausted",
+                    "agent: mid-stream failure selecting recovery strategy",
                     extra={
                         "extra_data": {
                             "session_id": ctx.session.session_id,
@@ -9539,15 +10205,13 @@ class AgentLoop:
                     provider_retry_after_seconds is not None
                     and provider_retry_after_seconds > _MAX_RETRY_AFTER_SLEEP_SECONDS
                 )
-                if (
+                successor_eligible = (
                     _should_continue_after_exhausted_mid_stream_failure(
-                        mid_stream_error,
-                        mid_stream_error_details,
+                        mid_stream_error, mid_stream_error_details
                     )
-                    and continuation_count < max_continuations
                     and not retry_after_exceeds_inline_cap
-                    and not visible_chunk_seen
-                ):
+                )
+                if successor_eligible and continuation_count < max_continuations:
                     if is_idle_timeout_failure:
                         idle_timeout_continuation_count += 1
                         continuation_count = idle_timeout_continuation_count
@@ -9619,7 +10283,11 @@ class AgentLoop:
                     )
                     mid_stream_retries = 0
                     visible_chunk_seen = False
-                    saved_partial_tool_calls = None
+                    if hasattr(self.session_cache, "discard_incomplete_active_thinking"):
+                        with contextlib.suppress(Exception):
+                            self.session_cache.discard_incomplete_active_thinking(
+                                ctx.session.session_id
+                            )
                     continue
                 retry_after_seconds = _mid_stream_retry_after_seconds(mid_stream_error_details)
                 retry_at = _retry_at_iso(provider_retry_after_seconds)
@@ -9641,15 +10309,20 @@ class AgentLoop:
                     idle_timeout_seconds=llm_stream_idle_timeout_seconds,
                     provider_retry_after_seconds=provider_retry_after_seconds,
                 )
+                if successor_eligible:
+                    error_notice = (
+                        "Model stream recovery exhausted within this turn. "
+                        "Requesting a bounded successor turn from saved state."
+                    )
                 events_to_record.append(
                     SessionEvent(
                         type="lifecycle",
                         data=_system_notice_data(
                             error_notice,
-                            kind="model_error",
+                            kind="model_recovery" if successor_eligible else "model_error",
                             turn_id=ctx.turn_id,
                             metadata={
-                                "scope": "failed_turn",
+                                "scope": "continuation" if successor_eligible else "failed_turn",
                                 "provider_id": notice_provider_id,
                                 "model": notice_model,
                                 "reason_class": reason_class,
@@ -9660,7 +10333,8 @@ class AgentLoop:
                                 "attempts_per_cycle": attempts_per_cycle,
                                 "continuation_attempts": continuation_count,
                                 "tool_results_saved": True,
-                                "recoverable": True,
+                                "recoverable": reason_class
+                                not in _RECOVERY_NON_RETRYABLE_CATEGORIES,
                             },
                         ),
                     )
@@ -9682,6 +10356,15 @@ class AgentLoop:
                         "reason": "mid_stream_failure_exhausted",
                     },
                     metadata={
+                        **(
+                            {
+                                "interrupted": True,
+                                "continuation_reason": MID_STREAM_FAILURE_CONTINUATION_REASON,
+                                "pending_todos": _pending_todos_snapshot(ctx),
+                            }
+                            if successor_eligible
+                            else {}
+                        ),
                         "model_error": {
                             "provider_id": notice_provider_id,
                             "model": notice_model,
@@ -9689,14 +10372,27 @@ class AgentLoop:
                             "attempts": total_attempts,
                             "continuation_attempts": continuation_count,
                             "tool_results_saved": True,
-                            "recoverable": True,
-                        }
+                            "recoverable": reason_class not in _RECOVERY_NON_RETRYABLE_CATEGORIES,
+                            # Durable retry is reserved for provider-directed
+                            # delays that cannot be honored in-process. Other
+                            # failures already consumed the bounded local
+                            # retry and continuation budgets.
+                            "transient": retry_after_exceeds_inline_cap
+                            and reason_class not in _RECOVERY_NON_RETRYABLE_CATEGORIES,
+                            "retry_after_seconds": provider_retry_after_seconds,
+                            "recovery_strategy": (
+                                "durable_delayed_retry"
+                                if retry_after_exceeds_inline_cap
+                                else "automatic_continuation"
+                                if successor_eligible
+                                else "terminal"
+                            ),
+                        },
                     },
                     attachments=list(collected_attachments),
                 )
 
             finish_reason = accumulator.finish_reason
-            saved_partial_tool_calls = None
             mid_stream_retries = 0
             visible_chunk_seen = False
             if hasattr(self.session_cache, "update_last_llm_usage"):
@@ -9709,6 +10405,9 @@ class AgentLoop:
                     ctx.session.session_id,
                     accumulator.performance,
                 )
+            persist_runtime_metadata = getattr(self.session_cache, "persist_runtime_metadata", None)
+            if callable(persist_runtime_metadata):
+                await persist_runtime_metadata(ctx.session.session_id)
 
             # ---------------------------------------------------------------
             # Finalize thinking blocks and drain any remaining events
@@ -9905,6 +10604,20 @@ class AgentLoop:
             for _tc_index, tc in enumerate(tool_calls):
                 if ctx.current_turn_cycle_index is not None:
                     tc.runtime_metadata["turn_cycle_index"] = ctx.current_turn_cycle_index
+                if tc.name == CALL_TOOL_TOOL.name:
+                    envelope_arguments = dict(tc.arguments)
+                    resolved_envelope = _resolve_call_tool_envelope(
+                        tc,
+                        searchable_inventory_tools,
+                    )
+                    if resolved_envelope is not None:
+                        target, target_arguments = resolved_envelope
+                        tool_call_visible_names[tc.call_id] = CALL_TOOL_TOOL.name
+                        tool_call_visible_arguments[tc.call_id] = envelope_arguments
+                        tc.runtime_metadata["visible_name"] = CALL_TOOL_TOOL.name
+                        tc.runtime_metadata["visible_arguments"] = envelope_arguments
+                        tc.name = target.name
+                        tc.arguments = target_arguments
                 mapped_name = exposure.alias_map.get(tc.name, tc.name)
                 if mapped_name != tc.name:
                     tool_call_visible_names[tc.call_id] = tc.name
@@ -10457,7 +11170,26 @@ class AgentLoop:
                     continue
                 else:
                     # Failed to call step_complete after re-prompt
-                    step_output = None
+                    error_msg = "Step did not call step_complete after the bounded reminder budget."
+                    step_output = StepOutput(
+                        summary="Step interrupted: missing step_complete",
+                        content=content,
+                        error=error_msg,
+                        outcome={
+                            "status": "failed",
+                            "reason": MISSING_STEP_COMPLETE_CONTINUATION_REASON,
+                        },
+                        metadata={
+                            "interrupted": True,
+                            "continuation_reason": MISSING_STEP_COMPLETE_CONTINUATION_REASON,
+                            "reprompt_count": step_reprompt_count,
+                            "max_reprompts": _MAX_STEP_COMPLETE_REPROMPTS,
+                        },
+                        attachments=list(collected_attachments),
+                        session_id=ctx.session.session_id,
+                        intaris_session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                        completed_at=datetime.now(UTC),
+                    )
                     break
 
             # Process tool calls
@@ -10476,7 +11208,9 @@ class AgentLoop:
                             "type": "function",
                             "function": {
                                 "name": tool_call_visible_names.get(tc.call_id, tc.name),
-                                "arguments": json.dumps(tc.arguments),
+                                "arguments": json.dumps(
+                                    tool_call_visible_arguments.get(tc.call_id, tc.arguments)
+                                ),
                             },
                         }
                         for tc in all_emitted_tool_calls
@@ -10498,7 +11232,9 @@ class AgentLoop:
                             "type": "function",
                             "function": {
                                 "name": tool_call_visible_names.get(tc.call_id, tc.name),
-                                "arguments": json.dumps(tc.arguments),
+                                "arguments": json.dumps(
+                                    tool_call_visible_arguments.get(tc.call_id, tc.arguments)
+                                ),
                             },
                         }
                         for tc in all_emitted_tool_calls
@@ -10567,13 +11303,17 @@ class AgentLoop:
                 registry_snapshot: Any = registry,
                 record_loop_guard: bool = True,
             ) -> None:
+                runtime_name, runtime_arguments = _runtime_tool_presentation(
+                    tc,
+                    tool_call_visible_names,
+                )
                 if on_tool_call:
                     await _emit_with_optional_trailing_arg(
                         on_tool_call,
                         (
-                            tool_call_visible_names.get(tc.call_id, tc.name),
+                            runtime_name,
                             tc.call_id,
-                            _parent_visible_tool_arguments(tc.name, tc.arguments),
+                            runtime_arguments,
                         ),
                         ctx.current_turn_cycle_index,
                     )
@@ -10581,6 +11321,7 @@ class AgentLoop:
                     events_to_record,
                     tc,
                     tool_id or _tool_id_for_call(tc.name, registry_snapshot),
+                    visible_name=tool_call_visible_names.get(tc.call_id),
                     turn_cycle_index=ctx.current_turn_cycle_index,
                 )
                 messages.append(
@@ -10606,7 +11347,7 @@ class AgentLoop:
                     await _emit_tool_result_callback(
                         on_tool_result,
                         call_id=tc.call_id,
-                        tool_name=tool_call_visible_names.get(tc.call_id, tc.name),
+                        tool_name=runtime_name,
                         result=payload,
                         is_error=True,
                         duration_ms=None,
@@ -10715,7 +11456,11 @@ class AgentLoop:
             # cross-turn duplicates that the same-cycle guard and the
             # executor's turn-id-scoped dedup cannot. The first (or original)
             # execution is retained; the duplicate never reaches the executor.
-            lineage_duplicate_indexes = _same_turn_duplicate_tool_call_indexes(
+            (
+                lineage_duplicate_indexes,
+                lineage_uncertain_indexes,
+            ) = self._same_turn_duplicate_tool_call_indexes(
+                ctx,
                 ctx.same_turn_tool_call_ledger,
                 tool_calls,
                 registry,
@@ -10767,6 +11512,47 @@ class AgentLoop:
                 # Reuse the same exclusion set the downstream dispatch/budget
                 # loop already honors so the suppressed call is never executed.
                 duplicate_tool_call_sources[lineage_index] = lineage_tc
+
+            for uncertain_index in sorted(lineage_uncertain_indexes):
+                uncertain_tc = tool_calls[uncertain_index]
+                SAME_TURN_DUPLICATE_TOOL_CALLS_SUPPRESSED_TOTAL.labels(
+                    tool_name=uncertain_tc.name,
+                    scope="uncertain_outcome",
+                ).inc()
+                logger.warning(
+                    "Blocked re-issue of tool call with unknown earlier outcome",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
+                            "tool_name": uncertain_tc.name,
+                            "call_id": uncertain_tc.call_id,
+                        }
+                    },
+                )
+                await _emit_synthetic_tool_error(
+                    uncertain_tc,
+                    uncertain_outcome_rejection_payload(uncertain_tc.name, uncertain_tc.arguments),
+                    tool_id=_tool_id_for_call(uncertain_tc.name, registry),
+                    lifecycle_data={
+                        "event": "tool_call_blocked_uncertain_outcome",
+                        "tool_name": uncertain_tc.name,
+                        "call_id": uncertain_tc.call_id,
+                        "reason": "previous_identical_call_outcome_unknown",
+                    },
+                    record_loop_guard=False,
+                )
+                # Warn once with an accurate diagnostic, then clear the entry:
+                # a deliberate second identical re-issue executes normally
+                # instead of wedging the turn on a call that never confirmably
+                # ran. Consumed only after the rejection was actually emitted —
+                # if emission fails, the safety barrier must stay in place.
+                canonical_name = _canonical_registered_tool_name(uncertain_tc.name, registry)
+                ctx.same_turn_tool_call_ledger.consume_uncertain(
+                    canonical_name,
+                    _canonical_tool_arguments(uncertain_tc.arguments),
+                )
+                duplicate_tool_call_sources[uncertain_index] = uncertain_tc
 
             retained_tool_calls = [
                 tool_call
@@ -10910,13 +11696,18 @@ class AgentLoop:
                     continue
                 STEP_TOOL_CALLS.labels(tool_name=tool_id).inc()
 
+                runtime_name, runtime_arguments = _runtime_tool_presentation(
+                    tc,
+                    tool_call_visible_names,
+                    tool_call_visible_arguments,
+                )
                 if on_tool_call:
                     await _emit_with_optional_trailing_arg(
                         on_tool_call,
                         (
-                            tc.name,
+                            runtime_name,
                             tc.call_id,
-                            _parent_visible_tool_arguments(tc.name, tc.arguments),
+                            runtime_arguments,
                         ),
                         ctx.current_turn_cycle_index,
                     )
@@ -11370,22 +12161,30 @@ class AgentLoop:
                 if self._should_count_tool_call(tc.name):
                     tool_call_count += 1
 
-                if prepared_regular_batch and (
+                controller_dispatch = (
                     tc.name in _CONTROLLER_INTERCEPTED_TOOLS or is_orchestration_tool(tc.name)
-                ):
-                    await self._execute_regular_tool_batch(
+                )
+                if controller_dispatch:
+                    if prepared_regular_batch:
+                        await self._execute_regular_tool_batch(
+                            ctx,
+                            prepared_regular_batch,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            collected_attachments=collected_attachments,
+                            pending_assistant_attachments=pending_assistant_attachments,
+                            promoted_tool_ids=promoted_tool_ids,
+                            activated_tool_ids=activated_tool_ids,
+                            on_token=on_token,
+                            on_tool_result=on_tool_result,
+                        )
+                        prepared_regular_batch.clear()
+                    terminal_output = await self._stale_session_step_output(
                         ctx,
-                        prepared_regular_batch,
-                        events_to_record=events_to_record,
-                        messages=messages,
-                        collected_attachments=collected_attachments,
-                        pending_assistant_attachments=pending_assistant_attachments,
-                        promoted_tool_ids=promoted_tool_ids,
-                        activated_tool_ids=activated_tool_ids,
-                        on_token=on_token,
-                        on_tool_result=on_tool_result,
+                        phase="before_controller_tool_dispatch",
                     )
-                    prepared_regular_batch.clear()
+                    if terminal_output is not None:
+                        return terminal_output
 
                 # Controller tool interception
                 if tc.name == ATTACH_ARTIFACT:
@@ -11574,7 +12373,8 @@ class AgentLoop:
                         validation_phase="execution",
                         exact_write_validation_present=exact_validation_present,
                     )
-                    rejection_reason = _write_deliverable_revalidation_reason(
+                    rejection_reason = _write_deliverable_execution_rejection_reason(
+                        tc.arguments,
                         ctx.validated_write_deliverable_states,
                         payload_fingerprint=payload_fingerprint,
                         current_state_fingerprint=execution_validation.get(
@@ -11634,48 +12434,6 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    raw_content = tc.arguments.get("content")
-                    if not isinstance(raw_content, str):
-                        err_content = json.dumps(
-                            {
-                                "status": "rejected",
-                                "reason": "invalid_content_type",
-                                "message": (
-                                    "write_deliverable.content must be a string. "
-                                    "Reissue write_deliverable with the exact deliverable text, "
-                                    "not an array, object, tuple-like value, or other type."
-                                ),
-                                "received_type": type(raw_content).__name__,
-                            }
-                        )
-                        messages.append(
-                            _tool_result_message(tc, err_content, protected=True, is_error=True)
-                        )
-                        _append_tool_result_event(
-                            events_to_record,
-                            tc,
-                            err_content,
-                            True,
-                            tool_id=tool_id,
-                            protect_from_pruning=True,
-                        )
-                        await self._flush_events_incremental(
-                            ctx,
-                            events_to_record,
-                            reason="tool_result:write_deliverable",
-                            on_token=on_token,
-                        )
-                        if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
-                        continue
-
-                    content = raw_content
-                    format_name = str(tc.arguments.get("format") or "markdown")
-                    title = tc.arguments.get("title")
-                    target = tc.arguments.get("target")
-                    outputs = tc.arguments.get("outputs")
-                    rich = tc.arguments.get("rich")
-
                     if (
                         self._deliverable_owner_step_run_id(ctx) is None
                         and ctx.controller_tool_surface != CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
@@ -11711,41 +12469,32 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
 
-                    if not content.strip():
-                        err_content = json.dumps(
-                            {
-                                "status": "rejected",
-                                "reason": "empty_content",
-                                "message": "write_deliverable requires non-empty content.",
+                    try:
+                        resolved_authoring = await resolve_deliverable_authoring(
+                            tc.arguments,
+                            session_factory=self.session_manager.session_factory,
+                            artifact_store=self.artifact_store,
+                            owner_email=ctx.conversation.user_email,
+                            conversation_id=ctx.conversation.conversation_id,
+                            agent_id=ctx.conversation.agent_id,
+                            expected_artifact_id=execution_validation.get("resolved_artifact_id"),
+                            expected_digest=execution_validation.get("resolved_artifact_digest"),
+                        )
+                    except (DeliverableAuthoringError, RichPayloadValidationError) as exc:
+                        if isinstance(exc, DeliverableAuthoringError):
+                            cause = {
+                                "reason": exc.code,
+                                "path": exc.path,
+                                "message": exc.message,
                             }
-                        )
-                        messages.append(
-                            _tool_result_message(tc, err_content, protected=True, is_error=True)
-                        )
-                        _append_tool_result_event(
-                            events_to_record,
-                            tc,
-                            err_content,
-                            True,
-                            tool_id=tool_id,
-                            protect_from_pruning=True,
-                        )
-                        await self._flush_events_incremental(
-                            ctx,
-                            events_to_record,
-                            reason="tool_result:write_deliverable",
-                            on_token=on_token,
-                        )
-                        if on_tool_result:
-                            await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
-                        continue
-
-                    if format_name not in {"markdown", "plain", "html", "rich"}:
+                        else:
+                            cause = exc.to_tool_result()
                         err_content = json.dumps(
                             {
                                 "status": "rejected",
-                                "reason": "invalid_format",
-                                "message": "write_deliverable format must be one of: markdown, plain, html, rich.",
+                                "reason": "invalid_authoring_payload",
+                                "message": "write_deliverable authoring resolution failed.",
+                                "cause": cause,
                             }
                         )
                         messages.append(
@@ -11784,26 +12533,26 @@ class AgentLoop:
                     try:
                         deliverable = await self._write_step_deliverable(
                             ctx,
-                            content=content,
-                            format=format_name,
-                            title=str(title).strip()
-                            if isinstance(title, str) and title.strip()
-                            else None,
-                            target=(
-                                str(target)
-                                if isinstance(target, str) and target in {"channel", "none"}
-                                else None
-                            ),
-                            outputs=outputs if isinstance(outputs, dict) else {},
-                            rich=rich if isinstance(rich, dict) else None,
+                            authoring=resolved_authoring,
                             daily_brief_contract_fingerprint=(
                                 payload_fingerprint if strict_daily_brief else None
                             ),
                             daily_brief_contract_version=(
-                                daily_brief_activation.version if strict_daily_brief else None
+                                daily_brief_activation.version
+                                if strict_daily_brief and daily_brief_activation is not None
+                                else None
                             ),
                         )
-                    except RichPayloadValidationError as exc:
+                    except (DeliverableAuthoringError, RichPayloadValidationError) as exc:
+                        cause = (
+                            {
+                                "reason": exc.code,
+                                "path": exc.path,
+                                "message": exc.message,
+                            }
+                            if isinstance(exc, DeliverableAuthoringError)
+                            else exc.to_tool_result()
+                        )
                         err_content = json.dumps(
                             {
                                 "status": "rejected",
@@ -11812,7 +12561,7 @@ class AgentLoop:
                                     "Artifact or media state changed after execution-time "
                                     "revalidation; validate the exact payload again."
                                 ),
-                                "cause": exc.to_tool_result(),
+                                "cause": cause,
                                 "required_action": "revalidate_exact_payload",
                             }
                         )
@@ -11869,13 +12618,15 @@ class AgentLoop:
                             await on_tool_result(tc.call_id, tc.name, err_content, True, None, None)
                         continue
                     ctx.deterministic_deliverable_failures.reset()
-                    preview = compact_snippet(content, max_chars=_DELIVERABLE_PREVIEW_CHARS)
+                    preview = compact_snippet(
+                        deliverable.content, max_chars=_DELIVERABLE_PREVIEW_CHARS
+                    )
                     result_content = json.dumps(
                         {
                             "status": "buffered",
                             "deliverable_id": deliverable.deliverable_id,
                             "version": deliverable.version,
-                            "length": len(content),
+                            "length": len(deliverable.content),
                             "format": deliverable.format,
                             "scope": "step" if deliverable.step_run_id else "conversation",
                             "render_metadata": deliverable.render_metadata,
@@ -12251,6 +13002,8 @@ class AgentLoop:
                     ctx.profile_switch_continuation = True
                     ctx.profile_switch_tool_call_count = tool_call_count
                     ctx.profile_switch_agentic_step_count = agentic_step_count
+                    ctx.profile_switch_todo_last_write_cycle = todo_last_write_cycle
+                    ctx.profile_switch_todo_last_reminder_cycle = todo_last_reminder_cycle
                     ctx.profile_switch_assistant_content_parts = assistant_content_parts
                     ctx.profile_switch_assistant_memory_parts = assistant_memory_parts
                     ctx.profile_switch_collected_attachments = collected_attachments
@@ -12378,14 +13131,17 @@ class AgentLoop:
 
                     previous_executor_id = getattr(ctx, "active_executor_id", None)
                     switched_target: Any = None
+                    target = pool.by_id(target_executor_id_arg.strip())
                     if _is_delegated_child_context(ctx):
-                        target = pool.by_id(target_executor_id_arg.strip())
-                        if target is not None and target.usable:
-                            self._install_active_executor_target(
+                        if (
+                            target is not None
+                            and target.usable
+                            and self._install_active_executor_target(
                                 ctx,
                                 target,
                                 update_conversation=False,
                             )
+                        ):
                             switched_target = target
                             outcome_payload = {
                                 "status": "ok",
@@ -12416,6 +13172,24 @@ class AgentLoop:
                             }
                             is_error = True
                             result_content = json.dumps(outcome_payload)
+                    elif (
+                        target is not None
+                        and target.executor_type == "websocket"
+                        and self._resolve_target_connection(
+                            target_executor_id=target.executor_id,
+                            target_executor_type=target.executor_type,
+                        )
+                        is None
+                    ):
+                        is_error = True
+                        result_content = json.dumps(
+                            {
+                                "status": "error",
+                                "reason": "not_ready",
+                                "detail": f"Executor '{target.executor_id}' is reconnecting.",
+                                "executor_id": target.executor_id,
+                            }
+                        )
                     else:
                         outcome = await perform_executor_switch(
                             conversation_id=ctx.conversation.conversation_id,
@@ -12427,10 +13201,37 @@ class AgentLoop:
                             task_id=ctx.task_id,
                         )
                         is_error = outcome.status == "error"
-                        if not is_error and outcome.target is not None:
-                            self._install_active_executor_target(ctx, outcome.target)
-                            switched_target = outcome.target
                         result_content = json.dumps(outcome.to_tool_result())
+                        if not is_error and outcome.target is not None:
+                            if self._install_active_executor_target(ctx, outcome.target):
+                                switched_target = outcome.target
+                            else:
+                                if isinstance(previous_executor_id, str) and previous_executor_id:
+                                    await perform_executor_switch(
+                                        conversation_id=ctx.conversation.conversation_id,
+                                        pool=pool,
+                                        executor_id=previous_executor_id,
+                                        actor="agent",
+                                        session_factory=self.session_manager.session_factory,
+                                        task_id=ctx.task_id,
+                                    )
+                                is_error = True
+                                result_content = json.dumps(
+                                    {
+                                        "status": "error",
+                                        "reason": "not_ready",
+                                        "detail": (
+                                            f"Executor '{outcome.target.executor_id}' is reconnecting."
+                                        ),
+                                        "executor_id": outcome.target.executor_id,
+                                    }
+                                )
+                    if (
+                        not is_error
+                        and switched_target is not None
+                        and switched_target.executor_id != previous_executor_id
+                    ):
+                        await self._refresh_executor_session_policy(ctx)
                     messages.append(_tool_result_message(tc, result_content, protected=True))
                     _append_tool_result_event(
                         events_to_record, tc, result_content, is_error, tool_id=tool_id
@@ -12440,6 +13241,11 @@ class AgentLoop:
                         and switched_target is not None
                         and switched_target.executor_id != previous_executor_id
                     ):
+                        await self._persist_execution_paths(
+                            ctx,
+                            workspace_root=ctx.workspace_root,
+                            working_directory=ctx.working_directory,
+                        )
                         new_executor_id = switched_target.executor_id
                         escaped_previous_executor_id = html.escape(
                             previous_executor_id or "unassigned", quote=True
@@ -13172,6 +13978,8 @@ class AgentLoop:
                     unchanged = previous_normalized == new_normalized
                     ctx.todos = new_normalized
                     await self._persist_todos(ctx)
+                    todo_last_write_cycle = agentic_step_count
+                    ctx.profile_switch_todo_last_write_cycle = todo_last_write_cycle
                     if not unchanged:
                         await self.event_bus.publish(
                             Event(
@@ -13418,6 +14226,16 @@ class AgentLoop:
                     # Pause and wait for input
                     pause_id = f"input_{uuid.uuid4().hex[:12]}"
                     pause_context = normalize_context(tc.arguments.get("context"))
+                    async with self.session_manager.session_factory() as db:
+                        step_request_timeout_raw: int = await get_setting_value(  # type: ignore[assignment]
+                            db,
+                            "session.step_request_questions_timeout_seconds",
+                            3600,
+                        )
+                    step_request_timeout_seconds = max(
+                        1.0,
+                        float(step_request_timeout_raw or 3600),
+                    )
 
                     # Create the step question via the notification service
                     # so it is persisted, resolved to the source conversation,
@@ -13436,6 +14254,9 @@ class AgentLoop:
                             "context": pause_context,
                             "origin_call_id": tc.call_id,
                             "origin_tool_name": tc.name,
+                            "expires_at": (
+                                datetime.now(UTC) + timedelta(seconds=step_request_timeout_seconds)
+                            ).isoformat(),
                         },
                     )
 
@@ -13452,16 +14273,6 @@ class AgentLoop:
                         },
                     )
                     try:
-                        async with self.session_manager.session_factory() as db:
-                            step_request_timeout_raw: int = await get_setting_value(  # type: ignore[assignment]
-                                db,
-                                "session.step_request_questions_timeout_seconds",
-                                3600,
-                            )
-                        step_request_timeout_seconds = max(
-                            1.0,
-                            float(step_request_timeout_raw or 3600),
-                        )
                         resolution = await self.notification_service.wait_for_resolution(
                             pause_id,
                             timeout=step_request_timeout_seconds,
@@ -13827,6 +14638,79 @@ class AgentLoop:
                         await on_tool_result(tc.call_id, tc.name, result_content, False, None, None)
                     continue
 
+                elif tc.name == CALL_TOOL_TOOL.name:
+                    _append_tool_call_event(
+                        events_to_record,
+                        tc,
+                        tool_id,
+                        visible_name=tool_call_visible_names.get(tc.call_id),
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason="tool_call:call_tool",
+                        on_token=on_token,
+                    )
+                    validation_error = self._validate_controller_tool_arguments(
+                        tc.name, tc.arguments
+                    )
+                    if validation_error is not None:
+                        await self._emit_tool_argument_error(
+                            ctx,
+                            tc=tc,
+                            tool_id=tool_id,
+                            events_to_record=events_to_record,
+                            messages=messages,
+                            error=validation_error,
+                            on_tool_result=on_tool_result,
+                            on_token=on_token,
+                        )
+                        continue
+                    target_identifier = str(tc.arguments.get("tool", ""))
+                    resolved_protocol_target = resolve_inventory_tool(
+                        cast(list[NativeToolDefinition], searchable_inventory_tools),
+                        target_identifier,
+                    )
+                    reason = (
+                        "protocol_recursion"
+                        if resolved_protocol_target is not None
+                        and resolved_protocol_target.name
+                        in {CALL_TOOL_TOOL.name, SEARCH_TOOLS_TOOL.name}
+                        else "tool_not_available"
+                    )
+                    payload = json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason": reason,
+                            "message": (
+                                "call_tool cannot target discovery protocol tools."
+                                if reason == "protocol_recursion"
+                                else "The target does not resolve uniquely in the current authorized inventory."
+                            ),
+                        },
+                        separators=(",", ":"),
+                    )
+                    messages.append(
+                        _tool_result_message(tc, payload, protected=True, is_error=True)
+                    )
+                    _append_tool_result_event(
+                        events_to_record,
+                        tc,
+                        payload,
+                        True,
+                        tool_id=tool_id,
+                        protect_from_pruning=True,
+                    )
+                    await self._flush_events_incremental(
+                        ctx,
+                        events_to_record,
+                        reason=f"tool_result:call_tool:{reason}",
+                        on_token=on_token,
+                    )
+                    if on_tool_result:
+                        await on_tool_result(tc.call_id, tc.name, payload, True, None, None)
+                    continue
+
                 elif tc.name == SEARCH_TOOLS_TOOL.name:
                     _append_tool_call_event(
                         events_to_record,
@@ -13856,7 +14740,7 @@ class AgentLoop:
                         )
                         continue
                     matches = search_inventory(
-                        searchable_inventory_tools,
+                        cast(list[NativeToolDefinition], searchable_inventory_tools),
                         str(tc.arguments.get("query", "")),
                         category=(
                             str(tc.arguments.get("category"))
@@ -13871,7 +14755,7 @@ class AgentLoop:
                             **self._step_log_metadata(ctx),
                         },
                     )
-                    new_promoted = {
+                    matched_tool_ids = {
                         str(match["tool_id"])
                         for match in matches
                         if isinstance(match.get("tool_id"), str)
@@ -13907,16 +14791,14 @@ class AgentLoop:
                                 },
                             )
                         )
-                    promoted_tool_ids.update(new_promoted)
                     logger.info(
-                        "tool discovery updated",
+                        "tool discovery completed",
                         extra={
                             "extra_data": {
                                 "session_id": ctx.session.session_id,
                                 "query_length": len(str(tc.arguments.get("query", ""))),
                                 "match_count": len(matches),
-                                "promoted_tool_count": len(promoted_tool_ids),
-                                "match_tool_ids": sorted(new_promoted),
+                                "match_tool_ids": sorted(matched_tool_ids),
                             }
                         },
                     )
@@ -13970,18 +14852,24 @@ class AgentLoop:
                         ctx, introspection_tools
                     )
                     identifier = str(tc.arguments.get("tool", ""))
+                    inspection_payload: dict[str, Any]
                     if tc.name == DESCRIBE_TOOL_TOOL.name:
-                        payload = describe_available_tool(introspection_tools, identifier)
+                        requested_operation = tc.arguments.get("operation")
+                        inspection_payload = describe_available_tool(
+                            introspection_tools,
+                            identifier,
+                            (str(requested_operation) if requested_operation is not None else None),
+                        )
                     else:
-                        payload = await self._validate_introspection_tool_call(
+                        inspection_payload = await self._validate_introspection_tool_call(
                             ctx,
                             introspection_tools,
                             identifier,
                             tc.arguments.get("arguments"),
                         )
                         if (
-                            payload.get("valid") is True
-                            and identifier == WRITE_DELIVERABLE
+                            inspection_payload.get("valid") is True
+                            and identifier in {WRITE_DELIVERABLE, "builtin:write_deliverable"}
                             and isinstance(tc.arguments.get("arguments"), dict)
                         ):
                             payload_fingerprint = tool_call_fingerprint(
@@ -13989,13 +14877,18 @@ class AgentLoop:
                                 tc.arguments["arguments"],
                             )
                             ctx.validated_tool_call_fingerprints.add(payload_fingerprint)
-                            state_fingerprint = payload.get("validation_state_fingerprint")
+                            state_fingerprint = inspection_payload.get(
+                                "validation_state_fingerprint"
+                            )
                             if isinstance(state_fingerprint, str):
                                 ctx.validated_write_deliverable_states[payload_fingerprint] = (
                                     state_fingerprint
                                 )
-                    is_error = payload.get("error") == "tool_not_available"
-                    result_content = json.dumps(payload)
+                    is_error = inspection_payload.get("error") in {
+                        "tool_not_available",
+                        "operation_not_available",
+                    }
+                    result_content = json.dumps(inspection_payload)
                     messages.append(
                         {"role": "tool", "tool_call_id": tc.call_id, "content": result_content}
                     )
@@ -14412,20 +15305,12 @@ class AgentLoop:
                 on_token=on_token,
             )
             if compaction_result is not None and compaction_result.compacted:
-                new_session = await self._rotate_after_compaction(
+                await self._rotate_after_compaction(
                     ctx,
                     compaction_result,
                     trigger="post_turn_auto",
                     run=compaction_run,
                 )
-                if new_session is not None:
-                    await self._emit_compaction_notice(
-                        ctx,
-                        "Session compacted. Previous context was summarized into a fresh session.",
-                        on_token=on_token,
-                        persist=False,
-                        metadata=compaction_run.event_data(),
-                    )
 
         step_status = (
             step_output.outcome.status
@@ -14526,16 +15411,23 @@ class AgentLoop:
         )
         pause_id = intaris_call_id
 
-        # Send an interim tool_result to the WebSocket so the UI shows
-        # the escalation status on the tool call block immediately.
+        # Emit a non-terminal runtime state. This is not a model-visible
+        # tool_result and is never persisted as a failed result.
         if on_tool_result:
-            await on_tool_result(
-                tc.call_id,
-                tc.name,
-                "Waiting for user approval...",
-                True,
-                None,
-                {**eval_meta, "pending": True},
+            await _emit_tool_result_callback(
+                on_tool_result,
+                call_id=tc.call_id,
+                tool_name=tc.name,
+                result="Waiting for user approval...",
+                is_error=False,
+                duration_ms=None,
+                evaluation={
+                    **eval_meta,
+                    "pending": True,
+                    "phase": "waiting_for_approval",
+                    "notification_id": intaris_call_id,
+                },
+                turn_cycle_index=tc.runtime_metadata.get("turn_cycle_index"),
             )
 
         logger.info(
@@ -14554,8 +15446,23 @@ class AgentLoop:
         try:
             resolution = await self._wait_for_escalation_resolution(pause_id, timeout=timeout_f)
         except TimeoutError:
-            resolution = PauseResolution(decision="deny", data={"reason": "timeout"})
-            await self.notification_service.mark_orphaned(intaris_call_id, reason="timeout")
+            resolution = await self.notification_service.resolve_timeout(intaris_call_id)
+            if resolution is None:
+                return ToolResult(
+                    output=(
+                        "Approval resolution did not reach an authoritative terminal state. "
+                        "The tool was not executed."
+                    ),
+                    is_error=True,
+                    metadata={
+                        **(result.metadata or {}),
+                        "evaluation": {
+                            **eval_meta,
+                            "resolution": "unsettled",
+                        },
+                        "tool_status": "failed",
+                    },
+                )
 
         # Publish resolution event to all channel subscribers
         await self.event_bus.publish(
@@ -14583,19 +15490,28 @@ class AgentLoop:
                 },
             )
             # Re-execute: Intaris auto-approves via escalation retry (10 min)
-            result: ToolResult = await self.tool_router.execute(
-                tc.model_copy(
-                    update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
+            retry_result = cast(
+                ToolResult,
+                await self.tool_router.execute(
+                    tc.model_copy(
+                        update={
+                            "runtime_metadata": {
+                                **self._tool_runtime_metadata_for_call(ctx, tc),
+                                "approval_call_id": intaris_call_id,
+                            }
+                        }
+                    ),
+                    ctx.session,
+                    ctx.agent,
+                    self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
+                    self._get_executor(ctx),
                 ),
-                ctx.session,
-                ctx.agent,
-                self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
-                self._get_executor(ctx),
             )
-            self._record_execution_evidence(ctx, tool_name=tc.name, result=result)
+            await self._sync_guardrails_terminal_result(ctx, retry_result)
+            self._record_execution_evidence(ctx, tool_name=tc.name, result=retry_result)
             # If Intaris still escalates on retry (shouldn't happen), treat
             # as denied to avoid infinite loops.
-            retry_eval = result.metadata.get("evaluation") if result.metadata else None
+            retry_eval = retry_result.metadata.get("evaluation") if retry_result.metadata else None
             if retry_eval and retry_eval.get("decision") == "escalate":
                 logger.warning(
                     "Escalation retry still escalated — treating as denied",
@@ -14609,9 +15525,9 @@ class AgentLoop:
                 return ToolResult(
                     output="Tool denied: approval could not be verified.",
                     is_error=True,
-                    metadata=result.metadata,
+                    metadata=retry_result.metadata,
                 )
-            return result
+            return retry_result
 
         # Denied by user or timed out
         if resolution.data.get("reason") == "timeout":
@@ -14634,7 +15550,15 @@ class AgentLoop:
         return ToolResult(
             output=reason,
             is_error=True,
-            metadata=result.metadata,
+            metadata={
+                **(result.metadata or {}),
+                "evaluation": {
+                    **eval_meta,
+                    "resolution": "deny",
+                    "note": resolution.data.get("note"),
+                },
+                "tool_status": "denied",
+            },
         )
 
     async def _wait_for_escalation_resolution(
@@ -14667,7 +15591,7 @@ class AgentLoop:
                     break
                 if await self.notification_service.reconcile_remote_escalation(pause_id):
                     break
-            return await wait_task
+            return cast(PauseResolution, await wait_task)
         finally:
             if not wait_task.done():
                 wait_task.cancel()
@@ -15062,7 +15986,7 @@ class AgentLoop:
         }:
             wait = True
         elif wait_provided and wait is False and not surface_policy.allow_delegate_wait_false:
-            payload = {
+            async_rejection_payload = {
                 "status": "error",
                 "code": "delegate_async_not_allowed",
                 "message": (
@@ -15072,7 +15996,7 @@ class AgentLoop:
                 ),
             }
             return ToolResult(
-                output=json.dumps(payload),
+                output=json.dumps(async_rejection_payload),
                 is_error=True,
                 duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
             )
@@ -16179,6 +17103,9 @@ class AgentLoop:
                 return payload
             async with self.session_manager.session_factory() as db:
                 binding = await queries.get_managed_channel_binding_for_link(db, row.link_id)
+                from cognis.channels.delivery_state import managed_delivery_outcome_uncertain
+
+                outcome_uncertain = await managed_delivery_outcome_uncertain(db, binding)
                 observed = (
                     await queries.get_channel_observed_target(
                         db,
@@ -16189,6 +17116,36 @@ class AgentLoop:
                     if binding is not None
                     else None
                 )
+            now = datetime.now(UTC)
+            expires_at = None
+            lease_expires_at = None
+            if binding is not None:
+                expires_at = (
+                    binding.expires_at.replace(tzinfo=UTC)
+                    if binding.expires_at.tzinfo is None
+                    else binding.expires_at.astimezone(UTC)
+                )
+                lease_expires_at = (
+                    (
+                        binding.delivery_lease_expires_at.replace(tzinfo=UTC)
+                        if binding.delivery_lease_expires_at.tzinfo is None
+                        else binding.delivery_lease_expires_at.astimezone(UTC)
+                    )
+                    if binding.delivery_lease_expires_at is not None
+                    else None
+                )
+            recovery_eligible = bool(
+                binding is not None
+                and binding.state == "delivery_failed"
+                and binding.active_route_key is not None
+                and expires_at is not None
+                and expires_at <= now
+                and not (
+                    binding.delivery_lease_token
+                    and lease_expires_at is not None
+                    and lease_expires_at > now
+                )
+            )
             payload["channel"] = (
                 {
                     "channel_type": binding.channel_type,
@@ -16196,6 +17153,20 @@ class AgentLoop:
                         observed.display_name if observed is not None else "External participant"
                     ),
                     "state": binding.state,
+                    "route_reserved": binding.active_route_key is not None,
+                    "outcome_uncertain": outcome_uncertain,
+                    "recovery": {
+                        "action": "agent_conversation_recover_channel",
+                        "eligible": recovery_eligible,
+                        "requires_owner_epoch": True,
+                        "automatic_retry": False,
+                        "held_messages_replayed": False,
+                        "resend_guidance": (
+                            "If the managed delivery outcome is uncertain, reconcile externally "
+                            "before resending. A one-shot idempotency key cannot deduplicate the "
+                            "managed delivery."
+                        ),
+                    },
                     "last_activity_at": (
                         binding.updated_at.isoformat() if binding.updated_at else None
                     ),
@@ -16214,9 +17185,29 @@ class AgentLoop:
             """Return the safe managed-conversation shape for results and live progress."""
 
             conversation = _row_payload(link) if link is not None else None
+            logical_request: dict[str, Any] | None = None
+            if isinstance(conversation, dict):
+                raw_control_metadata = conversation.get("control_metadata")
+                control_metadata = (
+                    raw_control_metadata if isinstance(raw_control_metadata, dict) else {}
+                )
+                logical_request = {
+                    "logical_turn_id": control_metadata.get("logical_turn_id")
+                    or conversation.get("active_turn_id")
+                    or conversation.get("last_result_turn_id"),
+                    "current_physical_turn_id": conversation.get("active_turn_id"),
+                    "continuation_predecessor_turn_id": control_metadata.get(
+                        "continuation_predecessor_turn_id"
+                    ),
+                    "continuation_successor_turn_id": control_metadata.get(
+                        "continuation_successor_turn_id"
+                    ),
+                    "continuation_reason": control_metadata.get("continuation_reason"),
+                }
             return {
                 "status": status or _managed_conversation_status(conversation),
                 "conversation": conversation,
+                "logical_request": logical_request,
             }
 
         def _bounded_live_text(value: Any, *, limit: int = 1_000) -> str | None:
@@ -16233,6 +17224,7 @@ class AgentLoop:
                 return payload
             return {
                 "status": payload["status"],
+                "logical_request": payload["logical_request"],
                 "conversation": {
                     key: conversation.get(key)
                     for key in (
@@ -16362,17 +17354,40 @@ class AgentLoop:
         async def _admit_managed_turn(
             row: Any,
             *,
+            db: Any | None = None,
+            request: DirectTurnRequestRow | None = None,
+            created: bool = True,
             turn_id: str,
             turn_state: str,
             notify_on_completion: bool,
             joined: bool,
         ) -> Any:
             identity = _managed_join_handoff_identity(row, turn_id) if joined else None
-            async with self.session_manager.session_factory() as db:
+
+            async def _admit(session: Any) -> Any:
+                if request is not None:
+                    return await queries.admit_managed_conversation_direct_turn(
+                        session,
+                        row.link_id,
+                        request=request,
+                        created=created,
+                        turn_state=turn_state,
+                        notify_on_completion=notify_on_completion,
+                        control_metadata=_control_metadata_for_new_managed_turn(row),
+                        handoff_state="pending" if joined else None,
+                        handoff_controller_session_id=(
+                            identity["controller_session_id"] if identity else None
+                        ),
+                        handoff_controller_turn_id=(
+                            identity["controller_turn_id"] if identity else None
+                        ),
+                        handoff_tool_call_id=identity["tool_call_id"] if identity else None,
+                    )
                 admitted = await queries.admit_managed_conversation_turn(
-                    db,
+                    session,
                     row.link_id,
                     turn_id=turn_id,
+                    created=created,
                     turn_state=turn_state,
                     notify_on_completion=notify_on_completion,
                     control_metadata=_control_metadata_for_new_managed_turn(row),
@@ -16385,14 +17400,18 @@ class AgentLoop:
                     ),
                     handoff_tool_call_id=identity["tool_call_id"] if identity else None,
                 )
-                await db.commit()
-            if admitted is None:
-                raise ManagedConversationAdmissionConflict(
-                    "Managed conversation already has a queued admission"
-                )
-            if joined:
-                _register_managed_join_handoff(admitted, turn_id)
-            return admitted
+                if admitted is None:
+                    raise ManagedConversationAdmissionConflict(
+                        "Managed conversation already has a queued admission"
+                    )
+                return admitted
+
+            if db is not None:
+                return await _admit(db)
+            async with self.session_manager.session_factory() as session:
+                admitted = await _admit(session)
+                await session.commit()
+                return admitted
 
         async def _settle_managed_admission_error(
             row: Any,
@@ -16517,6 +17536,16 @@ class AgentLoop:
             link, err = await _require_link(conversation_id)
             if err is not None:
                 return None, err
+            if link is None:
+                return None, ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "message": "Managed conversation not found.",
+                        }
+                    ),
+                    is_error=True,
+                )
             if link.conversation_state == "closed":
                 return None, ToolResult(
                     output=json.dumps(
@@ -16609,26 +17638,14 @@ class AgentLoop:
             *,
             expected_turn_id: str,
             timeout_seconds: int,
+            prefer_local_wait: bool = False,
         ) -> _DurableManagedTurnSettlement | Any | None:
             """Join a managed turn using durable state when execution is remote."""
 
             deadline = monotonic() + timeout_seconds
+            observed_turn_id = expected_turn_id
             has_running_turn = getattr(self._turn_scheduler, "has_running_turn", None)
             active_turn_id = getattr(self._turn_scheduler, "active_turn_id", None)
-            locally_running = (
-                has_running_turn(conversation_id)
-                if callable(has_running_turn)
-                else callable(active_turn_id)
-                and active_turn_id(conversation_id) == expected_turn_id
-            )
-            if locally_running:
-                local = await self._turn_scheduler.wait_for_turn(
-                    conversation_id,
-                    timeout_seconds=timeout_seconds,
-                )
-                if local is not None:
-                    return local
-
             generation_getter = getattr(
                 self._turn_scheduler,
                 "turn_scope_change_generation",
@@ -16639,6 +17656,24 @@ class AgentLoop:
                 "wait_for_turn_scope_change",
                 None,
             )
+            locally_running = (
+                has_running_turn(conversation_id)
+                if callable(has_running_turn)
+                else callable(active_turn_id)
+                and active_turn_id(conversation_id) == expected_turn_id
+            )
+            # A just-submitted local turn can be in the short admission window
+            # before active_turn_id becomes observable. Callers that own that
+            # submission opt into the local waiter explicitly; ordinary get/wait
+            # calls must not attach to an unrelated or no-longer-local turn.
+            if locally_running or prefer_local_wait:
+                local = await self._turn_scheduler.wait_for_turn(
+                    conversation_id,
+                    timeout_seconds=timeout_seconds,
+                )
+                if local is not None:
+                    return local
+
             while True:
                 generation = (
                     generation_getter(conversation_id) if callable(generation_getter) else 0
@@ -16652,12 +17687,16 @@ class AgentLoop:
                         code="managed_conversation_unavailable",
                         message="The managed conversation is no longer available.",
                     )
-                if durable_link.last_result_turn_id == expected_turn_id:
+                if (
+                    durable_link.last_result_turn_id == observed_turn_id
+                    and durable_link.active_turn_id != observed_turn_id
+                    and durable_link.turn_state not in {"queued", "running"}
+                ):
                     failed = durable_link.turn_state in {"failed", "interrupted"}
                     return _DurableManagedTurnSettlement(
                         conversation_id=conversation_id,
                         session_id=durable_link.target_session_id or "",
-                        turn_id=expected_turn_id,
+                        turn_id=observed_turn_id,
                         final_content=durable_link.last_result_summary,
                         code=(
                             "managed_turn_interrupted"
@@ -16668,7 +17707,27 @@ class AgentLoop:
                         ),
                         message=durable_link.last_error if failed else None,
                     )
-                if durable_link.active_turn_id != expected_turn_id:
+                if durable_link.active_turn_id != observed_turn_id:
+                    control_metadata = (
+                        durable_link.control_metadata
+                        if isinstance(durable_link.control_metadata, dict)
+                        else {}
+                    )
+                    physical_turn_ids = [
+                        value
+                        for value in control_metadata.get("physical_turn_ids", [])
+                        if isinstance(value, str)
+                    ]
+                    successor_turn_id = durable_link.active_turn_id
+                    if (
+                        successor_turn_id
+                        and observed_turn_id in physical_turn_ids
+                        and successor_turn_id in physical_turn_ids
+                        and physical_turn_ids.index(successor_turn_id)
+                        > physical_turn_ids.index(observed_turn_id)
+                    ):
+                        observed_turn_id = successor_turn_id
+                        continue
                     return _DurableManagedTurnSettlement(
                         conversation_id=conversation_id,
                         session_id=durable_link.target_session_id or "",
@@ -16699,10 +17758,15 @@ class AgentLoop:
             expected_turn_id: str | None = None,
             progress_observer: ManagedConversationProgressObserver | None = None,
             settlement_waiter: asyncio.Future[Any] | None = None,
+            prefer_local_wait: bool = False,
         ) -> dict[str, Any]:
             timeout_seconds = timeout_seconds or _MANAGED_JOIN_TIMEOUT_SECONDS
             link = await _get_link_for_target(conversation_id)
-            join_turn_id = expected_turn_id or getattr(link, "active_turn_id", None)
+            join_turn_id: str | None = expected_turn_id
+            if join_turn_id is None and link is not None:
+                active_turn_id = getattr(link, "active_turn_id", None)
+                if isinstance(active_turn_id, str):
+                    join_turn_id = active_turn_id
             fallback_owned = False
             cooperative_yields = ctx.runtime_info.setdefault(
                 "cooperative_managed_wait_yields",
@@ -16790,13 +17854,47 @@ class AgentLoop:
                             except TimeoutError:
                                 return None
 
-                        settlement = _wait_for_observed_settlement()
+                        async def _wait_for_observed_or_durable_settlement() -> Any:
+                            """Use local completion when available, but never require it.
+
+                            The observer future is process-local. In a multi-replica
+                            controller deployment, the target turn can settle on a
+                            different replica, so the durable managed-link state is
+                            the cross-replica completion signal.
+                            """
+                            if join_turn_id is None:
+                                return await _wait_for_observed_settlement()
+                            observed_task = asyncio.create_task(_wait_for_observed_settlement())
+                            durable_task = asyncio.create_task(
+                                _wait_for_durable_managed_settlement(
+                                    conversation_id,
+                                    expected_turn_id=join_turn_id,
+                                    timeout_seconds=timeout_seconds,
+                                    prefer_local_wait=prefer_local_wait,
+                                )
+                            )
+                            tasks = {observed_task, durable_task}
+                            try:
+                                done, _pending = await asyncio.wait(
+                                    tasks,
+                                    return_when=asyncio.FIRST_COMPLETED,
+                                )
+                                results = {task: task.result() for task in done}
+                                return results.get(durable_task) or results.get(observed_task)
+                            finally:
+                                for task in tasks:
+                                    if not task.done():
+                                        task.cancel()
+                                await asyncio.gather(*tasks, return_exceptions=True)
+
+                        settlement = _wait_for_observed_or_durable_settlement()
                     else:
                         if join_turn_id:
                             settlement = _wait_for_durable_managed_settlement(
                                 conversation_id,
                                 expected_turn_id=join_turn_id,
                                 timeout_seconds=timeout_seconds,
+                                prefer_local_wait=prefer_local_wait,
                             )
                         else:
                             settlement = self._turn_scheduler.wait_for_turn(
@@ -16835,7 +17933,19 @@ class AgentLoop:
             link = await _get_link_for_target(conversation_id)
             await _mark_target_read(conversation_id)
             active_status = _managed_conversation_payload(link)["status"]
-            wait_timed_out = waited is None and wait_yield_reason is None and not fallback_owned
+            if (
+                waited is None
+                and link is not None
+                and isinstance(link.handoff_target_turn_id, str)
+                and link.handoff_target_turn_id
+                and link.handoff_state in {"pending", "fallback_claimed"}
+            ):
+                join_turn_id = link.handoff_target_turn_id
+            wait_timed_out = (
+                waited is None
+                and wait_yield_reason is None
+                and (not fallback_owned or cooperative_reattach)
+            )
             if waited is None and active_status in {"queued", "running"} and link is not None:
                 if join_turn_id and not fallback_owned:
                     identity = _managed_join_handoff_identity(link, join_turn_id)
@@ -16891,7 +18001,13 @@ class AgentLoop:
                 **_managed_conversation_payload(link, status=status),
                 "waited": waited is not None,
                 "expected_turn_id": expected_turn_id,
+                "observed_physical_turn_id": (
+                    getattr(waited, "turn_id", None) if waited is not None else join_turn_id
+                ),
                 "fallback_owned": fallback_owned,
+                # Delivery ownership does not determine controller lifetime.
+                # Reattached waits retain fallback-only completion delivery.
+                "continue_controller_turn": (wait_yield_reason is not None or cooperative_reattach),
                 "wait_yielded_for_boundary_event": wait_yield_reason is not None,
                 "wait_yielded_for_input": wait_yield_reason == "queued_user_input",
                 "wait_yield_reason": wait_yield_reason,
@@ -16914,7 +18030,8 @@ class AgentLoop:
                     payload["message"] = (
                         "The managed wait reached its requested timeout. The child "
                         "continues in the background and its correlated completion "
-                        "notification will resume the controller exactly once."
+                        "notification remains the sole completion delivery path. "
+                        "Continue this controller turn; you may wait again."
                     )
                 else:
                     payload["message"] = (
@@ -17007,7 +18124,7 @@ class AgentLoop:
         def _managed_wait_tool_result(payload: dict[str, Any]) -> ToolResult:
             background_owned = bool(
                 payload.get("fallback_owned") is True
-                or payload.get("wait_yielded_for_boundary_event") is True
+                and payload.get("continue_controller_turn") is not True
             )
             return ToolResult(
                 output=json.dumps(payload, default=str),
@@ -17022,6 +18139,8 @@ class AgentLoop:
                     else None
                 ),
             )
+
+        link: Any = None
 
         if tc.name == "agent_conversation_create_channel":
             from cognis.channels.managed import create_managed_channel_conversation
@@ -17053,9 +18172,10 @@ class AgentLoop:
                 )
             title = str(tc.arguments.get("title") or "").strip()
             initial_message = str(tc.arguments.get("initial_message") or "").strip()
-            wait = _managed_wait_arg()
-            if isinstance(wait, ToolResult):
-                return wait
+            wait_arg = _managed_wait_arg()
+            if isinstance(wait_arg, ToolResult):
+                return wait_arg
+            wait = wait_arg
             if not agent_id or not title or not initial_message:
                 return ToolResult(
                     output=json.dumps(
@@ -17197,7 +18317,7 @@ class AgentLoop:
                 )
                 progress_observer = _managed_progress_observer(conversation.conversation_id)
                 await _publish_managed_conversation_progress(link)
-                error = await self._turn_scheduler.submit_turn(
+                error = await self._submit_managed_turn(
                     conversation.conversation_id,
                     initial_message,
                     user_email=user_email,
@@ -17256,6 +18376,7 @@ class AgentLoop:
                     None,
                     expected_turn_id=turn_id,
                     progress_observer=progress_observer,
+                    prefer_local_wait=True,
                 )
                 payload["created"] = True
                 return _managed_wait_tool_result(payload)
@@ -17309,9 +18430,10 @@ class AgentLoop:
                     output=json.dumps({"status": "error", "message": str(exc)}),
                     is_error=True,
                 )
-            wait = _managed_wait_arg()
-            if isinstance(wait, ToolResult):
-                return wait
+            wait_arg = _managed_wait_arg()
+            if isinstance(wait_arg, ToolResult):
+                return wait_arg
+            wait = wait_arg
             waiting_signal = None
             resume_request_id = None
             turn_id = new_managed_turn_id()
@@ -17443,7 +18565,7 @@ class AgentLoop:
                         binding_id=binding_id,
                         conversation_id=conversation_id,
                     )
-            turn_completion: asyncio.Future[Any] | None = (
+            retry_turn_completion: asyncio.Future[Any] | None = (
                 asyncio.get_running_loop().create_future() if wait else None
             )
 
@@ -17458,26 +18580,46 @@ class AgentLoop:
 
                 async def on_turn_complete(self, result: Any) -> None:
                     await super().on_turn_complete(result)
-                    if turn_completion is not None and not turn_completion.done():
-                        turn_completion.set_result(result)
+                    if retry_turn_completion is not None and not retry_turn_completion.done():
+                        retry_turn_completion.set_result(result)
 
                 async def on_turn_error(self, conversation_id: str, error: Any) -> None:
                     await super().on_turn_error(conversation_id, error)
-                    if turn_completion is not None and not turn_completion.done():
-                        turn_completion.set_result(error)
+                    if retry_turn_completion is not None and not retry_turn_completion.done():
+                        retry_turn_completion.set_result(error)
 
-            async def _on_admitted(admitted_turn_id: str, queued: bool) -> None:
-                nonlocal link
-                admitted = await _admit_managed_turn(
+            admitted_in_transaction = False
+
+            async def _admit_in_transaction(
+                db: Any,
+                request: DirectTurnRequestRow,
+                created: bool,
+            ) -> None:
+                nonlocal admitted_in_transaction, link
+                link = await _admit_managed_turn(
                     link,
-                    turn_id=admitted_turn_id,
-                    turn_state="queued" if queued else "running",
+                    db=db,
+                    request=request,
+                    created=created,
+                    turn_id=request.turn_id,
+                    turn_state="running",
                     notify_on_completion=not wait,
                     joined=wait,
                 )
-                if admitted is None:
-                    raise RuntimeError("Managed conversation link disappeared during admission")
-                link = admitted
+                admitted_in_transaction = True
+
+            async def _on_admitted(admitted_turn_id: str, queued: bool) -> None:
+                nonlocal link
+                if not admitted_in_transaction:
+                    link = await _admit_managed_turn(
+                        link,
+                        turn_id=admitted_turn_id,
+                        turn_state="queued" if queued else "running",
+                        notify_on_completion=not wait,
+                        joined=wait,
+                    )
+                if wait:
+                    _register_managed_join_handoff(link, admitted_turn_id)
                 await _publish_managed_conversation_progress(link)
 
             durable_admission_guard = None
@@ -17496,7 +18638,7 @@ class AgentLoop:
                 durable_admission_guard = _validate_resume_admission
 
             try:
-                error = await self._turn_scheduler.submit_turn(
+                error = await self._submit_managed_turn(
                     conversation_id,
                     message,
                     user_email=user_email,
@@ -17523,6 +18665,7 @@ class AgentLoop:
                     turn_id=turn_id,
                     durable_request_id=resume_request_id,
                     durable_admission_guard=durable_admission_guard,
+                    admission_transaction_participant=_admit_in_transaction,
                     admission_observer=_on_admitted,
                     allow_queue=False,
                 )
@@ -17610,14 +18753,14 @@ class AgentLoop:
                     succeeded=True,
                 )
             if wait:
-                if turn_completion is None:
+                if retry_turn_completion is None:
                     raise RuntimeError("Managed wait observer was not initialized")
                 return _managed_wait_tool_result(
                     await _wait_payload(
                         conversation_id,
                         _MANAGED_JOIN_TIMEOUT_SECONDS,
                         expected_turn_id=turn_id,
-                        settlement_waiter=turn_completion,
+                        settlement_waiter=retry_turn_completion,
                     )
                 )
             return ToolResult(
@@ -17686,9 +18829,10 @@ class AgentLoop:
                     ),
                     is_error=True,
                 )
-            wait = _managed_wait_arg()
-            if isinstance(wait, ToolResult):
-                return wait
+            wait_arg = _managed_wait_arg()
+            if isinstance(wait_arg, ToolResult):
+                return wait_arg
+            wait = wait_arg
             turn_id = new_managed_turn_id()
             turn_completion: asyncio.Future[Any] | None = (
                 asyncio.get_running_loop().create_future() if wait else None
@@ -17711,20 +18855,40 @@ class AgentLoop:
                     if turn_completion is not None and not turn_completion.done():
                         turn_completion.set_result(error)
 
-            async def _on_admitted(admitted_turn_id: str, queued: bool) -> None:
-                nonlocal link
-                admitted = await _admit_managed_turn(
+            admitted_in_transaction = False
+
+            async def _admit_in_transaction(
+                db: Any,
+                request: DirectTurnRequestRow,
+                created: bool,
+            ) -> None:
+                nonlocal admitted_in_transaction, link
+                link = await _admit_managed_turn(
                     link,
-                    turn_id=admitted_turn_id,
-                    turn_state="queued" if queued else "running",
+                    db=db,
+                    request=request,
+                    created=created,
+                    turn_id=request.turn_id,
+                    turn_state="running",
                     notify_on_completion=not wait,
                     joined=wait,
                 )
-                if admitted is None:
-                    raise RuntimeError("Managed conversation link disappeared during admission")
-                link = admitted
+                admitted_in_transaction = True
 
-            error = await self._turn_scheduler.submit_turn(
+            async def _on_admitted(admitted_turn_id: str, queued: bool) -> None:
+                nonlocal link
+                if not admitted_in_transaction:
+                    link = await _admit_managed_turn(
+                        link,
+                        turn_id=admitted_turn_id,
+                        turn_state="queued" if queued else "running",
+                        notify_on_completion=not wait,
+                        joined=wait,
+                    )
+                if wait:
+                    _register_managed_join_handoff(link, admitted_turn_id)
+
+            error = await self._submit_managed_turn(
                 conversation_id,
                 retry_message.content,
                 user_email=user_email,
@@ -17733,17 +18897,27 @@ class AgentLoop:
                 retry_source_turn_id=retry_message.turn_id,
                 turn_id=turn_id,
                 turn_observers=(_RetryObserver() if wait else _AgentWorkTurnObserver(),),
+                admission_transaction_participant=_admit_in_transaction,
                 admission_observer=_on_admitted,
+                allow_queue=False,
             )
             if error is not None:
+                error_code = error.code
+                error_message = error.message
+                if error.code in {"managed_admission_conflict", "queueing_not_allowed"}:
+                    error_code = "managed_conversation_busy"
+                    error_message = (
+                        "Managed conversation has active or queued work. Wait for it to "
+                        "finish or interrupt it before retrying."
+                    )
                 return ToolResult(
                     output=json.dumps(
                         {
                             "status": "error",
                             "conversation": _row_payload(link),
                             "error": {
-                                "code": error.code,
-                                "message": error.message,
+                                "code": error_code,
+                                "message": error_message,
                                 "recoverable": error.recoverable,
                             },
                         },
@@ -17851,6 +19025,13 @@ class AgentLoop:
                 link, err = await _require_open_link(conversation_id)
                 if err is not None:
                     return err
+                get_queued_messages = getattr(
+                    self._turn_scheduler,
+                    "get_queued_messages",
+                    None,
+                )
+                if callable(get_queued_messages):
+                    await get_queued_messages(conversation_id)
                 if (
                     self._turn_scheduler.has_active_turn(conversation_id)
                     or self._turn_scheduler.queued_count(conversation_id) > 0
@@ -17873,8 +19054,8 @@ class AgentLoop:
                 async with self.session_manager.session_factory() as db:
                     conversation_row = await queries.get_conversation(db, conversation_id)
                     session_row = (
-                        await queries.get_session_row(db, link.target_session_id)
-                        if link.target_session_id
+                        await queries.get_session_row(db, conversation_row.active_session_id)
+                        if conversation_row is not None and conversation_row.active_session_id
                         else None
                     )
                 if conversation_row is None or session_row is None:
@@ -17955,6 +19136,9 @@ class AgentLoop:
                 return err
             reason = str(tc.arguments.get("reason") or "Interrupted by supervising agent")
             cancelled = await self._turn_scheduler.cancel_turn(conversation_id)
+            get_queued_messages = getattr(self._turn_scheduler, "get_queued_messages", None)
+            if callable(get_queued_messages):
+                await get_queued_messages(conversation_id)
             async with self.session_manager.session_factory() as db:
                 link = await queries.update_managed_conversation_link(
                     db,
@@ -18036,7 +19220,7 @@ class AgentLoop:
             )
 
         if tc.name == "agent_conversation_list":
-            status = tc.arguments.get("status")
+            list_status = tc.arguments.get("status")
             limit = tc.arguments.get("limit", 25)
             kind = str(tc.arguments.get("kind") or "agent")
             async with self.session_manager.session_factory() as db:
@@ -18051,7 +19235,7 @@ class AgentLoop:
                         controller_session_id if task_primary and kind != "channel" else None
                     ),
                     kind=kind,
-                    status=str(status) if isinstance(status, str) else None,
+                    status=str(list_status) if isinstance(list_status, str) else None,
                     limit=int(limit) if isinstance(limit, int) else 25,
                 )
             projected = [await _with_channel_projection(row, _row_payload(row)) for row in links]
@@ -18135,6 +19319,149 @@ class AgentLoop:
                     {"status": "owned", "conversation": _row_payload(link)}, default=str
                 )
             )
+
+        if tc.name == "agent_conversation_recover_channel":
+            conversation_id = str(tc.arguments.get("conversation_id") or "").strip()
+            delivery_id = str(tc.arguments.get("delivery_id") or "").strip()
+            expected_owner_epoch = int(tc.arguments.get("expected_owner_epoch") or 0)
+            reason = str(tc.arguments.get("reason") or "").strip()
+            if bool(conversation_id) == bool(delivery_id) or (delivery_id and expected_owner_epoch):
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": "invalid_recovery_target",
+                            "message": (
+                                "Supply conversation_id with expected_owner_epoch, or "
+                                "supply delivery_id. Do not supply both forms."
+                            ),
+                        }
+                    ),
+                    is_error=True,
+                )
+            service = getattr(self.providers, "managed_channel_service", None)
+            if service is None:
+                return ToolResult(
+                    output=json.dumps(
+                        {
+                            "status": "error",
+                            "code": "managed_channel_recovery_unavailable",
+                            "message": "Managed channel recovery is unavailable.",
+                        }
+                    ),
+                    is_error=True,
+                )
+            if delivery_id:
+                result = await service.recover_uncertain_one_shot_route(
+                    delivery_id=delivery_id,
+                    user_email=user_email,
+                    actor_agent_id=ctx.agent.agent_id,
+                    actor_conversation_id=controller_conversation_id,
+                    actor_session_id=controller_session_id,
+                    reason=reason,
+                )
+                payload = {
+                    "status": result.status,
+                    "action": "release_uncertain_one_shot_route",
+                    "delivery_id": result.delivery_id,
+                    "delivery_status": result.delivery_status,
+                    "remaining_blockers": [
+                        asdict(blocker) for blocker in result.remaining_blockers
+                    ],
+                    "outcome_uncertain": result.outcome_uncertain,
+                    "route_reserved": result.route_reserved,
+                    "delivery_retried": False,
+                    "held_messages_replayed": False,
+                    "audit": result.audit,
+                    "resend_guidance": (
+                        "The outcome remains uncertain and the original idempotency key remains "
+                        "reserved. Reconcile externally before any new send."
+                    ),
+                }
+                if result.status == "not_found":
+                    payload.update(
+                        code="channel_delivery_not_found",
+                        message="One-shot delivery not found.",
+                    )
+                    return ToolResult(output=json.dumps(payload, default=str), is_error=True)
+                if result.status in {"not_eligible", "conflict"}:
+                    payload.update(
+                        code="channel_delivery_recovery_not_eligible",
+                        message=(
+                            "Recovery requires an uncertain explicit one-shot delivery with no "
+                            "active lease. No delivery was retried."
+                        ),
+                    )
+                    return ToolResult(output=json.dumps(payload, default=str), is_error=True)
+                payload["message"] = (
+                    "The uncertain one-shot route was already released."
+                    if result.status == "already_released"
+                    else (
+                        "The uncertain one-shot route was released. Its delivery outcome and "
+                        "idempotency record remain unchanged."
+                    )
+                )
+                return ToolResult(output=json.dumps(payload, default=str))
+            result = await service.recover_expired_delivery_failure(
+                target_conversation_id=conversation_id,
+                user_email=user_email,
+                expected_owner_epoch=expected_owner_epoch,
+                actor_agent_id=ctx.agent.agent_id,
+                actor_conversation_id=controller_conversation_id,
+                actor_session_id=controller_session_id,
+                reason=reason,
+            )
+            payload = {
+                "status": result.status,
+                "action": "release_expired",
+                "conversation_id": result.conversation_id,
+                "owner_epoch": result.owner_epoch,
+                "prior_state": result.prior_state,
+                "binding_state": result.binding_state,
+                "expires_at": (
+                    result.expires_at.isoformat() if result.expires_at is not None else None
+                ),
+                "outcome_uncertain": result.outcome_uncertain,
+                "route_reserved": result.route_reserved,
+                "delivery_retried": False,
+                "held_messages_replayed": False,
+                "audit": result.audit,
+                "resend_guidance": (
+                    "The managed delivery evidence remains authoritative. If its outcome is "
+                    "uncertain, reconcile externally before any resend because a one-shot "
+                    "idempotency key cannot deduplicate it."
+                ),
+            }
+            if result.status == "not_found":
+                payload.update(
+                    code="managed_channel_not_found",
+                    message="Managed channel conversation not found.",
+                )
+                return ToolResult(output=json.dumps(payload, default=str), is_error=True)
+            if result.status == "conflict":
+                payload.update(
+                    code="managed_ownership_conflict",
+                    message="The owner epoch changed. Inspect the conversation before recovery.",
+                )
+                return ToolResult(output=json.dumps(payload, default=str), is_error=True)
+            if result.status == "not_eligible":
+                payload.update(
+                    code="managed_channel_recovery_not_eligible",
+                    message=(
+                        "Recovery requires an expired delivery_failed route with no active "
+                        "delivery lease. No delivery was retried."
+                    ),
+                )
+                return ToolResult(output=json.dumps(payload, default=str), is_error=True)
+            payload["message"] = (
+                "The expired managed route was already released."
+                if result.status == "already_released"
+                else (
+                    "The expired managed route was released. Delivery evidence remains "
+                    "unchanged and held messages were not replayed."
+                )
+            )
+            return ToolResult(output=json.dumps(payload, default=str))
 
         if tc.name == "agent_conversation_fork":
             conversation_id = str(tc.arguments.get("conversation_id") or "").strip()
@@ -18225,10 +19552,11 @@ class AgentLoop:
                     is_error=True,
                 )
             message = str(tc.arguments.get("message") or "").strip()
-            wait = _managed_wait_arg()
-            if isinstance(wait, ToolResult):
-                return wait
-            turn_id = new_managed_turn_id() if message else None
+            wait_arg = _managed_wait_arg()
+            if isinstance(wait_arg, ToolResult):
+                return wait_arg
+            wait = wait_arg
+            fork_turn_id = new_managed_turn_id() if message else None
             async with self.session_manager.session_factory() as db:
                 new_link = await queries.create_managed_conversation_link(
                     db,
@@ -18245,7 +19573,7 @@ class AgentLoop:
                     target_session_id=new_session.session_id,
                     title=new_conversation.title or "Agent work fork",
                     turn_state="running" if message else "idle",
-                    active_turn_id=turn_id,
+                    active_turn_id=fork_turn_id,
                     notify_on_completion=bool(message) and not wait,
                 )
                 await queries.update_conversation_context_data(
@@ -18276,21 +19604,22 @@ class AgentLoop:
             )
             started_async_turn = False
             if message:
-                progress_observer = (
+                fork_progress_observer = (
                     _managed_progress_observer(new_conversation.conversation_id) if wait else None
                 )
-                error = await self._turn_scheduler.submit_turn(
+                assert fork_turn_id is not None
+                error = await self._submit_managed_turn(
                     new_conversation.conversation_id,
                     message,
                     user_email=user_email,
                     one_shot_chat_mode=_chat_mode_arg(),
-                    turn_observers=(progress_observer or ManagedConversationTurnObserver(),),
-                    turn_id=turn_id,
+                    turn_observers=(fork_progress_observer or ManagedConversationTurnObserver(),),
+                    turn_id=fork_turn_id,
                 )
                 if error is not None:
                     new_link = await _settle_managed_admission_error(
                         new_link,
-                        turn_id=cast(str, turn_id),
+                        turn_id=fork_turn_id,
                         error=error,
                     )
                     return ToolResult(
@@ -18313,8 +19642,9 @@ class AgentLoop:
                         await _wait_payload(
                             new_conversation.conversation_id,
                             None,
-                            expected_turn_id=turn_id,
-                            progress_observer=progress_observer,
+                            expected_turn_id=fork_turn_id,
+                            progress_observer=fork_progress_observer,
+                            prefer_local_wait=True,
                         )
                     )
                 started_async_turn = True
@@ -18524,6 +19854,12 @@ class AgentLoop:
                         expected_attempt=scoped_task.attempt_number,
                     )
                     async with self.session_manager.session_factory() as db:
+                        revision_action_result = {
+                            "new_attempt": changed.attempt_number,
+                            "target_step": changed.target_step,
+                            "superseded_count": changed.superseded_count,
+                            "relaunched": changed.relaunched,
+                        }
                         comment = await create_task_comment(
                             db,
                             task_id=task_id,
@@ -18533,7 +19869,10 @@ class AgentLoop:
                             noop=False,
                             target_step=tc.arguments.get("target_step"),
                             attempt_number=scoped_task.attempt_number,
-                            metadata={"source": "task_control_chat"},
+                            metadata={
+                                "source": "task_control_chat",
+                                "action_result": revision_action_result,
+                            },
                         )
                         await update_task_comment(db, comment.comment_id, applied=True)
                         await db.commit()
@@ -18553,6 +19892,15 @@ class AgentLoop:
                         "task_id": task_id,
                         "task_status": str(changed.status),
                         "attempt_number": changed.attempt_number,
+                        **(
+                            {
+                                "target_step": changed.target_step,
+                                "superseded_count": changed.superseded_count,
+                                "relaunched": changed.relaunched,
+                            }
+                            if tc.name == "request_task_revision"
+                            else {}
+                        ),
                     }
                 )
             )
@@ -18829,6 +20177,8 @@ class AgentLoop:
                     "step_name": sr.step_name,
                     "status": sr.status,
                     "attempt": sr.attempt,
+                    "attempt_number": getattr(sr, "attempt_number", 1),
+                    "superseded_by_step_run_id": getattr(sr, "superseded_by_step_run_id", None),
                     "session_id": getattr(sr, "session_id", None),
                     "conversation_id": getattr(sr, "conversation_id", None),
                     "started_at": str(getattr(sr, "started_at", None))
@@ -18928,7 +20278,8 @@ class AgentLoop:
 
         elif tc.name == "get_task_step_output":
             task_id = tc.arguments.get("task_id", "")
-            step_name = tc.arguments.get("step_name", "")
+            step_name = str(tc.arguments.get("step_name") or "").strip()
+            step_run_id = str(tc.arguments.get("step_run_id") or "").strip()
             attempt, attempt_error = self._parse_attempt_argument(tc.arguments.get("attempt"))
             if attempt_error is not None:
                 return ToolResult(output=json.dumps({"error": attempt_error}), is_error=True)
@@ -18948,6 +20299,7 @@ class AgentLoop:
                 step_rows,
                 step_name=step_name,
                 attempt=attempt,
+                step_run_id=step_run_id,
             )
             if selected_run is None:
                 return ToolResult(output=json.dumps({"error": select_error}), is_error=True)
@@ -18955,7 +20307,8 @@ class AgentLoop:
 
         elif tc.name == "get_task_step_logs":
             task_id = tc.arguments.get("task_id", "")
-            step_name = tc.arguments.get("step_name", "")
+            step_name = str(tc.arguments.get("step_name") or "").strip()
+            step_run_id = str(tc.arguments.get("step_run_id") or "").strip()
             attempt, attempt_error = self._parse_attempt_argument(tc.arguments.get("attempt"))
             if attempt_error is not None:
                 return ToolResult(output=json.dumps({"error": attempt_error}), is_error=True)
@@ -18995,6 +20348,7 @@ class AgentLoop:
                     step_rows,
                     step_name=step_name,
                     attempt=attempt,
+                    step_run_id=step_run_id,
                 )
                 if selected_run is None:
                     return ToolResult(output=json.dumps({"error": select_error}), is_error=True)
@@ -19023,6 +20377,7 @@ class AgentLoop:
                     limit=min(limit, 200),
                     allow_missing_stream=True,
                 )
+                next_after_seq = next_event_page_after_seq(event_result, after_seq)
             except Exception as exc:
                 return ToolResult(
                     output=json.dumps(
@@ -19038,6 +20393,7 @@ class AgentLoop:
                 events=list(event_result.events),
                 last_seq=event_result.last_seq,
                 has_more=event_result.has_more,
+                next_after_seq=next_after_seq,
                 after_seq=after_seq,
                 limit=min(limit, 200),
                 missing_stream=bool(getattr(event_result, "missing_stream_fallback_used", False)),
@@ -19217,14 +20573,14 @@ class AgentLoop:
                 project_id_arg = tc.arguments.get("project_id")
                 project_id = str(project_id_arg) if project_id_arg else task_row.project_id
                 if project_id_arg:
-                    project = await get_project(db, project_id)
+                    project = await get_project(db, str(project_id))
                     project_access = (
                         project is not None
                         and (project.status == "active")
                         and (
                             project.owner_email == ctx.session.user_email
                             or await get_active_project_grant(
-                                db, project_id, ctx.session.user_email
+                                db, str(project_id), ctx.session.user_email
                             )
                             is not None
                         )
@@ -19319,6 +20675,7 @@ class AgentLoop:
             task_queue = self._task_queue
             if task_queue is not None:
                 if control_task_id:
+                    assert scoped_task is not None
                     try:
                         await task_queue.cancel_task(
                             task_id,
@@ -19376,6 +20733,10 @@ class AgentLoop:
 
         task_agent_id = getattr(task_row, "agent_id", None)
         current_agent_id = ctx.agent.agent_id
+        # Agent affinity controls execution routing, not owner recovery. The
+        # owning user's controller can inspect and cancel any owned task.
+        if ctx.agent.owner_email == task_owner:
+            return True
         if getattr(task_row, "created_by_agent_id", None) == current_agent_id:
             return True
         if not task_agent_id:
@@ -19646,7 +21007,7 @@ class AgentLoop:
                 exc_info=True,
             )
             return None
-        return artifact_id
+        return str(artifact_id)
 
     @staticmethod
     def _parse_attempt_argument(raw_attempt: Any) -> tuple[int | None, str | None]:
@@ -19670,8 +21031,28 @@ class AgentLoop:
         *,
         step_name: str,
         attempt: int | None,
+        step_run_id: str = "",
     ) -> tuple[Any | None, str | None]:
-        """Resolve a task step attempt by step name and optional attempt number."""
+        """Resolve a task step run by immutable ID or legacy step selectors."""
+
+        if step_run_id:
+            for row in step_rows:
+                if getattr(row, "step_run_id", None) != step_run_id:
+                    continue
+                if step_name and row.step_name != step_name:
+                    return None, (
+                        f"Step run '{step_run_id}' belongs to step '{row.step_name}', "
+                        f"not '{step_name}'."
+                    )
+                if attempt is not None and int(getattr(row, "attempt", 0) or 0) != attempt:
+                    return None, (
+                        f"Step run '{step_run_id}' has attempt {row.attempt}, not {attempt}."
+                    )
+                return row, None
+            return None, f"No step run '{step_run_id}' found for this task."
+
+        if not step_name:
+            return None, "step_name or step_run_id is required."
 
         matching = [row for row in step_rows if row.step_name == step_name]
         if not matching:
@@ -19697,6 +21078,7 @@ class AgentLoop:
             f"Task ID: {task_id}",
             f"Step: {step_run.step_name}",
             f"Attempt: {step_run.attempt}",
+            f"Task attempt: {getattr(step_run, 'attempt_number', 1)}",
             f"Status: {step_run.status}",
         ]
         if getattr(step_run, "step_run_id", None):
@@ -19752,7 +21134,10 @@ class AgentLoop:
                 lines=_indent_block(content, prefix=""),
             )
 
-        claims = output.get("claims") if isinstance(output.get("claims"), list) else []
+        claims = cast(
+            list[Any],
+            output.get("claims") if isinstance(output.get("claims"), list) else [],
+        )
         if claims:
             compact_builder.add_section(
                 "claims",
@@ -19871,6 +21256,7 @@ class AgentLoop:
         events: list[dict[str, Any]],
         last_seq: int,
         has_more: bool,
+        next_after_seq: int | None,
         after_seq: int,
         limit: int,
         missing_stream: bool,
@@ -19894,8 +21280,9 @@ class AgentLoop:
         if missing_stream:
             overview_lines.append("Warning: the session event stream was missing in Intaris.")
         if has_more:
+            assert next_after_seq is not None
             overview_lines.append(
-                f"Next page: call get_task_step_logs again with after_seq={last_seq}."
+                f"Next page: call get_task_step_logs again with after_seq={next_after_seq}."
             )
         compact_builder.add_section(
             "overview",
@@ -19918,7 +21305,8 @@ class AgentLoop:
             kind = _task_log_anchor_kind(event_type)
             counts[kind] = counts.get(kind, 0) + 1
             anchor = f"{kind}:{counts[kind]}"
-            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            raw_data = event.get("data")
+            data: dict[str, Any] = raw_data if isinstance(raw_data, dict) else {}
             seq = event.get("seq")
             timestamp = event.get("ts") or event.get("timestamp")
             label_parts = [event_type]
@@ -20926,11 +22314,14 @@ class AgentLoop:
         *,
         reason: str,
         on_token: TokenCallback | None = None,
+        on_append_result: Callable[[Any], Coroutine[Any, Any, None]] | None = None,
     ) -> bool:
         if not events:
             return False
         batch = with_session_events_turn_id(events, ctx.turn_id)
+        source_event_count = len(batch)
         intaris_id = ctx.session.intaris_session_id or ctx.session.session_id
+        turn_id = str(ctx.turn_id or "")
         ctx.intaris_batch_counter += 1
         context_comment_id = (
             batch[0].data.get("comment_id")
@@ -20939,16 +22330,65 @@ class AgentLoop:
             and batch[0].data.get("source") == "task_context_comment"
             else None
         )
+        durable_follow_up_id = (
+            batch[0].data.get("follow_up_id")
+            if len(batch) == 1
+            and batch[0].type == "system_message"
+            and batch[0].data.get("source") == "durable_boundary_follow_up"
+            else None
+        )
         if isinstance(context_comment_id, str) and context_comment_id:
             idempotency_key = f"{intaris_id}:task_context_comment:{context_comment_id}"
+        elif isinstance(durable_follow_up_id, str) and durable_follow_up_id:
+            idempotency_key = f"{intaris_id}:durable_boundary_follow_up:{durable_follow_up_id}"
         else:
             idempotency_key = self._intaris_batch_idempotency_key(
                 intaris_id, batch, reason=reason, nonce=ctx.intaris_batch_counter
             )
+        append_groups: list[tuple[list[SessionEvent], str]] = []
+        pending_group: list[SessionEvent] = []
+
+        def _append_pending_group() -> None:
+            nonlocal pending_group
+            if not pending_group:
+                return
+            group_key = (
+                idempotency_key
+                if len(pending_group) == len(batch)
+                else self._intaris_batch_idempotency_key(
+                    intaris_id,
+                    pending_group,
+                    reason=f"{reason}:segment:{len(append_groups)}",
+                    nonce=ctx.intaris_batch_counter,
+                )
+            )
+            append_groups.append((pending_group, group_key))
+            pending_group = []
+
+        for event in batch:
+            if event.type != "tool_call":
+                pending_group.append(event)
+                continue
+            _append_pending_group()
+            call_id = event.data.get("call_id")
+            if not isinstance(call_id, str):
+                raise ValueError("tool_call event is missing call_id")
+            append_groups.append(([event], tool_call_idempotency_key(intaris_id, turn_id, call_id)))
+        _append_pending_group()
+        single_tool_result = (
+            batch[0]
+            if ctx.execution_fence is not None
+            and len(batch) == 1
+            and batch[0].type == "tool_result"
+            and isinstance(batch[0].data.get("call_id"), str)
+            and isinstance(batch[0].data.get("name"), str)
+            and isinstance(batch[0].data.get("turn_id"), str)
+            else None
+        )
         while True:
             self._raise_if_cancelled(ctx)
             try:
-                if ctx.execution_fence is not None:
+                if ctx.execution_fence is not None and single_tool_result is None:
                     await ctx.execution_fence.checkpoint(
                         "intaris_append",
                         session_id=intaris_id,
@@ -20963,46 +22403,208 @@ class AgentLoop:
                         turn_id=ctx.turn_id,
                         reason=reason,
                     )
-                append_result = await self.providers.guardrails.record_events(
-                    session_id=intaris_id,
-                    events=batch,
-                    source="cognis",
-                    idempotency_key=idempotency_key,
-                )
-                if not append_result.ok:
+                settlement = None
+                append_results: list[tuple[list[SessionEvent], Any]] = []
+                if single_tool_result is not None:
+                    call_snapshot = ctx.canonical_tool_call_snapshots.get(
+                        single_tool_result.data["call_id"], {}
+                    )
+                    raw_call_event = call_snapshot.get("event")
+                    call_event = (
+                        SessionEvent(
+                            type=raw_call_event["type"],
+                            data=dict(raw_call_event["data"]),
+                        )
+                        if isinstance(raw_call_event, dict)
+                        and isinstance(raw_call_event.get("type"), str)
+                        and isinstance(raw_call_event.get("data"), dict)
+                        else None
+                    )
+                    raw_call_idempotency_key = call_snapshot.get("idempotency_key")
+                    raw_call_seq = call_snapshot.get("seq")
+                    try:
+                        settlement = await append_tool_result_once(
+                            self.providers.guardrails,
+                            session_id=intaris_id,
+                            turn_id=single_tool_result.data["turn_id"],
+                            call_id=single_tool_result.data["call_id"],
+                            tool_name=single_tool_result.data["name"],
+                            event=single_tool_result,
+                            targeted_evidence=True,
+                            tool_call_event=call_event,
+                            tool_call_idempotency_key=(
+                                raw_call_idempotency_key
+                                if isinstance(raw_call_idempotency_key, str)
+                                else None
+                            ),
+                            tool_call_seq=raw_call_seq if isinstance(raw_call_seq, int) else None,
+                            cancel_event=ctx.cancel_event,
+                        )
+                    except CanonicalToolHistoryError as exc:
+                        if call_event is None:
+                            raise
+                        recovered_result_event = (
+                            exc.result_event
+                            if isinstance(exc, CanonicalToolRepairUnavailable)
+                            and exc.result_event is not None
+                            else SessionEvent(
+                                type="tool_result",
+                                data={
+                                    "call_id": single_tool_result.data["call_id"],
+                                    "name": single_tool_result.data["name"],
+                                    "is_error": True,
+                                    "result": (
+                                        "Canonical tool history could not be reconciled. "
+                                        "The interrupted tool was not redispatched and its "
+                                        "outcome is uncertain."
+                                    ),
+                                    "agent_visible": True,
+                                    "view_kind": "model_tool_result",
+                                    "turn_id": single_tool_result.data["turn_id"],
+                                    "recovery": True,
+                                    "uncertain": True,
+                                },
+                            )
+                        )
+                        boundary = canonical_tool_continuation_events(
+                            session_id=intaris_id,
+                            call_event=call_event,
+                            result_event=recovered_result_event,
+                        )
+                        append_result = await self.providers.guardrails.record_events(
+                            session_id=intaris_id,
+                            events=boundary,
+                            source="cognis",
+                            idempotency_key=(
+                                f"{intaris_id}:turn:{single_tool_result.data['turn_id']}:"
+                                f"canonical-continuation:{single_tool_result.data['call_id']}"
+                            ),
+                        )
+                        settlement = ToolResultSettlement(
+                            append_result=append_result,
+                            event={"type": boundary[1].type, "data": boundary[1].data},
+                            appended=True,
+                        )
+                        batch = boundary
+                    append_result = settlement.append_result
+                else:
+                    for append_group, append_key in append_groups:
+                        append_result = await self.providers.guardrails.record_events(
+                            session_id=intaris_id,
+                            events=append_group,
+                            source="cognis",
+                            idempotency_key=append_key,
+                        )
+                        if not append_result.ok:
+                            raise RuntimeError(f"Intaris did not persist {reason}")
+                        append_results.append((append_group, append_result))
+                if single_tool_result is not None and not append_result.ok:
                     raise RuntimeError(f"Intaris did not persist {reason}")
                 if ctx.execution_fence is not None:
                     await ctx.execution_fence.assert_current()
-                next_seq = append_result.first_seq
-                for event in batch:
-                    if event.type == "user_message":
-                        ctx.remember_user_event_seq = next_seq
-                    elif event.type == "assistant_message":
-                        ctx.remember_assistant_event_seq = next_seq
-                    next_seq += 1
-                await self.session_cache.append_recorded_events(ctx.session, batch, append_result)
-                _record_tool_call_ledger_events(ctx, batch)
+                if settlement is not None and not settlement.appended:
+                    await self.session_cache.invalidate_canonical(ctx.session.session_id)
+                elif settlement is not None:
+                    await self.session_cache.append_recorded_events(
+                        ctx.session, batch, append_result
+                    )
+                else:
+                    for append_group, group_result in append_results:
+                        next_seq = group_result.first_seq
+                        for event in append_group:
+                            if event.type == "user_message":
+                                ctx.remember_user_event_seq = next_seq
+                                if TRUSTED_EVIDENCE_MARKER_KEY in event.data:
+                                    ctx.remember_evidence_event_hash = event_hash(
+                                        intaris_id,
+                                        next_seq,
+                                        event,
+                                    )
+                            elif event.type == "assistant_message":
+                                ctx.remember_assistant_event_seq = next_seq
+                                if ctx.remember_evidence_event_hash:
+                                    ctx.remember_assistant_event_hash = event_hash(
+                                        intaris_id,
+                                        next_seq,
+                                        event,
+                                    )
+                            next_seq += 1
+                    for append_group, group_result in append_results:
+                        await self.session_cache.append_recorded_events(
+                            ctx.session, append_group, group_result
+                        )
+                    if on_append_result is not None:
+                        if len(append_results) != 1:
+                            raise RuntimeError("append result callback requires one append group")
+                        await on_append_result(append_results[0][1])
+                self._record_tool_call_ledger_events(ctx, batch)
+                if (
+                    ctx.memory_policy is not None
+                    and ctx.memory_policy.auto_remember
+                    and ctx.remember_evidence_event_hash
+                    and ctx.remember_user_event_seq
+                    and evidence_admission_authorizes(
+                        ctx.trusted_evidence_admission,
+                        key=self.trusted_evidence_admission_key,
+                        owner_id=ctx.agent.owner_email,
+                    )
+                ):
+                    await self._enqueue_evidence_rows_after_append(ctx)
+                if any(
+                    event.type == "tool_call" and not event.data.get("canonical_recovery_boundary")
+                    for event in batch
+                ):
+                    tool_call_seqs = {
+                        event.data["call_id"]: group_result.first_seq
+                        for append_group, group_result in append_results
+                        for event in append_group
+                        if event.type == "tool_call"
+                        and not event.data.get("canonical_recovery_boundary")
+                        and isinstance(event.data.get("call_id"), str)
+                    }
+                    tool_call_snapshots = {
+                        event.data["call_id"]: {
+                            "event": {"type": event.type, "data": dict(event.data)},
+                            "idempotency_key": tool_call_idempotency_key(
+                                intaris_id, turn_id, event.data["call_id"]
+                            ),
+                            "seq": tool_call_seqs.get(event.data["call_id"]),
+                        }
+                        for event in batch
+                        if event.type == "tool_call"
+                        and not event.data.get("canonical_recovery_boundary")
+                        and isinstance(event.data.get("call_id"), str)
+                        and isinstance(event.data.get("name"), str)
+                    }
+                    ctx.canonical_tool_call_snapshots.update(tool_call_snapshots)
                 if ctx.execution_fence is not None and any(
-                    event.type == "tool_call" for event in batch
+                    event.type == "tool_call" and not event.data.get("canonical_recovery_boundary")
+                    for event in batch
                 ):
                     await ctx.execution_fence.checkpoint(
                         "tool_in_flight",
-                        call_ids=[
-                            event.data.get("call_id")
+                        tool_calls=[
+                            {
+                                "call_id": event.data.get("call_id"),
+                                "tool_name": event.data.get("name"),
+                                "frozen": False,
+                                "dispatch_state": "pending",
+                                **tool_call_snapshots.get(event.data.get("call_id"), {}),
+                            }
                             for event in batch
                             if event.type == "tool_call"
+                            and not event.data.get("canonical_recovery_boundary")
+                            and isinstance(event.data.get("call_id"), str)
+                            and isinstance(event.data.get("name"), str)
                         ],
-                        timeout_seconds=self.default_step_timeout_seconds,
+                        session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                        turn_id=ctx.turn_id,
                     )
-                if ctx.execution_fence is not None and any(
-                    event.type == "tool_result" for event in batch
-                ):
-                    await ctx.execution_fence.checkpoint("tool_result_persisted")
                 # Delete only the snapshotted prefix: the Intaris append (and
                 # a potentially minutes-long recovery wait) may have allowed
                 # concurrent orchestration handlers to append new events to
                 # the shared list. events.clear() would silently drop them.
-                del events[: len(batch)]
+                del events[:source_event_count]
                 return True
             except Exception as exc:
                 if not is_retryable_http_error(exc):
@@ -21124,7 +22726,7 @@ class AgentLoop:
         reason: str,
         on_token: TokenCallback | None,
     ) -> bool:
-        """Drain queued same-conversation/task input into the active turn."""
+        """Drain one bounded, quiescent batch of same-turn input."""
 
         if ctx.consume_boundary_batch is None:
             return False
@@ -21134,6 +22736,62 @@ class AgentLoop:
         if not batch:
             return False
 
+        loop = asyncio.get_running_loop()
+        batching_deadline = loop.time() + _BOUNDARY_BATCH_MAX_WAIT_SECONDS
+        quiet_deadline = loop.time() + _BOUNDARY_BATCH_QUIET_SECONDS
+        total_batch_size = 0
+        drain_passes = 0
+        absorbed_user_input = False
+        while True:
+            drain_passes += 1
+            total_batch_size += len(batch)
+            absorbed_user_input = absorbed_user_input or any(
+                not bool(item.get("system_initiated")) for item in batch
+            )
+            for item in batch:
+                if self._boundary_item_already_present(messages, item):
+                    if ctx.on_boundary_persisted is not None:
+                        await ctx.on_boundary_persisted(item)
+                    continue
+                await self._append_boundary_batch_item(
+                    ctx,
+                    messages=messages,
+                    pending_audit_messages=pending_audit_messages,
+                    item=item,
+                    on_token=on_token,
+                )
+
+            if drain_passes >= _BOUNDARY_BATCH_MAX_DRAIN_PASSES or (
+                drain_passes > 1 and loop.time() >= batching_deadline
+            ):
+                break
+
+            # Capture admissions that committed while the previous snapshot was
+            # being persisted before waiting for another queue notification.
+            batch = await ctx.consume_boundary_batch(reason)
+            if batch:
+                quiet_deadline = loop.time() + _BOUNDARY_BATCH_QUIET_SECONDS
+                continue
+
+            now = loop.time()
+            wait_seconds = min(quiet_deadline - now, batching_deadline - now)
+            if wait_seconds <= 0:
+                break
+            if ctx.wait_for_boundary_input is None:
+                await asyncio.sleep(wait_seconds)
+            else:
+                try:
+                    async with asyncio.timeout(wait_seconds):
+                        await ctx.wait_for_boundary_input(None)
+                except TimeoutError:
+                    pass
+            batch = await ctx.consume_boundary_batch(reason)
+            if batch:
+                quiet_deadline = loop.time() + _BOUNDARY_BATCH_QUIET_SECONDS
+                continue
+            if loop.time() >= quiet_deadline:
+                break
+
         logger.info(
             "agent: absorbed queued batch",
             extra={
@@ -21141,22 +22799,13 @@ class AgentLoop:
                     "session_id": ctx.session.session_id,
                     "conversation_id": ctx.conversation.conversation_id,
                     "reason": reason,
-                    "batch_size": len(batch),
+                    "batch_size": total_batch_size,
+                    "drain_passes": drain_passes,
                 }
             },
         )
-        for item in batch:
-            if self._boundary_item_already_present(messages, item):
-                if ctx.on_boundary_persisted is not None:
-                    await ctx.on_boundary_persisted(item)
-                continue
-            await self._append_boundary_batch_item(
-                ctx,
-                messages=messages,
-                pending_audit_messages=pending_audit_messages,
-                item=item,
-                on_token=on_token,
-            )
+        if absorbed_user_input and ctx.advance_boundary_phase is not None:
+            ctx.advance_boundary_phase()
         return True
 
     @staticmethod
@@ -21199,6 +22848,7 @@ class AgentLoop:
         source = str(item.get("source") or "user_input")
         intention_eligible = bool(item.get("intention_eligible", not system_initiated))
 
+        rendered_follow_up: str | None = None
         if follow_up is not None:
             messages.append(
                 {
@@ -21213,18 +22863,23 @@ class AgentLoop:
                 source="follow_up_boundary",
                 content=str(messages[-1]["content"]),
             )
-            messages.append(
-                {
-                    "role": "system",
-                    "content": render_follow_up_block(follow_up),
-                }
-            )
+            rendered_follow_up = render_follow_up_block(follow_up)
+            if not any(
+                message.get("role") == "system" and message.get("content") == rendered_follow_up
+                for message in messages
+            ):
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": rendered_follow_up,
+                    }
+                )
             self._append_pending_audit_message(
                 messages,
                 pending_audit_messages,
                 role="developer",
                 source="follow_up_boundary",
-                content=str(messages[-1]["content"]),
+                content=rendered_follow_up,
             )
 
         if isinstance(attachment_notice, str) and attachment_notice:
@@ -21249,72 +22904,145 @@ class AgentLoop:
         if system_initiated:
             if content:
                 messages.append({"role": "system", "content": content})
+            durable_request_id = item.get("durable_request_id")
+            if isinstance(durable_request_id, str):
+                follow_up_id = (
+                    follow_up.follow_up_id
+                    if isinstance(follow_up, FollowUpMetadata)
+                    else durable_request_id
+                )
+                if ctx.on_absorbed_append_start is not None:
+                    await ctx.on_absorbed_append_start(
+                        durable_request_id,
+                        ctx.session.intaris_session_id or ctx.session.session_id,
+                        ["system_message"],
+                    )
+                persisted_content = rendered_follow_up or content
+                if persisted_content:
+                    await self._record_events_strict(
+                        ctx,
+                        [
+                            SessionEvent(
+                                type="system_message",
+                                data={
+                                    "content": persisted_content,
+                                    "source": "durable_boundary_follow_up",
+                                    "follow_up_id": follow_up_id,
+                                    "queue_id": item.get("queue_id") or durable_request_id,
+                                    **(
+                                        {
+                                            "origin_kind": follow_up.origin_kind.value,
+                                            "reason": getattr(follow_up, "reason", None),
+                                            "topic_ref": follow_up.topic_ref,
+                                        }
+                                        if isinstance(follow_up, FollowUpMetadata)
+                                        else {}
+                                    ),
+                                },
+                            )
+                        ],
+                        reason="system_follow_up_boundary",
+                        on_token=on_token,
+                    )
+                if ctx.on_boundary_persisted is not None:
+                    await ctx.on_boundary_persisted(item)
+                if ctx.on_absorbed_persisted is not None:
+                    await ctx.on_absorbed_persisted(durable_request_id)
             return
 
         recorded_user_message = _user_message_for_recording(content, attachments)
         # Record if there is text content OR if the user only sent attachments
         # (attachment-only messages have content="" which is falsy but still need
         # to be persisted so the history and WS events are faithful to what was sent).
-        if (not ctx.is_retry or source == "task_context_comment") and (
-            recorded_user_message or attachments
-        ):
+        if recorded_user_message or attachments:
             durable_request_id = item.get("durable_request_id")
+            queue_id = item.get("queue_id")
+            client_message_id = item.get("client_message_id")
             if isinstance(durable_request_id, str) and ctx.on_absorbed_append_start is not None:
                 await ctx.on_absorbed_append_start(
                     durable_request_id,
                     ctx.session.intaris_session_id or ctx.session.session_id,
+                    ["user_message"],
                 )
-            await self._record_events_strict(
-                ctx,
-                [
-                    SessionEvent(
-                        type="user_message",
-                        data={
-                            "role": "user",
-                            "content": recorded_user_message,
-                            "content_type": "text",
-                            "source": source,
-                            "intention_eligible": intention_eligible,
-                            "turn_id": ctx.turn_id,
-                            "hash": hashlib.sha256(
-                                json.dumps(
-                                    {
-                                        "role": "user",
-                                        "content": recorded_user_message,
-                                        "source": source,
-                                        "intention_eligible": intention_eligible,
-                                    },
-                                    sort_keys=True,
-                                    separators=(",", ":"),
-                                ).encode("utf-8")
-                            ).hexdigest(),
-                            "attachments": attachment_refs_to_dicts(
-                                attachments,
-                                include_url=False,
-                            ),
-                            **{
-                                key: value
-                                for key, value in {
-                                    "comment_id": item.get("comment_id"),
-                                    "author_email": item.get("author_email"),
-                                    # Persist the client/queue identity so the
-                                    # canonical projection produces the same
-                                    # item id (user:{client_message_id}) as the
-                                    # optimistic bubble and the live WS event.
-                                    # Without it the optimistic message never
-                                    # confirms — duplicating or vanishing on
-                                    # refresh.
-                                    "client_message_id": item.get("client_message_id"),
-                                    "queue_id": item.get("queue_id"),
-                                    "message_id": item.get("client_message_id"),
-                                }.items()
-                                if value is not None
+            append_started = monotonic()
+
+            async def _capture_boundary_receipt(append_result: Any) -> None:
+                if (
+                    ctx.on_boundary_committed is None
+                    or not isinstance(durable_request_id, str)
+                    or not isinstance(client_message_id, str)
+                ):
+                    return
+                await ctx.on_boundary_committed(
+                    {
+                        "session_id": ctx.session.intaris_session_id or ctx.session.session_id,
+                        "seq": append_result.first_seq,
+                        "queue_id": queue_id or durable_request_id,
+                        "client_message_id": client_message_id,
+                    }
+                )
+
+            try:
+                await self._record_events_strict(
+                    ctx,
+                    [
+                        SessionEvent(
+                            type="user_message",
+                            data={
+                                "role": "user",
+                                "content": recorded_user_message,
+                                "content_type": "text",
+                                "source": source,
+                                "intention_eligible": intention_eligible,
+                                "turn_id": ctx.turn_id,
+                                "hash": hashlib.sha256(
+                                    json.dumps(
+                                        {
+                                            "role": "user",
+                                            "content": recorded_user_message,
+                                            "source": source,
+                                            "intention_eligible": intention_eligible,
+                                        },
+                                        sort_keys=True,
+                                        separators=(",", ":"),
+                                    ).encode("utf-8")
+                                ).hexdigest(),
+                                "attachments": attachment_refs_to_dicts(
+                                    attachments,
+                                    include_url=False,
+                                ),
+                                **{
+                                    key: value
+                                    for key, value in {
+                                        "comment_id": item.get("comment_id"),
+                                        "author_email": item.get("author_email"),
+                                        # Persist the client/queue identity so the
+                                        # canonical projection produces the same
+                                        # item id (user:{client_message_id}) as the
+                                        # optimistic bubble and the live WS event.
+                                        # Without it the optimistic message never
+                                        # confirms — duplicating or vanishing on
+                                        # refresh.
+                                        "client_message_id": item.get("client_message_id"),
+                                        "queue_id": item.get("queue_id"),
+                                        "message_id": item.get("client_message_id"),
+                                    }.items()
+                                    if value is not None
+                                },
                             },
-                        },
-                    )
-                ],
-                reason="user_message_boundary",
-                on_token=on_token,
+                        )
+                    ],
+                    reason="user_message_boundary",
+                    on_token=on_token,
+                    on_append_result=_capture_boundary_receipt,
+                )
+            except Exception:
+                BOUNDARY_USER_APPEND_DURATION.labels(outcome="failure").observe(
+                    monotonic() - append_started
+                )
+                raise
+            BOUNDARY_USER_APPEND_DURATION.labels(outcome="success").observe(
+                monotonic() - append_started
             )
             if ctx.on_boundary_persisted is not None:
                 await ctx.on_boundary_persisted(item)
@@ -21634,6 +23362,10 @@ class AgentLoop:
         definition = ctx.classified_tool_definitions.get(
             stable_tool_id(registered.definition), registered.definition
         )
+        if definition.category == "memory":
+            # Memory results can allocate durable session aliases. Keep their
+            # execution and settlement ordered within the conversation turn.
+            return False
         allowlisted_parallel_mutation = (
             definition.source.type == "executor"
             and definition.name in _PARALLEL_MUTATION_TOOL_NAMES
@@ -21888,6 +23620,19 @@ class AgentLoop:
         executor selection, target override stripping, ToolRouter invocation,
         reconnect policy, metrics, and bounded result sanitization.
         """
+        stale_output = await self._stale_session_step_output(
+            ctx,
+            phase="before_tool_dispatch",
+        )
+        if stale_output is not None:
+            return ToolResult(
+                output=stale_output.summary or "Session is no longer active.",
+                is_error=True,
+                metadata={
+                    "code": "session_not_continuable",
+                    **(stale_output.metadata or {}),
+                },
+            )
         if not external_tool_allowed(
             tool_name=tc.name,
             tool_id=_tool_id_for_call(tc.name, ctx.tool_registry),
@@ -21940,6 +23685,7 @@ class AgentLoop:
                     )
 
         executor_connection = self._get_executor(ctx)
+        target_executor_environment: ExecutorEnvironmentSnapshot | None = None
 
         async def _on_tool_output_chunk(delta: str, stream: str | None) -> None:
             if ctx.on_tool_output_chunk is not None:
@@ -22006,10 +23752,22 @@ class AgentLoop:
                         is_error=True,
                     )
                 executor_connection = resolved_conn
+            if target_executor_id == getattr(ctx, "active_executor_id", None):
+                target_executor_environment = ctx.executor_environment
+            else:
+                target_executor_environment = self._executor_environment_for_target(target)
 
         try:
             registry = self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx))
             registered = registry.get(tc.name) if registry is not None else None
+            if registered is not None and not filter_edit_tools_for_model(
+                [registered.definition],
+                getattr(ctx.current_model_info, "model_id", None) or ctx.current_model,
+            ):
+                return ToolResult(
+                    output="This editing tool is unavailable for the current model.",
+                    is_error=True,
+                )
             if registered is not None:
                 route = str(registered.definition.source.type)
             if (
@@ -22020,15 +23778,66 @@ class AgentLoop:
                 executor_connection = await self._refresh_active_executor_connection(ctx)
             if target_executor_id is not None:
                 route = f"{route}:target_executor"
-            result = await self.tool_router.execute(
-                tc.model_copy(
-                    update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
-                ),
+
+            async def _before_executor_send(
+                executor_id: str, executor_instance_id: str | None
+            ) -> None:
+                await self._bind_tool_dispatch_fence(
+                    ctx,
+                    call_id=tc.call_id,
+                    executor_id=executor_id,
+                    executor_instance_id=executor_instance_id,
+                    dispatch_state="dispatching",
+                )
+
+            async def _after_executor_send(
+                executor_id: str, executor_instance_id: str | None
+            ) -> None:
+                with contextlib.suppress(Exception):
+                    await self._bind_tool_dispatch_fence(
+                        ctx,
+                        call_id=tc.call_id,
+                        executor_id=executor_id,
+                        executor_instance_id=executor_instance_id,
+                        dispatch_state="sent",
+                    )
+
+            runtime_metadata = self._tool_runtime_metadata_for_call(ctx, tc)
+            if target_executor_environment is not None:
+                runtime_metadata.pop("workspace_root", None)
+                target_working_directory = (
+                    target_executor_environment.cwd or target_executor_environment.home
+                )
+                if target_working_directory:
+                    runtime_metadata["working_directory"] = target_working_directory
+                else:
+                    runtime_metadata.pop("working_directory", None)
+                runtime_metadata["executor_environment"] = self._executor_environment_metadata(
+                    target_executor_environment
+                )
+                if target_executor_id != getattr(ctx, "active_executor_id", None):
+                    await self._refresh_executor_session_policy(
+                        ctx,
+                        additional_environment=target_executor_environment,
+                    )
+            routed_tool_call = tc.model_copy(update={"runtime_metadata": runtime_metadata})
+            result: ToolResult = await self.tool_router.execute(
+                routed_tool_call,
                 ctx.session,
                 ctx.agent,
                 registry,
                 executor_connection,
                 output_chunk_callback=output_chunk_callback,
+                before_executor_send=(
+                    _before_executor_send
+                    if registered is not None and registered.definition.source.type == "executor"
+                    else None
+                ),
+                after_executor_send=(
+                    _after_executor_send
+                    if registered is not None and registered.definition.source.type == "executor"
+                    else None
+                ),
             )
             if isinstance(result.metadata, dict):
                 delivery_metadata = dict(result.metadata)
@@ -22039,10 +23848,11 @@ class AgentLoop:
                 ):
                     delivery_metadata.setdefault("generation", active_generation)
                 result = result.model_copy(update={"metadata": delivery_metadata})
+            await self._sync_guardrails_terminal_result(ctx, result)
             if self._is_same_executor_transient_failure(result):
                 retry_result = await self._retry_tool_after_same_executor_reconnect(
                     ctx,
-                    tc=tc,
+                    tc=routed_tool_call,
                     registered=registered,
                     target_executor_id=target_executor_id,
                     failed_connection=executor_connection,
@@ -22058,6 +23868,30 @@ class AgentLoop:
         except AmbiguousToolOutcome:
             outcome = "ambiguous"
             raise
+        except StaleDirectTurnOwner:
+            outcome = "error"
+            # A durable owner must stop before an executor dispatch after its
+            # fence changes. The turn scheduler owns the stale-owner outcome.
+            raise
+        except ExecutorRecoveryTimeout:
+            outcome = "error"
+            raise
+        except CircuitBreakerError as exc:
+            outcome = "error"
+            dependency = f" '{exc.name}'" if exc.name else ""
+            return ToolResult(
+                output=(
+                    f"Tool dependency{dependency} is temporarily unavailable because its "
+                    "circuit breaker is open. "
+                    f"Retry after {exc.retry_after_seconds:.1f} seconds."
+                ),
+                is_error=True,
+                metadata={
+                    "code": "tool_dependency_circuit_open",
+                    "retryable": True,
+                    "circuit": exc.metadata(),
+                },
+            )
         except Exception as exc:
             outcome = "error"
             return ToolResult(output=f"Tool execution failed: {str(exc)[:1000]}", is_error=True)
@@ -22084,6 +23918,29 @@ class AgentLoop:
                     }
                 },
             )
+
+    @staticmethod
+    async def _bind_tool_dispatch_fence(
+        ctx: StepContext,
+        *,
+        call_id: str,
+        executor_id: str,
+        executor_instance_id: str | None,
+        dispatch_state: str,
+    ) -> None:
+        fence = ctx.execution_fence
+        if fence is None:
+            return
+        bind_tool_dispatch = getattr(fence, "bind_tool_dispatch", None)
+        if callable(bind_tool_dispatch):
+            await bind_tool_dispatch(
+                call_id,
+                executor_id,
+                executor_instance_id,
+                dispatch_state=dispatch_state,
+            )
+        elif dispatch_state == "dispatching":
+            await fence.assert_current()
 
     async def _refresh_active_executor_connection(self, ctx: StepContext) -> Any:
         """Refresh the turn-local active WebSocket connection without switching executors."""
@@ -22184,7 +24041,12 @@ class AgentLoop:
             capabilities = tool_capabilities(definition)
         except Exception:
             return False
-        return ToolCapability.READ in capabilities and ToolCapability.WRITE not in capabilities
+        unsafe = {
+            ToolCapability.WRITE,
+            ToolCapability.DESTRUCTIVE,
+            ToolCapability.PRIVILEGED,
+        }
+        return ToolCapability.READ in capabilities and capabilities.isdisjoint(unsafe)
 
     def _canonical_tool_identity(
         self,
@@ -22208,11 +24070,317 @@ class AgentLoop:
             canonical_name,
             _canonical_tool_arguments(tool_call.arguments),
         )
-        ctx.same_turn_tool_call_ledger.record_fingerprint(canonical_name, fingerprint)
+        ctx.same_turn_tool_call_ledger.record_uncertain_fingerprint(canonical_name, fingerprint)
         ambiguity.add_uncertain_tool_call(
             tool_name=canonical_name,
             argument_fingerprint=fingerprint,
         )
+
+    async def _reconcile_accepted_tool_call(
+        self,
+        ctx: StepContext,
+        *,
+        tc: ToolCall,
+        registered: Any | None,
+        executor_id: str,
+        failed_connection: Any,
+        original_result: ToolResult,
+        deadline: float,
+    ) -> tuple[str, ToolResult | None, str]:
+        """Ask the reconnected executor what actually happened to one call.
+
+        Returns ``("terminal", result, reason)`` when the executor still holds
+        the real outcome, ``("not_sent", None, reason)`` when the accepting
+        process proves the call never ran, and ``("unresolved", None, reason)``
+        when the outcome genuinely cannot be established (for example the
+        executor process itself died). ``reason`` is a bounded diagnostic code
+        recorded on the ambiguity payload so an unresolved outcome can always be
+        attributed after the fact.
+
+        Deadlines are two-tier: reconnecting and the first authoritative report
+        must land within ``deadline`` (the recovery budget), but once the same
+        accepting process confirms the call is still ACTIVE, polling extends to
+        the tool's own completion budget. A long-running command that survives
+        a socket drop is indistinguishable from normal execution and must not
+        be declared ambiguous merely because it outlives the reconnect budget.
+        """
+
+        # The accepting instance must come from the failed dispatch itself. A
+        # turn-local connection reference may already point at a replacement,
+        # and trusting it would let a restarted executor masquerade as the
+        # original process.
+        transport = (original_result.metadata or {}).get("transport")
+        accepted_instance = (
+            transport.get("executor_instance_id") if isinstance(transport, dict) else None
+        )
+        if not isinstance(accepted_instance, str) or not accepted_instance:
+            return ("unresolved", None, "no_accepted_instance")
+        ws_provider = self._same_executor_reconnect_provider()
+        if ws_provider is None:
+            return ("unresolved", None, "no_ws_provider")
+
+        loop = asyncio.get_running_loop()
+        definition = getattr(registered, "definition", None)
+        tool_timeout = getattr(definition, "timeout_seconds", None)
+        completion_budget = (
+            float(tool_timeout)
+            if isinstance(tool_timeout, int | float) and tool_timeout > 0
+            else _TOOL_RECONCILE_DEFAULT_COMPLETION_BUDGET_SECONDS
+        )
+        # Activated on the first authoritative same-instance ACTIVE report.
+        # Computed from now as an upper bound: the executor enforces its own
+        # inner timeout, so the retained terminal (or timeout) result arrives
+        # within one poll of completion.
+        completion_deadline = (
+            loop.time() + completion_budget + _TOOL_RECONCILE_COMPLETION_GRACE_SECONDS
+        )
+        # An accepted call always gets a minimal reconciliation window even if
+        # the recovery budget is spent: refusing to ask the accepting process
+        # guarantees a false ambiguity.
+        effective_deadline = max(deadline, loop.time() + _TOOL_RECONCILE_MIN_WINDOW_SECONDS)
+        remaining = max(0.0, effective_deadline - loop.time())
+        conn: Any = None
+        try:
+            conn = await ws_provider.wait_for_connection(
+                executor_id,
+                timeout=remaining,
+                failed_connection=failed_connection,
+                delivery_state=DeliveryState.NOT_SENT.value,
+                cancel_event=ctx.cancel_event,
+                execution_fence=ctx.execution_fence,
+            )
+        except (StaleDirectTurnOwner, StaleTaskExecutionOwner):
+            raise
+        except Exception:
+            conn = None
+        if conn is None:
+            return ("unresolved", None, "reconnect_timeout")
+
+        fetch_failures = 0
+        while True:
+            current_instance = getattr(conn, "executor_instance_id", None)
+            if isinstance(current_instance, str) and current_instance != accepted_instance:
+                # The executor process itself restarted: the outcome of a
+                # mutating call is genuinely unknowable.
+                return ("unresolved", None, "instance_mismatch")
+            fetch = getattr(conn, "fetch_tool_result", None)
+            if fetch is None:
+                return ("unresolved", None, "fetch_unsupported")
+            remaining = effective_deadline - loop.time()
+            if remaining <= 0:
+                return ("unresolved", None, "deadline_exceeded")
+            try:
+                # Bound each lookup by the remaining window so reconciliation
+                # cannot overrun the tool's own budget.
+                report = await self._await_reconcile_fetch(
+                    ctx,
+                    fetch(tc.call_id, timeout=min(remaining, 30.0)),
+                    timeout=min(remaining, 30.0),
+                )
+            except (StaleDirectTurnOwner, StaleTaskExecutionOwner, StepInterrupted):
+                raise
+            except Exception as exc:
+                fetch_failures += 1
+                logger.info(
+                    "agent: tool outcome reconciliation fetch failed",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
+                            **self._step_log_metadata(ctx),
+                            "tool_name": tc.name,
+                            "call_id": tc.call_id,
+                            "executor_id": executor_id,
+                            "attempt": fetch_failures,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                )
+                if (
+                    fetch_failures >= _TOOL_RECONCILE_MAX_FETCH_FAILURES
+                    or loop.time() >= effective_deadline
+                ):
+                    return ("unresolved", None, "fetch_failed")
+                # A stale forwarded proxy still bound to the previous owner epoch
+                # is a recoverable condition, not proof the outcome is unknown.
+                refreshed = await self._refresh_reconcile_connection(
+                    ws_provider,
+                    ctx=ctx,
+                    executor_id=executor_id,
+                    failed_connection=conn,
+                    deadline=effective_deadline,
+                )
+                if refreshed is None:
+                    return ("unresolved", None, "reconnect_timeout")
+                conn = refreshed
+                continue
+            # Only the process that accepted the call may describe its outcome.
+            # An absent or mismatched identity is never trustworthy evidence.
+            report_instance = report.get("executor_instance_id")
+            if not isinstance(report_instance, str) or report_instance != accepted_instance:
+                return ("unresolved", None, "report_instance_mismatch")
+            # An authoritative report proves the transport works again: isolated
+            # fetch hiccups during a long ACTIVE wait must not accumulate into a
+            # false ambiguity. The cap only limits *consecutive* failures.
+            fetch_failures = 0
+            state = str(report.get("state") or "")
+            if state == "terminal":
+                payload = report.get("result")
+                if not isinstance(payload, dict):
+                    return ("unresolved", None, "malformed_terminal_report")
+                metadata = dict(payload.get("metadata") or {})
+                # Controller-owned audit metadata always wins. An executor must
+                # never be able to supply its own guardrails verdict, so these
+                # keys are replaced (or removed) regardless of what it returned.
+                from cognis.core.tool_router import (
+                    _CONTROLLER_OWNED_RESULT_METADATA_KEYS,
+                )
+
+                original_metadata = original_result.metadata or {}
+                for audit_key in _CONTROLLER_OWNED_RESULT_METADATA_KEYS:
+                    if audit_key in original_metadata:
+                        metadata[audit_key] = original_metadata[audit_key]
+                    else:
+                        metadata.pop(audit_key, None)
+                metadata["recovered_after_reconnect"] = True
+                logger.info(
+                    "agent: recovered tool outcome after executor reconnect",
+                    extra={
+                        "extra_data": {
+                            "session_id": ctx.session.session_id,
+                            "turn_id": ctx.turn_id,
+                            **self._step_log_metadata(ctx),
+                            "tool_name": tc.name,
+                            "call_id": tc.call_id,
+                            "executor_id": executor_id,
+                        }
+                    },
+                )
+                recovered = ToolResult(
+                    output=str(payload.get("output", "")),
+                    is_error=bool(payload.get("is_error", False)),
+                    duration_ms=payload.get("duration_ms"),
+                    metadata=metadata,
+                    attachments=payload.get("attachments"),
+                )
+                finalize = getattr(self.tool_router, "finalize_recovered_executor_result", None)
+                if finalize is None or registered is None:
+                    # Without the normal post-execution pipeline the output would
+                    # bypass the untrusted-content boundary, so do not use it.
+                    return ("unresolved", None, "finalize_unavailable")
+                recovered = await finalize(
+                    result=recovered,
+                    # Use dispatch runtime metadata so model-aware
+                    # post-processing and token limits match normal execution.
+                    tool_call=tc.model_copy(
+                        update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
+                    ),
+                    registered_tool=registered,
+                    session=ctx.session,
+                    agent=ctx.agent,
+                )
+                return ("terminal", recovered, "recovered")
+            if state == "unknown":
+                return ("not_sent", None, "executor_never_ran")
+            if state != "active":
+                return ("unresolved", None, "indeterminate_state")
+            # The accepting process confirmed the call is still running: allow
+            # waiting for its terminal result within the tool's own completion
+            # budget instead of abandoning it at the reconnect budget.
+            effective_deadline = max(effective_deadline, completion_deadline)
+            remaining = max(0.0, effective_deadline - loop.time())
+            if remaining <= 0:
+                return ("unresolved", None, "deadline_exceeded")
+            self._raise_if_cancelled(ctx)
+            if ctx.execution_fence is not None:
+                await ctx.execution_fence.assert_current()
+            await asyncio.sleep(min(_TOOL_RECONCILE_POLL_SECONDS, remaining))
+            refreshed = await self._refresh_reconcile_connection(
+                ws_provider,
+                ctx=ctx,
+                executor_id=executor_id,
+                failed_connection=None,
+                deadline=effective_deadline,
+            )
+            if refreshed is None:
+                return ("unresolved", None, "reconnect_timeout")
+            conn = refreshed
+
+    async def _await_reconcile_fetch(
+        self,
+        ctx: StepContext,
+        fetch_awaitable: Any,
+        *,
+        timeout: float,
+    ) -> Any:
+        """Wait for one result fetch while polling cancellation and ownership."""
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        fetch_task = asyncio.create_task(fetch_awaitable)
+        try:
+            while True:
+                self._raise_if_cancelled(ctx)
+                if ctx.execution_fence is not None:
+                    await ctx.execution_fence.assert_current()
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError
+                done, _ = await asyncio.wait(
+                    {fetch_task},
+                    timeout=min(remaining, 0.25),
+                )
+                if fetch_task in done:
+                    return fetch_task.result()
+        finally:
+            if not fetch_task.done():
+                fetch_task.cancel()
+                await asyncio.gather(fetch_task, return_exceptions=True)
+
+    async def _refresh_reconcile_connection(
+        self,
+        ws_provider: Any,
+        *,
+        ctx: StepContext,
+        executor_id: str,
+        failed_connection: Any,
+        deadline: float,
+    ) -> Any:
+        """Re-resolve a usable connection for outcome reconciliation.
+
+        A forwarded proxy bound to a superseded owner epoch is invalidated first
+        so reconciliation can follow the executor to its current owner instead of
+        abandoning a recoverable call.
+        """
+
+        loop = asyncio.get_running_loop()
+        if failed_connection is not None and hasattr(failed_connection, "owner_id"):
+            invalidate = getattr(ws_provider, "invalidate_forwarded_connection", None)
+            if invalidate is not None and inspect.iscoroutinefunction(invalidate):
+                with contextlib.suppress(Exception):
+                    await invalidate(executor_id, failed_connection)
+        refreshed = self._resolve_target_connection(
+            target_executor_id=executor_id,
+            target_executor_type="websocket",
+        )
+        if refreshed is not None and refreshed is not failed_connection:
+            return refreshed
+        remaining = max(0.0, deadline - loop.time())
+        if remaining <= 0:
+            return None
+        try:
+            return await ws_provider.wait_for_connection(
+                executor_id,
+                timeout=remaining,
+                failed_connection=failed_connection,
+                delivery_state=DeliveryState.NOT_SENT.value,
+                cancel_event=ctx.cancel_event,
+                execution_fence=ctx.execution_fence,
+            )
+        except (StaleDirectTurnOwner, StaleTaskExecutionOwner):
+            raise
+        except Exception:
+            return None
 
     async def _handle_tool_after_same_executor_transient_failure(
         self,
@@ -22224,14 +24392,14 @@ class AgentLoop:
         failed_connection: Any,
         output_chunk_callback: Any,
         original_result: ToolResult,
+        recovery_deadline: float | None = None,
+        recovery_window: Any | None = None,
     ) -> ToolResult | None:
         delivery_state = str(
             (original_result.metadata or {}).get("delivery_state")
             or DeliveryState.ACCEPTED_UNKNOWN.value
         )
-        safe_to_retry = delivery_state == DeliveryState.NOT_SENT.value or (
-            registered is not None and self._tool_safe_for_same_executor_retry(registered)
-        )
+        safe_to_retry = delivery_state == DeliveryState.NOT_SENT.value
 
         pool = getattr(ctx, "executor_pool", None)
         executor_id: str | None = None
@@ -22247,15 +24415,125 @@ class AgentLoop:
         if not executor_id or executor_type != "websocket":
             return None
 
-        if delivery_state == DeliveryState.ACCEPTED_UNKNOWN.value and not safe_to_retry:
+        from cognis.core.executor_recovery import (
+            begin_executor_recovery,
+            clear_executor_recovery,
+        )
+        from cognis.providers.executor.websocket import executor_reconnect_retry_budget_seconds
+
+        loop = asyncio.get_running_loop()
+        budget = executor_reconnect_retry_budget_seconds()
+        session_factory = vars(self.providers).get("_session_factory")
+        active_executor_id = getattr(ctx, "active_executor_id", None)
+        window = recovery_window
+        if (
+            window is None
+            and session_factory is not None
+            and executor_id == active_executor_id
+            and (ctx.task_id or ctx.conversation.conversation_id)
+        ):
+            window = await begin_executor_recovery(
+                session_factory,
+                conversation_id=ctx.conversation.conversation_id,
+                task_id=ctx.task_id,
+                executor_id=executor_id,
+            )
+            budget = min(budget, window.remaining_seconds())
+        if recovery_deadline is None:
+            recovery_deadline = loop.time() + budget
+        if window is not None and recovery_deadline - loop.time() <= 0:
+            raise ExecutorRecoveryTimeout(window, phase="tool_reconciliation")
+
+        if delivery_state == DeliveryState.ACCEPTED_UNKNOWN.value:
+            # A dropped socket is not evidence that the outcome is unknowable.
+            # When the same executor process is still alive it can report the
+            # real outcome, so reconcile before giving up on the call.
+            (
+                reconciled_state,
+                reconciled_result,
+                reconcile_reason,
+            ) = await self._reconcile_accepted_tool_call(
+                ctx,
+                tc=tc,
+                registered=registered,
+                executor_id=executor_id,
+                failed_connection=failed_connection,
+                original_result=original_result,
+                deadline=recovery_deadline,
+            )
+            if reconciled_state == "terminal" and reconciled_result is not None:
+                # Once the accepting executor reports a terminal result, that
+                # result is authoritative even if reconciliation outlived the
+                # reconnect window. Reporting an infrastructure timeout here
+                # would hide a side effect that actually completed.
+                if window is not None and session_factory is not None:
+                    await clear_executor_recovery(
+                        session_factory,
+                        conversation_id=ctx.conversation.conversation_id,
+                        task_id=ctx.task_id,
+                        executor_id=executor_id,
+                    )
+                return reconciled_result
+            if reconciled_state == "not_sent":
+                prior_metadata = dict(original_result.metadata or {})
+                return await self._handle_tool_after_same_executor_transient_failure(
+                    ctx,
+                    tc=tc,
+                    registered=registered,
+                    target_executor_id=target_executor_id,
+                    failed_connection=failed_connection,
+                    output_chunk_callback=output_chunk_callback,
+                    recovery_deadline=recovery_deadline,
+                    recovery_window=window,
+                    original_result=original_result.model_copy(
+                        update={
+                            "metadata": {
+                                **prior_metadata,
+                                "delivery_state": DeliveryState.NOT_SENT.value,
+                                "reconciled_delivery_state": DeliveryState.NOT_SENT.value,
+                                "same_executor_retry_attempt": int(
+                                    prior_metadata.get("same_executor_retry_attempt", 0)
+                                ),
+                            }
+                        }
+                    ),
+                )
+            if registered is not None and self._tool_safe_for_same_executor_retry(registered):
+                # Reconciliation was attempted first. If transport failure still
+                # prevents an answer, only an explicitly read-only tool may be
+                # replayed; mutations always fall through to ambiguity below.
+                return await self._handle_tool_after_same_executor_transient_failure(
+                    ctx,
+                    tc=tc,
+                    registered=registered,
+                    target_executor_id=target_executor_id,
+                    failed_connection=failed_connection,
+                    output_chunk_callback=output_chunk_callback,
+                    recovery_deadline=recovery_deadline,
+                    recovery_window=window,
+                    original_result=original_result.model_copy(
+                        update={
+                            "metadata": {
+                                **(original_result.metadata or {}),
+                                "delivery_state": DeliveryState.NOT_SENT.value,
+                                "reconciled_delivery_state": "unresolved_replay_safe",
+                                "reconcile_outcome": reconcile_reason,
+                            }
+                        }
+                    ),
+                )
             canonical_name, _ = self._canonical_tool_identity(ctx, tc)
             fingerprint = tool_call_argument_fingerprint(
                 canonical_name,
                 _canonical_tool_arguments(tc.arguments),
             )
-            ctx.same_turn_tool_call_ledger.record_fingerprint(canonical_name, fingerprint)
-            metadata = original_result.metadata or {}
-            raise AmbiguousToolOutcome(
+            # An ambiguous outcome is NOT a successful execution: track it in
+            # the uncertain set so the duplicate guard reports it honestly and
+            # a deliberate re-issue is not wedged for the rest of the turn.
+            ctx.same_turn_tool_call_ledger.record_uncertain_fingerprint(canonical_name, fingerprint)
+            metadata = dict(original_result.metadata or {})
+            ambiguity = AmbiguousToolOutcome(
+                call_id=tc.call_id,
                 tool_name=canonical_name,
                 argument_fingerprint=fingerprint,
                 executor_id=executor_id,
@@ -22263,6 +24541,82 @@ class AgentLoop:
                 if isinstance(metadata.get("generation"), int)
                 else None,
                 epoch=metadata.get("epoch") if isinstance(metadata.get("epoch"), int) else None,
+            )
+            ambiguity_detail = ambiguity.detail()
+            transport = metadata.get("transport")
+            if isinstance(transport, dict):
+                ambiguity_detail["transport"] = {
+                    key: transport[key]
+                    for key in (
+                        "route",
+                        "delivery_state",
+                        "close_code",
+                        "error_type",
+                        # Identity of the accepting process and the reconcile
+                        # verdict are the two fields that make an ambiguous
+                        # outcome diagnosable without guesswork.
+                        "executor_instance_id",
+                    )
+                    if key in transport
+                }
+            ambiguity_detail["reconcile_outcome"] = reconcile_reason
+            logger.warning(
+                "agent: tool outcome ambiguous after reconciliation",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
+                        **self._step_log_metadata(ctx),
+                        "tool_name": canonical_name,
+                        "call_id": tc.call_id,
+                        "executor_id": executor_id,
+                        "reconcile_outcome": reconcile_reason,
+                        "route": transport.get("route") if isinstance(transport, dict) else None,
+                        "delivery_state": delivery_state,
+                        "executor_instance_id": (
+                            transport.get("executor_instance_id")
+                            if isinstance(transport, dict)
+                            else None
+                        ),
+                    }
+                },
+            )
+            metadata.update(
+                {
+                    "code": "tool_outcome_ambiguous",
+                    "ambiguity": ambiguity_detail,
+                    "retryable": False,
+                    "uncertain": True,
+                }
+            )
+            if window is not None and session_factory is not None:
+                await clear_executor_recovery(
+                    session_factory,
+                    conversation_id=ctx.conversation.conversation_id,
+                    task_id=ctx.task_id,
+                    executor_id=executor_id,
+                )
+            return ToolResult(
+                output=json.dumps(
+                    {
+                        "status": "outcome_unknown",
+                        "message": (
+                            f"Outcome of tool '{canonical_name}' is unknown. "
+                            "The tool was not replayed because it may have performed side effects."
+                        ),
+                        "call_id": tc.call_id,
+                        "executor_id": executor_id,
+                        "safe_to_retry": False,
+                        "reconciliation": (
+                            "Inspect the external system or retry only after the previous "
+                            "execution is proven absent."
+                        ),
+                        "ambiguity": ambiguity_detail,
+                    },
+                    default=str,
+                ),
+                is_error=True,
+                metadata=metadata,
             )
 
         ws_provider = self._same_executor_reconnect_provider()
@@ -22275,12 +24629,11 @@ class AgentLoop:
             and inspect.iscoroutinefunction(invalidate_forwarded)
             and failed_connection is not None
             and hasattr(failed_connection, "owner_id")
+            and metadata.get("code") != "executor_bridge_capacity"
         ):
             await invalidate_forwarded(executor_id, failed_connection)
 
-        from cognis.providers.executor.websocket import executor_reconnect_retry_budget_seconds
-
-        budget = executor_reconnect_retry_budget_seconds()
+        remaining = max(0.0, recovery_deadline - loop.time())
         logger.info(
             "agent: waiting for same executor reconnect after transient tool failure",
             extra={
@@ -22301,9 +24654,10 @@ class AgentLoop:
             metadata = original_result.metadata or {}
             conn = await ws_provider.wait_for_connection(
                 executor_id,
-                timeout=budget,
+                timeout=remaining,
                 failed_connection=failed_connection,
                 delivery_state=delivery_state,
+                accepted_unknown_replay_safe=False,
                 failed_generation=metadata.get("generation")
                 if isinstance(metadata.get("generation"), int)
                 else None,
@@ -22313,7 +24667,12 @@ class AgentLoop:
                 failed_epoch=metadata.get("epoch")
                 if isinstance(metadata.get("epoch"), int)
                 else None,
+                require_recovered_connection=metadata.get("code") == "executor_circuit_open",
+                cancel_event=ctx.cancel_event,
+                execution_fence=ctx.execution_fence,
             )
+        except (StaleDirectTurnOwner, StaleTaskExecutionOwner):
+            raise
         except Exception:
             logger.warning(
                 "agent: same executor reconnect wait failed",
@@ -22339,26 +24698,24 @@ class AgentLoop:
         )
 
         if conn is None:
-            metadata.update(
-                {
-                    "code": "executor_recovery_timeout",
-                    "auto_retried": False,
-                    "auto_retry_skipped_reason": "same_executor_reconnect_timeout",
-                }
-            )
-            return ToolResult(
-                output=(
-                    f"Executor '{executor_id}' did not reconnect within the bounded "
-                    "same-executor recovery window."
-                ),
-                is_error=True,
-                metadata=metadata,
-            )
+            if window is not None:
+                raise ExecutorRecoveryTimeout(window, phase="tool_reconciliation")
+            return None
+
+        if window is not None and recovery_deadline - loop.time() <= 0:
+            raise ExecutorRecoveryTimeout(window, phase="tool_reconciliation")
 
         if target_executor_id is None:
             ctx.executor_connection = conn
 
         if not safe_to_retry:
+            if window is not None and session_factory is not None:
+                await clear_executor_recovery(
+                    session_factory,
+                    conversation_id=ctx.conversation.conversation_id,
+                    task_id=ctx.task_id,
+                    executor_id=executor_id,
+                )
             metadata.update(
                 {
                     "auto_retried": False,
@@ -22370,17 +24727,109 @@ class AgentLoop:
                 metadata,
             )
 
-        retry_call = tc.model_copy(
-            update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
-        )
-        retry_result: ToolResult = await self.tool_router.execute(
-            retry_call,
-            ctx.session,
-            ctx.agent,
-            self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
-            conn,
-            output_chunk_callback=output_chunk_callback,
-        )
+        retry_attempts = int(metadata.get("same_executor_retry_attempt", 0))
+        if retry_attempts >= _SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS - 1:
+            metadata.update(
+                {
+                    "auto_retried": False,
+                    "auto_retry_skipped_reason": "dispatch_attempt_limit",
+                }
+            )
+            return self._same_executor_transient_result_with_metadata(
+                original_result,
+                metadata,
+            )
+
+        retry_call = tc
+        if not retry_call.runtime_metadata:
+            retry_call = tc.model_copy(
+                update={"runtime_metadata": self._tool_runtime_metadata_for_call(ctx, tc)}
+            )
+        retry_sent = False
+        retry_instance_id: str | None = None
+
+        async def _before_retry_send(
+            retry_executor_id: str, executor_instance_id: str | None
+        ) -> None:
+            await self._bind_tool_dispatch_fence(
+                ctx,
+                call_id=tc.call_id,
+                executor_id=retry_executor_id,
+                executor_instance_id=executor_instance_id,
+                dispatch_state="dispatching",
+            )
+
+        async def _after_retry_send(
+            retry_executor_id: str, executor_instance_id: str | None
+        ) -> None:
+            nonlocal retry_sent, retry_instance_id
+            retry_sent = True
+            retry_instance_id = executor_instance_id
+            with contextlib.suppress(Exception):
+                await self._bind_tool_dispatch_fence(
+                    ctx,
+                    call_id=tc.call_id,
+                    executor_id=retry_executor_id,
+                    executor_instance_id=executor_instance_id,
+                    dispatch_state="sent",
+                )
+
+        remaining = max(0.0, recovery_deadline - loop.time())
+        if remaining <= 0:
+            if window is not None:
+                raise ExecutorRecoveryTimeout(window, phase="tool_replay")
+            return None
+        try:
+            retry_result: ToolResult = await asyncio.wait_for(
+                self.tool_router.execute(
+                    retry_call,
+                    ctx.session,
+                    ctx.agent,
+                    self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
+                    conn,
+                    output_chunk_callback=output_chunk_callback,
+                    before_executor_send=_before_retry_send,
+                    after_executor_send=_after_retry_send,
+                ),
+                timeout=remaining,
+            )
+            await self._sync_guardrails_terminal_result(ctx, retry_result)
+        except TimeoutError:
+            # Once dispatch starts, cancellation cannot prove it remained
+            # unsent. Fail closed as accepted_unknown. Process identity is
+            # included only after owner-confirmed physical acceptance.
+            accepted_metadata = {
+                **metadata,
+                "code": "executor_delivery_failure",
+                "delivery_state": DeliveryState.ACCEPTED_UNKNOWN.value,
+                "same_executor_only": True,
+                "retryable": True,
+                "same_executor_retry_attempt": retry_attempts + 1,
+                "transport": {
+                    "route": (
+                        "forwarded_bridge" if hasattr(conn, "owner_id") else "physical_websocket"
+                    ),
+                    "delivery_state": DeliveryState.ACCEPTED_UNKNOWN.value,
+                    "executor_instance_id": retry_instance_id if retry_sent else None,
+                },
+            }
+            return await self._handle_tool_after_same_executor_transient_failure(
+                ctx,
+                tc=tc,
+                registered=registered,
+                target_executor_id=target_executor_id,
+                failed_connection=conn,
+                output_chunk_callback=output_chunk_callback,
+                original_result=ToolResult(
+                    output=(
+                        "Executor delivery failed; recovery is restricted to the same executor."
+                    ),
+                    is_error=True,
+                    metadata=accepted_metadata,
+                ),
+                recovery_deadline=recovery_deadline,
+                recovery_window=window,
+            )
         retry_metadata = dict(retry_result.metadata or {})
         retry_metadata.update(
             {
@@ -22390,7 +24839,100 @@ class AgentLoop:
                 "previous_error_code": metadata.get("code"),
             }
         )
-        return retry_result.model_copy(update={"metadata": retry_metadata})
+        retry_result = retry_result.model_copy(update={"metadata": retry_metadata})
+        retry_attempt = retry_attempts + 1
+        retry_metadata["same_executor_retry_attempt"] = retry_attempt
+        retry_delivery_state = str(
+            (retry_result.metadata or {}).get("delivery_state")
+            or DeliveryState.ACCEPTED_UNKNOWN.value
+        )
+        retry_is_recoverable = retry_delivery_state == DeliveryState.NOT_SENT.value
+        # Attempts already spent on this call: the initial dispatch plus every
+        # retry performed so far (this frame's retry included).
+        attempts_completed = retry_attempt + 1
+        if (
+            attempts_completed < _SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS
+            and self._is_same_executor_transient_failure(retry_result)
+            and retry_is_recoverable
+            and loop.time() < recovery_deadline
+        ):
+            backoff = min(
+                _SAME_EXECUTOR_RETRY_BACKOFF_SECONDS * (2 ** (retry_attempt - 1)),
+                _SAME_EXECUTOR_RETRY_BACKOFF_MAX_SECONDS,
+            )
+            logger.info(
+                "agent: retrying tool after repeated same-executor transport failure",
+                extra={
+                    "extra_data": {
+                        "session_id": ctx.session.session_id,
+                        "turn_id": ctx.turn_id,
+                        **self._step_log_metadata(ctx),
+                        "tool_name": tc.name,
+                        "call_id": tc.call_id,
+                        "executor_id": executor_id,
+                        "attempt": attempts_completed + 1,
+                        "max_attempts": _SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS,
+                        "delivery_state": retry_delivery_state,
+                        "backoff_seconds": backoff,
+                    }
+                },
+            )
+            await asyncio.sleep(min(backoff, max(0.0, recovery_deadline - loop.time())))
+            return await self._handle_tool_after_same_executor_transient_failure(
+                ctx,
+                tc=tc,
+                registered=registered,
+                target_executor_id=target_executor_id,
+                failed_connection=conn,
+                output_chunk_callback=output_chunk_callback,
+                recovery_deadline=recovery_deadline,
+                recovery_window=window,
+                original_result=retry_result.model_copy(update={"metadata": retry_metadata}),
+            )
+        if (
+            self._is_same_executor_transient_failure(retry_result)
+            and retry_delivery_state == DeliveryState.NOT_SENT.value
+            and attempts_completed >= _SAME_EXECUTOR_MAX_DISPATCH_ATTEMPTS
+        ):
+            retry_metadata.update(
+                {
+                    "auto_retried": True,
+                    "auto_retry_skipped_reason": "dispatch_attempt_limit",
+                }
+            )
+            return self._same_executor_transient_result_with_metadata(retry_result, retry_metadata)
+        if (
+            self._is_same_executor_transient_failure(retry_result)
+            and retry_delivery_state == DeliveryState.ACCEPTED_UNKNOWN.value
+        ):
+            # Every accepted call is reconciled before any further dispatch,
+            # including a mutation whose first attempt was proven not sent.
+            return await self._handle_tool_after_same_executor_transient_failure(
+                ctx,
+                tc=tc,
+                registered=registered,
+                target_executor_id=target_executor_id,
+                failed_connection=conn,
+                output_chunk_callback=output_chunk_callback,
+                original_result=retry_result,
+                recovery_deadline=recovery_deadline,
+                recovery_window=window,
+            )
+        if (
+            window is not None
+            and session_factory is not None
+            and not self._is_same_executor_transient_failure(retry_result)
+        ):
+            # A terminal replay result is authoritative even if execution
+            # crossed the recovery deadline. The deadline prevents another
+            # dispatch or infrastructure wait; it cannot erase the result.
+            await clear_executor_recovery(
+                session_factory,
+                conversation_id=ctx.conversation.conversation_id,
+                task_id=ctx.task_id,
+                executor_id=executor_id,
+            )
+        return retry_result
 
     def _same_executor_transient_result_with_metadata(
         self,
@@ -22465,7 +25007,7 @@ class AgentLoop:
         if ws_provider is None:
             return None
         try:
-            return ws_provider.get_connection(target_executor_id)
+            return ws_provider.get_ready_connection(target_executor_id)
         except Exception:
             return None
 
@@ -22485,11 +25027,6 @@ class AgentLoop:
         target_executor_id = target_executor_id.strip()
         target_executor_type = target_executor_type if isinstance(target_executor_type, str) else ""
 
-        ctx.active_executor_id = target_executor_id
-        if update_conversation:
-            with contextlib.suppress(Exception):
-                ctx.conversation.active_executor_id = target_executor_id
-
         if target_executor_type != "websocket":
             return False
 
@@ -22505,20 +25042,75 @@ class AgentLoop:
         if resolved_conn is None:
             return False
 
+        ctx.active_executor_id = target_executor_id
+        if update_conversation:
+            with contextlib.suppress(Exception):
+                ctx.conversation.active_executor_id = target_executor_id
         ctx.executor_connection = resolved_conn
-        ctx.executor_environment = ExecutorEnvironmentSnapshot.unavailable(
-            executor_id=target_executor_id,
-            executor_type=target_executor_type,
+        ctx.executor_environment = self._executor_environment_for_target(target)
+        working_directory = ctx.executor_environment.cwd or ctx.executor_environment.home
+        ctx.workspace_root = working_directory
+        ctx.working_directory = working_directory
+        return True
+
+    def _executor_environment_for_target(
+        self,
+        target: Any,
+    ) -> ExecutorEnvironmentSnapshot:
+        """Return the environment snapshot for one resolved executor target."""
+
+        executor_id = getattr(target, "executor_id", None)
+        executor_type = getattr(target, "executor_type", None)
+        environment = ExecutorEnvironmentSnapshot.unavailable(
+            executor_id=executor_id,
+            executor_type=executor_type,
             source="remote_executor_metadata_unavailable",
         )
-        with contextlib.suppress(Exception):
-            ctx.executor_environment = environment_from_metadata(
-                ws_provider.get_handle_metadata(target_executor_id),
-                executor_id=target_executor_id,
-                executor_type=target_executor_type,
-                fallback_source="remote_executor_metadata",
+        executor_provider = getattr(self.providers, "executor", None)
+        ws_provider = getattr(executor_provider, "websocket", None)
+        if ws_provider is not None:
+            with contextlib.suppress(Exception):
+                environment = environment_from_metadata(
+                    ws_provider.get_handle_metadata(executor_id),
+                    executor_id=executor_id,
+                    executor_type=executor_type,
+                    fallback_source="remote_executor_metadata",
+                )
+        return environment
+
+    async def _refresh_executor_session_policy(
+        self,
+        ctx: StepContext,
+        *,
+        additional_environment: ExecutorEnvironmentSnapshot | None = None,
+    ) -> None:
+        """Refresh Intaris paths for the active and per-call executor environments."""
+
+        # The switch changes the active runtime for the rest of this serialized
+        # turn. Keep ambient consumers aligned with the StepContext before any
+        # later tool evaluation or session creation.
+        current_workspace_root.set(ctx.workspace_root)
+        current_effective_working_directory.set(ctx.working_directory)
+        current_executor_environment.set(ctx.executor_environment)
+        refresh_policy = getattr(self.session_manager, "refresh_intaris_session_policy", None)
+        if refresh_policy is None:
+            return
+        additional_allowed_paths: list[str] = []
+        if additional_environment is not None:
+            additional_allowed_paths.extend(
+                path
+                for path in (
+                    additional_environment.home,
+                    additional_environment.cwd,
+                    getattr(additional_environment, "tmpdir", None),
+                )
+                if path
             )
-        return True
+        await refresh_policy(
+            ctx.session,
+            session_policy_override=dict(ctx.session_policy) if ctx.session_policy else None,
+            additional_allowed_paths=additional_allowed_paths or None,
+        )
 
     async def _finalize_regular_tool_result(
         self,
@@ -22774,6 +25366,11 @@ class AgentLoop:
                     "name": tc.name,
                     "tool_id": tool_id,
                     "is_error": result.is_error,
+                    "status": (
+                        result.metadata.get("tool_status")
+                        if isinstance(result.metadata, dict)
+                        else None
+                    ),
                     "ambiguity": (result.metadata.get("ambiguity") if result.metadata else None),
                     "duration_ms": result.duration_ms,
                     "result": result.output,
@@ -22801,6 +25398,12 @@ class AgentLoop:
                     )
                     or agent_visible_truncated,
                     "protect_from_pruning": protect_from_pruning,
+                    **(
+                        {"memory_aliases": result.metadata["memory_aliases"]}
+                        if isinstance(result.metadata, dict)
+                        and isinstance(result.metadata.get("memory_aliases"), dict)
+                        else {}
+                    ),
                 },
             )
         )
@@ -22925,13 +25528,7 @@ class AgentLoop:
             }
         )
         record_tool_result(ctx.loop_guard_state, tc.name, tc.arguments, result.output)
-        if (
-            not result.is_error or bool(result.metadata and result.metadata.get("uncertain"))
-        ) and not _tool_is_read_only(tc.name, ctx.tool_registry):
-            # Same-process fast path: record before the next LLM cycle. The
-            # canonical Intaris tool events record the same fingerprint after
-            # persistence and support restart/retry reconstruction.
-            ctx.same_turn_tool_call_ledger.record(tc.name, tc.arguments)
+        _record_tool_outcome_in_same_turn_ledger(ctx, tc, result)
         attachment_context = self._build_tool_attachment_context(ctx, tc, result.attachments)
         if attachment_context is not None:
             attachment_context["_recovery_call_id"] = recovery_call_id
@@ -23112,7 +25709,7 @@ class AgentLoop:
             demoted_anchors = compacted_tool_group_anchors(pruned)
             if demoted_anchors:
                 prior_turn_state.record_demotions(demoted_anchors)
-                if pressure_mode == "critical" or pressure_mode == PressureMode.critical:
+                if pressure_mode == "critical":
                     prior_turn_state.prune_committed_preservations(demoted_anchors)
         stripped = [_strip_internal_message_fields(message) for message in pruned]
         projected_token_estimate = _projected_messages_token_estimate(stripped)
@@ -23639,6 +26236,8 @@ class AgentLoop:
                     if ctx.last_projection_policy is not None
                     else None
                 ),
+                turn_id=ctx.turn_id,
+                runtime_selection_revision=ctx.session.runtime_override_revision,
             )
         except TypeError:
             self.session_cache.update_context_usage(
@@ -23649,6 +26248,9 @@ class AgentLoop:
                 available_prompt_tokens=snapshot.available_prompt_tokens,
                 model=ctx.current_model or "",
             )
+        persist_runtime_metadata = getattr(self.session_cache, "persist_runtime_metadata", None)
+        if callable(persist_runtime_metadata):
+            await persist_runtime_metadata(ctx.session.session_id)
         if ctx.on_context_usage is not None:
             if hasattr(self.session_cache, "get_context_usage"):
                 usage = self.session_cache.get_context_usage(ctx.session.session_id)
@@ -23685,6 +26287,21 @@ class AgentLoop:
             },
         )
 
+    async def _sync_guardrails_terminal_result(
+        self,
+        ctx: StepContext,
+        result: ToolResult,
+    ) -> None:
+        """Make an Intaris hard kill immediately authoritative in Cognis."""
+
+        metadata = result.metadata if isinstance(result.metadata, dict) else {}
+        evaluation = metadata.get("evaluation")
+        if not isinstance(evaluation, dict) or evaluation.get("session_status") != "terminated":
+            return
+        reason = str(evaluation.get("status_reason") or "terminated by Intaris")[:500]
+        await self.session_manager.mark_terminated(ctx.session.session_id, reason=reason)
+        ctx.session.status = "terminated"
+
     async def _stale_session_step_output(
         self,
         ctx: StepContext,
@@ -23698,9 +26315,6 @@ class AgentLoop:
         can still receive an LLM response after that happens.  It must not run
         that response against the now-completed Intaris session.
         """
-
-        if getattr(ctx.session, "parent_session_id", None) is not None:
-            return None
 
         session_factory = getattr(self.session_manager, "session_factory", None)
         if session_factory is None:
@@ -23743,7 +26357,12 @@ class AgentLoop:
             )
             return None
 
-        rotated = bool(active_session_id and active_session_id != ctx.session.session_id)
+        is_child_session = getattr(ctx.session, "parent_session_id", None) is not None
+        rotated = bool(
+            not is_child_session
+            and active_session_id
+            and active_session_id != ctx.session.session_id
+        )
         terminal = session_status in _TERMINAL_SESSION_STATUSES
         if not rotated and not terminal:
             return None
@@ -23863,10 +26482,34 @@ class AgentLoop:
                 on_token=on_token,
             )
             if ctx.execution_fence is not None:
+                descriptors: list[dict[str, Any]] = []
+                for item in group[:500]:
+                    canonical_name, registered = self._canonical_tool_identity(ctx, item.tool_call)
+                    snapshot = ctx.canonical_tool_call_snapshots.get(item.tool_call.call_id, {})
+                    snapshot_data = snapshot.get("event", {}).get("data")
+                    snapshot_name = (
+                        snapshot_data.get("name")
+                        if isinstance(snapshot_data, dict)
+                        and isinstance(snapshot_data.get("name"), str)
+                        else canonical_name
+                    )
+                    descriptors.append(
+                        {
+                            "call_id": item.tool_call.call_id,
+                            "tool_name": snapshot_name,
+                            "frozen": bool(
+                                registered is not None
+                                and self._tool_safe_for_same_executor_retry(registered)
+                            ),
+                            "dispatch_state": "pending",
+                            **snapshot,
+                        }
+                    )
                 await ctx.execution_fence.checkpoint(
                     "tool_in_flight",
-                    call_ids=[item.tool_call.call_id for item in group],
-                    timeout_seconds=self.default_step_timeout_seconds,
+                    tool_calls=descriptors,
+                    session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+                    turn_id=ctx.turn_id,
                 )
 
             try:
@@ -23878,6 +26521,35 @@ class AgentLoop:
                     group_results = await self._execute_parallel_regular_tool_group(ctx, group)
             except AmbiguousToolOutcome as exc:
                 ambiguity = exc.detail()
+                primary_call_id = exc.call_id
+                primary_executor_id = exc.executor_id
+
+                def _item_ambiguity(
+                    item: _PreparedRegularToolCall,
+                    *,
+                    base_ambiguity: dict[str, Any] = ambiguity,
+                    accepted_call_id: str | None = primary_call_id,
+                    accepted_executor_id: str | None = primary_executor_id,
+                ) -> dict[str, Any]:
+                    canonical_name, _registered = self._canonical_tool_identity(
+                        ctx,
+                        item.tool_call,
+                    )
+                    return {
+                        **base_ambiguity,
+                        "call_id": item.tool_call.call_id,
+                        "tool_name": canonical_name,
+                        "argument_fingerprint": tool_call_argument_fingerprint(
+                            canonical_name,
+                            _canonical_tool_arguments(item.tool_call.arguments),
+                        ),
+                        "executor_id": (
+                            accepted_executor_id
+                            if item.tool_call.call_id == accepted_call_id
+                            else None
+                        ),
+                    }
+
                 logger.warning(
                     "agent: unsafe tool outcome is ambiguous; continuing turn without replay",
                     extra={
@@ -23895,24 +26567,36 @@ class AgentLoop:
                     ToolResult(
                         output=json.dumps(
                             {
-                                "status": "ambiguous",
+                                "status": "outcome_unknown",
                                 "message": (
-                                    f"Outcome of tool '{exc.tool_name}' is unknown. "
+                                    f"Outcome of tool '{_item_ambiguity(item)['tool_name']}' is "
+                                    "unknown. "
                                     "The tool was not replayed because it may have performed side effects."
                                 ),
-                                "ambiguity": ambiguity,
+                                "call_id": item.tool_call.call_id,
+                                "executor_id": (
+                                    primary_executor_id
+                                    if item.tool_call.call_id == primary_call_id
+                                    else None
+                                ),
+                                "safe_to_retry": False,
+                                "reconciliation": (
+                                    "Inspect the external system or retry only after the previous "
+                                    "execution is proven absent."
+                                ),
+                                "ambiguity": _item_ambiguity(item),
                             },
                             default=str,
                         ),
                         is_error=True,
                         metadata={
                             "code": "tool_outcome_ambiguous",
-                            "ambiguity": ambiguity,
+                            "ambiguity": _item_ambiguity(item),
                             "retryable": False,
                             "uncertain": True,
                         },
                     )
-                    for _item in group
+                    for item in group
                 ]
             if any(result.is_error for result in group_results):
                 batch_outcome = "error"
@@ -23952,6 +26636,11 @@ class AgentLoop:
                     on_token=on_token,
                     on_tool_result=on_tool_result,
                 )
+            if ctx.execution_fence is not None:
+                await ctx.execution_fence.checkpoint(
+                    "tool_result_persisted",
+                    call_ids=[item.tool_call.call_id for item in group],
+                )
 
     async def _execute_parallel_regular_tool_group(
         self,
@@ -23976,6 +26665,17 @@ class AgentLoop:
                 if not task.cancelled()
                 and isinstance((error := task.exception()), AmbiguousToolOutcome)
             ]
+            stale_owners = [
+                error
+                for task in done
+                if not task.cancelled()
+                and isinstance((error := task.exception()), StaleDirectTurnOwner)
+            ]
+            if stale_owners:
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                raise stale_owners[0]
             if not ambiguities:
                 return list(await asyncio.gather(*tasks))
             ambiguity = ambiguities[0]
@@ -24107,13 +26807,15 @@ class AgentLoop:
             ctx.runtime_info.get("provider_overflow_recoveries", 0) or 0
         )
         if provider_overflow_recoveries >= 1:
+            error_msg = "Provider context overflow persisted after compaction."
             return StepOutput(
                 summary="Stopped because provider context overflow persisted after compaction.",
                 content="\n\n".join(assistant_content_parts),
                 outcome={
                     "status": "failed",
-                    "reason": "Provider context overflow persisted after compaction.",
+                    "reason": error_msg,
                 },
+                error=error_msg,
                 metadata={
                     "provider_context_overflow": {
                         "reason": reason,
@@ -24181,13 +26883,15 @@ class AgentLoop:
                     on_tool_result=on_tool_result,
                 )
 
+        error_msg = "Provider context overflow could not be compacted."
         return StepOutput(
             summary="Stopped because provider context overflow could not be compacted.",
             content="\n\n".join(assistant_content_parts),
             outcome={
                 "status": "failed",
-                "reason": "Provider context overflow could not be compacted.",
+                "reason": error_msg,
             },
+            error=error_msg,
             metadata={"provider_context_overflow": overflow_run.event_data()},
             attachments=list(collected_attachments),
         )
@@ -24245,10 +26949,12 @@ class AgentLoop:
                 run_data = run.event_data()
             else:
                 run_data = {
+                    "compaction_id": f"compact_{uuid.uuid4().hex[:12]}",
                     "trigger": trigger,
                     "status": "failed",
                     "fallback_reason": "rotation_failed",
                 }
+            await self.persist_compaction_terminal(ctx.session, run_data)
             await self.event_bus.publish(
                 Event(
                     type=EventType.SESSION_COMPACTION_FINISHED,
@@ -24407,6 +27113,63 @@ class AgentLoop:
             return
 
         try:
+            common_payload = {
+                "session_id": ctx.session.mnemory_session_id,
+                "cognis_session_id": ctx.session.session_id,
+                "intaris_session_id": (
+                    getattr(ctx.session, "intaris_session_id", None) or ctx.session.session_id
+                ),
+                "conversation_id": ctx.conversation.conversation_id,
+                "turn_id": ctx.turn_id,
+                "user_email": ctx.session.user_email,
+                "owner_email": ctx.agent.owner_email,
+                "agent_owner_email": ctx.agent.owner_email,
+                "agent_id": ctx.session.agent_id,
+                "policy_agent_id": ctx.session.agent_id,
+                "originating_memory_backend": ctx.memory_policy.backend_id,
+                "originating_agent_profile_id": ctx.memory_policy.profile_id,
+                "memory_policy_fingerprint": ctx.memory_policy.policy_fingerprint,
+            }
+            admitted_evidence = evidence_admission_authorizes(
+                ctx.trusted_evidence_admission,
+                key=self.trusted_evidence_admission_key,
+                owner_id=ctx.agent.owner_email,
+            )
+            if (
+                admitted_evidence
+                and ctx.remember_evidence_event_hash
+                and ctx.remember_user_event_seq
+            ):
+                evidence_id = deterministic_queue_id(
+                    EVIDENCE_QUEUE_KIND,
+                    ctx.remember_evidence_event_hash,
+                )
+                if ctx.remember_assistant_event_seq:
+                    await self.remember_queue.enqueue(
+                        {
+                            **common_payload,
+                            "queue_kind": ORDINARY_ASSISTANT_QUEUE_KIND,
+                            "item_id": deterministic_queue_id(
+                                ORDINARY_ASSISTANT_QUEUE_KIND,
+                                ctx.remember_evidence_event_hash,
+                                ctx.remember_assistant_event_hash,
+                            ),
+                            "event_hash": ctx.remember_evidence_event_hash,
+                            "depends_on": evidence_id,
+                            "include_user_message": False,
+                            "user_event_seq": None,
+                            "assistant_event_seq": ctx.remember_assistant_event_seq,
+                            "assistant_event_hash": ctx.remember_assistant_event_hash,
+                            "agent_id": ctx.session.agent_id,
+                            "agent_owner_email": ctx.agent.owner_email,
+                        }
+                    )
+                return
+            if admitted_evidence:
+                # A recovered append has an authoritative marker, but its local
+                # handoff can be missing. Reconciliation owns both evidence and
+                # ordinary rows, so a legacy ordinary enqueue cannot overtake it.
+                return
             await self.remember_queue.enqueue(
                 {
                     "session_id": ctx.session.mnemory_session_id,
@@ -24416,6 +27179,7 @@ class AgentLoop:
                     "user_event_seq": ctx.remember_user_event_seq,
                     "assistant_event_seq": ctx.remember_assistant_event_seq,
                     "user_email": ctx.session.user_email,
+                    "owner_email": ctx.agent.owner_email,
                     "agent_id": ctx.session.agent_id,
                     "agent_owner_email": ctx.agent.owner_email,
                     "originating_memory_backend": ctx.memory_policy.backend_id,
@@ -24429,6 +27193,23 @@ class AgentLoop:
                 extra={"extra_data": {"session_id": ctx.session.session_id}},
                 exc_info=True,
             )
+
+    async def _enqueue_evidence_rows_after_append(self, ctx: StepContext) -> None:
+        """Persist evidence and its user dependency immediately after append."""
+        assert ctx.remember_evidence_event_hash is not None
+        assert ctx.remember_user_event_seq is not None
+        assert ctx.trusted_evidence_admission is not None
+        await self.remember_queue.enqueue_after_user_append(
+            session=ctx.session,
+            agent=ctx.agent,
+            conversation_id=ctx.conversation.conversation_id,
+            turn_id=ctx.turn_id,
+            event_seq=ctx.remember_user_event_seq,
+            event_hash_value=ctx.remember_evidence_event_hash,
+            owner_email=ctx.agent.owner_email,
+            marker_admitted_at=ctx.trusted_evidence_admission.admitted_at,
+            evidence_admission=serialize_evidence_admission(ctx.trusted_evidence_admission),
+        )
 
     async def _resolve_compaction_model_context(
         self,
@@ -24447,41 +27228,20 @@ class AgentLoop:
         if model_context.model:
             return model_context
 
-        resolved_agent_profile = resolve_conversation_agent_profile(
-            ctx.agent, ctx.session, ctx.conversation
-        )
-        model_override = self.session_cache.get_model_override(ctx.session.session_id)
-        model_override_provider_id = self.session_cache.get_model_override_provider_id(
-            ctx.session.session_id
-        )
-        if model_override:
-            model_for_llm = model_override
-            provider_for_llm = model_override_provider_id
-        else:
-            model_for_llm = resolved_agent_profile.model or (
-                ctx.agent.llm_config.model if ctx.agent.llm_config else None
-            )
-            provider_for_llm = resolved_agent_profile.provider_id or (
-                ctx.agent.llm_config.provider_id if ctx.agent.llm_config else None
-            )
+        from cognis.core.runtime_selection import resolve_runtime_selection
+
+        runtime_selection = resolve_runtime_selection(ctx.agent, ctx.session, ctx.conversation)
+        model_for_llm = runtime_selection.model
+        provider_for_llm = runtime_selection.provider_id
         reasoning_effort = (
-            self.session_cache.get_reasoning_effort_override(ctx.session.session_id)
-            or getattr(ctx.step_definition, "reasoning_effort", None)
-            or resolved_agent_profile.reasoning_effort
-            or (ctx.agent.llm_config.reasoning_effort if ctx.agent.llm_config else None)
-        )
-        get_fast_mode_override = getattr(self.session_cache, "get_fast_mode_override", None)
-        fast_mode = (
-            get_fast_mode_override(ctx.session.session_id)
-            if callable(get_fast_mode_override)
-            else None
-        )
-        if fast_mode is None:
-            fast_mode = (
-                resolved_agent_profile.fast_mode
-                if resolved_agent_profile.fast_mode is not None
-                else (ctx.agent.llm_config.fast_mode if ctx.agent.llm_config else None)
+            runtime_selection.reasoning_effort
+            if runtime_selection.reasoning_effort_source == "session_override"
+            else (
+                getattr(ctx.step_definition, "reasoning_effort", None)
+                or runtime_selection.reasoning_effort
             )
+        )
+        fast_mode = runtime_selection.fast_mode
         if reasoning_effort:
             ctx.runtime_info["current_reasoning_effort"] = reasoning_effort
         ctx.runtime_info["current_fast_mode"] = fast_mode
@@ -24556,14 +27316,14 @@ class AgentLoop:
         # created a near-empty session).
         cache_entry = self.session_cache.get_entry(ctx.session.session_id)
         if cache_entry is not None and not skip_few_events_check:
-            relevant_events = self.session_cache.get_events_since_compaction(
-                ctx.session.session_id,
-                ["user_message", "assistant_message"],
-            )
+            relevant_events = self.session_cache.get_events_since_compaction(ctx.session.session_id)
             if min_relevant_events is None:
                 preserve_turns = getattr(self.compaction_strategy, "preserve_turns", 10)
+                preserve_events = min(max(50, preserve_turns * 20), 200)
                 too_few_events = (
-                    sum(1 for e in relevant_events if e.type == "user_message") <= preserve_turns
+                    sum(1 for event in relevant_events if event.type == "user_message")
+                    <= preserve_turns
+                    and len(relevant_events) <= preserve_events
                 )
             else:
                 preserve_turns = None
@@ -24600,10 +27360,13 @@ class AgentLoop:
                 event_data = run.event_data()
             else:
                 event_data = {
+                    "compaction_id": f"compact_{uuid.uuid4().hex[:12]}",
                     "trigger": trigger,
                     "status": status,
                     "fallback_reason": fallback_reason,
                 }
+            if status in {"failed", "skipped"}:
+                await self.persist_compaction_terminal(ctx.session, event_data)
             await self.event_bus.publish(
                 Event(
                     type=event_type,
@@ -24620,6 +27383,8 @@ class AgentLoop:
         with AUTO_COMPACTION_DURATION.time():
             try:
                 model_context = await self._resolve_compaction_model_context(ctx)
+                if run is not None:
+                    model_context.compaction_id = run.compaction_id
             except Exception:
                 logger.warning(
                     "agent: auto-compaction model context resolution failed",
@@ -24744,6 +27509,41 @@ class AgentLoop:
         )
         return compaction_result
 
+    async def persist_compaction_terminal(
+        self,
+        session: SessionModel,
+        event_data: Mapping[str, Any],
+    ) -> None:
+        """Persist one terminal compaction occurrence before publishing it."""
+
+        status = str(event_data.get("status") or "")
+        if status not in {"failed", "skipped"}:
+            raise ValueError(f"Unsupported terminal compaction status: {status}")
+        compaction_id = str(event_data.get("compaction_id") or "")
+        if not compaction_id:
+            raise ValueError("Terminal compaction events require compaction_id")
+        payload = {
+            "event": "session_compaction_finished",
+            "session_id": session.session_id,
+            **dict(event_data),
+        }
+        events = with_session_events_turn_id(
+            [SessionEvent(type="lifecycle", data=payload)],
+            None,
+        )
+        append_result = await self.providers.guardrails.record_events(
+            session_id=session.intaris_session_id or session.session_id,
+            events=events,
+            source="cognis",
+            idempotency_key=(
+                f"{session.intaris_session_id or session.session_id}:"
+                f"compaction_terminal:{compaction_id}:{status}"
+            ),
+        )
+        if not getattr(append_result, "ok", False):
+            raise RuntimeError(f"Intaris rejected compaction event {compaction_id}")
+        await self.session_cache.append_recorded_events(session, events, append_result)
+
     def session_is_locked(self, session_id: str) -> bool:
         """Return whether a session currently has an active agent-loop turn."""
 
@@ -24845,7 +27645,10 @@ class AgentLoop:
 
         ctx.workflow_state.status = "paused"
         ctx.workflow_state.current_step_status = "paused"
-        ctx.workflow_state.pending_pause_type = pause_type
+        ctx.workflow_state.pending_pause_type = cast(
+            Literal["gate", "step_input", "credential_request", "auth_challenge"],
+            pause_type,
+        )
         ctx.workflow_state.pending_pause_payload = pause_payload
 
         from cognis.store.queries import (
@@ -25069,43 +27872,45 @@ class AgentLoop:
 
         if content_ref.startswith("dlv_"):
             async with self.session_manager.session_factory() as db_session:
-                row = await get_deliverable(db_session, content_ref)
-                published = await get_artifact_record(db_session, content_ref)
+                deliverable_row = await get_deliverable(db_session, content_ref)
+                published_row = await get_artifact_record(db_session, content_ref)
             owner_published = (
-                published is not None
-                and published.owner_email == ctx.conversation.user_email
-                and published.conversation_id is None
-                and published.status != "deleted"
-                and published.deleted_at is None
-                and published.purpose == "conversation_deliverable"
+                published_row is not None
+                and published_row.owner_email == ctx.conversation.user_email
+                and published_row.conversation_id is None
+                and published_row.status != "deleted"
+                and published_row.deleted_at is None
+                and published_row.purpose == "conversation_deliverable"
             )
-            if row is None or (
-                row.conversation_id != ctx.conversation.conversation_id and not owner_published
+            if deliverable_row is None or (
+                deliverable_row.conversation_id != ctx.conversation.conversation_id
+                and not owner_published
             ):
                 raise ValueError("Content reference was not found or is unavailable.")
             if self.artifact_store is not None:
-                await hydrate_deliverable_payload(row, self.artifact_store)
+                await hydrate_deliverable_payload(deliverable_row, self.artifact_store)
             return (
                 None,
                 Deliverable.model_validate(
                     {
-                        "deliverable_id": row.deliverable_id,
-                        "step_run_id": row.step_run_id,
-                        "version": row.version,
-                        "content": row.content,
-                        "format": row.format,
-                        "title": row.title,
-                        "target": row.target,
-                        "outputs": row.outputs or {},
-                        "rich": getattr(row, "rich_payload", None),
-                        "rich_payload": getattr(row, "rich_payload", None),
-                        "validation_warnings": getattr(row, "validation_warnings", None) or [],
-                        "render_metadata": getattr(row, "render_metadata", None) or {},
-                        "export_metadata": getattr(row, "export_metadata", None) or {},
-                        "status": row.status,
-                        "evaluator_feedback": row.evaluator_feedback,
-                        "created_at": row.created_at,
-                        "updated_at": row.updated_at,
+                        "deliverable_id": deliverable_row.deliverable_id,
+                        "step_run_id": deliverable_row.step_run_id,
+                        "version": deliverable_row.version,
+                        "content": deliverable_row.content,
+                        "format": deliverable_row.format,
+                        "title": deliverable_row.title,
+                        "target": deliverable_row.target,
+                        "outputs": deliverable_row.outputs or {},
+                        "rich": getattr(deliverable_row, "rich_payload", None),
+                        "rich_payload": getattr(deliverable_row, "rich_payload", None),
+                        "validation_warnings": getattr(deliverable_row, "validation_warnings", None)
+                        or [],
+                        "render_metadata": getattr(deliverable_row, "render_metadata", None) or {},
+                        "export_metadata": getattr(deliverable_row, "export_metadata", None) or {},
+                        "status": deliverable_row.status,
+                        "evaluator_feedback": deliverable_row.evaluator_feedback,
+                        "created_at": deliverable_row.created_at,
+                        "updated_at": deliverable_row.updated_at,
                     }
                 ),
             )
@@ -25120,12 +27925,7 @@ class AgentLoop:
         self,
         ctx: StepContext,
         *,
-        content: str,
-        format: str,
-        title: str | None,
-        target: str | None,
-        outputs: dict[str, Any] | None,
-        rich: dict[str, Any] | None = None,
+        authoring: ResolvedDeliverableAuthoring,
         daily_brief_contract_fingerprint: str | None = None,
         daily_brief_contract_version: int | None = None,
     ) -> Deliverable:
@@ -25138,8 +27938,30 @@ class AgentLoop:
         ):
             raise ValueError("not_in_workflow")
 
+        persisted_authoring = authoring
+        if authoring.source_artifact_id is not None:
+            presentation = (
+                authoring.rich.get("metadata", {}).get("presentation")
+                if authoring.rich is not None
+                else None
+            )
+            persisted_authoring = await resolve_deliverable_authoring(
+                {
+                    "action": rich_action_for_presentation(presentation),
+                    "payload_artifact": {"artifact_id": authoring.source_artifact_id},
+                },
+                session_factory=self.session_manager.session_factory,
+                artifact_store=self.artifact_store,
+                owner_email=ctx.conversation.user_email,
+                conversation_id=ctx.conversation.conversation_id,
+                agent_id=ctx.conversation.agent_id,
+                expected_artifact_id=authoring.source_artifact_id,
+                expected_digest=authoring.source_digest,
+            )
         async with self.session_manager.session_factory() as db_session:
             try:
+                if ctx.execution_fence is not None and deliverable_step_run_id is not None:
+                    await ctx.execution_fence.assert_current(db_session)
                 row = await create_deliverable(
                     db_session,
                     step_run_id=deliverable_step_run_id,
@@ -25148,12 +27970,12 @@ class AgentLoop:
                     else None,
                     session_id=ctx.session.session_id if deliverable_step_run_id is None else None,
                     turn_id=ctx.turn_id if deliverable_step_run_id is None else None,
-                    content=content,
-                    format=format,
-                    title=title,
-                    target=target,
-                    outputs=outputs,
-                    rich=rich,
+                    content=persisted_authoring.content,
+                    format=persisted_authoring.format,
+                    title=persisted_authoring.title,
+                    target=None,
+                    outputs=persisted_authoring.outputs,
+                    rich=persisted_authoring.rich,
                     artifact_store=self.artifact_store,
                     media_owner_email=ctx.conversation.user_email,
                     media_accessor_conversation_id=ctx.conversation.conversation_id,
@@ -25362,7 +28184,10 @@ class AgentLoop:
         getter = getattr(self.session_cache, "get_project_metadata_context", None)
         if not callable(getter):
             return None
-        return getter(ctx.session.session_id, project_id)
+        return cast(
+            ProjectMetadataEntry | None,
+            getter(ctx.session.session_id, project_id),
+        )
 
     async def _store_session_project_metadata(
         self,
@@ -25376,7 +28201,7 @@ class AgentLoop:
         store = getattr(self.session_cache, "store_project_metadata_context", None)
         if not callable(store):
             return entry
-        return await store(ctx.session.session_id, entry)
+        return cast(ProjectMetadataEntry, await store(ctx.session.session_id, entry))
 
     async def _maybe_resolve_and_store_project_metadata(
         self,
@@ -25562,7 +28387,10 @@ class AgentLoop:
         getter = getattr(self.session_cache, "get_project_context", None)
         if not callable(getter):
             return None
-        return getter(ctx.session.session_id, project_root)
+        return cast(
+            ProjectContextEntry | None,
+            getter(ctx.session.session_id, project_root),
+        )
 
     async def _store_session_project_context(
         self,
@@ -25576,7 +28404,7 @@ class AgentLoop:
         store = getattr(self.session_cache, "store_project_context", None)
         if not callable(store):
             return entry
-        return await store(ctx.session.session_id, entry)
+        return cast(ProjectContextEntry, await store(ctx.session.session_id, entry))
 
     async def _record_project_context_event(
         self,
@@ -25614,12 +28442,17 @@ class AgentLoop:
         self,
         ctx: StepContext,
         *,
-        workspace_root: str,
+        workspace_root: str | None,
         working_directory: str | None,
     ) -> None:
         if self._session_factory is None:
             return
-        working_directory = normalize_project_path(working_directory) or workspace_root
+        working_directory = normalize_project_path(working_directory)
+        workspace_root = normalize_project_path(workspace_root)
+        if working_directory and not workspace_root:
+            workspace_root = working_directory
+        if workspace_root and not working_directory:
+            working_directory = workspace_root
         try:
             async with self._session_factory() as db_session:
                 if ctx.task_id is not None:
@@ -25644,8 +28477,14 @@ class AgentLoop:
                     platform_data = dict(
                         getattr(ctx.conversation.context, "platform_data", {}) or {}
                     )
-                    platform_data["workspace_root"] = workspace_root
-                    platform_data["working_directory"] = working_directory
+                    if workspace_root:
+                        platform_data["workspace_root"] = workspace_root
+                    else:
+                        platform_data.pop("workspace_root", None)
+                    if working_directory:
+                        platform_data["working_directory"] = working_directory
+                    else:
+                        platform_data.pop("working_directory", None)
                     await update_conversation_context_data(
                         db_session,
                         ctx.conversation.conversation_id,
@@ -25705,17 +28544,9 @@ class AgentLoop:
         if ctx.working_directory:
             metadata["working_directory"] = ctx.working_directory
         if ctx.executor_environment is not None:
-            metadata["executor_environment"] = {
-                "available": bool(getattr(ctx.executor_environment, "available", False)),
-                "executor_id": getattr(ctx.executor_environment, "executor_id", None),
-                "executor_type": getattr(ctx.executor_environment, "executor_type", None),
-                "user": getattr(ctx.executor_environment, "user", None),
-                "home": getattr(ctx.executor_environment, "home", None),
-                "cwd": getattr(ctx.executor_environment, "cwd", None),
-                "hostname": getattr(ctx.executor_environment, "hostname", None),
-                "source": getattr(ctx.executor_environment, "source", None),
-                "observed_at": getattr(ctx.executor_environment, "observed_at", None),
-            }
+            metadata["executor_environment"] = self._executor_environment_metadata(
+                ctx.executor_environment
+            )
         if ctx.current_model:
             metadata["resolved_model"] = ctx.current_model
         if ctx.current_provider_id:
@@ -25737,6 +28568,22 @@ class AgentLoop:
         }
         metadata["authorized_lazy_artifact_refs"] = sorted(ctx.authorized_lazy_artifact_refs)
         return metadata
+
+    @staticmethod
+    def _executor_environment_metadata(
+        environment: ExecutorEnvironmentSnapshot,
+    ) -> dict[str, Any]:
+        return {
+            "available": environment.available,
+            "executor_id": environment.executor_id,
+            "executor_type": environment.executor_type,
+            "user": environment.user,
+            "home": environment.home,
+            "cwd": environment.cwd,
+            "hostname": environment.hostname,
+            "source": environment.source,
+            "observed_at": environment.observed_at,
+        }
 
     def _tool_runtime_metadata_for_call(
         self,
@@ -26101,9 +28948,9 @@ class AgentLoop:
             item = self._background_work_item_from_managed_link(row, now=now)
             if item is not None:
                 items.append(item)
-        for row in child_sessions:
+        for child_row in child_sessions:
             item = self._background_work_item_from_child_session(
-                row,
+                child_row,
                 active_children=active_children,
                 now=now,
             )
@@ -26609,6 +29456,10 @@ class AgentLoop:
 
         state = ctx.workflow_state
         revision_context = getattr(state, "last_revision_context", None)
+        operator_instruction = getattr(state, "last_operator_instruction", None)
+        ctx.user_visible_message = None
+        if revision_context and operator_instruction == revision_context:
+            ctx.user_visible_message = revision_context
         composed = compose_workflow_prompt(
             workflow_id=ctx.workflow_id,
             workflow_name=ctx.workflow_name,
@@ -26617,6 +29468,7 @@ class AgentLoop:
             task_expected_output=ctx.task_expected_output,
             task_source_type=ctx.task_source_type,
             task_source_ref=ctx.task_source_ref,
+            task_trigger_context=ctx.task_trigger_context,
             attachment_refs=[
                 f"{attachment.artifact_id} ({attachment.filename})"
                 for attachment in ctx.user_attachments
@@ -26628,7 +29480,7 @@ class AgentLoop:
             todos=ctx.todos,
             reviewer_feedback=getattr(state, "last_evaluation_feedback", None),
             revision_context=revision_context,
-            operator_instruction=getattr(state, "last_operator_instruction", None),
+            operator_instruction=operator_instruction,
             completion_delivery=ctx.completion_delivery,
             require_step_complete=ctx.policy.require_step_complete,
             deliverable_owned=self._deliverable_owner_step_run_id(ctx) is not None,
@@ -26824,8 +29676,9 @@ class AgentLoop:
         task_control_surface = ctx.controller_tool_surface == CONTROLLER_TOOL_SURFACE_TASK_CONTROL
         alias_map: dict[str, str] = {}
         exposed_definitions: list[ToolDefinition] = []
+        deferred_definitions: list[ToolDefinition] = []
 
-        def _visible_tool_name(tool_def: Any) -> str:
+        def _visible_tool_name(tool_def: ToolDefinition) -> str:
             if not direct_chat_surface:
                 return tool_def.name
             if tool_def.name == STEP_REQUEST_QUESTIONS_TOOL.name:
@@ -26836,7 +29689,7 @@ class AgentLoop:
                 return CONTROLLER_TOOL_TODO_LIST
             return tool_def.name
 
-        def _visible_description(tool_def: Any) -> str:
+        def _visible_description(tool_def: ToolDefinition) -> str:
             if direct_chat_surface and tool_def.name == STEP_REQUEST_QUESTIONS_TOOL.name:
                 return (
                     "Ask the user structured questions during execution. Use this to clarify "
@@ -26847,22 +29700,20 @@ class AgentLoop:
                 )
             if direct_chat_surface and tool_def.name == STEP_TODO_WRITE_TOOL.name:
                 return (
-                    "Track required progress for genuine multistep work in this chat. Do not create "
-                    "todos for work that can be completed in a single response, including "
-                    "straightforward questions, short answers, or simple clarification. Created "
-                    "todos persist across turns until terminal; keep them current and complete or "
-                    "cancel every item before finishing. Multiple in_progress items are allowed "
-                    "only for genuinely parallel workstreams."
+                    "Track progress for genuine multistep work in this chat. Keep statuses current "
+                    "as work changes, and complete or cancel every item before finishing."
                 )
             if direct_chat_surface and tool_def.name == STEP_TODO_LIST_TOOL.name:
                 return "Read the durable todo list for this chat."
             return tool_def.description
 
-        def _to_schema(tool_def: Any) -> dict[str, Any]:
+        def _prepare_definition(
+            tool_def: ToolDefinition,
+        ) -> tuple[ToolDefinition, dict[str, Any]]:
             import copy
 
             tool_def = enrich_orchestration_target_catalog(
-                tool_def,
+                cast(NativeToolDefinition, tool_def),
                 ctx.orchestration_target_snapshot,
             )
             parameters = copy.deepcopy(tool_input_schema(tool_def))
@@ -26887,22 +29738,30 @@ class AgentLoop:
             visible_name = _visible_tool_name(tool_def)
             if visible_name != tool_def.name:
                 alias_map[visible_name] = tool_def.name
-            exposed_definitions.append(
-                tool_with_input_schema(
-                    tool_def,
-                    parameters,
-                    name=visible_name,
-                    description=_visible_description(tool_def),
-                )
+            prepared = tool_with_input_schema(
+                tool_def,
+                parameters,
+                name=visible_name,
+                description=_visible_description(tool_def),
             )
+            provider_parameters = copy.deepcopy(tool_provider_exposure_schema(prepared))
+            return prepared, provider_parameters
+
+        def _to_schema(tool_def: Any) -> dict[str, Any]:
+            prepared, provider_parameters = _prepare_definition(tool_def)
+            exposed_definitions.append(prepared)
             return {
                 "type": "function",
                 "function": {
-                    "name": visible_name,
-                    "description": _visible_description(tool_def),
-                    "parameters": parameters,
+                    "name": prepared.name,
+                    "description": prepared.description,
+                    "parameters": provider_parameters,
                 },
             }
+
+        def _defer(tool_def: Any) -> None:
+            prepared, _provider_parameters = _prepare_definition(tool_def)
+            deferred_definitions.append(prepared)
 
         tools: list[dict[str, Any]] = []
         delegated_child = _is_delegated_child_context(ctx)
@@ -26961,6 +29820,8 @@ class AgentLoop:
             tools.append(_to_schema(SEARCH_TOOLS_TOOL))
         if not task_control_surface and _controller_builtin_enabled(ctx.agent, DESCRIBE_TOOL_TOOL):
             tools.append(_to_schema(DESCRIBE_TOOL_TOOL))
+        if not task_control_surface and _controller_builtin_enabled(ctx.agent, SEARCH_TOOLS_TOOL):
+            tools.append(_to_schema(CALL_TOOL_TOOL))
         if not task_control_surface and _controller_builtin_enabled(
             ctx.agent, VALIDATE_TOOL_CALL_TOOL
         ):
@@ -26973,24 +29834,44 @@ class AgentLoop:
 
         # Orchestration tools — based on orchestration_mode.
         conversation = getattr(ctx, "conversation", None)
-        surface_policy = orchestration_surface_policy(getattr(conversation, "context", None))
+        conversation_context = getattr(conversation, "context", None)
+        surface_policy = orchestration_surface_policy(conversation_context)
+        # Child lifecycle controls are independent of nested-work creation policy.
+        from cognis.core.external_managed_policy import (
+            external_managed_policy,
+            external_tool_allowed,
+        )
+
+        if external_managed_policy(conversation_context) is not None:
+            from cognis.tools.builtin.orchestration import MANAGED_CHANNEL_CHILD_CONTROL_TOOLS
+
+            for control_tool in MANAGED_CHANNEL_CHILD_CONTROL_TOOLS:
+                if external_tool_allowed(
+                    tool_name=control_tool.name,
+                    tool_id=f"builtin:{control_tool.name}",
+                    context=conversation_context,
+                    memory_backend_configured=False,
+                ):
+                    tools.append(_to_schema(control_tool))
         for tool_def in orchestration_tools(
             ctx.orchestration_mode,
             expose_delegate_wait_option=surface_policy.expose_delegate_wait_option,
             expose_managed_conversation_tools=surface_policy.expose_managed_conversation_tools,
             expose_managed_conversation_wait_option=surface_policy.expose_managed_conversation_wait_option,
             managed_conversation_wait_default=surface_policy.managed_conversation_wait_default,
-            expose_task_tools=surface_policy.expose_task_tools,
+            expose_task_tools=task_control_surface or surface_policy.expose_task_tools,
             expose_workflow_tools=surface_policy.expose_workflow_tools,
             expose_compose_workflow_tool=surface_policy.expose_compose_workflow_tool,
         ):
-            if not task_control_surface and tool_def.name in {
-                "add_task_note",
-                "add_task_context",
-                "pause_task",
-                "resume_task",
-                "request_task_revision",
-            }:
+            if (
+                surface_policy.surface == OrchestrationSurface.MANAGED_AGENT_CONVERSATION
+                and is_task_tool(tool_def.name)
+                and (
+                    not isinstance(ctx.agent.tools, dict)
+                    or not isinstance(ctx.agent.tools.get("builtin_tools"), list)
+                    or not _controller_builtin_enabled(ctx.agent, tool_def)
+                )
+            ):
                 continue
             if task_control_surface and tool_def.name not in TASK_CONTROL_CONTROLLER_TOOL_NAMES:
                 continue
@@ -26999,7 +29880,10 @@ class AgentLoop:
                 ctx.orchestration_target_snapshot,
             ):
                 continue
-            tools.append(_to_schema(tool_def))
+            if not task_control_surface and is_task_tool(tool_def.name):
+                _defer(tool_def)
+            else:
+                tools.append(_to_schema(tool_def))
 
         # Stage 36: switch_executor — exposed only when the agent has at
         # least two USABLE assigned executors. Hiding it when fewer are
@@ -27031,10 +29915,12 @@ class AgentLoop:
                     )
                 )
 
+        validate_direct_schema_sizes([*exposed_definitions, *deferred_definitions])
         return ControllerToolExposure(
             schemas=tools,
             alias_map=alias_map,
             definitions=exposed_definitions,
+            deferred_definitions=deferred_definitions,
         )
 
     def _build_controller_tool_schemas(self, ctx: StepContext) -> list[dict[str, Any]]:
@@ -27169,12 +30055,41 @@ class AgentLoop:
             arguments,
             validation_context,
         )
-        if identifier == WRITE_DELIVERABLE and isinstance(arguments, dict):
+        if identifier in {WRITE_DELIVERABLE, "builtin:write_deliverable"} and isinstance(
+            arguments, dict
+        ):
             payload_fingerprint = tool_call_fingerprint(WRITE_DELIVERABLE, arguments)
             state_fingerprint = write_deliverable_validation_state_fingerprint(
                 validation_context,
                 schema_hash=result.get("schema_hash"),
             )
+            if result.get("valid") is True and is_rich_authoring_action(arguments.get("action")):
+                try:
+                    resolved_validation = await resolve_deliverable_authoring(
+                        arguments,
+                        session_factory=self.session_manager.session_factory,
+                        artifact_store=self.artifact_store,
+                        owner_email=ctx.conversation.user_email,
+                        conversation_id=ctx.conversation.conversation_id,
+                        agent_id=ctx.conversation.agent_id,
+                    )
+                except DeliverableAuthoringError as exc:
+                    result["valid"] = False
+                    result["errors"] = [
+                        {"code": exc.code, "path": exc.path, "message": exc.message}
+                    ]
+                else:
+                    if resolved_validation.source_artifact_id is not None:
+                        result["resolved_artifact_id"] = resolved_validation.source_artifact_id
+                        result["resolved_artifact_digest"] = resolved_validation.source_digest
+                        state_fingerprint = tool_call_fingerprint(
+                            "write_deliverable_validation_state",
+                            {
+                                "state": state_fingerprint,
+                                "artifact_id": resolved_validation.source_artifact_id,
+                                "digest": resolved_validation.source_digest,
+                            },
+                        )
             result["validation_state_fingerprint"] = state_fingerprint
             if result.get("valid") is True and validation_phase == "preflight":
                 activation = resolve_daily_brief_contract(
@@ -27354,16 +30269,16 @@ class AgentLoop:
         }
         for tool_def in orchestration_tools(OrchestrationMode.FULL):
             registry[tool_def.name] = tool_def
-        tool_def = registry.get(tool_name)
-        if tool_def is None:
+        resolved_tool_def = registry.get(tool_name)
+        if resolved_tool_def is None:
             return None
         if ctx is not None and tool_name == STEP_COMPLETE_TOOL.name:
             import copy
 
-            parameters = copy.deepcopy(tool_input_schema(tool_def))
+            parameters = copy.deepcopy(tool_input_schema(resolved_tool_def))
             self._apply_step_metadata_contract_schema(ctx, parameters)
             return parameters
-        return tool_input_schema(tool_def)
+        return tool_input_schema(resolved_tool_def)
 
     def _apply_step_metadata_contract_schema(
         self,
@@ -27585,7 +30500,7 @@ class AgentLoop:
                 return False
             if active_id is not None and target.executor_id == active_id:
                 return True
-            return target.executor_type == "websocket"
+            return bool(target.executor_type == "websocket")
 
         effective: list[ToolDefinition] = []
         for tool in tools:
@@ -27651,25 +30566,43 @@ class AgentLoop:
             )
         return classified_registry if changed else registry
 
+    def _record_tool_call_ledger_events(
+        self,
+        ctx: StepContext,
+        events: list[SessionEvent],
+    ) -> None:
+        _record_tool_call_ledger_events(
+            ctx,
+            events,
+            self._get_classified_tool_registry(ctx, self._get_tool_registry(ctx)),
+        )
+
+    def _same_turn_duplicate_tool_call_indexes(
+        self,
+        ctx: StepContext,
+        ledger: SameTurnToolCallLedger,
+        tool_calls: list[ToolCall],
+        registry: Any | None,
+        *,
+        excluded_indexes: set[int] | None = None,
+    ) -> tuple[set[int], set[int]]:
+        return _same_turn_duplicate_tool_call_indexes(
+            ledger,
+            tool_calls,
+            self._get_classified_tool_registry(ctx, registry),
+            excluded_indexes=excluded_indexes,
+        )
+
     def _get_initial_promoted_tool_ids(self, ctx: StepContext) -> set[str]:
         """Return tool ids that should be promoted visible before any discovery calls.
 
-        Skill-attached tool ids are pre-promoted so they survive from the
-        previous session into the current step without requiring a fresh
-        ``search_tools`` call.  Session-discovered tool ids are also restored
-        here; later inventory/profile/permission filtering decides whether they
-        are still valid for this turn.
+        Only auto-loaded skill links are promoted from agent metadata. Explicit
+        skill loads and classifier activations are restored from session state
+        by ``_get_initial_activated_tool_ids``.
         """
 
         promoted: set[str] = set()
         if isinstance(ctx.agent.skills, dict):
-            raw_ids = ctx.agent.skills.get("_attached_skill_tool_ids")
-            if isinstance(raw_ids, list):
-                promoted.update(
-                    str(tool_id)
-                    for tool_id in raw_ids
-                    if isinstance(tool_id, str) and tool_id.strip()
-                )
             auto_loaded_ids = ctx.agent.skills.get("_auto_loaded_skill_tool_ids")
             if isinstance(auto_loaded_ids, list):
                 promoted.update(
@@ -27677,13 +30610,6 @@ class AgentLoop:
                     for tool_id in auto_loaded_ids
                     if isinstance(tool_id, str) and tool_id.strip()
                 )
-        get_discovered = getattr(self.session_cache, "get_discovered_tool_ids", None)
-        if callable(get_discovered):
-            promoted.update(
-                str(tool_id)
-                for tool_id in get_discovered(ctx.session.session_id)
-                if isinstance(tool_id, str) and tool_id.strip()
-            )
         return promoted
 
     def _get_initial_activated_tool_ids(self, ctx: StepContext) -> set[str]:
@@ -27973,7 +30899,12 @@ class AgentLoop:
                     content or "{}",
                     label="skill_tool_classifier",
                 )
-                raw_ids = payload.get("tool_ids") if isinstance(payload, dict) else []
+                raw_ids = cast(
+                    list[Any],
+                    payload.get("tool_ids")
+                    if isinstance(payload, dict) and isinstance(payload.get("tool_ids"), list)
+                    else [],
+                )
                 # A4: capture reasons at DEBUG level only.
                 reasons = payload.get("reasons") if isinstance(payload, dict) else None
                 if isinstance(reasons, dict):
@@ -28053,10 +30984,10 @@ class AgentLoop:
         """
         activation = metadata.get("skill_activation")
         if not isinstance(activation, dict):
-            return
+            return None
         skill_id = str(activation.get("skill_id") or "").strip()
         if not skill_id:
-            return
+            return None
         skill_name = str(activation.get("name") or "").strip().lower()
         if skill_name:
             ctx.loaded_skill_names.add(skill_name)
@@ -28080,9 +31011,10 @@ class AgentLoop:
         # metadata dicts.  The internal variable is promoted_tool_ids, but the key
         # name is kept stable so existing skill tool metadata round-trips correctly.
         raw_declared_tool_ids = metadata.get("discovered_tool_ids")
+        declared_tool_ids = raw_declared_tool_ids if isinstance(raw_declared_tool_ids, list) else []
         resolved_tool_ids = {
             str(tool_id)
-            for tool_id in raw_declared_tool_ids
+            for tool_id in declared_tool_ids
             if isinstance(tool_id, str) and tool_id.strip()
         }
         resolution_path = "declared"
@@ -28111,7 +31043,11 @@ class AgentLoop:
                     step_profile_allows_tool(tool, resolved_profile)
                     or stable_tool_id(tool) in activated_tool_ids
                 )
-                and not step_profile_visible_by_default(tool, resolved_profile)
+                and not _tool_visible_by_default(
+                    tool,
+                    resolved_profile,
+                    activated_tool_ids=activated_tool_ids,
+                )
                 and stable_tool_id(tool) not in activated_tool_ids
             ]
             resolved_tool_ids = await self._classify_skill_activation_tool_ids(
@@ -28232,6 +31168,10 @@ class AgentLoop:
     @staticmethod
     def _strict_daily_brief_activation(ctx: StepContext) -> Any | None:
         if _is_delegated_child_context(ctx):
+            return None
+        if not ctx.policy.require_step_complete:
+            return None
+        if ctx.step_run_id is None and ctx.deliverable_step_run_id is None:
             return None
         activation = resolve_daily_brief_contract(
             task_title=ctx.task_title,

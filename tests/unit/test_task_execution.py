@@ -229,3 +229,32 @@ async def test_renewal_error_marks_fence_lost_and_cancels(
         await fence.close()
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_or_superseded_attempt_invalidates_fence_immediately(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _database(tmp_path)
+    try:
+        store = TaskExecutionStore(
+            factory,
+            owner_id="controller-a:boot-a",
+            max_active_global=1,
+            max_active_per_agent=1,
+        )
+        claim = await store.claim_ready()
+        assert claim is not None
+        fence = TaskExecutionFence(store, claim, asyncio.Event())
+
+        async with factory() as session:
+            task = await session.get(Task, claim.task_id)
+            assert task is not None
+            task.status = "cancelled"
+            await session.commit()
+
+        assert await store.renew(claim) is None
+        with pytest.raises(StaleTaskExecutionOwner):
+            await fence.assert_current()
+    finally:
+        await engine.dispose()

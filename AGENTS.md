@@ -1,806 +1,386 @@
-# AGENTS.md — Coding Agent Instructions for cognis
+# AGENTS.md — Cognis Repository Instructions
 
-## Project Overview
+## Purpose
 
-**cognis** is a controller and orchestration layer for self-hosted AI agents — a decoupled control plane that manages agent definitions, interactive chat, delegated sub-sessions, tool execution routing, and integrations with external memory (Mnemory) and guardrails/audit (Intaris) services.
+Cognis is a cloud-native agent operating system. The controller owns agent
+identity, conversations, orchestration, workflows, memory context, guardrails,
+routing, and the API. Executors run tools and optional inference near the
+resources that they access.
 
-- **Language**: Python 3.12+, typed, async-first
-- **Framework**: FastAPI (Starlette) for HTTP/WebSocket, Typer for CLI
-- **Core dependencies**: fastapi, uvicorn, httpx, pydantic v2, sqlalchemy 2.x, litellm, typer
-- **Frontend**: SvelteKit (separate app in `ui/`)
-- **License**: TBD
-- **Repository**: https://github.com/fpytloun/cognis
-- **Companion services**: Intaris guardrails/audit and Mnemory memory
+The backend uses Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.x, and
+`asyncio`. The frontend is a separate SvelteKit application in `ui/`.
 
-## Architecture
+## Read Before Editing
 
-```
-cognis/
-├── pyproject.toml
-├── cognis/
-│   ├── __init__.py
-│   ├── main.py                     # Entry point (Typer CLI + server start)
-│   ├── config.py                   # Env var configuration (no config file)
-│   │
-│   ├── api/                        # API Gateway
-│   │   ├── app.py                  # FastAPI factory
-│   │   ├── routes/
-│   │   │   ├── auth.py             # Login, refresh, logout, setup, exchange-token
-│   │   │   ├── conversations.py
-│   │   │   ├── agents.py
-│   │   │   ├── secrets.py
-│   │   │   ├── settings.py         # System settings, LLM providers, model routing
-│   │   │   ├── tasks.py            # Task queue, dependencies, gate/step responses
-│   │   │   ├── tools.py
-│   │   │   ├── workflows.py        # Workflow CRUD, duplication, import/export
-│   │   │   ├── schedules.py        # Schedule CRUD (task factory)
-│   │   │   ├── escalations.py
-│   │   │   ├── images.py            # Image serving, upload, generation
-│   │   │   └── system.py           # Health, metrics, JWKS
-│   │   ├── websocket.py            # WebSocket transport layer (thin adapter)
-│   │   ├── executor_ws.py          # Executor WebSocket endpoint (auth + configure)
-│   │   ├── runtime_support.py      # Step runtime factory (executor resolution)
-│   │   ├── middleware.py           # Auth (JWT + API key), rate limiting
-│   │   └── models.py              # API request/response Pydantic models
-│   │
-│   ├── core/                       # Orchestration Core
-│   │   ├── turn_scheduler.py      # Turn orchestration (transport-agnostic)
-│   │   ├── commands.py            # Slash command dispatch (transport-agnostic)
-│   │   ├── agent_loop.py          # Agent loop engine (step runner)
-│   │   ├── task_queue.py          # Queue picking, capacity, dependency resolution
-│   │   ├── workflow_engine.py     # Workflow orchestration (step sequencing, gates, loops)
-│   │   ├── step_evaluator.py      # Semantic step completion evaluation
-│   │   ├── decision.py            # Decision Engine (rules + workflow selection)
-│   │   ├── session.py             # Session Manager
-│   │   ├── session_cache.py       # L1 in-memory cache for Intaris-derived state
-│   │   ├── tool_router.py         # Tool routing logic
-│   │   ├── compaction/            # Context compaction package (strategy, banding, fallback, recovery)
-│   │   ├── context.py             # Context assembly (parallel external fetches)
-│   │   ├── events.py              # Event Bus + hooks
-│   │   ├── remember_queue.py      # Bounded retry queue for Mnemory remember
-│   │   ├── agent_registry.py      # System agent definitions + registry
-│   │   └── executor_resolution.py # Executor selection (labels, defaults, tool enablement)
-│   │
-│   ├── models/                     # Domain models (Pydantic)
-│   │   ├── agent.py
-│   │   ├── channel.py
-│   │   ├── session.py
-│   │   ├── tool.py
-│   │   ├── delegation.py
-│   │   └── config.py              # LLMProviderConfig, ModelRoutingPolicy, ImageGenerationResult, etc.
-│   │
-│   ├── artifacts/                  # Binary artifact storage (images, etc.)
-│   │   ├── __init__.py
-│   │   └── store.py               # ArtifactBackend Protocol, FS/S3 backends, ArtifactStore
-│   │
-│   ├── channels/                   # External messaging adapters + pairing
-│   │   ├── protocol.py            # ChannelAdapter protocol + base adapter
-│   │   ├── manager.py             # Channel lifecycle + adapter orchestration
-│   │   ├── inbound.py             # Channel -> TurnScheduler pipeline
-│   │   ├── delivery.py            # EventBus -> channel delivery
-│   │   ├── pairing.py             # Sender-initiated remote verification flow
-│   │   ├── formatting.py          # Message splitting + markdown stripping
-│   │   ├── registry.py            # Channel metadata for setup UI
-│   │   └── adapters/              # Signal/Slack/etc. concrete adapters
-│   │
-│   ├── providers/                  # Provider interfaces + implementations
-│   │   ├── base.py                 # Protocol definitions (all 6 providers)
-│   │   ├── retry.py               # Shared retry utility (exponential backoff + jitter)
-│   │   ├── registry.py
-│   │   ├── memory/
-│   │   │   ├── protocol.py        # MemoryProvider Protocol
-│   │   │   └── mnemory.py         # Mnemory HTTP client (JWT auth)
-│   │   ├── guardrails/
-│   │   │   ├── protocol.py        # GuardrailsProvider Protocol
-│   │   │   └── intaris.py         # Intaris HTTP client (JWT auth)
-│   │   ├── executor/
-│   │   │   ├── protocol.py        # ExecutorProvider Protocol + re-exports
-│   │   │   ├── in_process.py      # In-process executor (same process)
-│   │   │   ├── websocket.py       # WebSocket remote executor connection + provider
-│   │   │   ├── subprocess.py      # Local subprocess executor (spawns process)
-│   │   │   ├── composite.py       # Composite provider (routes by executor_type)
-│   │   │   ├── docker.py          # Phase 2 (planned, not yet created)
-│   │   │   └── kubernetes.py      # Phase 2 (planned, not yet created)
-│   │   ├── secrets/
-│   │   │   ├── protocol.py
-│   │   │   └── encrypted_db.py    # AES-256-GCM encrypted secrets
-│   │   ├── llm/
-│   │   │   ├── protocol.py        # LLMProvider Protocol
-│   │   │   ├── litellm.py         # LiteLLM wrapper (loads config from DB)
-│   │   │   └── inference_router.py # Routes LLM inference to executor-side endpoints
-│   │   └── auth/
-│   │       ├── protocol.py
-│   │       └── jwt.py             # ES256 JWT (auto-generated keys)
-│   │
-│   ├── tools/                      # Tool system
-│   │   ├── builtin/
-│   │   │   ├── orchestration.py   # delegate, task/workflow orchestration
-│   │   │   └── system.py          # list_agents, get_status
-│   │   ├── executor/
-│   │   │   ├── lsp/               # LSP diagnostics integration
-│   │   │   │   ├── client.py      # Async LSP client (JSON-RPC/stdio)
-│   │   │   │   ├── diagnostics.py # Diagnostic formatting for LLM context
-│   │   │   │   ├── install.py     # Auto-install strategies
-│   │   │   │   ├── manager.py     # LSPManager (lazy spawn, routing)
-│   │   │   │   ├── servers.py     # Language server definitions
-│   │   │   │   └── types.py       # LSP type definitions
-│   │   │   ├── filesystem.py      # read, write, edit, patch, multiedit
-│   │   │   ├── search.py          # glob, grep
-│   │   │   ├── shell.py           # bash
-│   │   │   └── definitions.py     # Tool definitions + handler registry
-│   │   ├── mcp.py                  # MCP client
-│   │   ├── skills.py
-│   │   └── registry.py
-│   │
-│   ├── store/                      # Cognis DB (metadata only)
-│   │   ├── database.py            # SQLAlchemy async engine + session factory
-│   │   ├── models.py              # SQLAlchemy ORM models
-│   │   ├── queries.py             # Query helpers
-│   │   └── migrations/            # Alembic migrations
-│   │       ├── env.py
-│   │       └── versions/
-│   │
-│   ├── executor/                    # Standalone executor runner (remote process)
-│   │   ├── __init__.py
-│   │   ├── __main__.py            # Entry point (python -m cognis.executor)
-│   │   ├── runner.py              # ExecutorRunner (WS client, tool dispatch, heartbeat)
-│   │   └── inference.py           # InferenceHandler (LiteLLM proxy for controller-routed calls)
-│   │
-│   └── cli/                        # Typer CLI commands
-│       ├── __init__.py
-│       ├── admin.py               # create-user, reset-password, api-key (direct DB)
-│       ├── executor.py            # executor run (standalone executor process)
-│       └── serve.py               # Server start
-│
-├── ui/                             # SvelteKit frontend (separate app)
-│
-└── tests/
-    ├── unit/                       # Fast, no external services needed
-    ├── integration/                # Require running Cognis + providers
-    └── contract/                   # Validate Mnemory/Intaris API contracts
-```
+1. Read this file.
+2. Inspect the current implementation and tests for the area that will change.
+3. Read the relevant specification from `docs/specs/README.md`.
+4. Read user-facing guides when behavior or configuration changes.
 
-### Layer responsibilities
+Current code and user guides are product truth. Some specifications describe
+future or partially shipped work. Do not implement an old plan because it
+appears in a specification.
 
-| Layer | Directory | Responsibility |
+This file defines stable boundaries and repository rules. It is not an
+exhaustive file inventory.
+
+## Repository and Package Boundaries
+
+| Path | Package or role | Responsibility |
 |---|---|---|
-| **CLI** | `cli/` | Typer commands: `serve`, `admin create-user`, `admin reset-password`, `admin api-key`, `config init`, `status`, `executor run` |
-| **API Gateway** | `api/` | FastAPI routes, WebSocket transport layer (thin adapter), executor WebSocket endpoint, auth middleware, request/response models |
-| **Turn Scheduler** | `core/turn_scheduler.py` | Transport-agnostic turn orchestration: submission, serialization, decision dispatch, follow-up turns, cancellation, error classification |
-| **Command Dispatcher** | `core/commands.py` | Transport-agnostic slash command handling: /compact, /new, /model, /thinking, /context, /info, /lsp, /help, /approve, /deny |
-| **Orchestration Core** | `core/` | Agent loop, Decision Engine, Session Manager, context assembly, compaction, tool routing, event bus |
-| **Session Cache** | `core/session_cache.py` | L1 in-memory cache for Intaris-derived state (events, seq, compaction, intention). No DB persistence. |
-| **Remember Queue** | `core/remember_queue.py` | Bounded async retry queue for failed Mnemory remember() calls |
-| **Notification Service** | `core/notifications.py` | Unified lifecycle for escalations, gates, and step questions. DB-persistent, PauseWaiter-backed. |
-| **Agent Registry** | `core/agent_registry.py` | System agent definitions (Python constants) + registry merging system and DB agents |
-| **Executor Resolution** | `core/executor_resolution.py` | Executor selection by ID, labels, and default; tool enablement checks |
-| **Executor WS Endpoint** | `api/executor_ws.py` | Accepts remote executor WebSocket connections, handles JWT auth and executor.configure handshake |
-| **Domain Models** | `models/` | Pydantic models for agents, sessions, tools, delegations, config |
-| **Channels** | `channels/` | Channel adapter lifecycle, pairing, inbound routing, outbound delivery, and message formatting |
-| **Providers** | `providers/` | Protocol definitions + implementations (memory, guardrails, executor, secrets, LLM, auth) |
-| **Tools** | `tools/` | Built-in tools, MCP client, skill loader, tool registry |
-| **Storage** | `store/` | SQLAlchemy async engine, ORM models, Alembic migrations, query helpers |
-| **Frontend** | `ui/` | SvelteKit app (chat, agents, settings) |
-| **Tests** | `tests/` | Unit, integration, and contract tests |
+| `cognis/` | `cognis-controller` | Controller, API, orchestration, persistence, providers |
+| `packages/common/` | `cognis-common` | Pure contracts shared by controller and executor |
+| `packages/executor/` | `cognis-executor` | Standalone executor, tools, browser, local runtime |
+| `ui/` | SvelteKit application | Web and PWA user interface |
+| `tests/` | Test suites | Unit, contract, integration, deployment, and E2E coverage |
+| `docs/` | Documentation | User guides, architecture references, and implementation history |
+| `deploy/`, `docker/` | Deployment assets | Kubernetes, systemd, Docker, and local-stack support |
 
-### Key design decisions
+Dependency direction is:
 
-1. **Controller = Brain, Executor = Hands**: The controller runs all agent loops, manages LLM interaction, memory, guardrails, and sessions. The executor is a pure tool execution sandbox — it receives `tool.execute` commands via JSON-RPC and returns results. It knows nothing about memory, guardrails, or sessions. **Hard rule: the controller NEVER executes tool calls directly.**
+```text
+controller ──> common <── executor
+```
 
-2. **No config file**: Infrastructure config (URLs, ports, keys) uses environment variables. Application config (LLM providers, model routing, session settings, security policies) is stored in the database and managed via the API/UI. There is no `cognis.yaml` or any config file.
+`common` must not import controller or executor implementation code. The
+controller must not depend on executor implementation packages.
 
-3. **Email as user_id**: The user's email is the primary key in the `users` table and flows as `sub` claim in JWTs and `X-User-Id` to Mnemory/Intaris. This is the universal user identifier across the ecosystem.
+## Architecture and Ownership
 
-4. **JWT-only service auth**: Cognis issues ES256 JWTs. Mnemory and Intaris validate them. No API keys between services. JWT `aud` claim prevents confused-deputy attacks.
+These are target ownership boundaries. Some legacy hotspots contain mixed
+responsibilities. Existing placement inside a hotspot is not a precedent for
+new code.
 
-5. **Session cache, not DB cache**: Intaris-derived state (event sequences, compaction summaries, intention) is cached in-memory (L1) and optionally Redis (L2). It is NOT stored in Cognis DB. Intaris is the single durable source of truth for session content. This eliminates dual-write consistency problems.
+| Area | Canonical owner |
+|---|---|
+| HTTP request and response adaptation | `cognis/api/routes/` |
+| WebSocket protocol and connection adaptation | `cognis/api/websocket.py`, `cognis/api/chat_v2/` |
+| Application construction and lifespan entry | `cognis/api/app.py` |
+| Effective executor, tool, and skill runtime planning | `cognis/api/runtime_support.py` and focused core collaborators |
+| Turn admission, serialization, cancellation, and recovery | `cognis/core/turn_scheduler.py` |
+| LLM and tool turn coordination | `cognis/core/agent_loop.py` |
+| Slash commands | `cognis/core/commands.py` |
+| Workflow sequencing, gates, and step lifecycle | `cognis/core/workflow_engine.py` |
+| Tool authorization, routing, and result trust boundary | `cognis/core/tool_router.py` |
+| Context assembly and compaction | `cognis/core/context.py`, `cognis/core/compaction/` |
+| Intaris-derived runtime cache | `cognis/core/session_cache.py` |
+| Cognis metadata persistence | `cognis/store/` |
+| External service integrations | `cognis/providers/` |
+| External messaging adapters | `cognis/channels/` |
 
-6. **Parallel context assembly**: Mnemory recall, Intaris event refresh, and Intaris intention read run concurrently via `asyncio.gather()`. Partial failures degrade gracefully.
+Transport modules adapt application operations. They must not own business
+rules that another transport must reproduce.
 
-7. **Mnemory owns runtime personality**: Cognis bootstraps agent personality into Mnemory on creation. After that, Mnemory is the runtime authority — personality evolves through interactions. No ongoing sync from Cognis to Mnemory.
+## Non-Negotiable System Contracts
 
-8. **Workflow-driven execution**: All execution goes through the workflow engine. Main chat is a single-step `direct` workflow. Background tasks use multi-step workflows with planning, evaluation, review loops, and gates. Workflows are portable templates above agents — they define process, not agent identity. See `docs/specs/14-workflow-engine.md`.
+### Controller and executor
 
-9. **Explicit step completion**: A workflow step is not done because the LLM stopped calling tools. The agent must call `step_complete` to signal completion. The controller then runs semantic evaluation before advancing the workflow. This is controller-driven, not model-driven.
+- The controller decides. Executors perform tool execution.
+- Never execute executor tools directly in the controller, including local
+  development. Route every tool call through an executor provider.
+- An executor does not own conversations, memory, guardrail decisions, or
+  workflow state.
+- Channel adapters can run on the controller or an executor. Platform
+  connection state belongs where the adapter runs. Reuse the same adapter
+  implementation.
+- Executor-routed inference remains transparent to controller policy. The
+  controller resolves provider and model configuration before dispatch.
+- Behavior needed by both controller and executor belongs in `cognis-common`
+  only when it is portable and does not reverse package dependencies.
 
-10. **Tasks route back into conversations**: Task results, task questions, and task failures are injected as synthetic events into a target conversation. Tasks do NOT speak directly to channels. Channel adapters deliver conversation events to Signal/Slack/web/etc. This keeps all human-facing communication inside the normal conversation/session model.
+### Data ownership
 
-11. **Follows mnemory/intaris conventions**: Same build tooling (hatchling/uv), config pattern (env vars, no config files), error handling, and code style. Compatible ecosystem.
+| Data | Durable owner |
+|---|---|
+| Users, agents, projects, tasks, workflows, settings, and secrets | Cognis DB |
+| Conversation and session metadata | Cognis DB |
+| Session content, event sequence, compaction history, and tool-call audit | Intaris |
+| Guardrail decisions and behavioral analysis | Intaris |
+| Persistent memories and recall artifacts | Mnemory |
+| Tool runtime state and browser profiles | Executor |
 
- 12. **Compaction creates new sessions**: When context reaches the configured hard-pressure band (currently about 92% of the selected model budget) or a user runs manual `/compact`, compaction creates a new Intaris session within the same conversation. The compacted summary is injected as system context. Manual compaction (`/compact`) runs compact→rotate immediately under the agent-loop per-session lock; concurrent turns wait and re-resolve the new active session before recording. Long-lived ambient chats (web agent-direct and external channel conversations) can also idle-checkpoint before the next user message after `session.long_lived_chat_idle_compaction_seconds` (default 6h) if at least `session.long_lived_chat_idle_compaction_min_events` uncompacted events exist. The old session is marked completed with `completion_reason="compacted"`. Compaction input is assembled using a three-band strategy with exact token checks, middle-band user messages preserved verbatim, and a preserved tail walked backwards on user-turn boundaries up to 30% of the session model prompt budget; `session.compaction_preserve_turns` is a maximum cap, not a target. The LLM retries transient errors including 429 before falling back to a sliding-window mechanical summary that prepends the prior anchored summary and original request. The mechanical fallback is a last resort — the `cognis_compaction_fallback_used_total` counter is alert-worthy. Compaction recursion is bounded at `session.compaction_max_recursion` (default 2); exceeding it surfaces a `compaction_recursion_exhausted` classified failure and starts a short auto-compaction cooldown. The deferred-rotation path is crash-recovery only: it re-fetches preserved tail events from the old session's Intaris stream (using `tail_start_seq` from the `compaction_summary` event) and seeds them into the new session so continuity is preserved.
+- Do not copy Intaris-derived state into Cognis DB.
+- `SessionCache` can cache Intaris data in memory or Redis. It must remain
+  reconstructable from the durable owner.
+- Cognis DB stores metadata and references, not duplicate message or memory
+  content.
 
- 13. **Prompt caching via provider breakpoints**: Context is structured with an immutable prefix (tool schemas → one consolidated first system message containing tagged sections for identity, runtime instructions, memory instructions, core memories, available skills, and continuation summary), optional frozen project-context messages, then a mutable suffix (stable environment → history → recalled memories → delegations → current user/tool loop transcript → volatile tail reminders). Follow-up guidance is suffix-only and does not rewrite the immutable prefix. Anthropic requests use up to four `cache_control` breakpoints, recomputed for every LLM cycle: the last tool schema, the last cached prefix/project-context message, the end of prior-turn history, and the current request tail. `session.anthropic_cache_ttl` defaults to `5m`; when set to `1h`, only tools and cached prefix/project context use `1h`, while moving breakpoints stay `5m`, and the extended-cache-ttl beta is sent. OpenAI/ChatGPT uses automatic prefix caching unless explicit prompt cache keys are opted in. Refresh of the immutable prefix is still triggered only by explicit repair signals: Mnemory session adoption, missing entries after a cold load, or post-compaction prefix repair. Cross-turn history remains verbatim below the steady prompt target; above it, projection compacts only enough oldest fully recoverable tool groups to meet the required token savings. Within-turn re-projection now occurs when real context pressure exists (≥ 92% of available tokens, exact-pressure projection trigger, or an oversized tool result was appended); ordinary turns skip re-projection. See `docs/specs/06-tool-system.md` for the full tool exposure architecture.
+### Security and access
 
-14. **External channel senders must be verifiable**: Channel accounts should default to `pairing` so unknown remote senders cannot talk to an agent until they redeem a short-lived verification code in the Cognis UI.
+- Intaris evaluation is fail-closed for non-bypassable tools.
+- Secret resolution is fail-closed.
+- Tool output is untrusted input. Apply the normal sanitization boundary to
+  direct, recovered, and remotely reported results.
+- The `admin` role does not grant access to another user's agents,
+  conversations, tasks, schedules, memories, or secrets. Use ownership or an
+  explicit grant.
+- Email is the canonical Cognis user identifier and JWT subject. Service JWT
+  audiences must remain scoped to their intended Cognis, Intaris, Mnemory, or
+  executor recipient.
+- Cognis, Intaris, and Mnemory use audience-scoped ES256 service JWTs. Do not
+  add service API keys as a parallel authentication path.
+- External channel senders must pass the configured verification policy.
+- Never log message content, tool arguments or results, memory content, raw
+  prompts or completions, or secret values.
+- Logs and metrics can contain IDs, tool and model names, token counts,
+  latencies, status codes, error categories, and decision outcomes.
 
-15. **Channel adapters may run on executors**: The default location is still the controller, but the target architecture allows a channel account to run on a connected executor when the platform needs user-local services or network reachability (for example Signal via `signal-cli`). The executor reuses the exact same adapter code; the controller does not own the platform-side connection state.
+### Execution and lifecycle
 
-16. **LLM provider executor routing**: LLM providers are configured normally (same UI, same DB table). Setting `location="executor"` on a provider routes inference through a matching remote executor instead of calling the API from the controller. The executor is a transparent LiteLLM proxy — it receives the fully resolved model string and kwargs per-call. `executor_labels` on the provider config selects which executor to use. This means any LiteLLM-supported provider can run on any executor.
+- All interactive and task execution uses the workflow execution model.
+- A normal workflow step completes only through its explicit completion
+  contract. LLM silence is not completion.
+- Workflow deliverables are canonical step artifacts. Free-text step messages
+  are progress unless the direct-step contract says otherwise.
+- Task results, questions, and failures return through conversations. Tasks do
+  not send directly to external channels.
+- Compaction rotates to a new Intaris session within the same conversation.
+  Preserve continuity, canonical history, and session ownership during
+  compaction and recovery.
+- Preserve cancellation, retry, idempotency, event-ordering, and ownership
+  semantics across refactors.
+- Keep database sessions around database work only. Release them before
+  external I/O, event-store reads, or shared waits.
+- Never use blocking I/O in the controller.
 
-17. **Structured LLM stream failures**: Both Responses and Chat Completions streams emit mid-stream failures as `mid_stream_failure=true` chunks with a normalized `response_error` payload. Error classes and payload categories live in `cognis/providers/llm/errors.py`. The agent loop uses `cognis_llm_mid_stream_errors_total{provider_id,model,category}` as the canonical stream-failure metric; older phase-specific idle-timeout counters were removed. Mid-stream retries use the shared exponential retry policy, and runtime capability fallback markers (native OpenAI tool search, JSON mode, prompt cache key, reasoning summaries) expire after one hour by default. If a provider rejects `reasoning.summary`, Cognis retries the same Responses request once with the summary field omitted and marks that provider/model pair temporarily broken.
+### Schema evolution
 
-## Build / Run / Test
+- Every schema change requires an Alembic migration and a matching idempotent
+  bootstrap path.
+- Test migrations and bootstrap behavior against SQLite and PostgreSQL.
+- Do not add Intaris-owned event sequence, compaction, or intention fields to
+  the Cognis session table.
 
-This project uses **uv** for dependency management. All tools (pytest, ruff,
-mypy, alembic) run through `uv run` to use the project's `.venv`.
+## Architecture, Contract, and Invariant Hygiene
 
-### Local development
+Treat the smallest correct change as the smallest change at the canonical
+owner, not the change with the fewest edited lines.
+
+- Before adding behavior, search for its existing owner and equivalent policy,
+  schema, fallback, and implementation paths.
+- `agent_loop.py` coordinates a turn. Put independently testable command,
+  persistence, provider, and synchronization policy in an owned core module.
+- `api/websocket.py` adapts the WebSocket protocol. Put operations shared with
+  REST or channels in transport-neutral handlers.
+- `api/app.py` is the composition root. Give new services explicit
+  construction and lifecycle interfaces. Do not add private-field injection.
+- Runtime execution and preview paths must consume the same effective tool,
+  skill, executor, and access-policy plan.
+- Do not copy implementations between controller and executor distributions.
+- Give every state transition and side effect one owner. Avoid untyped state
+  bags and hidden mutation across components.
+- A compatibility path must identify its concrete consumer, supported
+  contract, persisted format, or rollout need. It also needs coverage and a
+  removal condition. Test-only aliases are not compatibility APIs.
+- Keep mechanical relocation separate from behavior changes.
+- Add invariant comments only for non-obvious ordering, ownership,
+  transactional, or failure semantics.
+
+For changes to `agent_loop.py`, `turn_scheduler.py`, `tool_router.py`,
+`session_cache.py`, or persistence transactions, record the applicable:
+
+- owned state and state lifetime;
+- external side effects;
+- lock or transaction boundary;
+- cancellation owner;
+- idempotency and retry contract;
+- compatibility surface.
+
+Keep this note proportional. Routine local changes do not need architecture
+boilerplate.
+
+### Controller tool contracts
+
+- Controller-injected tool schemas have one source of truth in
+  `cognis/tools/builtin/workflow.py`.
+- Do not hand-write a second LLM-facing or validator-facing schema.
+- Validate controller tool arguments through
+  `cognis.core.tool_arguments.validate_tool_arguments` before mutation.
+- On invalid arguments, return a synthetic error result that lets the model
+  correct the call.
+
+### API and lifecycle contracts
+
+- API response models must represent every producer. Add contract coverage in
+  `tests/unit/test_api_contracts.py`.
+- Keep Pydantic and TypeScript API contracts synchronized.
+- Put persistent-state lifecycle checkers and reconcilers in
+  `cognis.core.invariants`.
+- Do not clean up step sessions when a task pauses. Cleanup occurs only after a
+  terminal task state.
+
+## Python Conventions
+
+- Use Python 3.12 syntax and `from __future__ import annotations`.
+- Add type annotations to function signatures and return values.
+- Add docstrings to public classes and public methods.
+- Use `async def` for I/O-bound controller operations.
+- Use `httpx.AsyncClient`, not `requests`.
+- Use `asyncio` primitives, not threading primitives or polling loops.
+- Use the `logging` module. Use `print()` only for intentional Typer CLI output.
+- Keep code identifiers, comments, docstrings, and commit messages in English.
+- Use comments sparingly. Explain constraints and intent, not syntax.
+
+### Failure behavior
+
+| Dependency or operation | Required behavior |
+|---|---|
+| Mnemory recall or remember | Degrade safely without inventing memory |
+| Intaris evaluation | Fail closed |
+| Intaris event recording | Preserve durability and retry semantics |
+| LLM request | Use the configured retry and fallback policy |
+| Executor delivery | Reconcile delivery state before a retry that can duplicate effects |
+| Secret access | Fail closed |
+
+Use shared provider retry and normalized error facilities. Do not add a broad
+exception handler only to hide an unknown failure. Preserve intentional
+failure isolation for metrics, cleanup, and optional caches.
+
+## Configuration
+
+- Infrastructure configuration uses environment variables.
+- Application configuration uses the Cognis settings tables and API.
+- LLM providers and model routing use their dedicated database models.
+- Do not introduce a general application configuration file.
+- `cognis/config.py` must remain safe to import without I/O or environment
+  mutation.
+- See `docs/guide/settings.md`, `docs/guide/deployment.md`, and
+  `docs/specs/11-deployment.md` for the current configuration surface.
+
+## Build and Validation
+
+Use `uv` for Python dependency management and commands.
 
 ```bash
-# Install
-uv pip install -e ".[dev]"
-
-# Start ecosystem
-uvx mnemory                     # Memory layer on :8050
-uvx intaris                     # Guardrails on :8060
-uvx cognis-controller           # Controller on :8080
-
-# Or run directly
+uv sync --all-packages --all-extras
 uv run python -m cognis serve
 ```
 
-On first start, Cognis auto-creates `~/.cognis/` with ES256 keys, secrets
-encryption key, and SQLite database. A one-time setup URL (15 min TTL) is
-printed to stdout for creating the first admin user.
-
-### CLI admin commands
+Before each commit, run focused tests for the changed behavior and the required
+repository checks:
 
 ```bash
-cognis-controller admin create-user admin@example.com --name "Admin"
-cognis-controller admin reset-password admin@example.com
-cognis-controller admin api-key create admin@example.com --name "dev-key"
-cognis-controller admin api-key list admin@example.com
-cognis-controller status        # Health + provider status (via API)
-cognis-controller config init   # Print env var template
+uv run ruff check cognis/ packages/common/src/ packages/executor/src/ tests/
+uv run ruff format --check cognis/ packages/common/src/ packages/executor/src/ tests/
+MYPYPATH=packages/common/src:packages/executor/src uv run mypy --explicit-package-bases cognis/
+uv run --package cognis-common mypy packages/common/src/cognis
+MYPYPATH=.:packages/common/src:packages/executor/src uv run --package cognis-executor mypy --explicit-package-bases packages/executor/src/cognis
+make test
+cd ui && npm test -- --run && npm run check && npm run build:standalone
 ```
 
-`admin` commands access the database directly — no API auth needed, but
-requires local filesystem access to `COGNIS_DATA_DIR`.
+Do not weaken tests, add broad type suppressions, or reduce validation to make
+a change pass.
 
-### Tests
+### Additional validation by change type
 
-```bash
-# Unit tests (fast, no external services, default pytest run)
-uv run pytest tests/unit/ -v
+| Change | Additional validation |
+|---|---|
+| Mnemory or Intaris client contract | `uv run pytest tests/contract/ -v` with the services running |
+| Core orchestration, agent loop, context, or compaction | Relevant integration and E2E scenarios |
+| Database schema, locking, leases, or CAS | SQLite and PostgreSQL migration or integration tests |
+| Controller/common/executor package boundary | `COGNIS_RUN_ISOLATED_PACKAGE_TESTS=1 uv run pytest tests/unit/test_package_split.py -q` |
+| Chat v2 backend frames or projection | Backend Chat v2 tests and canonical event replay |
+| Frontend state or rendering | Unit checks, Svelte check, standalone build, and focused Playwright coverage |
+| Release | Unit, contract, integration, E2E, browser, and package checks |
 
-# Contract tests (require running Mnemory + Intaris with JWT auth)
-uv run pytest tests/contract/ -v
+### Chat v2
 
-# Integration tests (require full running Cognis stack)
-uv run pytest tests/integration/ -v
+The active chat protocol uses `chat_v2_frame`,
+`conversation_runtime_snapshot`, and REST snapshot/sync/backfill under
+`cognis/api/chat_v2/`. There is no legacy timeline transport.
 
-# All tests
-uv run pytest -v
-```
-
-### Contract tests
-
-Contract tests in `tests/contract/` validate the exact API shapes Cognis
-expects from Mnemory and Intaris. They run against real service instances
-and catch integration mismatches early.
-
-**When to run:**
-- After changing any provider implementation (`providers/memory/`, `providers/guardrails/`)
-- After updating Mnemory or Intaris
-- Before releases
-- In CI (requires running Mnemory + Intaris services)
-
-**Requirements:**
-- Mnemory running on `COGNIS_MNEMORY_URL` (default localhost:8050)
-- Intaris running on `COGNIS_INTARIS_URL` (default localhost:8060)
-- Both services configured with Cognis JWT public key for auth
-
-### Integration tests
-
-Integration tests exercise full user flows: chat → delegation → tool call →
-Intaris evaluation → Mnemory recall → result. They require a running Cognis
-instance with all providers connected.
-
-**When to run:**
-- After changing orchestration core (`core/`)
-- After changing the agent loop or delegation logic
-- After changing context assembly or compaction
-- Before releases
-
-### E2E tests (streaming chat timeline)
-
-E2E tests reproduce streaming-chat bugs deterministically using a mock LLM
-provider and a self-contained stack. See `docs/specs/33-e2e-test-harness.md`
-for the full design.
-
-**IMPORTANT — current chat protocol (Chat v2):** the backend no longer emits
-legacy rendering events (removed with the legacy timeline projection). The live protocol is `chat_v2_frame` (runtime overlay
-frames coalesced ~60 ms) + `conversation_runtime_snapshot` + REST
-snapshot/sync/backfill (`cognis/api/chat_v2/`). Production chat renders from
-`ChatV2Store` (`ui/src/lib/chat-v2/store.svelte.ts` over the pure
-`sync-engine.ts`). Session and task-step detail panels use the same scoped
- ChatV2 store; there is no second legacy timeline path.
-
-**Three test layers:**
-
-| Layer | Command | Speed | What it tests |
-|---|---|---|---|
-| L1 unit | `cd ui && npm test` | ms | ChatV2 sync-engine + invariant scenarios (`src/lib/chat-v2/`) |
-| L2 event capture/replay | `uv run pytest tests/e2e/ -v` then `make e2e-events-replay` | ~2 min + ms | Scoped ChatV2 backend frames and canonical client invariants |
-| L3 browser | `cd ui && npx playwright test e2e/` | ~1 min | Rendered DOM (spinner, no flicker, scroll stability) |
-
-**Chat v2 invariant suite (primary for ordering/grouping bugs):**
-`ui/src/lib/chat-v2/sync-engine.invariants.test.ts` replays frame sequences
-(streaming frames, completion frames, settle frames, canonical syncs,
-snapshot refreshes, cross-turn queued messages, reconnects) through the same
-pure functions the production store uses and asserts after every step:
-INV-NO-HANG, INV-NO-DUP, INV-STABLE-ORDER (relative order of visible items
-never flips), INV-FINAL-PRESENCE, INV-REFRESH-NO-DROP. Backend counterpart:
-`tests/unit/api/chat_v2/test_id_equivalence.py` asserts every runtime overlay
-item id is byte-identical to the canonical projector id for the same event —
-an id mismatch is the #1 source of streaming-vs-reload duplicates.
-
-**L2 feedback loop (canonical scoped ChatV2):**
+For ordering, identity, reconnect, or projection changes:
 
 ```bash
-# Step 1: Capture golden event streams from live stack (starts everything automatically)
 uv run pytest tests/e2e/ -v
-
-# Step 2: Run the canonical scoped ChatV2 invariant suite
 make e2e-events-replay
+cd ui && npx playwright test e2e/
 ```
 
-Step 1 starts: mock-llm (deterministic OpenAI-compatible server) + Mnemory +
-Intaris (`ANALYSIS_ENABLED=false`, no LLM needed) + Cognis, seeds a
-capability-off e2e agent (`memory_backend=none, guardrails_backend=none`),
-runs each scenario, and writes `tests/e2e/golden/<scenario>.jsonl`.
+Canonical client invariants live in
+`ui/src/lib/chat-v2/sync-engine.invariants.test.ts`. Backend runtime and
+canonical IDs must remain byte-identical. See
+`docs/specs/35-chat-v2-sync-architecture.md` and
+`docs/specs/33-e2e-test-harness.md`.
 
-The canonical ChatV2 invariant suite asserts no hangs or duplicates, stable
-ordering, final presence, refresh safety, and reconnect behavior against the
-same pure sync engine used by production.
+## Database Changes
 
-Chat v2 ordering contracts the fixes rely on: canonical sort keys are
-`lineage:seq:phase:kind_rank:local`; active-turn runtime items live in the
-`9998` sentinel band with per-item phases; carried (settled-but-unconfirmed)
-prior-turn items are rekeyed into the `9997` band so the next turn's items
-and new optimistic user messages sort after them; assistant phases advance
-once per tool call (`_bump_assistant_phase_for_tool`) and are persisted on
-assistant/thinking/tool events; tool grouping joins on turn + cycle +
-classification only (never phases or live-mutable status). Scroll has a
-single driver (ResizeObserver) for streaming growth.
+Cognis uses two schema evolution paths:
 
-**Scenario catalog** (`tests/e2e/scenarios/`):
-- `single-phase-stream` — baseline text streaming
-- `thinking-multiblock` — thinking segment with multiple blocks (id-stability bug)
-- `multiphase-thinking-tool-assistant` — thinking + multi-segment text
-- `tool-args-then-result` — multi-turn: text+tool_call → text (field-loss bug)
-- `rapid-tokens` — high-rate token stream (batching/dedup)
-- `coding-session-multiphase` — production-inspired: tool calls → text summary
-- `research-multiphase` — production-inspired: multiple searches → response
-- `tool-error-recovery` — production-inspired: multiple tool calls → recovery
-- `long-streaming-response` — sustained burst (rAF batching)
-- `thinking-then-tools-then-answer` — thinking + multi-turn + text
-- `prod-multiphase-workflow` — production-shaped: 3 LLM calls, phases 0→1→2, thinking
-- `reconnect-stale-thinking` — thinking + tools + text, then a post-turn reconnect snapshot
-  (INV-RECONNECT-NO-HANG)
+1. Idempotent bootstrap helpers in `cognis/bootstrap.py` run on startup.
+2. Reversible Alembic migrations in `cognis/store/migrations/versions/`
+   support formal upgrades and rollbacks.
 
-**L3 browser specs** (`ui/e2e/`, shared helpers in `ui/e2e/helpers.ts`):
-- `timeline.spec.ts` — spinner/phase/duplicate DOM assertions; `single-phase-stream` also
-  asserts the assistant message node is never unmounted mid-stream (flicker check).
-- `scroll-stability.spec.ts` — tail stays pinned during a streaming burst and a manual
-  scroll-up is preserved (Symptom 4). Uses `data-testid="timeline-viewport"` hooks.
+For an existing-table schema change:
 
-**Mock LLM multi-turn contract** (critical for multi-phase turns):
-- Each `turns` entry = one LLM call. `turn_index` = number of assistant messages in history.
-- Scenario resolved from the **first** user message (original trigger), not the last.
-- `finish_reason` is derived from the turn's last step:
-  - Last step is `tool_call` → `"tool_calls"` → agent executes tool, bumps phase, re-invokes LLM
-  - Last step is `text`/`thinking` → `"stop"` → turn complete
-- Without correct `finish_reason`, the agent loop never enters the multi-phase path.
+1. Add the Alembic migration.
+2. Add and register the matching bootstrap helper.
+3. Add a regression fixture with the previous schema.
+4. Run bootstrap twice and verify columns, indexes, constraints, and backfills.
+5. Test SQLite and PostgreSQL behavior.
 
-**Live WS frame recorder** (dev/debug):
-```javascript
-// Activate via URL: ?recordWs=1
-// Or from browser console:
-window.__cognisWsRecorder.start()
-window.__cognisWsRecorder.download()  // saves ws-recording-<timestamp>.jsonl
-```
-Place the downloaded JSONL in `tests/e2e/golden/` to replay as a golden test.
+Do not combine schema changes with query refactors.
 
-**CRITICAL — test coverage gap:** The golden replay tests only exercise the
-**client store** against a pre-captured, clean, mock-LLM stream. They do NOT
-cover: the 60ms coalescer, rAF batching, WS delivery/backpressure, real-LLM
-timing/ordering, or apply_patch/tool-output progress (mock never emits
-`tool_progress`). When a prod bug persists despite green tests, the first
-diagnostic step is to capture a **live WS recording** of the broken session
-and replay it through the golden store test. This is the only artifact that
-exercises the real coalescer+WS+real-LLM delivery layer. If frames are MISSING
-from the recording, the bug is server-side (dropped frame, guard, coalescer).
-If frames are PRESENT but mis-rendered, the bug is client-side (store/order).
+## Common Extension Procedures
 
-**Adding a new scenario** (reproduce → promote loop):
-1. Start the interactive e2e stack: `make e2e-up && make e2e-seed`
-2. Inject a scenario via the mock-llm control plane:
-   `curl -X POST http://localhost:8090/__mock/active -d '{"id":"my-scenario"}'`
-3. Reproduce the bug in the browser at `http://localhost:8080`
-4. Save the scenario YAML to `tests/e2e/scenarios/my-scenario.yaml`
-5. Run `uv run pytest tests/e2e/ -v` to capture the golden file
-6. Run `make e2e-events-replay` — it will fail if the bug is present in the
-   canonical ChatV2 sync engine
-7. Fix the code, re-run step 6 (fast, no stack needed)
-8. Re-run step 5 to update the captured event stream with the fixed behavior
+### Add a provider
 
-**Interactive debugging with Playwright MCP** (see `docs/specs/33-e2e-test-harness.md`):
-```bash
-make e2e-up && make e2e-seed   # Start deterministic stack
-# Attach @playwright/mcp to http://localhost:8080
-# Inject scenario: POST http://localhost:8090/__mock/active {"id":"..."}
-make e2e-down                  # Teardown
-```
+1. Define or extend the provider protocol.
+2. Implement the provider in its category package.
+3. Register it through the provider registry.
+4. Add configuration and health behavior.
+5. For remote providers, use the shared retry and circuit-breaker facilities
+   when the failure policy requires them.
+6. Add unit and contract coverage.
+7. Update the relevant specification.
 
-**Per-agent backend capabilities** (`AgentCapabilities`):
-- `memory_backend: "none"` — disables Mnemory recall/remember for this agent
-- `guardrails_backend: "none"` — disables Intaris evaluate/report_reasoning
-  (Intaris event store still used; all tools auto-approved including non-bypassable)
-- Defaults: `"mnemory"` and `"intaris"` (existing behavior unchanged)
-- System defaults: `COGNIS_DEFAULT_MEMORY_BACKEND` / `COGNIS_DEFAULT_GUARDRAILS_BACKEND`
-- Adding a new backend: create `cognis/providers/backends/{kind}/{id}.py`,
-  implement the Provider Protocol, decorate with `@register_backend(kind=..., id=...)`
+### Add an API operation
 
-**Mock LLM server** (`cognis/testing/mock_llm/`):
-- Implements OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`
-- Replays scenario scripts keyed by first-user-message trigger (not last message)
-- Multi-turn: `turn_index` = assistant message count in history; each turn is one LLM call
-- Control plane: `POST /__mock/scenario` (inject), `POST /__mock/active` (set active),
-  `GET /__mock/scenarios`, `GET /__mock/history`
-- Run standalone: `python -m cognis.testing.mock_llm --port 8090`
-- Thinking blocks: emit `reasoning_content` in the delta (not a custom field)
+1. Put transport-neutral behavior in its owning service.
+2. Add a thin route or protocol adapter.
+3. Add request and response models.
+4. Apply authentication and ownership checks.
+5. Add API contract and behavior tests.
+6. Update the API specification and user guide when applicable.
 
-### Linting
+### Add a tool
 
-```bash
-ruff check cognis/ tests/
-ruff format cognis/ tests/
-```
-
-### Type checking
-
-```bash
-mypy cognis/
-```
-
-### Database migrations
-
-Cognis uses **two complementary schema evolution mechanisms**:
-
-1. **Bootstrap helpers** (`cognis/bootstrap.py`) — idempotent `_ensure_*` functions that run on every startup via `run_schema_bootstrap()`. These use `ALTER TABLE ADD COLUMN` with column-existence checks. This is the **primary mechanism** that keeps the schema up to date automatically.
-
-2. **Alembic migrations** (`cognis/store/migrations/versions/`) — formal reversible migrations for CI, production rollbacks, and documentation. These are **not run automatically** on startup.
-
-**IMPORTANT: When adding or modifying columns on an existing table, you MUST do BOTH:**
-- Create an Alembic migration file in `cognis/store/migrations/versions/`
-- Add a corresponding `_ensure_*` function in `cognis/bootstrap.py` and register it in `run_schema_bootstrap()`
-- Add a regression test that creates the previous table shape, runs
-  `run_schema_bootstrap()` twice, and verifies columns, backfills, and indexes
-
-If you only create the Alembic migration, the schema change will NOT be applied automatically on startup — the app will crash with `UndefinedColumnError` until someone manually runs `alembic upgrade head`.
-
-```bash
-# Create a new migration
-uv run alembic -c cognis/store/migrations/alembic.ini revision --autogenerate -m "description"
-
-# Apply all migrations (not needed for normal startup — bootstrap handles it)
-uv run alembic -c cognis/store/migrations/alembic.ini upgrade head
-
-# Rollback one migration
-uv run alembic -c cognis/store/migrations/alembic.ini downgrade -1
-```
-
-## Code Conventions
-
-### Style
-
-- Python 3.12+ features (type unions with `|`, `type` statements where helpful)
-- `from __future__ import annotations` in all files
-- Type hints on all function signatures and return types
-- Docstrings on all public classes and methods
-- `logging` module for all output (never `print()`, except CLI user-facing output via Typer)
-- f-strings for string formatting
-- `async def` for all I/O-bound operations
-- Comments and identifiers exclusively in English
-
-### Async conventions
-
-- Use `asyncio` everywhere. No sync I/O in the controller.
-- Use `httpx.AsyncClient` for HTTP calls (not `requests`).
-- Use `asyncio.gather()` for independent concurrent operations.
-- Use `asyncio.Lock` for per-session serialization (not threading locks).
-- Use `asyncio.Event` for signaling (not polling loops).
-- Provider Protocol methods are all `async def`.
-
-### Error handling
-
-- API routes catch `ValueError` (→ 4xx) and `Exception` (→ 500)
-- Provider failures handled per the failure mode table:
-  - Mnemory: graceful degradation (continue without memory)
-  - Intaris evaluate: **fail-closed** (block tool execution)
-  - Intaris event recording: retry, then buffer
-  - LLM: retry with fallback model
-  - Executor: retry, then inform LLM
-  - Secrets: fail-closed
-- Internal errors logged with `logger.exception()` for stack traces
-- Circuit breaker on all provider calls (5 failures → OPEN → 30s → HALF_OPEN)
-- Exponential backoff retry on all provider HTTP calls via shared `providers/retry.py`
-- Never let raw exceptions propagate to WebSocket clients — always send structured error messages
-
-### Configuration
-
-- All infrastructure config via environment variables (no config files)
-- Application config stored in the `settings` DB table, managed via API/UI
-- LLM providers stored in `llm_providers` DB table
-- Model routing stored in `model_routing` DB table
-- `config.py` reads env vars with sensible defaults for local development
-- Auto-generated keys and DB in `~/.cognis/` (configurable via `COGNIS_DATA_DIR`)
-
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `COGNIS_DATA_DIR` | `~/.cognis` | Data directory (keys, DB, secrets key) |
-| `COGNIS_HOST` | `0.0.0.0` | Bind address |
-| `COGNIS_PORT` | `8080` | Port |
-| `COGNIS_MNEMORY_URL` | `http://localhost:8050` | Mnemory service URL |
-| `COGNIS_INTARIS_URL` | `http://localhost:8060` | Intaris service URL |
-| `DATABASE_URL` | `sqlite+aiosqlite:///~/.cognis/cognis.db` | Database URL |
-| `COGNIS_JWT_PRIVATE_KEY_PATH` | `~/.cognis/keys/private.pem` | JWT private key (auto-generated) |
-| `COGNIS_JWT_PUBLIC_KEY_PATH` | `~/.cognis/keys/public.pem` | JWT public key (auto-generated) |
-| `COGNIS_SECRETS_KEY_PATH` | `~/.cognis/secrets.key` | AES-256-GCM key (auto-generated) |
-| `COGNIS_LOG_LEVEL` | `info` | Log level |
-| `COGNIS_LOG_FORMAT` | `json` | Log format (json or text) |
-| `COGNIS_CORS_ORIGINS` | `http://localhost:5173` | CORS allowlist |
-| `COGNIS_LSP_ENABLED` | `true` | Enable LSP diagnostics after file edits |
-| `COGNIS_LSP_AUTO_INSTALL` | `true` | Auto-install missing language servers |
-| `COGNIS_LSP_DIAGNOSTICS_TIMEOUT_MS` | `10000` | Max wait for diagnostics (ms) |
-| `COGNIS_LSP_IDLE_TIMEOUT_SECONDS` | `600` | Kill idle LSP servers after (s) |
-| `COGNIS_LSP_MAX_CONCURRENT_SERVERS` | `8` | Max concurrent LSP server processes |
-| `COGNIS_ARTIFACT_BACKEND` | `filesystem` | Artifact store backend (`filesystem` or `s3`) |
-| `COGNIS_ARTIFACT_PATH` | `~/.cognis/artifacts` | Filesystem artifact base path |
-| `COGNIS_ARTIFACT_S3_ENDPOINT` | `http://localhost:9000` | S3/MinIO endpoint |
-| `COGNIS_ARTIFACT_S3_ACCESS_KEY` | — | S3 access key (required for s3) |
-| `COGNIS_ARTIFACT_S3_SECRET_KEY` | — | S3 secret key (required for s3) |
-| `COGNIS_ARTIFACT_S3_BUCKET` | `cognis-artifacts` | S3 bucket name |
-| `COGNIS_ARTIFACT_S3_REGION` | — | S3 region (optional) |
-| `COGNIS_ARTIFACT_MAX_SIZE_MB` | `50` | Max artifact size in MB |
-| `COGNIS_INITIAL_ADMIN_EMAIL` | — | Container/CI: auto-create admin on first start |
-| `COGNIS_INITIAL_ADMIN_PASSWORD` | — | Container/CI: admin password (cleared after use) |
-| `COGNIS_CONTROLLER_URL` | — | Executor: controller WebSocket URL (alternative to `--controller-url`) |
-| `COGNIS_EXECUTOR_TOKEN` | — | Executor: JWT auth token (alternative to `--token`) |
-| `COGNIS_EXECUTOR_WORKDIR` | `~` | Executor: default working directory for tool calls (alternative to `--workdir`) |
-| `COGNIS_EXECUTOR_INFERENCE_CHUNK_TIMEOUT_SECONDS` | `300` | Controller: max inter-chunk wait for executor-routed inference streams (dead-man's switch; executors forward provider liveness chunks) |
-| `COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED` | `false` | Attach explicit `prompt_cache_key` to ChatGPT/Codex Responses requests only when explicitly opted in. Per-provider `use_prompt_cache_key: true` enables it for a single provider. |
-| `CHATGPT_DEFAULT_INSTRUCTIONS` | suppressed by Cognis | LiteLLM reads this to override the Codex CLI default instructions block. Cognis suppresses it at startup to prevent the ~5 KB Codex prompt from being prepended to every request. Set a non-empty value in the environment before startup to override. |
-
-### Database
-
-- SQLAlchemy 2.x with async engine (`aiosqlite` for SQLite, `asyncpg` for PostgreSQL)
-- Pydantic models for domain logic, SQLAlchemy ORM models for persistence
-- Alembic for schema migrations (reversible, tested against both SQLite and PostgreSQL)
-- `JSONB` columns use dialect-aware handling: native JSONB on PostgreSQL, JSON (TEXT) on SQLite
-- Email as primary key in `users` table — all FKs reference `users(email)`
-- Intaris-derived state (event seq, compaction, intention) is NOT in the DB — it lives in session cache
-
-### Database tables (metadata only)
-
-| Table | Primary Key | Purpose |
-|---|---|---|
-| `users` | `email` | User accounts (email is user_id everywhere) |
-| `api_keys` | `key_id` | API keys for programmatic access |
-| `agents` | `agent_id` | Agent definitions (primary/secondary types, system flag) |
-| `agent_secondary_bindings` | `(primary_agent_id, secondary_agent_id)` | Junction table for primary→secondary agent bindings |
-| `agent_grants` | `grant_id` | User-to-user agent sharing grants (polymorphic grantee; user wired, group reserved) |
-| `conversations` | `conversation_id` | Conversation metadata |
-| `sessions` | `session_id` | Session metadata (NO event seq/compaction fields) |
-| `tasks` | `task_id` | Durable work items (kanban cards, queue items) |
-| `task_dependencies` | `(task_id, depends_on)` | DAG edges between tasks |
-| `step_runs` | `step_run_id` | Current workflow step execution state + attempt counter |
-| `deliverables` | `deliverable_id` | Typed step artifacts and final workflow outputs |
-| `workflows` | `workflow_id` | Portable workflow templates |
-| `schedules` | `schedule_id` | Cron-like task factory |
-| `settings` | `key` | System settings (replaces config file) |
-| `llm_providers` | `provider_id` | LLM provider configurations |
-| `model_routing` | `task_type` | Model routing policy |
-| `secrets` | `secret_id` | Encrypted secrets (AES-256-GCM) |
-| `executors` | `executor_id` | Executor configurations (type, labels, enabled tools, config) |
-| `notifications` | `notification_id` | Persistent notifications (escalations, gates, step questions) |
-| `channel_accounts` | `account_id` | Configured external messaging connections |
-| `channel_contacts` | `contact_id` | Verified external sender to Cognis user mappings |
-| `channel_pairing_requests` | `request_id` | Short-lived remote verification challenges |
-| `audit_log` | `log_id` | System-level audit events (NOT session content) |
-
-### Session cache
-
-Intaris-derived state is cached in-memory, NOT in the database:
-
-```python
-class SessionCache:
-    """L1 in-memory cache for Intaris-derived session state."""
-    events: list[IntarisEvent]       # Events since last compaction (append-only)
-    last_event_seq: int              # Monotonically increasing
-    last_compaction_seq: int         # Updated on compaction
-    last_compaction_summary: str     # Updated on compaction
-    intention: str | None            # Read-through at turn start
-    memory_instructions: str | None  # Cached for session lifetime; refreshed on repair signal
-    core_memories: str | None        # Cached for session lifetime; refreshed on repair signal
-```
-
-- **Events are immutable in Intaris object store** — safe to cache without invalidation
-- **Incremental fetch**: only `after_seq=cached_last_seq` on warm cache
-- **Controller-triggered invalidation**: controller knows when compaction happens
-- **Lost on restart**: rebuilt from Intaris on first session access (cold-start penalty ~1-2s)
-
-### JWT authentication
-
-- Algorithm: ES256 (ECDSA P-256)
-- Keys auto-generated in `COGNIS_DATA_DIR/keys/` on first start
-- JWKS endpoint at `GET /.well-known/jwks.json`
-- User JWT: `sub` = email, `aud` = `["cognis"]`, `role` = user role
-- Service JWT (to Mnemory/Intaris): `sub` = user email, `aud` = `["mnemory", "intaris"]`
-- Executor JWT: `sub` = executor_id, `aud` = `["cognis-executor"]`, `typ` = `"executor"`. Remote executor tokens do not expire and are revoked by bumping the executor's `token_version`. Short-lived (5 min) tokens are still used for subprocess executors.
-- Password hashing: argon2id (`time_cost=3, memory_cost=65536, parallelism=4`)
-
-### Content redaction
-
-Logs and metrics MUST NOT contain:
-- Message content (user or assistant)
-- Tool call arguments or results
-- Memory content (recall or remember payloads)
-- Secret values
-- Raw LLM prompts or completions
-
-Logs MAY contain: IDs, tool names (not args), model names, token counts,
-latencies, status codes, error categories, decision outcomes.
-
-This is enforced by a logging allowlist, not by developer discipline.
-
-### Adding a new provider
-
-1. Define the Protocol in `providers/<category>/protocol.py`
-2. Implement the provider in `providers/<category>/<name>.py`
-3. Register in `providers/registry.py`
-4. Add configuration fields (env vars for infrastructure, DB settings for app config)
-5. Add health check method
-6. Add circuit breaker wrapping
-7. Write contract tests in `tests/contract/`
-8. Update this AGENTS.md
-
-### Adding a new API endpoint
-
-1. Add the route in `api/routes/<resource>.py`
-2. Add Pydantic request/response models in `api/models.py`
-3. Add auth middleware requirements (JWT required, admin-only, etc.)
-4. Add the endpoint to `docs/specs/10-api-spec.md`
-5. Write unit tests
-6. Ensure no content leaks into logs (use the redaction allowlist)
-
-### Adding a new tool
-
-1. Define the tool in `tools/builtin/<category>.py`
-2. Register in `tools/registry.py`
-3. Set `read_only`, `non_bypassable`, `timeout_seconds` appropriately
-4. Tool results are wrapped as untrusted content (XML tags) before LLM injection
-5. Large outputs are truncated to `max_result_size` with notice
-6. Write unit tests for the tool logic
-7. Update `docs/specs/06-tool-system.md`
-
-### Database migrations
-
-- **Every schema change requires BOTH an Alembic migration AND a bootstrap `_ensure_*` function** — see the "Database migrations" section under "Build / Run / Test" for details
-- Alembic migrations live in `cognis/store/migrations/versions/`
-- Bootstrap helpers live in `cognis/bootstrap.py` → `run_schema_bootstrap()`
-- Every Alembic migration must be reversible (`upgrade()` and `downgrade()`)
-- Bootstrap `_ensure_*` functions must be idempotent (check column existence before ALTER)
-- Test against both SQLite and PostgreSQL
-- Never add `last_event_seq`, `last_compaction_*`, or `intention` columns to the `sessions` table — these belong in the session cache
-
-## Data Ownership
-
-| Domain | Owner | Storage |
-|---|---|---|
-| Users, agents, secrets, system config | **Cognis** | Cognis DB (SQLite / PostgreSQL) |
-| Conversation & session metadata | **Cognis** | Cognis DB |
-| Session content (messages, tool calls, events) | **Intaris** | Intaris event store (S3 / filesystem) |
-| Safety decisions, intention, behavioral analysis | **Intaris** | Intaris DB + event store |
-| Persistent memory (facts, personality, recall) | **Mnemory** | Mnemory (Qdrant + artifacts) |
-
-**Cognis DB is metadata only.** Session content lives in Intaris. Persistent
-memory lives in Mnemory. Cognis never duplicates their data — it uses
-references and caches.
+1. Define the tool in its owning controller or executor package.
+2. Register it through the canonical registry.
+3. Set read-only, bypass, timeout, and side-effect metadata correctly.
+4. Preserve the untrusted-result boundary.
+5. Add focused tests and update the tool-system specification.
 
 ## Specifications
 
-Full architecture and design specifications are in `docs/specs/`:
+Use `docs/specs/README.md` as the specification index. Important references
+include:
 
-| File | Content |
-|---|---|
-| `00-vision.md` | Project vision, design principles, phased delivery |
-| `01-architecture.md` | System architecture, DB schema, session cache, package structure |
-| `02-agent-model.md` | Agent definitions, personality, delegation, skills |
-| `03-session-model.md` | Session model, turn lifecycle, context assembly, recovery, retention |
-| `04-controller-executor.md` | Controller-executor separation, JSON-RPC protocol |
-| `05-integrations.md` | Mnemory/Intaris/LLM/tool contracts with verified APIs |
-| `06-tool-system.md` | Tool routing, permissions, MCP, trust model |
-| `07-security-identity.md` | JWT auth, bootstrap, cross-service access, threat model |
-| `08-federation.md` | Future federation design (A2A, DID) |
-| `09-ui-ux.md` | SvelteKit UI, Typer CLI, WebSocket protocol |
-| `10-api-spec.md` | REST + WebSocket API surface |
-| `11-deployment.md` | Local/Docker/K8s deployment, env var reference |
-| `12-mvp-roadmap.md` | 8-week implementation plan |
-| `13-nfr-operations.md` | NFRs, SLOs, metrics, degraded modes, retention |
-| `14-workflow-engine.md` | Workflow templates, step types, completion protocol, evaluation, gates |
-| `15-browser-credentials.md` | Browser automation, credential records, auth request flows, and cloud-native executor behavior |
-| `21-workflow-deliverables.md` | Typed deliverables, `write_deliverable` tool, step_complete gate, once-only channel delivery |
-| `22-step-profiles.md` | Step profiles (`unrestricted`/`research`/`coding`), tool classification, per-step overrides |
-| `28-agent-sharing.md` | User-to-user agent sharing, `agent_grants`, two-headed runtime identity, Mnemory `(user, owner)` keying, no admin bypass for user-owned resources |
-| `30-projects-and-revisions.md` | Projects with multi-source repos and `project_grants`, project-aware tasks/schedules/conversations, path-touch project context injection, step-completion metadata contracts, conditional gate DSL, task comments with intent, and human-as-evaluator revision flow |
-| `31-voice-mode.md` | Voice mode (TTS/STT/conversation): `LLMProvider.synthesize()`, `text_to_speech` routing slot, per-agent voice with system fallback, web microphone with iMessage-style record-preview-send, speaker button on assistant messages with cached playback, sentence-buffered TTS streaming, and bidirectional conversation-mode overlay |
-| `32-conversation-search.md` | Conversation search: Intaris-owned hybrid index (lexical Tier 1 mandatory: PG `tsvector` + `pg_trgm` / SQLite FTS5 trigram; embedding Tier 2 optional via pgvector or Qdrant URL/local-mode), `INTARIS_SEARCH_ENABLED` feature flag, Cognis proxy + join with conversation metadata, Cmd+F in-conversation search with magnifier and client-first/server-fallback, sidebar promote-to-search with explicit submit, three LLM tools (`list_conversations`, `search_conversations`, `read_conversation_messages` with anchor-based pagination), `conversation_id` in runtime metadata, strict user scoping with no admin bypass and no agent-grant expansion |
+- `01-architecture.md`
+- `03-session-model.md`
+- `04-controller-executor.md`
+- `06-tool-system.md`
+- `07-security-identity.md`
+- `10-api-spec.md`
+- `13-nfr-operations.md`
+- `14-workflow-engine.md`
+- `18-runtime-contract.md`
+- `28-agent-sharing.md`
+- `30-projects-and-revisions.md`
+- `33-orchestration-routing.md`
+- `34-deterministic-workflows.md`
+- `35-chat-v2-sync-architecture.md`
 
-## Diagram Style
+Public diagrams must match the existing design language and retain editable
+sources. Diagrams must clarify boundaries and ownership rather than decorate.
 
-Public architecture diagrams in `docs/assets/images/` use the Cognis launch dark style. Keep matching editable sources in `docs/assets/diagrams/`.
+## Git and Delivery
 
-- Canvas: dark background `#020617`, rounded outer frame when useful.
-- Main panels: `#0f172a` or `#111827` with slate strokes `#334155` / `#475569`.
-- Primary/controller elements: cyan stroke `#38bdf8`, background `#082f49`.
-- Memory elements: green stroke `#10b981`, background `#052e2b`.
-- Guardrails/audit elements: purple stroke `#8b5cf6`, background `#22134d`.
-- Executor/runtime elements: amber stroke `#f59e0b`, background `#3b2603`.
-- Risk/denied/error elements: rose stroke `#fb7185`, background `#4c0519`.
-- User/channel/neutral elements: slate stroke `#64748b`, background `#111827`.
-- Text: primary `#f8fafc`, muted `#94a3b8`, monospace/details `#bae6fd`.
-- Typography: Helvetica for labels, monospace only for protocol/tool names. Use clear hierarchy: 28px title, 20px section heading, 14px labels, 12-13px details.
-- Shapes: rounded rectangles, clean SVG-like lines, `roughness: 0`; avoid hand-drawn styling.
-- Arrows: cyan for primary flow, slate dashed for retry/revision/secondary flows. Always label non-obvious edges.
-- Tone: diagrams should explain boundaries and ownership, not decorate. Prefer fewer boxes with stronger labels over dense exhaustive maps.
-
-**Read the relevant spec before making changes in that area.**
-
-## Important Rules
-
-- **Never execute tool calls in the controller.** All tool execution goes through an executor, even in-process.
-- **Never store Intaris-derived state in Cognis DB.** Use the session cache.
-- **Workflow deliverables are the canonical step artifacts.** In workflow steps, `write_deliverable` is the authoritative user-facing artifact for evaluation, UI, and final workflow output. Free-text assistant messages in workflow steps are reasoning/progress only. Exception: `system:direct` keeps normal chat-message replies.
-- **Never log message content, tool args, memory content, or secrets.**
-- **Never use sync I/O in the controller.** Everything is async.
-- **Never bypass Intaris for non-bypassable tools.** Even `"*": "allow"` permissions don't skip guardrails for these.
-- **No admin bypass for user-owned resources.** The `admin` role grants authority over system settings, providers, users, and audit — not over other users' agents, conversations, tasks, schedules, memories, or secrets. Access to a user-owned agent is through ownership or an explicit `agent_grants` grant, never through role alone. See `docs/specs/28-agent-sharing.md`.
-- **Never push to main/master without explicit approval.**
-- **Always use `git add -u`** (tracked files only), never `git add -A`.
-- **Always follow Conventional Commits** for commit messages.
-
-## Contract and Invariant Hygiene
-
-Stage 20+ refactors exposed several patterns that cost us debugging
-cycles. When extending the controller, API, or workflow engine, follow
-these rules:
-
-- **One source of truth for controller tool schemas.** Controller-injected
-  tools (``step_todo_write``, ``step_complete``, ``step_request_questions``,
-  etc.) must pull their JSON schema from
-  ``cognis/tools/builtin/workflow.py``. Never hand-roll a second schema
-  in the agent loop — the LLM-facing and validator-facing schemas must
-  be byte-identical.
-- **Validate controller tool arguments.** Every controller-intercepted
-  tool handler must call ``validate_tool_arguments`` from
-  ``cognis.core.tool_arguments`` before mutating state. On failure,
-  emit a synthetic ``is_error=True`` tool result so the LLM can
-  self-correct; never silently accept ``{"_raw": "..."}``.
-- **API response shapes must round-trip every producer.** Add a
-  coverage test in ``tests/unit/test_api_contracts.py`` for any new
-  response model. The UI TypeScript interface in
-  ``ui/src/lib/types/api.ts`` is enforced against the Pydantic model by
-  ``tests/unit/test_ui_contract_sync.py``.
-- **Lifecycle invariants belong in ``cognis.core.invariants``.** If a
-  transition can leak persistent state when a failure path skips it,
-  add a checker + reconciler there. The startup sequence and the
-  ``/api/v1/system/reconcile`` admin endpoint will pick it up
-  automatically.
-- **Never clean up step sessions on pause.** ``_cleanup_step_sessions``
-  must only run when ``task.status`` is terminal. Pausing the task
-  leaves the step session in place so it can resume with its pending
-  tool-call context.
+- Follow the active coding skill for worktree, review, and commit discipline.
+- Never push to `main` or `master` without explicit approval.
+- Stage tracked changes with `git add -u`.
+- Add new task-owned files by explicit path. Never use `git add -A`.
+- Use Conventional Commits unless the user requests another repository
+  convention.
+- Commit only task-owned changes.

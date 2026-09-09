@@ -36,7 +36,7 @@ test.describe('Stage 41 decision-first Task Cockpit', () => {
     await chatTab.focus();
     await page.keyboard.press('ArrowRight');
     await expect(workTab).toBeFocused();
-    await expect(page.getByRole('tabpanel')).toHaveAttribute('id', 'task-agent-panel-work');
+    await expect(page.locator('#task-agent-panel-work')).toBeVisible();
 
     await page.getByRole('button', { name: 'Expand agent to full screen' }).click();
     await expect(page.getByTestId('task-agent-dock')).toHaveAttribute('aria-modal', 'true');
@@ -102,7 +102,10 @@ test.describe('Stage 41 decision-first Task Cockpit', () => {
 
     fixture.setStatus('completed');
     await page.reload();
-    await expect(page.getByTestId('task-final-result')).toContainText('Release approved');
+    const result = page.getByTestId('task-final-result');
+    await expect(result).toContainText('Release decision');
+    await result.getByRole('button', { name: 'Expand document' }).click();
+    await expect(result).toContainText('Release approved');
     await expect(page.getByText('This task has not produced a final result yet.')).toHaveCount(0);
   });
 
@@ -116,7 +119,7 @@ test.describe('Stage 41 decision-first Task Cockpit', () => {
     const box = await launcher.boundingBox();
     expect(box?.width).toBeGreaterThanOrEqual(44);
     expect(box?.height).toBeGreaterThanOrEqual(44);
-    await page.keyboard.press('a');
+    await launcher.click();
     await expect(page.getByTestId('task-agent-dock')).toBeVisible();
     await expect(page.getByTestId('task-agent-dock')).toHaveCSS('width', '390px');
     await expect(page.getByTestId('task-agent-dock')).toHaveAttribute('aria-modal', 'true');

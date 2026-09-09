@@ -80,6 +80,8 @@ VISIBLE_LIFECYCLE_EVENTS: frozenset[str] = frozenset(
         "assistant_deliverable",
         "turn_error",
         "user_interaction_resolved",
+        "session_compaction_finished",
+        "session_recovered",
     }
 )
 _CANCELLED_TURN_ERROR_CODES: frozenset[str] = frozenset(
@@ -133,6 +135,9 @@ def normalize_session_events(
 
         kind = _event_kind(raw_event)
         data = dict(raw_event.data)
+        visible_workflow_content = _visible_workflow_prompt_content(data)
+        if visible_workflow_content is not None:
+            data["content"] = visible_workflow_content
         source_ref = SourceRef(
             store=raw_event.store_id,
             session_id=raw_event.session_id,
@@ -179,10 +184,59 @@ def _should_skip_event(raw_event: RawSessionEvent, *, visible_lanes: frozenset[s
         role = str(raw_event.data.get("role") or "").strip().lower()
         if role == "system":
             return True
+    if raw_event.type == "user_message" and _is_legacy_internal_workflow_prompt(raw_event.data):
+        return True
     if raw_event.lane not in visible_lanes:
         return True
     prompt_visibility = (raw_event.prompt_visibility or "").strip().lower()
+    if raw_event.type == "user_message" and _is_delegation_input(raw_event.data):
+        return False
+    if raw_event.type == "user_message" and _visible_workflow_prompt_content(raw_event.data):
+        return False
     return prompt_visibility in HIDDEN_PROMPT_VISIBILITIES
+
+
+def _is_delegation_input(data: dict[str, Any]) -> bool:
+    """Recognize caller-authored delegation input, including legacy hidden events."""
+
+    if data.get("source") == "delegation_input":
+        return True
+    provenance = data.get("prompt_provenance")
+    return isinstance(provenance, dict) and provenance.get("kind") == "delegation_input"
+
+
+def _visible_workflow_prompt_content(data: dict[str, Any]) -> str | None:
+    """Return the user-authored part of an internal workflow prompt."""
+
+    provenance = data.get("prompt_provenance")
+    content = data.get("user_visible_content")
+    if (
+        isinstance(provenance, dict)
+        and provenance.get("kind") == "internal_workflow_prompt"
+        and isinstance(content, str)
+        and content.strip()
+    ):
+        return content
+    return None
+
+
+def _is_legacy_internal_workflow_prompt(data: dict[str, Any]) -> bool:
+    """Hide only proven controller envelopes from events written before visibility typing."""
+
+    content = str(data.get("content") or "").strip()
+    if not (
+        content.startswith('<workflow_prompt_block kind="user_task_contract" ')
+        and content.endswith("</workflow_prompt_block>")
+    ):
+        return False
+    provenance = data.get("prompt_provenance")
+    if isinstance(provenance, dict):
+        return provenance.get("kind") == "internal_workflow_prompt" and any(
+            provenance.get(key) for key in ("task_id", "step_run_id", "workflow_id")
+        )
+    return data.get("source") == "workflow_prompt_contract" and any(
+        data.get(key) for key in ("task_id", "step_run_id", "workflow_id")
+    )
 
 
 def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
@@ -241,6 +295,10 @@ def _event_kind(raw_event: RawSessionEvent) -> NormalizedEventKind:
             return "error"
         if lifecycle_event == "user_interaction_resolved":
             return "user_interaction"
+        if lifecycle_event == "session_compaction_finished":
+            return "compaction"
+        if lifecycle_event == "session_recovered":
+            return "notice"
         return "unknown"
 
     if event_type == "evaluation":

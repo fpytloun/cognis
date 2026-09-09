@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import os
 import time
 import uuid
@@ -11,6 +13,43 @@ from pathlib import Path
 import httpx
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+
+
+@pytest.fixture(autouse=True)
+def preserve_logging_state() -> Iterator[None]:
+    """Prevent Alembic fileConfig and app startup from leaking logger state."""
+    manager = logging.Logger.manager
+    logger_dict = dict(manager.loggerDict)
+    loggers = [logging.getLogger()]
+    loggers.extend(
+        logger for logger in manager.loggerDict.values() if isinstance(logger, logging.Logger)
+    )
+    state = {
+        logger: (
+            logger.disabled,
+            logger.level,
+            list(logger.handlers),
+            logger.propagate,
+        )
+        for logger in loggers
+    }
+    try:
+        yield
+    finally:
+        for logger in manager.loggerDict.values():
+            if isinstance(logger, logging.Logger) and logger not in state:
+                logger.disabled = False
+                logger.setLevel(logging.NOTSET)
+                logger.handlers.clear()
+                logger.propagate = True
+        for logger, (disabled, level, handlers, propagate) in state.items():
+            logger.disabled = disabled
+            logger.setLevel(level)
+            logger.handlers[:] = handlers
+            logger.propagate = propagate
+        manager.loggerDict.clear()
+        manager.loggerDict.update(logger_dict)
 
 
 def _healthcheck(url: str) -> None:
@@ -79,16 +118,33 @@ def make_service_jwt(
         expires_in_seconds: int = 3600,
     ) -> str:
         now = datetime.now(UTC)
+        actual_subject = subject or contract_user_email
         payload: dict[str, object] = {
-            "sub": subject or contract_user_email,
+            "sub": actual_subject,
             "iss": "cognis",
             "aud": [audience],
+            "typ": "service",
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(seconds=expires_in_seconds)).timestamp()),
         }
         if agent_id is not None:
             payload["agent_id"] = agent_id
-        return jwt.encode(payload, jwt_private_key, algorithm="ES256")
+            payload["agent_owner_email"] = actual_subject
+        private_key = serialization.load_pem_private_key(
+            jwt_private_key.encode(),
+            password=None,
+        )
+        public_key = private_key.public_key().public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        kid = hashlib.sha256(public_key).hexdigest()[:16]
+        return jwt.encode(
+            payload,
+            jwt_private_key,
+            algorithm="ES256",
+            headers={"kid": kid},
+        )
 
     return _make_service_jwt
 

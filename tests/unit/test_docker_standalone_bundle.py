@@ -36,15 +36,14 @@ def test_ui_build_stage_builds_the_standalone_bundle() -> None:
 
 def test_runtime_stage_copies_the_standalone_bundle_to_the_expected_path() -> None:
     text = _dockerfile_text()
-    assert "COPY --from=ui-build /app/ui/standalone-build ./ui/standalone-build" in text, (
-        "Runtime stage must copy the standalone bundle to ./ui/standalone-build "
-        "(WORKDIR /app), matching cognis.ui_assets.resolve_standalone_build_dir()."
+    assert "COPY --from=ui-build /src/ui/standalone-build ./ui/standalone-build" in text, (
+        "The wheel build stage must receive the standalone bundle for packaging."
     )
 
 
 def test_standalone_build_ordering_is_after_the_regular_ui_build() -> None:
     text = _dockerfile_text()
-    regular_build_index = text.index("npm run build\n")
+    regular_build_index = text.index("npm run build &&")
     standalone_build_index = text.index("npm run build:standalone")
     assert regular_build_index < standalone_build_index
 

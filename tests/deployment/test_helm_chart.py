@@ -79,6 +79,10 @@ def test_ha_renders_one_public_and_one_headless_service() -> None:
     services = [resource for resource in resources if resource.get("kind") == "Service"]
     assert len(services) == 2
     assert sum(service["spec"].get("clusterIP") == "None" for service in services) == 1
+    public = next(service for service in services if service["spec"].get("clusterIP") != "None")
+    internal = next(service for service in services if service["spec"].get("clusterIP") == "None")
+    assert "publishNotReadyAddresses" not in public["spec"]
+    assert internal["spec"]["publishNotReadyAddresses"] is True
     assert len([resource for resource in resources if resource.get("kind") == "Ingress"]) == 1
 
 
@@ -108,7 +112,8 @@ def test_ha_controller_rollout_and_runtime_contract() -> None:
     assert pod_spec["serviceAccountName"] == "default"
     assert pod_spec["terminationGracePeriodSeconds"] == 75
     assert pod_spec["topologySpreadConstraints"]
-    _one(resources, "PodDisruptionBudget")
+    pdb = _one(resources, "PodDisruptionBudget")
+    assert pdb["spec"]["minAvailable"] == 1
     container = pod_spec["containers"][0]
     assert container["startupProbe"]["httpGet"]["path"] == "/api/livez"
     assert container["readinessProbe"]["httpGet"]["path"] == "/api/readyz"
@@ -130,11 +135,47 @@ def test_ha_controller_rollout_and_runtime_contract() -> None:
     assert env["COGNIS_EVENT_CACHE_COMPRESSION_ENABLED"]["value"] == "true"
     assert env["COGNIS_EVENT_CACHE_COMPRESSION_THRESHOLD_BYTES"]["value"] == "65536"
     assert env["COGNIS_EVENT_CACHE_MAX_VALUE_BYTES"]["value"] == "2097152"
+    assert env["COGNIS_TRUSTED_EVIDENCE_ENABLED"]["value"] == "false"
+    assert env["COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST"]["value"] == ""
+    assert env["COGNIS_TRUSTED_EVIDENCE_MAX_ATTEMPTS"]["value"] == "8"
+    assert env["COGNIS_TRUSTED_EVIDENCE_MAX_AGE_SECONDS"]["value"] == "3600"
     data_volume = next(volume for volume in pod_spec["volumes"] if volume["name"] == "data")
     assert data_volume["emptyDir"] == {}
     assert container["volumeMounts"][0] == {"name": "data", "mountPath": "/data"}
     crypto_volume = next(volume for volume in pod_spec["volumes"] if volume["name"] == "crypto")
     assert crypto_volume["secret"]["defaultMode"] == 0o440
+
+
+def test_trusted_evidence_allowlist_uses_optional_secret_reference() -> None:
+    result = _helm(
+        "template",
+        "cognis",
+        str(CHART),
+        "--namespace",
+        "cognis",
+        "-f",
+        str(EXAMPLES / "values-ha.yaml"),
+        "--set",
+        "trustedEvidence.enabled=true",
+        "--set",
+        "trustedEvidence.ownerAllowlistSecret=cognis-policy",
+        "--set",
+        "trustedEvidence.ownerAllowlistSecretKey=canary-owners",
+    )
+    resources = [item for item in yaml.safe_load_all(result.stdout) if isinstance(item, dict)]
+    statefulset = _one(resources, "StatefulSet")
+    env = {
+        item["name"]: item
+        for item in statefulset["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+
+    assert env["COGNIS_TRUSTED_EVIDENCE_ENABLED"]["value"] == "true"
+    assert env["COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST"]["valueFrom"] == {
+        "secretKeyRef": {
+            "name": "cognis-policy",
+            "key": "canary-owners",
+        }
+    }
 
 
 def test_ha_migration_job_is_preinstall_preupgrade_hook() -> None:

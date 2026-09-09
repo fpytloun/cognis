@@ -125,7 +125,9 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
 
         default_response = client.get("/api/v1/user-preferences", headers=headers)
         assert default_response.status_code == 200
+        assert default_response.json()["display"]["dashboard_workspace_windows"] is True
         assert default_response.json()["chat"] == {
+            "enter_to_send": True,
             "show_thinking_blocks": False,
             "group_tool_calls": True,
             "keep_assistant_messages_separate": False,
@@ -133,8 +135,13 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
         }
 
         payload = {
-            "display": {"theme": "system", "language": "cs-CZ"},
+            "display": {
+                "theme": "system",
+                "language": "cs-CZ",
+                "dashboard_workspace_windows": True,
+            },
             "chat": {
+                "enter_to_send": False,
                 "show_thinking_blocks": True,
                 "group_tool_calls": True,
                 "keep_assistant_messages_separate": True,
@@ -161,6 +168,7 @@ def test_user_preferences_reject_invalid_language(monkeypatch: object, tmp_path:
             json={
                 "display": {"theme": "system", "language": "../bad"},
                 "chat": {
+                    "enter_to_send": True,
                     "show_thinking_blocks": True,
                     "group_tool_calls": True,
                     "show_internal_tool_calls": False,
@@ -196,6 +204,8 @@ def test_user_preferences_adds_default_for_legacy_persisted_state(
         )
 
         assert response.status_code == 200
+        assert response.json()["display"]["dashboard_workspace_windows"] is True
+        assert response.json()["chat"]["enter_to_send"] is True
         assert response.json()["chat"]["keep_assistant_messages_separate"] is False
 
 

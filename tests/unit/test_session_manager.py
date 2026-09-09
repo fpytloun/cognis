@@ -476,7 +476,7 @@ async def test_seed_rotated_tail_events_batches_large_event_sets(tmp_path) -> No
     await engine.dispose()
 
 
-async def _session_factory(tmp_path) -> object:
+async def _session_factory(tmp_path, *, capabilities: dict | None = None) -> object:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'cognis.db'}")
     session_factory = create_session_factory(engine)
     from cognis.bootstrap import run_schema_bootstrap
@@ -491,10 +491,28 @@ async def _session_factory(tmp_path) -> object:
                 owner_email="user@example.com",
                 name="Agent One",
                 description="Helpful assistant",
+                capabilities=capabilities,
             )
         )
         await session.commit()
     return engine, session_factory
+
+
+@pytest.mark.asyncio
+async def test_require_agent_preserves_capabilities(tmp_path) -> None:
+    engine, session_factory = await _session_factory(
+        tmp_path,
+        capabilities={"guardrails_backend": "none"},
+    )
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+
+    async with session_factory() as session:
+        agent = await manager._require_agent(session, "agent-1")
+
+    assert agent.capabilities.guardrails_backend == "none"
+    assert agent.capabilities.guardrails_enabled is False
+
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1054,6 +1072,53 @@ async def test_session_manager_recovery_uses_updated_at_not_started_at(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_session_manager_recovery_commits_when_intaris_rejects_notice(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _NonAppendingGuardrails()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    now = datetime.now(UTC)
+    async with session_factory() as session:
+        session.add(
+            Conversation(
+                conversation_id="conv-recovery-rejected-notice",
+                user_email="user@example.com",
+                agent_id="agent-1",
+                context_type="web",
+            )
+        )
+        session.add(
+            Session(
+                session_id="stale-rejected-notice",
+                conversation_id="conv-recovery-rejected-notice",
+                user_email="user@example.com",
+                agent_id="agent-1",
+                status="active",
+                started_at=now - timedelta(hours=1),
+                updated_at=now - timedelta(minutes=20),
+            )
+        )
+        await session.commit()
+
+    recovered_ids = await manager.recover_stale_sessions(stale_after_seconds=300)
+
+    assert recovered_ids == ["stale-rejected-notice"]
+    assert providers.guardrails.recorded_events
+    target_session_id, _, idempotency_key = providers.guardrails.recorded_events[0]
+    assert target_session_id == "stale-rejected-notice"
+    assert idempotency_key is not None
+    assert idempotency_key.startswith(f"{target_session_id}:")
+    async with session_factory() as session:
+        recovered = await session.get(Session, "stale-rejected-notice")
+        assert recovered is not None
+        assert recovered.status == "idle"
+        assert recovered.idle_since is not None
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     providers = _Providers()
@@ -1171,9 +1236,25 @@ async def test_rotate_session_transition_matrix(
     async with session_factory() as db:
         await replace_conversation_todos(db, conversation.conversation_id, todos)
         await replace_session_todos(db, root_session.session_id, todos)
+        root_row = await db.get(Session, root_session.session_id)
+        assert root_row is not None
+        root_row.model_override = "selected-model"
+        root_row.model_override_provider_id = "selected-provider"
+        root_row.reasoning_effort_override = "high"
+        root_row.fast_mode_override = False
+        root_row.runtime_override_revision = 4
         await db.commit()
 
     tail = [SimpleNamespace(seq=2, type="user_message", data={"content": "recent"})]
+    root_session = root_session.model_copy(
+        update={
+            "model_override": "selected-model",
+            "model_override_provider_id": "selected-provider",
+            "reasoning_effort_override": "high",
+            "fast_mode_override": False,
+            "runtime_override_revision": 4,
+        }
+    )
     successor = await manager.rotate_session(
         conversation_id=conversation.conversation_id,
         current_session=root_session,
@@ -1185,6 +1266,11 @@ async def test_rotate_session_transition_matrix(
     )
 
     assert (successor.activity_scope_id == root_session.activity_scope_id) is preserves_scope
+    preserves_overrides = transition is SessionTransition.COMPACT
+    assert (successor.model_override == "selected-model") is preserves_overrides
+    assert (successor.reasoning_effort_override == "high") is preserves_overrides
+    assert (successor.fast_mode_override is False) is preserves_overrides
+    assert successor.runtime_override_revision == (4 if preserves_overrides else 0)
     async with session_factory() as db:
         assert bool(await list_conversation_todos(db, conversation.conversation_id)) is (
             preserves_todos
@@ -1242,6 +1328,31 @@ async def test_rotate_child_preserves_lane_identity_and_root_visibility(tmp_path
     )
 
     async with session_factory() as db:
+        db.add(User(email="other@example.com", name="Other", password_hash="x", role="user"))
+        await db.flush()
+        unrelated_sibling = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root_session.session_id,
+            source_session_id=second_successor.session_id,
+            delegation_mode="execute",
+            delegation_task="Implement the fix",
+            activity_scope_id=child.activity_scope_id,
+        )
+        cross_owner_successor = await create_session(
+            db,
+            conversation.conversation_id,
+            "other@example.com",
+            "agent-1",
+            parent_session_id=root_session.session_id,
+            previous_session_id=second_successor.session_id,
+            delegation_mode="execute",
+            delegation_task="Implement the fix",
+            activity_scope_id=child.activity_scope_id,
+        )
+        await db.commit()
         conv = await db.get(Conversation, conversation.conversation_id)
         first_row = await db.get(Session, first_successor.session_id)
         second_row = await db.get(Session, second_successor.session_id)
@@ -1252,6 +1363,12 @@ async def test_rotate_child_preserves_lane_identity_and_root_visibility(tmp_path
         )
         child_chain, child_truncated = await get_child_session_continuation_chain(
             db, child.session_id
+        )
+        successor_chain, successor_truncated = await get_child_session_continuation_chain(
+            db, second_successor.session_id
+        )
+        bounded_chain, bounded_truncated = await get_child_session_continuation_chain(
+            db, second_successor.session_id, max_depth=2
         )
 
     assert conv is not None
@@ -1274,8 +1391,152 @@ async def test_rotate_child_preserves_lane_identity_and_root_visibility(tmp_path
         second_successor.session_id,
     ]
     assert child_truncated is False
+    assert [row.session_id for row in successor_chain] == [
+        child.session_id,
+        first_successor.session_id,
+        second_successor.session_id,
+    ]
+    successor_ids = {row.session_id for row in successor_chain}
+    assert unrelated_sibling.session_id not in successor_ids
+    assert cross_owner_successor.session_id not in successor_ids
+    assert successor_truncated is False
+    assert len(bounded_chain) == 2
+    assert bounded_truncated is True
     assert providers.guardrails.calls[-2][2] == root_session.session_id
     assert providers.guardrails.calls[-1][2] == root_session.session_id
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_continuation_chain_detects_branch_and_cycles(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Invalid child lineage",
+    )
+    async with session_factory() as db:
+        child = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            delegation_mode="execute",
+            delegation_task="Inspect lineage",
+        )
+        successor = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            previous_session_id=child.session_id,
+            delegation_mode=child.delegation_mode,
+            delegation_task=child.delegation_task,
+            activity_scope_id=child.activity_scope_id,
+        )
+        branch = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            previous_session_id=child.session_id,
+            delegation_mode=child.delegation_mode,
+            delegation_task=child.delegation_task,
+            activity_scope_id=child.activity_scope_id,
+        )
+        await db.commit()
+
+        branch_chain, branch_invalid = await get_child_session_continuation_chain(
+            db, child.session_id
+        )
+        assert [row.session_id for row in branch_chain] == [child.session_id]
+        assert branch_invalid is True
+
+        await db.delete(branch)
+        child.previous_session_id = successor.session_id
+        await db.commit()
+        for selected_id in (child.session_id, successor.session_id):
+            cycle_chain, cycle_invalid = await get_child_session_continuation_chain(db, selected_id)
+            assert {row.session_id for row in cycle_chain} == {
+                child.session_id,
+                successor.session_id,
+            }
+            assert cycle_invalid is True
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_child_continuation_chain_rejects_missing_predecessor_but_allows_scope_boundary(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Child lineage boundaries",
+    )
+    async with session_factory() as db:
+        child = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            delegation_mode="execute",
+            delegation_task="Inspect lineage",
+        )
+        child.previous_session_id = "missing-child"
+        await db.commit()
+        missing_chain, missing_invalid = await get_child_session_continuation_chain(
+            db, child.session_id
+        )
+        assert [row.session_id for row in missing_chain] == [child.session_id]
+        assert missing_invalid is True
+
+        boundary = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            delegation_mode=child.delegation_mode,
+            delegation_task=child.delegation_task,
+            activity_scope_id="prior-scope",
+        )
+        child.previous_session_id = boundary.session_id
+        await db.commit()
+        boundary_chain, boundary_invalid = await get_child_session_continuation_chain(
+            db, child.session_id
+        )
+        assert [row.session_id for row in boundary_chain] == [child.session_id]
+        assert boundary_invalid is False
+
+        incompatible = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            parent_session_id=root.session_id,
+            delegation_mode=child.delegation_mode,
+            delegation_task="Different delegation",
+            activity_scope_id=child.activity_scope_id,
+        )
+        child.previous_session_id = incompatible.session_id
+        await db.commit()
+        incompatible_chain, incompatible_invalid = await get_child_session_continuation_chain(
+            db, child.session_id
+        )
+        assert [row.session_id for row in incompatible_chain] == [child.session_id]
+        assert incompatible_invalid is True
 
     await engine.dispose()
 
@@ -1322,7 +1583,7 @@ async def test_stale_root_rotation_has_clean_conflict(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_rotate_session_keeps_new_root_when_compaction_summary_append_fails(
+async def test_rotate_session_does_not_activate_root_when_compaction_summary_append_fails(
     tmp_path,
 ) -> None:
     engine, session_factory = await _session_factory(tmp_path)
@@ -1338,30 +1599,28 @@ async def test_rotate_session_keeps_new_root_when_compaction_summary_append_fail
         title="Rotation append failure test",
     )
 
-    new_session = await manager.rotate_session(
-        conversation_id=conversation.conversation_id,
-        current_session=root_session,
-        intention="Continued after compaction",
-        completion_reason="compacted",
-        compaction_summary="Summary of older turns.",
-    )
+    with pytest.raises(RuntimeError, match="Could not seed rotated compaction summary"):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root_session,
+            intention="Continued after compaction",
+            completion_reason="compacted",
+            compaction_summary="Summary of older turns.",
+        )
 
     async with session_factory() as db:
         conv = await db.get(Conversation, conversation.conversation_id)
         old_row = await db.get(Session, root_session.session_id)
-        new_row = await db.get(Session, new_session.session_id)
+        rows = await list_conversation_sessions(db, conversation.conversation_id)
 
     assert conv is not None
-    assert conv.active_session_id == new_session.session_id
+    assert conv.active_session_id == root_session.session_id
     assert old_row is not None
-    assert old_row.status == "completed"
-    assert old_row.completion_reason == "compacted"
-    assert new_row is not None
-    assert new_row.status == "active"
-    assert new_row.previous_session_id == root_session.session_id
-    assert providers.guardrails.recorded_events
-    assert len(cache.appended_events) == 1
-    assert cache.appended_events[0][1][0].type == "lifecycle"
+    assert old_row.status == "active"
+    assert old_row.completion_reason is None
+    assert [row.session_id for row in rows] == [root_session.session_id]
+    assert len(providers.guardrails.recorded_events) == 2
+    assert cache.appended_events == []
 
     await engine.dispose()
 
@@ -1643,6 +1902,75 @@ async def test_mark_failed_syncs_terminated_to_intaris(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_terminal_session_cannot_be_completed_or_reactivated(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Terminal test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+
+    assert await manager.mark_terminated(root.session_id, reason="Intaris hard kill")
+    assert not await manager.mark_completed(root.session_id, result_summary="late result")
+    assert not await manager.mark_active(root.session_id)
+
+    async with session_factory() as db_session:
+        row = await get_session_row(db_session, root.session_id)
+        assert row is not None
+        assert row.status == "terminated"
+        assert row.result_summary == "Intaris hard kill"
+
+    assert [status for _, status, _ in providers.guardrails.status_calls] == ["terminated"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_terminal_session_cannot_be_rotated(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    manager = SessionManager(session_factory, _Providers(), _Cache())
+    conversation = await manager.create_conversation(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Terminal rotation test",
+    )
+    root = await manager.create_root_session(
+        conversation_id=conversation.conversation_id,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        intention="test",
+    )
+    assert await manager.mark_terminated(root.session_id, reason="Intaris hard kill")
+
+    with pytest.raises(
+        SessionRotationConflictError,
+        match="Cannot rotate a terminal",
+    ):
+        await manager.rotate_session(
+            conversation_id=conversation.conversation_id,
+            current_session=root,
+            intention="Must not continue",
+        )
+
+    async with session_factory() as db_session:
+        stored = await get_session_row(db_session, root.session_id)
+        assert stored is not None
+        assert stored.status == "terminated"
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_mark_cancelled_syncs_terminated_to_intaris(tmp_path) -> None:
     engine, session_factory = await _session_factory(tmp_path)
     providers = _Providers()
@@ -1895,6 +2223,25 @@ async def test_create_root_session_passes_workdir_and_allow_paths_to_intaris(tmp
     assert not any(path.endswith("/.cognis/*") for path in allow_paths)
 
     await engine.dispose()
+
+
+def test_intaris_session_policy_includes_additional_executor_paths() -> None:
+    from cognis.core.session import _intaris_session_policy
+
+    policy = _intaris_session_policy(
+        "/home/riker/src/cognis",
+        executor_home="/home/riker",
+        additional_allowed_paths=[
+            "/Users/fpytloun",
+            "/Users/fpytloun/src/infra/ansible",
+            "/var/folders/cognis/tmp",
+        ],
+    )
+
+    assert "/home/riker/*" in policy["allow_paths"]
+    assert "/Users/fpytloun/*" in policy["allow_paths"]
+    assert "/Users/fpytloun/src/infra/ansible/*" in policy["allow_paths"]
+    assert "/var/folders/cognis/tmp/*" in policy["allow_paths"]
 
 
 @pytest.mark.asyncio

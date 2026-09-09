@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { portal } from '$lib/actions/portal';
 
   /**
    * Tap-or-hover popover. Replaces hover-only tooltips.
@@ -122,8 +123,9 @@
   {#if open}
     <span
       role="tooltip"
-      class="pointer-events-none z-[1000] whitespace-normal rounded-xl border border-slate-700 bg-slate-900 px-3 py-2 text-xs font-normal leading-relaxed text-slate-300 shadow-2xl ring-1 ring-black/30"
+      class="pointer-events-none z-[2147483647] whitespace-pre-line rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-normal leading-relaxed text-slate-200 shadow-2xl ring-1 ring-black/50"
       style={floatingStyle}
+      use:portal
     >
       {text}
       {#if placement === 'top'}

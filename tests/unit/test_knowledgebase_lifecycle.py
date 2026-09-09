@@ -1541,6 +1541,24 @@ async def test_alembic_upgrade_accepts_schema_already_updated_by_bootstrap(
             )
             assert _default_is_zero(columns["active_generation"]["default"])
             assert _default_is_zero(columns["desired_generation"]["default"])
+            notification_columns = {
+                column["name"] for column in inspect(connection).get_columns("notifications")
+            }
+            notification_indexes = {
+                index["name"] for index in inspect(connection).get_indexes("notifications")
+            }
+            assert {"revision", "expires_at"} <= notification_columns
+            assert "ix_notifications_user_task_status" in notification_indexes
+            session_columns = {
+                column["name"] for column in inspect(connection).get_columns("sessions")
+            }
+            assert {
+                "model_override",
+                "model_override_provider_id",
+                "reasoning_effort_override",
+                "fast_mode_override",
+                "runtime_override_revision",
+            } <= session_columns
     finally:
         sync_engine.dispose()
 

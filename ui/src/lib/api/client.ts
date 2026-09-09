@@ -6,6 +6,10 @@ import type {
   ApiKeyCreateResponse,
   Agent,
   AgentGrant,
+  AttentionActionDetail,
+  AttentionActionResolvePayload,
+  AttentionActionResolveResponse,
+  DashboardIssuesResponse,
   MemoryBackendDescriptor,
   AttachmentRef,
   ChannelAccount,
@@ -399,6 +403,24 @@ export const api = {
     }
   },
 
+  dashboard: {
+    issues(): Promise<DashboardIssuesResponse> {
+      return request<DashboardIssuesResponse>('/api/v1/dashboard/issues', {
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+      });
+    },
+
+    dismissScheduleIssue(scheduleId: string, incidentToken: string): Promise<{ ok: boolean }> {
+      return request<{ ok: boolean }>(
+        `/api/v1/dashboard/issues/schedules/${encodeURIComponent(scheduleId)}/dismiss`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ incident_token: incidentToken })
+        }
+      );
+    }
+  },
+
   search: {
     health(): Promise<SearchHealth> {
       return request<SearchHealth>('/api/v1/search/health');
@@ -450,20 +472,24 @@ export const api = {
 
     list(
       cursor: string | null = null,
-      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null; includeAgentDirect?: boolean | null } = {}
+      filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; projectId?: string | null; status?: string | null; includeAgentDirect?: boolean | null; includeAttentionActions?: boolean | null; query?: string | null; limit?: number } = {},
+      options: { signal?: AbortSignal } = {}
     ): Promise<CursorPage<Conversation>> {
       return request<CursorPage<Conversation>>(
         `/api/v1/conversations${encodeQuery({
           cursor,
-          limit: 50,
+          limit: filters.limit ?? 50,
           context_type: filters.contextType,
           context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
           agent_ids: filters.agentIds ?? undefined,
+          project_id: filters.projectId,
           status: filters.status,
-          include_agent_direct: filters.includeAgentDirect
+          include_agent_direct: filters.includeAgentDirect,
+          include_attention_actions: filters.includeAttentionActions,
+          q: filters.query
         })}`,
-        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS }
+        { timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS, signal: options.signal }
       );
     },
 
@@ -476,13 +502,14 @@ export const api = {
     sidebar(
       cursor: string | null = null,
       filters: { contextType?: string | null; contextTypes?: string[] | null; agentId?: string | null; agentIds?: string[] | null; status?: string | null } = {},
-      options: { changedSince?: string | null } = {}
+      options: { changedSince?: string | null; sidebarRevision?: string | null } = {}
     ): Promise<SidebarProjection> {
       return request<SidebarProjection>(
         `/api/v1/conversations/sidebar${encodeQuery({
           cursor,
           limit: 50,
           changed_since: options.changedSince,
+          sidebar_revision: options.sidebarRevision,
           context_type: filters.contextType,
           context_types: filters.contextTypes ?? undefined,
           agent_id: filters.agentId,
@@ -525,9 +552,13 @@ export const api = {
       });
     },
 
-    detail(conversationId: string, options: { includeState?: boolean } = {}): Promise<Conversation> {
+    detail(
+      conversationId: string,
+      options: { includeState?: boolean; includeAttentionActions?: boolean } = {}
+    ): Promise<Conversation> {
       return request<Conversation>(`/api/v1/conversations/${conversationId}${encodeQuery({
-        include_state: options.includeState
+        include_state: options.includeState,
+        include_attention_actions: options.includeAttentionActions
       })}`, {
         timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
       });
@@ -545,9 +576,15 @@ export const api = {
       });
     },
 
-    slashCommandSuggestions(conversationId: string, input: string, limit = 12): Promise<SlashCommandSuggestionsResponse> {
+    slashCommandSuggestions(
+      conversationId: string,
+      input: string,
+      limit = 12,
+      options: { signal?: AbortSignal } = {},
+    ): Promise<SlashCommandSuggestionsResponse> {
       return request<SlashCommandSuggestionsResponse>(
-        `/api/v1/conversations/${conversationId}/slash-command-suggestions${encodeQuery({ input, limit })}`
+        `/api/v1/conversations/${conversationId}/slash-command-suggestions${encodeQuery({ input, limit })}`,
+        { signal: options.signal },
       );
     },
 
@@ -811,6 +848,10 @@ export const api = {
 
     signedUrl(artifactId: string, ttlSeconds = 3600, mode: 'download' | 'view' = 'download'): Promise<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }> {
       return request<{ artifact_id: string; url: string; mode?: string; expires_at: string | null }>(`/api/v1/artifacts/${artifactId}/signed-url${encodeQuery({ ttl_seconds: ttlSeconds, mode: mode === 'download' ? undefined : mode })}`);
+    },
+
+    textPreview(artifactId: string): Promise<{ artifact_id: string; filename: string; mime_type: string; size_bytes: number; content: string; truncated: boolean }> {
+      return request(`/api/v1/artifacts/${artifactId}/text-preview`);
     }
   },
 
@@ -1529,15 +1570,24 @@ export const api = {
       return collectCursorPages((cursor) => this.list({ cursor }));
     },
 
-    board(params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoard> {
+    board(
+      params: Record<string, string | number | null | undefined> = {},
+      options: { signal?: AbortSignal } = {}
+    ): Promise<TaskBoard> {
       return request<TaskBoard>(`/api/v1/tasks/board${encodeQuery({ limit: 20, ...params })}`, {
-        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS,
+        signal: options.signal
       });
     },
 
-    boardColumn(columnId: string, params: Record<string, string | number | null | undefined> = {}): Promise<TaskBoardColumn> {
+    boardColumn(
+      columnId: string,
+      params: Record<string, string | number | null | undefined> = {},
+      options: { signal?: AbortSignal } = {}
+    ): Promise<TaskBoardColumn> {
       return request<TaskBoardColumn>(`/api/v1/tasks/board/${columnId}${encodeQuery({ limit: 20, ...params })}`, {
-        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS
+        timeoutMs: UI_LOAD_REQUEST_TIMEOUT_MS,
+        signal: options.signal
       });
     },
 
@@ -2194,8 +2244,8 @@ export const api = {
   },
 
   sessions: {
-    detail(sessionId: string): Promise<Session> {
-      return request<Session>(`/api/v1/sessions/${sessionId}`);
+    detail(sessionId: string, options: { signal?: AbortSignal } = {}): Promise<Session> {
+      return request<Session>(`/api/v1/sessions/${sessionId}`, { signal: options.signal });
     },
 
     cancel(sessionId: string): Promise<{ ok: boolean; session_id: string }> {
@@ -2243,6 +2293,24 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(payload)
       });
+    }
+  },
+
+  attentionActions: {
+    get(actionId: string): Promise<AttentionActionDetail> {
+      return request<AttentionActionDetail>(
+        `/api/v1/attention-actions/${encodeURIComponent(actionId)}`
+      );
+    },
+
+    resolve(
+      actionId: string,
+      payload: AttentionActionResolvePayload
+    ): Promise<AttentionActionResolveResponse> {
+      return request<AttentionActionResolveResponse>(
+        `/api/v1/attention-actions/${encodeURIComponent(actionId)}/resolve`,
+        { method: 'POST', body: JSON.stringify(payload) }
+      );
     }
   },
 

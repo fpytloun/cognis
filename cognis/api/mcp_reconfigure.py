@@ -7,7 +7,10 @@ from typing import Any
 
 from sqlalchemy import select
 
-from cognis.api.executor_runtime import schedule_executor_reconfigure
+from cognis.api.executor_runtime import (
+    schedule_executor_reconfigure,
+    schedule_mcp_credential_reload,
+)
 from cognis.logging import get_logger
 from cognis.store.models import MCPOAuthTransactionRow
 from cognis.store.queries import (
@@ -29,7 +32,35 @@ async def schedule_mcp_server_executor_reconfigure_for_app(
 ) -> list[str] | None:
     """Bump and schedule websocket executors that reference an MCP server."""
 
+    credential_only_refresh = (
+        reason in {"refresh_succeeded", "mcp_oauth_refresh_succeeded"}
+        and admission_guard is None
+        and terminal_cleanup_transaction_id is None
+    )
     async with app.state.session_factory() as session:
+        if credential_only_refresh:
+            executors = await list_websocket_executors_for_mcp_server(session, server_id)
+            ws_provider = app.state.providers.executor.websocket
+            refresh_scheduled_ids = [
+                row.executor_id
+                for row in executors
+                if ws_provider.get_connection(row.executor_id) is not None
+            ]
+            await session.rollback()
+            for executor_id in refresh_scheduled_ids:
+                schedule_mcp_credential_reload(app, executor_id, server_id)
+            if refresh_scheduled_ids:
+                logger.info(
+                    "mcp: scheduled credential-only executor reload after OAuth refresh",
+                    extra={
+                        "extra_data": {
+                            "server_id": server_id,
+                            "reason": reason,
+                            "executor_ids": refresh_scheduled_ids,
+                        }
+                    },
+                )
+            return refresh_scheduled_ids
         if admission_guard is not None and not await admission_guard(session):
             await session.rollback()
             return None

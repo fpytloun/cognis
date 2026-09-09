@@ -6,6 +6,7 @@ task material in user-role context and controller policy in system-role context.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -123,6 +124,7 @@ def compose_workflow_prompt(
     require_step_complete: bool,
     deliverable_owned: bool,
     continuation_source: str | None = None,
+    task_trigger_context: dict[str, Any] | None = None,
 ) -> ComposedWorkflowPrompt:
     """Compose one isolated workflow-step request from typed shared blocks."""
 
@@ -171,6 +173,11 @@ def compose_workflow_prompt(
                 )
                 if part
             )
+        )
+    if task_trigger_context:
+        task_lines.append(
+            "Immutable schedule trigger:\n"
+            + json.dumps(task_trigger_context, sort_keys=True, separators=(",", ":"))
         )
     if attachment_refs:
         task_lines.append("Attachments: " + ", ".join(attachment_refs))

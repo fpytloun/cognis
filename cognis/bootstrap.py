@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import os
 import secrets
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +15,7 @@ import sqlalchemy as sa
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from sqlalchemy import inspect, select, text
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cognis.config import CognisConfig
@@ -36,6 +38,19 @@ from cognis.store.schema import validate_schema
 from cognis.tools.skill_parser import compute_content_hash
 
 logger = get_logger(__name__)
+
+
+def _as_connection(sync_conn: object) -> Connection:
+    return cast(Connection, sync_conn)
+
+
+def _model_table(model: type[Base]) -> sa.Table:
+    return cast(sa.Table, model.__table__)
+
+
+def _create_model_table(model: type[Base], sync_conn: object) -> None:
+    _model_table(model).create(bind=_as_connection(sync_conn), checkfirst=True)
+
 
 _BUILTIN_MANAGEMENT_SKILLS: Final[list[dict[str, object]]] = list(SYSTEM_SKILL_DEFAULTS.values())
 
@@ -142,6 +157,7 @@ def ensure_secrets_key(config: CognisConfig) -> None:
 async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     """Create schema directly for MVP before/alongside Alembic use."""
 
+    is_postgresql = engine.dialect.name == "postgresql"
     async with engine.begin() as conn:
         await conn.run_sync(normalize_legacy_profile_override_revision)
         await conn.run_sync(Base.metadata.create_all)
@@ -186,9 +202,13 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_task_session_policy_column)
         await conn.run_sync(_ensure_task_control_conversation_column)
         await conn.run_sync(_ensure_conversation_lineage_columns)
-        await conn.run_sync(_ensure_work_scope_revision_tables)
+        await conn.run_sync(_ensure_work_projection_tables)
+        if not is_postgresql:
+            await conn.run_sync(_ensure_work_call_state_index)
         await conn.run_sync(_ensure_task_board_indexes)
+        await conn.run_sync(_ensure_notification_attention_columns)
         await conn.run_sync(_ensure_agent_profile_columns)
+        await conn.run_sync(_ensure_session_runtime_override_columns)
         await conn.run_sync(_ensure_managed_conversation_lineage)
         await conn.run_sync(_ensure_managed_channel_foundation)
         await conn.run_sync(_ensure_channel_observed_targets)
@@ -209,6 +229,10 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_tool_classification_table)
         await conn.run_sync(_ensure_tool_classification_override_table)
         await conn.run_sync(_ensure_browser_sessions_table)
+        await conn.run_sync(_ensure_native_sessions_table)
+        await conn.run_sync(_ensure_mfa_tables)
+        await conn.run_sync(_ensure_user_auth_version)
+        await conn.run_sync(_ensure_session_auth_versions)
         await conn.run_sync(_ensure_push_subscriptions_table)
         await conn.run_sync(_ensure_channel_preferred_delivery_column)
         await conn.run_sync(_ensure_projects_tables)
@@ -222,18 +246,73 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_local_model_byte_counter_types)
         await conn.run_sync(_ensure_local_model_provider_columns)
         await conn.run_sync(_ensure_channel_delivery_progress_columns)
+        await conn.run_sync(_ensure_channel_delivery_route_release_columns)
         await conn.run_sync(_ensure_coordination_leases_table)
         await conn.run_sync(_ensure_controller_instances_table)
         await conn.run_sync(_ensure_direct_turn_requests_table)
         await conn.run_sync(_ensure_schedule_fires_table)
         await conn.run_sync(_ensure_channel_recipient_intents_table)
-        await conn.run_sync(_ensure_work_projection_tables)
+        if not is_postgresql:
+            await conn.run_sync(_ensure_work_load_indexes)
+
+    if is_postgresql:
+        async with engine.connect() as conn:
+            await conn.execution_options(isolation_level="AUTOCOMMIT")
+            await conn.run_sync(_ensure_work_call_state_index)
+            await conn.run_sync(_ensure_work_load_indexes)
 
 
 def _ensure_coordination_leases_table(sync_conn: object) -> None:
     from cognis.store.models import CoordinationLeaseRow
 
     cast(Any, CoordinationLeaseRow.__table__).create(bind=sync_conn, checkfirst=True)
+
+
+def _ensure_notification_attention_columns(sync_conn: object) -> None:
+    """Add attention-action notification columns during normal bootstrap."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "notifications" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("notifications")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "revision" not in columns:
+        execute(text("ALTER TABLE notifications ADD COLUMN revision BIGINT NOT NULL DEFAULT 1"))
+    if "expires_at" not in columns:
+        timestamp_type = (
+            "TIMESTAMP WITH TIME ZONE"
+            if sync_conn.dialect.name == "postgresql"  # type: ignore[attr-defined]
+            else "TIMESTAMP"
+        )
+        execute(text(f"ALTER TABLE notifications ADD COLUMN expires_at {timestamp_type}"))
+    indexes = {index["name"] for index in inspector.get_indexes("notifications")}
+    if "ix_notifications_user_task_status" not in indexes:
+        execute(
+            text(
+                "CREATE INDEX ix_notifications_user_task_status "
+                "ON notifications (user_email, task_id, status)"
+            )
+        )
+
+
+def _ensure_session_runtime_override_columns(sync_conn: object) -> None:
+    """Add authoritative interactive runtime selection columns."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "sessions" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("sessions")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    definitions = {
+        "model_override": "VARCHAR",
+        "model_override_provider_id": "VARCHAR",
+        "reasoning_effort_override": "VARCHAR",
+        "fast_mode_override": "BOOLEAN",
+        "runtime_override_revision": "BIGINT NOT NULL DEFAULT 0",
+    }
+    for name, definition in definitions.items():
+        if name not in columns:
+            execute(text(f"ALTER TABLE sessions ADD COLUMN {name} {definition}"))
 
 
 def _ensure_controller_instances_table(sync_conn: object) -> None:
@@ -280,10 +359,104 @@ def _ensure_channel_recipient_intents_table(sync_conn: object) -> None:
             execute(text(f"ALTER TABLE channel_recipient_intents ADD COLUMN {column_name} {ddl}"))
 
 
+def _ensure_work_call_state_index(sync_conn: object) -> None:
+    """Create the newest-call-state index on existing Work tables."""
+
+    dialect_name = sync_conn.dialect.name  # type: ignore[attr-defined]
+    if dialect_name != "postgresql":
+        _ensure_work_call_state_index_locked(sync_conn)
+        return
+    lock_key = "hashtextextended('cognis:work_call_state_index:v1', 0)"
+    while not bool(
+        sync_conn.scalar(text(f"SELECT pg_try_advisory_lock({lock_key})"))  # type: ignore[attr-defined]
+    ):
+        time.sleep(0.1)
+    try:
+        _ensure_work_call_state_index_locked(sync_conn)
+    finally:
+        sync_conn.execute(text(f"SELECT pg_advisory_unlock({lock_key})"))  # type: ignore[attr-defined]
+
+
+def _ensure_work_call_state_index_locked(sync_conn: object) -> None:
+    inspector = cast(Any, inspect(sync_conn))
+    try:
+        indexes = inspector.get_indexes("work_records")
+    except Exception:
+        return
+    index_name = "ix_work_records_owner_version_call_state"
+    existing = next((index for index in indexes if index.get("name") == index_name), None)
+    dialect_name = sync_conn.dialect.name  # type: ignore[attr-defined]
+    existing_matches = False
+    if existing is not None:
+        columns_match = existing.get("column_names") == [
+            "owner_email",
+            "materializer_version",
+            "materialized_at",
+        ]
+        sorting = dict(existing.get("column_sorting") or {})
+        descending_matches = "desc" in sorting.get("materialized_at", ())
+        options = dict(existing.get("dialect_options") or {})
+        predicate_value = options.get(f"{dialect_name}_where")
+        predicate = str(predicate_value).lower() if predicate_value is not None else ""
+        predicate_matches = "call_id is not null" in predicate
+        include_matches = dialect_name != "postgresql" or existing.get("include_columns") == [
+            "session_id",
+            "call_id",
+            "is_evidence",
+        ]
+        existing_matches = (
+            columns_match and descending_matches and predicate_matches and include_matches
+        )
+        if existing_matches:
+            return
+    if dialect_name == "postgresql":
+        replacement_name = f"{index_name}_replacement"
+        if existing is not None:
+            sync_conn.execute(  # type: ignore[attr-defined]
+                text(f"DROP INDEX CONCURRENTLY IF EXISTS {replacement_name}")
+            )
+            sync_conn.execute(  # type: ignore[attr-defined]
+                text(
+                    f"CREATE INDEX CONCURRENTLY {replacement_name} "
+                    "ON work_records (owner_email, materializer_version, materialized_at DESC) "
+                    "INCLUDE (session_id, call_id, is_evidence) WHERE call_id IS NOT NULL"
+                )
+            )
+            sync_conn.execute(  # type: ignore[attr-defined]
+                text(f"DROP INDEX CONCURRENTLY IF EXISTS {index_name}")
+            )
+            sync_conn.execute(  # type: ignore[attr-defined]
+                text(f"ALTER INDEX {replacement_name} RENAME TO {index_name}")
+            )
+            return
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(f"DROP INDEX CONCURRENTLY IF EXISTS {replacement_name}")
+        )
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(
+                f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {index_name} "
+                "ON work_records (owner_email, materializer_version, materialized_at DESC) "
+                "INCLUDE (session_id, call_id, is_evidence) WHERE call_id IS NOT NULL"
+            )
+        )
+        return
+    if existing is not None:
+        sync_conn.execute(text(f"DROP INDEX IF EXISTS {index_name}"))  # type: ignore[attr-defined]
+    include = " INCLUDE (session_id, call_id, is_evidence)" if dialect_name == "postgresql" else ""
+    sync_conn.execute(  # type: ignore[attr-defined]
+        text(
+            f"CREATE INDEX IF NOT EXISTS {index_name} "
+            "ON work_records (owner_email, materializer_version, materialized_at DESC)"
+            f"{include} WHERE call_id IS NOT NULL"
+        )
+    )
+
+
 def _ensure_work_projection_tables(sync_conn: object) -> None:
     """Create the rebuildable durable Work projection tables."""
 
     from cognis.store.models import (
+        WorkCurrentFileRow,
         WorkRecordFileRow,
         WorkRecordRow,
         WorkSessionProjectionRow,
@@ -292,27 +465,335 @@ def _ensure_work_projection_tables(sync_conn: object) -> None:
     cast(Any, WorkRecordRow.__table__).create(bind=sync_conn, checkfirst=True)
     cast(Any, WorkRecordFileRow.__table__).create(bind=sync_conn, checkfirst=True)
     cast(Any, WorkSessionProjectionRow.__table__).create(bind=sync_conn, checkfirst=True)
+    cast(Any, WorkCurrentFileRow.__table__).create(bind=sync_conn, checkfirst=True)
     inspector = cast(Any, inspect(sync_conn))
     columns = {column["name"] for column in inspector.get_columns("work_records")}
     execute = sync_conn.execute  # type: ignore[attr-defined]
+    timestamp_type = (
+        "TIMESTAMP WITH TIME ZONE"
+        if sync_conn.dialect.name == "postgresql"  # type: ignore[attr-defined]
+        else "TIMESTAMP"
+    )
     additions = {
         "category": "VARCHAR",
         "entity_id": "VARCHAR",
         "file_path_ids": "JSON NOT NULL DEFAULT '[]'",
         "additions": "INTEGER NOT NULL DEFAULT 0",
         "deletions": "INTEGER NOT NULL DEFAULT 0",
+        "source_content_expires_at": timestamp_type,
+        "source_content_scrubbed_at": timestamp_type,
     }
     for name, ddl in additions.items():
         if name not in columns:
             execute(text(f"ALTER TABLE work_records ADD COLUMN {name} {ddl}"))
-    indexes = {index["name"] for index in inspector.get_indexes("work_records")}
+    file_columns = {column["name"] for column in inspector.get_columns("work_record_files")}
+    file_additions = {
+        "owner_email": "VARCHAR",
+        "session_id": "VARCHAR",
+        "materializer_version": "VARCHAR",
+        "path_generation_id": "VARCHAR NOT NULL DEFAULT ''",
+        "source_seq": "BIGINT NOT NULL DEFAULT 0",
+        "item_ordinal": "INTEGER NOT NULL DEFAULT 0",
+        "status": "VARCHAR",
+        "old_path": "TEXT",
+        "old_path_id": "VARCHAR",
+        "binary": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "generated": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "truncated": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "preview_omitted": "BOOLEAN NOT NULL DEFAULT FALSE",
+    }
+    for name, ddl in file_additions.items():
+        if name not in file_columns:
+            execute(text(f"ALTER TABLE work_record_files ADD COLUMN {name} {ddl}"))
+    execute(
+        text(
+            """
+            UPDATE work_record_files
+            SET owner_email = (
+                SELECT owner_email FROM work_records
+                WHERE work_records.work_record_id = work_record_files.work_record_id
+            ), session_id = (
+                SELECT session_id FROM work_records
+                WHERE work_records.work_record_id = work_record_files.work_record_id
+            ), materializer_version = (
+                SELECT materializer_version FROM work_records
+                WHERE work_records.work_record_id = work_record_files.work_record_id
+            ), source_seq = COALESCE((
+                SELECT source_seq FROM work_records
+                WHERE work_records.work_record_id = work_record_files.work_record_id
+            ), source_seq), item_ordinal = COALESCE((
+                SELECT item_ordinal FROM work_records
+                WHERE work_records.work_record_id = work_record_files.work_record_id
+            ), item_ordinal)
+            WHERE owner_email IS NULL OR session_id IS NULL OR materializer_version IS NULL
+            """
+        )
+    )
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_schedules_run_status_updated "
+            "ON schedules (last_run_status, updated_at)"
+        )
+    )
+    current_file_columns = {
+        column["name"] for column in inspector.get_columns("work_current_files")
+    }
+    for name in ("additions", "deletions"):
+        if name not in current_file_columns:
+            execute(
+                text(f"ALTER TABLE work_current_files ADD COLUMN {name} BIGINT NOT NULL DEFAULT 0")
+            )
+    projection_columns = {
+        column["name"] for column in inspector.get_columns("work_session_projections")
+    }
+    dialect = sync_conn.dialect.name  # type: ignore[attr-defined]
+    timestamp_type = "TIMESTAMP WITH TIME ZONE" if dialect == "postgresql" else "TIMESTAMP"
+    projection_additions = {
+        "next_head_check_at": timestamp_type,
+        "record_count": "BIGINT NOT NULL DEFAULT 0",
+        "evidence_record_count": "BIGINT NOT NULL DEFAULT 0",
+        "mutation_count": "INTEGER NOT NULL DEFAULT 0",
+        "command_count": "INTEGER NOT NULL DEFAULT 0",
+        "file_count": "INTEGER NOT NULL DEFAULT 0",
+        "artifact_count": "INTEGER NOT NULL DEFAULT 0",
+        "deliverable_count": "INTEGER NOT NULL DEFAULT 0",
+        "additions": "BIGINT NOT NULL DEFAULT 0",
+        "deletions": "BIGINT NOT NULL DEFAULT 0",
+        "omitted_file_count": "INTEGER NOT NULL DEFAULT 0",
+        "expected_record_count": "BIGINT NOT NULL DEFAULT 0",
+        "expected_record_file_count": "BIGINT NOT NULL DEFAULT 0",
+    }
+    for name, ddl in projection_additions.items():
+        if name not in projection_columns:
+            execute(text(f"ALTER TABLE work_session_projections ADD COLUMN {name} {ddl}"))
+    projection_checks = inspector.get_check_constraints("work_session_projections")
+    projection_counter_check = any(
+        "expected_record_file_count" in str(constraint.get("sqltext") or "")
+        for constraint in projection_checks
+    )
+    if not projection_counter_check and dialect == "sqlite":
+        execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_work_session_projections_cache_nonnegative_insert
+                BEFORE INSERT ON work_session_projections
+                WHEN NEW.record_count < 0 OR NEW.evidence_record_count < 0
+                  OR NEW.mutation_count < 0 OR NEW.command_count < 0 OR NEW.file_count < 0
+                  OR NEW.artifact_count < 0 OR NEW.deliverable_count < 0
+                  OR NEW.additions < 0 OR NEW.deletions < 0 OR NEW.omitted_file_count < 0
+                  OR NEW.expected_record_count < 0 OR NEW.expected_record_file_count < 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'negative Work projection cache counter');
+                END
+                """
+            )
+        )
+        execute(
+            text(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_work_session_projections_cache_nonnegative_update
+                BEFORE UPDATE ON work_session_projections
+                WHEN NEW.record_count < 0 OR NEW.evidence_record_count < 0
+                  OR NEW.mutation_count < 0 OR NEW.command_count < 0 OR NEW.file_count < 0
+                  OR NEW.artifact_count < 0 OR NEW.deliverable_count < 0
+                  OR NEW.additions < 0 OR NEW.deletions < 0 OR NEW.omitted_file_count < 0
+                  OR NEW.expected_record_count < 0 OR NEW.expected_record_file_count < 0
+                BEGIN
+                    SELECT RAISE(ABORT, 'negative Work projection cache counter');
+                END
+                """
+            )
+        )
+    elif not projection_counter_check and dialect == "postgresql":
+        execute(
+            text(
+                "ALTER TABLE work_session_projections "
+                "DROP CONSTRAINT IF EXISTS ck_work_session_projections_nonnegative"
+            )
+        )
+        execute(
+            text(
+                "ALTER TABLE work_session_projections "
+                "ADD CONSTRAINT ck_work_session_projections_nonnegative CHECK ("
+                "target_seq >= 0 AND covered_through_seq >= 0 AND retry_count >= 0 "
+                "AND lease_fence >= 0 AND record_count >= 0 AND evidence_record_count >= 0 "
+                "AND mutation_count >= 0 AND command_count >= 0 AND file_count >= 0 "
+                "AND artifact_count >= 0 AND deliverable_count >= 0 AND additions >= 0 "
+                "AND deletions >= 0 AND omitted_file_count >= 0 "
+                "AND expected_record_count >= 0 AND expected_record_file_count >= 0)"
+            )
+        )
+    file_indexes = {index["name"] for index in inspector.get_indexes("work_record_files")}
     for index_name in (
+        "ix_work_record_files_old_path",
+        "ix_work_record_files_generation_source",
+    ):
+        index = next(
+            item for item in _model_table(WorkRecordFileRow).indexes if item.name == index_name
+        )
+        if index.name not in file_indexes:
+            index.create(bind=_as_connection(sync_conn))
+    indexes = {index["name"] for index in inspector.get_indexes("work_records")}
+    index_names = [
         "ix_work_records_owner_category_order",
         "ix_work_records_owner_category_entity",
-    ):
-        index = next(item for item in WorkRecordRow.__table__.indexes if item.name == index_name)
+    ]
+    if sync_conn.dialect.name != "postgresql":  # type: ignore[attr-defined]
+        # PostgreSQL receives this large-table index through migration 141,
+        # which creates it concurrently before application rollout.
+        index_names.append("ix_work_records_overview_evidence")
+    for index_name in index_names:
+        index = next(
+            item for item in _model_table(WorkRecordRow).indexes if item.name == index_name
+        )
         if index.name not in indexes:
-            index.create(bind=sync_conn)
+            index.create(bind=_as_connection(sync_conn))
+
+
+def _ensure_work_load_indexes(sync_conn: object) -> None:
+    """Create the model-declared indexes used to load Work graph data."""
+
+    from cognis.store.models import DirectTurnRequestRow, Session, StepRun
+
+    connection = cast(Any, sync_conn)
+    is_postgresql = connection.dialect.name == "postgresql"
+    inspector = None if is_postgresql else cast(Any, inspect(sync_conn))
+    for table, index_names in (
+        (
+            _model_table(Session),
+            (
+                "ix_sessions_owner_conversation_activity_scope_session",
+                "ix_sessions_owner_activity_scope_updated",
+            ),
+        ),
+        (
+            _model_table(StepRun),
+            ("ix_step_runs_task_step_run", "ix_step_runs_session_status"),
+        ),
+        (
+            _model_table(DirectTurnRequestRow),
+            ("ix_direct_turn_requests_session_latest",),
+        ),
+    ):
+        declared_indexes: dict[str, sa.Index] = {str(index.name): index for index in table.indexes}
+        existing_indexes = (
+            {}
+            if inspector is None
+            else {
+                index["name"]: tuple(index["column_names"])
+                for index in inspector.get_indexes(table.name)
+            }
+        )
+        for index_name in index_names:
+            index = declared_indexes[index_name]
+            expected_columns = tuple(column.name for column in index.columns)
+            if is_postgresql:
+                existing = _postgresql_work_load_index(connection, index_name)
+                if existing is not None and existing["valid"]:
+                    if not _is_exact_postgresql_work_load_index(
+                        existing,
+                        table=table.name,
+                        columns=expected_columns,
+                    ):
+                        raise RuntimeError(f"Conflicting index definition for {index_name}")
+                    continue
+                quote = connection.dialect.identifier_preparer.quote
+                if existing is not None:
+                    connection.execute(
+                        text(f"DROP INDEX CONCURRENTLY IF EXISTS {quote(index_name)}")
+                    )
+                column_sql = ", ".join(quote(column) for column in expected_columns)
+                connection.execute(
+                    text(
+                        "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                        f"{quote(index_name)} ON {quote(table.name)} ({column_sql})"
+                    )
+                )
+                continue
+            existing_columns = existing_indexes.get(index_name)
+            if existing_columns is not None and existing_columns != expected_columns:
+                raise RuntimeError(f"Conflicting index definition for {index_name}")
+            if existing_columns is None:
+                index.create(bind=_as_connection(sync_conn), checkfirst=True)
+
+
+def _postgresql_work_load_index(
+    connection: Any,
+    name: str,
+) -> sa.RowMapping | None:
+    return cast(
+        sa.RowMapping | None,
+        connection.execute(
+            text(
+                """
+                SELECT
+                    index_metadata.indisvalid AS valid,
+                    table_relation.relname AS table_name,
+                    index_metadata.indisunique AS is_unique,
+                    index_metadata.indpred IS NULL AS has_no_predicate,
+                    index_metadata.indexprs IS NULL AS has_no_expressions,
+                    access_method.amname AS access_method,
+                    index_metadata.indnkeyatts AS key_count,
+                    index_metadata.indnatts AS total_count,
+                    array_agg(attribute.attname ORDER BY key.ordinality)
+                        FILTER (
+                            WHERE key.ordinality <= index_metadata.indnkeyatts
+                        ) AS columns,
+                    pg_get_indexdef(index_relation.oid) AS definition
+                FROM pg_class AS index_relation
+                JOIN pg_namespace AS namespace
+                    ON namespace.oid = index_relation.relnamespace
+                JOIN pg_index AS index_metadata
+                    ON index_metadata.indexrelid = index_relation.oid
+                JOIN pg_class AS table_relation
+                    ON table_relation.oid = index_metadata.indrelid
+                JOIN pg_am AS access_method
+                    ON access_method.oid = index_relation.relam
+                JOIN LATERAL unnest(index_metadata.indkey)
+                    WITH ORDINALITY AS key(attnum, ordinality) ON TRUE
+                LEFT JOIN pg_attribute AS attribute
+                    ON attribute.attrelid = index_metadata.indrelid
+                    AND attribute.attnum = key.attnum
+                WHERE
+                    namespace.nspname = current_schema()
+                    AND index_relation.relname = :name
+                GROUP BY
+                    index_metadata.indisvalid,
+                    table_relation.relname,
+                    index_metadata.indisunique,
+                    index_metadata.indpred IS NULL,
+                    index_metadata.indexprs IS NULL,
+                    access_method.amname,
+                    index_metadata.indnkeyatts,
+                    index_metadata.indnatts,
+                    pg_get_indexdef(index_relation.oid)
+                """
+            ),
+            {"name": name},
+        )
+        .mappings()
+        .one_or_none(),
+    )
+
+
+def _is_exact_postgresql_work_load_index(
+    row: sa.RowMapping,
+    *,
+    table: str,
+    columns: tuple[str, ...],
+) -> bool:
+    expected_suffix = f"USING btree ({', '.join(columns)})"
+    return bool(
+        row["table_name"] == table
+        and tuple(row["columns"] or ()) == columns
+        and str(row["definition"]).endswith(expected_suffix)
+        and not row["is_unique"]
+        and row["has_no_predicate"]
+        and row["has_no_expressions"]
+        and row["access_method"] == "btree"
+        and row["key_count"] == len(columns)
+        and row["total_count"] == len(columns)
+    )
 
 
 def _ensure_canonical_chart_payloads(sync_conn: object) -> None:
@@ -394,6 +875,29 @@ def _ensure_channel_delivery_progress_columns(sync_conn: object) -> None:
         execute(
             text("ALTER TABLE channel_delivery_outbox ADD COLUMN direct_turn_fencing_token BIGINT")
         )
+
+
+def _ensure_channel_delivery_route_release_columns(sync_conn: object) -> None:
+    """Add durable route-release evidence without changing delivery outcome."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    if "channel_delivery_outbox" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("channel_delivery_outbox")}
+    execute = sync_conn.execute  # type: ignore[attr-defined]
+    if "route_released_at" not in columns:
+        timestamp_type = (
+            "TIMESTAMP WITH TIME ZONE"
+            if cast(Any, sync_conn).dialect.name == "postgresql"
+            else "TIMESTAMP"
+        )
+        execute(
+            text(
+                f"ALTER TABLE channel_delivery_outbox ADD COLUMN route_released_at {timestamp_type}"
+            )
+        )
+    if "route_release_audit" not in columns:
+        execute(text("ALTER TABLE channel_delivery_outbox ADD COLUMN route_release_audit JSON"))
 
 
 def _ensure_task_creator_agent_column(sync_conn: object) -> None:
@@ -524,13 +1028,13 @@ def _ensure_knowledgebase_schema(sync_conn: object) -> None:
         KnowledgebaseRow,
     )
 
-    KnowledgebaseRow.__table__.create(bind=sync_conn, checkfirst=True)
-    KnowledgebaseGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
-    for index in KnowledgebaseGrantRow.__table__.indexes:
-        index.create(bind=sync_conn, checkfirst=True)
-    KnowledgebaseArtifactRow.__table__.create(bind=sync_conn, checkfirst=True)
-    KnowledgebaseChunkRow.__table__.create(bind=sync_conn, checkfirst=True)
-    KnowledgebaseIndexJobRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(KnowledgebaseRow, sync_conn)
+    _create_model_table(KnowledgebaseGrantRow, sync_conn)
+    for index in _model_table(KnowledgebaseGrantRow).indexes:
+        index.create(bind=_as_connection(sync_conn), checkfirst=True)
+    _create_model_table(KnowledgebaseArtifactRow, sync_conn)
+    _create_model_table(KnowledgebaseChunkRow, sync_conn)
+    _create_model_table(KnowledgebaseIndexJobRow, sync_conn)
 
     inspector = cast(Any, inspect(sync_conn))
     execute = sync_conn.execute  # type: ignore[attr-defined]
@@ -753,8 +1257,8 @@ def _ensure_todos_tables(sync_conn: object) -> None:
 
     from cognis.store.models import ConversationTodo, SessionTodo
 
-    ConversationTodo.__table__.create(bind=sync_conn, checkfirst=True)
-    SessionTodo.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(ConversationTodo, sync_conn)
+    _create_model_table(SessionTodo, sync_conn)
     sync_conn.execute(  # type: ignore[attr-defined]
         text(
             """
@@ -863,15 +1367,6 @@ def _ensure_conversation_lineage_columns(sync_conn: object) -> None:
                 "ON tasks (created_by, source_ref, task_id)"
             )
         )
-
-
-def _ensure_work_scope_revision_tables(sync_conn: object) -> None:
-    """Create the rebuildable Work revision read model on bootstrap upgrades."""
-
-    from cognis.store.models import WorkScopeState, WorkScopeStream
-
-    WorkScopeState.__table__.create(bind=sync_conn, checkfirst=True)
-    WorkScopeStream.__table__.create(bind=sync_conn, checkfirst=True)
 
 
 def _ensure_session_compaction_columns(sync_conn: object) -> None:
@@ -1038,9 +1533,9 @@ def _ensure_harness_recovery_tables(sync_conn: object) -> None:
 
     from cognis.store.models import FollowUpDedupeRow, FollowUpIntentRow, RememberQueueRow
 
-    RememberQueueRow.__table__.create(bind=sync_conn, checkfirst=True)
-    FollowUpDedupeRow.__table__.create(bind=sync_conn, checkfirst=True)
-    FollowUpIntentRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(RememberQueueRow, sync_conn)
+    _create_model_table(FollowUpDedupeRow, sync_conn)
+    _create_model_table(FollowUpIntentRow, sync_conn)
 
     inspector = cast(Any, inspect(sync_conn))
     execute = sync_conn.execute  # type: ignore[attr-defined]
@@ -1079,7 +1574,7 @@ def _ensure_tool_classification_table(sync_conn: object) -> None:
 
     from cognis.store.models import ToolClassificationRow
 
-    ToolClassificationRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(ToolClassificationRow, sync_conn)
 
 
 def _ensure_tool_classification_override_table(sync_conn: object) -> None:
@@ -1087,7 +1582,7 @@ def _ensure_tool_classification_override_table(sync_conn: object) -> None:
 
     from cognis.store.models import ToolClassificationOverrideRow
 
-    ToolClassificationOverrideRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(ToolClassificationOverrideRow, sync_conn)
 
 
 def _ensure_browser_sessions_table(sync_conn: object) -> None:
@@ -1095,7 +1590,54 @@ def _ensure_browser_sessions_table(sync_conn: object) -> None:
 
     from cognis.store.models import BrowserSession
 
-    BrowserSession.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(BrowserSession, sync_conn)
+
+
+def _ensure_native_sessions_table(sync_conn: object) -> None:
+    """Create the durable native refresh session table."""
+
+    from cognis.store.models import NativeSession
+
+    _create_model_table(NativeSession, sync_conn)
+
+
+def _ensure_mfa_tables(sync_conn: object) -> None:
+    """Create focused TOTP MFA persistence tables."""
+
+    from cognis.store.models import (
+        MfaAttemptBudget,
+        MfaChallenge,
+        MfaRecoveryCode,
+        UserTotpFactor,
+    )
+
+    _create_model_table(UserTotpFactor, sync_conn)
+    _create_model_table(MfaRecoveryCode, sync_conn)
+    _create_model_table(MfaChallenge, sync_conn)
+    _create_model_table(MfaAttemptBudget, sync_conn)
+
+
+def _ensure_user_auth_version(sync_conn: object) -> None:
+    """Add the durable access-token revocation version to existing users."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "auth_version" not in columns:
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+        )
+
+
+def _ensure_session_auth_versions(sync_conn: object) -> None:
+    """Add auth-version bindings to pre-existing sessions and MFA challenges."""
+
+    inspector = cast(Any, inspect(sync_conn))
+    for table_name in ("browser_sessions", "native_sessions", "mfa_challenges"):
+        columns = {column["name"] for column in inspector.get_columns(table_name)}
+        if "auth_version" not in columns:
+            sync_conn.execute(  # type: ignore[attr-defined]
+                text(f"ALTER TABLE {table_name} ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+            )
 
 
 def _ensure_push_subscriptions_table(sync_conn: object) -> None:
@@ -1103,7 +1645,7 @@ def _ensure_push_subscriptions_table(sync_conn: object) -> None:
 
     from cognis.store.models import PushSubscriptionRow
 
-    PushSubscriptionRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(PushSubscriptionRow, sync_conn)
 
 
 def _ensure_channel_preferred_delivery_column(sync_conn: object) -> None:
@@ -1127,8 +1669,8 @@ def _ensure_projects_tables(sync_conn: object) -> None:
 
     from cognis.store.models import ProjectRow, ProjectSourceRow
 
-    ProjectRow.__table__.create(bind=sync_conn, checkfirst=True)
-    ProjectSourceRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(ProjectRow, sync_conn)
+    _create_model_table(ProjectSourceRow, sync_conn)
 
 
 def _ensure_project_links_workflows_grants(sync_conn: object) -> None:
@@ -1136,8 +1678,8 @@ def _ensure_project_links_workflows_grants(sync_conn: object) -> None:
 
     from cognis.store.models import ProjectGrantRow, ProjectWorkflowRow
 
-    ProjectWorkflowRow.__table__.create(bind=sync_conn, checkfirst=True)
-    ProjectGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(ProjectWorkflowRow, sync_conn)
+    _create_model_table(ProjectGrantRow, sync_conn)
     inspector = cast(Any, inspect(sync_conn))
     execute = sync_conn.execute  # type: ignore[attr-defined]
     task_columns = {column["name"] for column in inspector.get_columns("tasks")}
@@ -1222,7 +1764,7 @@ def _ensure_task_comments_table(sync_conn: object) -> None:
 
     from cognis.store.models import TaskCommentRow
 
-    TaskCommentRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(TaskCommentRow, sync_conn)
 
 
 def _ensure_tts_cache_table(sync_conn: object) -> None:
@@ -1230,7 +1772,7 @@ def _ensure_tts_cache_table(sync_conn: object) -> None:
 
     from cognis.store.models import TtsCacheRow
 
-    TtsCacheRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(TtsCacheRow, sync_conn)
 
 
 def _ensure_agent_grants_table(sync_conn: object) -> None:
@@ -1238,7 +1780,7 @@ def _ensure_agent_grants_table(sync_conn: object) -> None:
 
     from cognis.store.models import AgentGrantRow
 
-    AgentGrantRow.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(AgentGrantRow, sync_conn)
 
 
 def _ensure_agent_grant_overrides_column(sync_conn: object) -> None:
@@ -1383,7 +1925,7 @@ def _ensure_llm_provider_owner_schema(sync_conn: object) -> None:
             "ON model_routing (owner_email, task_type)"
         )
     )
-    LLMProviderAuthSession.__table__.create(bind=sync_conn, checkfirst=True)
+    _create_model_table(LLMProviderAuthSession, sync_conn)
 
 
 def _ensure_active_session_id_column(sync_conn: object) -> None:
@@ -1648,7 +2190,7 @@ def _ensure_executor_pin_stage3_schema(sync_conn: object) -> None:
             )
         )
     transition_indexes = {
-        index["name"] for index in inspect(sync_conn).get_indexes("executor_pin_transitions")
+        index["name"] for index in inspector.get_indexes("executor_pin_transitions")
     }
     if "ix_executor_pin_transitions_notice_pending" not in transition_indexes:
         execute(
@@ -1704,7 +2246,7 @@ def _ensure_executor_pin_stage3_schema(sync_conn: object) -> None:
         if "agent_id" not in columns:
             execute(text("ALTER TABLE executor_pin_notice_outbox ADD COLUMN agent_id VARCHAR"))
     outbox_indexes = {
-        index["name"] for index in inspect(sync_conn).get_indexes("executor_pin_notice_outbox")
+        index["name"] for index in inspector.get_indexes("executor_pin_notice_outbox")
     }
     if "ix_executor_pin_notice_outbox_pending" not in outbox_indexes:
         execute(
@@ -1863,8 +2405,23 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
         execute(
             text("ALTER TABLE schedules ADD COLUMN delete_after_run BOOLEAN NOT NULL DEFAULT false")
         )
+    if "retry_failed_tasks" not in columns:
+        execute(
+            text(
+                "ALTER TABLE schedules ADD COLUMN retry_failed_tasks BOOLEAN NOT NULL DEFAULT false"
+            )
+        )
+    if "fail_paused_task_on_next_fire" not in columns:
+        execute(
+            text(
+                "ALTER TABLE schedules ADD COLUMN fail_paused_task_on_next_fire "
+                "BOOLEAN NOT NULL DEFAULT true"
+            )
+        )
     if "last_run_status" not in columns:
         execute(text("ALTER TABLE schedules ADD COLUMN last_run_status VARCHAR"))
+    if "last_terminal_task_id" not in columns:
+        execute(text("ALTER TABLE schedules ADD COLUMN last_terminal_task_id VARCHAR"))
     if "consecutive_errors" not in columns:
         execute(
             text("ALTER TABLE schedules ADD COLUMN consecutive_errors INTEGER NOT NULL DEFAULT 0")
@@ -1903,6 +2460,12 @@ def _ensure_schedule_extended_columns(sync_conn: object) -> None:
 
     with contextlib.suppress(Exception):
         execute(text("ALTER TABLE schedules ALTER COLUMN cron_expr DROP NOT NULL"))
+    execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_schedules_owner_run_status_updated "
+            "ON schedules (created_by, last_run_status, updated_at)"
+        )
+    )
 
 
 def _ensure_mcp_server_headers_column(sync_conn: object) -> None:
@@ -1932,8 +2495,8 @@ def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
     execute = sync_conn.execute  # type: ignore[attr-defined]
     if columns and "auth_config" not in columns:
         execute(text("ALTER TABLE mcp_servers ADD COLUMN auth_config JSON"))
-    MCPOAuthTokenRow.__table__.create(sync_conn, checkfirst=True)
-    MCPOAuthTransactionRow.__table__.create(sync_conn, checkfirst=True)
+    _create_model_table(MCPOAuthTokenRow, sync_conn)
+    _create_model_table(MCPOAuthTransactionRow, sync_conn)
     try:
         token_columns = {column["name"] for column in inspector.get_columns("mcp_oauth_tokens")}
     except Exception:
@@ -1950,8 +2513,8 @@ def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
     for name, sql_type in additions.items():
         if token_columns and name not in token_columns:
             execute(text(f"ALTER TABLE mcp_oauth_tokens ADD COLUMN {name} {sql_type}"))
-    for index in MCPOAuthTokenRow.__table__.indexes:
-        index.create(sync_conn, checkfirst=True)
+    for index in _model_table(MCPOAuthTokenRow).indexes:
+        index.create(bind=_as_connection(sync_conn), checkfirst=True)
     try:
         transaction_columns = {
             column["name"] for column in inspector.get_columns("mcp_oauth_transactions")
@@ -1967,8 +2530,8 @@ def _ensure_mcp_oauth_schema(sync_conn: object) -> None:
     for name, sql_type in transaction_additions.items():
         if transaction_columns and name not in transaction_columns:
             execute(text(f"ALTER TABLE mcp_oauth_transactions ADD COLUMN {name} {sql_type}"))
-    for index in MCPOAuthTransactionRow.__table__.indexes:
-        index.create(sync_conn, checkfirst=True)
+    for index in _model_table(MCPOAuthTransactionRow).indexes:
+        index.create(bind=_as_connection(sync_conn), checkfirst=True)
 
 
 def _ensure_system_override_tables(sync_conn: object) -> None:
@@ -1976,8 +2539,8 @@ def _ensure_system_override_tables(sync_conn: object) -> None:
 
     from cognis.store.models import SystemAgentOverride, SystemWorkflowOverride
 
-    SystemAgentOverride.__table__.create(sync_conn, checkfirst=True)
-    SystemWorkflowOverride.__table__.create(sync_conn, checkfirst=True)
+    _create_model_table(SystemAgentOverride, sync_conn)
+    _create_model_table(SystemWorkflowOverride, sync_conn)
 
 
 def _ensure_task_execution_paths(sync_conn: object) -> None:
@@ -1985,9 +2548,10 @@ def _ensure_task_execution_paths(sync_conn: object) -> None:
 
     from sqlalchemy import inspect, text
 
-    inspector = inspect(sync_conn)
+    connection = _as_connection(sync_conn)
+    inspector = inspect(connection)
     columns = {column["name"] for column in inspector.get_columns("tasks")}
-    execute = sync_conn.execute
+    execute = connection.execute
     if "workspace_root" not in columns:
         execute(text("ALTER TABLE tasks ADD COLUMN workspace_root TEXT"))
     if "working_directory" not in columns:
@@ -2091,9 +2655,7 @@ def _ensure_managed_conversation_lineage(sync_conn: object) -> None:
             "(handoff_state, handoff_controller_session_id, handoff_controller_turn_id)"
         )
     )
-    columns = {
-        column["name"] for column in inspect(sync_conn).get_columns("managed_conversation_links")
-    }
+    columns = {column["name"] for column in inspector.get_columns("managed_conversation_links")}
     if {"user_email", "controller_session_id", "link_id"} <= columns:
         execute(
             text(
@@ -2242,13 +2804,18 @@ def _ensure_managed_channel_fence_columns(sync_conn: object) -> None:
 
     inspector = cast(Any, inspect(sync_conn))
     execute = sync_conn.execute  # type: ignore[attr-defined]
+    timestamp_type = (
+        "TIMESTAMP WITH TIME ZONE"
+        if sync_conn.dialect.name == "postgresql"  # type: ignore[attr-defined]
+        else "DATETIME"
+    )
     additions = {
         "managed_conversation_signals": (("source_turn_id", "VARCHAR"),),
         "managed_channel_bindings": (
             ("delivery_lease_token", "VARCHAR"),
             ("delivery_lease_version", "BIGINT"),
             ("delivery_lease_owner_epoch", "BIGINT"),
-            ("delivery_lease_expires_at", "DATETIME"),
+            ("delivery_lease_expires_at", timestamp_type),
         ),
     }
     for table_name, columns in additions.items():
@@ -2276,13 +2843,13 @@ def _ensure_group_context_columns(sync_conn: object) -> None:
     ledger_table = "channel_inbound_ledger"
     if inspector.has_table(ledger_table):
         existing = {column["name"] for column in inspector.get_columns(ledger_table)}
-        additions = (
+        consumption_additions = (
             ("observed_at", "TIMESTAMP WITH TIME ZONE"),
             ("ordering_key", "VARCHAR"),
             ("ordering_source", "VARCHAR NOT NULL DEFAULT 'observed'"),
             ("retain_until", "TIMESTAMP WITH TIME ZONE"),
         )
-        for column_name, sql_type in additions:
+        for column_name, sql_type in consumption_additions:
             if column_name not in existing:
                 execute(text(f"ALTER TABLE {ledger_table} ADD COLUMN {column_name} {sql_type}"))
         execute(
@@ -2382,9 +2949,10 @@ def _ensure_step_run_execution_paths(sync_conn: object) -> None:
 
     from sqlalchemy import inspect, text
 
-    inspector = inspect(sync_conn)
+    connection = _as_connection(sync_conn)
+    inspector = inspect(connection)
     columns = {column["name"] for column in inspector.get_columns("step_runs")}
-    execute = sync_conn.execute
+    execute = connection.execute
     if "workspace_root" not in columns:
         execute(text("ALTER TABLE step_runs ADD COLUMN workspace_root TEXT"))
     if "working_directory" not in columns:
@@ -2396,7 +2964,7 @@ def _ensure_deliverables_table(sync_conn: object) -> None:
 
     from cognis.store.models import DeliverableRow
 
-    DeliverableRow.__table__.create(sync_conn, checkfirst=True)
+    _create_model_table(DeliverableRow, sync_conn)
     inspector = cast(Any, inspect(sync_conn))
     column_info = {column["name"]: column for column in inspector.get_columns("deliverables")}
     columns = set(column_info)
@@ -2481,7 +3049,7 @@ def _make_deliverables_column_nullable(
         from alembic.operations import Operations
         from alembic.runtime.migration import MigrationContext
 
-        context = MigrationContext.configure(sync_conn)
+        context = MigrationContext.configure(_as_connection(sync_conn))
         with Operations(context).batch_alter_table("deliverables") as batch:
             batch.alter_column(column_name, existing_type=existing_type, nullable=True)
         return
@@ -2570,7 +3138,7 @@ async def _ensure_system_user(session: AsyncSession) -> None:
     now = datetime.now(UTC)
     await insert_row_if_absent(
         session,
-        User.__table__,
+        _model_table(User),
         {
             "email": SYSTEM_USER_EMAIL,
             "name": "System",
@@ -2600,7 +3168,7 @@ async def seed_system_agents(session: AsyncSession) -> None:
         now = datetime.now(UTC)
         await insert_row_if_absent(
             session,
-            Agent.__table__,
+            _model_table(Agent),
             {
                 "agent_id": agent_def.agent_id,
                 "owner_email": SYSTEM_USER_EMAIL,
@@ -2641,7 +3209,7 @@ async def seed_default_settings(session: AsyncSession) -> None:
     for key, (category, value) in DEFAULT_SETTINGS.items():
         await insert_row_if_absent(
             session,
-            Setting.__table__,
+            _model_table(Setting),
             {
                 "key": key,
                 "value": value,
@@ -2662,9 +3230,12 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
         assert defaults is not None
         skill_id = str(skill["skill_id"])
         now = datetime.now(UTC)
+        linked_tool_ids = cast(list[object], defaults.get("linked_tool_ids") or [])
+        tags = cast(list[object], defaults["tags"])
+        steps = cast(list[dict[str, Any]] | None, defaults.get("steps"))
         await insert_row_if_absent(
             session,
-            SkillRow.__table__,
+            _model_table(SkillRow),
             {
                 "skill_id": skill_id,
                 "name": str(defaults["name"]),
@@ -2675,11 +3246,9 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
                 ),
                 "instructions": str(defaults["instructions"]),
                 "tools": defaults.get("tools"),
-                "linked_tool_ids": [
-                    str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
-                ],
+                "linked_tool_ids": [str(tool_id) for tool_id in linked_tool_ids],
                 "prompt_templates": defaults.get("prompt_templates"),
-                "tags": list(defaults["tags"]),
+                "tags": list(tags),
                 "auto_load": bool(defaults.get("auto_load", False)),
                 "is_system": True,
                 "source": "db",
@@ -2704,9 +3273,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             "tools": defaults["tools"],
             "prompt_templates": defaults["prompt_templates"],
             "tags": defaults["tags"],
-            "linked_tool_ids": [
-                str(tool_id) for tool_id in (defaults.get("linked_tool_ids") or [])
-            ],
+            "linked_tool_ids": [str(tool_id) for tool_id in linked_tool_ids],
         }
         for key, value in updates.items():
             setattr(existing, key, value)
@@ -2715,7 +3282,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             existing.tools,
             existing.linked_tool_ids,
             existing.prompt_templates,
-            steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+            steps=steps,
         )
         current_version = (
             await get_skill_version(session, existing.current_version_id)
@@ -2734,7 +3301,7 @@ async def seed_builtin_management_skills(session: AsyncSession) -> None:
             linked_tool_ids=existing.linked_tool_ids,
             prompt_templates=existing.prompt_templates,
             secret_placeholders=None,
-            steps=defaults.get("steps") if isinstance(defaults.get("steps"), list) else None,
+            steps=steps,
             decomposition_source_hash=None,
         )
         await set_current_version(session, existing.skill_id, version_row.version_id)
@@ -2758,7 +3325,7 @@ async def maybe_seed_initial_admin(
     now = datetime.now(UTC)
     await insert_row_if_absent(
         session,
-        User.__table__,
+        _model_table(User),
         {
             "email": config.initial_admin_email,
             "name": "Admin",

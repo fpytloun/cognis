@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "id": "id-collision-report",
+  "title": "ID collision report",
+  "description": "Reserved namespaces, duplicate explicit IDs, and titled Markdown hierarchy.",
+  "group": "reference",
+  "sort_key": 1100,
+  "content": "Collision fixture fallback.",
+  "payload": {
+    "metadata": {
+      "toc": {
+        "enabled": true,
+        "depth": 3
+      }
+    },
+    "blocks": [
+      {
+        "type": "section",
+        "id": "rich-section-0",
+        "title": "Legacy collision"
+      },
+      {
+        "type": "section",
+        "id": "reference-1",
+        "title": "Reference collision"
+      },
+      {
+        "type": "section",
+        "id": "references-heading",
+        "title": "Bibliography collision"
+      },
+      {
+        "type": "section",
+        "id": "cite-1-1",
+        "title": "Citation collision"
+      },
+      {
+        "type": "section",
+        "id": "toc",
+        "title": "TOC collision"
+      },
+      {
+        "type": "figure",
+        "id": "figure-1",
+        "title": "Figure collision"
+      },
+      {
+        "type": "table",
+        "id": "table-1",
+        "title": "Table collision"
+      },
+      {
+        "type": "section",
+        "id": "mermaid-0",
+        "title": "Mermaid ID collision"
+      },
+      {
+        "type": "mermaid",
+        "title": "Actual Mermaid",
+        "source": "flowchart LR\n  A --> B"
+      },
+      {
+        "type": "section",
+        "id": "duplicate",
+        "title": "Duplicate one"
+      },
+      {
+        "type": "section",
+        "id": "duplicate",
+        "title": "Duplicate two"
+      },
+      {
+        "type": "markdown",
+        "id": "summary",
+        "title": "Summary",
+        "content": "# Content heading\n\nParagraph.\n\n### Detail heading\n\nMore."
+      },
+      {
+        "type": "research_answer",
+        "title": "Evidence",
+        "paragraphs": [
+          {
+            "text": "Claim.",
+            "citations": [
+              "source"
+            ]
+          }
+        ]
+      }
+    ],
+    "assets": [],
+    "sources": [
+      {
+        "id": "source",
+        "title": "Collision source"
+      }
+    ],
+    "datasets": [],
+    "exports": []
+  }
+}

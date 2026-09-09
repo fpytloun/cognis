@@ -1896,7 +1896,10 @@ async def _handle_skill_import_url(
         return ToolResult(output=f"Import failed: {exc}", is_error=True)
 
     try:
-        name = arguments.get("name") or skill_data.get("name") or "Imported Skill"
+        raw_name = arguments.get("name") or skill_data.get("name")
+        name = raw_name if isinstance(raw_name, str) and raw_name.strip() else "Imported Skill"
+        raw_description = skill_data.get("description")
+        description = raw_description if isinstance(raw_description, str) else None
         instructions = str(skill_data.get("instructions") or "")
         tools = normalize_skill_tools(skill_data.get("tools"))
         linked_tool_ids = (
@@ -1909,8 +1912,19 @@ async def _handle_skill_import_url(
         )
         templates = normalize_prompt_templates(skill_data.get("prompt_templates"))
         placeholders = normalize_secret_placeholders(skill_data.get("secret_placeholders"))
-        steps = skill_data.get("steps") if isinstance(skill_data.get("steps"), list) else None
-        tags = arguments.get("tags") or skill_data.get("tags") or []
+        steps = normalize_skill_steps(skill_data.get("steps"))
+        raw_assets = skill_data.get("assets")
+        assets = (
+            [item for item in raw_assets if isinstance(item, dict)]
+            if isinstance(raw_assets, list)
+            else None
+        )
+        raw_tags = arguments.get("tags") or skill_data.get("tags") or []
+        tags = (
+            [item for item in raw_tags if isinstance(item, str)]
+            if isinstance(raw_tags, list)
+            else []
+        )
         attach_to_all_agents = _resolve_attach_to_all_agents(arguments)
     except ValueError as exc:
         return ToolResult(output=str(exc), is_error=True)
@@ -1919,7 +1933,7 @@ async def _handle_skill_import_url(
         row = await create_skill(
             session,
             name=name,
-            description=skill_data.get("description"),
+            description=description,
             instructions=instructions,
             tools=tools,
             linked_tool_ids=linked_tool_ids,
@@ -1942,9 +1956,7 @@ async def _handle_skill_import_url(
                 prompt_templates=templates,
                 secret_placeholders=placeholders,
                 steps=steps,
-                assets=skill_data.get("assets")
-                if isinstance(skill_data.get("assets"), list)
-                else None,
+                assets=assets,
                 allow_binary_assets=False,
                 source_url=provenance.source_url,
                 resolved_url=provenance.resolved_url,
@@ -1976,7 +1988,7 @@ async def _handle_skill_import_url(
                 _resolved_skill_tool_ids(
                     row.skill_id,
                     str(name),
-                    skill_data.get("description"),
+                    description,
                     attach_to_all_agents,
                     str(instructions),
                     tools,
@@ -2015,7 +2027,7 @@ async def _handle_skill_export(
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
 
         version_row = await resolve_current_skill_version(session, row)
-        asset_manifest = []
+        asset_manifest: list[SkillAssetRef] = []
         asset_bytes: dict[str, bytes] = {}
         if version_row is not None:
             asset_manifest, asset_bytes = await load_export_assets(

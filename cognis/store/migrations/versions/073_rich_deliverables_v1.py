@@ -16,17 +16,26 @@ depends_on = None
 
 
 def _column_names() -> set[str]:
-    return {column["name"] for column in sa.inspect(op.get_bind()).get_columns("deliverables")}
+    return {
+        str(column["name"])
+        for column in sa.inspect(op.get_bind()).get_columns("deliverables")
+        if column.get("name")
+    }
 
 
 def _index_names() -> set[str]:
-    return {index["name"] for index in sa.inspect(op.get_bind()).get_indexes("deliverables")}
+    return {
+        str(index["name"])
+        for index in sa.inspect(op.get_bind()).get_indexes("deliverables")
+        if index.get("name")
+    }
 
 
 def _unique_constraint_names() -> set[str]:
     return {
-        constraint["name"]
+        str(constraint["name"])
         for constraint in sa.inspect(op.get_bind()).get_unique_constraints("deliverables")
+        if constraint.get("name")
     }
 
 

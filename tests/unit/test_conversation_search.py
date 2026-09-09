@@ -60,6 +60,7 @@ async def test_join_session_matches_drops_non_owned_and_sorts_by_kind(
             project_id=None,
             status="active",
             context_type="web",
+            context_data={},
         ),
         "conv-2": SimpleNamespace(
             conversation_id="conv-2",
@@ -69,6 +70,7 @@ async def test_join_session_matches_drops_non_owned_and_sorts_by_kind(
             project_id=None,
             status="active",
             context_type="web",
+            context_data={},
         ),
     }
 
@@ -161,6 +163,7 @@ async def test_join_session_matches_filters_score_deleted_and_context(
             project_id=None,
             status="active",
             context_type="web",
+            context_data={},
         ),
         "conv-signal": SimpleNamespace(
             conversation_id="conv-signal",
@@ -170,6 +173,7 @@ async def test_join_session_matches_filters_score_deleted_and_context(
             project_id=None,
             status="active",
             context_type="signal",
+            context_data={},
         ),
         "conv-deleted": SimpleNamespace(
             conversation_id="conv-deleted",
@@ -179,6 +183,7 @@ async def test_join_session_matches_filters_score_deleted_and_context(
             project_id=None,
             status="deleted",
             context_type="web",
+            context_data={},
         ),
     }
 
@@ -276,6 +281,7 @@ async def test_join_session_matches_preserves_low_score_exact_hits(
         project_id=None,
         status="active",
         context_type="web",
+        context_data={},
     )
 
     async def fake_list_sessions(_db: object, ids: list[str]) -> list[object]:

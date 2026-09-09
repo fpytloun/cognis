@@ -20,6 +20,7 @@ from cognis.core.question_sets import normalize_questions, normalize_reply
 from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
 from cognis.models.conversation_state import ConversationStateEnvelope
 from cognis.models.executor_resources import ExecutorResourceSnapshot
+from cognis.models.runtime_capabilities import RuntimeCapabilityReport
 from cognis.models.task import TaskDelivery
 from cognis.models.workflow import SessionPolicy, WorkflowState
 
@@ -34,6 +35,57 @@ class ErrorBody(BaseModel):
 
 class ErrorResponse(BaseModel):
     error: ErrorBody
+
+
+DashboardIssueSeverity = Literal["critical", "warning", "info"]
+DashboardIssueKind = Literal[
+    "executor_unavailable",
+    "executor_degraded",
+    "executor_config_not_converged",
+    "tool_observation_missing",
+    "tool_observation_stale",
+    "mcp_runtime_fault",
+    "mcp_auth_fault",
+    "schedule_failed",
+    "schedule_auto_disabled",
+]
+
+
+class DashboardIssueResource(BaseModel):
+    type: Literal["executor", "mcp_server", "schedule"]
+    id: str
+    label: str
+
+
+class DashboardIssue(BaseModel):
+    id: str
+    severity: DashboardIssueSeverity
+    kind: DashboardIssueKind
+    title: str
+    detail: str
+    resource: DashboardIssueResource
+    observed_at: datetime | None = None
+    action_url: str
+    action_label: str = "View"
+    dismiss_token: str | None = None
+
+
+class DashboardIssueDismissRequest(BaseModel):
+    incident_token: str
+
+
+class DashboardIssuesSummary(BaseModel):
+    total: int
+    critical: int
+    warning: int
+    info: int
+    truncated: bool = False
+
+
+class DashboardIssuesResponse(BaseModel):
+    generated_at: datetime
+    issues: list[DashboardIssue]
+    summary: DashboardIssuesSummary
 
 
 class CursorPage[T](BaseModel):
@@ -99,9 +151,11 @@ class SetupRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+    mode: Literal["browser", "native"] = "browser"
 
 
 class RefreshRequest(BaseModel):
+    mode: Literal["browser", "native"] = "browser"
     refresh_token: str | None = None
 
 
@@ -117,12 +171,68 @@ class TokenResponse(BaseModel):
     user: dict[str, Any]
 
 
-class AuthSessionResponse(BaseModel):
+class BrowserSessionResponse(BaseModel):
+    status: Literal["authenticated"] = "authenticated"
     user: dict[str, Any]
     expires_at: datetime
-    token: str | None = None
-    refresh_token: str | None = None
-    expires_in: int | None = None
+    recovery_codes: list[str] | None = None
+
+
+class NativeTokenResponse(BaseModel):
+    status: Literal["authenticated"] = "authenticated"
+    user: dict[str, Any]
+    token: str
+    refresh_token: str
+    expires_in: int
+    recovery_codes: list[str] | None = None
+
+
+class MfaChallengeResponse(BaseModel):
+    status: Literal["mfa_required", "mfa_setup_required"]
+    method: Literal["totp"] = "totp"
+    challenge_token: str
+    expires_in: int
+
+
+class MfaChallengeRequest(BaseModel):
+    challenge_token: str = Field(min_length=20, max_length=200)
+
+
+class MfaEnrollmentStartRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+
+
+class MfaCodeRequest(MfaChallengeRequest):
+    code: str = Field(min_length=6, max_length=32)
+
+
+class MfaSetupResponse(BaseModel):
+    status: Literal["mfa_setup"]
+    method: Literal["totp"] = "totp"
+    challenge_token: str
+    secret: str
+    provisioning_uri: str
+
+
+class MfaStatusResponse(BaseModel):
+    method: Literal["totp"] = "totp"
+    enabled: bool
+    policy: Literal["optional", "required"]
+    recovery_codes_remaining: int
+
+
+class MfaEnabledResponse(BaseModel):
+    status: Literal["mfa_enabled"] = "mfa_enabled"
+    recovery_codes: list[str]
+
+
+class MfaManageRequest(BaseModel):
+    current_password: str
+    code: str = Field(min_length=6, max_length=32)
+
+
+class MfaRecoveryCodesResponse(BaseModel):
+    recovery_codes: list[str]
 
 
 class ExchangeTokenResponse(BaseModel):
@@ -194,6 +304,7 @@ class UserDisplayPreferences(BaseModel):
 
     theme: Literal["system", "dark", "light"] = "system"
     language: str = "auto"
+    dashboard_workspace_windows: bool = True
 
     @field_validator("language")
     @classmethod
@@ -214,6 +325,7 @@ class UserDisplayPreferences(BaseModel):
 class UserChatPreferences(BaseModel):
     model_config = {"extra": "forbid"}
 
+    enter_to_send: bool = True
     show_thinking_blocks: bool = False
     group_tool_calls: bool = True
     keep_assistant_messages_separate: bool = False
@@ -252,6 +364,7 @@ class HealthResponse(BaseModel):
     status: str
     providers: dict[str, dict[str, Any]]
     remember_queue: dict[str, Any] | None = None
+    trusted_evidence_policy: dict[str, Any] | None = None
 
 
 class ClientDiscoveryProduct(BaseModel):
@@ -426,6 +539,96 @@ class ConversationUpdateRequest(BaseModel):
     starred_at: datetime | None = None
 
 
+AttentionActionKind = Literal[
+    "escalation",
+    "gate",
+    "step_question",
+    "credential_request",
+    "auth_challenge",
+    "oauth_authorization",
+    "unsupported",
+]
+AttentionActionAvailability = Literal[
+    "actionable",
+    "read_only",
+    "resolving",
+    "recovery_required",
+    "unsupported",
+    "expired",
+    "resolved",
+]
+
+
+class AttentionActionSource(BaseModel):
+    notification_id: str
+    conversation_id: str
+    managed_origin_conversation_id: str | None = None
+    task_id: str | None = None
+    step_name: str | None = None
+    step_run_id: str | None = None
+    session_id: str | None = None
+
+
+class AttentionActionSummary(BaseModel):
+    action_id: str
+    kind: AttentionActionKind
+    status: str
+    availability: AttentionActionAvailability
+    title: str
+    source: AttentionActionSource
+    can_resolve: bool
+    has_action_form: bool = False
+    expires_at: datetime | None = None
+    revision: int
+    convergence_id: str
+
+
+class AttentionActionChoice(BaseModel):
+    action: str
+    label: str
+    intent: Literal["primary", "secondary", "danger"] = "secondary"
+    input: Literal["none", "note", "feedback", "structured", "credential", "auth_fields"]
+
+
+class AttentionQuestionOption(BaseModel):
+    id: str
+    label: str
+    description: str | None = None
+
+
+class AttentionQuestion(BaseModel):
+    id: str
+    question: str
+    header: str | None = None
+    options: list[AttentionQuestionOption] = Field(default_factory=list)
+    multiple: bool = False
+    allow_custom: bool = True
+    required: bool = True
+
+
+class AttentionActionDisplay(BaseModel):
+    message: str | None = None
+    tool_name: str | None = None
+    arguments_display: dict[str, Any] | None = None
+    reasoning: str | None = None
+    risk: str | None = None
+    questions: list[AttentionQuestion] = Field(default_factory=list)
+    required_fields: list[str] = Field(default_factory=list)
+    credential_id: str | None = None
+    credential_kind: str | None = None
+    credential_label: str | None = None
+    credential_scope: str | None = None
+    authorization_url: str | None = None
+    user_code: str | None = None
+    callback_mode: str | None = None
+    executor_name: str | None = None
+
+
+class AttentionActionDetail(AttentionActionSummary):
+    display: AttentionActionDisplay
+    allowed_actions: list[AttentionActionChoice] = Field(default_factory=list)
+
+
 class ConversationResponse(BaseModel):
     conversation_id: str
     user_email: str
@@ -445,6 +648,7 @@ class ConversationResponse(BaseModel):
     active_turn_chat_mode: str | None = None
     active_turn_chat_mode_source: str | None = None
     pending_notification_types: list[str] = Field(default_factory=list)
+    attention_actions: list[AttentionActionSummary] = Field(default_factory=list)
     starred_at: datetime | None = None
     status: str
     last_message_at: datetime | None = None
@@ -716,6 +920,11 @@ class SessionResponse(BaseModel):
     user_email: str
     agent_id: str
     agent_profile_id: str | None = None
+    model_override: str | None = None
+    model_override_provider_id: str | None = None
+    reasoning_effort_override: str | None = None
+    fast_mode_override: bool | None = None
+    runtime_override_revision: int = 0
     delegation_mode: str | None = None
     delegation_task: str | None = None
     status: str
@@ -732,6 +941,21 @@ class SessionResponse(BaseModel):
     updated_at: datetime | None = None
 
 
+class RuntimeSelectionResponse(BaseModel):
+    """Effective runtime selection for the next admitted turn."""
+
+    revision: int
+    profile_id: str
+    profile_source: str
+    model: str | None = None
+    provider_id: str | None = None
+    model_source: str
+    reasoning_effort: str | None = None
+    reasoning_effort_source: str
+    fast_mode: bool | None = None
+    fast_mode_source: str
+
+
 class IntarisSessionDetailResponse(BaseModel):
     session_id: str
     intaris_session_id: str
@@ -746,6 +970,7 @@ class IntarisSessionDetailResponse(BaseModel):
     context_usage: dict[str, Any] | None = None
     token_usage: TokenUsage | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
+    runtime_selection: RuntimeSelectionResponse | None = None
 
 
 class SessionCancelResponse(BaseModel):
@@ -874,11 +1099,14 @@ class BackgroundWorkTodoResponse(BaseModel):
 
 
 class BackgroundWorkItemResponse(BaseModel):
-    kind: Literal["managed_conversation", "delegated_session"]
+    kind: Literal["managed_conversation", "delegated_session", "background_command"]
     work_id: str
     controller_conversation_id: str
+    controller_session_id: str | None = None
     target_conversation_id: str | None = None
     session_id: str | None = None
+    parent_session_id: str | None = None
+    executor_id: str | None = None
     title: str
     agent_id: str
     agent_profile_id: str | None = None
@@ -902,8 +1130,11 @@ class SidebarProjectionResponse(BaseModel):
     context_types: list[str] = Field(default_factory=list)
     removed_conversation_ids: list[str] = Field(default_factory=list)
     full_resync_required: bool = False
+    is_delta: bool = False
     sync_timestamp: datetime | None = None
-    background_work: BackgroundWorkProjectionResponse
+    sidebar_revision: str | None = None
+    background_work: BackgroundWorkProjectionResponse | None = None
+    background_work_changed: bool = True
 
 
 class AgentCardResponse(BaseModel):
@@ -1296,7 +1527,17 @@ class TaskCommentCreateRequest(BaseModel):
     intent: str = "record_only"
     noop: bool = True
     target_step: str | None = None
+    expected_attempt: int | None = Field(default=None, ge=1)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def require_revision_attempt(self) -> TaskCommentCreateRequest:
+        if self.intent == "request_revision" and self.expected_attempt is None:
+            raise PydanticCustomError(
+                "missing_revision_attempt",
+                "expected_attempt is required for request_revision",
+            )
+        return self
 
 
 class TaskCommentUpdateRequest(BaseModel):
@@ -1458,6 +1699,17 @@ class TaskResponse(BaseModel):
         return _serialize_public_workflow_state(state)
 
 
+class TaskBoardProgressSummaryResponse(BaseModel):
+    todo_total: int = 0
+    todo_completed: int = 0
+    todo_in_progress: int = 0
+    current_step_name: str | None = None
+    current_step_status: str | None = None
+    changed_files: int = 0
+    additions: int = 0
+    deletions: int = 0
+
+
 class TaskBoardItemResponse(BaseModel):
     task_id: str
     title: str
@@ -1473,6 +1725,9 @@ class TaskBoardItemResponse(BaseModel):
     completed_at: datetime | None = None
     updated_at: datetime | None = None
     result_summary: str | None = None
+    attention_type: str | None = None
+    attention_actions: list[AttentionActionSummary] = Field(default_factory=list)
+    progress_summary: TaskBoardProgressSummaryResponse | None = None
 
 
 class TaskBoardDoneGroupResponse(BaseModel):
@@ -1612,6 +1867,8 @@ class CreateScheduleRequest(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
+    retry_failed_tasks: bool = False
+    fail_paused_task_on_next_fire: bool = True
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = "none"
@@ -1659,6 +1916,8 @@ class UpdateScheduleRequest(BaseModel):
     enabled: bool | None = None
     max_concurrent_runs: int | None = None
     delete_after_run: bool | None = None
+    retry_failed_tasks: bool | None = None
+    fail_paused_task_on_next_fire: bool | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
     interaction_mode_override: InteractionModeOverride | None = None
@@ -1696,6 +1955,8 @@ class ScheduleResponse(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
+    retry_failed_tasks: bool = False
+    fail_paused_task_on_next_fire: bool = True
     completion_mode_family: str = "default"
     allow_silent_completion: bool = False
     interaction_mode_override: InteractionModeOverride | None = "none"
@@ -2173,6 +2434,7 @@ class ExecutorStatusResponse(BaseModel):
     active_executors: int = 0
     capabilities: dict[str, Any] = Field(default_factory=dict)
     native_tools: list[str] = Field(default_factory=list)
+    available_executor_types: list[str] = Field(default_factory=list)
 
 
 class IntarisMCPServerResponse(BaseModel):
@@ -2187,6 +2449,8 @@ class ExecutorConfigResponse(BaseModel):
     executor_id: str
     name: str
     executor_type: str = "in_process"
+    available: bool = True
+    unavailable_reason: str | None = None
     labels: dict[str, Any] = Field(default_factory=dict)
     enabled_tools: list[str] = Field(default_factory=list)
     enabled_tool_groups: list[str] = Field(default_factory=list)
@@ -2201,6 +2465,8 @@ class ExecutorConfigResponse(BaseModel):
     desired_config_version: int = 0
     applied_config_version: int = 0
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
+    observed_tools: list[dict[str, Any]] = Field(default_factory=list)
+    observed_capabilities: RuntimeCapabilityReport | None = None
     resource_snapshot: ExecutorResourceSnapshot | None = None
     last_observed_at: datetime | None = None
     is_default: bool = False
@@ -2225,6 +2491,7 @@ class ExecutorCreateRequest(BaseModel):
 class ExecutorUpdateRequest(BaseModel):
     expected_config_version: int | None = Field(default=None, ge=0)
     name: str | None = None
+    executor_type: str | None = None
     labels: dict[str, Any] | None = None
     enabled_tools: list[str] | None = None
     enabled_tool_groups: list[str] | None = None

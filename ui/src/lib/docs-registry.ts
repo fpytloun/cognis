@@ -193,7 +193,15 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Choose where tools run and how remote executor placement affects agents.',
     category: 'operations',
     sourcePath: 'docs/guide/executors.md',
-    relatedSlugs: ['deployment', 'channels', 'configuring-providers', 'creating-agents']
+    relatedSlugs: ['macos-executor', 'deployment', 'channels', 'configuring-providers', 'creating-agents']
+  },
+  {
+    slug: 'macos-executor',
+    title: 'macOS executor distribution',
+    description: 'Install and operate the executor with Homebrew and a per-user launchd service.',
+    category: 'operations',
+    sourcePath: 'docs/guide/macos-executor.md',
+    relatedSlugs: ['executors', 'deployment', 'troubleshooting']
   },
   {
     slug: 'deployment',
@@ -244,6 +252,7 @@ export const ONBOARDING_DOC_SLUGS = [
   'workflows',
   'channels',
   'executors',
+  'macos-executor',
   'deployment',
   'high-availability',
   'ha-e2e',

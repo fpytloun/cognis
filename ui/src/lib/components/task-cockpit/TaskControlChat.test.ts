@@ -13,8 +13,11 @@ const api = vi.hoisted(() => ({
   snapshot: vi.fn(),
   sync: vi.fn(),
   timeline: vi.fn(),
-  sendMessage: vi.fn()
+  sendMessage: vi.fn(),
+  upload: vi.fn(),
+  signedUrl: vi.fn()
 }));
+const slashCommandSuggestions = vi.hoisted(() => vi.fn());
 
 vi.mock('$lib/chat-v2/api', () => ({
   chatV2Api: api
@@ -27,6 +30,18 @@ vi.mock('$lib/ws/client', () => ({
     updateChatV2Cursor: vi.fn(),
     releaseChatV2: vi.fn()
   }
+}));
+
+vi.mock('$lib/api/client', () => ({
+  api: {
+    conversations: {
+      slashCommandSuggestions,
+    },
+    artifacts: {
+      upload: api.upload,
+      signedUrl: api.signedUrl,
+    },
+  },
 }));
 
 import TaskControlChat from './TaskControlChat.svelte';
@@ -123,6 +138,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  localStorage.clear();
   api.snapshot.mockImplementation(async (scope: TimelineScope) => snapshot(scope));
   api.sync.mockImplementation(async (scope: TimelineScope) => syncResponse(scope));
   api.timeline.mockResolvedValue({ items: [], has_more_before: false, before_cursor: null });
@@ -130,6 +146,14 @@ beforeEach(() => {
     async (conversationId: string, clientTxnId: string, payload: SendMessageV2Request) =>
       admission(conversationId, clientTxnId, payload, 'accepted')
   );
+  api.upload.mockResolvedValue({
+    artifact_id: 'artifact-pasted',
+    filename: 'pasted.png',
+    mime_type: 'image/png',
+    size_bytes: 5,
+  });
+  slashCommandSuggestions.mockResolvedValue({ items: [] });
+  api.signedUrl.mockResolvedValue({ url: 'https://example.test/pasted.png' });
 });
 
 afterEach(() => {
@@ -138,6 +162,22 @@ afterEach(() => {
 });
 
 describe('TaskControlChat', () => {
+  it('scopes dynamic slash suggestions to the task conversation', async () => {
+    render(TaskControlChat, { chat: chat('task-a') });
+    const composer = await screen.findByTestId('task-control-composer');
+
+    await fireEvent.input(composer, { target: { value: '/profile ' } });
+
+    await waitFor(() => {
+      expect(slashCommandSuggestions).toHaveBeenCalledWith(
+        'conv-task-a',
+        '/profile ',
+        12,
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+  });
+
   it('embeds the native Chat v2 timeline and composer without an iframe shell', async () => {
     render(TaskControlChat, { chat: chat('task-39') });
 
@@ -156,13 +196,16 @@ describe('TaskControlChat', () => {
       );
       const onSent = vi.fn();
       render(TaskControlChat, { chat: chat('task-a'), onSent });
+      await waitFor(() =>
+        expect(document.querySelector('[data-cursor="cursor:conv-task-a:1"]')).toBeInTheDocument()
+      );
       const composer = screen.getByTestId('task-control-composer');
       await fireEvent.input(composer, { target: { value: 'Status update' } });
       await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
 
+      await waitFor(() => expect(api.sync).toHaveBeenCalled());
       await waitFor(() => expect(composer).toHaveValue(''));
-      expect(api.sync).toHaveBeenCalled();
-      expect(onSent).toHaveBeenCalledOnce();
+      await waitFor(() => expect(onSent).toHaveBeenCalledOnce());
     }
   );
 
@@ -214,5 +257,30 @@ describe('TaskControlChat', () => {
     expect(composer).toHaveValue('Task B draft');
     expect(api.sync).not.toHaveBeenCalled();
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('uploads a pasted file, renders its preview, and sends the attachment', async () => {
+    render(TaskControlChat, { chat: chat('task-a') });
+    const composer = screen.getByTestId('task-control-composer');
+    const file = new File(['image'], 'pasted.png', { type: 'image/png' });
+    const clipboardData = {
+      files: [file],
+      items: [],
+    } as unknown as DataTransfer;
+
+    await fireEvent.paste(composer, { clipboardData });
+
+    await waitFor(() => expect(api.upload).toHaveBeenCalledWith(file));
+    expect(await screen.findByText('pasted.png')).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
+
+    await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(
+      'conv-task-a',
+      expect.any(String),
+      expect.objectContaining({
+        content: '',
+        attachments: [expect.objectContaining({ artifact_id: 'artifact-pasted' })],
+      }),
+    ));
   });
 });

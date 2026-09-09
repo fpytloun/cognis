@@ -41,4 +41,17 @@ describe('TaskProgressPanel', () => {
     render(TaskProgressPanel, { projection: undefined });
     expect(screen.getByText(/Live progress is not available/)).toBeTruthy();
   });
+
+  it.each(['in_progress', 'active', 'running'])('uses the animated status dot for %s', (status) => {
+    render(TaskProgressPanel, {
+      projection: {
+        todos: [{ content: 'Current work', status }],
+        work_items: [],
+        active_count: 1,
+        completed_count: 0,
+        truncated: false
+      }
+    });
+    expect(screen.getByTestId('todo-status-dot')).toHaveAttribute('data-animated', 'true');
+  });
 });

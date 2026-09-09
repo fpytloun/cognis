@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
-from cognis.core.agent_loop import PauseWaiter
+from cognis.core.agent_loop import PauseWaiter, PendingPause
+from cognis.core.conversation_state import _pending_summary
 from cognis.core.notifications import (
     NotificationService,
+    _find_direct_turn_owner,
     _user_interaction_display,
     safe_display_arguments,
 )
@@ -107,6 +111,57 @@ def test_approved_escalation_includes_safe_arguments_and_past_tense_title() -> N
     ]
 
 
+def test_canonical_pending_escalation_exposes_safe_prompt_fields() -> None:
+    row = _notification_row()
+    row.payload = {
+        "call_id": "audit-call-1",
+        "tool_call_id": "tool-call-1",
+        "tool_name": "bash",
+        "arguments_display": {"command": "uv run pytest -q"},
+        "risk": "high",
+        "reasoning": "The command can mutate the repository.",
+        "timeout_seconds": 300,
+    }
+
+    summary = _pending_summary(row)
+
+    assert summary.notification_id == "call-1"
+    assert summary.call_id == "audit-call-1"
+    assert summary.session_id == "sess-1"
+    assert summary.tool_call_id == "tool-call-1"
+    assert summary.tool_name == "bash"
+    assert summary.arguments_display == {"command": "uv run pytest -q"}
+    assert summary.risk == "high"
+    assert summary.reasoning == "The command can mutate the repository."
+    assert summary.timeout_seconds == 300
+
+
+def test_canonical_pending_question_exposes_question_set_and_context() -> None:
+    row = _notification_row()
+    row.notification_type = "step_question"
+    row.payload = {
+        "questions": [
+            {
+                "id": "scope",
+                "question": "Which scope?",
+                "options": [{"id": "focused", "label": "Focused"}],
+            }
+        ],
+        "context": {"context": "Choose the implementation scope."},
+        "managed_conversation_title": "Research helper",
+        "managed_target_agent_id": "lumi",
+        "managed_origin_conversation_id": "conv-child",
+    }
+
+    summary = _pending_summary(row)
+
+    assert summary.questions[0]["id"] == "scope"
+    assert summary.context == {"context": "Choose the implementation scope."}
+    assert summary.managed_conversation_title == "Research helper"
+    assert summary.managed_target_agent_id == "lumi"
+    assert summary.managed_origin_conversation_id == "conv-child"
+
+
 class _FakeSession:
     def __init__(self, row: Any) -> None:
         self._row = row
@@ -122,12 +177,13 @@ class _FakeSession:
             return self._row
         return None
 
-    async def execute(self, statement: Any) -> None:
+    async def execute(self, statement: Any) -> Any:
         for key, value in getattr(statement, "_values", {}).items():
             attr = key.key if hasattr(key, "key") else str(key)
             if hasattr(value, "value"):
                 value = value.value
             setattr(self._row, attr, value)
+        return SimpleNamespace(rowcount=1)
 
     async def commit(self) -> None:
         return None
@@ -214,6 +270,33 @@ class _FakeSessionFactory:
         return _FakeSession(self._row)
 
 
+class _OrphanRaceSession(_FakeSession):
+    def __init__(self, row: Any, *, concurrent_status: str, concurrent_resolution: dict[str, Any]):
+        super().__init__(row)
+        self._concurrent_status = concurrent_status
+        self._concurrent_resolution = concurrent_resolution
+
+    async def execute(self, statement: Any) -> Any:
+        self._row.status = self._concurrent_status
+        self._row.resolution = self._concurrent_resolution
+        self._row.resolved_at = datetime.now(UTC)
+        return SimpleNamespace(rowcount=0)
+
+
+class _OrphanRaceSessionFactory:
+    def __init__(self, row: Any, *, concurrent_status: str, concurrent_resolution: dict[str, Any]):
+        self._row = row
+        self._concurrent_status = concurrent_status
+        self._concurrent_resolution = concurrent_resolution
+
+    def __call__(self) -> _OrphanRaceSession:
+        return _OrphanRaceSession(
+            self._row,
+            concurrent_status=self._concurrent_status,
+            concurrent_resolution=self._concurrent_resolution,
+        )
+
+
 class _FakePauseWaiter:
     def __init__(self, *, should_resolve: bool = True, order: list[str] | None = None) -> None:
         self.should_resolve = should_resolve
@@ -271,6 +354,7 @@ def _notification_row() -> Any:
         payload={},
         status="pending",
         resolution=None,
+        expires_at=None,
         created_at=datetime.now(UTC),
         resolved_at=None,
     )
@@ -332,6 +416,43 @@ async def test_escalation_resolution_submits_before_unblocking_waiter() -> None:
     assert row.status == "resolved"
     assert row.resolution["decision"] == "approve"
     assert row.resolution["state"] == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_question_resolution_bounds_slow_interaction_recording(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.notification_type = "step_question"
+    event_bus = _FakeEventBus()
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    async def _slow_record(**_: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        "cognis.core.notifications._INTERACTION_RECORD_TIMEOUT_SECONDS",
+        0.01,
+    )
+    monkeypatch.setattr(service, "_record_user_interaction", _slow_record)
+
+    started_at = asyncio.get_running_loop().time()
+    resolved = await service.resolve(
+        "call-1",
+        "continue",
+        {"response_payload": {"mode": "plain_text", "answers": []}},
+        user_email="user@example.com",
+    )
+
+    assert resolved is True
+    assert asyncio.get_running_loop().time() - started_at < 0.2
+    assert len(event_bus.events) == 1
+    assert event_bus.events[0].data["notification_id"] == "call-1"
 
 
 @pytest.mark.asyncio
@@ -453,6 +574,333 @@ async def test_cross_controller_resolution_wakes_db_poll_without_shared_waiter()
 
 
 @pytest.mark.asyncio
+async def test_question_resolution_returns_before_slow_cluster_and_interaction_mirrors() -> None:
+    row = _notification_row()
+    row.notification_type = "step_question"
+    row.payload = {"origin_call_id": "tool-call-1"}
+    release = asyncio.Event()
+
+    class _SlowClusterSignals:
+        async def publish(self, *_: Any, **__: Any) -> None:
+            await release.wait()
+
+    class _SlowGuardrails(_FakeGuardrails):
+        async def record_events(self, **_: Any) -> Any:
+            await release.wait()
+            return SimpleNamespace(ok=True)
+
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_SlowGuardrails()),
+    )
+    service.cluster_signals = _SlowClusterSignals()
+
+    started = monotonic()
+    assert await service.resolve(
+        "call-1",
+        "continue",
+        {"mode": "structured", "answers": []},
+        user_email="user@example.com",
+    )
+    elapsed = monotonic() - started
+
+    assert elapsed < 0.1
+    assert len(service._background_tasks) == 2
+    release.set()
+    await asyncio.gather(*service._background_tasks)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("concurrent_status", "concurrent_resolution"),
+    [
+        (
+            "resolving",
+            {
+                "decision": "continue",
+                "state": "submitting",
+                "claim_token": "resolve_claim",
+                "answers": [],
+            },
+        ),
+        (
+            "resolved",
+            {
+                "decision": "continue",
+                "state": "resolved",
+                "answers": [{"question_id": "scope", "selected_option_ids": ["focused"]}],
+            },
+        ),
+    ],
+)
+async def test_mark_orphaned_loses_cas_to_concurrent_answer_without_overwrite(
+    concurrent_status: str,
+    concurrent_resolution: dict[str, Any],
+) -> None:
+    row = _notification_row()
+    row.notification_type = "step_question"
+    row.status = "pending"
+    event_bus = _FakeEventBus()
+    service = NotificationService(
+        session_factory=_OrphanRaceSessionFactory(
+            row,
+            concurrent_status=concurrent_status,
+            concurrent_resolution=concurrent_resolution,
+        ),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=event_bus,
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    assert not await service.mark_orphaned(
+        row.notification_id,
+        reason="direct_turn_recovery_timeout",
+    )
+    assert row.status == concurrent_status
+    assert row.resolution == concurrent_resolution
+    assert event_bus.events == []
+
+
+@pytest.mark.asyncio
+async def test_wait_for_resolution_gives_fresh_claim_completion_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {"decision": "approve", "state": "submitting"}
+    row.resolved_at = datetime.now(UTC)
+    waiter = PauseWaiter()
+    waiter.register(
+        PendingPause(
+            pause_id="call-1",
+            pause_type="escalation",
+        )
+    )
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=waiter,
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+    monkeypatch.setattr(
+        "cognis.core.notifications._RESOLUTION_CLAIM_SECONDS",
+        0.1,
+    )
+    monkeypatch.setattr(
+        "cognis.core.notifications._RESOLUTION_COMPLETION_GRACE_SECONDS",
+        0.05,
+    )
+
+    async def _finish() -> None:
+        await asyncio.sleep(0.02)
+        row.status = "resolved"
+        row.resolution = {"decision": "approve", "note": "near deadline"}
+
+    asyncio.create_task(_finish())
+    resolution = await service.wait_for_resolution(
+        "call-1",
+        timeout=0.01,
+        poll_seconds=0.005,
+    )
+
+    assert resolution.decision == "approve"
+    assert resolution.data["note"] == "near deadline"
+
+
+@pytest.mark.asyncio
+async def test_stale_resolving_claim_can_retry_submission() -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {"decision": "approve", "state": "submitting"}
+    row.resolved_at = datetime.now(UTC) - timedelta(seconds=60)
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+
+    assert await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "retry"},
+        user_email="user@example.com",
+    )
+    assert order == ["submit", "resolve"]
+    assert row.status == "resolved"
+    assert row.resolution["note"] == "retry"
+
+
+@pytest.mark.asyncio
+async def test_stale_quick_action_claim_does_not_repeat_side_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {
+        "decision": "approve",
+        "state": "submitting",
+        "claim_token": "owner",
+        "submission_id": "submission-1",
+    }
+    row.resolved_at = datetime.now(UTC) - timedelta(seconds=60)
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+    monkeypatch.setattr("cognis.core.notifications._RESOLUTION_POLL_SECONDS", 0.005)
+    side_effects = {"submission-1"}
+    factory_calls = 0
+
+    async def _side_effect() -> dict[str, str]:
+        nonlocal factory_calls
+        factory_calls += 1
+        side_effects.add("submission-1")
+        return {"credential_id": "credential-1"}
+
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"submission_id": "submission-1"},
+        user_email="user@example.com",
+        data_factory=_side_effect,
+    )
+
+    assert resolved is True
+    assert factory_calls == 1
+    assert side_effects == {"submission-1"}
+    assert row.status == "resolved"
+
+
+@pytest.mark.asyncio
+async def test_same_decision_waits_for_claim_owner_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {
+        "decision": "approve",
+        "state": "submitting",
+        "claim_token": "owner",
+        "note": "same request",
+    }
+    row.resolved_at = datetime.now(UTC)
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+    monkeypatch.setattr("cognis.core.notifications._RESOLUTION_CLAIM_SECONDS", 0.1)
+    monkeypatch.setattr("cognis.core.notifications._RESOLUTION_POLL_SECONDS", 0.005)
+
+    async def _fail_owner_submission() -> None:
+        await asyncio.sleep(0.02)
+        row.status = "pending"
+        row.resolution = None
+        row.resolved_at = None
+
+    owner = asyncio.create_task(_fail_owner_submission())
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "same request"},
+        user_email="user@example.com",
+    )
+    await owner
+
+    assert resolved is False
+    assert row.status == "pending"
+    assert order == []
+
+
+@pytest.mark.asyncio
+async def test_same_decision_waits_for_authoritative_terminal_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {
+        "decision": "approve",
+        "state": "submitting",
+        "claim_token": "owner",
+        "note": "same request",
+    }
+    row.resolved_at = datetime.now(UTC)
+    order: list[str] = []
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(order=order),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails(order=order)),
+    )
+    monkeypatch.setattr("cognis.core.notifications._RESOLUTION_CLAIM_SECONDS", 0.1)
+    monkeypatch.setattr("cognis.core.notifications._RESOLUTION_POLL_SECONDS", 0.005)
+
+    async def _finish_owner_submission() -> None:
+        await asyncio.sleep(0.02)
+        row.status = "resolved"
+        row.resolution = {
+            "decision": "approve",
+            "state": "resolved",
+            "note": "same request",
+        }
+
+    owner = asyncio.create_task(_finish_owner_submission())
+    resolved = await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "same request"},
+        user_email="user@example.com",
+    )
+    await owner
+
+    assert resolved is True
+    assert row.status == "resolved"
+    assert order == ["resolve"]
+
+
+class _NoCasSession(_FakeSession):
+    async def execute(self, statement: Any) -> Any:
+        return SimpleNamespace(rowcount=0)
+
+
+class _NoCasSessionFactory:
+    def __init__(self, row: Any) -> None:
+        self._row = row
+
+    def __call__(self) -> _NoCasSession:
+        return _NoCasSession(self._row)
+
+
+@pytest.mark.asyncio
+async def test_timeout_requires_successful_authoritative_cas() -> None:
+    row = _notification_row()
+    row.status = "resolving"
+    row.resolution = {"decision": "approve", "state": "submitting"}
+    row.resolved_at = datetime.now(UTC)
+    service = NotificationService(
+        session_factory=_NoCasSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    resolution = await service.resolve_timeout("call-1")
+
+    assert resolution is None
+    assert row.status == "resolving"
+    assert row.resolution["decision"] == "approve"
+
+
+@pytest.mark.asyncio
 async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -468,6 +916,7 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
         payload={},
         status="pending",
         resolution=None,
+        expires_at=None,
         created_at=datetime.now(UTC),
         resolved_at=None,
     )
@@ -483,6 +932,26 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
         payload={},
         status="pending",
         resolution=None,
+        expires_at=None,
+        created_at=datetime.now(UTC),
+        resolved_at=None,
+    )
+    callback_row = SimpleNamespace(
+        notification_id="notif_oauth",
+        notification_type="auth_challenge",
+        user_email="user@example.com",
+        conversation_id="conv-1",
+        task_id="task_done",
+        step_name="review",
+        step_run_id=None,
+        session_id="sess-3",
+        payload={
+            "kind": "oauth_authorization",
+            "metadata": {"callback_only": True},
+        },
+        status="pending",
+        resolution=None,
+        expires_at=None,
         created_at=datetime.now(UTC),
         resolved_at=None,
     )
@@ -497,7 +966,7 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
     monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
 
     service = NotificationService(
-        session_factory=_FakeListSessionFactory([active_row, stale_row], tasks),
+        session_factory=_FakeListSessionFactory([active_row, stale_row, callback_row], tasks),
         pause_waiter=_FakePauseWaiter(),
         event_bus=_FakeEventBus(),
         providers=SimpleNamespace(guardrails=_FakeGuardrails()),
@@ -505,9 +974,14 @@ async def test_list_pending_omits_and_orphans_notifications_for_terminal_tasks(
 
     pending = await service.list_pending("user@example.com", conversation_id="conv-1")
 
-    assert [notification.notification_id for notification in pending] == ["notif_active"]
+    assert [notification.notification_id for notification in pending] == [
+        "notif_active",
+        "notif_oauth",
+    ]
     assert stale_row.status == "resolved"
     assert stale_row.resolution == {"decision": "cancel", "reason": "task_terminal"}
+    assert callback_row.status == "pending"
+    assert callback_row.resolution is None
 
 
 @pytest.mark.asyncio
@@ -532,7 +1006,131 @@ async def test_list_pending_omits_and_orphans_expired_escalations() -> None:
 
     assert [notification.notification_id for notification in pending] == ["call-active"]
     assert expired_row.status == "resolved"
-    assert expired_row.resolution == {"decision": "cancel", "reason": "timeout"}
+    assert expired_row.resolution == {
+        "decision": "deny",
+        "reason": "timeout",
+        "state": "timed_out",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_preserves_callback_only_oauth_for_terminal_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+    row.notification_type = "auth_challenge"
+    row.task_id = "task_done"
+    row.payload = {
+        "kind": "oauth_authorization",
+        "metadata": {"callback_only": True},
+    }
+    tasks = {"task_done": _task_row("task_done", "completed")}
+
+    async def _fake_get_task(session: Any, task_id: str) -> Any:
+        return tasks.get(task_id)
+
+    monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
+    pause_waiter = PauseWaiter()
+    pause_waiter.register(
+        PendingPause(
+            pause_id=row.notification_id,
+            pause_type=row.notification_type,
+            task_id=row.task_id,
+            conversation_id=row.conversation_id,
+        )
+    )
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([row], tasks),
+        pause_waiter=pause_waiter,
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    reconciled = await service.reconcile_pending()
+
+    assert reconciled == 0
+    assert pause_waiter.get(row.notification_id) is None
+    assert row.status == "pending"
+    assert row.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_cleanup_preserves_callback_only_oauth() -> None:
+    callback_row = _notification_row()
+    callback_row.notification_type = "auth_challenge"
+    callback_row.task_id = "task_done"
+    callback_row.payload = {
+        "kind": "oauth_authorization",
+        "metadata": {"callback_only": True},
+    }
+    interactive_row = _notification_row()
+    interactive_row.notification_id = "otp-1"
+    interactive_row.notification_type = "auth_challenge"
+    interactive_row.task_id = "task_done"
+    interactive_row.payload = {"kind": "otp_code", "required_fields": ["code"]}
+    pause_waiter = PauseWaiter()
+    for row in (callback_row, interactive_row):
+        pause_waiter.register(
+            PendingPause(
+                pause_id=row.notification_id,
+                pause_type=row.notification_type,
+                task_id=row.task_id,
+                conversation_id=row.conversation_id,
+            )
+        )
+    service = NotificationService(
+        session_factory=_FakeListSessionFactory([callback_row, interactive_row], {}),
+        pause_waiter=pause_waiter,
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+    service.mark_orphaned = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    resolved = await service.mark_task_notifications_terminal(
+        "task_done",
+        reason="task_terminal",
+    )
+
+    assert resolved == 1
+    assert pause_waiter.get(callback_row.notification_id) is None
+    service.mark_orphaned.assert_awaited_once_with(
+        interactive_row.notification_id,
+        reason="task_terminal",
+    )
+
+
+@pytest.mark.asyncio
+async def test_bounded_intaris_timeout_keeps_resolution_claim_for_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _notification_row()
+
+    class _SlowGuardrails(_FakeGuardrails):
+        async def submit_decision(
+            self, call_id: str, decision: str, note: str | None = None
+        ) -> None:
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr(
+        "cognis.core.notifications._INTARIS_SUBMISSION_TIMEOUT_SECONDS",
+        0.01,
+    )
+    service = NotificationService(
+        session_factory=_FakeSessionFactory(row),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_SlowGuardrails()),
+    )
+
+    assert not await service.resolve(
+        "call-1",
+        "approve",
+        {"note": "bounded"},
+        user_email="user@example.com",
+    )
+    assert row.status == "resolving"
+    assert row.resolution["decision"] == "approve"
+    assert row.resolution["state"] == "submitting"
 
 
 @pytest.mark.asyncio
@@ -701,11 +1299,42 @@ def _managed_link(
     target_agent_id: str = "agent-sub",
 ) -> Any:
     return SimpleNamespace(
+        link_id=f"link-{target}",
         target_conversation_id=target,
         controller_conversation_id=controller,
         title=title,
         target_agent_id=target_agent_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_task_same_conversation_uses_source_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Agent-created task prompts return to the originating Matrix conversation."""
+
+    async def _fake_get_task(session: Any, task_id: str) -> Any:
+        return SimpleNamespace(
+            task_id=task_id,
+            delivery_mode="same_conversation",
+            source_type="agent",
+            source_ref="conv-matrix-main",
+            created_by="user@example.com",
+            agent_id="riker",
+            delivery_target=None,
+        )
+
+    monkeypatch.setattr("cognis.core.notifications.get_task", _fake_get_task)
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory({}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation("task-agent", "conv-task-internal")
+
+    assert result == "conv-matrix-main"
 
 
 @pytest.mark.asyncio
@@ -793,6 +1422,54 @@ async def test_resolve_target_conversation_walks_nested_managed_chain(
 
 
 @pytest.mark.asyncio
+async def test_resolve_target_conversation_promotes_delegated_session_to_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child with a distinct conversation still targets its root parent chat."""
+    sessions = {
+        "sess-child": SimpleNamespace(
+            session_id="sess-child",
+            conversation_id="conv-child",
+            parent_session_id="sess-parent",
+            user_email="user@example.com",
+        ),
+        "sess-parent": SimpleNamespace(
+            session_id="sess-parent",
+            conversation_id="conv-parent",
+            parent_session_id=None,
+            user_email="user@example.com",
+        ),
+    }
+
+    async def _fake_session(session: Any, session_id: str, **_: Any) -> Any:
+        return sessions.get(session_id)
+
+    async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
+        return None
+
+    monkeypatch.setattr("cognis.core.notifications.get_session_row", _fake_session)
+    monkeypatch.setattr(
+        "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
+    )
+
+    service = NotificationService(
+        session_factory=_ManagedLinkSessionFactory({}),
+        pause_waiter=_FakePauseWaiter(),
+        event_bus=_FakeEventBus(),
+        providers=SimpleNamespace(guardrails=_FakeGuardrails()),
+    )
+
+    result = await service.resolve_target_conversation(
+        None,
+        "conv-child",
+        session_id="sess-child",
+        user_email="user@example.com",
+    )
+
+    assert result == "conv-parent"
+
+
+@pytest.mark.asyncio
 async def test_resolve_target_conversation_cycle_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -847,18 +1524,36 @@ async def test_resolve_target_conversation_unchanged_for_direct_chat(
 
 
 @pytest.mark.asyncio
-async def test_create_registers_pause_under_parent_conversation_for_managed_child(
+async def test_create_promotes_delegated_session_through_managed_parent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Escalation created in a managed child registers PauseWaiter under the parent."""
-    links = {"conv-child": _managed_link("conv-child", "conv-parent")}
+    """A delegated escalation reaches the parent chat with managed context."""
+    links = {"conv-managed": _managed_link("conv-managed", "conv-parent")}
+    sessions = {
+        "sess-child": SimpleNamespace(
+            session_id="sess-child",
+            conversation_id="conv-child",
+            parent_session_id="sess-managed",
+            user_email="user@example.com",
+        ),
+        "sess-managed": SimpleNamespace(
+            session_id="sess-managed",
+            conversation_id="conv-managed",
+            parent_session_id=None,
+            user_email="user@example.com",
+        ),
+    }
 
     async def _fake_link(session: Any, target_id: str, **_: Any) -> Any:
         return links.get(target_id)
 
+    async def _fake_session(session: Any, session_id: str, **_: Any) -> Any:
+        return sessions.get(session_id)
+
     monkeypatch.setattr(
         "cognis.core.notifications.get_managed_conversation_link_for_target", _fake_link
     )
+    monkeypatch.setattr("cognis.core.notifications.get_session_row", _fake_session)
 
     registered: list[Any] = []
 
@@ -920,11 +1615,31 @@ async def test_create_registers_pause_under_parent_conversation_for_managed_chil
 
     # DB row and event must also use the parent conversation
     assert add_session.added[0].conversation_id == "conv-parent"
+    await asyncio.gather(*tuple(service._background_tasks))
     assert event_bus.events[0].data["conversation_id"] == "conv-parent"
 
     # Managed-origin metadata must be in the enriched payload
     assert add_session.added[0].payload.get("managed_conversation_title") == "Sub-task"
     assert add_session.added[0].payload.get("managed_target_agent_id") == "agent-sub"
+    assert add_session.added[0].payload.get("managed_origin_conversation_id") == "conv-managed"
+    assert add_session.added[0].payload.get("managed_link_id") == "link-conv-managed"
+
+
+def test_direct_question_owner_requires_matching_durable_tool_descriptor() -> None:
+    notification = SimpleNamespace(
+        payload={"origin_call_id": "tool-call-1"},
+    )
+    live_owner = SimpleNamespace(
+        status="running",
+        outcome={"tool_calls": [{"call_id": "tool-call-1"}]},
+    )
+    unrelated = SimpleNamespace(
+        status="failed",
+        outcome={"tool_calls": [{"call_id": "tool-call-2"}]},
+    )
+
+    assert _find_direct_turn_owner(notification, [unrelated, live_owner]) is live_owner
+    assert _find_direct_turn_owner(notification, [unrelated]) is None
 
 
 @pytest.mark.asyncio

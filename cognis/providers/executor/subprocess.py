@@ -16,6 +16,7 @@ from typing import Any
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.tool import ExecutorConfig, ExecutorHandle
+from cognis.providers.executor.forwarding import ForwardedExecutorConnection
 from cognis.providers.executor.websocket import (
     WebSocketExecutorConnection,
     WebSocketExecutorProvider,
@@ -103,7 +104,9 @@ class SubprocessExecutorProvider:
         handle.executor_type = "subprocess"
         return handle
 
-    async def get_executor(self, handle: ExecutorHandle) -> WebSocketExecutorConnection:
+    async def get_executor(
+        self, handle: ExecutorHandle
+    ) -> WebSocketExecutorConnection | ForwardedExecutorConnection:
         """Return the live connection (delegates to WS provider)."""
         return await self._ws_provider.get_executor(handle)
 

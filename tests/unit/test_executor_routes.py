@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
 from cognis.api.routes import executors as executors_routes
+from cognis.core.executor_availability import is_executor_package_available
 from cognis.store.queries import (
     bump_executor_reconfigure_generation,
     create_executor,
@@ -206,11 +207,13 @@ def test_executor_list_includes_shared_for_regular_users(
 
         assert response.status_code == 200
         payload = response.json()
-        assert {row["executor_id"] for row in payload} == {
-            "default_inprocess",
+        expected_ids = {
             "shared-exec",
             "private-exec",
         }
+        if is_executor_package_available():
+            expected_ids.add("default_inprocess")
+        assert {row["executor_id"] for row in payload} == expected_ids
         assert next(row for row in payload if row["executor_id"] == "shared-exec")["shared"] is True
 
 

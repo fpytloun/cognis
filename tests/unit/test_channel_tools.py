@@ -671,6 +671,66 @@ async def test_send_enqueues_idempotently_without_creating_conversation(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_same_key_reconciles_existing_delivery_before_managed_route_refusal(tmp_path) -> None:
+    engine, factory, handlers = await _setup(tmp_path)
+    try:
+        target_ref = (await handlers["search_channel_targets"]({"query": "Filip"}, _context()))[
+            "targets"
+        ][0]["target_ref"]
+        arguments = {
+            "target_ref": target_ref,
+            "content": "Hello",
+            "idempotency_key": "request-lost-result",
+        }
+        first = await handlers["send_channel_message"](arguments, _context())
+        blocked_handlers = build_channel_tool_handlers(
+            factory,
+            application_secret="stable-application-secret",
+            binding_lookup=_BindingLookup(
+                ActiveManagedChannelBinding(
+                    conversation_id="conv-managed",
+                    agent_id="agent-owner",
+                    title="Managed route",
+                    status="delivery_failed",
+                    owner_epoch=4,
+                    expires_at=datetime.now(UTC) - timedelta(minutes=1),
+                    outcome_uncertain=True,
+                    recovery_eligible=True,
+                )
+            ),
+        )
+
+        recovered = await blocked_handlers["send_channel_message"](arguments, _context())
+        assert recovered["delivery_id"] == first["delivery_id"]
+        assert recovered["created"] is False
+        assert "new key can duplicate" in recovered["safe_retry"].lower()
+        with pytest.raises(ValueError, match="conflicts"):
+            await blocked_handlers["send_channel_message"](
+                {**arguments, "content": "Different"},
+                _context(),
+            )
+        refused = await blocked_handlers["send_channel_message"](
+            {**arguments, "idempotency_key": "request-new-key"},
+            _context(),
+        )
+        assert refused.is_error is True
+        refusal = json.loads(refused.output)
+        assert refusal["code"] == "channel_route_managed"
+        assert refusal["active_binding"]["owner_epoch"] == 4
+        assert refusal["active_binding"]["outcome_uncertain"] is True
+        assert refusal["active_binding"]["recovery_eligible"] is True
+        assert (
+            "cannot deduplicate an uncertain managed delivery" in refusal["resend_guidance"].lower()
+        )
+
+        async with factory() as session:
+            rows = (await session.execute(select(ChannelDeliveryOutboxRow))).scalars().all()
+            assert len(rows) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_delivery_lookup_reports_status_failure_and_owner_scope(tmp_path) -> None:
     engine, factory, handlers = await _setup(tmp_path)
     try:
@@ -686,18 +746,48 @@ async def test_delivery_lookup_reports_status_failure_and_owner_scope(tmp_path) 
         async with factory() as session:
             row = await session.get(ChannelDeliveryOutboxRow, queued["delivery_id"])
             assert row is not None
-            row.status = "failed"
+            row.status = "uncertain"
             row.attempt_count = 2
-            row.last_error = "adapter unavailable"
+            row.last_error = json.dumps(
+                {
+                    "kind": "signal_delivery_failure",
+                    "provider": "signal-cli",
+                    "classification": "rate_limit",
+                    "provider_code": -5,
+                    "retry_after_seconds": 12.0,
+                    "challenge": True,
+                    "next_step": (
+                        "Do not resend automatically. Reconcile Signal delivery externally before "
+                        "any manual resend."
+                    ),
+                    "retry_scheduled": False,
+                    "side_effect_certainty": "uncertain",
+                    "token": "must-not-be-exposed",
+                }
+            )
             row.updated_at = datetime.now(UTC)
             await session.commit()
 
         status = await handlers["get_channel_delivery"](
             {"delivery_id": queued["delivery_id"]}, _context()
         )
-        assert status["status"] == "failed"
+        assert status["status"] == "uncertain"
         assert status["attempt_count"] == 2
-        assert status["last_error"] == "adapter unavailable"
+        assert status["last_error"] == "external_send_outcome_uncertain"
+        assert status["failure"] == {
+            "provider": "signal-cli",
+            "classification": "rate_limit",
+            "provider_code": -5,
+            "retry_after_seconds": 12.0,
+            "challenge": True,
+            "next_step": (
+                "Do not resend automatically. Reconcile Signal delivery externally before "
+                "any manual resend."
+            ),
+            "retry_scheduled": False,
+            "side_effect_certainty": "uncertain",
+        }
+        assert "must-not-be-exposed" not in str(status["failure"])
         assert "account-owner" not in str(status)
         with pytest.raises(ValueError, match="not found"):
             await handlers["get_channel_delivery"](

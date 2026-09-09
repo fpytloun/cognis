@@ -9,6 +9,8 @@ function executor(overrides: Partial<ExecutorConfig> = {}): ExecutorConfig {
     executor_id: 'exec-1',
     name: 'Workstation',
     executor_type: 'websocket',
+    available: true,
+    unavailable_reason: null,
     labels: {},
     enabled_tools: [],
     enabled_tool_groups: [],

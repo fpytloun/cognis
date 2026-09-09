@@ -246,7 +246,7 @@ async def test_initial_page_scans_non_work_tail_and_pages_only_evidence(
                 raw_tool_name="send_gmail_message",
             ),
             read_only=False,
-            category="filesystem",
+            category="external",
         )
     }
     kwargs = {
@@ -604,6 +604,54 @@ async def test_sparse_empty_scan_returns_signed_resumable_progress() -> None:
             break
     else:
         pytest.fail("bounded sparse scan did not reach canonical exhaustion")
+
+
+@pytest.mark.asyncio
+async def test_bounded_empty_work_page_fails_instead_of_returning_a_looping_cursor() -> None:
+    class _BoundedEmptyStore(_Store):
+        async def read_session_events(self, **kwargs: object) -> SessionEventPage:
+            self.event_reads += 1
+            return SessionEventPage(
+                store_id=self.store_id,
+                session_id=str(kwargs["session_id"]),
+                events=[],
+                first_seq=None,
+                last_seq=10,
+                has_more_before=True,
+                verified_empty=True,
+            )
+
+        async def read_session_high_watermark(self, *, session_id: str) -> SessionWatermark:
+            self.watermark_reads += 1
+            return SessionWatermark(
+                store_id=self.store_id,
+                session_id=session_id,
+                last_seq=10,
+            )
+
+    with pytest.raises(ChatV2SyncError) as raised:
+        await build_work_evidence_backfill_response(
+            scope=TimelineScope(
+                key="conversation:conv-1",
+                kind="conversation",
+                conversation_id="conv-1",
+            ),
+            before=None,
+            session_refs=[
+                ConversationSessionRef(
+                    session_id="session-1",
+                    event_store_session_id="stream-1",
+                    ordinal=0,
+                )
+            ],
+            event_store=_BoundedEmptyStore([]),
+            cursor_secret="work-sync-secret",
+            evidence_predicate=lambda item: False,
+            limit=10,
+            graph_fingerprint="graph-a",
+        )
+
+    assert raised.value.code == "event_store_paging_failed"
 
 
 @pytest.mark.asyncio

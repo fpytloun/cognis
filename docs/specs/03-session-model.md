@@ -28,6 +28,14 @@ Session **content** (messages, tool calls, events) is in Intaris event store.
 Intaris-derived state (event seq, compaction summary, intention) is in the
 **session cache** (in-memory / Redis) — NOT in Cognis DB.
 
+Mnemory records shown to a model use compact aliases such as `m1`. Each alias
+identifies one exact memory revision within one Intaris session. Alias deltas
+are stored in existing recalled-memory developer-message and memory tool-result
+metadata. SessionCache reconstructs the map from Intaris replay. Redis stores
+only an acceleration snapshot. A changed memory revision gets a new alias, and
+an old alias never rebinds. Session rotation starts a new alias map. Canonical
+Mnemory UUID input remains valid for compatibility.
+
 Persisted session events carry a `turn_id` field in their event data.
 For events that belong to a concrete turn, `turn_id` is that turn's stable
 correlation key across persisted history, replay, and live transport frames.

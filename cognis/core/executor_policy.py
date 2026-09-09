@@ -7,6 +7,10 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.core.executor_availability import (
+    is_executor_type_available,
+    unavailable_executor_reason,
+)
 from cognis.logging import get_logger
 from cognis.models.tool import MCP_SERVER_IDS_KEY
 from cognis.ownership import is_shared_owner_email
@@ -38,6 +42,8 @@ async def load_executor_policy(
 
 
 def is_executor_type_allowed(executor_type: str, policy: ExecutorPolicy) -> bool:
+    if not is_executor_type_available(executor_type):
+        return False
     if executor_type == "in_process":
         return policy.allow_in_process
     if executor_type == "subprocess":
@@ -63,6 +69,11 @@ def is_executor_row_usable(
 
 
 def ensure_executor_type_allowed(executor_type: str, policy: ExecutorPolicy) -> None:
+    if executor_type not in {"in_process", "subprocess", "websocket"}:
+        raise ValueError(f"Unknown executor type: {executor_type}")
+    reason = unavailable_executor_reason(executor_type)
+    if reason is not None:
+        raise ValueError(reason)
     if not is_executor_type_allowed(executor_type, policy):
         msg = f"Executor type '{executor_type}' is disabled by deployment policy"
         raise ValueError(msg)

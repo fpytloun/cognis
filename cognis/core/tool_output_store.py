@@ -551,7 +551,7 @@ class S3ToolOutputBackend:
     def _sync_cleanup_expired(self, ttl_seconds: int) -> int:
         deleted = 0
         now = time.time()
-        text_objects: dict[str, dict[str, Any]] = {}
+        text_objects: dict[str, Any] = {}
         paginator = self._client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self._bucket, Prefix="tool-outputs/"):
             for obj in page.get("Contents", []):

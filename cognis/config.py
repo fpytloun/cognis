@@ -57,6 +57,16 @@ def _trusted_proxy_cidrs(raw: str) -> tuple[str, ...]:
     return cidrs
 
 
+def _trusted_evidence_owner_allowlist(raw: str) -> tuple[str, ...]:
+    """Parse the owner-selection list, preserving deterministic order."""
+    if not raw.strip():
+        return ()
+    values = raw.split(",")
+    if any(not value.strip() for value in values):
+        raise ValueError("COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST contains an empty entry")
+    return tuple(value.strip().lower() for value in values)
+
+
 @dataclass(frozen=True)
 class CognisConfig:
     """Typed configuration loaded from environment variables."""
@@ -167,6 +177,12 @@ class CognisConfig:
 
     # Controller-owned MCP OAuth lifecycle
     mcp_oauth_refresh_timeout_seconds: float
+
+    # Trusted Mnemory evidence rollout and bounded availability
+    trusted_evidence_enabled: bool = False
+    trusted_evidence_owner_allowlist: tuple[str, ...] = ()
+    trusted_evidence_max_attempts: int = 8
+    trusted_evidence_max_age_seconds: int = 3600
 
     # Test-only control-plane routes
     e2e_mode: bool = False
@@ -385,6 +401,22 @@ def load_config() -> CognisConfig:
         initial_admin_password=os.environ.get("COGNIS_INITIAL_ADMIN_PASSWORD"),
         default_memory_backend=os.environ.get("COGNIS_DEFAULT_MEMORY_BACKEND", "mnemory"),
         default_guardrails_backend=os.environ.get("COGNIS_DEFAULT_GUARDRAILS_BACKEND", "intaris"),
+        trusted_evidence_enabled=_bool_env("COGNIS_TRUSTED_EVIDENCE_ENABLED", False),
+        trusted_evidence_owner_allowlist=_trusted_evidence_owner_allowlist(
+            os.environ.get("COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST", "")
+        ),
+        trusted_evidence_max_attempts=_bounded_int_env(
+            "COGNIS_TRUSTED_EVIDENCE_MAX_ATTEMPTS",
+            8,
+            minimum=1,
+            maximum=100,
+        ),
+        trusted_evidence_max_age_seconds=_bounded_int_env(
+            "COGNIS_TRUSTED_EVIDENCE_MAX_AGE_SECONDS",
+            3600,
+            minimum=60,
+            maximum=7 * 24 * 60 * 60,
+        ),
         mcp_oauth_refresh_timeout_seconds=_bounded_float_env(
             "COGNIS_MCP_OAUTH_REFRESH_TIMEOUT_SECONDS",
             30.0,
@@ -497,6 +529,12 @@ ENV_TEMPLATE = """\
 # COGNIS_JWT_PUBLIC_KEY_PATH=~/.cognis/keys/public.pem
 # COGNIS_SECRETS_KEY_PATH=~/.cognis/secrets.key
 # COGNIS_REQUIRE_EXTERNAL_CRYPTO=false
+
+# Trusted Mnemory evidence (disabled by default during rollout)
+# COGNIS_TRUSTED_EVIDENCE_ENABLED=false
+# COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST=
+# COGNIS_TRUSTED_EVIDENCE_MAX_ATTEMPTS=8
+# COGNIS_TRUSTED_EVIDENCE_MAX_AGE_SECONDS=3600
 
 # Web Push / PWA notifications (mount from Kubernetes Secret in stateless deployments)
 # COGNIS_VAPID_PRIVATE_KEY=

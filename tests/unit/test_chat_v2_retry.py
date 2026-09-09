@@ -77,8 +77,13 @@ async def test_retry_source_uses_durable_failed_turn_without_duplicate_user_mess
     ]
     monkeypatch.setattr(
         routes,
-        "_session_refs",
+        "_session_read_refs",
         AsyncMock(return_value=[_ref(events)]),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_rows",
+        AsyncMock(return_value=[SimpleNamespace(session_id="sess-1")]),
     )
     request = _request(events)
 
@@ -109,8 +114,13 @@ async def test_retry_source_distinguishes_legacy_failure_without_source(
     ]
     monkeypatch.setattr(
         routes,
-        "_session_refs",
+        "_session_read_refs",
         AsyncMock(return_value=[_ref(events)]),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_rows",
+        AsyncMock(return_value=[SimpleNamespace(session_id="sess-1")]),
     )
     request = _request(events)
 
@@ -185,8 +195,13 @@ async def test_retry_source_only_consumes_explicitly_successful_retry_attempt(
         )
     monkeypatch.setattr(
         routes,
-        "_session_refs",
+        "_session_read_refs",
         AsyncMock(return_value=[_ref(events)]),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_session_rows",
+        AsyncMock(return_value=[SimpleNamespace(session_id="sess-1")]),
     )
 
     source, failed_turn_found = await routes._retry_source_from_failed_turn(

@@ -90,17 +90,13 @@ export function isSystemSlashCommand(value: string): boolean {
 
 export function parseChatModeDirectiveInput(value: string): ChatModeDirective | null {
   const normalized = normalizeSlashCommandInput(value);
-  for (const mode of ['default', 'plan', 'build'] as const) {
-    const command = `/${mode}`;
-    if (normalized === command) {
-      return { mode, oneShot: false, content: null };
-    }
-    if (normalized.startsWith(`${command} `)) {
-      const content = normalized.slice(command.length).trim();
-      if (content) return { mode, oneShot: true, content };
-    }
-  }
-  return null;
+  const match = normalized.match(/^\/(default|plan|build)(?:\s+([\s\S]*))?$/);
+  if (!match) return null;
+  const mode = match[1] as ChatModeDirective['mode'];
+  const content = match[2]?.trim() ?? '';
+  return content
+    ? { mode, oneShot: true, content }
+    : { mode, oneShot: false, content: null };
 }
 
 export function localSlashCommandSuggestions(input: string, limit = 12): SlashCommandSuggestion[] {

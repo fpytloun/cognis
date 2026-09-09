@@ -275,6 +275,26 @@ class TestHtmlConversion:
         assert not result.attachments
         assert (result.metadata or {}).get("content_type") == "text/plain"
 
+    @pytest.mark.parametrize("headers", [{"content-type": "text/plain"}, {}])
+    def test_format_response_result_blank_non_html_recommends_browser_fallback(
+        self,
+        headers: dict[str, str],
+    ) -> None:
+        response = httpx.Response(
+            200,
+            content=b"",
+            headers=headers,
+            request=httpx.Request("GET", "https://example.com/dynamic-page"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert result.is_error
+        assert "HTTP response contained no content" in result.output
+        assert (result.metadata or {}).get("failure_category") == "empty_response"
+        assert (result.metadata or {}).get("browser_fallback_recommended") is True
+        assert _result_is_browser_fallback_candidate(result) is True
+
     def test_format_response_result_verification_page_is_error(self) -> None:
         response = httpx.Response(
             200,
@@ -295,6 +315,22 @@ class TestHtmlConversion:
         assert "requires verification" in result.output
         assert (result.metadata or {}).get("direct_fetch_blocked") is True
         assert (result.metadata or {}).get("direct_fetch_block_signal") == "verification"
+
+    def test_format_response_result_empty_extraction_recommends_browser_fallback(self) -> None:
+        response = httpx.Response(
+            200,
+            content=b"<html><head><title>Valid page</title></head><body></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", "https://example.com/dynamic-page"),
+        )
+
+        result = format_response_result(response, "markdown")
+
+        assert result.is_error
+        assert "extraction produced no content" in result.output
+        assert (result.metadata or {}).get("failure_category") == "empty_extraction"
+        assert (result.metadata or {}).get("browser_fallback_recommended") is True
+        assert _result_is_browser_fallback_candidate(result) is True
 
     def test_format_response_result_preserves_redirect_provenance(self) -> None:
         response = httpx.Response(
@@ -605,7 +641,7 @@ class TestDynamicWebDefinitions:
         assert "backend" not in fetch_props
         assert "backend" not in search_props
         assert "configured direct fetch backend" in fetch.description
-        assert "using DuckDuckGo" in search.description
+        assert "using DDGS metasearch" in search.description
 
     def test_fetch_brave_default_falls_back_to_direct_description(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
@@ -669,6 +705,17 @@ class TestDynamicWebDefinitions:
         if "backend" in props:
             assert "brave" not in props["backend"].get("enum", [])
 
+    def test_fetch_timeout_allows_slow_browser_fallback(self) -> None:
+        from cognis.tools.executor.web.definitions import web_tool_definitions
+
+        defs = web_tool_definitions(["direct", "browser"])
+        fetch = next(d for d in defs if d.name == "web_fetch")
+        timeout = fetch.parameters["properties"]["timeout"]
+
+        assert fetch.timeout_seconds == 130
+        assert "default: 60" in timeout["description"]
+        assert "Use 90 or more" in timeout["description"]
+
     def test_all_web_tools_are_read_only(self) -> None:
         from cognis.tools.executor.web.definitions import web_tool_definitions
 
@@ -713,6 +760,24 @@ class TestWebFetchHandler:
             assert (result.metadata or {}).get("stored_output")
             assert (result.metadata or {}).get("output_anchors")
             mock_backend.fetch.assert_awaited_once()
+            assert mock_backend.fetch.await_args.kwargs["timeout"] == 60
+
+    @pytest.mark.asyncio()
+    async def test_fetch_honors_explicit_timeout(self) -> None:
+        from cognis.tools.executor.web.handlers import handle_web_fetch
+
+        with patch("cognis.tools.executor.web.handlers.resolve_fetch_backend") as mock_resolve:
+            mock_backend = AsyncMock()
+            mock_backend.fetch.return_value = ToolResult(output="test content")
+            mock_resolve.return_value = mock_backend
+
+            result = await handle_web_fetch(
+                {"url": "https://example.com", "timeout": 90},
+                _DUMMY_CONTEXT,
+            )
+
+            assert not result.is_error
+            assert mock_backend.fetch.await_args.kwargs["timeout"] == 90
 
     @pytest.mark.asyncio()
     async def test_fetch_omitted_backend_uses_runtime_default(self) -> None:
@@ -1481,7 +1546,7 @@ class TestDirectBackend:
             image_limit=10,
         )
         assert result.metadata["backend"] == "direct"
-        assert result.metadata["provider"] == "duckduckgo"
+        assert result.metadata["provider"] == "ddgs"
         assert result.metadata["requested_search_mode"] == "web"
 
     @pytest.mark.asyncio()
@@ -1525,7 +1590,7 @@ class TestDirectBackend:
         backend = AsyncMock(spec=DirectBackend)
         backend.search.side_effect = [
             ToolResult(
-                output="DuckDuckGo search failed (timeout).",
+                output="DDGS search failed (timeout).",
                 is_error=True,
                 metadata={"backend": "direct", "failure_category": "timeout"},
             ),
@@ -1565,11 +1630,11 @@ class TestDirectBackend:
 
         backend = AsyncMock(spec=DirectBackend)
         backend.search.return_value = ToolResult(
-            output="DuckDuckGo search failed (rate limited).",
+            output="DDGS search failed (rate limited).",
             is_error=True,
             metadata={
                 "backend": "direct",
-                "provider": "duckduckgo",
+                "provider": "ddgs",
                 "failure_category": "rate_limited",
                 "exception_type": "RuntimeError",
             },
@@ -1590,7 +1655,7 @@ class TestDirectBackend:
         assert backend.search.await_count == 3
         assert result.metadata == {
             "backend": "direct",
-            "provider": "duckduckgo",
+            "provider": "ddgs",
             "attempts": 3,
             "failure_category": "rate_limited",
             "exception_type": "RuntimeError",
@@ -1603,7 +1668,7 @@ class TestDirectBackend:
 
         backend = AsyncMock(spec=DirectBackend)
         backend.search.return_value = ToolResult(
-            output="DuckDuckGo search failed (invalid response).",
+            output="DDGS search failed (invalid response).",
             is_error=True,
             metadata={"backend": "direct", "failure_category": "invalid_response"},
         )
@@ -1638,6 +1703,133 @@ class TestDirectBackend:
         await _ddg_search("bounded")
 
         assert constructor_kwargs == [{"timeout": 15}]
+
+    @pytest.mark.asyncio()
+    async def test_ddg_news_normalizes_url_and_filters_domains_locally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queries: list[str] = []
+
+        class _FakeDDGS:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def news(self, query: str, **_kwargs: object) -> list[dict[str, str]]:
+                queries.append(query)
+                return [
+                    {
+                        "title": "Wrong domain",
+                        "url": "https://example.com/news.html",
+                        "body": "Unrelated news.",
+                        "date": "2026-08-22",
+                        "source": "Example",
+                    },
+                    {
+                        "title": "Python release",
+                        "url": "https://docs.python.org/news.html",
+                        "body": "Python release news.",
+                        "date": "2026-08-22",
+                        "source": "Python",
+                    },
+                ]
+
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+
+        result = await _ddg_search(
+            "Python release",
+            mode="news",
+            options={"include_domains": ["docs.python.org"]},
+        )
+
+        assert queries == ["Python release"]
+        assert "https://docs.python.org/news.html" in result.output
+        assert "https://example.com/news.html" not in result.output
+
+    @pytest.mark.asyncio()
+    async def test_ddg_no_results_exception_returns_empty_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
+
+        class _FakeDDGS:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
+                nonlocal calls
+                calls += 1
+                raise RuntimeError("No results found.")
+
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+
+        result = await _ddg_search("no matching result")
+
+        assert not result.is_error
+        assert result.output == "No search results found."
+        assert calls == 3
+
+    @pytest.mark.asyncio()
+    async def test_ddg_retries_no_results_before_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        calls = 0
+
+        class _FakeDDGS:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
+                nonlocal calls
+                calls += 1
+                if calls < 3:
+                    raise RuntimeError("No results found.")
+                return [
+                    {
+                        "title": "Result",
+                        "href": "https://example.com/result",
+                        "body": "Found.",
+                    }
+                ]
+
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+
+        result = await _ddg_search("eventual result")
+
+        assert not result.is_error
+        assert "https://example.com/result" in result.output
+        assert calls == 3
+
+    @pytest.mark.asyncio()
+    async def test_ddg_preserves_text_when_optional_images_have_no_results(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        image_calls = 0
+
+        class _FakeDDGS:
+            def __init__(self, **_kwargs: object) -> None:
+                pass
+
+            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
+                return [
+                    {
+                        "title": "Result",
+                        "href": "https://example.com/result",
+                        "body": "Found.",
+                    }
+                ]
+
+            def images(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
+                nonlocal image_calls
+                image_calls += 1
+                raise RuntimeError("No results found.")
+
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+
+        result = await _ddg_search("text only", include_images=True)
+
+        assert not result.is_error
+        assert "https://example.com/result" in result.output
+        assert image_calls == 3
 
     @pytest.mark.asyncio()
     async def test_search_returns_lazy_artifact_candidates_for_direct_image_results(

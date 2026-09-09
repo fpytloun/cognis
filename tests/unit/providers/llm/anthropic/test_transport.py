@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 
 import httpx
 import pytest
 
 from cognis.core.tool_exposure import _normalize_anthropic_tool_schema_arguments
+from cognis.executor.providers.llm import retry as executor_llm_retry
 from cognis.models.config import ModelInfo
+from cognis.providers.llm import retry as controller_llm_retry
 from cognis.providers.llm.anthropic import (
     AnthropicAuthPolicy,
     AnthropicLocation,
@@ -27,6 +29,7 @@ from cognis.providers.llm.anthropic import (
 from cognis.providers.llm.anthropic.transport import (
     AnthropicMessagesClient,
     _chat_response,
+    _compat_usage,
     _envelope_from_message,
     _payload,
     _request_endpoint,
@@ -76,6 +79,25 @@ def _decoder() -> AnthropicStreamDecoder:
         model_fingerprint="model",
         thinking_fingerprint="thinking",
     )
+
+
+def test_compat_usage_includes_cached_input_in_prompt_and_total_tokens() -> None:
+    assert _compat_usage(
+        {
+            "input_tokens": 100,
+            "cache_read_input_tokens": 9900,
+            "cache_creation_input_tokens": 200,
+            "output_tokens": 50,
+        }
+    ) == {
+        "input_tokens": 100,
+        "cache_read_input_tokens": 9900,
+        "cache_creation_input_tokens": 200,
+        "output_tokens": 50,
+        "prompt_tokens": 10200,
+        "completion_tokens": 50,
+        "total_tokens": 10250,
+    }
 
 
 def _aliased_bundle() -> CompiledAnthropicToolBundle:
@@ -495,6 +517,55 @@ async def test_http_rate_limit_preserves_retry_after() -> None:
     assert exc_info.value.status_code == 429
     assert exc_info.value.to_payload()["category"] == "rate_limit"
     assert exc_info.value.to_payload()["retry_after_seconds"] == 23
+
+
+@pytest.mark.parametrize("retry_module", [controller_llm_retry, executor_llm_retry])
+@pytest.mark.asyncio
+async def test_native_transport_connection_failure_retries_with_shared_client(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_module: ModuleType,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise httpx.ReadTimeout("", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_123",
+                "model": "claude-test",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+            },
+        )
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr(retry_module.asyncio, "sleep", no_sleep)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = AnthropicMessagesClient(
+            lambda _reference: _resolved_credential("secret"),
+            http_client=http_client,
+        )
+        result = await retry_module.with_llm_retry(
+            client.complete,
+            _context(AnthropicAuthPolicy.API_KEY),
+            {"messages": [{"role": "user", "content": "hello"}]},
+            _bundle(),
+            provider_fingerprint="provider",
+            model_fingerprint="model",
+            max_retries=1,
+            jitter=False,
+        )
+        assert not http_client.is_closed
+
+    assert attempts == 2
+    assert result["choices"][0]["message"]["content"] == "ok"
 
 
 async def _resolved_credential(value: str) -> str:

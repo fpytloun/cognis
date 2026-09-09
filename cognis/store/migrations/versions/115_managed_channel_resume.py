@@ -26,11 +26,13 @@ def _named_unique_representation(
     definitions: list[tuple[str, bool, tuple[str, ...]]] = []
     for constraint in inspector.get_unique_constraints(table_name):
         if constraint.get("name") == name:
-            columns = tuple(constraint.get("column_names") or ())
+            columns = tuple(
+                str(column) for column in constraint.get("column_names") or () if column
+            )
             definitions.append(("constraint", True, columns))
     for index in inspector.get_indexes(table_name):
         if index.get("name") == name:
-            columns = tuple(index.get("column_names") or ())
+            columns = tuple(str(column) for column in index.get("column_names") or () if column)
             definitions.append(("index", bool(index.get("unique")), columns))
     if not definitions:
         return None

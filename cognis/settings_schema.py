@@ -46,6 +46,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "session.core_memories_max_tokens": ("session", 2000),
     "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
     "session.recall_ttl_seconds": ("session", 86400),
+    "session.optional_recall_timeout_seconds": ("session", 5.0),
     "session.max_tool_calls_per_turn": ("session", 500),
     "session.max_llm_cycles_per_turn": ("session", 150),
     "session.idle_timeout_seconds": ("session", 1800),
@@ -58,6 +59,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "session.escalation_timeout_seconds": ("session", 300),
     "session.step_request_questions_timeout_seconds": ("session", 3600),
     "session.cache_max_entries": ("session", 200),
+    "work.source_preview_max_lifetime_seconds": ("work", 0),
     "managed_conversations.cleanup_retention_days": ("managed_conversations", 7),
     "search.display_min_score": ("search", 0.2),
     "evaluator.timeout_ms": ("evaluator", 180000),
@@ -71,6 +73,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "security.token_ttl_seconds": ("security", 3600),
     "security.max_connections": ("security", 100),
     "security.ws_auth_timeout_seconds": ("security", 10),
+    "security.mfa_policy": ("security", "optional"),
     "mcp.tool_timeout_seconds": ("mcp", 300),
     "mcp.connect_timeout_seconds": ("mcp", 15),
     "web.backend": ("web", "direct"),
@@ -132,6 +135,7 @@ _HOT_KEYS: Final[set[str]] = {
     "session.core_memories_max_tokens",
     "session.immutable_prefix_repair_cooldown_seconds",
     "session.recall_ttl_seconds",
+    "session.optional_recall_timeout_seconds",
     "session.max_tool_calls_per_turn",
     "session.max_llm_cycles_per_turn",
     "session.max_delegation_depth",
@@ -159,6 +163,7 @@ _NEXT_OPERATION_KEYS: Final[set[str]] = {
     "session.step_request_questions_timeout_seconds",
     "managed_conversations.cleanup_retention_days",
     "search.display_min_score",
+    "security.mfa_policy",
     "executors.secondary_assignment_ttl_seconds",
     "executors.secondary_disconnect_retry_seconds",
     "executors.secondary_disconnect_retry_interval_seconds",
@@ -172,6 +177,7 @@ _NEXT_RUNTIME_KEYS: Final[set[str]] = {
 } | {
     "executors.allow_in_process",
     "executors.allow_subprocess",
+    "work.source_preview_max_lifetime_seconds",
 }
 
 _UNCLASSIFIED_KEYS = (
@@ -182,6 +188,7 @@ if _UNCLASSIFIED_KEYS:
 
 _ENUM_KEYS: Final[dict[str, tuple[str, ...]]] = {
     "session.anthropic_cache_ttl": ("5m", "1h"),
+    "security.mfa_policy": ("optional", "required"),
     "web.backend": ("direct", "tavily", "brave", "searxng"),
     "web.search_backend": ("direct", "tavily", "brave", "searxng"),
     "web.fetch_backend": ("direct", "tavily", "browser"),
@@ -191,6 +198,7 @@ _ENUM_KEYS: Final[dict[str, tuple[str, ...]]] = {
 _RANGES: Final[dict[str, tuple[int | float | None, int | float | None]]] = {
     "session.compaction_threshold": (0.3, 0.99),
     "session.max_llm_cycles_per_turn": (1, 1000),
+    "session.optional_recall_timeout_seconds": (0.1, None),
     "search.display_min_score": (0.0, 1.0),
 }
 
@@ -214,6 +222,14 @@ _DESCRIPTIONS: Final[dict[str, str]] = {
     "session.anthropic_cache_ttl": "Prompt-cache TTL used for Anthropic-compatible requests.",
     "session.max_delegation_depth": "Maximum permitted primary-agent delegation chain depth.",
     "session.cache_max_entries": "Maximum in-memory session-state entries retained by this worker.",
+    "session.optional_recall_timeout_seconds": (
+        "Total timeout for optional per-turn memory search. Core memory bootstrap uses its "
+        "separate reliable loading policy."
+    ),
+    "work.source_preview_max_lifetime_seconds": (
+        "Maximum persisted lifetime for bounded, redacted Work source previews. "
+        "Keep this value at or below the authoritative Intaris retention period."
+    ),
     "decision_engine.inline_max_length": (
         "Maximum message length eligible for deterministic inline classification."
     ),
@@ -226,6 +242,9 @@ _DESCRIPTIONS: Final[dict[str, str]] = {
     "security.token_ttl_seconds": "Lifetime assigned to newly issued access and service tokens.",
     "security.ws_auth_timeout_seconds": (
         "Maximum time a new WebSocket connection may remain unauthenticated."
+    ),
+    "security.mfa_policy": (
+        "Require TOTP enrollment at the next password login, or allow users to opt in."
     ),
     "executors.allow_in_process": "Allow new tool runtimes to use the controller process.",
     "executors.allow_subprocess": "Allow new tool runtimes to use local subprocess executors.",

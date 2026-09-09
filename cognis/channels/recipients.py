@@ -9,12 +9,13 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal, cast
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis.channels.addressing import ADDRESS_KINDS
 from cognis.channels.route_admission import active_managed_binding_id, lock_channel_route
 from cognis.channels.target_refs import ChannelTargetRefCodec
 from cognis.models.channel import (
@@ -48,17 +49,6 @@ _MATRIX_USER = re.compile(r"^@[^: \t\r\n]+:[^: \t\r\n]+$")
 _GOOGLE_SPACE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
 _GOOGLE_USER = re.compile(r"^users/[A-Za-z0-9._~:-]+$")
 
-ADDRESS_KINDS: dict[str, tuple[str, ...]] = {
-    "signal": ("signal_e164", "signal_uuid", "signal_group_id"),
-    "whatsapp": ("whatsapp_e164",),
-    "telegram": ("telegram_chat_id", "telegram_public_username"),
-    "discord": ("discord_channel_id", "discord_user_id"),
-    "slack": ("slack_conversation_id", "slack_user_id"),
-    "matrix": ("matrix_room_id", "matrix_room_alias", "matrix_user_id"),
-    "irc": ("irc_nick", "irc_channel"),
-    "google_chat": ("google_chat_space", "google_workspace_user"),
-    "bluebubbles": ("bluebubbles_chat_guid", "imessage_handle"),
-}
 _CHAT_KINDS: dict[str, dict[str, tuple[str, ...]]] = {
     "signal": {
         "signal_e164": ("direct",),
@@ -120,7 +110,7 @@ def normalize_recipient(recipient: ChannelRecipient) -> ChannelRecipient:
     allowed_chat_kinds = _CHAT_KINDS[channel][kind]
     chat_kind = recipient.chat_kind
     if chat_kind is None:
-        chat_kind = allowed_chat_kinds[0]
+        chat_kind = cast(Literal["direct", "group"], allowed_chat_kinds[0])
     if chat_kind not in allowed_chat_kinds:
         raise RecipientNormalizationError(
             "chat_kind_mismatch", "Recipient chat kind does not match address kind"
@@ -446,6 +436,7 @@ class RecipientResolutionService:
                 ).scalars()
             )
             if account_ref:
+                assert account_token is not None
                 accounts = [
                     account
                     for account in accounts
@@ -585,15 +576,21 @@ class RecipientResolutionService:
                 continue
             try:
                 recipient = ChannelRecipient.model_validate(raw_recipient)
+                raw_artifacts = payload.get("artifacts")
+                artifact_metadata = (
+                    [item for item in raw_artifacts if isinstance(item, dict)]
+                    if isinstance(raw_artifacts, list)
+                    else [
+                        item
+                        for item in (row.authorized_artifacts_json or [])
+                        if isinstance(item, dict)
+                    ]
+                )
                 result = await self.send(
                     user_email=row.user_email,
                     recipient=recipient,
                     content=str(payload.get("content") or row.content),
-                    artifact_metadata=(
-                        payload.get("artifacts")
-                        if isinstance(payload.get("artifacts"), list)
-                        else row.authorized_artifacts_json or []
-                    ),
+                    artifact_metadata=artifact_metadata,
                     idempotency_key=str(payload.get("idempotency_key") or row.idempotency_key),
                     idempotency_scope=str(
                         payload.get("idempotency_scope") or row.idempotency_scope
@@ -667,7 +664,10 @@ class RecipientResolutionService:
                 admission.intent_id, "resolution_unavailable", "Recipient resolution is unavailable"
             )
         try:
-            target = await adapter.resolve_recipient(recipient, resolution_key=admission.intent_id)
+            raw_target = await adapter.resolve_recipient(
+                recipient, resolution_key=admission.intent_id
+            )
+            target = ResolvedChannelTarget.model_validate(raw_target)
         except Exception as exc:
             raw_code = str(getattr(exc, "code", "resolution_failed"))
             code = raw_code if re.fullmatch(r"[a-z0-9_]{1,64}", raw_code) else "resolution_failed"

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "id": "solar-infographic",
+  "title": "Solar System field guide",
+  "description": "An image-led science infographic with scale, comparison, timeline, glossary, and sources.",
+  "group": "learning",
+  "sort_key": 1300,
+  "content": "Solar System field guide with a planet comparison, orbital-period chart, formation timeline, glossary, and sources.",
+  "visibility": ["gallery"],
+  "payload": {
+    "metadata": {"eyebrow": "Science visual guide", "subtitle": "Eight planets, one star, and 4.6 billion years of history.", "density": "comfortable"},
+    "blocks": [
+      {"type": "hero", "eyebrow": "The Solar System", "title": "A field guide to our planetary neighborhood", "subtitle": "Distances and positions below are illustrative; planet facts use NASA reference data."},
+      {"type": "figure", "title": "The planetary system", "src": "/fixtures/rich-scenarios/solar-infographic/solar-system.svg", "alt": "Illustrated Solar System with the Sun and the eight named planets on nested orbits.", "caption": "The Sun contains about 99.8% of the Solar System's mass. Illustration is not to scale.", "source": "Cognis fixture illustration", "source_url": "https://science.nasa.gov/solar-system/"},
+      {"type": "section_header", "eyebrow": "Compare", "title": "Eight worlds, radically different years", "subtitle": "A year is one trip around the Sun. Size is diameter, rounded to the nearest kilometer."},
+      {"type": "table", "title": "Planet comparison", "columns": [{"key": "planet", "label": "Planet"}, {"key": "type", "label": "Type"}, {"key": "diameter", "label": "Diameter"}, {"key": "year", "label": "Orbital period"}], "rows": [{"planet": "Mercury", "type": "Rocky", "diameter": "4,879 km", "year": "88 days"}, {"planet": "Earth", "type": "Rocky", "diameter": "12,756 km", "year": "365.25 days"}, {"planet": "Jupiter", "type": "Gas giant", "diameter": "142,984 km", "year": "11.86 years"}, {"planet": "Neptune", "type": "Ice giant", "diameter": "49,528 km", "year": "164.8 years"}], "source_ids": ["nasa-planets"]},
+      {"type": "chart", "title": "How long a year lasts", "description": "Orbital periods in Earth years; a logarithmic-looking contrast without pretending that it is a live metric.", "spec_version": "cognis.chart.v1", "chart_type": "bar", "series": [{"id": "orbital-period", "label": "Earth years", "points": [{"x": "Mercury", "y": 0.24}, {"x": "Earth", "y": 1}, {"x": "Jupiter", "y": 11.86}, {"x": "Neptune", "y": 164.8}]}], "x_axis": {"type": "category", "label": "Planet"}, "y_axis": {"type": "linear", "label": "Orbital period", "unit": "Earth years"}, "legend_position": "none", "palette_token": "cool", "source_ids": ["nasa-planets"]},
+      {"type": "columns", "blocks": [{"type": "section", "title": "Extremes", "content": "**Largest:** Jupiter. **Hottest surface:** Venus, whose dense atmosphere traps heat. **Fastest year:** Mercury. **Longest year:** Neptune."}, {"type": "section", "title": "What counts as a planet?", "content": "A planet orbits the Sun, is nearly round, and has cleared most neighboring objects from its orbital path."}]},
+      {"type": "timeline", "title": "Formation in broad strokes", "items": [{"time": "4.6 billion years ago", "title": "A cloud collapses", "content": "Gravity pulls gas and dust into a spinning disk around the young Sun."}, {"time": "4.5 billion years ago", "title": "Planets assemble", "content": "Small bodies collide and grow; rocky worlds form close to the Sun."}, {"time": "Today", "title": "A mature system", "content": "Eight planets remain in stable, distinct orbits."}]},
+      {"type": "section", "title": "Compact glossary", "blocks": [{"type": "markdown", "content": "**Orbit** — the path of one body around another.\n\n**Astronomical unit (AU)** — the average Earth–Sun distance, about 150 million km.\n\n**Gas giant** — a large planet made mostly of hydrogen and helium.\n\n**Ice giant** — a planet rich in water-, ammonia-, and methane-derived ices."}]},
+      {"type": "source_list", "title": "Sources and further reading"}
+    ],
+    "sources": [{"id": "nasa-planets", "title": "Solar System Exploration: Planets", "publisher": "NASA", "url": "https://science.nasa.gov/solar-system/planets/"}, {"id": "iau", "title": "Resolution B5: Definition of a Planet", "publisher": "International Astronomical Union", "url": "https://www.iau.org/static/resolutions/Resolution_GA26-5-6.pdf"}],
+    "assets": [], "datasets": [], "exports": []
+  }
+}

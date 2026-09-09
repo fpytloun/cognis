@@ -61,6 +61,101 @@ async def test_normal_conversation_snapshot_has_no_task(tmp_path: object) -> Non
 
 
 @pytest.mark.asyncio
+async def test_managed_notification_is_visible_in_parent_and_origin_only(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _factory(tmp_path)
+    try:
+        async with factory() as session:
+            for conversation_id in ("conv_parent", "conv_child", "conv_sibling"):
+                session.add(
+                    Conversation(
+                        conversation_id=conversation_id,
+                        user_email="user@test.com",
+                        agent_id="agent-1",
+                        context_type="web",
+                    )
+                )
+            session.add(
+                NotificationRow(
+                    notification_id="ntf_managed",
+                    notification_type="escalation",
+                    user_email="user@test.com",
+                    conversation_id="conv_parent",
+                    status="pending",
+                    payload={
+                        "call_id": "call-1",
+                        "tool_name": "bash",
+                        "managed_origin_conversation_id": "conv_child",
+                    },
+                )
+            )
+            await session.commit()
+            parent = await snapshot_for_conversation(
+                session,
+                user_email="user@test.com",
+                conversation_id="conv_parent",
+            )
+            child = await snapshot_for_conversation(
+                session,
+                user_email="user@test.com",
+                conversation_id="conv_child",
+            )
+            sibling = await snapshot_for_conversation(
+                session,
+                user_email="user@test.com",
+                conversation_id="conv_sibling",
+            )
+
+        assert parent is not None
+        assert child is not None
+        assert sibling is not None
+        assert parent.pending.escalation is not None
+        assert child.pending.escalation is not None
+        assert child.pending.escalation.notification_id == "ntf_managed"
+        assert sibling.pending.escalation is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reuses_caller_session_for_durable_turn_read(tmp_path: object) -> None:
+    engine, factory = await _factory(tmp_path)
+
+    class _Scheduler:
+        def __init__(self) -> None:
+            self.session = None
+
+        async def durable_running_turn_state(self, _conversation_id: str, *, session=None):
+            assert session is not None
+            self.session = session
+            return None
+
+    scheduler = _Scheduler()
+    try:
+        async with factory() as session:
+            session.add(
+                Conversation(
+                    conversation_id="conv_session_reuse",
+                    user_email="user@test.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                )
+            )
+            await session.commit()
+            snapshot = await snapshot_for_conversation(
+                session,
+                user_email="user@test.com",
+                conversation_id="conv_session_reuse",
+                turn_scheduler=scheduler,
+            )
+            assert scheduler.session is session
+        assert snapshot is not None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_normal_conversation_snapshot_projects_conversation_todos(tmp_path: object) -> None:
     engine, factory = await _factory(tmp_path)
     try:
@@ -151,7 +246,18 @@ async def test_step_conversation_snapshot_projects_todos_and_pending(tmp_path: o
                     task_id=task.task_id,
                     step_run_id=step.step_run_id,
                     status="pending",
-                    payload={"question": "Continue?", "options": [{"label": "yes"}]},
+                    payload={
+                        "question": "Continue?",
+                        "options": [{"label": "yes"}],
+                        "questions": [
+                            {
+                                "id": "scope",
+                                "question": "Which scope?",
+                                "options": [{"id": "focused", "label": "Focused"}],
+                            }
+                        ],
+                        "context": {"context": "Choose the implementation scope."},
+                    },
                 )
             )
             await session.commit()
@@ -169,6 +275,10 @@ async def test_step_conversation_snapshot_projects_todos_and_pending(tmp_path: o
         assert snapshot.pending.notification_types == ["step_question"]
         assert snapshot.pending.pending_input is not None
         assert snapshot.pending.pending_input.question == "Continue?"
+        assert snapshot.pending.pending_input.questions[0]["id"] == "scope"
+        assert snapshot.pending.pending_input.context == {
+            "context": "Choose the implementation scope."
+        }
     finally:
         await engine.dispose()
 

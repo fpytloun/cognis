@@ -45,6 +45,24 @@ from cognis.models.tool import (
 logger = logging.getLogger(__name__)
 
 
+def _native_tool_with_input_schema(
+    tool: ToolDefinition,
+    schema: dict[str, Any],
+    *,
+    name: str | None = None,
+    description: str | None = None,
+) -> ToolDefinition:
+    """Apply a schema overlay while preserving the native tool subtype."""
+
+    enriched = tool_with_input_schema(
+        tool,
+        schema,
+        name=name,
+        description=description,
+    )
+    return ToolDefinition.model_validate(enriched.model_dump(mode="python"))
+
+
 class OrchestrationMode(StrEnum):
     """Controls which orchestration tools are available in a given context.
 
@@ -110,6 +128,7 @@ MANAGED_CONVERSATION_TOOL_NAMES = {
     "agent_conversation_list",
     "agent_conversation_get",
     "agent_conversation_take_ownership",
+    "agent_conversation_recover_channel",
     "agent_conversation_send_controller",
     "agent_conversation_complete",
 }
@@ -130,19 +149,25 @@ DELEGATE_TOOL = ToolDefinition(
     description=(
         "Delegate work to a focused sub-session and receive the result.\n\n"
         "Treat the child as an isolated context. For substantial work, provide a "
-        "proportional objective, context, scope, acceptance, and return contract; "
-        "do not make the child rediscover verified context.\n\n"
+        "compact contract with a proportional objective, exact references, scope, "
+        "acceptance, and return evidence; do not make the child rediscover verified "
+        "context or pass the parent transcript.\n\n"
         "agent_id is required and must identify an eligible secondary specialist "
         "from the current caller-scoped target catalog. Use managed conversations "
         "for primary user agents.\n\n"
-        "Before creating a fresh child, inspect existing sub-sessions. Reuse or fork a "
-        "child only when the same problem, specialist role, tool/authority scope, and "
-        "expected output remain compatible. Follow-up and fork preserve the source "
-        "child's agent identity and capabilities; they do not change specialist. For "
-        "the same compatible line of work, use follow_up_subsession; use "
-        "fork_subsession for an independent branch. Start fresh with the appropriate "
-        "specialist when the next work needs a different role, tools, authority, or "
-        "output contract. "
+        "Before creating a fresh child, inspect existing sub-sessions. Continue only "
+        "for the same problem, specifically the same bounded problem, with a compatible "
+        "specialist role, tool/authority scope, and expected output remain compatible; "
+        "responsibilities must also remain compatible. Continue only when retained "
+        "context is materially useful; send the context delta only. Create a fresh "
+        "isolated child for a materially different role, responsibility, tool or "
+        "authority scope, or an independent workstream. Follow-up and fork preserve the "
+        "source child's identity and capabilities; they do not change specialist. Fork "
+        "only an independent branch requiring inherited context, not an ordinary "
+        "handoff, correction, or review; use a fresh specialist when compatibility "
+        "changes. Use follow_up_subsession for compatible continuation and "
+        "fork_subsession only for that independent branch. Start fresh with the "
+        "appropriate specialist when compatibility changes. "
         "This applies to implementation, research, debugging, review, and other delegated "
         "work—not only code review.\n\n"
         "## Wait behavior\n\n"
@@ -197,7 +222,9 @@ DELEGATE_TOOL = ToolDefinition(
                 "type": "string",
                 "description": (
                     "Required return contract: status, summary, changes or findings, "
-                    "verification evidence, risks/assumptions, and open questions as relevant."
+                    "changed references, verification evidence, risks/assumptions, "
+                    "and open questions as relevant. Keep detailed logs inspectable "
+                    "outside the parent's active context."
                 ),
             },
             "wait": {
@@ -318,12 +345,14 @@ RETRY_SUBSESSION_TOOL = ToolDefinition(
 FOLLOW_UP_SUBSESSION_TOOL = ToolDefinition(
     name="follow_up_subsession",
     description=(
-        "Send a new instruction using a terminal delegate child's full prior context. "
+        "Send a new instruction using a terminal delegate child's retained prior context. "
         "Creates a derived child because delegate history and results are immutable. "
-        "Prefer this over a fresh delegate only when continuing the same compatible "
-        "problem, specialist role, tool/authority scope, and output contract. It "
-        "preserves the source child's agent identity and capabilities; use a fresh "
-        "delegate when the next work needs a different specialist."
+        "Prefer this over a fresh delegate, but use only for the same bounded problem when "
+        "the specialist role, responsibilities, "
+        "tool/authority scope, and output contract remain compatible and the retained "
+        "context is materially useful. Send the delta only, not repeated stable history. "
+        "It preserves the source child's identity and capabilities; use a fresh isolated "
+        "delegate for changed compatibility or an independent workstream."
     ),
     parameters={
         "type": "object",
@@ -341,13 +370,14 @@ FOLLOW_UP_SUBSESSION_TOOL = ToolDefinition(
 FORK_SUBSESSION_TOOL = ToolDefinition(
     name="fork_subsession",
     description=(
-        "Branch from a terminal delegate child's full prior context with a new "
+        "Branch from a terminal delegate child's retained prior context with a new "
         "instruction. Creates an independent derived child while preserving lineage. "
-        "Use this only when the prior child's specialist role, tool/authority scope, "
-        "and output contract remain compatible, but the work should explore an "
-        "alternative, obtain an independent branch, or proceed without changing the "
-        "original continuation line. It preserves the source child's agent identity "
-        "and capabilities; use a fresh delegate to change specialist."
+        "Use this only for an independent branch requiring inherited context to "
+        "explore an alternative, when "
+        "the prior child's role, responsibilities, tool/authority scope, and output "
+        "contract remain compatible. It is not for an ordinary handoff, correction, or "
+        "review. It preserves the source child's identity and capabilities; use a fresh "
+        "delegate when compatibility changes."
     ),
     parameters={
         "type": "object",
@@ -722,7 +752,8 @@ GET_TASK_OUTPUT_TOOL = ToolDefinition(
 GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
     name="get_task_step_output",
     description=(
-        "Get the output of a specific workflow step attempt. Returns a compact anchored "
+        "Get the output of a specific workflow step run. Select it by step_run_id, or by "
+        "step_name and optional attempt for backward compatibility. Returns a compact anchored "
         "summary with the step output, evaluation, and todos. Use get_task first to inspect "
         "available steps and attempts, then use list_tool_output_anchors or read_tool_output_anchor "
         "on this tool call for deeper sections."
@@ -738,12 +769,16 @@ GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Name of the step (e.g., 'plan', 'research', 'synthesize').",
             },
+            "step_run_id": {
+                "type": "string",
+                "description": "Immutable step run ID. Prefer this for historical task attempts.",
+            },
             "attempt": {
                 "type": "integer",
                 "description": "Optional attempt number. Omit to inspect the latest attempt.",
             },
         },
-        "required": ["task_id", "step_name"],
+        "required": ["task_id"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
@@ -753,7 +788,8 @@ GET_TASK_STEP_OUTPUT_TOOL = ToolDefinition(
 GET_TASK_STEP_LOGS_TOOL = ToolDefinition(
     name="get_task_step_logs",
     description=(
-        "Inspect the recorded execution log for a specific workflow step attempt. Returns a compact "
+        "Inspect the recorded execution log for a specific workflow step run. Select it by "
+        "step_run_id, or by step_name and optional attempt for backward compatibility. Returns a compact "
         "anchored event timeline including assistant messages, reasoning, tool calls, and tool results. "
         "Use read_tool_output_anchor on this tool call to drill into specific events, and use any call_id "
         "you find there with read_tool_output or search_tool_output to inspect full tool output."
@@ -768,6 +804,10 @@ GET_TASK_STEP_LOGS_TOOL = ToolDefinition(
             "step_name": {
                 "type": "string",
                 "description": "Name of the step to inspect.",
+            },
+            "step_run_id": {
+                "type": "string",
+                "description": "Immutable step run ID. Prefer this for historical task attempts.",
             },
             "attempt": {
                 "type": "integer",
@@ -784,7 +824,7 @@ GET_TASK_STEP_LOGS_TOOL = ToolDefinition(
                 "default": 50,
             },
         },
-        "required": ["task_id", "step_name"],
+        "required": ["task_id"],
     },
     source=ToolSource(type="builtin"),
     category="orchestration",
@@ -913,6 +953,7 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "exploration, research, consultation, or independent review is still allowed. "
         "Coordinate permits decomposition into independent workstreams while retaining "
         "integration and acceptance ownership. Do not force rediscovery of known context. "
+        "Use exact references in a compact contract; never pass the parent transcript. "
         "With wait=false, this is "
         "fire-and-follow-up: after starting the managed turn, do "
         "not continue the same scoped work in parallel; finish the parent turn unless "
@@ -985,7 +1026,10 @@ AGENT_CONVERSATION_CREATE_CHANNEL_TOOL = ToolDefinition(
     name="agent_conversation_create_channel",
     description=(
         "Create a managed external-channel conversation for one opaque observed target. "
-        "The objective, target identity, expiry, and tool allowlist are immutable."
+        "The objective, target identity, expiry, and tool allowlist are immutable. "
+        "expires_at must be in the future and no more than 30 days away. "
+        "agent_conversation_send_controller and agent_conversation_complete are added "
+        "automatically and can also be named explicitly in allowed_tools."
     ),
     parameters={
         "type": "object",
@@ -1008,8 +1052,16 @@ AGENT_CONVERSATION_CREATE_CHANNEL_TOOL = ToolDefinition(
                 "type": "array",
                 "items": {"type": "string"},
                 "uniqueItems": True,
+                "description": (
+                    "Explicit tool names or stable IDs. The two fixed child control tools are "
+                    "always added. Naming them explicitly does not grant any other tool."
+                ),
             },
-            "expires_at": {"type": "string", "format": "date-time"},
+            "expires_at": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Timezone-aware expiry, no more than 30 days in the future.",
+            },
         },
         "required": [
             "target_ref",
@@ -1030,11 +1082,15 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
     name="agent_conversation_send",
     description=(
         "Send a new turn into an existing managed agent conversation. Prefer this for "
-        "same-problem continuation instead of creating a duplicate managed "
-        "conversation, including plan/debug to implementation handoffs with "
-        'chat_mode="build". Reuse context the target already owns: send the new '
-        "instruction and changed context, decisions, or acceptance criteria rather than "
-        "repeating stable history. Managed conversations never queue controller messages: "
+        "same-problem continuation instead of creating a duplicate managed conversation, "
+        "but only "
+        "for the same bounded problem when the role, responsibilities, tools, authority, "
+        "and output contract remain compatible and retained context is materially useful; "
+        "otherwise create a fresh isolated child. This includes plan/debug to "
+        'implementation handoffs with chat_mode="build". Reuse context the target '
+        "already owns: send the new instruction and context delta, decisions, or changed "
+        "acceptance criteria rather than repeating stable history or the parent transcript. "
+        "Managed conversations never queue controller messages: "
         "when work is active, wait for it to finish or interrupt it before sending another "
         "message. With wait=false, this is fire-and-follow-up: do not "
         "continue the same scoped work in parallel after sending; finish the parent "
@@ -1172,8 +1228,13 @@ AGENT_CONVERSATION_FORK_TOOL = ToolDefinition(
     name="agent_conversation_fork",
     description=(
         "Fork a managed agent conversation and optionally start the fork with a message. "
-        "Use this when existing context is relevant but the work needs an independent "
-        "branch; use agent_conversation_send for ordinary same-problem continuation."
+        "Use this only for an independent branch requiring inherited context. Start "
+        "initial independent review fresh; use agent_conversation_send for compatible "
+        "re-review when retained investigative context remains materially useful. Start "
+        "re-review fresh with a compact review contract when that context is not useful. "
+        "Use agent_conversation_send for same-problem continuation, handoff, or correction. "
+        "Create a fresh isolated child when role, responsibility, tool/authority scope, "
+        "or output contract changes."
     ),
     parameters={
         "type": "object",
@@ -1260,6 +1321,63 @@ AGENT_CONVERSATION_TAKE_OWNERSHIP_TOOL = ToolDefinition(
     read_only=False,
 )
 
+AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL = ToolDefinition(
+    name="agent_conversation_recover_channel",
+    description=(
+        "Release either an expired managed channel route or an uncertain one-shot delivery "
+        "route. Supply conversation_id with expected_owner_epoch for a managed route, or "
+        "delivery_id for a one-shot route. The authority-checked action never retries delivery "
+        "or replays held participant messages. Reconcile an uncertain outcome externally before "
+        "any resend because the original one-shot idempotency key remains reserved."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "conversation_id": {"type": "string"},
+            "delivery_id": {"type": "string"},
+            "expected_owner_epoch": {"type": "integer", "minimum": 1},
+            "reason": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "Auditable reason for releasing the expired route.",
+            },
+        },
+        "required": ["reason"],
+        "oneOf": [
+            {
+                "required": ["conversation_id", "expected_owner_epoch"],
+                "not": {"required": ["delivery_id"]},
+            },
+            {
+                "required": ["delivery_id"],
+                "not": {
+                    "anyOf": [
+                        {"required": ["conversation_id"]},
+                        {"required": ["expected_owner_epoch"]},
+                    ]
+                },
+            },
+        ],
+        "additionalProperties": False,
+    },
+    examples=[
+        {
+            "conversation_id": "conv_target",
+            "expected_owner_epoch": 1,
+            "reason": "The external outcome was reconciled.",
+        },
+        {
+            "delivery_id": "cdel_target",
+            "reason": "The external outcome was reconciled.",
+        },
+    ],
+    source=ToolSource(type="builtin"),
+    category="orchestration",
+    read_only=False,
+)
+
+
 AGENT_CONVERSATION_SEND_CONTROLLER_TOOL = ToolDefinition(
     name="agent_conversation_send_controller",
     description=(
@@ -1298,6 +1416,11 @@ AGENT_CONVERSATION_COMPLETE_TOOL = ToolDefinition(
     read_only=False,
 )
 
+MANAGED_CHANNEL_CHILD_CONTROL_TOOLS = (
+    AGENT_CONVERSATION_SEND_CONTROLLER_TOOL,
+    AGENT_CONVERSATION_COMPLETE_TOOL,
+)
+
 _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_CREATE_TOOL,
     AGENT_CONVERSATION_CREATE_CHANNEL_TOOL,
@@ -1311,8 +1434,7 @@ _ALL_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_LIST_TOOL,
     AGENT_CONVERSATION_GET_TOOL,
     AGENT_CONVERSATION_TAKE_OWNERSHIP_TOOL,
-    AGENT_CONVERSATION_SEND_CONTROLLER_TOOL,
-    AGENT_CONVERSATION_COMPLETE_TOOL,
+    AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL,
 ]
 
 
@@ -1324,11 +1446,23 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
         "delegate result or a structured workflow task. Target agent IDs must be "
         "primary/user agents; use delegate() for system specialist agents (`system:*`) "
         "available in this agent session. On restricted task surfaces, the child is linked "
-        "to the active step. The started managed turn is joined before returning."
+        "to the active step. The contract must state `Working mode: execute` or "
+        "`Working mode: coordinate` and include the objective, confirmed context and "
+        "exact references, scope and non-goals, acceptance and verification, and "
+        "return status and evidence. Execute means the target completes the core work "
+        "itself; coordinate retains decomposition, integration, and acceptance ownership. "
+        "Use a compact contract and never pass the parent transcript. The started "
+        "managed turn is joined before returning."
     ),
     "agent_conversation_send": (
-        "Send a new turn into an existing managed agent conversation. On this "
-        "conversation surface, the submitted managed turn is joined before returning."
+        "Send a new turn into an existing managed agent conversation only for the same "
+        "bounded problem with compatible role, responsibilities, tools, authority, and "
+        "output contract and materially useful retained context. Send the context delta "
+        "only. Start an initial independent review in a fresh conversation; use this "
+        "existing conversation for re-review only when reviewer role, criteria, findings, "
+        "dispositions, and retained investigative context remain compatible and useful. "
+        "Create a fresh isolated child when compatibility or useful context is absent. "
+        "On this conversation surface, the submitted managed turn is joined before returning."
     ),
     "agent_conversation_retry": (
         "Retry the last failed or interrupted Agent work turn in the same normal "
@@ -1338,8 +1472,13 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
     ),
     "agent_conversation_fork": (
         "Fork a managed agent conversation and optionally start the fork with a "
-        "message. On this conversation surface, a started managed turn in the fork "
-        "is joined before returning."
+        "message. Use only for an independent branch requiring inherited context, not "
+        "an initial independent review, ordinary handoff, correction, or review. Start "
+        "initial independent review fresh; use agent_conversation_send for compatible "
+        "re-review when retained investigative context remains materially useful. Start "
+        "re-review fresh with a compact review contract when that context is not useful. "
+        "On this conversation surface, a started managed turn in the fork is joined before "
+        "returning."
     ),
 }
 
@@ -1351,7 +1490,7 @@ def _managed_conversation_sync_tool(tool: ToolDefinition) -> ToolDefinition:
     properties = parameters.get("properties")
     if isinstance(properties, dict):
         properties.pop("wait", None)
-    return tool_with_input_schema(
+    return _native_tool_with_input_schema(
         tool,
         parameters,
         description=_SYNC_MANAGED_CONVERSATION_DESCRIPTIONS.get(
@@ -1376,7 +1515,7 @@ def _managed_conversation_default_wait_tool(
     if not isinstance(properties, dict) or "wait" not in properties:
         return tool
     properties["wait"]["default"] = True
-    return tool_with_input_schema(
+    return _native_tool_with_input_schema(
         tool,
         parameters,
         description=(
@@ -1397,12 +1536,17 @@ _SYNC_MANAGED_CONVERSATION_TOOLS = [
     AGENT_CONVERSATION_CLOSE_TOOL,
     AGENT_CONVERSATION_LIST_TOOL,
     AGENT_CONVERSATION_GET_TOOL,
+    AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL,
 ]
 
 _TASK_PRIMARY_MANAGED_CONVERSATION_TOOLS = [
     tool
     for tool in _SYNC_MANAGED_CONVERSATION_TOOLS
-    if tool.name != "agent_conversation_set_profile"
+    if tool.name
+    not in {
+        "agent_conversation_set_profile",
+        "agent_conversation_recover_channel",
+    }
 ]
 
 
@@ -1806,7 +1950,7 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
 )
 
 # Sync-only delegate for task steps (no wait parameter exposed — always sync)
-_DELEGATE_SYNC_TOOL = tool_with_input_schema(
+_DELEGATE_SYNC_TOOL = _native_tool_with_input_schema(
     DELEGATE_TOOL,
     {
         "type": "object",
@@ -1879,7 +2023,7 @@ def enrich_orchestration_target_catalog(
     base_description = str(agent_field.get("description") or "").rstrip()
     catalog = "\n".join(f"- {line}" for line in catalog_lines) or "- none"
     agent_field["description"] = f"{base_description}\n\nEligible targets for this turn:\n{catalog}"
-    enriched = tool_with_input_schema(tool, schema)
+    enriched = _native_tool_with_input_schema(tool, schema)
     operations = []
     for operation in enriched.native_operations or []:
         options = [

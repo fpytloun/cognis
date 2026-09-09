@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Any, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import case, exists, literal, or_, select, update
@@ -20,6 +20,13 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
+from cognis.core.trusted_evidence import (
+    TRUSTED_EVIDENCE_ADMISSION_KEY,
+    deserialize_evidence_admission,
+    deserialize_evidence_origin,
+    serialize_evidence_admission,
+    serialize_evidence_origin,
+)
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import ChannelDeliveryDescriptor
 from cognis.models.retry import RetryReason
@@ -28,8 +35,10 @@ from cognis.store.models import (
     ArtifactRecordRow,
     AuditLog,
     ChannelDeliveryOutboxRow,
+    Conversation,
     CoordinationLeaseRow,
     DirectTurnRequestRow,
+    ManagedConversationLink,
 )
 
 
@@ -111,7 +120,7 @@ class DirectTurnRecoveryResult:
     changed: bool
 
 
-class DurableAttachmentRefV1(BaseModel):  # type: ignore[misc]
+class DurableAttachmentRefV1(BaseModel):
     """Stable attachment identity and metadata; signed URLs are never durable."""
 
     model_config = ConfigDict(extra="forbid")
@@ -124,7 +133,7 @@ class DurableAttachmentRefV1(BaseModel):  # type: ignore[misc]
     url: str | None = Field(default=None, exclude=True)
 
 
-class DirectTurnPayloadV1(BaseModel):  # type: ignore[misc]
+class DirectTurnPayloadV1(BaseModel):
     """Strict durable envelope for reproducing one admitted direct message."""
 
     model_config = ConfigDict(extra="forbid")
@@ -196,6 +205,7 @@ class PermanentDirectTurnPayloadError(RuntimeError):
 class AdmissionResult:
     request: DirectTurnRequestRow
     created: bool
+    queued_behind_predecessor: bool
 
 
 @dataclass(frozen=True)
@@ -238,10 +248,35 @@ def _validated_payload(payload: dict[str, Any], payload_version: int) -> dict[st
     if payload.get("schema_version") != payload_version:
         raise ValueError("payload schema_version does not match payload_version")
     validated = DirectTurnPayloadV1.model_validate(payload)
-    normalized = cast(dict[str, Any], validated.model_dump(mode="json"))
+    normalized = validated.model_dump(mode="json")
+    raw_origin = normalized["metadata"].get("evidence_origin")
+    if raw_origin is not None:
+        origin = deserialize_evidence_origin(raw_origin)
+        if origin is None:
+            raise ValueError("metadata.evidence_origin is invalid")
+        normalized["metadata"]["evidence_origin"] = serialize_evidence_origin(origin)
+    raw_admission = normalized["metadata"].get(TRUSTED_EVIDENCE_ADMISSION_KEY)
+    if raw_admission is not None:
+        admission = deserialize_evidence_admission(raw_admission)
+        if admission is None:
+            raise ValueError(f"metadata.{TRUSTED_EVIDENCE_ADMISSION_KEY} is invalid")
+        normalized["metadata"][TRUSTED_EVIDENCE_ADMISSION_KEY] = serialize_evidence_admission(
+            admission
+        )
     if "retry_reason" not in payload:
         normalized.pop("retry_reason", None)
     return normalized
+
+
+def _admission_descriptor_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove server-owned policy data from the client idempotency descriptor."""
+    descriptor_payload = dict(payload)
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        descriptor_payload["metadata"] = {
+            key: value for key, value in metadata.items() if key != TRUSTED_EVIDENCE_ADMISSION_KEY
+        }
+    return descriptor_payload
 
 
 class DirectTurnStore:
@@ -277,7 +312,7 @@ class DirectTurnStore:
             "agent_id": agent_id,
             "user_id": user_id,
             "payload_version": payload_version,
-            "payload": payload,
+            "payload": _admission_descriptor_payload(payload),
         }
         admission_hash = _canonical_hash(descriptor)
         payload_hash = _canonical_hash(payload)
@@ -327,6 +362,14 @@ class DirectTurnStore:
         ),
     ) -> AdmissionResult:
         async with self._session_factory() as session:
+            # Serialize admission disposition per conversation. Durable rows
+            # are inserted as QUEUED staging records, but the FIFO head can run
+            # immediately and must not be exposed as user-visible queueing.
+            await session.execute(
+                select(Conversation.conversation_id)
+                .where(Conversation.conversation_id == values["conversation_id"])
+                .with_for_update()
+            )
             if admission_guard is not None and not await admission_guard(session):
                 await session.rollback()
                 raise DirectTurnAdmissionRejected("durable admission fence changed")
@@ -361,21 +404,35 @@ class DirectTurnStore:
                     )
             if transaction_participant is not None:
                 await transaction_participant(session, row, created)
+            queued_behind_predecessor = bool(
+                await session.scalar(
+                    select(
+                        exists().where(
+                            DirectTurnRequestRow.conversation_id == row.conversation_id,
+                            DirectTurnRequestRow.admission_order < row.admission_order,
+                            DirectTurnRequestRow.status.in_(
+                                [status.value for status in NONTERMINAL_STATUSES]
+                            ),
+                        )
+                    )
+                )
+            )
             await session.commit()
-            return AdmissionResult(request=row, created=created)
+            return AdmissionResult(
+                request=row,
+                created=created,
+                queued_behind_predecessor=queued_behind_predecessor,
+            )
 
     async def get(self, request_id: str) -> DirectTurnRequestRow | None:
         async with self._session_factory() as session:
-            return cast(
-                DirectTurnRequestRow | None,
-                (
-                    await session.execute(
-                        select(DirectTurnRequestRow).where(
-                            DirectTurnRequestRow.request_id == request_id
-                        )
+            return (
+                await session.execute(
+                    select(DirectTurnRequestRow).where(
+                        DirectTurnRequestRow.request_id == request_id
                     )
-                ).scalar_one_or_none(),
-            )
+                )
+            ).scalar_one_or_none()
 
     async def list_claimable_heads(self, *, limit: int = 100) -> list[DirectTurnRequestRow]:
         """Return FIFO conversation heads that are eligible for ownership."""
@@ -420,43 +477,59 @@ class DirectTurnStore:
             )
             return list(result.scalars().all())
 
-    async def get_conversation_active(self, conversation_id: str) -> DirectTurnRequestRow | None:
+    async def get_conversation_active(
+        self,
+        conversation_id: str,
+        *,
+        session: AsyncSession | None = None,
+    ) -> DirectTurnRequestRow | None:
         """Return the authoritative active durable turn for a conversation."""
 
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(DirectTurnRequestRow)
-                .where(
-                    DirectTurnRequestRow.conversation_id == conversation_id,
-                    DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
+        if session is None:
+            async with self._session_factory() as owned_session:
+                return await self.get_conversation_active(
+                    conversation_id,
+                    session=owned_session,
                 )
-                .order_by(DirectTurnRequestRow.admission_order)
-                .limit(1)
+        result = await session.execute(
+            select(DirectTurnRequestRow)
+            .where(
+                DirectTurnRequestRow.conversation_id == conversation_id,
+                DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
             )
-            return result.scalar_one_or_none()
+            .order_by(DirectTurnRequestRow.admission_order)
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def list_conversations_active(
-        self, conversation_ids: list[str]
+        self,
+        conversation_ids: list[str],
+        *,
+        session: AsyncSession | None = None,
     ) -> dict[str, DirectTurnRequestRow]:
         """Return one authoritative active durable turn per requested conversation."""
 
         if not conversation_ids:
             return {}
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(DirectTurnRequestRow)
-                .where(
-                    DirectTurnRequestRow.conversation_id.in_(conversation_ids),
-                    DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
+        if session is None:
+            async with self._session_factory() as owned_session:
+                return await self.list_conversations_active(
+                    conversation_ids,
+                    session=owned_session,
                 )
-                .order_by(
-                    DirectTurnRequestRow.conversation_id, DirectTurnRequestRow.admission_order
-                )
+        result = await session.execute(
+            select(DirectTurnRequestRow)
+            .where(
+                DirectTurnRequestRow.conversation_id.in_(conversation_ids),
+                DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
             )
-            rows: dict[str, DirectTurnRequestRow] = {}
-            for row in result.scalars():
-                rows.setdefault(row.conversation_id, row)
-            return rows
+            .order_by(DirectTurnRequestRow.conversation_id, DirectTurnRequestRow.admission_order)
+        )
+        rows: dict[str, DirectTurnRequestRow] = {}
+        for row in result.scalars():
+            rows.setdefault(row.conversation_id, row)
+        return rows
 
     async def list_stale_active(self, *, limit: int = 100) -> list[DirectTurnRequestRow]:
         """Return active rows whose exact lease tuple is no longer current."""
@@ -772,15 +845,67 @@ class DirectTurnStore:
         expected_payload_hash: str | None = None,
     ) -> DirectTurnRequestRow | None:
         """Replace payload only while the request remains queued."""
-        payload = _validated_payload(payload, payload_version)
         async with self._session_factory() as session:
+            current = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(
+                        DirectTurnRequestRow.request_id == request_id,
+                        DirectTurnRequestRow.status == DirectTurnStatus.QUEUED.value,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                await session.rollback()
+                return None
+            if expected_payload_hash is not None and current.payload_hash != expected_payload_hash:
+                await session.rollback()
+                return None
+            raw_current_metadata = (
+                current.payload.get("metadata") if isinstance(current.payload, dict) else None
+            )
+            current_metadata: dict[str, Any] = (
+                dict(raw_current_metadata) if isinstance(raw_current_metadata, dict) else {}
+            )
+            current_admission = current_metadata.get(TRUSTED_EVIDENCE_ADMISSION_KEY)
+            parsed_current_admission = deserialize_evidence_admission(current_admission)
+            if parsed_current_admission is not None and parsed_current_admission.admitted:
+                bound_fields_changed = any(
+                    payload.get(field) != current.payload.get(field)
+                    for field in ("content", "attachments")
+                )
+                if bound_fields_changed:
+                    await session.rollback()
+                    raise ValueError(
+                        "content and attachments are immutable after trusted evidence admission"
+                    )
+            raw_proposed_metadata = payload.get("metadata")
+            proposed_metadata: dict[str, Any]
+            if not isinstance(raw_proposed_metadata, dict):
+                proposed_metadata = {}
+                payload = {**payload, "metadata": proposed_metadata}
+            else:
+                proposed_metadata = dict(raw_proposed_metadata)
+            proposed_admission = proposed_metadata.get(TRUSTED_EVIDENCE_ADMISSION_KEY)
+            if proposed_admission is not None and proposed_admission != current_admission:
+                await session.rollback()
+                raise ValueError("trusted evidence admission is immutable")
+            if current_admission is not None:
+                payload = {
+                    **payload,
+                    "metadata": {
+                        **proposed_metadata,
+                        TRUSTED_EVIDENCE_ADMISSION_KEY: current_admission,
+                    },
+                }
+            payload = _validated_payload(payload, payload_version)
             now = await database_now(session)
             predicates = [
                 DirectTurnRequestRow.request_id == request_id,
                 DirectTurnRequestRow.status == DirectTurnStatus.QUEUED.value,
+                DirectTurnRequestRow.payload_hash == current.payload_hash,
             ]
-            if expected_payload_hash is not None:
-                predicates.append(DirectTurnRequestRow.payload_hash == expected_payload_hash)
             row = (
                 await session.execute(
                     update(DirectTurnRequestRow)
@@ -795,7 +920,191 @@ class DirectTurnStore:
                 )
             ).scalar_one_or_none()
             await session.commit()
-            return cast(DirectTurnRequestRow | None, row)
+            return row
+
+    async def handoff(
+        self,
+        session: AsyncSession,
+        *,
+        request_id: str,
+        turn_id: str,
+        lease: Lease,
+        successor: DirectTurnRequestRow,
+    ) -> bool:
+        """Complete a predecessor inside the successor admission transaction.
+
+        The caller holds the conversation admission lock. Return False for an
+        exact committed replay, True for a new handoff.
+        """
+        predecessor = await session.scalar(
+            select(DirectTurnRequestRow).where(DirectTurnRequestRow.request_id == request_id)
+        )
+        if (
+            predecessor is None
+            or predecessor.conversation_id != successor.conversation_id
+            or predecessor.turn_id != turn_id
+        ):
+            raise DirectTurnAdmissionRejected("continuation predecessor mismatch")
+        outcome = {
+            "phase": "automatic_continuation_handoff",
+            "successor_request_id": successor.request_id,
+            "successor_turn_id": successor.turn_id,
+        }
+        if predecessor.status == DirectTurnStatus.COMPLETED.value:
+            if predecessor.outcome == outcome:
+                return False
+            raise DirectTurnAdmissionRejected("continuation predecessor already settled")
+        now = await database_now(session)
+        updated = await self._owned_fenced_update(
+            session,
+            request_id=request_id,
+            lease=lease,
+            statuses=ACTIVE_STATUSES,
+            predicates=(DirectTurnRequestRow.cancel_requested_at.is_(None),),
+            values={
+                "status": DirectTurnStatus.COMPLETED.value,
+                "outcome": outcome,
+                "terminal_at": now,
+                "updated_at": now,
+            },
+        )
+        if updated is None:
+            raise DirectTurnAdmissionRejected("continuation predecessor fence changed")
+        return True
+
+    async def cancel_conversation(
+        self,
+        conversation_id: str,
+        *,
+        clear_queue: bool,
+        active_request_id: str | None = None,
+    ) -> list[CancelResult]:
+        """Serialize stop with admission and follow the committed active chain."""
+        async with self._session_factory() as session:
+            await session.execute(
+                select(Conversation.conversation_id)
+                .where(Conversation.conversation_id == conversation_id)
+                .with_for_update()
+            )
+            rows = list(
+                (
+                    await session.scalars(
+                        select(DirectTurnRequestRow)
+                        .where(
+                            DirectTurnRequestRow.conversation_id == conversation_id,
+                            DirectTurnRequestRow.status.in_(
+                                [status.value for status in NONTERMINAL_STATUSES]
+                            ),
+                        )
+                        .order_by(DirectTurnRequestRow.admission_order)
+                    )
+                ).all()
+            )
+            if not clear_queue:
+                active = (
+                    await session.scalar(
+                        select(DirectTurnRequestRow).where(
+                            DirectTurnRequestRow.request_id == active_request_id
+                        )
+                    )
+                    if active_request_id
+                    else None
+                )
+                if active is None:
+                    active = next(
+                        (
+                            row
+                            for row in rows
+                            if row.status
+                            in {DirectTurnStatus.CLAIMED.value, DirectTurnStatus.RUNNING.value}
+                        ),
+                        None,
+                    )
+                if active is None:
+                    active = await session.scalar(
+                        select(DirectTurnRequestRow)
+                        .where(
+                            DirectTurnRequestRow.conversation_id == conversation_id,
+                            DirectTurnRequestRow.status == DirectTurnStatus.COMPLETED.value,
+                            DirectTurnRequestRow.outcome["phase"].as_string()
+                            == "automatic_continuation_handoff",
+                        )
+                        .order_by(DirectTurnRequestRow.admission_order.desc())
+                        .limit(1)
+                    )
+                seen: set[str] = set()
+                while (
+                    active is not None
+                    and active.conversation_id == conversation_id
+                    and active.request_id not in seen
+                    and (active.outcome or {}).get("phase") == "automatic_continuation_handoff"
+                ):
+                    seen.add(active.request_id)
+                    outcome = active.outcome or {}
+                    successor = await session.scalar(
+                        select(DirectTurnRequestRow).where(
+                            DirectTurnRequestRow.request_id == outcome["successor_request_id"]
+                        )
+                    )
+                    active = successor
+                if active_request_id is not None and active is not None and active not in rows:
+                    rows = []
+                    active = None
+                elif active is None or active not in rows:
+                    active = next(
+                        (row for row in rows if row.status == DirectTurnStatus.RECOVERABLE.value),
+                        None,
+                    )
+                rows = [active] if active is not None else []
+            now = await database_now(session)
+            results = []
+            for row in rows:
+                updated_row = (
+                    await session.execute(
+                        update(DirectTurnRequestRow)
+                        .where(
+                            DirectTurnRequestRow.request_id == row.request_id,
+                            DirectTurnRequestRow.status.in_(
+                                [status.value for status in NONTERMINAL_STATUSES]
+                            ),
+                        )
+                        .values(
+                            cancel_requested_at=now,
+                            updated_at=now,
+                            status=case(
+                                (
+                                    DirectTurnRequestRow.status.in_(
+                                        [status.value for status in CLAIMABLE_STATUSES]
+                                    ),
+                                    DirectTurnStatus.CANCELLED.value,
+                                ),
+                                else_=DirectTurnRequestRow.status,
+                            ),
+                            terminal_at=case(
+                                (
+                                    DirectTurnRequestRow.status.in_(
+                                        [status.value for status in CLAIMABLE_STATUSES]
+                                    ),
+                                    now,
+                                ),
+                                else_=DirectTurnRequestRow.terminal_at,
+                            ),
+                        )
+                        .returning(DirectTurnRequestRow)
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if updated_row is None:
+                    continue
+                results.append(
+                    CancelResult(
+                        request=updated_row,
+                        cancellation_requested=DirectTurnStatus(updated_row.status)
+                        in ACTIVE_STATUSES,
+                    )
+                )
+            await session.commit()
+            return results
 
     async def request_cancel(self, request_id: str) -> CancelResult | None:
         """Atomically cancel idle work or durably flag active work."""
@@ -882,6 +1191,221 @@ class DirectTurnStore:
             await session.commit()
             return row
 
+    async def merge_tool_dispatch(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        call_id: str,
+        executor_id: str,
+        executor_instance_id: str | None,
+        dispatch_state: Literal["dispatching", "sent"],
+    ) -> DirectTurnRequestRow | None:
+        """Merge one physical dispatch binding under the live direct-turn fence."""
+
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                request is None
+                or request.status not in {status.value for status in ACTIVE_STATUSES}
+                or request.cancel_requested_at is not None
+                or request.owner_controller_id is None
+                or request.owner_incarnation_id is None
+                or lease.owner_id
+                != _owner_id(request.owner_controller_id, request.owner_incarnation_id)
+                or request.fencing_token != lease.fencing_token
+                or lease.resource_key != conversation_lease_key(request.conversation_id)
+                or not await session.scalar(select(self._lease_predicate(session, lease)))
+            ):
+                return None
+            outcome = dict(request.outcome) if isinstance(request.outcome, dict) else {}
+            descriptors = outcome.get("tool_calls")
+            if not isinstance(descriptors, list):
+                return None
+            matched = False
+            merged: list[dict[str, Any]] = []
+            for raw in descriptors[:500]:
+                if not isinstance(raw, dict):
+                    continue
+                descriptor = dict(raw)
+                if descriptor.get("call_id") == call_id:
+                    descriptor.update(
+                        {
+                            "executor_id": executor_id,
+                            "executor_instance_id": executor_instance_id,
+                            "dispatch_state": dispatch_state,
+                        }
+                    )
+                    matched = True
+                merged.append(descriptor)
+            if not matched:
+                return None
+            now = await database_now(session)
+            request.outcome = {**outcome, "tool_calls": merged}
+            request.updated_at = now
+            await session.commit()
+            return request
+
+    async def begin_tool_recovery(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        controller_id: str,
+        incarnation_id: str,
+        deadline_seconds: float,
+    ) -> DirectTurnRequestRow | None:
+        """Take over stale tool recovery and preserve its first DB-time deadline."""
+
+        if lease.owner_id != _owner_id(controller_id, incarnation_id):
+            raise ValueError("lease owner does not match controller incarnation")
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                request is None
+                or request.status not in {status.value for status in ACTIVE_STATUSES}
+                or request.fencing_token is None
+                or request.fencing_token >= lease.fencing_token
+                or lease.resource_key != conversation_lease_key(request.conversation_id)
+                or not await session.scalar(select(self._lease_predicate(session, lease)))
+            ):
+                return None
+            outcome = dict(request.outcome) if isinstance(request.outcome, dict) else {}
+            if outcome.get("phase") != "tool_in_flight":
+                return None
+            now = await database_now(session)
+            recovery_started_at = outcome.get("recovery_started_at")
+            if not isinstance(recovery_started_at, str):
+                recovery_started_at = now.isoformat()
+            recovery_deadline_at = outcome.get("recovery_deadline_at")
+            if not isinstance(recovery_deadline_at, str):
+                recovery_deadline_at = (
+                    now + timedelta(seconds=max(1.0, deadline_seconds))
+                ).isoformat()
+            request.owner_controller_id = controller_id
+            request.owner_incarnation_id = incarnation_id
+            request.fencing_token = lease.fencing_token
+            request.outcome = {
+                **outcome,
+                "recovery_started_at": recovery_started_at,
+                "recovery_deadline_at": recovery_deadline_at,
+            }
+            request.updated_at = now
+            await session.commit()
+            return request
+
+    async def mark_tool_recovery_terminal(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        status: DirectTurnStatus,
+        outcome: dict[str, Any],
+    ) -> DirectTurnRequestRow | None:
+        """Settle a failed recovery and any matching managed link atomically."""
+
+        if status not in {DirectTurnStatus.FAILED, DirectTurnStatus.AMBIGUOUS}:
+            raise ValueError("tool recovery fallback must be failed or ambiguous")
+        async with self._session_factory() as session:
+            now = await database_now(session)
+            row = await self._owned_fenced_update(
+                session,
+                request_id=request_id,
+                lease=lease,
+                statuses=ACTIVE_STATUSES,
+                values={
+                    "status": status.value,
+                    "outcome": outcome,
+                    "terminal_at": now,
+                    "updated_at": now,
+                },
+            )
+            if row is None:
+                await session.rollback()
+                return None
+            await session.execute(
+                update(ManagedConversationLink)
+                .where(
+                    ManagedConversationLink.target_conversation_id == row.conversation_id,
+                    ManagedConversationLink.active_turn_id == row.turn_id,
+                )
+                .values(
+                    turn_state="failed",
+                    active_turn_id=None,
+                    notify_on_completion=False,
+                    last_error=str(outcome.get("error") or outcome.get("reason") or "")[:1000],
+                    last_result_turn_id=row.turn_id,
+                    handoff_state=None,
+                    handoff_target_turn_id=None,
+                    handoff_controller_session_id=None,
+                    handoff_controller_turn_id=None,
+                    handoff_tool_call_id=None,
+                    completed_at=now,
+                    updated_at=now,
+                )
+            )
+            await session.commit()
+            return row
+
+    async def finish_tool_recovery(
+        self,
+        request_id: str,
+        *,
+        lease: Lease,
+        outcome: dict[str, Any],
+    ) -> DirectTurnRequestRow | None:
+        """Make recovered work claimable, or honor cancellation atomically."""
+
+        async with self._session_factory() as session:
+            request = (
+                await session.execute(
+                    select(DirectTurnRequestRow)
+                    .where(DirectTurnRequestRow.request_id == request_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                request is None
+                or request.status not in {status.value for status in ACTIVE_STATUSES}
+                or request.owner_controller_id is None
+                or request.owner_incarnation_id is None
+                or lease.owner_id
+                != _owner_id(request.owner_controller_id, request.owner_incarnation_id)
+                or request.fencing_token != lease.fencing_token
+                or lease.resource_key != conversation_lease_key(request.conversation_id)
+                or not await session.scalar(select(self._lease_predicate(session, lease)))
+            ):
+                return None
+            now = await database_now(session)
+            if request.cancel_requested_at is not None:
+                request.status = DirectTurnStatus.CANCELLED.value
+                request.outcome = {
+                    "phase": "cancelled",
+                    "reason": "cancelled during tool recovery",
+                }
+                request.terminal_at = now
+            else:
+                request.status = DirectTurnStatus.RECOVERABLE.value
+                request.outcome = outcome
+            request.owner_controller_id = None
+            request.owner_incarnation_id = None
+            request.fencing_token = None
+            request.updated_at = now
+            await session.commit()
+            return request
+
     async def materialize_claimed_payload(
         self,
         request_id: str,
@@ -912,6 +1436,8 @@ class DirectTurnStore:
                 or lease.resource_key != conversation_lease_key(request.conversation_id)
             ):
                 return None
+            if request.payload_hash != _canonical_hash(request.payload):
+                raise PermanentDirectTurnPayloadError("Durable direct-turn payload hash mismatch")
             payload = DirectTurnPayloadV1.model_validate(request.payload)
             artifact_ids = [attachment.artifact_id for attachment in payload.attachments]
             records = (
@@ -1098,7 +1624,7 @@ class DirectTurnStore:
                 )
             ).scalar_one_or_none()
             await session.commit()
-            return cast(DirectTurnRequestRow | None, row)
+            return row
 
     async def mark_stale_ambiguous(
         self,
@@ -1298,7 +1824,7 @@ class DirectTurnStore:
                 )
             ).scalar_one_or_none()
             await session.commit()
-            return cast(DirectTurnRequestRow | None, row)
+            return row
 
     async def recover_stale_absorbing(
         self,
@@ -1433,7 +1959,10 @@ class DirectTurnStore:
                 session,
                 request_id=request_id,
                 lease=lease,
-                statuses={DirectTurnStatus.QUEUED},
+                statuses={
+                    DirectTurnStatus.QUEUED,
+                    DirectTurnStatus.RECOVERABLE,
+                },
                 values={
                     "status": DirectTurnStatus.ABSORBING.value,
                     "owner_controller_id": controller_id,
@@ -1663,17 +2192,14 @@ class DirectTurnStore:
                     )
                 )
             )
-        return cast(
-            DirectTurnRequestRow | None,
-            (
-                await session.execute(
-                    update(DirectTurnRequestRow)
-                    .where(*predicates)
-                    .values(**values)
-                    .returning(DirectTurnRequestRow)
-                )
-            ).scalar_one_or_none(),
-        )
+        return (
+            await session.execute(
+                update(DirectTurnRequestRow)
+                .where(*predicates)
+                .values(**values)
+                .returning(DirectTurnRequestRow)
+            )
+        ).scalar_one_or_none()
 
     async def _owned_fenced_update(
         self,
@@ -1699,25 +2225,22 @@ class DirectTurnStore:
             != _owner_id(request.owner_controller_id, request.owner_incarnation_id)
         ):
             return None
-        return cast(
-            DirectTurnRequestRow | None,
-            (
-                await session.execute(
-                    update(DirectTurnRequestRow)
-                    .where(
-                        DirectTurnRequestRow.request_id == request_id,
-                        DirectTurnRequestRow.status.in_([status.value for status in statuses]),
-                        DirectTurnRequestRow.owner_controller_id == request.owner_controller_id,
-                        DirectTurnRequestRow.owner_incarnation_id == request.owner_incarnation_id,
-                        DirectTurnRequestRow.fencing_token == lease.fencing_token,
-                        self._lease_predicate(session, lease),
-                        *predicates,
-                    )
-                    .values(**values)
-                    .returning(DirectTurnRequestRow)
+        return (
+            await session.execute(
+                update(DirectTurnRequestRow)
+                .where(
+                    DirectTurnRequestRow.request_id == request_id,
+                    DirectTurnRequestRow.status.in_([status.value for status in statuses]),
+                    DirectTurnRequestRow.owner_controller_id == request.owner_controller_id,
+                    DirectTurnRequestRow.owner_incarnation_id == request.owner_incarnation_id,
+                    DirectTurnRequestRow.fencing_token == lease.fencing_token,
+                    self._lease_predicate(session, lease),
+                    *predicates,
                 )
-            ).scalar_one_or_none(),
-        )
+                .values(**values)
+                .returning(DirectTurnRequestRow)
+            )
+        ).scalar_one_or_none()
 
     @staticmethod
     def _lease_predicate(session: AsyncSession, lease: Lease) -> Any:

@@ -1446,7 +1446,6 @@ function memoryResultSummary(
   if (item.status === 'started') return 'Waiting for memory operation result.';
   const message = stringField(parsed?.message);
   if (item.isError || parsed?.error === true) return message || firstOutputLine(cleanToolResult(item.result)) || 'Memory operation failed.';
-  if (message) return message;
   const count = resultItems.length;
   if (name === 'memoryask') {
     const answer = stringField(parsed?.answer);
@@ -1455,6 +1454,7 @@ function memoryResultSummary(
   if (name === 'memorysearch' || name === 'memoryfind' || name === 'memorylist' || name === 'memoryrecent') {
     return `${count} memor${count === 1 ? 'y' : 'ies'} found.`;
   }
+  if (message) return message;
   if (name === 'memoryaddbatch' || name === 'memoryadd' || name === 'memoryupdate' || name === 'memorydelete') {
     return isMemorySaveTool(name)
       ? memorySaveSummary(resultItems, 'Memory operation completed.')

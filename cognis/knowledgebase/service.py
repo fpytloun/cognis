@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import builtins
 import contextlib
 import hashlib
 import json
@@ -446,7 +447,7 @@ def _filter_matches_value(
         except ValueError:
             return False
     if item.op == "eq":
-        return actual == item.value
+        return bool(actual == item.value)
     if item.op == "in":
         return actual in item.value
     if item.op == "contains":
@@ -930,7 +931,7 @@ class KnowledgebaseService:
         owner_email: str,
         knowledgebase_id: str,
         access_context: KnowledgebaseAccessContext | None = None,
-    ) -> list[KnowledgebaseArtifactModel] | None:
+    ) -> builtins.list[KnowledgebaseArtifactModel] | None:
         self.require_enabled()
         async with self._session_factory() as session:
             kb = await self._resolve_direct_document_access(
@@ -965,7 +966,7 @@ class KnowledgebaseService:
 
     async def list_shares(
         self, *, owner_email: str, knowledgebase_id: str
-    ) -> list[KnowledgebaseShareModel] | None:
+    ) -> builtins.list[KnowledgebaseShareModel] | None:
         self.require_enabled()
         async with self._session_factory() as session:
             resolved = await resolve_knowledgebase_access(
@@ -994,7 +995,7 @@ class KnowledgebaseService:
 
     async def share_candidates(
         self, *, owner_email: str, knowledgebase_id: str, query: str | None = None
-    ) -> list[KnowledgebaseShareCandidate] | None:
+    ) -> builtins.list[KnowledgebaseShareCandidate] | None:
         self.require_enabled()
         async with self._session_factory() as session:
             kb = await resolve_knowledgebase_access(
@@ -1085,10 +1086,11 @@ class KnowledgebaseService:
         except Exception:
             return
         if not persisted:
+            artifact_store = self._artifact_store
+            if artifact_store is None:
+                return
             with contextlib.suppress(Exception):
-                await self._artifact_store.async_delete(
-                    "knowledgebase-documents", artifact_id, filename
-                )
+                await artifact_store.async_delete("knowledgebase-documents", artifact_id, filename)
 
     async def documents(
         self,
@@ -1400,10 +1402,10 @@ class KnowledgebaseService:
         *,
         owner_email: str,
         knowledgebase_id: str,
-        files: list[tuple[str, bytes | bytearray, str, str | None]],
+        files: builtins.list[tuple[str, bytes | bytearray, str, str | None]],
         metadata: dict[str, Any] | None,
         conflict_policy: Literal["skip", "replace", "keep_both"],
-    ) -> list[KnowledgebaseIngestOutcome] | None:
+    ) -> builtins.list[KnowledgebaseIngestOutcome] | None:
         self.require_enabled()
         await self._require_index_ready()
         if self._artifact_store is None:
@@ -1424,7 +1426,7 @@ class KnowledgebaseService:
             if kb.knowledgebase.status != "active":
                 raise KnowledgebaseRequestError("archived knowledgebase is read-only")
         batch_paths: set[str] = set()
-        outcomes: list[KnowledgebaseIngestOutcome] = []
+        outcomes: builtins.list[KnowledgebaseIngestOutcome] = []
         for filename_raw, content, upload_mime, path_raw in files:
             filename = sanitize_artifact_filename(filename_raw, default="document")
             try:
@@ -1455,6 +1457,10 @@ class KnowledgebaseService:
                         )
                     outcome_status, source_path, existing = conflict
                     if outcome_status == "unchanged":
+                        if existing is None:
+                            raise KnowledgebaseRequestError(
+                                "unchanged conflict result is missing the existing document"
+                            )
                         outcomes.append(
                             KnowledgebaseIngestOutcome(
                                 filename=filename_raw,
@@ -1467,6 +1473,10 @@ class KnowledgebaseService:
                         )
                         continue
                     if outcome_status == "skipped":
+                        if existing is None:
+                            raise KnowledgebaseRequestError(
+                                "skipped conflict result is missing the existing document"
+                            )
                         outcomes.append(
                             KnowledgebaseIngestOutcome(
                                 filename=filename_raw,
@@ -1483,6 +1493,7 @@ class KnowledgebaseService:
                         existing.pending_source_hash,
                     }
                     if same_content:
+                        assert existing is not None
                         updated = await update_knowledgebase_artifact_metadata(
                             session,
                             owner_email=owner_email,
@@ -1617,7 +1628,7 @@ class KnowledgebaseService:
         status: str | None = None,
         job_type: str | None = None,
         limit: int = 100,
-    ) -> list[KnowledgebaseIndexJobModel] | None:
+    ) -> builtins.list[KnowledgebaseIndexJobModel] | None:
         self.require_enabled()
         context = access_context or KnowledgebaseAccessContext(actor_email=owner_email)
         if context.agent_id is not None or context.actor_email != owner_email:
@@ -1673,7 +1684,7 @@ class KnowledgebaseService:
 
     async def reindex(
         self, *, owner_email: str, knowledgebase_id: str
-    ) -> list[KnowledgebaseIndexJobModel] | None:
+    ) -> builtins.list[KnowledgebaseIndexJobModel] | None:
         self.require_enabled()
         await self._require_index_ready()
         async with self._session_factory() as session:
@@ -1798,7 +1809,7 @@ class KnowledgebaseService:
                 raise KnowledgebaseFacetLimitError(
                     f"exact facets are limited to {_MAX_FACET_DOCUMENTS} active documents"
                 )
-            documents: list[dict[str, Any]] = []
+            documents: builtins.list[dict[str, Any]] = []
             for row, artifact in rows:
                 values = dict(row.active_metadata_json or {})
                 values["source_path"] = row.source_path
@@ -1815,7 +1826,7 @@ class KnowledgebaseService:
                     )
                 documents.append(values)
 
-        facet_fields: list[KnowledgebaseFacetField] = []
+        facet_fields: builtins.list[KnowledgebaseFacetField] = []
         for field in payload.fields:
             applicable_filters = [item for item in payload.filters if item.field != field]
             counts: Counter[str | int | float | bool] = Counter()
@@ -1843,13 +1854,17 @@ class KnowledgebaseService:
             ordered = sorted(counts.items(), key=lambda item: (-item[1], str(item[0])))
             shown = ordered[: payload.limit_per_field]
             normalized_type = allowed[field]
-            response_type: Literal["string", "number", "boolean", "datetime", "array"] = (
-                "array"
-                if normalized_type == "string[]"
-                else "string"
-                if normalized_type in {"string", "keyword"}
-                else normalized_type
-            )
+            response_type: Literal["string", "number", "boolean", "datetime", "array"]
+            if normalized_type == "string[]":
+                response_type = "array"
+            elif normalized_type in {"string", "keyword"}:
+                response_type = "string"
+            elif normalized_type == "number":
+                response_type = "number"
+            elif normalized_type == "boolean":
+                response_type = "boolean"
+            else:
+                response_type = "datetime"
             facet_fields.append(
                 KnowledgebaseFacetField(
                     field=field,
@@ -1948,7 +1963,7 @@ class KnowledgebaseService:
                     list(rows.values()), payload.filters, kb.metadata_schema
                 )
             }
-        matches: list[KnowledgebaseSearchMatch] = []
+        matches: builtins.list[KnowledgebaseSearchMatch] = []
         for chunk_id in sorted(fused, key=lambda value: fused[value], reverse=True):
             chunk = rows.get(chunk_id)
             if chunk is None:

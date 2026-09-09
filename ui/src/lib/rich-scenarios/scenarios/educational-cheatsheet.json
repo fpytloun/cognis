@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "educational-cheatsheet",
+  "title": "Photography exposure triangle",
+  "description": "A dense, printable two-column reference for aperture, shutter speed, ISO, examples, mistakes, and terminology.",
+  "group": "learning",
+  "sort_key": 1310,
+  "content": "Photography exposure triangle cheatsheet: spoiler-free, print-friendly reference for aperture, shutter speed, ISO, examples, mistakes, glossary, and sources.",
+  "visibility": ["gallery"],
+  "payload": {
+    "metadata": {"eyebrow": "Field reference", "subtitle": "A compact, static reference for learning manual exposure.", "density": "compact"},
+    "blocks": [
+      {"type": "hero", "eyebrow": "Photography basics", "title": "The exposure triangle", "subtitle": "Aperture, shutter speed, and ISO jointly control brightness. Each has a creative side effect."},
+      {"type": "figure", "title": "One exposure, three controls", "src": "/fixtures/rich-scenarios/educational-cheatsheet/exposure-triangle.svg", "alt": "Triangular diagram linking aperture, shutter speed, and ISO to exposure.", "caption": "Keep brightness constant by compensating a change in one setting with another.", "source": "Cognis fixture illustration", "source_url": "https://www.nationalgeographic.com/photography/article/understanding-exposure"},
+      {"type": "columns", "blocks": [{"type": "section", "title": "Aperture · f-stop", "content": "**Lower f-number** → wider opening → more light → shallower depth of field.\n\n**Higher f-number** → narrower opening → less light → more depth of field.\n\nStart at f/2 for a portrait or f/8 for a landscape."}, {"type": "section", "title": "Shutter speed · time", "content": "**Faster** (1/1000 s) freezes motion but admits less light.\n\n**Slower** (1/30 s) blurs motion and admits more light.\n\nHandheld starting point: use at least 1/focal-length seconds."}]},
+      {"type": "columns", "blocks": [{"type": "section", "title": "ISO · sensor gain", "content": "**Low ISO** gives cleaner detail but needs more light.\n\n**High ISO** helps in dim light but adds visible noise.\n\nUse the lowest ISO that supports your needed aperture and shutter speed."}, {"type": "section", "title": "Quick settings", "content": "**Portrait:** f/2–f/4, 1/125 s or faster, ISO 100–800.\n\n**Sports:** f/2.8–f/5.6, 1/1000 s, Auto ISO.\n\n**Landscape:** f/8–f/11, tripod if needed, ISO 100."}]},
+      {"type": "table", "title": "Three practical starting points", "columns": [{"key": "scene", "label": "Scene"}, {"key": "aperture", "label": "Aperture"}, {"key": "shutter", "label": "Shutter"}, {"key": "iso", "label": "ISO"}], "rows": [{"scene": "Window-light portrait", "aperture": "f/2.8", "shutter": "1/250 s", "iso": "400"}, {"scene": "Running child outdoors", "aperture": "f/4", "shutter": "1/1000 s", "iso": "Auto"}, {"scene": "City at night, tripod", "aperture": "f/8", "shutter": "2 s", "iso": "100"}]},
+      {"type": "callout", "tone": "warning", "title": "Common mistakes", "content": "Do not raise ISO first when the subject is still. First open the aperture or use a slower shutter speed. Do not use a slow handheld shutter speed when camera shake will blur the image."},
+      {"type": "section", "title": "Glossary", "blocks": [{"type": "markdown", "content": "**Depth of field** — the zone that appears acceptably sharp.\n\n**Stop** — a doubling or halving of light.\n\n**Noise** — random-looking grain or color variation, more visible at high ISO.\n\n**Focal length** — the lens property that changes angle of view and influences handheld shutter-speed needs."}]},
+      {"type": "source_list", "title": "Source list"}
+    ],
+    "sources": [{"id": "ng-exposure", "title": "Understanding Exposure", "publisher": "National Geographic", "url": "https://www.nationalgeographic.com/photography/article/understanding-exposure"}, {"id": "nikon-exposure", "title": "The Exposure Triangle", "publisher": "Nikon Learn & Explore", "url": "https://www.nikonusa.com/learn-and-explore/c/tips-and-techniques/the-exposure-triangle"}],
+    "assets": [], "datasets": [], "exports": []
+  }
+}

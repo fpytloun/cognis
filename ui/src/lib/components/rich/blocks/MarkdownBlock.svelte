@@ -6,6 +6,7 @@
 
   $: rendered = renderMarkdown(blockText(block));
   $: publicationHtml = renderPublicationMarkdown(rendered, block);
+  $: role = typeof block.role === 'string' ? block.role : '';
 
   function renderPublicationMarkdown(value: string, current: RichBlock): string {
     const anchor = typeof current.__publication_anchor === 'string' ? current.__publication_anchor : '';
@@ -60,4 +61,4 @@
   }
 </script>
 
-<div class="rich-markdown" data-rich-block-type="markdown">{@html publicationHtml}</div>
+<div class="rich-markdown" data-rich-block-type="markdown" data-rich-role={role || undefined}>{@html publicationHtml}</div>

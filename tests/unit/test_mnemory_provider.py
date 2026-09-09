@@ -107,6 +107,40 @@ class _ValidationErrorClient:
 
 
 @pytest.mark.asyncio
+async def test_add_memory_uses_deterministic_create_and_current_result_id() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    client = _Client({"results": [{"event": "ADD", "id": "mem-current"}]})
+    provider.client = client
+
+    memory_id = await provider.add_memory(
+        "remember this",
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    assert memory_id == "mem-current"
+    assert client.last_json is not None
+    assert client.last_json["infer"] is False
+
+
+@pytest.mark.asyncio
+async def test_add_memory_keeps_extraction_for_assistant_identity_data() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    client = _Client({"results": [{"event": "ADD", "id": "mem-assistant"}]})
+    provider.client = client
+
+    await provider.add_memory(
+        "assistant preference",
+        role="assistant",
+        agent_id="agent-1",
+        user_email="user@example.com",
+    )
+
+    assert client.last_json is not None
+    assert client.last_json["infer"] is True
+
+
+@pytest.mark.asyncio
 async def test_recall_flags_forged_session_ids() -> None:
     provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
     provider.client = _Client(
@@ -271,6 +305,22 @@ async def test_delete_memory_tool_calls_mnemory_delete_endpoint() -> None:
         )
     ]
     assert auth.calls == [("user@example.com", "agent-1", ["mnemory"], "user@example.com")]
+
+
+@pytest.mark.asyncio
+async def test_mutation_native_revision_uses_if_match_header() -> None:
+    provider = MnemoryProvider("https://mnemory.test", _AuthProvider())
+    client = _Client({})
+    provider.client = client
+
+    await provider.delete_memory_tool(
+        "mem_123",
+        agent_id="agent-1",
+        user_email="user@example.com",
+        expected_revision="revision-7",
+    )
+
+    assert client.requests[-1][2]["If-Match"] == "revision-7"
 
 
 @pytest.mark.asyncio

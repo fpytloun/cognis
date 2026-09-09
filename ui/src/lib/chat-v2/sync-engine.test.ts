@@ -5,11 +5,16 @@ import {
   addLocalSystemMessage,
   addOptimisticUserMessage,
   applyBackfill,
+  applyBackfillResult,
   applyRealtimeFrame,
   applySendResponse,
   applySnapshot,
   applySyncResponse,
+  deleteQueuedAdmission,
   maybeApplyRuntime,
+  promoteQueuedUserMessage,
+  updateQueuedAdmissionContent,
+  visibleQueueMessages,
   visibleTimelineItems
 } from './sync-engine';
 import type {
@@ -105,7 +110,7 @@ describe('Chat v2 sync engine', () => {
     expect(state.timelineItems.map((item) => item.id)).toEqual(['message:1']);
   });
 
-  it('settles the optimistic sending state as soon as admission is acknowledged', () => {
+  it('keeps accepted optimistic messages in the timeline and moves queued messages to the queue', () => {
     const optimistic = addOptimisticUserMessage(
       applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
       {
@@ -151,7 +156,79 @@ describe('Chat v2 sync engine', () => {
       cursor: null,
       server_time: '2026-01-01T00:00:01Z',
     });
-    expect(queued.localItems[0]?.status).toBe('waiting');
+    expect(queued.localItems).toHaveLength(1);
+    expect(queued.queue).toEqual({
+      messages: [],
+      queued_count: 0,
+    });
+    expect(visibleQueueMessages(queued)).toEqual({
+      messages: [{
+        queue_id: 'queue-1',
+        client_message_id: 'client-1',
+        client_txn_id: 'txn-1',
+        content: 'hello',
+        attachments: [],
+        position: 1,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:01Z',
+        status: 'queued',
+        cancel_requested: false,
+      }],
+      queued_count: 1,
+    });
+
+    const promoted = promoteQueuedUserMessage(queued, {
+      content: 'hello',
+      clientMessageId: 'client-1',
+      createdAt: '2026-01-01T00:00:00Z',
+      chatMode: 'plan',
+    });
+    expect(visibleQueueMessages(promoted).messages).toEqual([]);
+    expect(visibleTimelineItems(promoted)).toHaveLength(1);
+    expect(visibleTimelineItems(promoted)[0]).toMatchObject({
+      client_message_id: 'client-1',
+      chat_mode: 'plan',
+      status: 'complete',
+    });
+
+    const lateQueuedResponse = applySendResponse(promoted, {
+      status: 'queued',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-1',
+      cursor: null,
+      server_time: '2026-01-01T00:00:02Z',
+    });
+    expect(visibleQueueMessages(lateQueuedResponse).messages).toEqual([]);
+    expect(visibleTimelineItems(lateQueuedResponse)).toHaveLength(1);
+    expect(visibleTimelineItems(lateQueuedResponse)[0]).toMatchObject({
+      client_message_id: 'client-1',
+      chat_mode: 'plan',
+    });
+    expect(visibleTimelineItems(queued)).toEqual([]);
+
+    const duplicateQueued = applySendResponse(optimistic, {
+      status: 'duplicate',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-1',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    expect(duplicateQueued.localItems).toHaveLength(1);
+    expect(visibleQueueMessages(duplicateQueued).messages).toEqual([
+      expect.objectContaining({
+        queue_id: 'queue-1',
+        client_message_id: 'client-1',
+        content: 'hello',
+        attachments: [],
+        position: 1,
+      }),
+    ]);
 
     const unrelated = addOptimisticUserMessage(optimistic, {
       content: 'another message',
@@ -169,6 +246,503 @@ describe('Chat v2 sync engine', () => {
       server_time: '2026-01-01T00:00:01Z',
     });
     expect(acknowledgedOne.localItems.map((item) => item.status)).toEqual(['complete', 'pending']);
+  });
+
+  it('never shows one client message in both the queue and timeline across response races', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'queue me',
+        clientMessageId: 'client-1',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+    const queue = {
+      messages: [{
+        queue_id: 'queue-1',
+        client_message_id: 'client-1',
+        client_txn_id: 'txn-1',
+        content: 'queue me',
+        attachments: [],
+        position: 1,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:01Z',
+      }],
+      queued_count: 1,
+    };
+
+    const queueFirst = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue,
+    }), optimistic);
+    expect(queueFirst.localItems).toHaveLength(1);
+    expect(visibleTimelineItems(queueFirst)).toHaveLength(1);
+    expect(visibleQueueMessages(queueFirst).messages).toEqual([]);
+
+    const responseFirst = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-1',
+      client_message_id: 'client-1',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-1',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    const canonicalQueue = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue,
+    }), responseFirst);
+    expect(canonicalQueue.queue?.messages).toHaveLength(1);
+    expect(canonicalQueue.localItems).toHaveLength(1);
+    expect(visibleTimelineItems(canonicalQueue)).toEqual([]);
+    expect(visibleQueueMessages(canonicalQueue).messages).toHaveLength(1);
+  });
+
+  it('does not let a late queued response override canonical boundary persistence', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'queued follow-up',
+        clientMessageId: 'client-boundary',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+    const canonical = applySnapshot(snapshot({
+      timeline: {
+        items: [message({
+          id: 'user:client-boundary',
+          role: 'user',
+          content: 'queued follow-up',
+          message_id: 'client-boundary',
+          client_message_id: 'client-boundary',
+          sort_key: '0000:000000000000002:000000:01:000000000',
+          source_refs: [{
+            store: 'intaris',
+            session_id: 'sess-1',
+            seq: 2,
+            event_type: 'user_message',
+          }],
+        })],
+        has_more_before: false,
+      },
+    }), optimistic);
+
+    const lateQueuedResponse = applySendResponse(canonical, {
+      status: 'queued',
+      client_txn_id: 'txn-boundary',
+      client_message_id: 'client-boundary',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-boundary',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+
+    expect(lateQueuedResponse.admissionPlacements['client-boundary']?.placement).toBe('timeline');
+    expect(visibleQueueMessages(lateQueuedResponse).messages).toEqual([]);
+    expect(visibleTimelineItems(lateQueuedResponse).filter((item) =>
+      item.kind === 'message' && item.client_message_id === 'client-boundary'
+    )).toHaveLength(1);
+  });
+
+  it('flushes a committed queued user before the same-turn continuation phase', () => {
+    const phaseZero = message({
+      id: 'assistant:turn-1:phase:0',
+      stable: false,
+      partial: true,
+      content: 'answer before follow-up',
+      turn_id: 'turn-1',
+      assistant_phase_index: 0,
+      sort_key: '9998:999999999999999:000000:02:000000000',
+      source_refs: []
+    });
+    const phaseOne = message({
+      id: 'assistant:turn-1:phase:1',
+      stable: false,
+      partial: true,
+      content: 'continuation answer',
+      turn_id: 'turn-1',
+      assistant_phase_index: 1,
+      sort_key: '9998:999999999999999:000001:02:000000000',
+      source_refs: []
+    });
+    const base = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [phaseZero]
+      })
+    }));
+    const optimistic = addOptimisticUserMessage(base, {
+      content: 'queued follow-up',
+      clientMessageId: 'client-boundary',
+      createdAt: '2026-01-01T00:00:01Z'
+    });
+    const queued = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-boundary',
+      client_message_id: 'client-boundary',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-boundary',
+      cursor: null,
+      server_time: '2026-01-01T00:00:02Z'
+    });
+    expect(visibleTimelineItems(queued)
+      .filter((item) => item.kind === 'message')
+      .map((item) => item.content)).toEqual([
+      'answer before follow-up'
+    ]);
+
+    const frame: ChatRealtimeFrame = {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      scope: { key: 'conversation:conv-1', kind: 'conversation', conversation_id: 'conv-1' },
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      cycle_states: [],
+      runtime: runtime(2, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [phaseZero, phaseOne],
+        boundary_receipts: [{
+          session_id: 'sess-1',
+          seq: 42,
+          queue_id: 'queue-boundary',
+          client_message_id: 'client-boundary'
+        }]
+      }),
+      server_time: '2026-01-01T00:00:03Z'
+    };
+    const applied = applyRealtimeFrame(queued, frame);
+
+    expect(applied.outcome).toBe('applied');
+    expect(visibleQueueMessages(applied.state).messages).toEqual([]);
+    expect(visibleTimelineItems(applied.state)
+      .filter((item) => item.kind === 'message')
+      .map((item) => item.content)).toEqual([
+      'answer before follow-up',
+      'queued follow-up',
+      'continuation answer'
+    ]);
+    const preservedPhase = visibleTimelineItems(applied.state).find(
+      (item) => item.kind === 'message' && item.id === phaseZero.id
+    );
+    expect(preservedPhase?.kind === 'message' ? preservedPhase.content : null)
+      .toBe('answer before follow-up');
+  });
+
+  it('keeps the timeline placeholder until admission decides where the message belongs', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'queue me',
+        clientMessageId: 'client-1',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+    const staleState = {
+      ...optimistic,
+      queue: {
+        messages: [{
+          queue_id: 'queue-1',
+          client_message_id: 'client-1',
+          content: 'queue me',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    };
+
+    expect(visibleTimelineItems(staleState)).toHaveLength(1);
+    expect(visibleQueueMessages(staleState).messages).toEqual([]);
+  });
+
+  it('places an optimistic queue item after existing canonical positions', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({
+        timeline: { items: [], has_more_before: false },
+        queue: {
+          messages: [{
+            queue_id: 'queue-existing',
+            client_message_id: 'client-existing',
+            content: 'already queued',
+            attachments: [],
+            position: 1,
+          }],
+          queued_count: 1,
+        },
+      })),
+      {
+        content: 'queue me next',
+        clientMessageId: 'client-2',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+
+    const queued = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-2',
+      client_message_id: 'client-2',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-2',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+
+    expect(visibleQueueMessages(queued).messages.map((item) => item.position)).toEqual([1, 2]);
+    expect(visibleQueueMessages(queued).queued_count).toBe(2);
+  });
+
+  it('prefers a canonical promoted bubble over a stale queue entry', () => {
+    const promoted = message({
+      id: 'message:promoted',
+      role: 'user',
+      content: 'promote me',
+      message_id: 'promoted',
+      client_message_id: 'client-1',
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 2, event_type: 'user_message' }],
+    });
+    const state = applySnapshot(snapshot({
+      timeline: { items: [promoted], has_more_before: false },
+      queue: {
+        messages: [{
+          queue_id: 'queue-1',
+          client_message_id: 'client-1',
+          content: 'promote me',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    }));
+
+    expect(visibleTimelineItems(state).map((item) => item.id)).toEqual(['message:promoted']);
+    expect(visibleQueueMessages(state).messages).toEqual([]);
+    expect(state.queue?.messages).toHaveLength(1);
+
+    const caughtUp = applySnapshot(snapshot({
+      timeline: { items: [promoted], has_more_before: false },
+      queue: { messages: [], queued_count: 0 },
+    }), state);
+    expect(visibleTimelineItems(caughtUp).map((item) => item.id)).toEqual(['message:promoted']);
+  });
+
+  it('keeps exactly one representation through stale snapshot and HA delivery order', () => {
+    const base = applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } }));
+    const optimistic = addOptimisticUserMessage(base, {
+      content: 'race proof',
+      clientMessageId: 'client-race',
+      createdAt: '2026-01-01T00:00:00Z',
+    });
+    const assertOneLocation = (
+      state: ReturnType<typeof applySnapshot>,
+      expected: 'timeline' | 'queue',
+    ) => {
+      const timelineCount = visibleTimelineItems(state).filter((item) =>
+        item.kind === 'message' && item.client_message_id === 'client-race'
+      ).length;
+      const queueCount = visibleQueueMessages(state).messages.filter((item) =>
+        item.client_message_id === 'client-race'
+      ).length;
+      expect({ timelineCount, queueCount }).toEqual(
+        expected === 'timeline'
+          ? { timelineCount: 1, queueCount: 0 }
+          : { timelineCount: 0, queueCount: 1 }
+      );
+    };
+
+    assertOneLocation(optimistic, 'timeline');
+    const staleBeforeAdmission = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: { messages: [], queued_count: 0 },
+    }), optimistic);
+    assertOneLocation(staleBeforeAdmission, 'timeline');
+
+    const queued = applySendResponse(staleBeforeAdmission, {
+      status: 'queued',
+      client_txn_id: 'txn-race',
+      client_message_id: 'client-race',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-race',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    assertOneLocation(queued, 'queue');
+
+    const staleAfterAdmission = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: { messages: [], queued_count: 0 },
+    }), queued);
+    assertOneLocation(staleAfterAdmission, 'queue');
+
+    const canonicalUser = message({
+      id: 'message:race',
+      role: 'user',
+      content: 'race proof',
+      message_id: 'race',
+      client_message_id: 'client-race',
+      source_refs: [{ store: 'intaris', session_id: 'sess-1', seq: 2, event_type: 'user_message' }],
+    });
+    const promoted = applySnapshot(snapshot({
+      timeline: { items: [canonicalUser], has_more_before: false },
+      queue: {
+        messages: [{
+          queue_id: 'queue-race',
+          client_message_id: 'client-race',
+          content: 'race proof',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    }), staleAfterAdmission);
+    assertOneLocation(promoted, 'timeline');
+
+    const staleAfterCanonical = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: { messages: [], queued_count: 0 },
+    }), promoted);
+    assertOneLocation(staleAfterCanonical, 'timeline');
+  });
+
+  it('does not resurrect a deleted local admission from a stale queue snapshot', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'delete me',
+        clientMessageId: 'client-delete',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+    const queued = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-delete',
+      client_message_id: 'client-delete',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-delete',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    const deleted = deleteQueuedAdmission(queued, 'queue-delete');
+    const stale = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: {
+        messages: [{
+          queue_id: 'queue-delete',
+          client_message_id: 'client-delete',
+          content: 'delete me',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    }), deleted);
+
+    expect(visibleTimelineItems(stale)).toEqual([]);
+    expect(visibleQueueMessages(stale).messages).toEqual([]);
+  });
+
+  it('projects a queued edit from the local admission over stale canonical content', () => {
+    const optimistic = addOptimisticUserMessage(
+      applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })),
+      {
+        content: 'old content',
+        clientMessageId: 'client-edit',
+        createdAt: '2026-01-01T00:00:00Z',
+      },
+    );
+    const queued = applySendResponse(optimistic, {
+      status: 'queued',
+      client_txn_id: 'txn-edit',
+      client_message_id: 'client-edit',
+      conversation_id: 'conv-1',
+      message_id: null,
+      queue_id: 'queue-edit',
+      cursor: null,
+      server_time: '2026-01-01T00:00:01Z',
+    });
+    const edited = updateQueuedAdmissionContent(queued, 'queue-edit', 'new content');
+
+    expect(visibleQueueMessages(edited).messages[0]?.content).toBe('new content');
+    expect(visibleTimelineItems(edited)).toEqual([]);
+  });
+
+  it('protects edits and deletions for canonically loaded queue messages', () => {
+    const canonicalQueue = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: {
+        messages: [{
+          queue_id: 'queue-loaded',
+          client_message_id: 'client-loaded',
+          client_txn_id: 'txn-loaded',
+          content: 'loaded old content',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    }));
+
+    const edited = updateQueuedAdmissionContent(
+      canonicalQueue,
+      'queue-loaded',
+      'loaded new content',
+    );
+    const staleAfterEdit = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: canonicalQueue.queue!,
+    }), edited);
+    expect(visibleQueueMessages(staleAfterEdit).messages[0]?.content).toBe('loaded new content');
+
+    const deleted = deleteQueuedAdmission(staleAfterEdit, 'queue-loaded');
+    const staleAfterDelete = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: canonicalQueue.queue!,
+    }), deleted);
+    expect(visibleQueueMessages(staleAfterDelete).messages).toEqual([]);
+    expect(visibleTimelineItems(staleAfterDelete)).toEqual([]);
+  });
+
+  it('creates a delete tombstone when a queue update wins before the REST response', () => {
+    const canonicalQueue = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: {
+        messages: [{
+          queue_id: 'queue-race-delete',
+          client_message_id: 'client-race-delete',
+          content: 'delete despite race',
+          attachments: [],
+          position: 1,
+        }],
+        queued_count: 1,
+      },
+    }));
+    const clientMessageId = canonicalQueue.queue?.messages[0]?.client_message_id;
+    const wsWon = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: { messages: [], queued_count: 0 },
+    }), canonicalQueue);
+    const deleted = deleteQueuedAdmission(
+      wsWon,
+      'queue-race-delete',
+      clientMessageId,
+    );
+    const delayedStaleQueue = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false },
+      queue: canonicalQueue.queue!,
+    }), deleted);
+
+    expect(visibleQueueMessages(delayedStaleQueue).messages).toEqual([]);
   });
 
   it('persists opaque backfill cursors and disables older loading at the terminal page', () => {
@@ -189,6 +763,26 @@ describe('Chat v2 sync engine', () => {
     });
     expect(next.hasMoreBefore).toBe(false);
     expect(next.beforeCursor).toBe(null);
+  });
+
+  it('reports projection-mismatched backfill rejection without advancing cursor', () => {
+    const current = applySnapshot(snapshot({
+      timeline: { items: [message()], has_more_before: true, before_cursor: 'current-before' }
+    }));
+    const result = applyBackfillResult(current, {
+      schema_version: 2,
+      projection_version: 'stale-projection',
+      conversation_id: 'conv-1',
+      items: [message({ id: 'message:old', content: 'stale older' })],
+      has_more_before: false,
+      before_cursor: null,
+      server_time: '2026-01-01T00:00:02Z'
+    });
+    expect(result.admitted).toBe(false);
+    expect(result.state.beforeCursor).toBe('current-before');
+    expect(result.state.hasMoreBefore).toBe(true);
+    expect(result.state.timelineItems.some((item) => item.id === 'message:old')).toBe(false);
+    expect(result.state.syncStatus).toBe('gapped');
   });
 
   it('applies sync ops only when cursor matches', () => {
@@ -271,7 +865,7 @@ describe('Chat v2 sync engine', () => {
     expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(0);
   });
 
-  it('reconciles local items once during a canonical transition and not in visible derives', () => {
+  it('retains the local admission fallback without reconciling in visible derives', () => {
     const optimistic = addOptimisticUserMessage(applySnapshot(snapshot({ timeline: { items: [], has_more_before: false } })), {
       content: 'queued',
       clientMessageId: 'cmsg-1',
@@ -298,7 +892,7 @@ describe('Chat v2 sync engine', () => {
     );
 
     expect(result.outcome).toBe('applied');
-    expect(result.state.localItems).toEqual([]);
+    expect(result.state.localItems).toHaveLength(1);
     expect(__chatV2SyncEngineTestHooks.counters().reconcileLocalItemsCalls).toBe(1);
 
     expect(visibleTimelineItems(result.state).map((item) => item.id)).toEqual(['user:cmsg-1']);
@@ -1540,6 +2134,175 @@ describe('Chat v2 sync engine', () => {
     });
 
     expect(visibleTimelineItems(settled.state).map((item) => item.id)).toEqual(['message:1']);
+  });
+
+  it.each([
+    ['retry', false],
+    ['transient_retry', false],
+    ['turn', true],
+    ['continuation', true]
+  ])('settles model recovery scope %s with durable=%s', (noticeScope, durable) => {
+    const recoveryNotice = {
+      id: `system:model-recovery:${noticeScope}`,
+      kind: 'message',
+      sort_key: '9998:999999999999999:000000:09:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'system_message' }],
+      stable: false,
+      status: 'complete',
+      role: 'system',
+      content: 'Model recovery notice.',
+      message_id: `model-recovery:${noticeScope}`,
+      notice_id: `model-recovery:${noticeScope}`,
+      notice_kind: 'model_recovery',
+      notice_scope: noticeScope,
+      turn_id: 'turn-1',
+      attachments: [],
+      partial: false
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({ runtime: runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      volatile_items: [recoveryNotice]
+    }) }));
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [recoveryNotice] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(visibleTimelineItems(settled.state).some((item) => item.id === recoveryNotice.id)).toBe(durable);
+  });
+
+  it('keeps a carried turn boundary before its settled follow-up activity', () => {
+    const boundary = {
+      id: 'system:turn-init:follow-up-1',
+      kind: 'message',
+      sort_key: '9997:999999999999999:000000:09:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'system_message' }],
+      stable: false,
+      status: 'complete',
+      role: 'system',
+      content: 'Turn initiated by other: Agent work finished.',
+      message_id: 'turn-init:follow-up-1',
+      notice_id: 'turn-init:follow-up-1',
+      notice_kind: 'turn_initiated',
+      notice_scope: 'turn',
+      turn_id: 'turn-follow-up',
+      attachments: [],
+      partial: false
+    } as TimelineItem;
+    const assistant = {
+      id: 'message:assistant-follow-up',
+      kind: 'message',
+      sort_key: '9998:999999999999999:000000:02:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_message' }],
+      stable: false,
+      status: 'complete',
+      role: 'assistant',
+      content: 'Follow-up result.',
+      message_id: 'assistant-follow-up',
+      turn_id: 'turn-follow-up',
+      attachments: [],
+      partial: false
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({
+      runtime: runtime(1, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-follow-up', session_id: 'sess-1', status: 'running' },
+        volatile_items: [boundary, assistant]
+      })
+    }));
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(visibleTimelineItems(settled.state).map((item) => item.id)).toEqual([
+      'message:1',
+      boundary.id,
+      assistant.id
+    ]);
+    expect(settled.state.localItems.find((item) => item.id === boundary.id)?.sort_key).toMatch(/^9995:/);
+    expect(settled.state.localItems.find((item) => item.id === assistant.id)?.sort_key).toMatch(/^9996:/);
+  });
+
+  it('keeps an inactive compaction card visible until canonical reconciliation', () => {
+    const compaction = {
+      id: 'compaction:sess-old',
+      kind: 'compaction',
+      sort_key: '9997:999999999999999:000000:12:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-new', seq: 0, event_type: 'session_compaction_started' }],
+      stable: false,
+      status: 'running',
+      session_id: 'sess-new',
+      previous_session_id: 'sess-old',
+      summary_preview: 'Compacting conversation history…',
+      method: 'pending',
+      turns_compacted: 0
+    } as TimelineItem;
+    const base = applySnapshot(snapshot({
+      runtime: runtime(1, { has_active_turn: false, volatile_items: [compaction] })
+    }));
+
+    const settled = applyRealtimeFrame(base, {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      runtime: runtime(2, { has_active_turn: false, volatile_items: [] }),
+      server_time: '2026-01-01T00:00:02Z'
+    });
+
+    expect(visibleTimelineItems(settled.state).map((item) => item.id)).toEqual([
+      'message:1',
+      'compaction:sess-old'
+    ]);
+    expect(visibleTimelineItems(settled.state)[1]).toMatchObject({
+      kind: 'compaction',
+      status: 'running'
+    });
+
+    const canonical = {
+      ...compaction,
+      sort_key: '0000:000000000000002:000000:12:000000000',
+      source_refs: [{ store: 'intaris', session_id: 'sess-new', seq: 2, event_type: 'compaction_summary' }],
+      stable: true,
+      status: 'compacted',
+      summary_preview: 'Conversation summary',
+      summary: 'Complete conversation summary',
+      method: 'model',
+      turns_compacted: 12
+    } as TimelineItem;
+    const reconciled = applySyncResponse(
+      settled.state,
+      syncResponse({
+        ops: [{ op: 'upsert_item', item: canonical }],
+        runtime: runtime(3, { has_active_turn: false, volatile_items: [] })
+      })
+    );
+
+    expect(reconciled.state.localItems.some((item) => item.id === compaction.id)).toBe(false);
+    expect(visibleTimelineItems(reconciled.state).filter((item) => item.id === compaction.id)).toEqual([
+      expect.objectContaining({ kind: 'compaction', status: 'compacted', stable: true })
+    ]);
   });
 
   it('carries the streamed final message on a CURSOR-SKEWED settle frame', () => {

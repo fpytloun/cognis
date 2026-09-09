@@ -20,6 +20,8 @@
 
 export type EdgeSwipeEdge = 'left' | 'right';
 
+const POINTER_ACTIVATION_DISTANCE = 8;
+
 export interface EdgeSwipeParam {
   /** Which edge the swipe must originate from. */
   edge: EdgeSwipeEdge;
@@ -73,6 +75,14 @@ function hasHorizontalScrollAncestor(target: EventTarget | null): boolean {
     el = el.parentElement;
   }
   return false;
+}
+
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  if (target.closest('[data-edge-swipe-surface="true"]')) return false;
+  return Boolean(target.closest(
+    'button, a[href], input, select, textarea, summary, [role="button"], [contenteditable="true"]'
+  ));
 }
 
 function isInsideEdge(edge: EdgeSwipeEdge, x: number, edgeWidth: number, viewportWidth: number): boolean {
@@ -130,6 +140,7 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
     reset(state);
     if (disabled()) return;
     if (event.touches.length !== 1) return;
+    if (isInteractiveTarget(event.target)) return;
     const touch = event.touches[0];
     const viewportWidth = window.innerWidth;
     if (!isInsideEdge(param().edge, touch.clientX, edgeWidth(), viewportWidth)) return;
@@ -164,6 +175,12 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
       reset(state);
       return;
     }
+    if (
+      !state.claimed
+      && Math.max(Math.abs(dx), Math.abs(dy)) < POINTER_ACTIVATION_DISTANCE
+    ) {
+      return;
+    }
     // Horizontal-dominant: claim it. Calling preventDefault here stops
     // iOS from taking the gesture for its bezel back/forward swipe.
     if (event.cancelable) event.preventDefault();
@@ -185,6 +202,8 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
     if (event.pointerType === 'touch') return; // touch path owns this
     if (disabled()) return;
     if (state.activePointer !== null) return;
+    if (event.pointerType === 'mouse' && event.button !== 0) return;
+    if (isInteractiveTarget(event.target)) return;
     const viewportWidth = window.innerWidth;
     if (!isInsideEdge(param().edge, event.clientX, edgeWidth(), viewportWidth)) return;
     if (respectHScroll() && hasHorizontalScrollAncestor(event.target)) return;
@@ -201,6 +220,12 @@ export function edgeSwipe(node: HTMLElement, initial: EdgeSwipeParam) {
     const dy = event.clientY - state.startY;
     if (!state.claimed && Math.abs(dy) > Math.abs(dx)) {
       reset(state);
+      return;
+    }
+    if (
+      !state.claimed
+      && Math.max(Math.abs(dx), Math.abs(dy)) < POINTER_ACTIVATION_DISTANCE
+    ) {
       return;
     }
     state.claimed = true;

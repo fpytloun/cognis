@@ -2,8 +2,9 @@
   import CheckCircle2 from 'lucide-svelte/icons/check-circle-2';
   import Circle from 'lucide-svelte/icons/circle';
   import ExternalLink from 'lucide-svelte/icons/external-link';
-  import LoaderCircle from 'lucide-svelte/icons/loader-circle';
+  import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
   import type { TaskProgressProjection, TaskProgressTodo } from '$lib/types/api';
+  import { renderMarkdown } from '$lib/markdown';
 
   let { projection }: { projection: TaskProgressProjection | null | undefined } = $props();
   const todos = $derived(projection?.todos ?? []);
@@ -11,7 +12,7 @@
 
   function todoIcon(todo: TaskProgressTodo): 'done' | 'active' | 'pending' {
     if (todo.status === 'completed') return 'done';
-    if (todo.status === 'in_progress') return 'active';
+    if (['in_progress', 'active', 'running'].includes(todo.status)) return 'active';
     return 'pending';
   }
 
@@ -47,7 +48,7 @@
               {@const icon = todoIcon(todo)}
               <li class="flex items-start gap-2 rounded-xl border border-slate-800 bg-slate-950/50 px-3 py-2 text-sm text-slate-200" data-todo-status={todo.status}>
                 {#if icon === 'done'}<CheckCircle2 class="mt-0.5 h-4 w-4 shrink-0 text-emerald-300" />
-                {:else if icon === 'active'}<LoaderCircle class="mt-0.5 h-4 w-4 shrink-0 animate-spin text-sky-300" />
+                {:else if icon === 'active'}<TodoStatusDot status={todo.status} class="mt-1 h-3 w-3" />
                 {:else}<Circle class="mt-0.5 h-4 w-4 shrink-0 text-slate-500" />{/if}
                 <span class:line-through={todo.status === 'completed'} class:text-slate-500={todo.status === 'completed'}>{todo.content}</span>
               </li>
@@ -71,8 +72,8 @@
                   <span class="text-[10px] font-semibold uppercase tracking-wide text-violet-300">{item.status}</span>
                   {#if href}<a href={href} aria-label={`Open ${workTitle}`} class="text-violet-200 hover:text-white"><ExternalLink class="h-4 w-4" /></a>{/if}
                 </div>
-                {#if item.result_summary}<p class="mt-2 text-xs leading-5 text-slate-300">{item.result_summary}</p>{/if}
-                {#if item.error}<p class="mt-2 text-xs leading-5 text-rose-300">{item.error}</p>{/if}
+                {#if item.result_summary}<div class="prose prose-sm prose-invert mt-2 max-w-none text-xs leading-5 text-slate-300">{@html renderMarkdown(item.result_summary)}</div>{/if}
+                {#if item.error}<div class="prose prose-sm prose-invert mt-2 max-w-none text-xs leading-5 text-rose-300">{@html renderMarkdown(item.error)}</div>{/if}
                 {#if item.todos.length > 0}<p class="mt-2 text-xs text-slate-500">{item.todos.filter((todo) => todo.status === 'completed').length}/{item.todos.length} todos completed</p>{/if}
               </article>
             {/each}

@@ -181,6 +181,12 @@ class DirectTurnRequestRow(Base):
             "next_attempt_at",
         ),
         Index(
+            "ix_direct_turn_requests_session_latest",
+            "user_id",
+            "session_id",
+            "admission_order",
+        ),
+        Index(
             "ix_direct_turn_requests_owner",
             "owner_controller_id",
             "owner_incarnation_id",
@@ -210,6 +216,9 @@ class User(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     disabled_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     disabled_by: Mapped[str | None] = mapped_column(String, nullable=True)
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
 
 
 class UserUiState(Base):
@@ -261,6 +270,9 @@ class BrowserSession(Base):
     session_id: Mapped[str] = mapped_column(String, primary_key=True)
     user_email: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
     token_hash: Mapped[str] = mapped_column(String, nullable=False)
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
@@ -268,6 +280,118 @@ class BrowserSession(Base):
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
     created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class NativeSession(Base):
+    """Durable rotating refresh session for a native client."""
+
+    __tablename__ = "native_sessions"
+    __table_args__ = (
+        Index("ix_native_sessions_family_id", "family_id"),
+        Index("ix_native_sessions_user_email", "user_email"),
+        Index("ix_native_sessions_expires_at", "expires_at"),
+        UniqueConstraint("token_hash", name="uq_native_sessions_token_hash"),
+    )
+
+    session_id: Mapped[str] = mapped_column(String, primary_key=True)
+    family_id: Mapped[str] = mapped_column(String, nullable=False)
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    token_hash: Mapped[str] = mapped_column(String, nullable=False)
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class UserTotpFactor(Base):
+    """One encrypted TOTP factor per local user."""
+
+    __tablename__ = "user_totp_factors"
+
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), primary_key=True
+    )
+    encrypted_secret: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_accepted_counter: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
+
+class MfaRecoveryCode(Base):
+    """Hashed one-time recovery credential for a TOTP factor."""
+
+    __tablename__ = "mfa_recovery_codes"
+    __table_args__ = (
+        Index("ix_mfa_recovery_codes_user_email", "user_email"),
+        UniqueConstraint("code_hash", name="uq_mfa_recovery_codes_code_hash"),
+    )
+
+    code_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    code_hash: Mapped[str] = mapped_column(String, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class MfaChallenge(Base):
+    """Durable, bounded, single-use MFA login or setup challenge."""
+
+    __tablename__ = "mfa_challenges"
+    __table_args__ = (
+        Index("ix_mfa_challenges_user_email", "user_email"),
+        Index("ix_mfa_challenges_expires_at", "expires_at"),
+        UniqueConstraint("token_hash", name="uq_mfa_challenges_token_hash"),
+    )
+
+    challenge_id: Mapped[str] = mapped_column(String, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String, nullable=False)
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
+    )
+    purpose: Mapped[str] = mapped_column(String, nullable=False)
+    method: Mapped[str] = mapped_column(String, nullable=False, default="totp")
+    login_mode: Mapped[str] = mapped_column(String, nullable=False, default="browser")
+    auth_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    pending_secret: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    expires_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+class MfaAttemptBudget(Base):
+    """Durable per-user MFA verification failure window."""
+
+    __tablename__ = "mfa_attempt_budgets"
+
+    user_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), primary_key=True
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    window_started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
@@ -654,6 +778,20 @@ class Session(Base):
         Index("ix_sessions_owner_source_session", "user_email", "source_session_id"),
         Index("ix_sessions_owner_parent_session", "user_email", "parent_session_id", "session_id"),
         Index(
+            "ix_sessions_owner_conversation_activity_scope_session",
+            "user_email",
+            "conversation_id",
+            "activity_scope_id",
+            "session_id",
+        ),
+        Index(
+            "ix_sessions_owner_activity_scope_updated",
+            "user_email",
+            "activity_scope_id",
+            "updated_at",
+            "session_id",
+        ),
+        Index(
             "ix_sessions_owner_previous_session",
             "user_email",
             "previous_session_id",
@@ -678,6 +816,13 @@ class Session(Base):
     user_email: Mapped[str] = mapped_column(String, nullable=False)
     agent_id: Mapped[str] = mapped_column(String, nullable=False)
     agent_profile_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    model_override: Mapped[str | None] = mapped_column(String, nullable=True)
+    model_override_provider_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    reasoning_effort_override: Mapped[str | None] = mapped_column(String, nullable=True)
+    fast_mode_override: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    runtime_override_revision: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
     delegation_mode: Mapped[str | None] = mapped_column(String, nullable=True)
     delegation_task: Mapped[str | None] = mapped_column(Text, nullable=True)
     delegation_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
@@ -692,41 +837,6 @@ class Session(Base):
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     result_content: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
-    )
-
-
-class WorkScopeState(Base):
-    """Rebuildable control-plane revision state for one authorized Work root.
-
-    Canonical Work evidence remains in Intaris. This row stores only monotonic
-    invalidation counters and the fingerprint of the derived lineage graph.
-    """
-
-    __tablename__ = "work_scope_states"
-    __table_args__ = (
-        Index("ix_work_scope_states_owner_root", "user_email", "scope_kind", "root_id"),
-    )
-
-    scope_key: Mapped[str] = mapped_column(String, primary_key=True)
-    user_email: Mapped[str] = mapped_column(
-        String,
-        ForeignKey("users.email", ondelete="CASCADE"),
-        nullable=False,
-    )
-    scope_kind: Mapped[str] = mapped_column(String, nullable=False)
-    root_id: Mapped[str] = mapped_column(String, nullable=False)
-    graph_fingerprint: Mapped[str | None] = mapped_column(String, nullable=True)
-    work_revision: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, default=0, server_default="0"
-    )
-    graph_revision: Mapped[int] = mapped_column(
-        BigInteger, nullable=False, default=0, server_default="0"
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
-    )
     updated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
@@ -787,12 +897,40 @@ class WorkRecordRow(Base):
             "entity_id",
         ),
         Index(
+            "ix_work_records_overview_evidence",
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "category",
+            "work_record_id",
+            postgresql_include=("entity_id",),
+            postgresql_where=text("is_evidence IS TRUE"),
+            sqlite_where=text("is_evidence IS TRUE"),
+        ),
+        Index(
             "ix_work_records_pairing",
             "owner_email",
             "session_id",
             "materializer_version",
             "call_id",
             "pairing_key",
+        ),
+        Index(
+            "ix_work_records_owner_version_call_state",
+            "owner_email",
+            "materializer_version",
+            text("materialized_at DESC"),
+            postgresql_include=("session_id", "call_id", "is_evidence"),
+            postgresql_where=text("call_id IS NOT NULL"),
+            sqlite_where=text("call_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_work_records_source_retention",
+            "materializer_version",
+            "materialized_at",
+            "work_record_id",
+            postgresql_where=text("source_content_scrubbed_at IS NULL"),
+            sqlite_where=text("source_content_scrubbed_at IS NULL"),
         ),
     )
 
@@ -829,6 +967,12 @@ class WorkRecordRow(Base):
     pairing_key: Mapped[str | None] = mapped_column(String, nullable=True)
     call_id: Mapped[str | None] = mapped_column(String, nullable=True)
     timeline_item: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    source_content_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    source_content_scrubbed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     materialized_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True),
         nullable=False,
@@ -857,9 +1001,29 @@ class WorkRecordFileRow(Base):
             "path_id",
             "work_record_id",
         ),
+        Index(
+            "ix_work_record_files_old_path",
+            "old_path_id",
+            "work_record_id",
+        ),
+        Index(
+            "ix_work_record_files_generation_source",
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "path_generation_id",
+            "source_seq",
+            "item_ordinal",
+            "file_ordinal",
+        ),
     )
 
     work_record_file_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    session_id: Mapped[str] = mapped_column(String, nullable=False, default="", server_default="")
+    materializer_version: Mapped[str] = mapped_column(
+        String, nullable=False, default="", server_default=""
+    )
     work_record_id: Mapped[str] = mapped_column(
         ForeignKey("work_records.work_record_id", ondelete="CASCADE"),
         nullable=False,
@@ -867,8 +1031,26 @@ class WorkRecordFileRow(Base):
     file_ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
     path_id: Mapped[str] = mapped_column(String, nullable=False)
+    path_generation_id: Mapped[str] = mapped_column(String, nullable=False, default="")
+    source_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    item_ordinal: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     additions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     deletions: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str | None] = mapped_column(String, nullable=True)
+    old_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    old_path_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    binary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    generated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    preview_omitted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
 
 class WorkSessionProjectionRow(Base):
@@ -887,7 +1069,11 @@ class WorkSessionProjectionRow(Base):
         ),
         CheckConstraint(
             "target_seq >= 0 AND covered_through_seq >= 0 AND retry_count >= 0 "
-            "AND lease_fence >= 0",
+            "AND lease_fence >= 0 AND record_count >= 0 AND evidence_record_count >= 0 "
+            "AND mutation_count >= 0 AND command_count >= 0 AND file_count >= 0 "
+            "AND artifact_count >= 0 AND deliverable_count >= 0 AND additions >= 0 "
+            "AND deletions >= 0 AND omitted_file_count >= 0 "
+            "AND expected_record_count >= 0 AND expected_record_file_count >= 0",
             name="ck_work_session_projections_nonnegative",
         ),
         Index(
@@ -954,40 +1140,179 @@ class WorkSessionProjectionRow(Base):
     head_checked_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
-
-
-class WorkScopeStream(Base):
-    """Reference-only membership and high-water state for one Work stream."""
-
-    __tablename__ = "work_scope_streams"
-    __table_args__ = (
-        Index(
-            "ix_work_scope_streams_event_stream",
-            "event_store_id",
-            "event_store_session_id",
-            "scope_key",
-        ),
-        Index("ix_work_scope_streams_session", "session_id", "scope_key"),
+    next_head_check_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    record_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    evidence_record_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    mutation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    command_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    file_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    artifact_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    deliverable_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    additions: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    deletions: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    omitted_file_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    expected_record_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    expected_record_file_count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
     )
 
-    scope_key: Mapped[str] = mapped_column(
+
+class WorkLiveRevisionRow(Base):
+    """Durable monotonic invalidation revision for one Work owner."""
+
+    __tablename__ = "work_live_revisions"
+    __table_args__ = (CheckConstraint("revision >= 0", name="ck_work_live_revisions_nonnegative"),)
+
+    owner_email: Mapped[str] = mapped_column(
         String,
-        ForeignKey("work_scope_states.scope_key", ondelete="CASCADE"),
+        ForeignKey("users.email", ondelete="CASCADE"),
         primary_key=True,
+    )
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=func.now(),
+    )
+
+
+class WorkCurrentFileRow(Base):
+    """Rebuildable current-file state for one projected Work session."""
+
+    __tablename__ = "work_current_files"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "file_projector_version",
+            "path_generation_id",
+            name="uq_work_current_files_upsert_identity",
+        ),
+        CheckConstraint(
+            "source_seq >= 0 AND rename_ordinal >= 0 AND recreate_ordinal >= 0 "
+            "AND preview_size >= 0 AND additions >= 0 AND deletions >= 0",
+            name="ck_work_current_files_nonnegative",
+        ),
+        Index(
+            "ix_work_current_files_session_root_path",
+            "owner_email",
+            "session_id",
+            "materializer_version",
+            "file_projector_version",
+            "root_id",
+            "path_id",
+        ),
+        Index(
+            "ix_work_current_files_source",
+            "source_store",
+            "source_session_id",
+            "source_seq",
+        ),
+        Index("ix_work_current_files_previous_path", "previous_path_id", "session_id"),
+        Index("ix_work_current_files_content_expiry", "content_expires_at", "content_scrubbed_at"),
+        Index(
+            "ix_work_current_files_content_retention",
+            "content_expires_at",
+            "current_file_id",
+            postgresql_where=text("content_scrubbed_at IS NULL"),
+            sqlite_where=text("content_scrubbed_at IS NULL"),
+        ),
+    )
+
+    current_file_id: Mapped[str] = mapped_column(String, primary_key=True)
+    owner_email: Mapped[str] = mapped_column(
+        String, ForeignKey("users.email", ondelete="CASCADE"), nullable=False
     )
     session_id: Mapped[str] = mapped_column(
-        String,
-        ForeignKey("sessions.session_id", ondelete="CASCADE"),
-        primary_key=True,
+        String, ForeignKey("sessions.session_id", ondelete="CASCADE"), nullable=False
     )
-    event_store_id: Mapped[str] = mapped_column(String, nullable=False, default="intaris")
-    event_store_session_id: Mapped[str] = mapped_column(String, nullable=False)
-    last_seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    materializer_version: Mapped[str] = mapped_column(String, nullable=False)
+    file_projector_version: Mapped[str] = mapped_column(String, nullable=False)
+    path_generation_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_store: Mapped[str] = mapped_column(
+        String, nullable=False, default="intaris", server_default="intaris"
+    )
+    source_session_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    source_event_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    source_item_id: Mapped[str] = mapped_column(String, nullable=False)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    path_id: Mapped[str] = mapped_column(String, nullable=False)
+    relative_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    root_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    root_label: Mapped[str | None] = mapped_column(String, nullable=True)
+    previous_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    previous_path_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    rename_ordinal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    recreate_ordinal: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    state: Mapped[str] = mapped_column(String, nullable=False)
+    binary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    generated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    additions: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    deletions: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default="0"
+    )
+    preview: Mapped[str | None] = mapped_column(Text, nullable=True)
+    preview_size: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    preview_truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    preview_omitted: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    content_hash: Mapped[str | None] = mapped_column(String, nullable=True)
+    content_expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    content_scrubbed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False, default=_utcnow
+        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
-        TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        default=_utcnow,
+        onupdate=_utcnow,
+        server_default=func.now(),
     )
 
 
@@ -1776,6 +2101,10 @@ class StepRun(Base):
     """Current execution state for one workflow step within a task run."""
 
     __tablename__ = "step_runs"
+    __table_args__ = (
+        Index("ix_step_runs_task_step_run", "task_id", "step_run_id"),
+        Index("ix_step_runs_session_status", "session_id", "status"),
+    )
 
     step_run_id: Mapped[str] = mapped_column(String, primary_key=True)
     task_id: Mapped[str] = mapped_column(String, ForeignKey("tasks.task_id"), nullable=False)
@@ -1938,6 +2267,12 @@ class Schedule(Base):
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
     max_concurrent_runs: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     delete_after_run: Mapped[bool] = mapped_column(nullable=False, default=False)
+    retry_failed_tasks: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
+    fail_paused_task_on_next_fire: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=true()
+    )
     completion_mode_family: Mapped[str] = mapped_column(
         String, nullable=False, default="default", server_default="default"
     )
@@ -1950,6 +2285,7 @@ class Schedule(Base):
     last_fired_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     next_fire_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     last_run_status: Mapped[str | None] = mapped_column(String, nullable=True)
+    last_terminal_task_id: Mapped[str | None] = mapped_column(String, nullable=True)
     consecutive_errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     disabled_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_by: Mapped[str] = mapped_column(String, ForeignKey("users.email"), nullable=False)
@@ -1960,7 +2296,16 @@ class Schedule(Base):
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
-    __table_args__ = (Index("ix_schedules_enabled_next_fire", "enabled", "next_fire_at"),)
+    __table_args__ = (
+        Index("ix_schedules_enabled_next_fire", "enabled", "next_fire_at"),
+        Index(
+            "ix_schedules_owner_run_status_updated",
+            "created_by",
+            "last_run_status",
+            "updated_at",
+        ),
+        Index("ix_schedules_run_status_updated", "last_run_status", "updated_at"),
+    )
 
 
 class ScheduleFireRow(Base):
@@ -1976,6 +2321,7 @@ class ScheduleFireRow(Base):
         String, nullable=False, default="recurring", server_default="recurring"
     )
     scheduled_fire_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), nullable=False)
+    schedule_timezone: Mapped[str | None] = mapped_column(String, nullable=True)
     task_id: Mapped[str | None] = mapped_column(
         String, ForeignKey("tasks.task_id", ondelete="SET NULL"), nullable=True
     )
@@ -2719,6 +3065,8 @@ class NotificationRow(Base):
     payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     resolution: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=1)
+    expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )
@@ -2727,6 +3075,7 @@ class NotificationRow(Base):
     __table_args__ = (
         Index("ix_notifications_user_status", "user_email", "status"),
         Index("ix_notifications_conv_status", "conversation_id", "status"),
+        Index("ix_notifications_user_task_status", "user_email", "task_id", "status"),
     )
 
 
@@ -2938,6 +3287,10 @@ class ChannelDeliveryOutboxRow(Base):
     )
     sent_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(String, nullable=True)
+    route_released_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    route_release_audit: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=_utcnow
     )

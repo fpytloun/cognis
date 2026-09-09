@@ -22,14 +22,14 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _seed_user(app: object, email: str = "user@example.com") -> None:
+async def _seed_user(app: object, email: str = "user@example.com", role: str = "user") -> None:
     async with app.state.session_factory() as session:  # type: ignore[attr-defined]
         await create_user(
             session,
             email=email,
             name="User",
             password_hash=app.state.password_hasher.hash("password123"),  # type: ignore[attr-defined]
-            role="user",
+            role=role,
         )
         await session.commit()
 
@@ -47,6 +47,7 @@ def test_list_skills_marks_system_skills(monkeypatch: object, tmp_path: Path) ->
         assert skills["cognis-task-manager"]["is_system"] is True
         assert skills["cognis-workflow-manager"]["is_system"] is True
         assert skills["cognis-pulse-deliverable"]["is_system"] is True
+        assert skills["cognis-frontend-engineering"]["is_system"] is True
         assert "attach_to_all_agents" in skills["cognis-task-manager"]
 
 
@@ -133,7 +134,7 @@ def test_system_skill_delete_is_forbidden(monkeypatch: object, tmp_path: Path) -
 
 def test_system_skill_reset_restores_default(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com"))
+        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         update = client.put(
@@ -193,7 +194,7 @@ def test_reset_system_skill_is_idempotent_when_already_default(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com"))
+        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         first = client.get("/api/v1/skills/cognis-task-manager", headers=headers)

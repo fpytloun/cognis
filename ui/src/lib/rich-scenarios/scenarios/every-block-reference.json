@@ -1,0 +1,607 @@
+{
+  "schema_version": 1,
+  "id": "every-block-reference",
+  "title": "Every block type reference",
+  "description": "One instance of every block type in SUPPORTED_RICH_BLOCK_TYPES, grouped by composition family, for design-system QA.",
+  "group": "reference",
+  "sort_key": 1200,
+  "content": "Every-block reference fallback for design-system QA.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Design system QA",
+      "subtitle": "Every registered block type, grouped by composition family."
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Feline field report",
+        "title": "Every rich block, investigated by cats",
+        "subtitle": "A cheerful QA surface: practical renderer coverage, questionable cat productivity."
+      },
+      {
+        "type": "section",
+        "title": "Status at a glance",
+        "blocks": [
+          {
+            "type": "dashboard",
+            "title": "Household cat operations",
+            "metrics": [
+              {
+                "label": "Naps completed",
+                "value": "14",
+                "delta": "+2 since lunch",
+                "tone": "success"
+              },
+              {
+                "label": "Laser-pointer budget",
+                "value": "42%",
+                "tone": "warning"
+              }
+            ]
+          },
+          {
+            "type": "status",
+            "status": "Treat drawer secured",
+            "description": "A critical control is holding despite sustained inspection."
+          },
+          {
+            "type": "status_grid",
+            "metrics": [
+              {
+                "label": "Window perch",
+                "value": "Occupied",
+                "tone": "success"
+              },
+              {
+                "label": "Cardboard box",
+                "value": "Contested",
+                "tone": "warning"
+              }
+            ]
+          },
+          {
+            "type": "action",
+            "title": "Open the treat protocol",
+            "href": "https://en.wikipedia.org/wiki/Cat",
+            "content": "One explicit next step: deploy snack."
+          },
+          {
+            "type": "metric",
+            "label": "Door-opening response",
+            "value": "0.4s",
+            "delta": "faster than human reflexes",
+            "tone": "success"
+          },
+          {
+            "type": "card_grid",
+            "blocks": [
+              {
+                "type": "card",
+                "title": "Operational finding",
+                "content": "The phrase “pspsps” has a significantly higher response rate near food."
+              },
+              {
+                "type": "card",
+                "title": "Risk register",
+                "content": "An unattended glass of water remains at elevated tail-sweep risk."
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Narrative with evidence",
+        "blocks": [
+          {
+            "type": "research_answer",
+            "title": "Can cats recognize their names?",
+            "description": "The short answer: often yes. The operational response is negotiable.",
+            "paragraphs": [
+              {
+                "text": "Cats can distinguish their own names from similar words, especially when spoken by familiar people.",
+                "sources": [
+                  "ref-a"
+                ]
+              },
+              {
+                "text": "A lack of response is not strong evidence of confusion; it may be a deliberate prioritization of sunbeam maintenance.",
+                "sources": [
+                  "ref-a"
+                ]
+              }
+            ],
+            "key_points": [
+              "Familiar voices improve recognition.",
+              "Selective hearing is a feature, not a bug."
+            ],
+            "source_ids": [
+              "ref-a"
+            ]
+          },
+          {
+            "type": "evidence_report",
+            "title": "Weighed claims",
+            "claims": [
+              {
+                "label": "Primary",
+                "title": "Purring is not only a happiness signal",
+                "content": "Cats also purr when self-soothing or asking for attention.",
+                "confidence": 0.86,
+                "evidence": [
+                  {
+                    "text": "Context matters: posture, eyes, and timing add the useful signal.",
+                    "source": "cat-behaviour-notes"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "claim_cards",
+            "title": "Claim cards alias",
+            "claims": [
+              {
+                "label": "Alias",
+                "title": "Cats have more than 20 muscles in each ear",
+                "content": "A cat can rotate an ear toward interesting sounds with remarkable precision.",
+                "confidence": 0.91
+              }
+            ]
+          },
+          {
+            "type": "quote",
+            "content": "In ancient times cats were worshipped as gods; they have not forgotten this."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Comparison and decision",
+        "blocks": [
+          {
+            "type": "table",
+            "title": "Cat activity forecast",
+            "columns": [
+              {
+                "key": "time",
+                "label": "Time"
+              },
+              {
+                "key": "activity",
+                "label": "Likely activity"
+              }
+            ],
+            "rows": [
+              {
+                "time": "03:17",
+                "activity": "Hallway sprinting"
+              },
+              {
+                "time": "09:00",
+                "activity": "Breakfast negotiation"
+              }
+            ]
+          },
+          {
+            "type": "comparison_matrix",
+            "title": "Comparison matrix",
+            "columns": [
+              {
+                "key": "option",
+                "label": "Sleeping venue"
+              },
+              {
+                "key": "cost",
+                "label": "Comfort score"
+              }
+            ],
+            "rows": [
+              {
+                "option": "Sunny chair",
+                "cost": "Excellent"
+              },
+              {
+                "option": "Laptop keyboard",
+                "cost": "Strategic"
+              }
+            ]
+          },
+          {
+            "type": "decision_matrix",
+            "title": "Decision matrix",
+            "columns": [
+              {
+                "key": "option",
+                "label": "Toy"
+              },
+              {
+                "key": "verdict",
+                "label": "Verdict"
+              }
+            ],
+            "rows": [
+              {
+                "option": "Crinkly paper",
+                "verdict": "Recommended",
+                "recommended": true
+              },
+              {
+                "option": "Expensive plush mouse",
+                "verdict": "Ignored"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Sequence and process",
+        "blocks": [
+          {
+            "type": "timeline",
+            "title": "A morning in cat time",
+            "items": [
+              {
+                "time": "05:42",
+                "title": "Breakfast escalation",
+                "content": "The bowl is only 18% empty, a clear emergency."
+              },
+              {
+                "time": "06:04",
+                "title": "Resolution",
+                "content": "Human acknowledges service-level objective."
+              }
+            ]
+          },
+          {
+            "type": "steps",
+            "title": "How to earn a cat’s approval",
+            "items": [
+              {
+                "step": "1",
+                "title": "Sit down",
+                "content": "Become a warm, stationary piece of furniture."
+              },
+              {
+                "step": "2",
+                "title": "Verify",
+                "content": "Wait for lap occupancy; do not move."
+              }
+            ]
+          },
+          {
+            "type": "day_agenda",
+            "eyebrow": "Thursday, July 16",
+            "title": "Agenda",
+            "now": "2026-07-16T08:20:00+02:00",
+            "timezone": "Europe/Prague",
+            "all_day": [
+              "Keep cardboard box under observation"
+            ],
+            "items": [
+              {
+                "start": "2026-07-16T09:00:00+02:00",
+                "end": "2026-07-16T09:30:00+02:00",
+                "title": "Sunbeam quality review",
+                "location": "South window",
+                "description": "Verify warmth and bird visibility before occupying the chair."
+              },
+              {
+                "start": "2026-07-16T11:30:00+02:00",
+                "end": "2026-07-16T12:00:00+02:00",
+                "title": "Lunch negotiation",
+                "description": "Escalate gently until a snack service-level objective is acknowledged."
+              }
+            ],
+            "tasks": [
+              {
+                "title": "Inspect every grocery bag on arrival"
+              },
+              {
+                "title": "Audit the new cardboard delivery"
+              }
+            ]
+          },
+          {
+            "type": "incident_timeline",
+            "title": "Incident timeline",
+            "items": [
+              {
+                "time": "10:42",
+                "title": "Vacuum cleaner detected",
+                "content": "Immediate evacuation to the secure under-bed zone.",
+                "tone": "danger"
+              }
+            ]
+          },
+          {
+            "type": "incident_checklist",
+            "title": "Remediation",
+            "checklist": [
+              {
+                "title": "Confirm no cucumber is present",
+                "owner": "Muchi",
+                "done": true
+              },
+              {
+                "title": "Reclaim cardboard box",
+                "owner": "Muchi",
+                "done": false
+              }
+            ]
+          },
+          {
+            "type": "checklist",
+            "title": "Checklist alias",
+            "checklist": [
+              {
+                "title": "Inspect every grocery bag on arrival",
+                "done": false
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Prose and structure",
+        "blocks": [
+          {
+            "type": "markdown",
+            "content": "Cats have a **Jacobson’s organ** in the roof of the mouth. That odd open-mouth face after a smell is called the [flehmen response](https://en.wikipedia.org/wiki/Flehmen_response)."
+          },
+          {
+            "type": "stack",
+            "blocks": [
+              {
+                "type": "markdown",
+                "content": "A cat’s whiskers are sensitive spatial sensors."
+              },
+              {
+                "type": "markdown",
+                "content": "That is why a narrow bowl can be surprisingly offensive."
+              }
+            ]
+          },
+          {
+            "type": "columns",
+            "blocks": [
+              {
+                "type": "markdown",
+                "content": "Left paw: unplanned keyboard input."
+              },
+              {
+                "type": "markdown",
+                "content": "Right paw: rigorous quality assurance."
+              }
+            ]
+          },
+          {
+            "type": "grid",
+            "blocks": [
+              {
+                "type": "metric",
+                "label": "Whiskers",
+                "value": "24"
+              },
+              {
+                "type": "metric",
+                "label": "Toe beans",
+                "value": "18"
+              },
+              {
+                "type": "metric",
+                "label": "Concern for calendars",
+                "value": "0%"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Visual evidence",
+        "blocks": [
+          {
+            "type": "chart",
+            "title": "Zoomies by weekday",
+            "description": "A minimal line chart for design-system QA.",
+            "spec_version": "cognis.chart.v1",
+            "chart_type": "line",
+            "series": [
+              {
+                "id": "zoomies",
+                "label": "Zoomie intensity",
+                "points": [
+                  {
+                    "x": "Mon",
+                    "y": 1
+                  },
+                  {
+                    "x": "Tue",
+                    "y": 3
+                  },
+                  {
+                    "x": "Wed",
+                    "y": 2
+                  }
+                ]
+              }
+            ],
+            "x_axis": {
+              "type": "category",
+              "label": "Weekday"
+            },
+            "y_axis": {
+              "type": "linear",
+              "label": "Intensity",
+              "unit": "laps",
+              "min": 0,
+              "max": 4
+            },
+            "legend_position": "none",
+            "palette_token": "default",
+            "source": "The Institute of Extremely Serious Cat Science",
+            "observed_at": "2026-07-16T08:00:00+00:00"
+          },
+          {
+            "type": "figure",
+            "alt": "An orange cat sleeping in a transparent illustration",
+            "caption": "Cats spend much of the day sleeping, apparently to preserve energy for exactly one dramatic hallway sprint.",
+            "src": "/docs/rich-deliverables/cat-nap.jpg"
+          },
+          {
+            "type": "gallery",
+            "blocks": [
+              {
+                "type": "figure",
+                "alt": "A cat birdwatching at a window",
+                "caption": "Birdwatching is premium entertainment.",
+                "src": "/docs/rich-deliverables/cat-window.jpg"
+              },
+              {
+                "type": "figure",
+                "alt": "A cat in a cardboard box",
+                "caption": "The box has passed inspection.",
+                "src": "/docs/rich-deliverables/cat-box.jpg"
+              }
+            ]
+          },
+          {
+            "type": "mermaid",
+            "title": "Treat delivery flow",
+            "source": "flowchart LR\n  A[Human opens drawer] --> B[Cat appears instantly]\n  B --> C{Treat supplied?}\n  C -->|Yes| D[Purr]\n  C -->|No| E[Escalate meow]"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Reference and code",
+        "blocks": [
+          {
+            "type": "code",
+            "title": "Snippet",
+            "language": "python",
+            "content": "def fix():\n    return True"
+          },
+          {
+            "type": "kv",
+            "title": "Key values",
+            "items": [
+              {
+                "label": "Owner",
+                "value": "Team A"
+              },
+              {
+                "label": "Priority",
+                "value": "High"
+              }
+            ]
+          },
+          {
+            "type": "key_value",
+            "title": "key_value alias",
+            "items": [
+              {
+                "label": "Alias",
+                "value": "Confirmed"
+              }
+            ]
+          },
+          {
+            "type": "source_list",
+            "title": "Sources"
+          },
+          {
+            "type": "link",
+            "title": "Feline enrichment guide",
+            "url": "https://example.org",
+            "description": "A concise reference for better birdwatching ergonomics.",
+            "thumbnail": "/docs/rich-deliverables/cat-window.jpg",
+            "thumbnail_alt": "Cat watching birds from a window"
+          },
+          {
+            "type": "link_preview",
+            "site": "Cat field notes",
+            "title": "The cardboard box quality standard",
+            "url": "https://example.org",
+            "description": "A preview card with an optional author-supplied thumbnail.",
+            "thumbnail": "/docs/rich-deliverables/cat-box.jpg",
+            "thumbnail_alt": "Cat inspecting a cardboard box"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Emphasis, sparingly",
+        "blocks": [
+          {
+            "type": "callout",
+            "tone": "success",
+            "title": "One highlight",
+            "content": "Exactly one true highlight per deliverable."
+          },
+          {
+            "type": "divider"
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Containers",
+        "blocks": [
+          {
+            "type": "tabs",
+            "items": [
+              {
+                "type": "markdown",
+                "title": "Tab one",
+                "content": "First tab content."
+              },
+              {
+                "type": "markdown",
+                "title": "Tab two",
+                "content": "Second tab content."
+              }
+            ]
+          },
+          {
+            "type": "accordion",
+            "items": [
+              {
+                "type": "markdown",
+                "title": "Accordion one",
+                "content": "First accordion content."
+              },
+              {
+                "type": "markdown",
+                "title": "Accordion two",
+                "content": "Second accordion content."
+              }
+            ]
+          },
+          {
+            "type": "modal",
+            "title": "Open modal",
+            "items": [
+              {
+                "type": "markdown",
+                "content": "Modal content."
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "ref-a",
+        "title": "Reference source"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

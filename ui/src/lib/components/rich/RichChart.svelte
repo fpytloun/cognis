@@ -200,6 +200,7 @@
   <div
     bind:this={wrapperEl}
     class:chart-ready={Boolean(chart)}
+    data-chart-ready={chart ? 'true' : 'false'}
     class="rich-chart-canvas"
     role={allowPinning ? 'button' : 'img'}
     tabindex={allowPinning ? 0 : -1}

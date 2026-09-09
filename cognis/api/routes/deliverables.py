@@ -547,13 +547,14 @@ async def _cached_pdf(request: Request, row: DeliverableRow, *, access_scope: st
     if task is None:
         task = asyncio.create_task(_render_and_cache_pdf(request, row, cache_key=cache_key))
         _pdf_render_flights[flight_key] = task
-        task.add_done_callback(
-            lambda completed, key=flight_key: (
+
+        def clear_pdf_flight(
+            completed: asyncio.Task[bytes], key: tuple[str, str, str] = flight_key
+        ) -> None:
+            if _pdf_render_flights.get(key) is completed:
                 _pdf_render_flights.pop(key, None)
-                if _pdf_render_flights.get(key) is completed
-                else None
-            )
-        )
+
+        task.add_done_callback(clear_pdf_flight)
     try:
         return await asyncio.shield(task)
     except DeliverableRenderError as exc:

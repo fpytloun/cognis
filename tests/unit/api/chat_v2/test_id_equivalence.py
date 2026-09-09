@@ -69,6 +69,39 @@ def test_retry_notice_runtime_and_canonical_ids_match() -> None:
     assert canonical[runtime.id] == runtime.kind
 
 
+def test_turn_initiated_notice_runtime_and_canonical_ids_match() -> None:
+    runtime = system_message_runtime_item(
+        notice_id="turn-init:fup-1",
+        content="Turn initiated by other: Agent work finished.",
+        turn_id="turn-follow-up",
+        session_id="sess-1",
+        timestamp=TS,
+        notice_kind="turn_initiated",
+        notice_scope="turn",
+    )
+    canonical = _canonical_ids(
+        [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-1",
+                seq=1,
+                type="system_message",
+                data={
+                    "notice_id": "turn-init:fup-1",
+                    "content": "Turn initiated by other: Agent work finished.",
+                    "turn_id": "turn-follow-up",
+                    "kind": "turn_initiated",
+                    "scope": "turn",
+                },
+            )
+        ]
+    )
+
+    assert runtime.id == "system:turn-init:fup-1"
+    assert runtime.sort_key.startswith("9997:")
+    assert canonical[runtime.id] == runtime.kind
+
+
 def test_compaction_ids_match_from_running_state_through_canonical_projection() -> None:
     running = compaction_runtime_item(
         {

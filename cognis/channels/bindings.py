@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 from sqlalchemy import select
@@ -19,6 +20,10 @@ class ActiveManagedChannelBinding:
     agent_id: str
     title: str | None
     status: str
+    owner_epoch: int | None = None
+    expires_at: datetime | None = None
+    outcome_uncertain: bool = False
+    recovery_eligible: bool = False
 
 
 class ManagedChannelBindingLookup(Protocol):
@@ -87,12 +92,45 @@ class DatabaseManagedChannelBindingLookup:
                 .limit(1)
             )
             row = result.one_or_none()
+            from cognis.channels.delivery_state import managed_delivery_outcome_uncertain
+
+            outcome_uncertain = await managed_delivery_outcome_uncertain(
+                session, row[0] if row is not None else None
+            )
         if row is None:
             return None
         binding, link = row
+        now = datetime.now(UTC)
+        expires_at = (
+            binding.expires_at.replace(tzinfo=UTC)
+            if binding.expires_at.tzinfo is None
+            else binding.expires_at.astimezone(UTC)
+        )
+        lease_expires_at = (
+            (
+                binding.delivery_lease_expires_at.replace(tzinfo=UTC)
+                if binding.delivery_lease_expires_at.tzinfo is None
+                else binding.delivery_lease_expires_at.astimezone(UTC)
+            )
+            if binding.delivery_lease_expires_at is not None
+            else None
+        )
         return ActiveManagedChannelBinding(
             conversation_id=link.target_conversation_id,
             agent_id=link.target_agent_id,
             title=link.title,
             status=binding.state,
+            owner_epoch=link.owner_epoch,
+            expires_at=expires_at,
+            outcome_uncertain=outcome_uncertain,
+            recovery_eligible=(
+                binding.state == "delivery_failed"
+                and binding.active_route_key is not None
+                and expires_at <= now
+                and not (
+                    binding.delivery_lease_token
+                    and lease_expires_at is not None
+                    and lease_expires_at > now
+                )
+            ),
         )

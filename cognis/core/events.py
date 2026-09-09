@@ -16,9 +16,10 @@ from collections import defaultdict
 from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime
 from enum import StrEnum
+from time import monotonic
 from typing import Any
 
-from prometheus_client import Counter
+from prometheus_client import Counter, Histogram
 from pydantic import BaseModel
 
 from cognis.logging import get_logger
@@ -34,6 +35,12 @@ _EVENT_SUBSCRIBERS_AUTO_REMOVED_TOTAL = Counter(
     "cognis_event_subscribers_auto_removed_total",
     "EventBus subscribers removed after repeated failures.",
     labelnames=("subscriber_type", "reason"),
+)
+_EVENT_SUBSCRIBER_DURATION = Histogram(
+    "cognis_event_subscriber_duration_seconds",
+    "Duration of EventBus subscriber calls.",
+    labelnames=("subscriber_type", "event_type"),
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
 )
 _MAX_SUBSCRIBER_ERRORS = 5
 
@@ -99,6 +106,7 @@ class EventType(StrEnum):
     SCHEDULE_FIRED = "schedule_fired"
     SCHEDULE_ERROR = "schedule_error"
     SCHEDULE_DISABLED = "schedule_disabled"
+    SCHEDULE_ACTION_CHANGED = "schedule_action_changed"
 
     # Unified notifications
     NOTIFICATION_CREATED = "notification_created"
@@ -136,14 +144,17 @@ class EventBus:
         self._handlers: dict[EventType, list[EventHandler]] = defaultdict(list)
         self._global_handlers: list[EventHandler] = []
         self._handler_error_counts: dict[int, int] = {}
+        self._resilient_handlers: set[EventHandler] = set()
 
     def subscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Register a handler for a specific event type."""
         self._handlers[event_type].append(handler)
 
-    def subscribe_all(self, handler: EventHandler) -> None:
+    def subscribe_all(self, handler: EventHandler, *, resilient: bool = False) -> None:
         """Register a handler for all event types."""
         self._global_handlers.append(handler)
+        if resilient:
+            self._resilient_handlers.add(handler)
 
     def unsubscribe(self, event_type: EventType, handler: EventHandler) -> None:
         """Remove a handler for a specific event type."""
@@ -161,6 +172,7 @@ class EventBus:
         with contextlib.suppress(ValueError):
             self._global_handlers.remove(handler)
         self._handler_error_counts.pop(id(handler), None)
+        self._resilient_handlers.discard(handler)
 
     async def publish(self, event: Event) -> None:
         """Publish an event to all matching handlers.
@@ -199,7 +211,7 @@ class EventBus:
                         }
                     },
                 )
-                if failures >= _MAX_SUBSCRIBER_ERRORS:
+                if failures >= _MAX_SUBSCRIBER_ERRORS and handler not in self._resilient_handlers:
                     self.unsubscribe_all(handler)
                     _EVENT_SUBSCRIBERS_AUTO_REMOVED_TOTAL.labels(
                         subscriber_type=subscriber_type,
@@ -237,6 +249,7 @@ def _subscriber_type(handler: EventHandler) -> str:
 
 async def _safe_call(handler: EventHandler, event: Event) -> bool:
     """Call a handler, catching all exceptions."""
+    started = monotonic()
     try:
         await handler(event)
         return True
@@ -246,3 +259,8 @@ async def _safe_call(handler: EventHandler, event: Event) -> bool:
             extra={"extra_data": {"event_type": event.type}},
         )
         return False
+    finally:
+        _EVENT_SUBSCRIBER_DURATION.labels(
+            subscriber_type=_subscriber_type(handler),
+            event_type=event.type,
+        ).observe(monotonic() - started)

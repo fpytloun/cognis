@@ -10,7 +10,7 @@ from cognis.store.schema import upgrade_schema
 database_app = typer.Typer(help="Database schema management")
 
 
-@database_app.command("upgrade")  # type: ignore[untyped-decorator]
+@database_app.command("upgrade")
 def upgrade() -> None:
     """Upgrade the configured database to the latest Alembic revision."""
     config = load_config()

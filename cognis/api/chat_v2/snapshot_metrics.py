@@ -8,6 +8,17 @@ from prometheus_client import Counter, Gauge, Histogram
 
 SnapshotRequestTier = Literal["unknown", "l1", "redis", "build", "bypass"]
 SnapshotRequestOutcome = Literal["success", "error"]
+WarmEventOutcome = Literal[
+    "requested",
+    "coalesced",
+    "overflow",
+    "debounced",
+    "max_delay",
+    "shutdown",
+    "succeeded",
+    "skipped",
+    "failed",
+]
 WarmFailureReason = Literal[
     "context_missing",
     "context_changed",
@@ -153,7 +164,10 @@ class SnapshotCacheMetrics:
             "resolver",
         }:
             raise ValueError("invalid snapshot overflow structure")
-        _OVERFLOW.labels(structure=structure).inc()
+        try:
+            _OVERFLOW.labels(structure=structure).inc()
+        except Exception:
+            return
 
     def codec_saturated(self) -> None:
         _CODEC_SATURATED.inc()
@@ -180,7 +194,34 @@ class SnapshotCacheMetrics:
             "internal",
         }:
             raise ValueError("invalid snapshot warm failure reason")
-        WARM_FAILURES.labels(reason=reason).inc()
+        try:
+            WARM_FAILURES.labels(reason=reason).inc()
+        except Exception:
+            return
+
+    def warm_event(self, outcome: WarmEventOutcome) -> None:
+        if outcome not in {
+            "requested",
+            "coalesced",
+            "overflow",
+            "debounced",
+            "max_delay",
+            "shutdown",
+            "succeeded",
+            "skipped",
+            "failed",
+        }:
+            raise ValueError("invalid snapshot warm outcome")
+        try:
+            WARM_EVENTS.labels(outcome=outcome).inc()
+        except Exception:
+            return
+
+    def warm_lag(self, seconds: float) -> None:
+        try:
+            WARM_LAG.observe(max(0.0, seconds))
+        except Exception:
+            return
 
     def l1_resident(self, entries: int, estimated_bytes: int) -> None:
         L1_ENTRIES.set(entries)
@@ -193,8 +234,11 @@ class SnapshotCacheMetrics:
         OWNED_LOCKS.set(count)
 
     def warmer(self, pending: int, active: int) -> None:
-        WARMER_PENDING.set(pending)
-        WARMER_ACTIVE.set(active)
+        try:
+            WARMER_PENDING.set(pending)
+            WARMER_ACTIVE.set(active)
+        except Exception:
+            return
 
     def append_mapping(self, count: int) -> None:
         APPEND_MAPPING_ENTRIES.set(count)
@@ -206,9 +250,22 @@ class SnapshotCacheMetrics:
         REDIS_VALUE_BYTES.observe(size_bytes)
 
     def client_performance(self, metric: str, duration_ms: float) -> None:
-        if metric not in {"cached_restore_ms", "timeline_fresh_ms"}:
+        if metric not in {
+            "cached_restore_ms",
+            "timeline_fresh_ms",
+            "activity_overview_cache_fresh_ms",
+            "activity_overview_cache_stale_ms",
+            "activity_overview_cache_miss_ms",
+            "activity_overview_request_success_ms",
+            "activity_overview_request_error_ms",
+            "activity_overview_request_aborted_ms",
+            "activity_overview_request_deduplicated_ms",
+        }:
             raise ValueError("invalid client performance metric")
-        CLIENT_PERFORMANCE_MS.labels(metric=metric).observe(duration_ms)
+        try:
+            CLIENT_PERFORMANCE_MS.labels(metric=metric).observe(duration_ms)
+        except Exception:
+            return
 
 
 SNAPSHOT_CACHE_METRICS = SnapshotCacheMetrics()

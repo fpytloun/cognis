@@ -2,8 +2,9 @@ import type {
   TimelineItem,
   ToolCallTimelineItem,
   TurnCycleState,
+  WorkstreamRef,
 } from '$lib/chat-v2/types';
-import type { BackgroundWorkItem, BackgroundWorkTodo } from '$lib/types/api';
+import type { BackgroundWorkItem, BackgroundWorkTodo, Session } from '$lib/types/api';
 
 const inactiveBackgroundStatuses = new Set([
   'complete',
@@ -20,6 +21,58 @@ export function backgroundWorkItemIsRunning(item: BackgroundWorkItem): boolean {
     return item.status === 'running' || item.status === 'queued';
   }
   return !inactiveBackgroundStatuses.has(item.status);
+}
+
+export function directChildBackgroundWork(
+  items: readonly BackgroundWorkItem[],
+  controllerSessionIds: ReadonlySet<string>,
+): BackgroundWorkItem[] {
+  if (controllerSessionIds.size === 0) return [];
+  return items.filter((item) => {
+    const controllerSessionId = item.kind === 'delegated_session'
+      ? item.parent_session_id
+      : item.controller_session_id;
+    return Boolean(
+      controllerSessionId
+      && controllerSessionIds.has(controllerSessionId),
+    );
+  });
+}
+
+export function activeRootSessionLineageIds(
+  sessions: readonly Session[],
+  activeSessionId: string | null | undefined,
+): ReadonlySet<string> {
+  if (!activeSessionId) return new Set<string>();
+  const byId = new Map(sessions.map((session) => [session.session_id, session]));
+  const active = byId.get(activeSessionId);
+  if (!active || active.parent_session_id) return new Set<string>();
+  const lineage = new Set<string>();
+  const visited = new Set<string>();
+  let current: Session | undefined = active;
+  while (
+    current
+    && !current.parent_session_id
+    && current.activity_scope_id === active.activity_scope_id
+    && !visited.has(current.session_id)
+  ) {
+    visited.add(current.session_id);
+    lineage.add(current.session_id);
+    current = current.previous_session_id
+      ? byId.get(current.previous_session_id)
+      : undefined;
+  }
+  return lineage;
+}
+
+export function workstreamSessionIds(
+  workstream: WorkstreamRef | null | undefined,
+): ReadonlySet<string> {
+  if (!workstream) return new Set<string>();
+  return new Set([
+    workstream.session_id,
+    ...(workstream.backing_session_ids ?? []),
+  ].filter(Boolean));
 }
 
 function backgroundWorkActivityMs(item: BackgroundWorkItem): number | null {

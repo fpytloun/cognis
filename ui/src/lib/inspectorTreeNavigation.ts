@@ -45,13 +45,53 @@ export function canonicalWorkstreamSessionId(
   return workstreamForSession(nodes, sessionId)?.session_id ?? sessionId;
 }
 
+export function workInvalidationTouchesTree(
+  invalidatedScopeKey: string | null | undefined,
+  inspectorScopeKey: string,
+  rootScopeKey: string | null,
+  nodes: WorkstreamRef[],
+): boolean {
+  if (!invalidatedScopeKey) return true;
+  if (invalidatedScopeKey === inspectorScopeKey || invalidatedScopeKey === rootScopeKey) {
+    return true;
+  }
+  const separator = invalidatedScopeKey.indexOf(':');
+  if (separator < 1) return false;
+  const kind = invalidatedScopeKey.slice(0, separator);
+  const identifier = invalidatedScopeKey.slice(separator + 1);
+  if (!identifier) return false;
+  if (kind === 'conversation') {
+    return nodes.some((node) => node.conversation_id === identifier);
+  }
+  if (kind === 'session') {
+    return nodes.some((node) => (
+      node.session_id === identifier || node.backing_session_ids?.includes(identifier)
+    ));
+  }
+  if (kind === 'task_step') {
+    return nodes.some((node) => node.step_run_id === identifier);
+  }
+  return false;
+}
+
+export function activityOverviewInvalidationScopeKeys(
+  inspectorScopeKey: string,
+  rootScopeKey: string | null,
+  fallbackScopeKey: string | null,
+): string[] {
+  return [...new Set(
+    [inspectorScopeKey, rootScopeKey, fallbackScopeKey]
+      .filter((scopeKey): scopeKey is string => Boolean(scopeKey)),
+  )];
+}
+
 export function treeSessionNavigation(presentation: 'closed' | 'pinned' | 'overlay' | 'focus'): {
   openSubSessionViewer: true;
   closeInspectorOverlay: boolean;
 } {
   return {
     openSubSessionViewer: true,
-    closeInspectorOverlay: false,
+    closeInspectorOverlay: presentation === 'overlay' || presentation === 'focus',
   };
 }
 
@@ -79,11 +119,12 @@ export function traverseInspectorSession(
   state: InspectorTraversalState,
   sessionId: string | null,
 ): InspectorTraversalState {
+  const dismissTransientInspector = state.presentation === 'overlay' || state.presentation === 'focus';
   return {
     ...state,
-    drawerOpen: state.drawerOpen,
+    drawerOpen: dismissTransientInspector ? false : state.drawerOpen,
     activeTab: state.activeTab,
-    presentation: state.presentation,
+    presentation: dismissTransientInspector ? 'closed' : state.presentation,
     focusedSessionId: sessionId,
     middleSessionId: sessionId,
     workSessionId: sessionId,

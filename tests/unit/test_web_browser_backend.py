@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 
 from cognis.models.tool import ToolResult
@@ -1134,6 +1135,50 @@ async def test_handle_web_fetch_auto_fallback_uses_browser_on_cloudflare(
     assert (result.metadata or {}).get("browser_fallback") is True
     assert (result.metadata or {}).get("stored_output")
     assert (result.metadata or {}).get("output_anchors")
+
+
+@pytest.mark.asyncio
+async def test_handle_web_fetch_auto_fallback_uses_browser_on_blank_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.tools.executor.web import handlers
+    from cognis.tools.executor.web.headers import format_response_result
+
+    browser_calls: list[str] = []
+
+    class _FakePrimary:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            response = httpx.Response(
+                200,
+                content=b"",
+                request=httpx.Request("GET", url),
+            )
+            return format_response_result(response, "markdown")
+
+    class _FakeBrowser:
+        async def fetch(self, url: str, **_: Any) -> ToolResult:
+            browser_calls.append(url)
+            return ToolResult(output="rendered content")
+
+    monkeypatch.setattr(handlers, "resolve_fetch_backend", lambda *_args, **_kwargs: _FakePrimary())
+    monkeypatch.setattr(
+        handlers,
+        "get_browser_fetch_backend",
+        lambda _metadata: _FakeBrowser(),
+    )
+
+    ctx = _FakeContext(
+        {
+            "web_fetch_backend": "direct",
+            "web_fetch_fallback_browser": True,
+        }
+    )
+    result = await handlers.handle_web_fetch({"url": "https://example.com"}, ctx)
+
+    assert browser_calls == ["https://example.com"]
+    assert not result.is_error
+    assert "rendered content" in result.output
+    assert (result.metadata or {}).get("browser_fallback") is True
 
 
 @pytest.mark.asyncio

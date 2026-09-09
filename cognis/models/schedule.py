@@ -25,6 +25,7 @@ class ScheduleRunStatus(StrEnum):
     SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
+    CANCELLED = "cancelled"
 
 
 class ScheduleModel(BaseModel):
@@ -47,6 +48,8 @@ class ScheduleModel(BaseModel):
     enabled: bool = True
     max_concurrent_runs: int = 1
     delete_after_run: bool = False
+    retry_failed_tasks: bool = False
+    fail_paused_task_on_next_fire: bool = True
     completion_delivery: CompletionDeliveryPolicy = Field(default_factory=CompletionDeliveryPolicy)
     interaction_mode_override: str | None = "none"
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)

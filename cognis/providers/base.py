@@ -42,6 +42,7 @@ from cognis.models.tool import (
 from cognis.providers.guardrails.events import EventAppendListener
 
 ToolOutputChunkCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
+ToolDispatchCallback = Callable[[str, str | None], Coroutine[Any, Any, None]]
 
 
 class MemoryProvider(Protocol):
@@ -230,6 +231,8 @@ class ExecutorConnection(Protocol):
         tool_call: ToolCall,
         timeout_seconds: int | None = None,
         output_chunk_callback: ToolOutputChunkCallback | None = None,
+        before_send: ToolDispatchCallback | None = None,
+        on_sent: ToolDispatchCallback | None = None,
     ) -> ToolResult: ...
     async def cancel_call(self, call_id: str) -> None: ...
 
@@ -360,7 +363,14 @@ class ImageGenerationProvider(Protocol):
 
 
 class AuthProvider(Protocol):
-    def sign_access_token(self, subject: str, name: str | None, role: str) -> str: ...
+    def sign_access_token(
+        self,
+        subject: str,
+        name: str | None,
+        role: str,
+        *,
+        auth_version: int = 0,
+    ) -> str: ...
     def sign_refresh_token(self, subject: str) -> str: ...
     def sign_service_jwt(
         self,

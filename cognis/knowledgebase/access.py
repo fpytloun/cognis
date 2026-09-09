@@ -77,8 +77,8 @@ async def resolve_knowledgebase_access(
         if knowledgebase_id not in _allowed_knowledgebases(agent):
             return None
         if context.actor_email != agent.owner_email:
-            grant = await get_active_agent_grant(session, agent.agent_id, context.actor_email)
-            if grant is None:
+            agent_grant = await get_active_agent_grant(session, agent.agent_id, context.actor_email)
+            if agent_grant is None:
                 return None
             return ResolvedKnowledgebaseAccess(
                 knowledgebase=kb,
@@ -103,8 +103,10 @@ async def resolve_knowledgebase_access(
             owner_email=kb.owner_email,
             is_owner=True,
         )
-    grant = await get_active_knowledgebase_grant(session, knowledgebase_id, context.actor_email)
-    if grant is not None:
+    knowledgebase_grant = await get_active_knowledgebase_grant(
+        session, knowledgebase_id, context.actor_email
+    )
+    if knowledgebase_grant is not None:
         return ResolvedKnowledgebaseAccess(
             knowledgebase=kb,
             actor_email=context.actor_email,

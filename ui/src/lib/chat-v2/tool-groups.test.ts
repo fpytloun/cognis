@@ -15,10 +15,12 @@ function sourceRef(seq: number) {
 }
 
 function activityEntryIds(row: ActivitySegmentRow): string[] {
-  return row.entries.map((entry) => entry.kind === 'assistant'
-    ? `assistant:${entry.item.id}`
-    : `tools:${entry.group.items.map((item) => item.id).join(',')}`
-  );
+  return row.entries.map((entry) => {
+    if (entry.kind === 'tool_group') {
+      return `tools:${entry.group.items.map((item) => item.id).join(',')}`;
+    }
+    return `${entry.kind}:${entry.item.id}`;
+  });
 }
 
 function rowShape(rows: ReturnType<typeof prepareTimelineRows>): string[] {
@@ -118,6 +120,125 @@ const SEPARATE_ASSISTANT_MESSAGES_PREFERENCES = {
 };
 
 describe('prepareTimelineRows', () => {
+  it('keeps same-target managed conversation activity together through typed recovery', () => {
+    const rows = prepareTimelineRows([
+      tool('before', 'agent_conversation_wait', {
+        turn_id: 'turn-1',
+        arguments: { conversation_id: 'conv-1' }
+      }),
+      message('recovery', {
+        role: 'system',
+        content: 'Recovered',
+        turn_id: 'turn-2',
+        notice_kind: 'model_recovery',
+        notice_scope: 'turn',
+        retry_source_turn_id: 'turn-1'
+      }),
+      tool('after', 'agent_conversation_get', {
+        turn_id: 'turn-2',
+        arguments: { conversation_id: 'conv-1' }
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('activity_segment');
+    if (rows[0].kind !== 'activity_segment') return;
+    expect(rows[0].entries.map((entry) => entry.kind)).toEqual([
+      'tool_group',
+      'recovery_notice',
+      'tool_group'
+    ]);
+  });
+
+  it('matches any shared allow-listed operation target', () => {
+    const rows = prepareTimelineRows([
+      tool('before', 'agent_conversation_wait', {
+        turn_id: 'turn-1',
+        arguments: { conversation_id: 'conv-1', task_id: 'task-1' }
+      }),
+      message('recovery', {
+        role: 'system',
+        turn_id: 'turn-2',
+        notice_kind: 'model_recovery',
+        notice_scope: 'turn',
+        retry_source_turn_id: 'turn-1'
+      }),
+      tool('after', 'agent_conversation_get', {
+        turn_id: 'turn-2',
+        arguments: { conversation_id: 'conv-2', task_id: 'task-1' }
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('activity_segment');
+  });
+
+  it('does not join a recovery continuation with a different operation target', () => {
+    const rows = prepareTimelineRows([
+      tool('before', 'agent_conversation_wait', {
+        turn_id: 'turn-1',
+        arguments: { conversation_id: 'conv-1' }
+      }),
+      message('recovery', {
+        role: 'system',
+        turn_id: 'turn-2',
+        notice_kind: 'model_recovery',
+        notice_scope: 'turn',
+        retry_source_turn_id: 'turn-1'
+      }),
+      tool('after', 'agent_conversation_get', {
+        turn_id: 'turn-2',
+        arguments: { conversation_id: 'conv-2' }
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item', 'tool_group']);
+  });
+
+  it('does not join recovery activity without an existing semantic target', () => {
+    const rows = prepareTimelineRows([
+      tool('before', 'bash', { turn_id: 'turn-1', arguments: { command: 'pwd' } }),
+      message('recovery', {
+        role: 'system',
+        turn_id: 'turn-2',
+        notice_kind: 'model_recovery',
+        notice_scope: 'turn',
+        retry_source_turn_id: 'turn-1'
+      }),
+      tool('after', 'bash', { turn_id: 'turn-2', arguments: { command: 'pwd' } })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item', 'tool_group']);
+  });
+
+  it.each([
+    [{ retry_source_turn_id: 'other-turn' }],
+    [{ notice_kind: 'other_notice' }],
+    [{ notice_scope: 'conversation' }],
+    [{ turn_id: 'different-turn' }]
+  ])('does not bridge an ineligible recovery notice: %o', (recoveryOverride) => {
+    const rows = prepareTimelineRows([
+      tool('before', 'agent_conversation_wait', {
+        turn_id: 'turn-1',
+        arguments: { conversation_id: 'conv-1' }
+      }),
+      message('recovery', {
+        role: 'system',
+        turn_id: 'turn-2',
+        notice_kind: 'model_recovery',
+        notice_scope: 'turn',
+        retry_source_turn_id: 'turn-1',
+        ...recoveryOverride
+      }),
+      tool('after', 'agent_conversation_get', {
+        turn_id: 'turn-2',
+        arguments: { conversation_id: 'conv-1' }
+      })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows.map((row) => row.kind)).toEqual(['tool_group', 'item', 'tool_group']);
+  });
+
   it('groups consecutive same-turn same-phase tool calls', () => {
     const rows = prepareTimelineRows([
       tool('a', 'read', { duration_ms: 10 }),
@@ -1256,6 +1377,46 @@ describe('prepareTimelineRows', () => {
     expect(shellRows[0].kind === 'tool_group' ? shellRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
     expect(genericRows[0].kind === 'tool_group' ? genericRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
     expect(webRows[0].kind === 'tool_group' ? webRows[0].summary.detailLabel : '').toBe('1 tool (1 failed)');
+  });
+
+  it('treats a `waiting` tool as non-terminal/running, not failed', () => {
+    const rows = prepareTimelineRows([
+      tool('a', 'run_shell', { status: 'waiting' })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows[0].kind).toBe('tool_group');
+    if (rows[0].kind !== 'tool_group') return;
+    expect(rows[0].summary.status).toBe('running');
+    expect(rows[0].summary.failedCount).toBe(0);
+  });
+
+  it('treats a `denied` tool as a terminal rejected outcome, distinct from `failed`', () => {
+    const rows = prepareTimelineRows([
+      tool('a', 'run_shell', { status: 'denied', is_error: true })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows[0].kind).toBe('tool_group');
+    if (rows[0].kind !== 'tool_group') return;
+    expect(rows[0].summary.status).toBe('denied');
+    expect(rows[0].summary.failedCount).toBe(0);
+    expect(rows[0].summary.deniedCount).toBe(1);
+  });
+
+  it('reports denied detail separately from failed detail in a mixed group', () => {
+    const rows = prepareTimelineRows([
+      tool('bash', 'bash', { status: 'denied' })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows[0].kind === 'tool_group' ? rows[0].summary.detailLabel : '').toBe('1 tool (1 denied)');
+  });
+
+  it('gives a real execution failure precedence over a denied approval in the same group', () => {
+    const rows = prepareTimelineRows([
+      tool('bash-1', 'bash', { call_id: 'bash-1', is_error: true, status: 'failed' }),
+      tool('bash-2', 'bash', { call_id: 'bash-2', status: 'denied' })
+    ], DEFAULT_USER_PREFERENCES);
+
+    expect(rows[0].kind === 'tool_group' ? rows[0].summary.status : '').toBe('failed');
   });
 
   it('keeps group identity stable when live tools append', () => {

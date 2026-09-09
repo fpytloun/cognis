@@ -44,6 +44,8 @@ _MAX_SNIPPET_CHARS = 220
 TOOL_CALL_CEILING_CONTINUATION_REASON = "tool_call_ceiling_reached"
 LLM_CYCLE_CEILING_CONTINUATION_REASON = "llm_cycle_ceiling_reached"
 STEP_TIMEOUT_CONTINUATION_REASON = "step_timeout"
+MISSING_STEP_COMPLETE_CONTINUATION_REASON = "missing_step_complete"
+MID_STREAM_FAILURE_CONTINUATION_REASON = "mid_stream_failure_exhausted"
 DEFAULT_MAX_AUTOMATIC_CONTINUATION_ATTEMPTS = 3
 
 
@@ -249,7 +251,7 @@ def build_automatic_continuation_follow_up(
     prior_follow_up: FollowUpMetadata | None,
     max_attempts: int = DEFAULT_MAX_AUTOMATIC_CONTINUATION_ATTEMPTS,
 ) -> ContinuationFollowUp | None:
-    if isinstance(prior_follow_up, ContinuationFollowUp) and prior_follow_up.reason == reason:
+    if isinstance(prior_follow_up, ContinuationFollowUp):
         attempt = prior_follow_up.attempt + 1
     else:
         attempt = 1

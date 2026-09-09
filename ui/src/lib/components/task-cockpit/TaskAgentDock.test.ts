@@ -263,6 +263,7 @@ describe('TaskAgentDock', () => {
       conversation_id: 'conversation-task-a',
       has_active_turn: false,
       has_unread: true,
+      last_message_at: '2026-01-01T00:00:00Z',
       active_session_status: 'active',
       active_session_completion_reason: null,
       pending_notification_types: [],
@@ -277,6 +278,34 @@ describe('TaskAgentDock', () => {
     await waitFor(() => expect(screen.getByTestId('activity-avatar-unread')).toBeInTheDocument());
     await fireEvent.click(screen.getByTestId('task-agent-dock-launcher'));
     await waitFor(() => expect(markRead).toHaveBeenCalledWith('conversation-task-a'));
+    expect(screen.queryByTestId('activity-avatar-unread')).toBeNull();
+  });
+
+  it('never shows unread activity when the control conversation has no message yet', async () => {
+    controlChat.mockResolvedValue(chat('task-a'));
+    conversationDetail.mockResolvedValue({
+      conversation_id: 'conversation-task-a',
+      has_active_turn: false,
+      has_unread: true,
+      last_message_at: null,
+      context: {
+        type: 'web',
+        ref: 'web:task_control:task-a',
+        platform_data: { kind: 'task_control', task_id: 'task-a' },
+        memory_labels: {},
+      },
+      active_session_status: 'active',
+      active_session_completion_reason: null,
+      pending_notification_types: [],
+    });
+    render(TaskAgentDock, {
+      task: task('task-a', 'Task A'),
+      agent,
+      onGate: vi.fn(),
+      onQuestion: vi.fn(),
+    });
+
+    await waitFor(() => expect(conversationDetail).toHaveBeenCalled());
     expect(screen.queryByTestId('activity-avatar-unread')).toBeNull();
   });
 
@@ -547,7 +576,7 @@ describe('TaskAgentDock', () => {
     expect(screen.getByLabelText('Background work active')).toBeInTheDocument();
   });
 
-  it('clears scoped runtime activity when chat unmounts on tab switch or minimize', async () => {
+  it('keeps control-chat activity visible across tab switch and minimize', async () => {
     controlChat.mockResolvedValue(chat('task-a'));
     conversationDetail.mockResolvedValue({
       conversation_id: 'conversation-task-a',
@@ -573,7 +602,7 @@ describe('TaskAgentDock', () => {
     await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('tab', { name: 'Work' }));
-    await waitFor(() => expect(screen.queryByTestId('activity-avatar-orbit')).toBeNull());
+    await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
 
     await fireEvent.click(screen.getByRole('tab', { name: 'Chat' }));
     await screen.findByTestId('task-control-native-chat');
@@ -584,16 +613,30 @@ describe('TaskAgentDock', () => {
     });
     await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
     await fireEvent.click(screen.getByRole('button', { name: 'Minimize agent dock' }));
+    await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
+    emit({
+      type: 'sidebar_conversation_upsert',
+      conversation_id: 'conversation-task-a',
+      conversation: {
+        conversation_id: 'conversation-task-a',
+        has_active_turn: false,
+        has_unread: false,
+      },
+    });
     await waitFor(() => expect(screen.queryByTestId('activity-avatar-orbit')).toBeNull());
     emit({
-      type: 'conversation_runtime_snapshot',
+      type: 'sidebar_conversation_upsert',
       conversation_id: 'conversation-task-a',
-      has_active_turn: true,
+      conversation: {
+        conversation_id: 'conversation-task-a',
+        has_active_turn: true,
+        has_unread: false,
+      },
     });
-    expect(screen.queryByTestId('activity-avatar-orbit')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
   });
 
-  it('ignores late runtime snapshots across tab, minimize, and task generations', async () => {
+  it('keeps minimized runtime snapshots scoped to the current task generation', async () => {
     controlChat.mockImplementation(async (taskId: string) => chat(taskId));
     const props = {
       task: task('task-a', 'Task A'),
@@ -610,9 +653,13 @@ describe('TaskAgentDock', () => {
       conversation_id: 'conversation-task-a',
       has_active_turn: true,
     });
-    expect(screen.queryByTestId('activity-avatar-orbit')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
 
     await rerender({ ...props, task: task('task-b', 'Task B') });
+    await waitFor(() => expect(conversationDetail).toHaveBeenCalledWith(
+      'conversation-task-b',
+      { includeState: false },
+    ));
     emit({
       type: 'conversation_runtime_snapshot',
       conversation_id: 'conversation-task-a',
@@ -624,7 +671,7 @@ describe('TaskAgentDock', () => {
       conversation_id: 'conversation-task-b',
       has_active_turn: true,
     });
-    expect(screen.queryByTestId('activity-avatar-orbit')).toBeNull();
+    await waitFor(() => expect(screen.getByTestId('activity-avatar-orbit')).toBeInTheDocument());
 
     taskAgentDock.open();
     await screen.findByTestId('task-control-native-chat');
@@ -659,7 +706,7 @@ describe('TaskAgentDock', () => {
   it.each([
     {
       name: 'unread',
-      detail: { has_unread: true },
+      detail: { has_unread: true, last_message_at: '2026-01-01T00:00:00Z' },
       label: 'Unread control chat activity',
     },
     {

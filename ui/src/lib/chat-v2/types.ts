@@ -66,7 +66,10 @@ export interface SourceRef {
 export interface FileDiffRef {
   path: string;
   diff: string;
+  occurred_at?: string | null;
   path_id?: string | null;
+  /** Additive: identifies a file's rename-lineage generation for lazy file-history fetches. */
+  path_generation_id?: string | null;
   relative_path?: string | null;
   root_label?: string | null;
   root_name?: string | null;
@@ -74,12 +77,16 @@ export interface FileDiffRef {
   additions?: number | null;
   deletions?: number | null;
   content_truncated?: boolean;
+  preview_omitted?: boolean;
+  preview_omission_reason?: 'not_persisted' | 'retention_expired' | 'projection_budget' | 'sensitive' | null;
   old_path?: string | null;
   status?: 'added' | 'modified' | 'deleted' | 'renamed' | string | null;
   binary?: boolean;
   generated?: boolean;
   truncated?: boolean;
   source_workstream?: WorkstreamRef | null;
+  /** Exact Work item/tool-call that produced this historical diff. */
+  source_item_id?: string | null;
 }
 
 export interface WorkstreamRef {
@@ -113,8 +120,24 @@ export interface WorkstreamRef {
   completed_at?: string | null;
   model?: string | null;
   reasoning_effort?: string | null;
+  active_turn_id?: string | null;
+  execution_turn_id?: string | null;
+  runtime_selection_revision?: number | null;
+  runtime_recorded_at?: string | null;
   agent_display_name?: string | null;
   agent_avatar_url?: string | null;
+  todo_progress?: {
+    total: number;
+    completed: number;
+    in_progress: number;
+  } | null;
+  /**
+   * Additive: server-owned execution lifecycle state, independent of the
+   * coarser `status`/`activity_state` fields. Optional so older/backend
+   * responses without it fall back to the existing status/activity/runtime
+   * overlay logic.
+   */
+  execution_state?: 'idle' | 'queued' | 'running' | 'waiting' | 'recovering' | 'completed' | 'failed' | 'cancelled' | null;
 }
 
 export interface WorkDeliverable {
@@ -156,6 +179,8 @@ export interface WorkMutationEvent {
   file_stats?: Array<{
     path: string;
     path_id: string;
+    /** Additive: identifies a file's rename-lineage generation for lazy file-history fetches. */
+    path_generation_id?: string | null;
     relative_path?: string | null;
     root_label?: string | null;
     root_name?: string | null;
@@ -173,6 +198,7 @@ export interface WorkMutationEvent {
   additions?: number;
   deletions?: number;
   source_workstream?: WorkstreamRef | null;
+  source_session_id?: string | null;
 }
 
 export interface WorkCommandEvent {
@@ -213,6 +239,7 @@ export interface WorkArtifact {
 
 export interface WorkProjectionResponse {
   schema_version: ChatV2SchemaVersion;
+  detail?: 'lightweight' | 'full';
   projection_version: string;
   scope: TimelineScope;
   final_deliverable?: WorkDeliverable | null;
@@ -237,13 +264,9 @@ export interface WorkProjectionResponse {
     omitted_files?: number;
   };
   materialization?: {
-    state: 'materializing' | 'caught_up' | 'repair' | 'failed';
-    completed_streams: number;
-    total_streams: number;
-    covered_events: number;
-    target_events: number;
-    failed_streams: number;
-    retry_after_ms?: number | null;
+    state: 'live' | 'catching_up' | 'partial' | 'failed';
+    lag_count?: number | null;
+    failure_count?: number | null;
   };
   has_more_before: boolean;
   before_cursor?: string | null;
@@ -267,6 +290,7 @@ export interface ActivityRecentItem {
 
 export interface ActivityOverviewResponse {
   schema_version: ChatV2SchemaVersion;
+  detail?: 'lightweight' | 'full';
   projection_version: string;
   scope: TimelineScope;
   summary: WorkProjectionResponse['summary'];
@@ -275,7 +299,32 @@ export interface ActivityOverviewResponse {
   recent: Partial<Record<WorkCategory, ActivityRecentItem[]>>;
   recent_work?: ActivityRecentWork | null;
   graph_fingerprint: string;
+  work_revision?: number | null;
+  graph_revision?: number | null;
+  overview_revision?: string | null;
   graph_truncated: boolean;
+  server_time?: string | null;
+}
+
+export interface WorkFileHistoryRequest {
+  scope: TimelineScope;
+  path_generation_id: string;
+  before?: string | null;
+  limit?: number;
+}
+
+export interface WorkFileHistoryResponse {
+  scope: TimelineScope;
+  path_generation_id: string;
+  items: FileDiffRef[];
+  before_cursor?: string | null;
+  has_more_before: boolean;
+}
+
+export interface WorkRefreshResponse {
+  accepted: boolean;
+  scope: TimelineScope;
+  session_count: number;
 }
 
 export interface ActivityRecentWork {
@@ -284,6 +333,43 @@ export interface ActivityRecentWork {
   mutations: WorkMutationEvent[];
   artifacts: WorkArtifact[];
   deliverables: WorkDeliverable[];
+}
+
+export interface WorkActivityRootRef {
+  kind: 'conversation' | 'task';
+  conversation_id?: string | null;
+  task_id?: string | null;
+  step_run_id?: string | null;
+  title?: string | null;
+}
+
+export interface WorkActivityAgentRef {
+  agent_id: string;
+  display_name: string;
+  avatar_url?: string | null;
+}
+
+export interface WorkActivityProjectRef {
+  project_id: string;
+  name: string;
+}
+
+export interface WorkActivityItem {
+  activity_scope_id: string;
+  scope: TimelineScope;
+  root: WorkActivityRootRef;
+  agent: WorkActivityAgentRef;
+  project?: WorkActivityProjectRef | null;
+  status: string;
+  last_activity_at: string;
+  summary?: WorkProjectionResponse['summary'] | null;
+  materialization: 'ready' | 'absent';
+}
+
+export interface WorkActivityListResponse {
+  items: WorkActivityItem[];
+  next_cursor?: string | null;
+  has_more: boolean;
 }
 
 export interface ThinkingBlock {
@@ -550,6 +636,7 @@ export interface ErrorTimelineItem extends TimelineItemBase {
   level: 'error';
   title: string;
   message?: string | null;
+  error_detail?: string | null;
   error_code?: string | null;
   recoverable: boolean;
 }
@@ -597,6 +684,13 @@ export interface RuntimeActiveTurn {
   updated_at?: string | null;
 }
 
+export interface BoundaryReceipt {
+  session_id: string;
+  seq: number;
+  queue_id: string;
+  client_message_id: string;
+}
+
 export interface RuntimeOverlaySnapshot {
   runtime_epoch: string;
   runtime_revision: number;
@@ -607,6 +701,7 @@ export interface RuntimeOverlaySnapshot {
   cycle_states?: TurnCycleState[];
   context_usage?: ContextUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;
+  boundary_receipts?: BoundaryReceipt[];
 }
 
 export interface ConversationSummary {
@@ -619,6 +714,7 @@ export interface ConversationSummary {
   active_session_id?: string | null;
   last_message_at?: string | null;
   last_read_at?: string | null;
+  has_message_history?: boolean;
 }
 
 export interface QueueMessage {
@@ -626,10 +722,14 @@ export interface QueueMessage {
   client_message_id?: string | null;
   client_txn_id?: string | null;
   content: string;
+  kind?: 'automatic_continuation' | null;
+  continuation_reason?: string | null;
   attachments: AttachmentRef[];
   position: number;
   created_at?: string | null;
   updated_at?: string | null;
+  status?: 'queued' | 'recoverable' | 'committing';
+  cancel_requested?: boolean;
 }
 
 export interface QueueState {

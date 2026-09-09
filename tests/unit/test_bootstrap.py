@@ -52,6 +52,7 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     async with session_factory() as session:
         settings = await list_settings(session)
         coding_skill = await get_skill(session, "cognis-coding")
+        frontend_skill = await get_skill(session, "cognis-frontend-engineering")
         task_skill = await get_skill(session, "cognis-task-manager")
         workflow_skill = await get_skill(session, "cognis-workflow-manager")
         pulse_skill = await get_skill(session, "cognis-pulse-deliverable")
@@ -66,11 +67,15 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert evaluator_timeout is not None
     assert evaluator_timeout.value == 180000
     assert coding_skill is not None
+    assert frontend_skill is not None
     assert task_skill is not None
     assert workflow_skill is not None
     assert pulse_version is not None
     assert coding_skill.auto_load is False
     assert coding_skill.is_system is True
+    assert frontend_skill.is_system is True
+    assert frontend_skill.name == "Cognis Frontend Engineering"
+    assert frontend_skill.current_version_id is not None
     assert task_skill.auto_load is False
     assert workflow_skill.auto_load is False
     assert task_skill.is_system is True
@@ -156,7 +161,137 @@ async def test_bootstrap_adds_task_control_conversation_link_idempotently(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_adds_work_scope_revision_tables_idempotently(tmp_path: Path) -> None:
+async def test_bootstrap_adds_notification_attention_state_idempotently(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "notification_attention_bootstrap.db"
+    sync_engine = sa.create_engine(f"sqlite:///{database_path}")
+    try:
+        with sync_engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    CREATE TABLE notifications (
+                        notification_id VARCHAR PRIMARY KEY,
+                        notification_type VARCHAR NOT NULL,
+                        user_email VARCHAR NOT NULL,
+                        conversation_id VARCHAR NOT NULL,
+                        task_id VARCHAR,
+                        payload JSON NOT NULL,
+                        status VARCHAR NOT NULL,
+                        resolution JSON,
+                        created_at TIMESTAMP NOT NULL,
+                        resolved_at TIMESTAMP
+                    )
+                    """
+                )
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO notifications (
+                        notification_id,
+                        notification_type,
+                        user_email,
+                        conversation_id,
+                        payload,
+                        status,
+                        created_at
+                    ) VALUES (
+                        'legacy-notification',
+                        'gate',
+                        'owner@example.com',
+                        'conversation-1',
+                        '{}',
+                        'pending',
+                        CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+    finally:
+        sync_engine.dispose()
+
+    engine = create_engine(f"sqlite+aiosqlite:///{database_path}")
+    try:
+        await run_schema_bootstrap(engine)
+        await run_schema_bootstrap(engine)
+        async with engine.begin() as connection:
+            columns = await connection.run_sync(
+                lambda sync_connection: {
+                    str(column["name"]): column
+                    for column in inspect(sync_connection).get_columns("notifications")
+                }
+            )
+            indexes = await connection.run_sync(
+                lambda sync_connection: {
+                    str(index["name"]): index
+                    for index in inspect(sync_connection).get_indexes("notifications")
+                }
+            )
+            legacy = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT revision, expires_at
+                        FROM notifications
+                        WHERE notification_id = 'legacy-notification'
+                        """
+                    )
+                )
+            ).one()
+            await connection.execute(
+                text(
+                    """
+                    INSERT INTO notifications (
+                        notification_id,
+                        notification_type,
+                        user_email,
+                        conversation_id,
+                        payload,
+                        status,
+                        created_at
+                    ) VALUES (
+                        'new-notification',
+                        'gate',
+                        'owner@example.com',
+                        'conversation-1',
+                        '{}',
+                        'pending',
+                        CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+            inserted_revision = (
+                await connection.execute(
+                    text(
+                        """
+                        SELECT revision
+                        FROM notifications
+                        WHERE notification_id = 'new-notification'
+                        """
+                    )
+                )
+            ).scalar_one()
+    finally:
+        await engine.dispose()
+
+    assert columns["revision"]["nullable"] is False
+    assert str(columns["revision"]["default"]).strip("()'\"") == "1"
+    assert "expires_at" in columns
+    assert legacy.revision == 1
+    assert legacy.expires_at is None
+    assert inserted_revision == 1
+    assert indexes["ix_notifications_user_task_status"]["column_names"] == [
+        "user_email",
+        "task_id",
+        "status",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_adds_live_work_projection_tables_idempotently(tmp_path: Path) -> None:
     database_path = tmp_path / "work_scope_bootstrap.db"
     alembic_config = Config("cognis/store/migrations/alembic.ini")
     alembic_config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
@@ -171,21 +306,20 @@ async def test_bootstrap_adds_work_scope_revision_tables_idempotently(tmp_path: 
             tables = await conn.run_sync(
                 lambda sync_conn: set(inspect(sync_conn).get_table_names())
             )
-            stream_indexes = await conn.run_sync(
-                lambda sync_conn: {
-                    index["name"] for index in inspect(sync_conn).get_indexes("work_scope_streams")
-                }
-            )
             session_indexes = await conn.run_sync(
                 lambda sync_conn: {
                     index["name"] for index in inspect(sync_conn).get_indexes("sessions")
                 }
             )
-        assert {"work_scope_states", "work_scope_streams"} <= tables
         assert {
-            "ix_work_scope_streams_event_stream",
-            "ix_work_scope_streams_session",
-        } <= stream_indexes
+            "work_live_revisions",
+            "work_session_projections",
+            "work_records",
+            "work_record_files",
+            "work_current_files",
+        } <= tables
+        assert "work_scope_states" not in tables
+        assert "work_scope_streams" not in tables
         assert {
             "ix_sessions_owner_parent_session",
             "ix_sessions_owner_previous_session",
@@ -233,18 +367,20 @@ async def test_bootstrap_backfills_existing_legacy_management_skill(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("skill_id", ["cognis-coding", "cognis-agent-manager"])
 async def test_system_skill_seed_publishes_changed_builtin_as_current_version(
     tmp_path: Path,
+    skill_id: str,
 ) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'system-skill-upgrade.db'}")
     await run_schema_bootstrap(engine)
     factory = create_session_factory(engine)
-    defaults = get_system_skill_default("cognis-coding")
+    defaults = get_system_skill_default(skill_id)
     assert defaults is not None
 
     async with factory() as session:
         await seed_builtin_management_skills(session)
-        skill = await get_skill(session, "cognis-coding")
+        skill = await get_skill(session, skill_id)
         assert skill is not None
         old_version = await create_skill_version(
             session,
@@ -268,7 +404,7 @@ async def test_system_skill_seed_publishes_changed_builtin_as_current_version(
     async with factory() as session:
         await seed_builtin_management_skills(session)
         await session.commit()
-        upgraded = await get_skill(session, "cognis-coding")
+        upgraded = await get_skill(session, skill_id)
         assert upgraded is not None
         assert upgraded.current_version_id != old_version.version_id
         current = await get_skill_version(session, upgraded.current_version_id)
@@ -276,11 +412,19 @@ async def test_system_skill_seed_publishes_changed_builtin_as_current_version(
     assert upgraded.instructions == defaults["instructions"]
     assert current is not None
     assert current.instructions == defaults["instructions"]
+    assert current.version_number == old_version.version_number + 1
+    if skill_id == "cognis-agent-manager":
+        assert (
+            "Self reads are allowed only within existing owner-authorized" in current.instructions
+        )
+        assert "For self mutations, use `manage_agents`." in current.instructions
+        assert "explicit user review" in current.instructions
+        assert "Never try to manage yourself" not in current.instructions
 
     async with factory() as session:
         await seed_builtin_management_skills(session)
         await session.commit()
-        unchanged = await get_skill(session, "cognis-coding")
+        unchanged = await get_skill(session, skill_id)
     assert unchanged is not None
     assert unchanged.current_version_id == upgraded.current_version_id
     await engine.dispose()
@@ -478,7 +622,7 @@ async def test_run_schema_bootstrap_upgrades_legacy_channel_delivery_outbox(
                 text(
                     "SELECT completed_chunk_count, projected_chunk_count, "
                     "projection_digest, inflight_chunk_index, inflight_idempotent, "
-                    "attachments_json "
+                    "attachments_json, route_released_at, route_release_audit "
                     "FROM channel_delivery_outbox WHERE delivery_id = 'cdel_legacy'"
                 )
             )
@@ -491,8 +635,10 @@ async def test_run_schema_bootstrap_upgrades_legacy_channel_delivery_outbox(
         "inflight_chunk_index",
         "inflight_idempotent",
         "attachments_json",
+        "route_released_at",
+        "route_release_audit",
     }.issubset(columns)
-    assert row == (0, None, None, None, None, None)
+    assert row == (0, None, None, None, None, None, None, None)
     await engine.dispose()
 
 

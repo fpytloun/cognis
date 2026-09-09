@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -26,7 +27,8 @@ from cognis.models.session import (
     SessionModel,
     SessionTransition,
 )
-from cognis.models.workflow import StepDefinition
+from cognis.models.tool import ToolCall, ToolResult
+from cognis.models.workflow import StepDefinition, StepOutput
 from cognis.store import queries
 
 # ---------------------------------------------------------------------------
@@ -93,6 +95,11 @@ class _FakeCompactionStrategy:
 class _FakeGuardrails:
     async def record_events(self, *, session_id: str, events: list, **_: Any) -> Any:
         return type("AppendResult", (), {"ok": True, "first_seq": 1, "last_seq": len(events)})()
+
+
+class _RejectedGuardrails:
+    async def record_events(self, *, session_id: str, events: list, **_: Any) -> Any:
+        return type("AppendResult", (), {"ok": False, "first_seq": 0, "last_seq": 0})()
 
 
 class _FakeLLM:
@@ -288,10 +295,15 @@ def _minimal_agent_loop(
     session_cache: _FakeSessionCache | None = None,
     event_bus: EventBus | None = None,
     llm: _FakeLLM | None = None,
+    guardrails: Any | None = None,
 ) -> AgentLoop:
     """Create an AgentLoop with only the fields needed for _auto_compact."""
     loop = AgentLoop(
-        providers=type("P", (), {"llm": llm or _FakeLLM(), "guardrails": _FakeGuardrails()})(),
+        providers=type(
+            "P",
+            (),
+            {"llm": llm or _FakeLLM(), "guardrails": guardrails or _FakeGuardrails()},
+        )(),
         session_manager=session_manager or _FakeSessionManager(),
         session_cache=session_cache or _FakeSessionCache(),
         context_assembler=None,
@@ -303,6 +315,38 @@ def _minimal_agent_loop(
         pause_waiter=PauseWaiter(),
     )
     return loop
+
+
+@pytest.mark.asyncio
+async def test_rejected_terminal_compaction_append_is_not_published() -> None:
+    compaction = _FakeCompactionStrategy(
+        result=CompactionResult(compacted=False, method="no_compactable_history")
+    )
+    cache = _FakeSessionCache(entry=_cache_entry_with_events(5))
+    published: list[Event] = []
+    bus = EventBus()
+
+    async def capture(event: Event) -> None:
+        published.append(event)
+
+    bus.subscribe_all(capture)
+    loop = _minimal_agent_loop(
+        compaction=compaction,
+        session_cache=cache,
+        event_bus=bus,
+        guardrails=_RejectedGuardrails(),
+    )
+
+    with pytest.raises(RuntimeError, match="rejected compaction event"):
+        await loop._auto_compact(  # noqa: SLF001
+            _step_context(),
+            run=CompactionRunContext(
+                trigger="pre_turn_auto",
+                reason="context_compaction_threshold",
+            ),
+        )
+
+    assert [event.type for event in published] == [EventType.SESSION_COMPACTION_STARTED]
 
 
 def _step_context(session: SessionModel | None = None) -> StepContext:
@@ -441,6 +485,89 @@ async def test_stale_rotated_session_stops_before_step_continuation(
 
 
 @pytest.mark.asyncio
+async def test_terminal_child_session_stops_before_step_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loop = _minimal_agent_loop()
+    ctx = _step_context()
+    ctx.session.parent_session_id = "parent-session"
+    ctx.turn_id = "turn-child"
+
+    async def fake_get_conversation(db_session: object, conversation_id: str) -> Any:
+        del db_session, conversation_id
+        return type("ConversationRow", (), {"active_session_id": "root-session"})()
+
+    async def fake_get_session_row(db_session: object, session_id: str) -> Any:
+        del db_session, session_id
+        return type(
+            "SessionRow",
+            (),
+            {"status": "terminated", "completion_reason": None},
+        )()
+
+    monkeypatch.setattr(queries, "get_conversation", fake_get_conversation)
+    monkeypatch.setattr(queries, "get_session_row", fake_get_session_row)
+
+    result = await loop._stale_session_step_output(
+        ctx,
+        phase="before_assistant_or_tool_dispatch",
+    )
+
+    assert result is not None
+    assert result.metadata["continuation_reason"] == "session_terminal"
+    assert result.metadata["session_status"] == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_intaris_terminated_result_marks_cognis_session_terminated() -> None:
+    loop = _minimal_agent_loop()
+    ctx = _step_context()
+    loop.session_manager.mark_terminated = AsyncMock(return_value=True)
+    result = ToolResult(
+        output="Session is terminated",
+        is_error=True,
+        metadata={
+            "evaluation": {
+                "session_status": "terminated",
+                "status_reason": "safety hard kill",
+            }
+        },
+    )
+
+    await loop._sync_guardrails_terminal_result(ctx, result)
+
+    loop.session_manager.mark_terminated.assert_awaited_once_with(
+        ctx.session.session_id,
+        reason="safety hard kill",
+    )
+    assert ctx.session.status == "terminated"
+
+
+@pytest.mark.asyncio
+async def test_terminal_session_is_blocked_at_each_tool_dispatch() -> None:
+    loop = _minimal_agent_loop()
+    ctx = _step_context()
+    loop._stale_session_step_output = AsyncMock(
+        return_value=StepOutput(
+            summary="Session is terminal.",
+            metadata={
+                "continuation_reason": "session_terminal",
+                "session_status": "terminated",
+            },
+        )
+    )
+
+    result = await loop.execute_controller_tool(
+        ctx,
+        ToolCall(call_id="call-after-terminal", name="bash", arguments={"command": "pwd"}),
+    )
+
+    assert result.is_error is True
+    assert result.metadata["code"] == "session_not_continuable"
+    assert result.metadata["session_status"] == "terminated"
+
+
+@pytest.mark.asyncio
 async def test_auto_compact_resolves_model_context_before_cycle_model_call() -> None:
     """Pre-turn auto-compaction has a concrete model for same-session routing."""
 
@@ -483,6 +610,38 @@ async def test_auto_compact_skips_when_few_events() -> None:
     # Compaction should not be called
     assert result is None
     assert len(compaction.calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_compact_does_not_skip_large_tool_heavy_single_turn() -> None:
+    compaction = _FakeCompactionStrategy()
+    compaction.preserve_turns = 5
+    entry = _cache_entry_with_events(1)
+    next_seq = entry.events[-1].seq + 1
+    for index in range(60):
+        call_id = f"call-{index}"
+        entry.events.extend(
+            [
+                CachedEvent(
+                    seq=next_seq + index * 2,
+                    type="tool_call",
+                    data={"call_id": call_id, "name": "read"},
+                ),
+                CachedEvent(
+                    seq=next_seq + index * 2 + 1,
+                    type="tool_result",
+                    data={"call_id": call_id, "name": "read", "result": "x"},
+                ),
+            ]
+        )
+    cache = _FakeSessionCache(entry=entry)
+    loop = _minimal_agent_loop(compaction=compaction, session_cache=cache)
+
+    result = await loop._auto_compact(_step_context())
+
+    assert result is not None
+    assert result.compacted
+    assert len(compaction.calls) == 1
 
 
 @pytest.mark.asyncio

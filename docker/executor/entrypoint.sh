@@ -5,12 +5,13 @@ DEFAULT_HOME=/home/cognis
 DEFAULT_USER=cognis
 DEFAULT_UID=1000
 DEFAULT_GID=1000
+RUNTIME_SUDOERS=/etc/sudoers.d/cognis-runtime
 
 export HOME="${HOME:-$DEFAULT_HOME}"
 export COGNIS_DATA_DIR="${COGNIS_DATA_DIR:-$HOME/.cognis}"
 export COGNIS_EXECUTOR_SHELL="${COGNIS_EXECUTOR_SHELL:-/bin/bash}"
 export SHELL="${SHELL:-/bin/bash}"
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/opt/cognis/bin:$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 if [[ "${1:-}" == -* ]]; then
   set -- cognis-executor "$@"
@@ -96,7 +97,7 @@ EOF
 # Cognis executor managed environment
 export COGNIS_DATA_DIR="${COGNIS_DATA_DIR:-$HOME/.cognis}"
 export COGNIS_EXECUTOR_SHELL="${COGNIS_EXECUTOR_SHELL:-/bin/bash}"
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/opt/cognis/bin:$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export SHELL="${SHELL:-/bin/bash}"
 if [ -d "$HOME/workspace" ]; then
   cd "$HOME/workspace" 2>/dev/null || true
@@ -124,7 +125,7 @@ load_local_compose_token() {
   fi
 
   deadline=$((SECONDS + wait_seconds))
-  while [[ SECONDS -lt deadline ]]; do
+  while ((SECONDS < deadline)); do
     if [[ -f "$token_file" ]]; then
       load_executor_env_file "$token_file"
       return 0
@@ -149,12 +150,57 @@ load_executor_env_file() {
   done < "$env_file"
 }
 
+configure_runtime_sudo() {
+  local enabled="${COGNIS_EXECUTOR_ENABLE_SUDO:-0}"
+  local sudoers_tmp
+
+  case "$enabled" in
+    0|"")
+      rm -f "$RUNTIME_SUDOERS"
+      return 0
+      ;;
+    1)
+      ;;
+    *)
+      echo "ERROR: COGNIS_EXECUTOR_ENABLE_SUDO must be 0 or 1." >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ "$(id -u)" != "0" ]]; then
+    cat >&2 <<'EOF'
+ERROR: Runtime sudo requires the container to start as root.
+
+Start the container with --user 0:0 and set COGNIS_EXECUTOR_ENABLE_SUDO=1.
+The entrypoint will configure sudo and then drop to the cognis user.
+EOF
+    exit 1
+  fi
+
+  sudoers_tmp="$(mktemp /etc/sudoers.d/.cognis-runtime.XXXXXX)"
+  cat > "$sudoers_tmp" <<'EOF'
+Defaults:cognis env_reset
+Defaults:cognis secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+cognis ALL=(ALL:ALL) NOPASSWD: ALL
+EOF
+  chown root:root "$sudoers_tmp"
+  chmod 0440 "$sudoers_tmp"
+  visudo -cf "$sudoers_tmp" >/dev/null
+  mv -f "$sudoers_tmp" "$RUNTIME_SUDOERS"
+}
+
 if [[ "$(id -u)" == "0" ]]; then
+  configure_runtime_sudo
   mkdir -p "$DEFAULT_HOME"
   if [[ "${COGNIS_SKIP_HOME_CHOWN:-}" != "1" ]]; then
     chown -R "$DEFAULT_UID:$DEFAULT_GID" "$DEFAULT_HOME" 2>/dev/null || true
   fi
-  exec gosu "$DEFAULT_USER" /usr/local/bin/cognis-executor-entrypoint "$@"
+  exec env -u COGNIS_EXECUTOR_ENABLE_SUDO \
+    gosu "$DEFAULT_USER" /usr/local/bin/cognis-executor-entrypoint "$@"
+fi
+
+if [[ "${COGNIS_EXECUTOR_ENABLE_SUDO:-0}" != "0" ]]; then
+  configure_runtime_sudo
 fi
 
 setup_nss_wrapper

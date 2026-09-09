@@ -90,7 +90,7 @@ def project_timeline(events: Iterable[NormalizedChatEvent]) -> TimelineProjectio
                 )
             )
             item = _unknown_notice(event)
-        _upsert_item(items_by_id, item)
+        _upsert_item(items_by_id, cast(TimelineItem, item))
 
     items = sorted(items_by_id.values(), key=lambda item: item.sort_key)
     return TimelineProjection(
@@ -203,12 +203,6 @@ def _project_event(
     if event.kind == "assistant_message":
         return _message_item(event, role="assistant")
     if event.kind == "system_message":
-        # Follow-up admission emits this notice live, before the controller turn
-        # starts. It is a transient turn-boundary signal, not conversation
-        # history. Keeping it in the canonical projection makes delayed
-        # backfills look like new work.
-        if event.data.get("kind") == "turn_initiated" and event.data.get("scope") == "turn":
-            return HIDDEN_EVENT
         return _message_item(event, role="system")
     if event.kind == "thinking":
         return _thinking_item(event)
@@ -350,6 +344,10 @@ def _tool_call_item(
 ) -> ToolCallTimelineItem:
     data = event.data
     call_id = _call_id(event)
+    tool_name = str(data.get("name") or data.get("tool_name") or "tool")
+    display_name = _str_or_none(data.get("visible_name") or data.get("display_name"))
+    if display_name == "call_tool" and tool_name != "call_tool":
+        display_name = None
     item_id = f"tool:{call_id}"
     existing = items_by_id.get(item_id)
     sidecar = evaluations_by_call_id.get(call_id)
@@ -366,8 +364,8 @@ def _tool_call_item(
         updated_at=event.timestamp,
         status=_status(data, default="running"),
         call_id=call_id,
-        tool_name=str(data.get("name") or data.get("tool_name") or "tool"),
-        display_name=_str_or_none(data.get("visible_name") or data.get("display_name")),
+        tool_name=tool_name,
+        display_name=display_name,
         turn_id=_str_or_none(data.get("turn_id")),
         assistant_phase_index=event.assistant_phase_index,
         turn_cycle_index=event.turn_cycle_index,
@@ -399,7 +397,10 @@ def _tool_result_item(
     sidecar = evaluations_by_call_id.get(call_id)
     _suppress_standalone_delegation_card(call_id, items_by_id, delegation_folds)
     is_error = bool(data.get("is_error", False))
-    status: TimelineItemStatus = "failed" if is_error else _status(data, default="complete")
+    explicit_status = _status(data, default="complete")
+    status: TimelineItemStatus = (
+        "denied" if explicit_status == "denied" else "failed" if is_error else explicit_status
+    )
     return ToolCallTimelineItem(
         id=item_id,
         sort_key=existing_tool.sort_key if existing_tool is not None else _sort_key(event),
@@ -886,10 +887,20 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
     # one card instead of rendering a duplicate.
     previous_session_id = _str_or_none(data.get("source_session_id")) or event.source_ref.session_id
     summary = str(data.get("summary") or "")
+    compaction_id = _str_or_none(data.get("compaction_id"))
     item_id = (
-        f"compaction:{previous_session_id}"
-        if previous_session_id
-        else f"compaction:{_fallback_id(event)}"
+        f"compaction:{compaction_id}"
+        if compaction_id
+        else (
+            f"compaction:{previous_session_id}"
+            if previous_session_id
+            else f"compaction:{_fallback_id(event)}"
+        )
+    )
+    raw_status = _str_or_none(data.get("status"))
+    status = cast(
+        Literal["compacted", "failed", "skipped"],
+        raw_status if raw_status in {"compacted", "failed", "skipped"} else "compacted",
     )
     turns_compacted = data.get("turns_compacted")
     return CompactionTimelineItem(
@@ -898,17 +909,20 @@ def _compaction_item(event: NormalizedChatEvent) -> CompactionTimelineItem | obj
         source_refs=[event.source_ref],
         created_at=event.timestamp,
         updated_at=event.timestamp,
-        status="compacted",
+        status=status,
         session_id=session_id,
         previous_session_id=previous_session_id,
-        summary_preview=summary[:500],
+        summary_preview=summary[:500]
+        or _str_or_none(data.get("fallback_reason"))
+        or _str_or_none(data.get("reason"))
+        or "",
         summary=summary,
         method=str(data.get("method") or "unknown"),
         turns_compacted=turns_compacted
         if isinstance(turns_compacted, int) and turns_compacted >= 0
         else 0,
         trigger=_str_or_none(data.get("trigger")),
-        reason=_str_or_none(data.get("reason")),
+        reason=_str_or_none(data.get("fallback_reason")) or _str_or_none(data.get("reason")),
         previous_usage_percentage=_float_or_none(data.get("previous_usage_percentage")),
         effective_usage_percentage=_float_or_none(data.get("effective_usage_percentage")),
         hard_pressure_exceeded=data.get("hard_pressure_exceeded") is True,
@@ -928,6 +942,7 @@ def _error_item(event: NormalizedChatEvent) -> ErrorTimelineItem:
         status="failed",
         title=str(data.get("title") or data.get("error") or "Error"),
         message=_str_or_none(data.get("message")),
+        error_detail=_str_or_none(data.get("error_detail")),
         error_code=_str_or_none(data.get("error_code") or data.get("code")),
         recoverable=bool(data.get("recoverable", False)),
     )
@@ -1126,7 +1141,7 @@ def _evaluation_payload(data: dict[str, Any]) -> dict[str, Any]:
 
 def _status(data: dict[str, Any], *, default: TimelineItemStatus) -> TimelineItemStatus:
     value = data.get("status")
-    if value in {"pending", "running", "waiting", "complete", "failed", "cancelled"}:
+    if value in {"pending", "running", "waiting", "complete", "failed", "cancelled", "denied"}:
         return cast(TimelineItemStatus, value)
     return default
 

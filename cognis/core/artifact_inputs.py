@@ -282,7 +282,7 @@ async def outbound_artifact_grant_is_valid(
     ):
         return False
     if scope == "conversation":
-        return artifact.conversation_id == accessor_id
+        return bool(artifact.conversation_id == accessor_id)
     if scope not in {"ancestor", "descendant"}:
         return False
     target_conversation_id = accessor_id if scope == "ancestor" else artifact.conversation_id

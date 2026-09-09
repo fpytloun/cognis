@@ -1,0 +1,159 @@
+{
+  "schema_version": 1,
+  "id": "research-answer",
+  "title": "Perplexity-style research answer",
+  "description": "A source-backed answer with direct recommendation, evidence cards, comparison table, and citations.",
+  "group": "research",
+  "sort_key": 100,
+  "content": "A source-backed AI market answer with evidence, sources, and a concise recommendation.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Research brief",
+      "subtitle": "A polished answer format for source-heavy research and synthesis tasks.",
+      "badges": [
+        "Source linked",
+        "Decision ready",
+        "5 min read"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Answer",
+        "title": "Managed, policy-driven agent tools beat naïve MCP for production workflows",
+        "subtitle": "The durable pattern is not “give the model every tool.” It is deferred access, scoped policies, audit trails, and app-owned UX for high-value outputs.",
+        "badges": [
+          "Recommendation",
+          "Architecture",
+          "Risk-aware"
+        ]
+      },
+      {
+        "type": "grid",
+        "blocks": [
+          {
+            "type": "metric",
+            "label": "Confidence",
+            "value": "High",
+            "delta": "4 independent signals",
+            "tone": "success"
+          },
+          {
+            "type": "metric",
+            "label": "Implementation risk",
+            "value": "Medium",
+            "delta": "Policy surface",
+            "tone": "warning"
+          },
+          {
+            "type": "metric",
+            "label": "Time to MVP",
+            "value": "2–3 weeks",
+            "delta": "Existing Cognis primitives",
+            "tone": "neutral"
+          }
+        ]
+      },
+      {
+        "type": "callout",
+        "tone": "success",
+        "title": "Bottom line",
+        "content": "Ship rich deliverables as **structured product surfaces**, not prettier Markdown. The data model should stay renderer-neutral, while the UI owns layout, hierarchy, and interactions."
+      },
+      {
+        "type": "markdown",
+        "content": "## Markdown fallback typography\n\nRich markdown blocks should remain as readable as normal assistant messages, including headings, emphasis, inline `code`, and forgiving table rendering.\n\n| Phase | Work | Branch/worktree | Parallel? |\n|---|---|--|\n| A | WS1 + WS2 (same files, one coherent change set) | fix/projection-critical-pressure | no — foundation |\n| B1 | WS3 (prefix stability) | feat/projection-prefix-stability on top of A | parallel with B2 |\n| B2 | WS4 (ingestion caps) | feat/presure-aware-ingestion on top of A | parallel with B1 |\n| C | WS5 synthetic long-turn suite + integration, merge B1/B2, full validation | integration worktree | after B |"
+      },
+      {
+        "type": "card_grid",
+        "blocks": [
+          {
+            "type": "card",
+            "eyebrow": "Why it works",
+            "title": "Structure survives replay",
+            "content": "The renderer can hydrate canonical content by deliverable ID, keeping refresh and raw/debug views stable even after tool outputs are compacted."
+          },
+          {
+            "type": "card",
+            "eyebrow": "Why Markdown loses",
+            "title": "No semantic layout",
+            "content": "A Markdown answer can imitate tables and headings, but cannot express metrics, source cards, charts, timelines, or full-view affordances reliably."
+          },
+          {
+            "type": "card",
+            "eyebrow": "Product implication",
+            "title": "Design for outcomes",
+            "content": "Research, incident reports, dashboards, and implementation plans should each have first-class blocks matching how users scan those artifacts."
+          }
+        ]
+      },
+      {
+        "type": "comparison_matrix",
+        "title": "Format comparison",
+        "columns": [
+          {
+            "key": "dimension",
+            "label": "Dimension"
+          },
+          {
+            "key": "markdown",
+            "label": "Markdown"
+          },
+          {
+            "key": "rich",
+            "label": "Rich deliverable"
+          }
+        ],
+        "rows": [
+          {
+            "dimension": "Decision summary",
+            "markdown": "Headings and bullets",
+            "rich": "Hero, callout, ranked cards"
+          },
+          {
+            "dimension": "Evidence",
+            "markdown": "Footnotes or links",
+            "rich": "Source cards and citations"
+          },
+          {
+            "dimension": "Status",
+            "markdown": "Plain text",
+            "rich": "Metrics, deltas, timelines"
+          },
+          {
+            "dimension": "Replay durability",
+            "markdown": "Transcript text",
+            "rich": "Canonical payload by deliverable ID"
+          }
+        ]
+      },
+      {
+        "type": "source_list",
+        "title": "Sources used"
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

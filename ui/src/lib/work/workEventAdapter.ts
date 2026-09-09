@@ -47,7 +47,10 @@ function toolCallStatus(status: WorkCommandEvent['status'] | WorkMutationEvent['
   return status === 'complete' ? 'completed' : status;
 }
 
-export function commandToToolCall(command: WorkCommandEvent): ToolCallTimelineItem {
+export function commandToToolCall(
+  command: WorkCommandEvent,
+  fallbackTimestamp: string | null = null,
+): ToolCallTimelineItem {
   return {
     id: command.id,
     kind: 'tool_call',
@@ -55,7 +58,7 @@ export function commandToToolCall(command: WorkCommandEvent): ToolCallTimelineIt
     toolName: command.tool_name || 'bash',
     displayToolName: command.display_name ?? 'Command',
     status: toolCallStatus(command.status),
-    timestamp: command.created_at ?? command.updated_at ?? null,
+    timestamp: command.created_at ?? command.updated_at ?? fallbackTimestamp,
     arguments: safeValue({
       ...(command.arguments ?? {}),
       command: command.command,

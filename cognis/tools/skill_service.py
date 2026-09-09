@@ -536,7 +536,7 @@ async def create_skill_version_with_assets(
             size_bytes=asset.size_bytes,
             content_type=asset.content_type,
         )
-    version_row._created_asset_object_keys = created_object_keys
+    setattr(version_row, "_created_asset_object_keys", created_object_keys)  # noqa: B010
     return version_row
 
 
@@ -546,7 +546,9 @@ async def cleanup_unpublished_skill_assets(
 ) -> None:
     """Delete blobs created for a version that failed optimistic publication."""
 
-    created_object_keys = getattr(version_row, "_created_asset_object_keys", set())
+    created_object_keys: set[tuple[str, str]] = getattr(
+        version_row, "_created_asset_object_keys", set()
+    )
     for raw in version_row.asset_manifest or []:
         asset = SkillAssetRef.model_validate(raw)
         object_key = (asset.artifact_namespace, asset.artifact_object_id)

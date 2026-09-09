@@ -1,0 +1,146 @@
+{
+  "schema_version": 1,
+  "id": "weekly-meal-plan",
+  "title": "Seven-day family meal plan",
+  "description": "A visual weekly meal plan fixture with household constraints, batch preparation, reuse, shopping, and safety notes.",
+  "group": "food",
+  "sort_key": 1510,
+  "content": "Seven-day family meal plan with recipe cards, a schedule, batch preparation, shopping checklist, and food safety notes.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Household plan",
+      "subtitle": "A practical seven-day plan with image-linked meals and one consolidated shop.",
+      "density": "comfortable",
+      "toc": false
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Weekly meal plan",
+        "title": "A calm week of shared dinners",
+        "subtitle": "Five cooked dinners, two flexible leftover nights, and one batch-prep window for a four-person household.",
+        "badges": ["4 people", "Vegetarian friendly", "Nut free", "One main shop"],
+        "media": {
+          "ref": "/fixtures/rich-scenarios/weekly-meal-plan/week-hero.svg",
+          "src": "/fixtures/rich-scenarios/weekly-meal-plan/week-hero.svg",
+          "alt": "Seven labeled day containers arranged around fresh vegetables on a kitchen table",
+          "credit": "Synthetic fixture illustration generated for Cognis visual QA"
+        }
+      },
+      {
+        "type": "grid",
+        "columns": 4,
+        "blocks": [
+          {"type": "metric", "label": "Estimated food cost", "value": "€78", "icon": "wallet"},
+          {"type": "metric", "label": "Weeknight cook time", "value": "25–35 min", "icon": "clock"},
+          {"type": "metric", "label": "Vegetable servings", "value": "28", "icon": "leaf"},
+          {"type": "metric", "label": "Leftover dinners", "value": "2", "icon": "repeat"}
+        ]
+      },
+      {
+        "type": "callout",
+        "title": "Plan constraints",
+        "tone": "info",
+        "content": "Nut free. One adult eats vegetarian meals; poultry and fish stay optional. Keep Tuesday and Thursday under 35 minutes."
+      },
+      {
+        "type": "day_agenda",
+        "eyebrow": "Dinner rhythm",
+        "title": "Seven-day schedule",
+        "timezone": "Europe/Prague",
+        "items": [
+          {"start": "2026-09-07T18:00:00+02:00", "end": "2026-09-07T18:35:00+02:00", "title": "Lemon chickpea traybake", "description": "Make extra roast vegetables for Tuesday."},
+          {"start": "2026-09-08T18:00:00+02:00", "end": "2026-09-08T18:30:00+02:00", "title": "Vegetable fried rice", "description": "Use Monday's roasted vegetables."},
+          {"start": "2026-09-09T18:00:00+02:00", "end": "2026-09-09T18:35:00+02:00", "title": "Tomato lentil pasta", "description": "Cook double sauce for Thursday."},
+          {"start": "2026-09-10T18:00:00+02:00", "end": "2026-09-10T18:20:00+02:00", "title": "Pasta bake leftovers", "description": "Reheat Wednesday's reserved sauce."},
+          {"start": "2026-09-11T18:00:00+02:00", "end": "2026-09-11T18:30:00+02:00", "title": "Fish tacos or bean tacos", "description": "Choose the household protein at serving time."},
+          {"start": "2026-09-12T18:00:00+02:00", "end": "2026-09-12T18:25:00+02:00", "title": "Soup and focaccia", "description": "Use freezer bread and remaining greens."},
+          {"start": "2026-09-13T18:00:00+02:00", "end": "2026-09-13T18:15:00+02:00", "title": "Flexible leftovers", "description": "Finish safely chilled portions before cooking more."}
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Recipe cards",
+        "subtitle": "Each image belongs to the meal card it previews; no detached image gallery.",
+        "blocks": [
+          {
+            "type": "grid",
+            "columns": 3,
+            "blocks": [
+              {"type": "card", "variant": "visual", "eyebrow": "Monday", "title": "Lemon chickpea traybake", "summary": "Chickpeas, carrots, peppers, lemon, and yogurt. Reserve two cups of vegetables.", "media": {"ref": "/fixtures/rich-scenarios/weekly-meal-plan/traybake.svg", "src": "/fixtures/rich-scenarios/weekly-meal-plan/traybake.svg", "alt": "Lemon chickpea traybake with peppers and carrots", "credit": "Synthetic fixture illustration generated for Cognis visual QA"}},
+              {"type": "card", "variant": "visual", "eyebrow": "Wednesday", "title": "Tomato lentil pasta", "summary": "Red lentils make a fast sauce. Freeze half only after it has cooled.", "media": {"ref": "/fixtures/rich-scenarios/weekly-meal-plan/lentil-pasta.svg", "src": "/fixtures/rich-scenarios/weekly-meal-plan/lentil-pasta.svg", "alt": "Tomato lentil pasta with basil in a shallow bowl", "credit": "Synthetic fixture illustration generated for Cognis visual QA"}},
+              {"type": "card", "variant": "visual", "eyebrow": "Friday", "title": "Fish or bean tacos", "summary": "Serve flaky white fish and spiced beans separately for an easy vegetarian option.", "media": {"ref": "/fixtures/rich-scenarios/weekly-meal-plan/tacos.svg", "src": "/fixtures/rich-scenarios/weekly-meal-plan/tacos.svg", "alt": "Three tacos with cabbage, lime, beans, and fish options", "credit": "Synthetic fixture illustration generated for Cognis visual QA"}}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "steps",
+            "title": "Sunday batch prep",
+            "items": [
+              {"step": "1", "title": "Wash and cut", "content": "Wash produce. Cut carrots, peppers, onions, and cabbage. Store dry vegetables in sealed containers."},
+              {"step": "2", "title": "Cook the base", "content": "Cook rice and lentil sauce. Cool both in shallow containers before refrigeration."},
+              {"step": "3", "title": "Label the portions", "content": "Label Monday vegetables, Wednesday sauce, and Friday taco fillings with the planned day."}
+            ]
+          },
+          {
+            "type": "figure",
+            "ref": "/fixtures/rich-scenarios/weekly-meal-plan/batch-prep.svg",
+            "src": "/fixtures/rich-scenarios/weekly-meal-plan/batch-prep.svg",
+            "alt": "Labeled meal-prep containers with chopped vegetables, rice, and lentil sauce",
+            "caption": "One 75-minute batch session reduces work on the two shortest evenings.",
+            "credit": "Synthetic fixture illustration generated for Cognis visual QA"
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "section",
+            "title": "Reuse and leftovers",
+            "blocks": [
+              {"type": "table", "columns": ["Cook once", "Use again"], "rows": [
+                {"Cook once": "Roast vegetables on Monday", "Use again": "Fold into Tuesday fried rice"},
+                {"Cook once": "Lentil sauce on Wednesday", "Use again": "Bake with pasta on Thursday"},
+                {"Cook once": "Shredded cabbage", "Use again": "Tacos Friday and soup Saturday"}
+              ]},
+              {"type": "callout", "title": "Leftover rule", "tone": "warning", "content": "Plan the leftover dinner for Sunday. Refrigerate cooked food within two hours and use it within three days."}
+            ]
+          },
+          {
+            "type": "section",
+            "title": "Shopping checklist",
+            "blocks": [
+              {"type": "checklist", "title": "Produce", "checklist": [{"title": "Carrots, peppers, onions, cabbage", "done": false}, {"title": "Lemons, limes, basil, rosemary", "done": false}, {"title": "Salad greens and tomatoes", "done": false}]},
+              {"type": "checklist", "title": "Dry goods and chilled", "checklist": [{"title": "Chickpeas, red lentils, rice, pasta, tortillas", "done": false}, {"title": "Yogurt, cheese, eggs", "done": false}, {"title": "White fish or extra beans", "done": false}]}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Substitutions, allergens, and safety",
+        "blocks": [
+          {"type": "table", "title": "Simple substitutions", "columns": ["If unavailable", "Use"], "rows": [{"If unavailable": "White fish", "Use": "Black beans or tofu"}, {"If unavailable": "Dairy yogurt", "Use": "Unsweetened soy yogurt"}, {"If unavailable": "Wheat tortillas", "Use": "Corn tortillas"}]},
+          {"type": "callout", "title": "Allergen note", "tone": "warning", "content": "The plan contains wheat, dairy, egg, soy options, and fish on Friday. Keep fish utensils and cutting boards separate from vegetarian fillings."},
+          {"type": "callout", "title": "Food safety", "tone": "danger", "content": "Keep raw fish below ready-to-eat food in the refrigerator. Reheat leftovers until steaming hot, and do not reheat them more than once."}
+        ]
+      },
+      {
+        "type": "source_list",
+        "title": "Provenance"
+      }
+    ],
+    "sources": [
+      {"id": "meal-plan-fixture", "title": "Cognis weekly meal plan fixture", "publisher": "Cognis"},
+      {"id": "usda-food-safety", "title": "Food Safety Basics", "publisher": "USDA Food Safety and Inspection Service", "url": "https://www.fsis.usda.gov/food-safety/safe-food-handling-and-preparation/food-safety-basics"}
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

@@ -5,6 +5,16 @@
 @tailwind utilities;
 
 @layer utilities {
+  .touch-target-compact {
+    height: 44px;
+    width: 44px;
+  }
+  @media (min-width: 1024px) and (hover: hover) and (pointer: fine) {
+    .touch-target-compact {
+      height: 2rem;
+      width: 2rem;
+    }
+  }
   .scrollbar-hidden-x {
     overflow-x: auto;
     white-space: nowrap;
@@ -30,23 +40,23 @@
   color-scheme: dark;
   --app-viewport-height: 100dvh;
   --app-viewport-offset-top: 0px;
+  --app-visual-viewport-offset-top: 0px;
+  --app-safe-area-top: env(safe-area-inset-top, 0px);
   --app-bottom-inset: 0px;
   --app-bottom-chrome-bg: #07111a;
-  /*
-   * Phones already reserve the iOS home-indicator strip in standalone PWAs, so
-   * adding the safe-area inset again creates a visible bottom gap. Tablet PWAs
-   * opt back in below where their wider chrome needs explicit clearance.
-   */
-  --app-bottom-control-inset: 0px;
+  /* Browser/desktop fallback. Installed display modes override this below with
+     a larger optical gutter that keeps controls inside rounded screen edges. */
+  --app-bottom-comfort-inset: 0.5rem;
+  --app-bottom-control-inset: var(--app-bottom-comfort-inset);
   --app-shell-top-offset: 0px;
   --app-shell-bottom-offset: 0px;
   --app-overlay-gap: 0.75rem;
   --app-floating-overlay-top: calc(max(var(--app-shell-top-offset, 0px), env(safe-area-inset-top, 0px)) + var(--app-overlay-gap));
-  --app-floating-overlay-bottom: calc(max(var(--app-shell-bottom-offset, 0px), env(safe-area-inset-bottom, 0px)) + var(--app-overlay-gap));
+  --app-floating-overlay-bottom: calc(var(--app-shell-bottom-offset, 0px) + max(var(--app-overlay-gap), var(--app-bottom-control-inset)));
   --app-floating-overlay-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
   --app-floating-overlay-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
   --app-overlay-inner-top: calc(var(--app-overlay-gap) + max(0px, calc(env(safe-area-inset-top, 0px) - var(--app-shell-top-offset, 0px))));
-  --app-overlay-inner-bottom: calc(var(--app-overlay-gap) + max(0px, calc(env(safe-area-inset-bottom, 0px) - var(--app-shell-bottom-offset, 0px))));
+  --app-overlay-inner-bottom: max(var(--app-overlay-gap), var(--app-bottom-control-inset));
   --app-overlay-inner-left: max(var(--app-overlay-gap), env(safe-area-inset-left, 0px));
   --app-overlay-inner-right: max(var(--app-overlay-gap), env(safe-area-inset-right, 0px));
   --theme-void: #020617;
@@ -58,10 +68,26 @@
   --theme-accent-soft: #06b6d4;
 }
 
-@media (pointer: coarse) and (min-width: 768px) and (min-height: 768px) {
+@media (display-mode: standalone), (display-mode: fullscreen) {
   :root {
-    --app-bottom-control-inset: env(safe-area-inset-bottom, 0px);
+    /* Browsers expose no physical corner-radius environment variable. Use the
+       larger of Cognis's optical minimum and the UA-reported safe boundary. */
+    --app-bottom-comfort-inset: max(
+      1.25rem,
+      env(safe-area-inset-bottom, 0px),
+      env(safe-area-max-inset-bottom, 0px)
+    );
   }
+}
+
+:root[data-standalone-pwa='true'] {
+  /* Older iOS releases expose installed mode only through
+     navigator.standalone. The viewport store mirrors that signal here. */
+  --app-bottom-comfort-inset: max(
+    1.25rem,
+    env(safe-area-inset-bottom, 0px),
+    env(safe-area-max-inset-bottom, 0px)
+  );
 }
 
 html {
@@ -103,13 +129,19 @@ html {
 html,
 body,
 #svelte {
-  height: 100%;
+  height: 100vh;
+}
+
+.app-viewport-frame {
+  top: var(--app-viewport-offset-top, 0px);
+  bottom: 0;
 }
 
 /*
  * Lock the root scroll container. The app shell is a `position: fixed`
- * element sized to the visualViewport via `--app-viewport-height` (see
- * `lib/stores/viewport.ts`). If `<body>` is allowed to scroll, iOS will
+ * frame anchored to the fixed viewport edges. Keyboard geometry is reserved
+ * only inside `.app-keyboard-avoiding-chat`; headers and navigation never
+ * inherit the visual viewport height. If `<body>` is allowed to scroll, iOS will
  * auto-scroll the page on input focus to keep the caret visible, which
  * exposes the body background below the shell and produces a growing
  * gap above the keyboard. Pinning the body removes that scroll surface
@@ -125,6 +157,19 @@ body {
   background: var(--app-bottom-chrome-bg);
   overflow: hidden;
   overscroll-behavior: none;
+}
+
+.app-keyboard-avoiding-chat {
+  box-sizing: border-box;
+}
+
+:root[data-keyboard='open'] .app-keyboard-stable-header {
+  transform: translate3d(0, var(--app-visual-viewport-offset-top, 0px), 0);
+  will-change: transform;
+}
+
+:root[data-keyboard='open'] .app-keyboard-avoiding-chat {
+  padding-bottom: var(--app-local-keyboard-occlusion, 0px);
 }
 
 .skip-link {
@@ -579,6 +624,75 @@ textarea:focus-visible,
   touch-action: pan-y;
 }
 
+/*
+ * Tablet and desktop surfaces protect the Apple status area while painting
+ * through the advisory bottom safe area.
+ */
+@media (min-width: 1024px) {
+  .app-shell-safe-block {
+    padding-top: max(0.75rem, var(--app-safe-area-top));
+    padding-bottom: 0;
+  }
+
+  .app-chat-shell-safe {
+    padding-top: max(0.75rem, var(--app-safe-area-top));
+  }
+}
+
+@media (max-width: 1023px) {
+  .app-chat-mobile-safe-top {
+    padding-top: 0;
+  }
+}
+
+/*
+ * iPad keeps desktop information architecture, but uses compact vertical
+ * chrome and touch-sized separators. any-pointer keeps this behavior when a
+ * trackpad is attached and touch remains available.
+ */
+@media (min-width: 1024px) and (any-pointer: coarse) {
+  .chat-header-shell {
+    padding-top: 0.25rem !important;
+    padding-right: max(0.75rem, env(safe-area-inset-right, 0px)) !important;
+    padding-bottom: 0.25rem !important;
+    padding-left: max(0.75rem, env(safe-area-inset-left, 0px)) !important;
+  }
+
+  .chat-header-meta {
+    display: none !important;
+  }
+
+  .chat-header-shell .touch-target-compact {
+    width: 36px;
+    min-width: 36px;
+    height: 36px;
+    min-height: 36px;
+  }
+}
+
+.chat-header-shell {
+  background: #020617;
+}
+
+@media (any-pointer: coarse) {
+  .touch-resize-handle {
+    width: 44px !important;
+  }
+
+  .touch-resize-handle--left {
+    left: -22px !important;
+  }
+
+  .touch-resize-handle--right {
+    right: -22px !important;
+  }
+
+  .touch-corner-resize {
+    width: 44px !important;
+    height: 44px !important;
+  }
+}
+
 @media (hover: hover) and (pointer: fine) {
   .app-shell-viewport {
     background-attachment: fixed;
@@ -589,8 +703,8 @@ textarea:focus-visible,
   min-height: var(--app-viewport-height, 100dvh);
   padding-left: max(1.5rem, env(safe-area-inset-left, 0px));
   padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
-  padding-top: max(1.5rem, calc(env(safe-area-inset-top, 0px) + 0.75rem));
-  padding-bottom: max(1.5rem, calc(env(safe-area-inset-bottom, 0px) + 0.75rem));
+  padding-top: max(1.5rem, calc(var(--app-safe-area-top) + 0.75rem));
+  padding-bottom: 1.5rem;
   background: #07111a;
 }
 

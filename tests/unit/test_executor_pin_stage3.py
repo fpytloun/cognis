@@ -61,7 +61,9 @@ class _Session:
 
 
 @pytest.mark.asyncio
-async def test_selector_failover_has_one_cas_winner(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_selector_pin_never_fails_over_during_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from cognis.store import queries
 
     calls = 0
@@ -92,8 +94,9 @@ async def test_selector_failover_has_one_cas_winner(monkeypatch: pytest.MonkeyPa
         ensure_active_executor_pin(**kwargs),
         ensure_active_executor_pin(**kwargs),
     )
-    assert calls == 2
-    assert {result.active_executor_id for result in results} == {"old", "new"}
+    assert calls == 0
+    assert {result.active_executor_id for result in results} == {"old"}
+    assert all(result.transient_unavailable for result in results)
 
 
 @pytest.mark.asyncio
@@ -164,11 +167,12 @@ async def test_explicit_primary_and_additional_are_not_selector_failover_targets
         ws_provider=_Provider({"additional": False, "primary": True}),
         retry_seconds=0,
     )
-    assert result.active_executor_id == "primary"
+    assert result.active_executor_id == "additional"
+    assert result.transient_unavailable is True
 
 
 @pytest.mark.asyncio
-async def test_connected_expired_additional_bypasses_reconnect_grace(
+async def test_connected_expired_additional_returns_future_work_to_primary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.store import queries
@@ -209,11 +213,12 @@ async def test_connected_expired_additional_bypasses_reconnect_grace(
         retry_seconds=30,
     )
     assert result.active_executor_id == "b-connected"
+    assert result.transient_unavailable is False
     assert reasons == ["secondary assignment expired"]
 
 
 @pytest.mark.asyncio
-async def test_transport_disconnect_reason_is_factual(
+async def test_transport_disconnect_preserves_selected_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.store import queries
@@ -238,12 +243,13 @@ async def test_transport_disconnect_reason_is_factual(
         ws_provider=_Provider({"old": False, "new": True}),
         retry_seconds=0,
     )
-    assert result.active_executor_id == "new"
-    assert reasons == ["executor transport disconnected or not ready"]
+    assert result.active_executor_id == "old"
+    assert result.transient_unavailable is True
+    assert reasons == []
 
 
 @pytest.mark.asyncio
-async def test_failover_skips_unready_replacement(
+async def test_ready_replacement_is_not_used_during_recovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.store import queries
@@ -281,12 +287,13 @@ async def test_failover_skips_unready_replacement(
         ),
         retry_seconds=0,
     )
-    assert result.active_executor_id == "b-connected"
-    assert destinations == ["b-connected"]
+    assert result.active_executor_id == "old"
+    assert result.transient_unavailable is True
+    assert destinations == []
 
 
 @pytest.mark.asyncio
-async def test_missing_selector_observation_grace_reconnect_and_failover(
+async def test_missing_selector_waits_for_same_executor_until_reconnect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.store import queries
@@ -327,7 +334,8 @@ async def test_missing_selector_observation_grace_reconnect_and_failover(
     )
     first = await ensure_active_executor_pin(**common, now=base)
     assert first.active_executor_id == "missing"
-    assert marks == [base]
+    assert first.transient_unavailable is True
+    assert marks == []
     before_grace = await ensure_active_executor_pin(
         **common, active_executor_unavailable_since=base, now=base + timedelta(seconds=5)
     )
@@ -347,9 +355,9 @@ async def test_missing_selector_observation_grace_reconnect_and_failover(
     failed = await ensure_active_executor_pin(
         **common, active_executor_unavailable_since=base, now=base + timedelta(seconds=16)
     )
-    assert failed.active_executor_id == "replacement"
-    assert cas_args[0]["reason"] == "executor is missing from the current assigned pool"
-    assert cas_args[0]["failover_source"] == "selector_primary"
+    assert failed.active_executor_id == "missing"
+    assert failed.transient_unavailable is True
+    assert cas_args == []
 
 
 @pytest.mark.asyncio
@@ -438,7 +446,7 @@ async def test_missing_legacy_selector_does_not_fail_over_after_binding_becomes_
 
 
 @pytest.mark.asyncio
-async def test_missing_additional_uses_grace_unless_expired_or_unbounded(
+async def test_missing_additional_recovers_only_until_assignment_expires(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from cognis.store import queries
@@ -478,7 +486,8 @@ async def test_missing_additional_uses_grace_unless_expired_or_unbounded(
         now=base,
     )
     assert unexpired.active_executor_id == "missing-additional"
-    assert marks == 1
+    assert unexpired.transient_unavailable is True
+    assert marks == 0
     grace = await ensure_active_executor_pin(
         **common,
         active_executor_expires_at=base + timedelta(seconds=60),
@@ -486,6 +495,14 @@ async def test_missing_additional_uses_grace_unless_expired_or_unbounded(
         now=base + timedelta(seconds=5),
     )
     assert grace.active_executor_id == "missing-additional"
+    expired_recovering = await ensure_active_executor_pin(
+        **common,
+        active_executor_expires_at=base - timedelta(seconds=1),
+        active_executor_unavailable_since=base,
+        now=base + timedelta(seconds=5),
+    )
+    assert expired_recovering.active_executor_id == "missing-additional"
+    assert expired_recovering.transient_unavailable is True
     expired = await ensure_active_executor_pin(
         **common,
         active_executor_expires_at=base - timedelta(seconds=1),
@@ -500,4 +517,6 @@ async def test_missing_additional_uses_grace_unless_expired_or_unbounded(
     )
     assert expired.active_executor_id == "ready-primary"
     assert unbounded.active_executor_id == "ready-primary"
+    assert expired.transient_unavailable is False
+    assert unbounded.transient_unavailable is False
     assert destinations == ["ready-primary", "ready-primary"]

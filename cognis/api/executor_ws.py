@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -11,18 +12,23 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from cognis.api.executor_runtime import (
+    persist_executor_call_snapshot,
     persist_executor_resource_snapshot,
     reconcile_executor,
+    schedule_mcp_credential_reload,
 )
+from cognis.api.mcp_policy import invalid_mcp_config_reason
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.logging import get_logger
+from cognis.models.executor_calls import normalize_executor_call_snapshot
 from cognis.models.executor_resources import (
     ExecutorResourceSnapshot,
     normalize_executor_resource_snapshot,
 )
+from cognis.models.runtime_capabilities import normalize_runtime_capability_report
 from cognis.models.tool import (
     MCP_SERVER_IDS_KEY,
     ExecutorCapabilities,
@@ -37,11 +43,26 @@ from cognis.store.queries import (
     get_mcp_server,
     get_setting_value,
 )
-from cognis.tools.mcp import invalid_mcp_config_reason
 
 _logger = get_logger(__name__)
 
 _AUTH_TIMEOUT_SECONDS = 30
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedExecutor:
+    claims: dict[str, Any]
+    row: Any
+    token_version: int
+
+
+class _ExecutorValidationError(Exception):
+    def __init__(self, code: int, message: str, close_code: int, close_reason: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.close_code = close_code
+        self.close_reason = close_reason
 
 
 def _coerce_positive_int(value: Any, default: int) -> int:
@@ -93,55 +114,46 @@ async def handle_executor_websocket(
     method = first_msg.get("method")
     params = first_msg.get("params", {})
     msg_id = first_msg.get("id")
+    if not isinstance(params, dict):
+        params = {}
     token = params.get("token")
-    if method != "executor.ready" or not token:
+    if method not in {"executor.ready", "executor.probe"} or not token:
         await _close_ws(ws, 4400, "First message must be executor.ready with token")
         return
 
-    try:
-        claims = providers.auth.verify_executor_token(token)
-    except Exception:
-        await _send_error(ws, msg_id, -32000, "Authentication failed")
-        await _close_ws(ws, 4401, "Invalid token")
-        return
-
-    executor_id = str(claims.get("sub", "")).strip()
-    if not executor_id:
-        await _send_error(ws, msg_id, -32000, "Executor token is missing subject")
-        await _close_ws(ws, 4401, "Invalid token")
-        return
-
     policy = await load_executor_policy(session_factory)
+    try:
+        validated = await _validate_executor_authentication(
+            session_factory,
+            providers,
+            token,
+            policy,
+            allow_legacy_expired=method == "executor.ready",
+        )
+    except _ExecutorValidationError as exc:
+        await _send_error(ws, msg_id, exc.code, exc.message)
+        await _close_ws(ws, exc.close_code, exc.close_reason)
+        return
+
+    if method == "executor.probe":
+        await ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "result": {
+                    "status": "authenticated",
+                    "executor_id": str(validated.row.executor_id),
+                },
+                "id": msg_id,
+            }
+        )
+        await _close_ws(ws, 1000, "Probe complete")
+        return
+
+    row = validated.row
+    executor_id = str(row.executor_id)
+    token_version = validated.token_version
     ownership: ExecutorConnectionOwnership = ws.app.state.executor_connection_ownership
     async with executor_token_lock(executor_id):
-        async with session_factory() as session:
-            row = await get_executor_row(session, executor_id)
-        if row is None:
-            await _send_error(ws, msg_id, -32004, "Executor not found")
-            await _close_ws(ws, 4404, "Executor not found")
-            return
-
-        if row.executor_type != "websocket" and _executor_token_expired(claims):
-            await _send_error(ws, msg_id, -32000, "Authentication failed")
-            await _close_ws(ws, 4401, "Invalid token")
-            return
-
-        token_version = _executor_token_version(claims)
-        expected_token_version = int(getattr(row, "token_version", 0) or 0)
-        if token_version != expected_token_version:
-            await _send_error(ws, msg_id, -32000, "Executor token has been revoked")
-            await _close_ws(ws, 4401, "Invalid token")
-            return
-
-        if row.status != "active":
-            await _send_error(ws, msg_id, -32005, "Executor is inactive")
-            await _close_ws(ws, 4403, "Executor inactive")
-            return
-        if not is_executor_type_allowed(row.executor_type, policy):
-            await _send_error(ws, msg_id, -32006, "Executor type is disabled by policy")
-            await _close_ws(ws, 4403, "Executor type disabled")
-            return
-
         try:
             connection_owner = await ownership.takeover_validated(
                 executor_id,
@@ -168,12 +180,15 @@ async def handle_executor_websocket(
             row.owner_email,
         )
         ready_snapshot = normalize_executor_resource_snapshot(params.get("resource_snapshot"))
+        ready_call_snapshot = normalize_executor_call_snapshot(params.get("call_snapshot"))
         ready_received_at = datetime.now(UTC)
         ready_runtime_metadata = _ready_runtime_metadata(
             row,
             environment=params.get("environment"),
             platform=params.get("platform"),
             resource_snapshot=ready_snapshot,
+            mcp_credential_revisions=params.get("mcp_credential_revisions"),
+            observed_capabilities=params.get("observed_capabilities"),
             received_at=ready_received_at,
         )
         conn = ws_provider.register_connection(
@@ -192,6 +207,10 @@ async def handle_executor_websocket(
                 owner_email=row.owner_email,
             ),
         )
+        if ready_call_snapshot is not None:
+            conn.executor_instance_id = ready_call_snapshot.executor_instance_id
+            ready_runtime_metadata["call_snapshot"] = ready_call_snapshot.model_dump(mode="json")
+            ready_runtime_metadata["call_snapshot_received_at"] = ready_received_at.isoformat()
 
         async def _heartbeat_received(received_at: datetime) -> bool:
             return bool(
@@ -242,6 +261,20 @@ async def handle_executor_websocket(
                 )
 
         conn.register_resource_snapshot_callback(_resource_snapshot_received)
+
+        async def _call_snapshot_received(
+            _owner: Any,
+            callback_executor_id: str,
+            payload: dict[str, Any],
+        ) -> None:
+            await persist_executor_call_snapshot(
+                ws.app,
+                callback_executor_id,
+                payload,
+                connection=conn,
+            )
+
+        conn.register_call_snapshot_callback(_call_snapshot_received)
         conn.start_receiver()
 
     # Acknowledge executor.ready before sending executor.configure.
@@ -260,15 +293,43 @@ async def handle_executor_websocket(
     # the DB may still show "active" with applied == desired, but the
     # freshly-reconnected executor has _configured=False and needs a full
     # configure handshake.
+    #
+    # Exception: an executor process that reports it is still configured at the
+    # controller's desired version can resume immediately. That keeps reconnects
+    # cheap on unstable links (mobile/NAT) instead of forcing a full
+    # reconfigure for every network blip.
+    resume_state = _fast_resume_runtime_state(params)
+    if resume_state is not None:
+        async with session_factory() as session:
+            current = await get_executor_row(session, executor_id)
+        desired_version = int(getattr(current, "desired_config_version", 0) or 0)
+        applied_version = int(getattr(current, "applied_config_version", 0) or 0)
+        reported_version = int(params.get("config_version") or 0)
+        # Resume only when the executor, the desired config and the persisted
+        # applied config all agree. Otherwise reconcile must run normally so a
+        # pending configuration change is still delivered.
+        if not (
+            desired_version >= 1
+            and reported_version == desired_version
+            and applied_version == desired_version
+        ):
+            resume_state = None
     async with session_factory() as session:
         await ownership.update_runtime_state(
             session,
             connection_owner,
-            runtime_state="offline",
+            runtime_state=resume_state or "offline",
             runtime_metadata=ready_runtime_metadata,
             last_observed_at=ready_received_at if ready_snapshot is not None else None,
         )
         await session.commit()
+    if resume_state is not None:
+        _logger.info(
+            "executor_ws: executor %s fast-resumed at config v%s (%s)",
+            executor_id,
+            params.get("config_version"),
+            resume_state,
+        )
 
     _logger.info("executor_ws: executor %s registered, starting reconcile", executor_id)
     try:
@@ -311,6 +372,15 @@ async def handle_executor_websocket(
         local_model_reconciler.trigger(executor_id=executor_id)
     if configure_ok and runtime_state in {"active", "degraded"}:
         ws_provider.schedule_browser_terminal_flush(executor_id)
+        configured_server_ids = (getattr(row, "config", None) or {}).get(MCP_SERVER_IDS_KEY, [])
+        if isinstance(configured_server_ids, list):
+            for configured_server_id in configured_server_ids:
+                if isinstance(configured_server_id, str) and configured_server_id:
+                    schedule_mcp_credential_reload(
+                        ws.app,
+                        executor_id,
+                        configured_server_id,
+                    )
 
     # Start any channel accounts assigned to this executor
     channel_manager = getattr(ws.app.state, "channel_manager", None)
@@ -387,15 +457,32 @@ async def handle_executor_websocket(
 
 
 async def _resolve_executor_mcp_payload(
-    row: Any, providers: Any
+    row: Any,
+    providers: Any,
+    *,
+    server_ids_override: list[str] | None = None,
 ) -> tuple[list[MCPServerConfig], dict[str, str], dict[str, Any]]:
-    server_ids = (row.config or {}).get(MCP_SERVER_IDS_KEY, [])
+    configured_server_ids = (row.config or {}).get(MCP_SERVER_IDS_KEY, [])
+    if not isinstance(configured_server_ids, list):
+        configured_server_ids = []
+    if server_ids_override is None:
+        server_ids = configured_server_ids
+    else:
+        configured = {
+            str(server_id)
+            for server_id in configured_server_ids
+            if isinstance(server_id, str) and server_id
+        }
+        server_ids = [
+            server_id for server_id in server_ids_override if str(server_id) in configured
+        ]
     if not isinstance(server_ids, list) or not server_ids:
         return [], {}, {}
 
     servers: list[MCPServerConfig] = []
     skipped_statuses: list[dict[str, Any]] = []
     warnings: list[str] = []
+    credential_revisions: dict[str, dict[str, str | int]] = {}
     secret_names: set[str] = set()
     async with providers._session_factory() as session:
         tool_timeout_raw = await get_setting_value(session, "mcp.tool_timeout_seconds", 300)
@@ -529,6 +616,11 @@ async def _resolve_executor_mcp_payload(
                     continue
                 headers = result.headers
                 auth_config = MCPAuthConfig(type="static_headers")
+                if result.token_id and result.token_version is not None:
+                    credential_revisions[str(server_id)] = {
+                        "token_id": result.token_id,
+                        "token_version": result.token_version,
+                    }
             servers.append(
                 MCPServerConfig(
                     name=mcp_row.name,
@@ -559,7 +651,79 @@ async def _resolve_executor_mcp_payload(
         metadata["mcp_servers"] = skipped_statuses
     if warnings:
         metadata["warnings"] = warnings
+    if credential_revisions:
+        metadata["mcp_credential_revisions"] = credential_revisions
     return servers, secrets, metadata
+
+
+async def _validate_executor_authentication(
+    session_factory: async_sessionmaker[Any],
+    providers: Any,
+    token: str,
+    policy: Any,
+    *,
+    allow_legacy_expired: bool,
+) -> _ValidatedExecutor:
+    """Authenticate a token and validate its executor without changing state."""
+
+    try:
+        claims = providers.auth.verify_executor_token(token)
+    except Exception as exc:
+        raise _ExecutorValidationError(
+            -32000,
+            "Authentication failed",
+            4401,
+            "Invalid token",
+        ) from exc
+    if not isinstance(claims, dict):
+        raise _ExecutorValidationError(-32000, "Authentication failed", 4401, "Invalid token")
+
+    executor_id = str(claims.get("sub", "")).strip()
+    if not executor_id:
+        raise _ExecutorValidationError(
+            -32000,
+            "Executor token is missing subject",
+            4401,
+            "Invalid token",
+        )
+
+    async with session_factory() as session:
+        row = await get_executor_row(session, executor_id)
+    if row is None:
+        raise _ExecutorValidationError(-32004, "Executor not found", 4404, "Executor not found")
+    if (
+        (not allow_legacy_expired or getattr(row, "executor_type", None) != "websocket")
+        and claims.get("exp") is not None
+        and _executor_token_expired(claims)
+    ):
+        raise _ExecutorValidationError(-32000, "Authentication failed", 4401, "Invalid token")
+    if getattr(row, "executor_type", None) != "websocket":
+        raise _ExecutorValidationError(
+            -32004,
+            "Executor is not a WebSocket executor",
+            4403,
+            "Executor unavailable",
+        )
+
+    token_version = _executor_token_version(claims)
+    expected_token_version = int(getattr(row, "token_version", 0) or 0)
+    if token_version != expected_token_version:
+        raise _ExecutorValidationError(
+            -32000,
+            "Executor token has been revoked",
+            4401,
+            "Invalid token",
+        )
+    if row.status != "active":
+        raise _ExecutorValidationError(-32005, "Executor is inactive", 4403, "Executor inactive")
+    if not is_executor_type_allowed(row.executor_type, policy):
+        raise _ExecutorValidationError(
+            -32006,
+            "Executor type is disabled by policy",
+            4403,
+            "Executor type disabled",
+        )
+    return _ValidatedExecutor(claims=claims, row=row, token_version=token_version)
 
 
 async def _close_ws(ws: WebSocket, code: int, reason: str) -> None:
@@ -580,6 +744,24 @@ def _executor_token_expired(claims: dict[str, Any]) -> bool:
     except (KeyError, TypeError, ValueError):
         return True
     return exp <= int(datetime.now(UTC).timestamp())
+
+
+def _fast_resume_runtime_state(params: dict[str, Any]) -> str | None:
+    """Return the resumable runtime state an executor reports, if trustworthy.
+
+    Only an executor process that is still configured may resume without a
+    fresh ``executor.configure``. The caller additionally verifies that the
+    reported config version matches the controller's desired version.
+    """
+
+    if params.get("configured") is not True:
+        return None
+    if int(params.get("config_version") or 0) < 1:
+        return None
+    runtime_state = params.get("runtime_state")
+    if runtime_state not in {"active", "degraded"}:
+        return None
+    return str(runtime_state)
 
 
 def _executor_connection_metadata(
@@ -614,6 +796,8 @@ def _ready_runtime_metadata(
     environment: Any,
     platform: Any,
     resource_snapshot: ExecutorResourceSnapshot | None,
+    mcp_credential_revisions: Any = None,
+    observed_capabilities: Any = None,
     received_at: datetime,
 ) -> dict[str, Any]:
     """Merge authenticated ready metadata without losing prior runtime state."""
@@ -643,6 +827,23 @@ def _ready_runtime_metadata(
                 exclude={"freshness"},
             )
             metadata["resource_snapshot_received_at"] = received_at.isoformat()
+    if isinstance(mcp_credential_revisions, dict):
+        metadata["mcp_credential_revisions"] = {
+            str(server_id): {
+                "token_id": str(revision.get("token_id") or ""),
+                "token_version": int(revision.get("token_version") or 0),
+            }
+            for server_id, revision in mcp_credential_revisions.items()
+            if isinstance(server_id, str) and isinstance(revision, dict)
+        }
+    if observed_capabilities is not None:
+        capability_report = normalize_runtime_capability_report(observed_capabilities)
+        if capability_report is None:
+            metadata.pop("observed_capabilities", None)
+            metadata["observed_capabilities_state"] = "unknown"
+        else:
+            metadata["observed_capabilities"] = capability_report.model_dump(mode="json")
+            metadata.pop("observed_capabilities_state", None)
     return metadata
 
 

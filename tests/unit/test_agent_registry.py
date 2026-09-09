@@ -84,7 +84,12 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
     assert "Do not nitpick style or architecture" in review.system_prompt
     assert "locked to the approved review scope" in review.system_prompt
     assert "concrete bug, regression, security" in review.system_prompt
+    assert "On repeated review, verify the previous findings" in review.system_prompt
+    assert "Do not repeat a full review unless" in review.system_prompt
+    assert "unresolved from the previous review" in review.system_prompt
     assert "### Must Fix" in review.system_prompt
+    assert "When reviewing an escalated implementation" in architect.system_prompt
+    assert "redo the whole plan" in architect.system_prompt
 
 
 def test_system_committer_allows_explicit_publish_only() -> None:

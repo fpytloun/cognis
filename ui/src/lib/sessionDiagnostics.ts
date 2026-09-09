@@ -7,6 +7,23 @@ export interface SessionDiagnostics {
   lastGeneration: GenerationPerformanceSnapshot | null;
 }
 
+export function mergeContextUsage(
+  current: ContextUsage | null,
+  incoming: ContextUsage | null,
+): ContextUsage | null {
+  if (!incoming) return current;
+  if (!current) return incoming;
+  const currentRevision = current.runtime_metadata_revision;
+  const incomingRevision = incoming.runtime_metadata_revision;
+  if (
+    currentRevision !== undefined
+    && (incomingRevision === undefined || incomingRevision < currentRevision)
+  ) {
+    return current;
+  }
+  return incoming;
+}
+
 export function diagnosticsForSession(
   sessionId: string | null,
   info: SessionInfoData | null,

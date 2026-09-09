@@ -627,10 +627,11 @@ async def test_two_task_authoritative_missing_selector_failovers_have_one_notice
         ensure_active_executor_pin(**kwargs),
     )
     assert [result.active_executor_id for result in results] == [
-        "replacement-sqlite",
-        "replacement-sqlite",
+        "missing-selector",
+        "missing-selector",
     ]
-    assert sum(result.notice is not None for result in results) == 1
+    assert all(result.transient_unavailable for result in results)
+    assert all(result.notice is None for result in results)
     async with factory() as session:
         task = await session.scalar(select(Task).where(Task.task_id == "unique-selector-task"))
         transitions = await session.scalar(
@@ -638,9 +639,9 @@ async def test_two_task_authoritative_missing_selector_failovers_have_one_notice
         )
         outbox = await session.scalar(select(func.count()).select_from(ExecutorPinNoticeOutboxRow))
         assert task is not None
-        assert task.active_executor_id == "replacement-sqlite"
-        assert task.active_executor_generation == 8
-        assert transitions == 1
-        assert outbox == 1
-    assert dispatcher.calls == 1
+        assert task.active_executor_id == "missing-selector"
+        assert task.active_executor_generation == 7
+        assert transitions == 0
+        assert outbox == 0
+    assert dispatcher.calls == 0
     await engine.dispose()

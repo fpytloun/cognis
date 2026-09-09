@@ -304,6 +304,19 @@ async def test_controller_directory_lifecycle_and_bootstrap_parity(tmp_path: Pat
     reachable = await directory.get_reachable(runtime.owner_id)
     assert reachable is not None
     assert reachable.lifecycle_state == "draining"
+    replacement_runtime = ControllerRuntime("controller-b", incarnation_id="boot-b")
+    replacement_directory = ControllerInstanceDirectory(
+        factory,
+        replacement_runtime,
+        internal_url="http://replacement",
+    )
+    await replacement_directory.start()
+    await replacement_directory.mark_ready()
+    replacement = await directory.get_ready_replacement(runtime.owner_id)
+    assert replacement is not None
+    assert replacement.owner_id == replacement_runtime.owner_id
+    assert replacement.internal_url == "http://replacement"
+    await replacement_directory.stop()
     await directory.stop()
     assert await directory.get_reachable(runtime.owner_id) is None
     async with factory() as session:

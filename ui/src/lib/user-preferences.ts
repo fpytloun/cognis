@@ -3,9 +3,11 @@ import type { UserPreferences } from '$lib/types/api';
 export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   display: {
     theme: 'system',
-    language: 'auto'
+    language: 'auto',
+    dashboard_workspace_windows: true
   },
   chat: {
+    enter_to_send: true,
     show_thinking_blocks: false,
     group_tool_calls: true,
     keep_assistant_messages_separate: false,
@@ -32,9 +34,15 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
   return {
     display: {
       theme,
-      language
+      language,
+      dashboard_workspace_windows: typeof display.dashboard_workspace_windows === 'boolean'
+        ? display.dashboard_workspace_windows
+        : DEFAULT_USER_PREFERENCES.display.dashboard_workspace_windows
     },
     chat: {
+      enter_to_send: typeof chat.enter_to_send === 'boolean'
+        ? chat.enter_to_send
+        : DEFAULT_USER_PREFERENCES.chat.enter_to_send,
       show_thinking_blocks: typeof chat.show_thinking_blocks === 'boolean'
         ? chat.show_thinking_blocks
         : DEFAULT_USER_PREFERENCES.chat.show_thinking_blocks,

@@ -11,7 +11,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import Connection, engine_from_config, pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from cognis.store.migrations.compat import normalize_legacy_profile_override_revision
@@ -67,9 +67,9 @@ async def run_migrations_online_async() -> None:
     await connectable.dispose()
 
 
-def _do_run_migrations(connection: object) -> None:
+def _do_run_migrations(connection: Connection) -> None:
     normalize_legacy_profile_override_revision(connection)
-    connection.commit()  # type: ignore[attr-defined]
+    connection.commit()
     context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
     with context.begin_transaction():
         context.run_migrations()

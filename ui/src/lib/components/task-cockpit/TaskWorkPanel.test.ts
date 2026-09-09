@@ -1,14 +1,32 @@
+// @ts-nocheck -- focused live lifecycle tests own lifecycle fixture validation.
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ActivityOverviewResponse, WorkProjectionResponse } from '$lib/chat-v2/types';
+import type {
+  ActivityOverviewResponse,
+  TimelineScope,
+  WorkProjectionResponse,
+} from '$lib/chat-v2/types';
+import { conversationTimelineScope } from '$lib/chat-v2/types';
 import type { StepRun } from '$lib/types/api';
 import TaskWorkPanel from './TaskWorkPanel.svelte';
-import { clearActivityOverview } from '$lib/activityOverviewCache';
-import { invalidateWorkScope } from '$lib/work/workViewState';
+import {
+  clearActivityOverview,
+  requestActivityOverview,
+  setActivityOverview,
+} from '$lib/activityOverviewCache';
+import {
+  clearWorkViewStates,
+  invalidateWorkFromSocket,
+  invalidateWorkScope,
+} from '$lib/work/workViewState';
 
 afterEach(cleanup);
-beforeEach(() => clearActivityOverview());
+beforeEach(() => {
+  clearActivityOverview();
+  clearWorkViewStates();
+  window.localStorage.clear();
+});
 
 const run = {
   step_run_id: 'run-1',
@@ -17,6 +35,17 @@ const run = {
   session_id: 'session-1',
   updated_at: '2026-01-01T00:00:00Z'
 } as StepRun;
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
+  return { promise, resolve };
+}
 
 function projection(changedFiles: number): WorkProjectionResponse {
   return {
@@ -43,7 +72,7 @@ function activityOverview(changedFiles: number): ActivityOverviewResponse {
   return {
     schema_version: 2, projection_version: 'test', scope: projection(changedFiles).scope,
     summary: { mutations: 2, commands: 3, changed_files: changedFiles, artifacts: 1 },
-    materialization: { state: 'caught_up', completed_streams: 1, total_streams: 1, covered_events: 1, target_events: 1, failed_streams: 0 },
+    materialization: { state: 'live' },
     recent: { commands: [{ id: 'recent-1', category: 'commands', session_id: 'session-1', occurred_at: '2026-01-01T00:00:00Z', title: 'Run tests' }] },
     recent_work: {
       commands: [{ id: 'command-1', call_id: 'call-1', sort_key: '1', command: 'npm test', description: 'Run tests', status: 'complete', preview: 'passed', preview_truncated: false, has_full_output: false }],
@@ -71,6 +100,8 @@ describe('TaskWorkPanel', () => {
     const loadOverview = vi.fn().mockResolvedValue(overview);
     render(TaskWorkPanel, { stepRuns: [run], loadWork: vi.fn().mockResolvedValue(projection(4)), loadOverview });
     await waitFor(() => expect(screen.getByTitle('npm test')).toBeTruthy());
+    await fireEvent.click(screen.getByRole('button', { name: 'Description' }));
+    expect(screen.getByTitle('Run tests')).toBeTruthy();
     expect(screen.getByText('Execution sessions')).toBeTruthy();
     expect(loadOverview).toHaveBeenCalledOnce();
   });
@@ -140,6 +171,113 @@ describe('TaskWorkPanel', () => {
     expect(loadOverview).toHaveBeenCalledTimes(2);
   });
 
+  it('reloads an exact-scope overview only for a strictly newer socket revision', async () => {
+    const scope = projection(4).scope;
+    setActivityOverview(scope, {
+      ...activityOverview(4),
+      work_revision: 7,
+    });
+    const loadOverview = vi.fn().mockResolvedValue({
+      ...activityOverview(8),
+      work_revision: 8,
+    });
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      loadWork: vi.fn().mockResolvedValue(projection(4)),
+      loadOverview,
+    });
+    await waitFor(() => expect(screen.getAllByText('4 files').length).toBeGreaterThan(0));
+
+    for (const revision of ['7', '6']) {
+      invalidateWorkFromSocket({
+        type: 'work_invalidated',
+        reason: 'work_invalidated',
+        revision,
+        work_scope_key: scope.key,
+      });
+      await Promise.resolve();
+    }
+    expect(loadOverview).not.toHaveBeenCalled();
+
+    invalidateWorkFromSocket({
+      type: 'work_invalidated',
+      reason: 'work_invalidated',
+      revision: '8',
+      work_scope_key: scope.key,
+    });
+    await waitFor(() => expect(loadOverview).toHaveBeenCalledOnce());
+  });
+
+  it('aborts an obsolete selected task-step request and starts the queued current scope', async () => {
+    const blockerReleases: Array<() => void> = [];
+    const blockers = Array.from({ length: 3 }, (_, index) => {
+      const blockerScope = conversationTimelineScope(`task-blocker-${index}`);
+      return requestActivityOverview(blockerScope, () => new Promise((resolve) => {
+        blockerReleases.push(() => resolve({
+          ...activityOverview(1),
+          scope: blockerScope,
+        }));
+      }));
+    });
+    const oldOverview = deferred<ActivityOverviewResponse>();
+    const currentOverview = deferred<ActivityOverviewResponse>();
+    const runTwo = {
+      ...run,
+      step_run_id: 'run-2',
+      step_name: 'review',
+      session_id: 'session-2',
+      updated_at: '2025-12-31T00:00:00Z',
+    } as StepRun;
+    const loadOverview = vi.fn((scope: TimelineScope) => (
+      scope.key === 'task_step:run-1'
+        ? oldOverview.promise
+        : currentOverview.promise
+    ));
+    const loadWork = vi.fn(async (scope: TimelineScope) => ({
+      ...projection(4),
+      scope,
+    }));
+    const rendered = render(TaskWorkPanel, {
+      stepRuns: [run, runTwo],
+      loadWork,
+      loadOverview,
+    });
+    await waitFor(() => expect(loadOverview).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'task_step:run-1' }),
+      expect.any(AbortSignal),
+    ));
+
+    await rendered.rerender({
+      stepRuns: [
+        run,
+        { ...runTwo, updated_at: '2026-01-02T00:00:00Z' },
+      ],
+      loadWork,
+      loadOverview,
+    });
+    await waitFor(() => expect(loadOverview).toHaveBeenCalledWith(
+      expect.objectContaining({ key: 'task_step:run-2' }),
+      expect.any(AbortSignal),
+    ));
+
+    currentOverview.resolve({
+      ...activityOverview(9),
+      scope: {
+        ...activityOverview(9).scope,
+        key: 'task_step:run-2',
+        step_run_id: 'run-2',
+        session_id: 'session-2',
+      },
+    });
+    await waitFor(() => expect(screen.getAllByText('9 files').length).toBeGreaterThan(0));
+    oldOverview.resolve(activityOverview(99));
+    await Promise.resolve();
+    expect(screen.queryByText('99 files')).not.toBeInTheDocument();
+
+    blockerReleases.forEach((release) => release());
+    await Promise.all(blockers);
+  });
+
   it('preserves the prior projection and offers retry after a refresh failure', async () => {
     const loadWork = vi.fn()
       .mockResolvedValueOnce(projection(4))
@@ -160,4 +298,126 @@ describe('TaskWorkPanel', () => {
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(3));
     expect(screen.getAllByText('4 files').length).toBeGreaterThan(0);
   });
+
+  it('loads the canonical task result through its authorized step-run accessor', async () => {
+    const work = projection(1);
+    work.final_deliverable = {
+      deliverable_id: 'deliverable-1',
+      format: 'markdown',
+      title: 'Canonical result',
+      content: '# Result',
+      render_metadata: {},
+      export_metadata: {},
+    };
+    const loadDeliverableForStepRun = vi.fn().mockResolvedValue({
+      deliverable_id: 'deliverable-1',
+      step_run_id: 'run-1',
+      version: 1,
+      attempt_number: 1,
+      content: '# Result\n\nLoaded through the step.',
+      format: 'markdown',
+      title: 'Canonical result',
+      target: 'none',
+      outputs: {},
+      status: 'ready',
+      evaluator_feedback: null,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    });
+
+    const loadOverview = vi.fn().mockResolvedValue(activityOverview(1));
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      canonicalDeliverableId: 'deliverable-1',
+      loadWork: vi.fn().mockResolvedValue(work),
+      loadOverview,
+      loadDeliverableForStepRun,
+      view: 'deliverable',
+    });
+
+    await waitFor(() => expect(loadDeliverableForStepRun).toHaveBeenCalledWith('run-1', 'deliverable-1'));
+    await screen.findByTestId('rich-deliverable');
+    expect(screen.getByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: 'Explore' })).toBeNull();
+    expect(loadOverview).not.toHaveBeenCalled();
+    expect(screen.queryByText('Loaded through the step.')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
+    expect(await screen.findByText('Loaded through the step.')).toBeInTheDocument();
+  });
+
+  it('auto-expands the canonical deliverable only when explicitly requested', async () => {
+    const work = projection(1);
+    work.final_deliverable = {
+      deliverable_id: 'deliverable-1',
+      format: 'markdown',
+      title: 'Canonical result',
+      content: '# Result',
+      render_metadata: {},
+      export_metadata: {},
+    };
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      canonicalDeliverableId: 'deliverable-1',
+      loadWork: vi.fn().mockResolvedValue(work),
+      loadDeliverableForStepRun: vi.fn().mockResolvedValue({
+        deliverable_id: 'deliverable-1',
+        step_run_id: 'run-1',
+        version: 1,
+        attempt_number: 1,
+        content: '# Result\n\nExpanded dashboard result.',
+        format: 'markdown',
+        title: 'Canonical result',
+        target: 'none',
+        outputs: {},
+        status: 'ready',
+        evaluator_feedback: null,
+        created_at: '2026-01-01T00:00:00Z',
+        updated_at: '2026-01-01T00:00:00Z',
+      }),
+      view: 'deliverable',
+      deliverableCollapsedByDefault: false,
+    });
+
+    expect(await screen.findByText('Expanded dashboard result.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Expand document' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
+  });
+
+  it('keeps final deliverables out of the activity-only task panel', async () => {
+    const work = projection(1);
+    work.final_deliverable = {
+      deliverable_id: 'deliverable-1',
+      format: 'markdown',
+      title: 'Canonical result',
+      content: '# Result',
+      render_metadata: {},
+      export_metadata: {},
+    };
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      canonicalDeliverableId: 'deliverable-1',
+      loadWork: vi.fn().mockResolvedValue(work),
+      loadOverview: vi.fn().mockResolvedValue(activityOverview(1)),
+      view: 'activity',
+    });
+
+    await waitFor(() => expect(screen.getByTestId('activity-summary-strip')).toBeInTheDocument());
+    expect(screen.queryByTestId('task-final-result')).toBeNull();
+  });
+
+  it('shows a retryable error when the deliverable projection fails', async () => {
+    const loadWork = vi.fn().mockRejectedValue(new Error('Projection unavailable'));
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      canonicalDeliverableId: 'deliverable-1',
+      loadWork,
+      view: 'deliverable',
+    });
+
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Projection unavailable'));
+    expect(screen.queryByTestId('task-final-result-empty')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(loadWork).toHaveBeenCalledTimes(2);
+  });
+
 });

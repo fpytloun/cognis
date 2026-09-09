@@ -3,11 +3,13 @@
   import { renderInlineMarkdown, renderMarkdown } from '$lib/markdown';
   import { portal } from '$lib/actions/portal';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
+  import { addToast } from '$lib/stores/toasts';
   import {
     blockTitle,
     normalizeRichDeliverable,
     privateDeliverableMediaUrl,
     resolveRichMedia,
+    richCanvas,
     richDensity,
     richPresentation,
     type RichMediaUrlFor,
@@ -23,6 +25,7 @@
   } from './publication';
   import { createPublicationContext } from './publication-context';
   import { allocateRichInstanceNamespace } from './instance-namespace';
+  import { namespaceMermaidSvg } from './namespace-svg';
 
   export let payload: unknown;
   export let content = '';
@@ -47,6 +50,11 @@
   $: metadata = normalized.metadata;
   $: presentation = richPresentation(metadata);
   $: density = richDensity(metadata, normalized.blocks);
+  $: canvas = richCanvas(metadata);
+  // Payload-level `title` is only a fallback for payloads authored with the
+  // title inline; the host-supplied `title` prop (the deliverable's own
+  // stored title/label) always wins when set.
+  $: effectiveTitle = title || normalized.title || '';
   $: subtitle = typeof metadata.subtitle === 'string' ? metadata.subtitle : '';
   $: eyebrow = typeof metadata.eyebrow === 'string' ? metadata.eyebrow : '';
   $: badges = Array.isArray(metadata.badges) ? metadata.badges.map(String).filter(Boolean) : [];
@@ -61,7 +69,15 @@
   $: decoratedBlocks = decorateBlocks(normalized.blocks, headingItems, options, instanceNamespace);
   $: heroTitle = normalized.blocks[0]?.type === 'hero' ? blockTitle(normalized.blocks[0]) : '';
   $: heroOwnsIdentity = Boolean(heroTitle);
-  $: documentBlocks = decoratedBlocks.map((block, index) => index === 0 && block.type === 'hero' && heroOwnsIdentity
+  // Dashboard documents use their first section header as the presentation
+  // title. Keep the host toolbar for actions, but do not duplicate that title
+  // above the authored dashboard canvas.
+  $: dashboardSectionOwnsIdentity = presentation === 'dashboard'
+    && normalized.blocks[0]?.type === 'section_header'
+    && Boolean(blockTitle(normalized.blocks[0]));
+  $: payloadOwnsIdentity = heroOwnsIdentity || dashboardSectionOwnsIdentity;
+  $: documentBlocks = decoratedBlocks.map((block, index) => index === 0
+    && ((block.type === 'hero' && heroOwnsIdentity) || (block.type === 'section_header' && dashboardSectionOwnsIdentity))
     ? { ...block, __document_h1: true }
     : block);
   $: publicationContext.set(buildCitationRegistry(normalized.blocks, normalized.sources, instanceNamespace));
@@ -72,6 +88,7 @@
   let copied = false;
   let shareCopied = false;
   let shareError = '';
+  let shareCopyResetTimer: ReturnType<typeof setTimeout> | null = null;
   let root: HTMLDivElement;
   let modalPanel: HTMLDivElement;
   let closeButton: HTMLButtonElement;
@@ -79,6 +96,18 @@
   let overlayId: string | null = null;
   let unregisterOverlay: (() => void) | null = null;
   let mermaidRenderQueued = false;
+  let inlineTocWide = false;
+  let rootResizeObserver: ResizeObserver | null = null;
+  let collapseIdentity = '';
+
+  $: {
+    const nextCollapseIdentity = `${instanceId}\u0000${title}`;
+    if (nextCollapseIdentity !== collapseIdentity) {
+      collapseIdentity = nextCollapseIdentity;
+      inlineExpanded = !collapsedByDefault;
+      tocOpen = false;
+    }
+  }
 
   function replaceFragment(fragment: string) {
     history.replaceState(history.state, '', fragment);
@@ -158,9 +187,14 @@
     shareError = '';
     try {
       const url = await shareLinkCallback();
-      await navigator.clipboard?.writeText(url);
+      await navigator.clipboard.writeText(url);
       shareCopied = true;
-      setTimeout(() => shareCopied = false, 1800);
+      if (shareCopyResetTimer) clearTimeout(shareCopyResetTimer);
+      shareCopyResetTimer = setTimeout(() => {
+        shareCopied = false;
+        shareCopyResetTimer = null;
+      }, 3_000);
+      addToast('Copied into clipboard', 'success');
     } catch (err) {
       shareError = err instanceof Error ? err.message : 'Share link failed';
     }
@@ -255,7 +289,7 @@
           const result = await mermaid.render(renderId, source);
           const wrapper = document.createElement('div');
           wrapper.className = 'rich-mermaid';
-          wrapper.innerHTML = result.svg;
+          wrapper.innerHTML = namespaceMermaidSvg(result.svg, renderId);
           node.replaceWith(wrapper);
         } catch {
           // Keep escaped source fallback.
@@ -280,6 +314,12 @@
     root.addEventListener('rich-toc-request', openContextualToc);
     rewriteInternalLinks();
     scheduleMermaidRender();
+    if (typeof ResizeObserver !== 'undefined') {
+      rootResizeObserver = new ResizeObserver(([entry]) => {
+        inlineTocWide = (entry?.contentRect.width ?? 0) >= 960;
+      });
+      rootResizeObserver.observe(root);
+    }
   });
   afterUpdate(() => {
     rewriteInternalLinks();
@@ -289,6 +329,8 @@
     root?.removeEventListener('click', handleRootClick, true);
     root?.removeEventListener('rich-toc-request', openContextualToc);
     unregisterOverlay?.();
+    rootResizeObserver?.disconnect();
+    if (shareCopyResetTimer) clearTimeout(shareCopyResetTimer);
   });
   $: if (fullOpen) scheduleMermaidRender();
 
@@ -357,20 +399,23 @@
   class:embedded={surface === 'embedded'}
   class="rich-deliverable"
   class:pulse={presentation === 'pulse'}
+  class:dashboard={presentation === 'dashboard'}
   data-presentation={presentation}
   data-rich-density={density}
+  data-rich-canvas={canvas}
   data-rich-instance={instanceNamespace}
   data-has-contextual-toc={showToc ? 'true' : undefined}
+  data-inline-toc-layout={inlineTocWide ? 'sidebar' : 'drawer'}
   data-testid="rich-deliverable"
 >
   <div class="rich-orb rich-orb-a" aria-hidden="true"></div>
   <div class="rich-orb rich-orb-b" aria-hidden="true"></div>
 
-  <header class="rich-toolbar" class:actions-only={heroOwnsIdentity && inlineExpanded} data-testid="rich-deliverable-toolbar">
-    {#if !heroOwnsIdentity || !inlineExpanded}
+  <header class="rich-toolbar" class:actions-only={payloadOwnsIdentity && inlineExpanded} data-testid="rich-deliverable-toolbar">
+    {#if !payloadOwnsIdentity || !inlineExpanded}
     <div>
       {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
-      <h1>{@html renderInlineMarkdown(title || 'Deliverable')}</h1>
+      <h1>{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
       {#if subtitle}<p>{@html renderInlineMarkdown(subtitle)}</p>{/if}
       {#if badges.length > 0}
         <div class="rich-badges">{#each badges as badge}<span>{@html renderInlineMarkdown(badge)}</span>{/each}</div>
@@ -404,19 +449,32 @@
         {#if standaloneUrl}<a href={standaloneUrl} target="_blank" rel="noreferrer" aria-label="Open standalone page" title="Open standalone page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 11 13M10 6H5a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5" /></svg></a>{/if}
       {/if}
       {#if pdfUrl}<a href={pdfUrl} aria-label="Download PDF" title="Download PDF"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-4-4 4 4 4-4M5 20h14" /></svg></a>{/if}
-      {#if shareLinkCallback}<button type="button" aria-label={shareCopied ? 'Share link copied' : 'Copy share link'} title="Copy share link" on:click={copyShareLink}><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5" /><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="19" r="2.5" /><path d="m8.2 10.8 7.6-4.5M8.2 13.2l7.6 4.5" /></svg></button>{/if}
+      {#if shareLinkCallback}
+        <button
+          class:rich-action-copied={shareCopied}
+          type="button"
+          aria-label={shareCopied ? 'Share link copied' : 'Copy share link'}
+          title={shareCopied ? 'Copied into clipboard' : 'Copy share link'}
+          on:click={copyShareLink}
+        >
+          {#if shareCopied}
+            <svg data-testid="rich-share-copied-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg>
+          {:else}
+            <svg data-testid="rich-share-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="18" cy="5" r="2.5" /><circle cx="6" cy="12" r="2.5" /><circle cx="18" cy="19" r="2.5" /><path d="m8.2 10.8 7.6-4.5M8.2 13.2l7.6 4.5" /></svg>
+          {/if}
+        </button>
+      {/if}
       <button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>
     </nav>
   </header>
   {#if shareError}<p class="rich-action-error">{shareError}</p>{/if}
 
-  {#if !fullOpen}
+  {#if !fullOpen && inlineExpanded}
   <div
     id={`${instanceNamespace}-inline-document`}
-    class:has-toc={showToc}
-    class="rich-document"
-    hidden={!inlineExpanded}
-    aria-hidden={!inlineExpanded}
+    class:has-toc={showToc && (!inlineTocWide || surface !== 'embedded' || tocOpen)}
+    class:inline-toc-sidebar={showToc && inlineTocWide && (surface !== 'embedded' || tocOpen)}
+    class="rich-document rich-inline-document"
     data-testid="rich-deliverable-inline-document"
   >
     {#if showToc}
@@ -425,6 +483,9 @@
         onNavigate={navigateToc}
         bind:open={tocOpen}
         onClose={() => tocOpen = false}
+        layout={inlineTocWide ? 'sidebar' : 'drawer'}
+        visible={surface === 'embedded' && inlineTocWide ? tocOpen : true}
+        dismissibleSidebar={surface === 'embedded'}
       />
     {/if}
 
@@ -442,14 +503,16 @@
     <div
       class="rich-full"
       class:pulse={presentation === 'pulse'}
+      class:dashboard={presentation === 'dashboard'}
       use:portal
       role="dialog"
       aria-modal="true"
       tabindex="-1"
-      aria-label={title || 'Document full view'}
+      aria-label={effectiveTitle || 'Document full view'}
       data-testid="rich-deliverable-full-view"
       data-presentation={presentation}
       data-rich-density={density}
+      data-rich-canvas={canvas}
       on:keydown|capture={handleKeydown}
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -463,9 +526,9 @@
            <button bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
         <div class="rich-full-body">
-             <div class:has-toc={showToc} class="rich-document">
+              <div class:has-toc={showToc} class="rich-document">
                {#if showToc}
-                <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} onClose={() => tocOpen = false} />
+                  <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} onClose={() => tocOpen = false} layout="auto" />
                 {/if}
 
             <div class="rich-body">
@@ -486,6 +549,7 @@
   .rich-deliverable {
     position: relative;
     isolation: isolate;
+    container: rich-inline / inline-size;
     width: 100%;
     min-width: 0;
     max-width: 100%;
@@ -571,6 +635,85 @@
     width: min(100%, 76rem);
     margin: 0 auto;
     padding: clamp(.75rem, 2vw, 1.35rem);
+  }
+
+  /* Dashboard presentation: flat, editorial, and dense -- restrained
+     shadows/gradients (no ambient orbs, a plain surface instead of the
+     default's layered gradient shell), strong section dividers (inherited
+     from `--rich-line` borders already used throughout), and tabular
+     numeric treatment (see `.rich-deliverable.dashboard :is(strong, .rich-metric strong)`
+     rules in rich-blocks.css). Kept minimal here: only the outer shell and
+     orb suppression are dashboard-specific chrome; everything else reuses
+     the same generic primitives every other presentation shares. */
+   .rich-deliverable.dashboard {
+     border-color: transparent;
+     border-radius: 0;
+     background: rgb(10 15 21);
+     box-shadow: none;
+   }
+
+  .rich-deliverable.dashboard .rich-orb {
+    display: none;
+  }
+
+   .rich-full.dashboard .rich-full-panel {
+     background: rgb(10 15 21);
+     box-shadow: none;
+   }
+
+   :global(:root[data-resolved-theme='light']) .rich-deliverable.dashboard,
+   :global(:root[data-resolved-theme='light']) .rich-full.dashboard .rich-full-panel {
+     background: rgb(250 251 252);
+   }
+
+   .rich-deliverable.dashboard .rich-toolbar {
+     min-height: 2.25rem;
+     padding: .3rem .55rem;
+     border-bottom-color: color-mix(in srgb, var(--rich-line) 72%, transparent);
+     background: transparent;
+     backdrop-filter: none;
+   }
+
+   .rich-deliverable.dashboard .rich-toolbar.actions-only {
+     padding-block: .2rem;
+   }
+
+   .rich-deliverable.dashboard .rich-actions {
+     gap: .3rem;
+   }
+
+   .rich-deliverable.dashboard .rich-actions button,
+   .rich-deliverable.dashboard .rich-actions a {
+     width: 2rem;
+     min-width: 2rem;
+     height: 2rem;
+     border-radius: .45rem;
+     border-color: color-mix(in srgb, var(--rich-line) 75%, transparent);
+     background: transparent;
+   }
+
+   .rich-deliverable.dashboard .rich-body,
+   .rich-full.dashboard .rich-body {
+     width: min(100%, 90rem);
+     margin: 0 auto;
+     padding: clamp(1rem, 3vw, 2.35rem);
+   }
+
+  /* Host-managed canvas width: `wide` only widens the two surfaces this
+     component fully owns end-to-end (the full-view modal here, and the
+     non-embedded/"standalone" document body below) -- both stay bounded by
+     `min(...)` so the real available width is still host-managed (a
+     narrower viewport or host container always wins). Embedded rendering
+     is deliberately untouched: it already fills whatever width its chat
+     host grants with no self-imposed cap, so a wider bounded canvas there
+     is the embedding host's decision, not this component's. */
+  .rich-full[data-rich-canvas='wide'] .rich-full-panel {
+    width: min(96vw, 104rem);
+  }
+
+  .rich-deliverable[data-rich-canvas='wide']:not(.embedded) .rich-body {
+    width: min(100%, 104rem);
+    margin: 0 auto;
   }
 
   /* Deliverables default to dark regardless of OS preference until Cognis
@@ -748,6 +891,21 @@
     transform: translateY(-1px);
   }
 
+  .rich-action-copied svg {
+    animation: rich-action-icon-enter 180ms ease-out;
+  }
+
+  @keyframes rich-action-icon-enter {
+    from {
+      opacity: 0;
+      transform: scale(0.72);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
   .rich-action-error {
     margin: 0;
     border-bottom: 1px solid var(--rich-line);
@@ -762,37 +920,19 @@
     max-width: 100%;
   }
 
-  /* Toast/drawer-first default (<1440px): the TOC is the hamburger drawer,
-     so there is no sidebar column to reserve. .rich-document.has-toc stays
-     a plain block (inherited from .rich-document above) with no padding of
-     its own, and .rich-body keeps its full normal padding on every side
-     (previously it lost its left/right/bottom padding whenever a TOC was
-     present at narrow widths, leaving content flush against the card
-     edges -- fixed here rather than preserved). The floating sticky
-     sidebar column (min-width: 1440px below) is an enhancement layered on
-     top only for very large/wide screens -- a sidebar at typical tablet
-     widths (including iPad Pro landscape, ~1366px CSS px) eats too much of
-     the reading column, so the drawer stays the default there too. */
+  /* Inline TOC layout follows this component's measured container, not the
+     viewport. Narrow embeddings use the drawer and one readable body column. */
+  .rich-inline-document.inline-toc-sidebar {
+    display: grid;
+    grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+    gap: clamp(0.85rem, 2vw, 1.25rem);
+    align-items: start;
+    padding: clamp(0.85rem, 2vw, 1.2rem);
+  }
 
-  @media (min-width: 1440px) {
-    .rich-document.has-toc {
-      display: grid;
-      grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
-      gap: clamp(0.85rem, 2vw, 1.25rem);
-      align-items: start;
-      padding: clamp(0.85rem, 2vw, 1.2rem);
-    }
-
-    .rich-document.has-toc .rich-body {
-      min-width: 0;
-      padding: 0;
-    }
-
-    /* The sticky sidebar column above has no need for a trigger -- hide
-       the hamburger whenever there is room for the floating column. */
-    .rich-toc-action {
-      display: none;
-    }
+  .rich-inline-document.inline-toc-sidebar .rich-body {
+    min-width: 0;
+    padding: 0;
   }
 
   .rich-body {
@@ -854,6 +994,23 @@
 
   .rich-full-body .rich-document.has-toc {
     padding: 0;
+  }
+
+  /* Fullscreen keeps the established viewport-driven TOC contract because
+     its portal is no longer inside the inline container. Keep this threshold
+     aligned with RichToc's automatic sidebar mode. */
+  @media (min-width: 1440px) {
+    .rich-full-body .rich-document.has-toc {
+      display: grid;
+      grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+      gap: clamp(0.85rem, 2vw, 1.25rem);
+      align-items: start;
+    }
+
+    .rich-full-body .rich-document.has-toc .rich-body {
+      min-width: 0;
+      padding: 0;
+    }
   }
 
   @media (max-width: 760px) {

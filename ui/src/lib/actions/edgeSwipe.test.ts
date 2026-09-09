@@ -57,6 +57,26 @@ function dispatchTouch(node: HTMLElement, type: string, touches: Touch[]): { def
   return { defaultPrevented: event.defaultPrevented };
 }
 
+function dispatchPointer(
+  node: HTMLElement,
+  type: string,
+  init: { pointerId: number; pointerType: string; clientX: number; clientY: number; button?: number },
+): { defaultPrevented: boolean } {
+  const event = new MouseEvent(type, {
+    bubbles: true,
+    cancelable: true,
+    clientX: init.clientX,
+    clientY: init.clientY,
+    button: init.button ?? 0,
+  });
+  Object.defineProperties(event, {
+    pointerId: { value: init.pointerId },
+    pointerType: { value: init.pointerType },
+  });
+  node.dispatchEvent(event);
+  return { defaultPrevented: event.defaultPrevented };
+}
+
 describe('edgeSwipe action', () => {
   let host: HTMLElement;
   const originalInnerWidth = window.innerWidth;
@@ -134,6 +154,28 @@ describe('edgeSwipe action', () => {
     action.destroy?.();
   });
 
+  it('does not claim sub-threshold horizontal touch jitter', () => {
+    const onTrigger = vi.fn();
+    const action = mount({ edge: 'left', onTrigger });
+
+    dispatchTouch(host, 'touchstart', [fakeTouch({
+      identifier: 3,
+      clientX: 8,
+      clientY: 100,
+      target: host,
+    })]);
+    const move = dispatchTouch(host, 'touchmove', [fakeTouch({
+      identifier: 3,
+      clientX: 14,
+      clientY: 100,
+      target: host,
+    })]);
+
+    expect(onTrigger).not.toHaveBeenCalled();
+    expect(move.defaultPrevented).toBe(false);
+    action.destroy?.();
+  });
+
   it('does not trigger when disabled', () => {
     const onTrigger = vi.fn();
     const action = mount({ edge: 'left', onTrigger, disabled: true });
@@ -185,6 +227,111 @@ describe('edgeSwipe action', () => {
       window.getComputedStyle = originalGetComputedStyle;
       action.destroy?.();
     }
+  });
+
+  it('does not capture mouse clicks that start on an interactive edge control', () => {
+    const button = document.createElement('button');
+    host.appendChild(button);
+    const onTrigger = vi.fn();
+    const onClick = vi.fn();
+    const setPointerCapture = vi.fn();
+    host.setPointerCapture = setPointerCapture;
+    button.addEventListener('click', onClick);
+    const action = mount({ edge: 'right', onTrigger, edgeWidth: 48, threshold: 60 });
+
+    dispatchPointer(button, 'pointerdown', {
+      pointerId: 11,
+      pointerType: 'mouse',
+      clientX: 390,
+      clientY: 40,
+    });
+    dispatchPointer(button, 'pointermove', {
+      pointerId: 11,
+      pointerType: 'mouse',
+      clientX: 320,
+      clientY: 40,
+    });
+    button.click();
+
+    expect(onTrigger).not.toHaveBeenCalled();
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(onClick).toHaveBeenCalledTimes(1);
+    action.destroy?.();
+  });
+
+  it('permits edge gestures from an explicitly designated button surface', () => {
+    const backdrop = document.createElement('button');
+    backdrop.dataset.edgeSwipeSurface = 'true';
+    host.appendChild(backdrop);
+    const onTrigger = vi.fn();
+    const setPointerCapture = vi.fn();
+    host.setPointerCapture = setPointerCapture;
+    const action = mount({ edge: 'right', onTrigger, edgeWidth: 48, threshold: 60 });
+
+    dispatchPointer(backdrop, 'pointerdown', {
+      pointerId: 14,
+      pointerType: 'mouse',
+      clientX: 390,
+      clientY: 40,
+    });
+    dispatchPointer(backdrop, 'pointermove', {
+      pointerId: 14,
+      pointerType: 'mouse',
+      clientX: 320,
+      clientY: 40,
+    });
+
+    expect(setPointerCapture).toHaveBeenCalledWith(14);
+    expect(onTrigger).toHaveBeenCalledTimes(1);
+    action.destroy?.();
+  });
+
+  it('waits for meaningful mouse movement before capturing an edge gesture', () => {
+    const onTrigger = vi.fn();
+    const setPointerCapture = vi.fn();
+    host.setPointerCapture = setPointerCapture;
+    const action = mount({ edge: 'right', onTrigger, edgeWidth: 48, threshold: 60 });
+
+    dispatchPointer(host, 'pointerdown', {
+      pointerId: 12,
+      pointerType: 'mouse',
+      clientX: 390,
+      clientY: 40,
+    });
+    dispatchPointer(host, 'pointermove', {
+      pointerId: 12,
+      pointerType: 'mouse',
+      clientX: 386,
+      clientY: 40,
+    });
+
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(onTrigger).not.toHaveBeenCalled();
+    action.destroy?.();
+  });
+
+  it('still supports a deliberate mouse edge drag', () => {
+    const onTrigger = vi.fn();
+    const setPointerCapture = vi.fn();
+    host.setPointerCapture = setPointerCapture;
+    const action = mount({ edge: 'right', onTrigger, edgeWidth: 48, threshold: 60 });
+
+    dispatchPointer(host, 'pointerdown', {
+      pointerId: 13,
+      pointerType: 'mouse',
+      clientX: 390,
+      clientY: 40,
+    });
+    dispatchPointer(host, 'pointermove', {
+      pointerId: 13,
+      pointerType: 'mouse',
+      clientX: 320,
+      clientY: 40,
+    });
+
+    expect(setPointerCapture).toHaveBeenCalledWith(13);
+    expect(onTrigger).toHaveBeenCalledTimes(1);
+    action.destroy?.();
   });
 
   it('cleans up listeners on destroy', () => {

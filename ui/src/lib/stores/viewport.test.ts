@@ -1,7 +1,12 @@
 import { get } from 'svelte/store';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { calculateViewportMetrics, isMobile, isTouch } from './viewport';
+import {
+  calculateViewportMetrics,
+  isMobile,
+  isTouch,
+  viewportCssPolicy,
+} from './viewport';
 
 describe('viewport stores', () => {
   const originalInnerWidth = window.innerWidth;
@@ -39,7 +44,7 @@ describe('viewport stores', () => {
 
   it('isTouch returns true when the media query reports coarse pointer + no hover', () => {
     window.matchMedia = vi.fn().mockImplementation((query: string) => ({
-      matches: query.includes('hover: none') && query.includes('pointer: coarse'),
+      matches: query.includes('any-pointer: coarse'),
       media: query,
       addEventListener: vi.fn(),
       removeEventListener: vi.fn(),
@@ -49,6 +54,39 @@ describe('viewport stores', () => {
       onchange: null
     })) as unknown as typeof window.matchMedia;
     expect(isTouch()).toBe(true);
+  });
+
+  it('delegates the closed standalone shell boundary to fixed viewport edges', () => {
+    expect(viewportCssPolicy({
+      height: 834,
+      offsetTop: 0,
+      keyboardOpen: false,
+    }, true)).toEqual({
+      height: null,
+      bottomControlInset: null,
+    });
+  });
+
+  it('keeps dynamic viewport CSS outside iOS standalone mode', () => {
+    expect(viewportCssPolicy({
+      height: 834,
+      offsetTop: 0,
+      keyboardOpen: false,
+    }, false)).toEqual({
+      height: null,
+      bottomControlInset: null,
+    });
+  });
+
+  it('uses visual viewport pixels and removes the safe inset while the keyboard is open', () => {
+    expect(viewportCssPolicy({
+      height: 536.4,
+      offsetTop: 0,
+      keyboardOpen: true,
+    }, true)).toEqual({
+      height: '536px',
+      bottomControlInset: '0px',
+    });
   });
 
   it('uses layout viewport height when visual viewport only differs by safe area', () => {
@@ -61,14 +99,25 @@ describe('viewport stores', () => {
     ).toEqual({ height: 874, offsetTop: 0, keyboardOpen: false });
   });
 
-  it('anchors the shell at top and shrinks from the bottom while keyboard is open', () => {
+  it('compensates a real keyboard-driven visual viewport pan', () => {
     expect(
       calculateViewportMetrics({
         innerHeight: 874,
         visualViewportHeight: 520,
         visualViewportOffsetTop: 16,
       })
-    ).toEqual({ height: 536, offsetTop: 0, keyboardOpen: true });
+    ).toEqual({ height: 536, offsetTop: 16, keyboardOpen: true });
+  });
+
+  it('detects a keyboard that resizes both layout and visual viewports', () => {
+    expect(
+      calculateViewportMetrics({
+        innerHeight: 520,
+        layoutViewportBaseline: 874,
+        visualViewportHeight: 520,
+        visualViewportOffsetTop: 0,
+      })
+    ).toEqual({ height: 520, offsetTop: 0, keyboardOpen: true });
   });
 
   it('ignores stale keyboard-sized visual viewport metrics when no text input is focused', () => {

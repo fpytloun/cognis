@@ -1,7 +1,10 @@
 import type { TimelineScope } from '$lib/chat-v2/types';
 import type { WebSocketWorkInvalidatedEvent } from '$lib/types/api';
 import { clearWorkFileTreeStates } from './workFileTreeState';
-import { invalidateActivityOverview } from '$lib/activityOverviewCache';
+import {
+  invalidateActivityOverview,
+  markAllActivityOverviewsStale,
+} from '$lib/activityOverviewCache';
 
 export type WorkViewTab = 'files' | 'commands' | 'mutations' | 'artifacts' | 'results';
 
@@ -26,11 +29,24 @@ const MAX_STATES = 24;
 const MAX_RESPONSE_SCOPES = 12;
 const MAX_RESPONSES_PER_SCOPE = 3;
 const RESPONSE_TTL_MS = 30_000;
-type CachedResponse = { value: unknown; expiresAt: number };
+type CachedResponse = { value: unknown; expiresAt: number; admittedRevision: number | null };
 const responseCache = new Map<string, Map<WorkViewTab, CachedResponse>>();
+const workSignalRevisions = new Map<string, number>();
+let ownerWideWorkRevision: number | null = null;
+const MAX_WORK_SIGNAL_REVISIONS = MAX_STATES;
 
-export function workViewIdentity(scope: TimelineScope, sessionId?: string | null): string {
-  return `${scope.key}::session=${sessionId ?? 'all'}`;
+export interface WorkResponseQueryIdentity {
+  from?: string | null;
+  to?: string | null;
+  admittedRevision?: number | null;
+}
+
+export function workViewIdentity(
+  scope: TimelineScope,
+  sessionId?: string | null,
+  query: WorkResponseQueryIdentity = {},
+): string {
+  return `${scope.key}::session=${sessionId ?? 'all'}::from=${query.from ?? 'all'}::to=${query.to ?? 'all'}`;
 }
 
 /** In-memory only: projections can be large and must never enter web storage. */
@@ -38,8 +54,9 @@ export function getWorkResponseCache<T>(
   scope: TimelineScope,
   tab: WorkViewTab,
   sessionId?: string | null,
+  query: WorkResponseQueryIdentity = {},
 ): T | null {
-  const identity = workViewIdentity(scope, sessionId);
+  const identity = workViewIdentity(scope, sessionId, query);
   const scoped = responseCache.get(identity);
   const cached = scoped?.get(tab);
   if (cached && cached.expiresAt <= Date.now()) {
@@ -47,6 +64,12 @@ export function getWorkResponseCache<T>(
     if (scoped?.size === 0) responseCache.delete(identity);
     return null;
   }
+  const requiredRevision = Math.max(
+    query.admittedRevision ?? -1,
+    workSignalRevisions.get(scope.key) ?? -1,
+    ownerWideWorkRevision ?? -1,
+  );
+  if (cached && (cached.admittedRevision ?? -1) < requiredRevision) return null;
   if (scoped) {
     responseCache.delete(identity);
     responseCache.set(identity, scoped);
@@ -59,11 +82,16 @@ export function setWorkResponseCache<T>(
   tab: WorkViewTab,
   value: T,
   sessionId?: string | null,
+  query: WorkResponseQueryIdentity = {},
 ): void {
-  const identity = workViewIdentity(scope, sessionId);
+  const identity = workViewIdentity(scope, sessionId, query);
   const scoped = responseCache.get(identity) ?? new Map<WorkViewTab, CachedResponse>();
   scoped.delete(tab);
-  scoped.set(tab, { value, expiresAt: Date.now() + RESPONSE_TTL_MS });
+  scoped.set(tab, {
+    value,
+    expiresAt: Date.now() + RESPONSE_TTL_MS,
+    admittedRevision: query.admittedRevision ?? null,
+  });
   while (scoped.size > MAX_RESPONSES_PER_SCOPE) {
     const oldest = scoped.keys().next().value;
     if (oldest === undefined) break;
@@ -84,7 +112,10 @@ export function clearWorkResponseCache(scopeKey?: string, sessionId?: string | n
     return;
   }
   if (sessionId !== undefined) {
-    responseCache.delete(`${scopeKey}::session=${sessionId ?? 'all'}`);
+    const prefix = `${scopeKey}::session=${sessionId ?? 'all'}::`;
+    for (const identity of responseCache.keys()) {
+      if (identity.startsWith(prefix)) responseCache.delete(identity);
+    }
     return;
   }
   for (const identity of responseCache.keys()) {
@@ -185,31 +216,72 @@ export interface WorkInvalidationDetail {
   scopeKey: string;
   workRevision?: number;
   graphRevision?: number;
+  overviewAdvanced?: boolean;
   reconnect?: boolean;
 }
 
 export function invalidateWorkScope(
   scopeKey: string,
-  revisions: Omit<WorkInvalidationDetail, 'scopeKey'> = {},
+  revisions: Omit<WorkInvalidationDetail, 'scopeKey' | 'overviewAdvanced'> = {},
 ): void {
+  const revision = Number(revisions.workRevision);
+  if (Number.isSafeInteger(revision) && revision >= 0) {
+    const previous = workSignalRevisions.get(scopeKey);
+    if (previous !== undefined && revision <= previous) return;
+    workSignalRevisions.delete(scopeKey);
+    workSignalRevisions.set(scopeKey, revision);
+    while (workSignalRevisions.size > MAX_WORK_SIGNAL_REVISIONS) {
+      const oldest = workSignalRevisions.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      workSignalRevisions.delete(oldest);
+    }
+  }
+  const overviewAdvanced = invalidateActivityOverview(scopeKey, revisions.workRevision);
   clearWorkResponseCache(scopeKey);
   clearWorkFileTreeStates(scopeKey);
-  invalidateActivityOverview(scopeKey);
   if (typeof window === 'undefined') return;
   window.dispatchEvent(new CustomEvent<WorkInvalidationDetail>('cognis:work-invalidated', {
-    detail: { scopeKey, ...revisions },
+    detail: { scopeKey, ...revisions, overviewAdvanced },
   }));
 }
 
 export function invalidateWorkFromSocket(event: WebSocketWorkInvalidatedEvent): void {
   const revision = Number(event.revision);
+  if (event.work_scope_key === '*') {
+    invalidateAllWorkScopes(
+      Number.isSafeInteger(revision) ? revision : undefined,
+    );
+    return;
+  }
   invalidateWorkScope(event.work_scope_key, {
     workRevision: Number.isSafeInteger(revision) ? revision : undefined,
   });
 }
 
+/** Clear every known Work projection after a WebSocket reconnect. */
+export function invalidateAllWorkScopes(workRevision?: number): void {
+  if (Number.isSafeInteger(workRevision) && Number(workRevision) >= 0) {
+    const revision = Number(workRevision);
+    if (ownerWideWorkRevision !== null && revision <= ownerWideWorkRevision) return;
+    ownerWideWorkRevision = revision;
+  }
+  clearWorkResponseCache();
+  clearWorkFileTreeStates();
+  markAllActivityOverviewsStale(workRevision);
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(new CustomEvent<WorkInvalidationDetail>('cognis:work-invalidated', {
+    detail: {
+      scopeKey: '',
+      workRevision,
+      reconnect: workRevision === undefined,
+    },
+  }));
+}
+
 export function clearWorkViewStates(): void {
   states.clear();
+  workSignalRevisions.clear();
+  ownerWideWorkRevision = null;
   clearWorkResponseCache();
   clearWorkFileTreeStates();
   if (typeof sessionStorage !== 'undefined') {

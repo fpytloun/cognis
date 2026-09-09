@@ -302,7 +302,12 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             WorkflowPhaseDefinition(
                 id="verify",
                 title="Verify",
-                step_names=["code_review", "code_review_route", "post_review_gate"],
+                step_names=[
+                    "code_review",
+                    "code_review_route",
+                    "code_review_exhausted_gate",
+                    "post_review_gate",
+                ],
             ),
             WorkflowPhaseDefinition(
                 id="deliver",
@@ -614,12 +619,29 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                 then="implement",
                 else_="post_review_gate",
                 revision_source="code_review",
-                max_loop_iterations=5,
-                on_exhausted="gate",
+                max_loop_iterations=1,
+                on_exhausted="continue",
                 output=DeterministicOutputConfig(
                     summary="Routed the code review decision.",
                 ),
             ),
+        ),
+        StepDefinition(
+            name="code_review_exhausted_gate",
+            type="gate",
+            gate=GateConfig(
+                message=(
+                    "Implementation still has blocking findings after one correction cycle. "
+                    "Replan or escalate before continuing."
+                ),
+                input=["plan", "implement", "code_review"],
+                options=[
+                    GateOption(label="Revise plan", action="revise(plan)"),
+                    GateOption(label="Continue explicitly", action="continue"),
+                    GateOption(label="Cancel", action="cancel"),
+                ],
+            ),
+            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
         ),
         StepDefinition(
             name="post_review_gate",

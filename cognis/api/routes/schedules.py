@@ -52,7 +52,7 @@ router = APIRouter(tags=["schedules"])
 # ---------------------------------------------------------------------------
 
 
-_VALID_SCHEDULE_RUN_STATUSES = {"success", "failed", "skipped"}
+_VALID_SCHEDULE_RUN_STATUSES = {"success", "failed", "skipped", "cancelled"}
 _ACTIVE_TASK_RUN_STATUSES = {"queued", "ready", "running", "paused"}
 SCHEDULE_EXPIRATION_GRACE = timedelta(hours=24)
 
@@ -111,14 +111,16 @@ def _effective_last_run_status(
     """Return the user-visible latest run status for a schedule."""
 
     if latest_task_run is None:
-        return row.last_run_status
+        value = getattr(row, "last_run_status", None)
+        return value if isinstance(value, str) else None
 
     task_status, task_created_at = latest_task_run
     if row.last_run_status in {"failed", "skipped"} and (
         task_created_at is None
         or (row.last_fired_at is not None and task_created_at < row.last_fired_at)
     ):
-        return row.last_run_status
+        value = getattr(row, "last_run_status", None)
+        return value if isinstance(value, str) else None
     return task_status
 
 
@@ -151,6 +153,8 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
+        retry_failed_tasks=bool(getattr(row, "retry_failed_tasks", False)),
+        fail_paused_task_on_next_fire=bool(getattr(row, "fail_paused_task_on_next_fire", True)),
         interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
         last_fired_at=row.last_fired_at,
         next_fire_at=row.next_fire_at,
@@ -179,6 +183,8 @@ def _row_to_response(
         enabled=row.enabled,
         max_concurrent_runs=row.max_concurrent_runs,
         delete_after_run=row.delete_after_run,
+        retry_failed_tasks=bool(getattr(row, "retry_failed_tasks", False)),
+        fail_paused_task_on_next_fire=bool(getattr(row, "fail_paused_task_on_next_fire", True)),
         completion_mode_family=getattr(row, "completion_mode_family", "default"),
         allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
         interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
@@ -396,6 +402,8 @@ async def create_schedule_route(
             enabled=body.enabled,
             max_concurrent_runs=body.max_concurrent_runs,
             delete_after_run=body.delete_after_run,
+            retry_failed_tasks=body.retry_failed_tasks,
+            fail_paused_task_on_next_fire=body.fail_paused_task_on_next_fire,
             completion_mode_family=body.completion_mode_family,
             allow_silent_completion=body.allow_silent_completion,
             interaction_mode_override=body.interaction_mode_override,
@@ -404,7 +412,10 @@ async def create_schedule_route(
         )
         await db.commit()
         # Re-read to get all defaults
-        row = await get_schedule(db, row.schedule_id)
+        reloaded_row = await get_schedule(db, row.schedule_id)
+        if reloaded_row is None:
+            raise api_exception(500, "internal_error", "Created schedule could not be reloaded")
+        row = reloaded_row
 
     # Notify scheduler
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -529,6 +540,11 @@ async def update_schedule_route(
                 raise api_exception(400, "invalid_cron", f"Invalid cron expression: {exc}") from exc
 
         fields = body.model_dump(exclude_unset=True)
+        if fields.get("enabled") is False:
+            fields["disabled_reason"] = "disabled_by_user"
+        elif fields.get("enabled") is True:
+            fields["disabled_reason"] = None
+            fields["consecutive_errors"] = 0
         if body.agent_id is not None and "agent_profile_id" not in body.model_fields_set:
             fields["agent_profile_id"] = None
         if body.skill_id is not None:
@@ -584,6 +600,10 @@ async def update_schedule_route(
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
+    if fields.get("enabled") is False:
+        await request.app.state.notification_service.resolve_schedule_action(
+            schedule_id, user_email=user.email, reason="schedule_decommissioned"
+        )
 
     return _row_to_response(
         row,
@@ -610,6 +630,9 @@ async def delete_schedule_route(
         await check_agent_access(request, agent, required="use")
         await delete_schedule(db, schedule_id)
         await db.commit()
+    await request.app.state.notification_service.resolve_schedule_action(
+        schedule_id, user_email=user.email, reason="schedule_deleted"
+    )
 
     # Notify scheduler
     scheduler = getattr(request.app.state, "scheduler", None)
@@ -689,7 +712,6 @@ async def enable_schedule_route(
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
-
     return _row_to_response(
         row,
         await _load_latest_task_run(request, schedule_id, created_by=user.email),
@@ -713,12 +735,20 @@ async def disable_schedule_route(
         if agent is None:
             raise api_exception(404, "agent_not_found", "Agent not found")
         await check_agent_access(request, agent, required="use")
-        row = await update_schedule(db, schedule_id, enabled=False)
+        row = await update_schedule(
+            db,
+            schedule_id,
+            enabled=False,
+            disabled_reason="disabled_by_user",
+        )
         await db.commit()
 
     scheduler = getattr(request.app.state, "scheduler", None)
     if scheduler is not None:
         await scheduler.notify_schedule_changed(schedule_id)
+    await request.app.state.notification_service.resolve_schedule_action(
+        schedule_id, user_email=user.email, reason="schedule_decommissioned"
+    )
 
     return _row_to_response(
         row,

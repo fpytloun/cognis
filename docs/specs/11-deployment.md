@@ -131,15 +131,16 @@ COGNIS_LOG_FORMAT=json                 # json or text
 COGNIS_SERVE_UI=true                   # Serve bundled UI assets
 COGNIS_CORS_ORIGINS=http://localhost:5173  # CORS allowlist
 COGNIS_CHATGPT_PROMPT_CACHE_KEY_ENABLED=false  # Enable ChatGPT prompt-cache key support
-# Comma-separated proxy CIDRs allowed to supply X-Forwarded-For.
-# Empty by default: forwarded client addresses are not trusted.
+# Comma-separated proxy CIDRs allowed to supply forwarded client and scheme data.
+# Empty by default: forwarded addresses and schemes are not trusted.
 COGNIS_TRUSTED_PROXY_CIDRS=
 ```
 
 Only configure `COGNIS_TRUSTED_PROXY_CIDRS` for reverse proxies that sanitize
-and append `X-Forwarded-For`. Cognis walks the forwarded chain from the trusted
-direct peer toward the client and uses the first untrusted address for public
-share abuse limits. Headers from direct peers outside these CIDRs are ignored.
+forwarded headers. The setting controls forwarded client addresses, forwarded
+schemes, Secure session cookies, and WebSocket origin checks. Cognis ignores
+forwarded headers from direct peers outside these CIDRs. A trusted proxy must
+replace untrusted `X-Forwarded-Proto` values and safely append `X-Forwarded-For`.
 
 ### Mnemory/Intaris JWT Configuration
 
@@ -240,26 +241,18 @@ frontend deployment.
 
 ### Dockerfile
 
-```dockerfile
-FROM node:20-slim AS ui-build
-WORKDIR /app
-COPY ui/package*.json ./
-RUN npm ci
-COPY ui/ .
-RUN npm run build
+The release [`Dockerfile`](../../Dockerfile) uses separate Node UI-build,
+common-wheel, controller-wheel, and slim-runtime stages. The UI is built in the
+Node stage, then the controller build hook consumes those assets with
+`COGNIS_SKIP_UI_BUILD=1`. The runtime copies only the `cognis-common` and
+`cognis-controller` wheels into a virtual environment; it does not contain the
+source workspace, executor package, documentation, scripts, or UI build trees.
+The runtime keeps `ffmpeg` for controller-side STT preprocessing and uses a
+Python standard-library HTTP health check.
 
-FROM python:3.12-slim AS runtime
-WORKDIR /app
-ENV COGNIS_SKIP_UI_BUILD=1
-COPY pyproject.toml README.md build.py ./
-COPY cognis/ ./cognis/
-COPY docs/ ./docs/
-COPY ui/ ./ui/
-COPY --from=ui-build /app/build ./ui/build
-RUN pip install --no-cache-dir .
-EXPOSE 8080
-CMD ["cognis-controller", "serve"]
-```
+This image is intentionally remote-WebSocket-only. Run a
+`cognis-executor[full]` sidecar or external process for filesystem, shell,
+browser, and other executor tools.
 
 ## Kubernetes
 
@@ -532,6 +525,7 @@ The SvelteKit UI reads browser-visible environment variables:
 | session | `session.core_memories_max_tokens` | 2000 | Token cap for core-memory content in the immutable prefix |
 | session | `session.immutable_prefix_repair_cooldown_seconds` | 300 | Cooldown before another immutable-prefix repair attempt for the same session; `0` disables cooldown |
 | session | `session.recall_ttl_seconds` | 86400 | TTL sent to managed Mnemory recall sessions |
+| session | `session.optional_recall_timeout_seconds` | 5.0 | Total timeout for optional per-turn memory search; immutable core-memory bootstrap keeps its separate reliable loading policy |
 | session | `session.cache_max_entries` | 200 | Maximum number of Intaris session cache entries kept in memory |
 | session | `session.escalation_timeout_seconds` | 300 | 5 min escalation timeout |
 | session | `session.step_request_questions_timeout_seconds` | 3600 | Default wait for workflow `step_request_questions` answers before returning a timeout tool result with prescribed next action |

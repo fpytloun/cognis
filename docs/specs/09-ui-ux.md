@@ -210,6 +210,14 @@ ordinary main-turn context.
 
 ## Agent Creation Wizard
 
+The current create and edit forms use five configuration tabs: Identity,
+Providers & models, Tools & access, Profiles, and Workflows. Secondary agents
+do not show Workflows. System agents show Profiles only when profiles are
+editable. Controls remain mounted when users change tabs, so drafts persist.
+One save action applies to all sections. Validation links identify the section
+that needs attention. Tool search filters names, descriptions, and categories
+without changing selections.
+
 5-step wizard:
 1. **Identity** — name, ID, description, avatar (generate/upload)
 2. **Personality** — traits (checkboxes), style, expertise, system prompt

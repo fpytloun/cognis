@@ -639,6 +639,230 @@
   }
 }
 
+/* Dashboard presentation is a deliberately flat technical canvas. Generic
+   blocks retain their semantics; only this presentation removes nested
+   container chrome and tightens the operational scan rhythm. */
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) {
+  --rich-density-gap: clamp(1.3rem, 2.4vw, 2.2rem);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list {
+  gap: var(--rich-density-gap);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) :is(
+  .rich-panel,
+  .rich-table-card,
+  .rich-chart-card,
+  .rich-kv,
+  .rich-timeline,
+  .rich-sources,
+  .rich-dashboard,
+  .rich-dashboard-card
+) {
+  border-width: 1px 0 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 1.1rem 0 0;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-metric {
+  display: flex;
+  flex-direction: column;
+  min-height: 10.5rem;
+  border: 1px solid var(--rich-line);
+  border-radius: .9rem;
+  background: color-mix(in srgb, var(--rich-surface-wash) 83%, transparent);
+  box-shadow: 0 6px 16px color-mix(in srgb, var(--rich-surface-wash-deep) 16%, transparent);
+  padding: 1rem 1.05rem .9rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-metric::before {
+  display: none;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-metric strong {
+  margin-top: .55rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: clamp(1.75rem, 2.5vw, 2.35rem);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--rich-ls-tighter);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-metric p {
+  margin-top: .65rem;
+  min-height: 2.9em;
+  order: 1;
+  font-size: var(--rich-fs-xs);
+  line-height: 1.45;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-metric .rich-progress {
+  order: 2;
+  margin-top: auto;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-section-header {
+  align-items: center;
+  border-bottom-width: 1px;
+  padding-bottom: .75rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-section-header h3 {
+  font-size: var(--rich-fs-sm);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 1.25rem;
+  border-bottom: 0;
+  padding: 0 0 .45rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header h1 {
+  margin: .25rem 0 0;
+  max-width: 58rem;
+  color: var(--rich-text);
+  font-size: clamp(2.25rem, 4.4vw, 3.75rem);
+  font-weight: 800;
+  letter-spacing: -.05em;
+  line-height: .98;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header p {
+  max-width: 62rem;
+  margin-top: .75rem;
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-md);
+  line-height: 1.45;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-markdown[data-rich-role='metadata'] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--rich-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: var(--rich-fs-xs);
+  letter-spacing: .015em;
+  line-height: 1.65;
+  padding: 0;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-markdown[data-rich-role='metadata'] :is(p, code, strong) {
+  color: inherit;
+  font: inherit;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-markdown[data-rich-role='status'] {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-sm);
+  padding: 0;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-markdown[data-rich-role='status'] p {
+  margin: 0;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-markdown[data-rich-role='status'] strong {
+  color: var(--rich-text);
+  font-weight: var(--rich-fw-semibold);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card {
+  padding-top: 1rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card h4 {
+  font-size: var(--rich-fs-sm);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card > p {
+  margin-top: .45rem;
+  color: var(--rich-muted);
+  font-size: var(--rich-fs-sm);
+  line-height: 1.45;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-wrap {
+  margin-top: .75rem;
+  border-radius: .8rem;
+  background: color-mix(in srgb, var(--rich-surface-wash) 42%, transparent);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card th,
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card td {
+  padding: .62rem .8rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card th {
+  background: color-mix(in srgb, var(--rich-surface-wash) 88%, transparent);
+  font-size: .66rem;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-table-card td {
+  font-size: var(--rich-fs-xs);
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) :is(
+  .rich-table-card td[data-cell-type='number'],
+  .rich-table-card td[data-cell-type='code'],
+  .rich-table-card td[data-cell-type='progress']
+) {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-card:not(.rich-card-status):not(.rich-card-action) {
+  border-width: 1px 0 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: .75rem 0 0;
+}
+
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-card-status,
+:is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-card-action {
+  border-radius: .9rem;
+  box-shadow: none;
+  padding: 1rem 1.05rem;
+}
+
+@container rich-inline (max-width: 430px) {
+  :is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header {
+    grid-template-columns: 1fr;
+    gap: .75rem;
+  }
+
+  :is(.rich-deliverable.dashboard, .rich-full.dashboard) .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header h1 {
+    font-size: clamp(2rem, 11vw, 2.65rem);
+  }
+}
+
+/* Full view is portaled outside `.rich-deliverable`, so it cannot observe the
+   inline container above. Use the viewport at the same mobile threshold. */
+@media (max-width: 430px) {
+  .rich-full.dashboard .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header {
+    grid-template-columns: 1fr;
+    gap: .75rem;
+  }
+
+  .rich-full.dashboard .rich-block-list > .rich-block-anchor:first-of-type .rich-section-header h1 {
+    font-size: clamp(2rem, 11vw, 2.65rem);
+  }
+}
+
 .rich-block-anchor {
   width: 100%;
   min-width: 0;
@@ -855,6 +1079,20 @@
 
 .rich-grid {
   grid-template-columns: repeat(var(--rich-columns, auto-fit), minmax(min(100%, 16rem), 1fr));
+  align-items: stretch;
+}
+
+/* RichBlockList supplies an anchor wrapper for every authored child. Make the
+   wrapper and card-like child participate in the row's stretch so a metric or
+   stat row reads as one deliberate band rather than uneven tiles. */
+.rich-grid > .rich-block-list > .rich-block-anchor {
+  display: flex;
+  min-width: 0;
+}
+
+.rich-grid > .rich-block-list > .rich-block-anchor > :is(.rich-card, .rich-metric, .rich-dashboard-card) {
+  width: 100%;
+  height: 100%;
 }
 
 .rich-columns {
@@ -959,6 +1197,8 @@
   .rich-card, .rich-panel { padding: var(--rich-space-4); border-radius: var(--rich-radius-md); }
   .rich-grid,
   .rich-columns { grid-template-columns: 1fr; }
+  .rich-grid > .rich-block-list > .rich-block-anchor { display: block; }
+  .rich-grid > .rich-block-list > .rich-block-anchor > :is(.rich-card, .rich-metric, .rich-dashboard-card) { height: auto; }
 }
 
 @media (max-width: 390px) {
@@ -1074,8 +1314,20 @@
 .rich-markdown ul,
 .rich-markdown ol {
   margin: .7rem 0;
-  padding-left: 1.3rem;
+  padding-inline-start: 1.5rem;
+  list-style-position: outside;
 }
+
+/* The application reset removes native list styles. Restore semantic markers
+   only in authored Rich Markdown; purpose-built lists such as TOCs, timelines,
+   and checklists retain their own marker-free layout. */
+.rich-markdown ul { list-style-type: disc; }
+.rich-markdown ol { list-style-type: decimal; }
+.rich-markdown ul ul { list-style-type: circle; }
+.rich-markdown ul ul ul { list-style-type: square; }
+.rich-markdown ol ol { list-style-type: lower-alpha; }
+.rich-markdown ol ol ol { list-style-type: lower-roman; }
+.rich-markdown ol ul { list-style-type: disc; }
 
 .rich-markdown ul ul,
 .rich-markdown ul ol,
@@ -1091,6 +1343,7 @@
 
 .rich-markdown li::marker {
   color: var(--rich-muted);
+  font-weight: var(--rich-fw-semibold);
 }
 
 .rich-markdown a {
@@ -1310,6 +1563,88 @@
 .rich-metric p {
   margin: var(--rich-space-3) 0 0;
   color: var(--rich-muted);
+}
+
+.rich-metric .rich-progress {
+  margin-top: var(--rich-space-3);
+}
+
+/* Generic block `surface`: overrides the existing card-like look only when
+   the author explicitly sets a recognized value (see `blockSurface()` --
+   it returns `undefined`, and no attribute is rendered, for anything else),
+   so every pre-existing composition keeps its current default (`raised`-
+   equivalent) appearance unchanged. */
+:is(.rich-card, .rich-metric, .rich-table-card, .rich-section-header, .rich-dashboard-card)[data-rich-surface='plain'] {
+  border-color: transparent;
+  background: none;
+  box-shadow: none;
+}
+
+:is(.rich-card, .rich-metric, .rich-table-card, .rich-section-header, .rich-dashboard-card)[data-rich-surface='subtle'] {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--rich-surface-wash) 55%, transparent);
+  box-shadow: none;
+}
+
+:is(.rich-card, .rich-metric, .rich-table-card, .rich-section-header, .rich-dashboard-card)[data-rich-surface='outlined'] {
+  border-color: var(--rich-line);
+  background: none;
+  box-shadow: none;
+}
+
+:is(.rich-card, .rich-metric, .rich-table-card, .rich-section-header, .rich-dashboard-card)[data-rich-surface='raised'] {
+  border-color: var(--rich-line);
+  background: var(--rich-surface-raised);
+  box-shadow: inset 0 1px 0 var(--rich-inset-highlight);
+}
+
+:is(.rich-card, .rich-metric, .rich-table-card, .rich-section-header, .rich-dashboard-card)[data-rich-surface='accent'] {
+  border-color: color-mix(in srgb, var(--rich-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--rich-accent) 10%, var(--rich-surface-raised));
+}
+
+/* Grid `layout` variants (grid block only; `columns`/`card_grid` keep their
+   existing auto-fit behavior). `equal` forces N even columns instead of the
+   auto-fit responsive minmax track; `split-2-1`/`split-1-2` are fixed
+   asymmetric two-column ratios for a lead column beside a secondary rail
+   (e.g. a scaling table beside a callout). All variants collapse to a single
+   stacked column at the same narrow breakpoint as every other grid -- see
+   the `max-width: 430px` rule below, updated to keep matching specificity. */
+.rich-grid[data-rich-grid-layout='equal'] {
+  grid-template-columns: repeat(var(--rich-columns, 1), minmax(0, 1fr));
+}
+
+.rich-grid[data-rich-grid-layout='split-2-1'] {
+  grid-template-columns: 2fr 1fr;
+}
+
+.rich-grid[data-rich-grid-layout='split-1-2'] {
+  grid-template-columns: 1fr 2fr;
+}
+
+@media (max-width: 430px) {
+  .rich-grid[data-rich-grid-layout] {
+    grid-template-columns: 1fr;
+  }
+
+  .rich-grid[data-rich-grid-layout] > .rich-block-list > .rich-block-anchor {
+    grid-column: span 1 !important;
+  }
+}
+
+/* Embedded rich cards can be narrow even in a wide desktop viewport. Follow
+   the renderer's measured container as well as the viewport. */
+@container rich-inline (max-width: 430px) {
+  .rich-grid > .rich-block-list > .rich-block-anchor { display: block; }
+  .rich-grid > .rich-block-list > .rich-block-anchor > :is(.rich-card, .rich-metric, .rich-dashboard-card) { height: auto; }
+
+  .rich-grid[data-rich-grid-layout] {
+    grid-template-columns: 1fr;
+  }
+
+  .rich-grid[data-rich-grid-layout] > .rich-block-list > .rich-block-anchor {
+    grid-column: span 1 !important;
+  }
 }
 
 .rich-kv dl {
@@ -1787,8 +2122,57 @@
   color: var(--rich-text-secondary);
 }
 
-.rich-table-card .align-right {
+.rich-table-card .align-right,
+.rich-table-card .align-end {
   text-align: right;
+}
+
+.rich-table-card .align-start {
+  text-align: left;
+}
+
+.rich-table-card .align-center {
+  text-align: center;
+}
+
+.rich-table-card td[data-cell-type='number'],
+.rich-table-card td[data-cell-type='progress'] {
+  font-variant-numeric: tabular-nums;
+}
+
+.rich-table-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--rich-tone-border, var(--rich-tone-neutral-border));
+  border-radius: var(--rich-radius-pill);
+  background: var(--rich-tone-bg, var(--rich-tone-neutral-bg));
+  color: var(--rich-tone-fg, var(--rich-tone-neutral-fg));
+  padding: .18rem .55rem;
+  font-size: var(--rich-fs-2xs);
+  font-weight: var(--rich-fw-bold);
+  letter-spacing: var(--rich-ls-wide);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.rich-table-code {
+  border: 1px solid color-mix(in srgb, var(--rich-accent-soft) 22%, transparent);
+  border-radius: var(--rich-radius-xs);
+  background: color-mix(in srgb, var(--rich-accent) 14%, var(--rich-surface-wash));
+  color: var(--rich-accent-soft);
+  padding: .12rem .38rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+  font-size: .88em;
+  white-space: nowrap;
+}
+
+.rich-table-cell-text.emphasis-strong {
+  color: var(--rich-text);
+  font-weight: var(--rich-fw-bold);
+}
+
+.rich-table-cell-text.emphasis-muted {
+  color: var(--rich-muted);
 }
 
 .rich-figure {

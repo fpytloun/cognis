@@ -23,7 +23,7 @@ from cognis.tools.executor.browser.manager import (
 
 
 def test_context_kwargs_includes_stealth_defaults_when_enabled() -> None:
-    manager = BrowserManager()  # defaults: playwright runtime, stealth on
+    manager = BrowserManager(runtime="playwright", channel=None)
     manager._browser_user_agents[False] = _coherent_chromium_user_agent(  # noqa: SLF001
         "145.0.7632.6"
     )
@@ -122,7 +122,7 @@ async def test_probe_browser_user_agent_uses_runtime_version_and_host(
 
 @pytest.mark.asyncio
 async def test_apply_context_defaults_invokes_stealth(monkeypatch: pytest.MonkeyPatch) -> None:
-    manager = BrowserManager()
+    manager = BrowserManager(runtime="playwright", channel=None)
 
     applied: list[Any] = []
 
@@ -175,7 +175,11 @@ def test_patchright_never_stacks_playwright_stealth_when_explicitly_enabled() ->
 async def test_stealth_evasion_exclusions_passed_to_stealth(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = BrowserManager(stealth_evasions=["navigator_languages", " webgl_vendor "])
+    manager = BrowserManager(
+        runtime="playwright",
+        channel=None,
+        stealth_evasions=["navigator_languages", " webgl_vendor "],
+    )
 
     captured: list[dict[str, Any]] = []
 
@@ -199,7 +203,7 @@ async def test_stealth_evasion_exclusions_passed_to_stealth(
 async def test_apply_context_defaults_swallows_stealth_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = BrowserManager()
+    manager = BrowserManager(runtime="playwright", channel=None)
 
     class _Stealth:
         def __init__(self, **_kwargs: Any) -> None:
@@ -221,14 +225,11 @@ async def test_apply_context_defaults_swallows_stealth_failures(
 # ---------------------------------------------------------------------------
 
 
-def test_patchright_runtime_defaults_channel_to_none_and_disables_stealth() -> None:
-    # Channel is no longer auto-pinned to "chrome" for Patchright; auto-install
-    # of system-browser channels requires sudo which is unavailable in daemon mode.
+def test_patchright_runtime_defaults_to_chrome_and_stealth_enabled() -> None:
     manager = BrowserManager(runtime="patchright")
     assert manager.runtime == "patchright"
-    assert manager.channel is None
-    # Patchright already covers stealth's evasions; default off avoids double-up.
-    assert manager.stealth_enabled is False
+    assert manager.channel == "chrome"
+    assert manager.stealth_enabled is True
 
 
 def test_patchright_runtime_does_not_override_explicit_channel() -> None:
@@ -271,16 +272,16 @@ def test_resolve_async_playwright_imports_runtime_specific_module(
 
 
 def test_launch_kwargs_includes_channel_when_explicitly_set() -> None:
-    # Channel must be explicitly provided; Patchright no longer auto-pins "chrome".
+    # Explicit channel values remain supported.
     manager = BrowserManager(runtime="patchright", channel="chrome")
     kwargs = manager._launch_kwargs(headless=True)  # noqa: SLF001
     assert kwargs["channel"] == "chrome"
 
 
-def test_launch_kwargs_omits_channel_when_unset() -> None:
+def test_launch_kwargs_uses_browser_default_channel_when_unset() -> None:
     manager = BrowserManager()
     kwargs = manager._launch_kwargs(headless=True)  # noqa: SLF001
-    assert "channel" not in kwargs
+    assert kwargs["channel"] == "chrome"
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +318,7 @@ def test_patchright_persistent_warning_silent_for_persistent_profile(
 def test_persistent_warning_silent_for_playwright_runtime(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    manager = BrowserManager()
+    manager = BrowserManager(runtime="playwright", channel=None)
     import logging
 
     with caplog.at_level(logging.WARNING):
@@ -334,7 +335,7 @@ def test_persistent_warning_silent_for_playwright_runtime(
 async def test_ensure_ready_uses_back_compat_for_default_playwright(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = BrowserManager()
+    manager = BrowserManager(runtime="playwright", channel=None)
     legacy_calls: list[dict[str, Any]] = []
     new_calls: list[dict[str, Any]] = []
 
@@ -383,15 +384,14 @@ async def test_ensure_ready_uses_new_helper_for_patchright(
 
     assert new_calls and not legacy_calls
     assert new_calls[0]["runtime"] == "patchright"
-    # Channel is no longer auto-pinned; manager.channel is None.
-    assert new_calls[0]["channel"] is None
+    assert new_calls[0]["channel"] == "chrome"
 
 
 @pytest.mark.asyncio
 async def test_ensure_ready_uses_new_helper_when_channel_pinned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = BrowserManager(channel="chrome")
+    manager = BrowserManager(runtime="playwright", channel="chrome")
     legacy_calls: list[dict[str, Any]] = []
     new_calls: list[dict[str, Any]] = []
 
@@ -543,15 +543,15 @@ def test_handler_browser_config_passthrough_dict() -> None:
     assert cfg["default_timezone_id"] == "Europe/Prague"
 
 
-def test_handler_browser_config_legacy_keys_default_runtime_to_playwright() -> None:
+def test_handler_browser_config_legacy_keys_use_new_defaults() -> None:
     from cognis.tools.executor.browser import handlers
 
     metadata = {
         "browser_engine": "chromium",
     }
     cfg = handlers._browser_config(metadata)  # noqa: SLF001
-    assert cfg["runtime"] == "playwright"
-    assert cfg["channel"] is None
+    assert cfg["runtime"] == "patchright"
+    assert cfg["channel"] == "chrome"
     assert cfg["stealth_enabled"] is None  # left for manager default
 
 

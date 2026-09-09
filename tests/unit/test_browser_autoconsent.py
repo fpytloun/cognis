@@ -179,12 +179,12 @@ def test_stage_c_defaults_keep_autoconsent_independent_from_stealth() -> None:
     assert off_manager.fingerprint_hardening is False
 
 
-def test_stage_c_defaults_for_patchright_disabled_by_default() -> None:
+def test_stage_c_defaults_for_patchright_keep_shared_hardening() -> None:
     manager = BrowserManager(runtime="patchright")
-    # Patchright defaults stealth off, but autoconsent still unblocks content.
+    # Patchright uses shared hardening without stacking Playwright Stealth.
     assert manager.auto_consent == "accept"
-    assert manager.humanize_input is False
-    assert manager.fingerprint_hardening is False
+    assert manager.humanize_input is True
+    assert manager.fingerprint_hardening is True
 
 
 @pytest.mark.asyncio

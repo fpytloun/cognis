@@ -58,6 +58,8 @@ function executor(overrides: Partial<ExecutorConfig> = {}): ExecutorConfig {
     executor_id: 'exec-1',
     name: 'Mac Studio',
     executor_type: 'websocket',
+    available: true,
+    unavailable_reason: null,
     labels: {},
     enabled_tools: [],
     enabled_tool_groups: [],
@@ -124,5 +126,18 @@ describe('ExecutorHealthPanel', () => {
 
     expect(screen.getByText('Resource data unavailable')).toBeTruthy();
     expect(screen.getByText('Current hardware details are not available.')).toBeTruthy();
+  });
+
+  it('clearly reports unavailable persisted local executors', () => {
+    render(ExecutorHealthPanel, {
+      executor: executor({
+        executor_type: 'in_process',
+        available: false,
+        unavailable_reason: 'cognis-executor package is not installed; local executors are unavailable'
+      })
+    });
+
+    expect(screen.getByText('Unavailable')).toBeTruthy();
+    expect(screen.getByText(/cognis-executor package is not installed/)).toBeTruthy();
   });
 });

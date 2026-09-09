@@ -32,7 +32,6 @@ def _notification() -> EventAppendNotification:
 @pytest.mark.asyncio
 async def test_listener_fast_path_orders_local_work_before_background_work() -> None:
     calls: list[str] = []
-    mapping: dict[str, tuple[str, int, str]] = {}
     work = AppendInvalidation("token", "authority", 1, True, 1)
     db_started = asyncio.Event()
     db_release = asyncio.Event()
@@ -43,18 +42,8 @@ async def test_listener_fast_path_orders_local_work_before_background_work() -> 
             calls.append("invalidate")
             return work
 
-    class PendingWarms:
-        def put(self, token, value):
-            calls.append("mapping")
-            mapping[token] = value
-            return False
-
-        def __len__(self):
-            return len(mapping)
-
     class Dispatcher:
         def enqueue(self, admitted):
-            assert mapping["token"][1] == 1
             assert admitted is work
             calls.append("dispatcher")
             return True
@@ -71,18 +60,15 @@ async def test_listener_fast_path_orders_local_work_before_background_work() -> 
 
     listener = EventAppendListenerFastPath(
         event_store=EventStore(),
-        pending_warms=PendingWarms(),
         invalidation_dispatcher=Dispatcher(),
         work_materializer=Materializer(),
-        on_mapping_size=lambda _size: None,
-        on_mapping_overflow=lambda: None,
     )
 
     started = perf_counter()
     await listener(_notification())
 
     assert perf_counter() - started < 0.1
-    assert calls == ["invalidate", "mapping", "dispatcher", "work"]
+    assert calls == ["invalidate", "dispatcher", "work"]
     await db_started.wait()
     db_release.set()
     await asyncio.gather(*db_tasks)
@@ -90,21 +76,13 @@ async def test_listener_fast_path_orders_local_work_before_background_work() -> 
 
 @pytest.mark.asyncio
 async def test_work_admission_failure_cannot_suppress_listener_invalidation() -> None:
-    state = SimpleNamespace(invalidated=False, mapped=False, dispatched=False)
+    state = SimpleNamespace(invalidated=False, dispatched=False)
     work = AppendInvalidation("token", "authority", 1, True, 1)
 
     class EventStore:
         def invalidate_append_local(self, _notification):
             state.invalidated = True
             return work
-
-    class PendingWarms:
-        def put(self, _token, _value):
-            state.mapped = True
-            return False
-
-        def __len__(self):
-            return 1
 
     class Dispatcher:
         def enqueue(self, _work):
@@ -117,17 +95,13 @@ async def test_work_admission_failure_cannot_suppress_listener_invalidation() ->
 
     listener = EventAppendListenerFastPath(
         event_store=EventStore(),
-        pending_warms=PendingWarms(),
         invalidation_dispatcher=Dispatcher(),
         work_materializer=Materializer(),
-        on_mapping_size=lambda _size: None,
-        on_mapping_overflow=lambda: None,
     )
 
     await listener(_notification())
 
     assert state.invalidated is True
-    assert state.mapped is True
     assert state.dispatched is True
 
 
@@ -141,13 +115,6 @@ async def test_listener_records_shutdown_rejection(
         def invalidate_append_local(self, _notification):
             return work
 
-    class PendingWarms:
-        def put(self, _token, _value):
-            return False
-
-        def __len__(self):
-            return 1
-
     class Dispatcher:
         def enqueue(self, _work):
             return True
@@ -158,11 +125,8 @@ async def test_listener_records_shutdown_rejection(
 
     listener = EventAppendListenerFastPath(
         event_store=EventStore(),
-        pending_warms=PendingWarms(),
         invalidation_dispatcher=Dispatcher(),
         work_materializer=Materializer(),
-        on_mapping_size=lambda _size: None,
-        on_mapping_overflow=lambda: None,
     )
 
     with caplog.at_level("WARNING"):

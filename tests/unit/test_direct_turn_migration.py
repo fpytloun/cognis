@@ -108,7 +108,9 @@ def _direct_turn_schema(engine: Engine) -> dict[str, Any]:
     }
 
 
-def _assert_direct_turn_schema(schema: dict[str, Any]) -> None:
+def _assert_direct_turn_schema(
+    schema: dict[str, Any], *, include_session_latest_index: bool = False
+) -> None:
     expected_columns = set(DirectTurnRequestRow.__table__.columns.keys())
     assert set(schema["columns"]) == expected_columns
     assert schema["primary_key"] == ("admission_order",)
@@ -154,7 +156,7 @@ def _assert_direct_turn_schema(schema: dict[str, Any]) -> None:
     for name, expected_type in expected_types.items():
         assert schema["columns"][name]["type"] == expected_type
     assert all(column["default"] is None for column in schema["columns"].values())
-    assert schema["indexes"] == {
+    expected_indexes = {
         "ix_direct_turn_requests_fifo": (
             "conversation_id",
             "status",
@@ -170,6 +172,13 @@ def _assert_direct_turn_schema(schema: dict[str, Any]) -> None:
             "next_attempt_at",
         ),
     }
+    if include_session_latest_index:
+        expected_indexes["ix_direct_turn_requests_session_latest"] = (
+            "user_id",
+            "session_id",
+            "admission_order",
+        )
+    assert schema["indexes"] == expected_indexes
     assert schema["unique_columns"] == {
         ("idempotency_scope", "idempotency_key"),
         ("request_id",),
@@ -221,12 +230,12 @@ async def test_direct_turn_bootstrap_matches_migration_schema(tmp_path: Path) ->
     config = Config("cognis/store/migrations/alembic.ini")
     config.set_main_option("sqlalchemy.url", f"sqlite:///{migration_path}")
     with _preserve_logging_state():
-        command.upgrade(config, "123_direct_turn_retry_schedule")
+        command.upgrade(config, "head")
     migration_engine = create_sync_engine(f"sqlite:///{migration_path}")
     try:
         bootstrap_schema = _direct_turn_schema(bootstrap_engine)
         migration_schema = _direct_turn_schema(migration_engine)
-        _assert_direct_turn_schema(bootstrap_schema)
+        _assert_direct_turn_schema(bootstrap_schema, include_session_latest_index=True)
         assert bootstrap_schema == migration_schema
     finally:
         bootstrap_engine.dispose()

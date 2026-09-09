@@ -14,6 +14,14 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from jose import JWTError, jwt
 
 from cognis.models.config import ProviderHealth
+from cognis.providers.memory.evidence import (
+    EvidenceBody,
+    UserEventRememberRequest,
+    canonical_request_hash,
+    derive_evidence_root,
+    evidence_body_dict,
+    user_event_request_hash,
+)
 
 
 def _b64url_uint(value: int) -> str:
@@ -51,7 +59,14 @@ class JWTAuthProvider:
             payload["exp"] = int((now + timedelta(seconds=expires_in)).timestamp())
         return jwt.encode(payload, self._private_key, algorithm="ES256", headers={"kid": self._kid})
 
-    def sign_access_token(self, subject: str, name: str | None, role: str) -> str:
+    def sign_access_token(
+        self,
+        subject: str,
+        name: str | None,
+        role: str,
+        *,
+        auth_version: int = 0,
+    ) -> str:
         return self._sign(
             {
                 "sub": subject,
@@ -59,6 +74,7 @@ class JWTAuthProvider:
                 "role": role,
                 "aud": ["cognis", "intaris", "mnemory"],
                 "typ": "access",
+                "authv": auth_version,
             },
             self.token_ttl_seconds,
         )
@@ -85,6 +101,80 @@ class JWTAuthProvider:
         if agent_owner_email and agent_owner_email != subject:
             payload["aow"] = agent_owner_email
         return self._sign(payload, self.token_ttl_seconds)
+
+    def sign_evidence_jwt(
+        self,
+        body: EvidenceBody,
+        *,
+        now: datetime | float | None = None,
+    ) -> str:
+        """Mint a 60-second, route-confined Mnemory user-event JWT."""
+        return self._sign_user_event_jwt(
+            body,
+            scope="mnemory:evidence",
+            request_hash=canonical_request_hash(body),
+            now=now,
+        )
+
+    def sign_user_event_jwt(
+        self,
+        body: EvidenceBody,
+        *,
+        now: datetime | float | None = None,
+    ) -> str:
+        """Mint a 60-second JWT for shared trusted user-event ingestion."""
+        validated_body = UserEventRememberRequest.model_validate(evidence_body_dict(body))
+        return self._sign_user_event_jwt(
+            validated_body,
+            scope="mnemory:remember:user",
+            request_hash=user_event_request_hash(validated_body),
+            now=now,
+        )
+
+    def _sign_user_event_jwt(
+        self,
+        body: EvidenceBody,
+        *,
+        scope: str,
+        request_hash: str,
+        now: datetime | float | None,
+    ) -> str:
+        """Mint one body-bound Mnemory user-event JWT."""
+        body_dict = evidence_body_dict(body)
+        actor = body_dict["actor"]
+        event = body_dict["event"]
+        issued_at = (
+            int(now.timestamp())
+            if isinstance(now, datetime)
+            else int(now)
+            if now is not None
+            else int(datetime.now(UTC).timestamp())
+        )
+        subject = actor["user_id"]
+        owner = actor["owner_id"]
+        claims: dict[str, Any] = {
+            "iss": "cognis",
+            "aud": "mnemory",
+            "typ": "user_event",
+            "scope": scope,
+            "evop": "remember",
+            "ver": 1,
+            "sub": subject,
+            "aow": owner,
+            "evt": event["id"],
+            "event_hash": event["event_hash"],
+            "request_hash": request_hash,
+            "evidence_root": derive_evidence_root(body_dict),
+            "cognis_session_id": event["cognis_session_id"],
+            "conversation_id": event["conversation_id"],
+            "turn_id": event["turn_id"],
+            "jti": uuid.uuid4().hex,
+            "iat": issued_at,
+            "nbf": issued_at,
+            "exp": issued_at + 60,
+        }
+        claims["aow"] = owner
+        return jwt.encode(claims, self._private_key, algorithm="ES256", headers={"kid": self._kid})
 
     def sign_executor_token(
         self,

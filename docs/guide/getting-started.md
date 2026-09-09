@@ -112,8 +112,12 @@ Once basic chat is working, the next useful areas are:
 
 Cognis publishes two container images:
 
-- `ghcr.io/fpytloun/cognis` for the controller and bundled web UI
+- `ghcr.io/fpytloun/cognis` for the remote-only controller and bundled web UI
 - `ghcr.io/fpytloun/cognis-executor` for a remote WebSocket executor with browser, coding, shell, search, and LSP tooling
+
+The controller image cannot execute host tools. It must connect the executor
+image as an external or sidecar process. Persisted local executor rows remain
+unavailable until an executor package/process is installed and connected.
 
 Run the controller with a persistent data volume:
 

@@ -22,6 +22,41 @@ Instead, Cognis uses reference-style values such as `value_ref` identifiers. The
 
 This gives agents enough information to complete a task without leaking API keys, passwords, browser storage state, or token values into prompt text.
 
+## Password login and TOTP MFA
+
+The `security.mfa_policy` system setting accepts `optional` or `required`.
+The default is `optional`.
+
+- With `optional`, users without a factor can sign in with a password.
+- Enrolled users must always supply a TOTP or one-time recovery code.
+- With `required`, the first password login forces TOTP enrollment before Cognis creates a session.
+
+The policy applies to the next password login. Existing browser and native
+sessions remain valid. A normal refresh of an existing session does not become
+a new MFA prompt.
+
+Cognis supports standard 6-digit, 30-second, SHA-1 TOTP authenticator apps.
+The enrollment QR code is rendered locally. Save the recovery codes when Cognis
+shows them because each code is shown once and works once.
+
+An optional-policy user can disable MFA from Account Settings. Disabling MFA or
+regenerating recovery codes requires the current password and a current TOTP or
+recovery code. Required-policy users cannot disable MFA.
+
+If a user loses all factors, run this local command on the controller host:
+
+```bash
+cognis-controller admin reset-mfa user@example.com
+```
+
+This command removes the factor and revokes the user's browser and native
+sessions. Under the required policy, the next password login forces enrollment.
+There is no remote administrator bypass.
+
+WebAuthn and passkeys are intentionally deferred. The challenge responses
+include a method discriminator so a future release can add another method
+without changing the password-login contract.
+
 ## What the LLM can still see
 
 The LLM receives the prompt, user-visible conversation context, tool schemas, selected memory/context, and tool results that Cognis intentionally exposes for the turn. It should not receive raw secrets, but it may receive content returned by tools, web pages, files, or MCP servers.
@@ -48,6 +83,13 @@ Use remote WebSocket executors when:
 - you want disposable cloud workers for stateless tasks
 
 For shared deployments, disable in-process and subprocess executors and use only WebSocket executors.
+
+The official controller image and a plain `pip install cognis-controller` do not
+contain the executor package. They cannot execute host tools, and persisted
+local executor rows remain unavailable until a compatible
+`cognis-executor[full]` process is installed and connected. Treat a sidecar or
+external executor as the security boundary that owns shells, files, browsers,
+credentials, and local network access.
 
 ## Guardrails and approvals
 

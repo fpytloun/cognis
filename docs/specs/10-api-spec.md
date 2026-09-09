@@ -169,6 +169,29 @@ updates and `GET /api/v1/chat/v2/conversations/:id/timeline?before=...` for
 older scrollback pages. The controller reads Intaris event streams and projects
 strict Chat v2 timeline items; clients must treat the cursor as opaque.
 
+#### Canonical Work activity list
+
+```http
+GET /api/v1/work/activities?limit=20&cursor=<opaque>
+```
+
+The endpoint returns one item for each authorized `activity_scope_id`. It orders
+items by `last_activity_at DESC, activity_scope_id DESC`. The signed cursor is
+owner-bound. Clients must treat it as opaque. Invalid, modified, or cross-owner
+cursors return `409 cursor_invalid`.
+
+Each item includes a server-derived `scope`. Use this complete `TimelineScope`
+to open the existing Work endpoints. Do not authorize or construct a Work view
+from `activity_scope_id` alone. Reset conversation activities use a `session`
+scope rooted at the canonical activity root. Task activities use the latest
+authorized, non-superseded `task_step` scope.
+
+The list reads only canonical Cognis metadata. It does not read Intaris, recover
+the Work graph, admit materialization, or create Work cache rows. If an active
+ready generation exists, `summary` contains immutable snapshot counters and
+`materialization` is `ready`. Otherwise, `summary` is `null` and
+`materialization` is `absent`. Opening the activity can start recovery.
+
 Message records may include lane metadata:
 
 ```json
@@ -915,6 +938,17 @@ JSON-RPC protocol specification.
 | `rate_limited` | 429 | Too many requests |
 | `provider_error` | 502 | Upstream provider error |
 | `internal_error` | 500 | Server error |
+
+## Conversation Sidebar Projection
+
+`GET /api/v1/conversations/sidebar` supports full snapshots and
+`changed_since` deltas. Full responses include `background_work` and set
+`background_work_changed=true`. A delta may omit unchanged expensive sections:
+when background work has not changed, it returns `background_work=null` with
+`background_work_changed=false`; clients must preserve their cached projection
+rather than clearing it. Changed background work is returned in full with the
+flag set. Delta responses likewise omit unchanged agent/context catalogs and
+contain only changed conversation/direct-chat rows plus tombstones.
 
 ## Pagination
 

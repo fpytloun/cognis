@@ -12,9 +12,12 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Query, Request
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
+from cognis.api.attention_actions import list_attention_rows_by_task, project_attention_summary
+from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.common import (
     api_exception,
     check_agent_access,
@@ -37,6 +40,7 @@ from cognis.api.models import (
     TaskBoardColumnResponse,
     TaskBoardDoneGroupResponse,
     TaskBoardItemResponse,
+    TaskBoardProgressSummaryResponse,
     TaskBoardResponse,
     TaskChatResponse,
     TaskCommentCreateRequest,
@@ -84,7 +88,13 @@ from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
 from cognis.runtime_context import RuntimeAccessContext, scoped_runtime_context
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
-from cognis.store.models import DeliverableRow, StepRun, Task
+from cognis.store.models import (
+    DeliverableRow,
+    StepRun,
+    Task,
+    WorkCurrentFileRow,
+    WorkSessionProjectionRow,
+)
 from cognis.store.queries import (
     add_task_dependency,
     claim_task_control_conversation,
@@ -106,6 +116,7 @@ from cognis.store.queries import (
     list_step_runs_for_task,
     list_step_runs_for_task_projection,
     list_task_comments,
+    mark_conversation_read,
     mark_task_control_conversation_ready,
     remove_task_dependency,
     set_conversation_status,
@@ -159,18 +170,23 @@ def _decode_offset_cursor(cursor: str | None) -> int:
         raise api_exception(400, "invalid_cursor", "Invalid cursor") from exc
 
 
-def _encode_task_cursor(row: Task) -> str:
+def _encode_task_cursor(row: Task, *, scope: dict[str, Any] | None = None) -> str:
     updated_at = row.updated_at or row.created_at
     payload = {
         "updated_at": updated_at.isoformat() if updated_at else "",
         "task_id": row.task_id,
+        "scope": scope or {},
     }
     return base64.urlsafe_b64encode(
         json.dumps(payload, separators=(",", ":")).encode("utf-8")
     ).decode("ascii")
 
 
-def _decode_task_cursor(cursor: str | None) -> tuple[datetime, str] | None:
+def _decode_task_cursor(
+    cursor: str | None,
+    *,
+    scope: dict[str, Any] | None = None,
+) -> tuple[datetime, str] | None:
     if cursor is None:
         return None
     try:
@@ -179,6 +195,8 @@ def _decode_task_cursor(cursor: str | None) -> tuple[datetime, str] | None:
         updated_at_raw = payload["updated_at"]
         task_id = payload["task_id"]
         if not isinstance(updated_at_raw, str) or not isinstance(task_id, str):
+            raise ValueError
+        if payload.get("scope", {}) != (scope or {}):
             raise ValueError
         return datetime.fromisoformat(updated_at_raw), task_id
     except Exception as exc:
@@ -238,7 +256,18 @@ def _decode_done_group_key(group_key: str) -> dict[str, str | None]:
         raise api_exception(400, "invalid_group_key", "Invalid done group key") from exc
 
 
-def _task_board_item_response(row: Task) -> TaskBoardItemResponse:
+def _task_board_item_response(
+    row: Task,
+    *,
+    progress_summary: TaskBoardProgressSummaryResponse | None = None,
+    attention_actions: list[Any] | None = None,
+) -> TaskBoardItemResponse:
+    workflow_state = row.workflow_state or {}
+    attention_type = (
+        str(workflow_state.get("pending_pause_type") or "").strip() or None
+        if row.status == "paused"
+        else None
+    )
     return TaskBoardItemResponse(
         task_id=row.task_id,
         title=row.title,
@@ -254,7 +283,166 @@ def _task_board_item_response(row: Task) -> TaskBoardItemResponse:
         completed_at=row.completed_at,
         updated_at=row.updated_at,
         result_summary=row.result_summary,
+        attention_type=attention_type,
+        attention_actions=attention_actions or [],
+        progress_summary=progress_summary,
     )
+
+
+def _todo_counts(step_runs: list[StepRun]) -> tuple[int, int, int]:
+    total = completed = in_progress = 0
+    for row in step_runs:
+        if row.superseded_by_step_run_id is not None:
+            continue
+        for item in row.todos or []:
+            if not isinstance(item, dict) or not str(item.get("content") or "").strip():
+                continue
+            total += 1
+            status = str(item.get("status") or "pending")
+            if status == "completed":
+                completed += 1
+            elif status == "in_progress":
+                in_progress += 1
+    return total, completed, in_progress
+
+
+async def _task_board_progress_summaries(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    task_ids: list[str],
+) -> dict[str, TaskBoardProgressSummaryResponse]:
+    """Load compact progress for selected owned tasks with two bounded batched queries."""
+
+    selected_ids = list(dict.fromkeys(task_ids))[:5]
+    if not selected_ids:
+        return {}
+
+    step_rows = list(
+        (
+            await session.execute(
+                select(StepRun)
+                .join(Task, Task.task_id == StepRun.task_id)
+                .options(
+                    load_only(
+                        StepRun.task_id,
+                        StepRun.step_run_id,
+                        StepRun.step_name,
+                        StepRun.status,
+                        StepRun.superseded_by_step_run_id,
+                        StepRun.todos,
+                        StepRun.updated_at,
+                    )
+                )
+                .where(
+                    Task.created_by == owner_email,
+                    Task.task_id.in_(selected_ids),
+                    StepRun.superseded_by_step_run_id.is_(None),
+                )
+                .order_by(
+                    StepRun.task_id.asc(),
+                    StepRun.updated_at.desc(),
+                    StepRun.step_run_id.desc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    runs_by_task: dict[str, list[StepRun]] = {task_id: [] for task_id in selected_ids}
+    for row in step_rows:
+        runs_by_task.setdefault(row.task_id, []).append(row)
+
+    session_tasks = (
+        select(StepRun.task_id, StepRun.session_id)
+        .join(Task, Task.task_id == StepRun.task_id)
+        .where(
+            Task.created_by == owner_email,
+            Task.task_id.in_(selected_ids),
+            StepRun.superseded_by_step_run_id.is_(None),
+            StepRun.session_id.is_not(None),
+        )
+        .distinct()
+        .subquery("dashboard_task_sessions")
+    )
+    projection_summary = (
+        select(
+            session_tasks.c.task_id,
+            func.coalesce(func.sum(WorkSessionProjectionRow.additions), 0).label("additions"),
+            func.coalesce(func.sum(WorkSessionProjectionRow.deletions), 0).label("deletions"),
+        )
+        .join(
+            WorkSessionProjectionRow,
+            and_(
+                WorkSessionProjectionRow.session_id == session_tasks.c.session_id,
+                WorkSessionProjectionRow.owner_email == owner_email,
+                WorkSessionProjectionRow.materializer_version == WORK_MATERIALIZER_VERSION,
+            ),
+        )
+        .group_by(session_tasks.c.task_id)
+        .subquery("dashboard_task_diff")
+    )
+    file_summary = (
+        select(
+            session_tasks.c.task_id,
+            func.count(func.distinct(WorkCurrentFileRow.path_id)).label("changed_files"),
+        )
+        .join(
+            WorkCurrentFileRow,
+            and_(
+                WorkCurrentFileRow.session_id == session_tasks.c.session_id,
+                WorkCurrentFileRow.owner_email == owner_email,
+                WorkCurrentFileRow.materializer_version == WORK_MATERIALIZER_VERSION,
+                WorkCurrentFileRow.state.not_in(["delete", "deleted", "removed"]),
+            ),
+        )
+        .group_by(session_tasks.c.task_id)
+        .subquery("dashboard_task_files")
+    )
+    diff_rows = list(
+        (
+            await session.execute(
+                select(
+                    projection_summary.c.task_id,
+                    projection_summary.c.additions,
+                    projection_summary.c.deletions,
+                    func.coalesce(file_summary.c.changed_files, 0).label("changed_files"),
+                ).outerjoin(
+                    file_summary,
+                    file_summary.c.task_id == projection_summary.c.task_id,
+                )
+            )
+        ).all()
+    )
+    diff_by_task = {
+        str(row.task_id): (
+            int(row.changed_files or 0),
+            int(row.additions or 0),
+            int(row.deletions or 0),
+        )
+        for row in diff_rows
+    }
+
+    summaries: dict[str, TaskBoardProgressSummaryResponse] = {}
+    for task_id in selected_ids:
+        runs = runs_by_task.get(task_id, [])
+        current = next(
+            (row for row in runs if row.status in {"running", "evaluating", "waiting"}),
+            runs[0] if runs else None,
+        )
+        total, completed, in_progress = _todo_counts(runs)
+        changed_files, additions, deletions = diff_by_task.get(task_id, (0, 0, 0))
+        summaries[task_id] = TaskBoardProgressSummaryResponse(
+            todo_total=total,
+            todo_completed=completed,
+            todo_in_progress=in_progress,
+            current_step_name=current.step_name if current is not None else None,
+            current_step_status=current.status if current is not None else None,
+            changed_files=changed_files,
+            additions=additions,
+            deletions=deletions,
+        )
+    return summaries
 
 
 def _task_filter_conditions(
@@ -287,9 +475,17 @@ def _task_filter_conditions(
         conditions.append(Task.project_id == project_id)
     if workflow_id is not None:
         conditions.append(Task.workflow_id == workflow_id)
-    if q:
-        pattern = f"%{q.strip()}%"
-        conditions.append(or_(Task.title.ilike(pattern), Task.description.ilike(pattern)))
+    normalized_query = (q or "").strip()
+    if normalized_query:
+        conditions.append(
+            or_(
+                Task.task_id.icontains(normalized_query, autoescape=True),
+                Task.title.icontains(normalized_query, autoescape=True),
+                Task.description.icontains(normalized_query, autoescape=True),
+                Task.result_summary.icontains(normalized_query, autoescape=True),
+                Task.workflow_id.icontains(normalized_query, autoescape=True),
+            )
+        )
     return conditions
 
 
@@ -456,6 +652,7 @@ async def _fetch_task_page(
     project_id: str | None = None,
     workflow_id: str | None = None,
     q: str | None = None,
+    require_attention: bool = False,
 ) -> tuple[list[Task], str | None, bool, int]:
     conditions = _task_filter_conditions(
         user_email=user_email,
@@ -468,7 +665,20 @@ async def _fetch_task_page(
         workflow_id=workflow_id,
         q=q,
     )
-    decoded_cursor = _decode_task_cursor(cursor)
+    if require_attention:
+        conditions.append(Task.workflow_state["pending_pause_type"].as_string().is_not(None))
+    cursor_scope = {
+        "statuses": list(statuses or ()),
+        "status": status or "",
+        "agent_id": agent_id or "",
+        "queue": queue or "",
+        "priority": priority,
+        "project_id": project_id or "",
+        "workflow_id": workflow_id or "",
+        "q": (q or "").strip().casefold(),
+        "require_attention": require_attention,
+    }
+    decoded_cursor = _decode_task_cursor(cursor, scope=cursor_scope)
     page_conditions = list(conditions)
     if decoded_cursor is not None:
         cursor_updated_at, cursor_task_id = decoded_cursor
@@ -489,7 +699,9 @@ async def _fetch_task_page(
     total_count = int(count_result.scalar_one() or 0)
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    next_cursor = _encode_task_cursor(page_rows[-1]) if has_more and page_rows else None
+    next_cursor = (
+        _encode_task_cursor(page_rows[-1], scope=cursor_scope) if has_more and page_rows else None
+    )
     return page_rows, next_cursor, has_more, total_count
 
 
@@ -567,7 +779,17 @@ async def _fetch_done_group_page(
         .join(ranked, ranked.c.task_id == Task.task_id)
         .where(ranked.c.rank == 1)
     )
-    decoded_cursor = _decode_task_cursor(cursor)
+    cursor_scope = {
+        "statuses": list(statuses),
+        "status": status or "",
+        "agent_id": agent_id or "",
+        "queue": queue or "",
+        "priority": priority,
+        "project_id": project_id or "",
+        "workflow_id": workflow_id or "",
+        "q": (q or "").strip().casefold(),
+    }
+    decoded_cursor = _decode_task_cursor(cursor, scope=cursor_scope)
     if decoded_cursor is not None:
         cursor_updated_at, cursor_task_id = decoded_cursor
         latest_rows = latest_rows.where(
@@ -586,7 +808,11 @@ async def _fetch_done_group_page(
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    next_cursor = _encode_task_cursor(page_rows[-1][0]) if has_more and page_rows else None
+    next_cursor = (
+        _encode_task_cursor(page_rows[-1][0], scope=cursor_scope)
+        if has_more and page_rows
+        else None
+    )
     return page_rows, next_cursor, has_more, total_count
 
 
@@ -635,7 +861,18 @@ async def _fetch_done_group_task_page(
     )
     conditions.extend(_done_group_identity_conditions(group))
     page_conditions = list(conditions)
-    decoded_cursor = _decode_task_cursor(cursor)
+    cursor_scope = {
+        "statuses": list(statuses),
+        "status": status or "",
+        "agent_id": agent_id or "",
+        "queue": queue or "",
+        "priority": priority,
+        "project_id": project_id or "",
+        "workflow_id": workflow_id or "",
+        "q": (q or "").strip().casefold(),
+        "group_key": group_key,
+    }
+    decoded_cursor = _decode_task_cursor(cursor, scope=cursor_scope)
     if decoded_cursor is not None:
         cursor_updated_at, cursor_task_id = decoded_cursor
         page_conditions.append(
@@ -655,7 +892,9 @@ async def _fetch_done_group_task_page(
     total_count = int(count_result.scalar_one() or 0)
     has_more = len(rows) > limit
     page_rows = rows[:limit]
-    next_cursor = _encode_task_cursor(page_rows[-1]) if has_more and page_rows else None
+    next_cursor = (
+        _encode_task_cursor(page_rows[-1], scope=cursor_scope) if has_more and page_rows else None
+    )
     return page_rows, next_cursor, has_more, total_count
 
 
@@ -744,7 +983,7 @@ async def task_list(
     priority: int | None = None,
     project_id: str | None = None,
     workflow_id: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(default=None, max_length=200),
 ) -> CursorPage[TaskResponse]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
@@ -775,7 +1014,11 @@ async def task_board(
     priority: int | None = None,
     project_id: str | None = None,
     workflow_id: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(default=None, max_length=200),
+    include_progress_summary: bool = False,
+    progress_limit: int = Query(default=5, ge=1, le=5),
+    attention_only: bool = False,
+    include_attention_actions: bool = Query(default=False),
 ) -> TaskBoardResponse:
     user = require_current_user(request)
     columns: dict[str, TaskBoardColumnResponse] = {}
@@ -819,13 +1062,48 @@ async def task_board(
                 project_id=project_id,
                 workflow_id=workflow_id,
                 q=q,
+                require_attention=attention_only and column_id == "paused",
+            )
+            progress_summaries = (
+                await _task_board_progress_summaries(
+                    session,
+                    owner_email=user.email,
+                    task_ids=[row.task_id for row in rows[:progress_limit]],
+                )
+                if include_progress_summary and column_id == "running"
+                else {}
             )
             columns[column_id] = TaskBoardColumnResponse(
-                items=[_task_board_item_response(row) for row in rows],
+                items=[
+                    _task_board_item_response(
+                        row,
+                        progress_summary=progress_summaries.get(row.task_id),
+                    )
+                    for row in rows
+                ],
                 cursor=next_cursor,
                 has_more=has_more,
                 total_count=total_count,
             )
+        if include_attention_actions:
+            task_ids = [item.task_id for column in columns.values() for item in column.items]
+            attention_rows = await list_attention_rows_by_task(
+                session,
+                owner_email=user.email,
+                task_ids=task_ids,
+            )
+            can_mutate = user.role != "viewer"
+            for column in columns.values():
+                for item in column.items:
+                    item.attention_actions = [
+                        project_attention_summary(row, can_mutate=can_mutate)
+                        for row in attention_rows.get(item.task_id, [])
+                    ]
+                for group in column.groups:
+                    group.latest.attention_actions = [
+                        project_attention_summary(row, can_mutate=can_mutate)
+                        for row in attention_rows.get(group.latest.task_id, [])
+                    ]
     return TaskBoardResponse(columns=columns)
 
 
@@ -841,7 +1119,8 @@ async def task_board_column(
     priority: int | None = None,
     project_id: str | None = None,
     workflow_id: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(default=None, max_length=200),
+    include_attention_actions: bool = Query(default=False),
 ) -> TaskBoardColumnResponse:
     user = require_current_user(request)
     column_statuses = _TASK_BOARD_COLUMN_STATUSES.get(column_id)
@@ -865,13 +1144,30 @@ async def task_board_column(
                 workflow_id=workflow_id,
                 q=q,
             )
-            return TaskBoardColumnResponse(
+            response = TaskBoardColumnResponse(
                 items=[_task_board_item_response(row[0]) for row in group_rows],
                 groups=[_done_group_response(row) for row in group_rows],
                 cursor=next_cursor,
                 has_more=has_more,
                 total_count=total_count,
             )
+            if include_attention_actions:
+                attention_rows = await list_attention_rows_by_task(
+                    session,
+                    owner_email=user.email,
+                    task_ids=[item.task_id for item in response.items],
+                )
+                for item in response.items:
+                    item.attention_actions = [
+                        project_attention_summary(row, can_mutate=user.role != "viewer")
+                        for row in attention_rows.get(item.task_id, [])
+                    ]
+                for group in response.groups:
+                    group.latest.attention_actions = [
+                        project_attention_summary(row, can_mutate=user.role != "viewer")
+                        for row in attention_rows.get(group.latest.task_id, [])
+                    ]
+            return response
         rows, next_cursor, has_more, total_count = await _fetch_task_page(
             session,
             user_email=user.email,
@@ -885,8 +1181,26 @@ async def task_board_column(
             workflow_id=workflow_id,
             q=q,
         )
+        attention_rows = (
+            await list_attention_rows_by_task(
+                session,
+                owner_email=user.email,
+                task_ids=[row.task_id for row in rows],
+            )
+            if include_attention_actions
+            else {}
+        )
     return TaskBoardColumnResponse(
-        items=[_task_board_item_response(row) for row in rows],
+        items=[
+            _task_board_item_response(
+                row,
+                attention_actions=[
+                    project_attention_summary(action_row, can_mutate=user.role != "viewer")
+                    for action_row in attention_rows.get(row.task_id, [])
+                ],
+            )
+            for row in rows
+        ],
         cursor=next_cursor,
         has_more=has_more,
         total_count=total_count,
@@ -908,7 +1222,7 @@ async def task_board_done_group_tasks(
     priority: int | None = None,
     project_id: str | None = None,
     workflow_id: str | None = None,
-    q: str | None = None,
+    q: str | None = Query(default=None, max_length=200),
 ) -> CursorPage[TaskBoardItemResponse]:
     user = require_current_user(request)
     effective_statuses = _effective_column_statuses(_TASK_BOARD_COLUMN_STATUSES["done"], status)
@@ -1399,6 +1713,8 @@ async def task_control_chat(request: Request, task_id: str) -> TaskControlChatRe
                     task_id,
                     candidate_id,
                 )
+                if finalized:
+                    await mark_conversation_read(session, candidate_id)
                 await session.commit()
             if not finalized:
                 await request.app.state.session_manager.soft_delete_conversation(candidate_id)
@@ -1776,6 +2092,25 @@ async def task_comment_create(
     forbid_mutation_for_viewer(request)
     user = require_current_user(request)
     task = await _require_task(request, task_id)
+    revision_metadata: dict[str, Any] | None = None
+    if payload.intent == "request_revision":
+        assert payload.expected_attempt is not None
+        try:
+            revised = await request.app.state.task_queue.request_revision(
+                task.task_id,
+                target_step=payload.target_step,
+                instruction=payload.body,
+                expected_attempt=payload.expected_attempt,
+            )
+        except (RuntimeError, ValueError) as exc:
+            raise api_exception(409, "conflict", str(exc)) from exc
+        revision_metadata = dict(payload.metadata)
+        revision_metadata["action_result"] = {
+            "new_attempt": revised.attempt_number,
+            "target_step": revised.target_step,
+            "superseded_count": revised.superseded_count,
+            "relaunched": revised.relaunched,
+        }
     async with request.app.state.session_factory() as session:
         row = await create_task_comment(
             session,
@@ -1783,18 +2118,22 @@ async def task_comment_create(
             author_email=user.email,
             body=payload.body,
             intent=payload.intent,
-            noop=payload.noop,
+            noop=False if revision_metadata is not None else payload.noop,
             target_step=payload.target_step,
-            attempt_number=task.attempt_number,
-            metadata=payload.metadata,
+            attempt_number=(
+                payload.expected_attempt
+                if revision_metadata is not None and payload.expected_attempt is not None
+                else task.attempt_number or 1
+            ),
+            metadata=revision_metadata if revision_metadata is not None else payload.metadata,
         )
+        if revision_metadata is not None:
+            await update_task_comment(session, row.comment_id, applied=True)
         await session.commit()
         await session.refresh(row)
     applied = False
     if payload.intent == "answer_pause":
         applied = await _apply_answer_pause_comment(request, task, row.comment_id, payload)
-    elif payload.intent == "request_revision":
-        applied = await _apply_request_revision_comment(request, task, row.comment_id, payload)
     if applied:
         async with request.app.state.session_factory() as session:
             updated = await get_task_comment(session, row.comment_id)
@@ -2196,6 +2535,11 @@ def _continuation_context_event(content: str, *, source: str) -> SessionEvent:
             "content_type": "text",
             "source": source,
             "intention_eligible": False,
+            "prompt_visibility": "model_only",
+            "prompt_provenance": {
+                "kind": "internal_workflow_prompt",
+                "source": source,
+            },
         },
     )
 
@@ -2223,19 +2567,41 @@ async def _task_final_deliverable_content(
     final_deliverable_id = result_data.get("final_deliverable_id")
     if isinstance(final_deliverable_id, str) and final_deliverable_id:
         row = await get_deliverable(session, final_deliverable_id)
-        if row is not None:
+        step_run = (
+            await get_step_run(session, row.step_run_id)
+            if row is not None and row.step_run_id is not None
+            else None
+        )
+        if (
+            row is not None
+            and step_run is not None
+            and step_run.task_id == task.task_id
+            and step_run.attempt_number == task.attempt_number
+            and row.attempt_number == task.attempt_number
+        ):
             summary = result_data.get("final_content_summary")
             if not isinstance(summary, str):
                 summary = result_data.get("final_channel_content")
             return _recoverable_snippet(summary or "", limit=2000), row.deliverable_id
     final_content = result_data.get("final_content")
     if isinstance(final_content, str) and final_content:
-        return _recoverable_snippet(final_content, limit=2000), final_deliverable_id if isinstance(
-            final_deliverable_id, str
-        ) else None
+        return _recoverable_snippet(final_content, limit=2000), None
     for deliverables in reversed(list(deliverables_by_step_run.values())):
-        if deliverables:
-            row = deliverables[0]
+        for row in deliverables:
+            if str(getattr(row, "status", "")) not in {"approved", "delivered"}:
+                continue
+            step_run = (
+                await get_step_run(session, row.step_run_id)
+                if row.step_run_id is not None
+                else None
+            )
+            if (
+                step_run is None
+                or step_run.task_id != task.task_id
+                or step_run.attempt_number != task.attempt_number
+                or row.attempt_number != task.attempt_number
+            ):
+                continue
             return _recoverable_snippet(
                 getattr(row, "title", "") or "", limit=2000
             ), row.deliverable_id
@@ -2439,9 +2805,12 @@ async def _apply_answer_pause_comment(
         elif state.pending_pause_type == "step_input":
             pending_pause = task_pending_pause_response(request.app.state.pause_waiter, task)
             questions = pending_pause.questions if pending_pause is not None else []
+            question_payloads = [
+                question.model_dump(mode="python") for question in (questions or [])
+            ]
             await respond_task_input(
                 task=task,
-                reply=plain_text_reply_for_questions(payload.body, questions),
+                reply=plain_text_reply_for_questions(payload.body, question_payloads),
                 pause_waiter=request.app.state.pause_waiter,
                 notification_service=getattr(request.app.state, "notification_service", None),
                 task_queue=request.app.state.task_queue,
@@ -2450,26 +2819,6 @@ async def _apply_answer_pause_comment(
             )
         else:
             return False
-    except (RuntimeError, ValueError):
-        return False
-    async with request.app.state.session_factory() as session:
-        await update_task_comment(session, comment_id, applied=True)
-        await session.commit()
-    return True
-
-
-async def _apply_request_revision_comment(
-    request: Request,
-    task: TaskModel,
-    comment_id: str,
-    payload: TaskCommentCreateRequest,
-) -> bool:
-    try:
-        await request.app.state.task_queue.request_revision(
-            task.task_id,
-            target_step=payload.target_step,
-            instruction=payload.body,
-        )
     except (RuntimeError, ValueError):
         return False
     async with request.app.state.session_factory() as session:

@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "id": "weekend-schedule",
+  "title": "Weekend plan: slow outdoors, one reservation, one fallback",
+  "description": "A warm two-day plan that balances weather, shared time, logistics, and a practical indoor alternative.",
+  "group": "planning",
+  "sort_key": 1600,
+  "content": "Weekend plan with a weather-aware Saturday and Sunday agenda, logistics, fallback, preparation, costs, and sources.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Weekend planning · sample",
+      "subtitle": "Synthetic itinerary for two adults and one child · refreshed Friday 18:00 CEST",
+      "density": "comfortable",
+      "badges": ["Weather-aware", "One reservation", "Indoor fallback"]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Saturday 12 – Sunday 13 September",
+        "title": "Keep the weekend light enough to enjoy",
+        "subtitle": "A garden afternoon anchors Saturday. Sunday stays local, flexible, and dry-first.",
+        "tags": ["Planning sample", "CEST", "No map"],
+        "media": {
+          "artifact_id": "fixture-weekend-garden",
+          "src": "/fixtures/rich-scenarios/weekend-schedule/weekend-garden.svg",
+          "alt": "Warm garden illustration with a picnic blanket, trees, and afternoon sun",
+          "credit": "Cognis local fixture · original SVG illustration",
+          "source_url": "https://example.test/fixtures/weekend-garden",
+          "width": 1600,
+          "height": 900
+        }
+      },
+      {
+        "type": "dashboard",
+        "blocks": [
+          {"type": "metric", "icon": "cloud-sun", "label": "Saturday", "value": "21 °C", "delta": "Dry until 17:00 · 15% rain"},
+          {"type": "metric", "icon": "cloud-rain", "label": "Sunday", "value": "18 °C", "delta": "Showers after 14:00 · 55% rain"},
+          {"type": "metric", "icon": "clock", "label": "Pace", "value": "2 anchors", "delta": "One booked table, no packed route"},
+          {"type": "metric", "icon": "wallet", "label": "Plan cost", "value": "2,050 Kč", "delta": "Includes 15% buffer"}
+        ]
+      },
+      {
+        "type": "section",
+        "eyebrow": "Saturday",
+        "title": "Outdoor day with a clear finish line",
+        "blocks": [
+          {
+            "type": "day_agenda",
+            "title": "Saturday agenda",
+            "date": "2026-09-12",
+            "timezone": "Europe/Prague",
+            "now": "2026-09-11T18:00:00+02:00",
+            "source": {"label": "Synthetic calendar fixture", "url": "https://example.test/fixtures/weekend-calendar", "refreshed_at": "2026-09-11T18:00:00+02:00"},
+            "items": [
+              {"start": "2026-09-12T09:30:00+02:00", "end": "2026-09-12T10:15:00+02:00", "title": "Coffee and bakery pickup", "location": "Neighbourhood bakery", "description": "Walkable pickup; leave the car at home."},
+              {"start": "2026-09-12T11:30:00+02:00", "end": "2026-09-12T14:30:00+02:00", "title": "Garden lunch and play", "location": "Friends' garden", "description": "Bring the picnic blanket and spare layer."},
+              {"start": "2026-09-12T16:30:00+02:00", "end": "2026-09-12T18:00:00+02:00", "title": "Early supper", "location": "Moss & Salt", "description": "Table held for three; release by 16:20."}
+            ],
+            "tasks": [
+              {"title": "Confirm the table by 10:00", "due": "2026-09-12T10:00:00+02:00", "priority": "high"},
+              {"title": "Pack rain jackets in the stroller basket", "due": "2026-09-12T09:00:00+02:00"}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "eyebrow": "Sunday",
+        "title": "Local morning, flexible afternoon",
+        "blocks": [
+          {
+            "type": "day_agenda",
+            "title": "Sunday agenda",
+            "date": "2026-09-13",
+            "timezone": "Europe/Prague",
+            "now": "2026-09-11T18:00:00+02:00",
+            "items": [
+              {"start": "2026-09-13T10:00:00+02:00", "end": "2026-09-13T11:30:00+02:00", "title": "Market and riverside walk", "location": "Town centre", "description": "Go before the forecast turns unsettled."},
+              {"start": "2026-09-13T12:30:00+02:00", "end": "2026-09-13T13:30:00+02:00", "title": "Lunch at home", "description": "Use Saturday leftovers and the market bread."},
+              {"start": "2026-09-13T15:00:00+02:00", "end": "2026-09-13T16:30:00+02:00", "title": "Decision window", "description": "Choose the indoor fallback if rain begins or everyone needs a reset."}
+            ]
+          }
+        ]
+      },
+      {
+        "type": "columns",
+        "blocks": [
+          {
+            "type": "card",
+            "variant": "status",
+            "tone": "success",
+            "eyebrow": "Reservation & logistics",
+            "title": "Moss & Salt · Saturday 16:30",
+            "summary": "Confirmed fixture booking for three; stroller space requested.",
+            "content": "Allow 20 minutes to walk back from the garden. Keep the booking message saved. The restaurant is the only fixed paid commitment."
+          },
+          {
+            "type": "card",
+            "variant": "action",
+            "tone": "warning",
+            "eyebrow": "Indoor fallback",
+            "title": "Library makers' room, Sunday 15:00",
+            "summary": "Use only if showers arrive or the group needs a quieter plan.",
+            "content": "Bring the membership card and one small craft kit. Cancel the room without cost before 14:30."
+          }
+        ]
+      },
+      {
+        "type": "section",
+        "title": "Prepare once, then stop planning",
+        "blocks": [
+          {
+            "type": "checklist",
+            "title": "Friday evening checklist",
+            "checklist": [
+              {"label": "Charge phone and compact speaker", "checked": false},
+              {"label": "Put picnic blanket, cups, and wipes by the door", "checked": false},
+              {"label": "Set out rain jackets and spare socks", "checked": false},
+              {"label": "Move Sunday leftovers to the front shelf", "checked": false}
+            ]
+          },
+          {
+            "type": "table",
+            "title": "Cost envelope",
+            "columns": [{"key": "item", "label": "Item"}, {"key": "estimate", "label": "Estimate"}, {"key": "note", "label": "Note"}],
+            "rows": [
+              {"item": "Bakery and market", "estimate": "520 Kč", "note": "Breakfast and Sunday bread"},
+              {"item": "Garden contribution", "estimate": "380 Kč", "note": "Drinks and fruit"},
+              {"item": "Saturday supper", "estimate": "850 Kč", "note": "Three covers, no alcohol"},
+              {"item": "Buffer", "estimate": "300 Kč", "note": "Taxi or indoor craft supplies"}
+            ]
+          }
+        ]
+      },
+      {"type": "callout", "title": "Decision rule", "content": "If rain starts before Sunday lunch, keep the market short and reserve the library room by 12:00."},
+      {"type": "source_list", "title": "Sources and freshness", "numbered": true}
+    ],
+    "sources": [
+      {"id": "weather", "number": 1, "title": "Weekend weather sample", "url": "https://example.test/fixtures/weekend-weather", "publisher": "Cognis synthetic fixture", "date": "2026-09-11T17:45:00+02:00"},
+      {"id": "calendar", "number": 2, "title": "Weekend calendar sample", "url": "https://example.test/fixtures/weekend-calendar", "publisher": "Cognis synthetic fixture", "date": "2026-09-11T18:00:00+02:00"},
+      {"id": "costs", "number": 3, "title": "Weekend cost sample", "url": "https://example.test/fixtures/weekend-costs", "publisher": "Cognis synthetic fixture", "date": "2026-09-11T17:50:00+02:00"}
+    ],
+    "assets": [{"id": "weekend-garden", "path": "/fixtures/rich-scenarios/weekend-schedule/weekend-garden.svg", "alt": "Warm garden illustration with a picnic blanket, trees, and afternoon sun", "attribution": "Cognis local fixture · original SVG illustration"}],
+    "datasets": [],
+    "exports": []
+  }
+}

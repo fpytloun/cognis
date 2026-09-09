@@ -133,7 +133,15 @@ def test_system_workflow_phase_membership_is_golden() -> None:
                 ["plan", "architect_review", "architect_review_route", "pre_implement_gate"],
             ),
             ("Build", ["implement", "update_docs"]),
-            ("Verify", ["code_review", "code_review_route", "post_review_gate"]),
+            (
+                "Verify",
+                [
+                    "code_review",
+                    "code_review_route",
+                    "code_review_exhausted_gate",
+                    "post_review_gate",
+                ],
+            ),
             ("Deliver", ["commit", "remember", "final_summary"]),
         ],
         "system:creative": [("Create", ["generate"])],
@@ -250,6 +258,11 @@ def test_software_development_review_steps_are_isolated_and_route_deterministica
     post_review_gate = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "post_review_gate"
     )
+    code_review_exhausted_gate = next(
+        step
+        for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps
+        if step.name == "code_review_exhausted_gate"
+    )
     commit_step = next(
         step for step in SOFTWARE_DEVELOPMENT_WORKFLOW.steps if step.name == "commit"
     )
@@ -288,9 +301,17 @@ def test_software_development_review_steps_are_isolated_and_route_deterministica
     assert code_review_route.condition is not None
     assert code_review_route.condition.then == "implement"
     assert code_review_route.condition.else_ == "post_review_gate"
-    assert code_review_route.condition.max_loop_iterations == 5
+    assert code_review_route.condition.max_loop_iterations == 1
+    assert code_review_route.condition.on_exhausted == "continue"
+    assert code_review_exhausted_gate.gate is not None
     assert post_review_gate.gate is not None
     assert post_review_gate.gate.options[0].action == "revise(implement)"
+    assert (
+        code_review_exhausted_gate.gate.message
+        == "Implementation still has blocking findings after one correction cycle. "
+        "Replan or escalate before continuing."
+    )
+    assert code_review_exhausted_gate.gate.options[0].action == "revise(plan)"
     assert "metadata.code_review.should_fix_count > 0" in (
         post_review_gate.gate.conditions[0].expression
     )

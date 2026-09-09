@@ -8,7 +8,13 @@
   export let items: TocItem[] = [];
   export let onNavigate: (item: TocItem) => void;
   export let open = false;
+  // A wide embedded document reserves the sidebar track only while this is
+  // visible. The component remains mounted while hidden to preserve its
+  // navigation state and avoid switching between sidebar/drawer modes.
+  export let visible = true;
+  export let dismissibleSidebar = false;
   export let onClose: (() => void) | undefined = undefined;
+  export let layout: 'auto' | 'sidebar' | 'drawer' = 'auto';
 
   $: nodes = nestTocItems(items);
   let activeAnchor = '';
@@ -28,7 +34,12 @@
   let narrowChangeHandler: ((event: MediaQueryListEvent) => void) | null = null;
   let isNarrow = false;
   let wasOpen = false;
+  let wasNarrowLayout = false;
   let closeInProgress = false;
+
+  function applyLayout(mediaNarrow: boolean, requestedLayout: typeof layout = layout): void {
+    isNarrow = requestedLayout === 'drawer' || (requestedLayout === 'auto' && mediaNarrow);
+  }
 
   function focusCloseButton() {
     closeButton?.focus({ preventScroll: true });
@@ -52,6 +63,18 @@
     if (options.restoreTrigger !== false && target?.isConnected) {
       target.focus({ preventScroll: true });
     }
+    onClose?.();
+    closeInProgress = false;
+  }
+
+  async function closeSidebar() {
+    if (closeInProgress || !open) return;
+    closeInProgress = true;
+    open = false;
+    await tick();
+    const target = restoreFocus;
+    restoreFocus = null;
+    if (target?.isConnected) target.focus({ preventScroll: true });
     onClose?.();
     closeInProgress = false;
   }
@@ -98,18 +121,23 @@
     }
   }
   $: handleOpenChange(open);
+  $: if (isNarrow !== wasNarrowLayout) {
+    const becameNarrow = isNarrow;
+    wasNarrowLayout = isNarrow;
+    if (becameNarrow && open) void focusDrawer();
+  }
 
   onMount(() => {
     document.addEventListener('focusin', keepFocusInDrawer);
     if (typeof window.matchMedia === 'function') {
       narrowQuery = window.matchMedia('(max-width: 1439.98px)');
-      isNarrow = narrowQuery.matches;
+      applyLayout(narrowQuery.matches);
       if (open && isNarrow) {
         restoreFocus ??= document.activeElement instanceof HTMLElement ? document.activeElement : null;
         void focusDrawer();
       }
       narrowChangeHandler = (event: MediaQueryListEvent) => {
-        isNarrow = event.matches;
+        applyLayout(event.matches);
         if (!isNarrow && open) void closeDrawer({ restoreTrigger: false });
       };
       narrowQuery.addEventListener('change', narrowChangeHandler);
@@ -129,6 +157,10 @@
       }
     }
   });
+  // Include `layout` as an explicit reactive argument. An embedded document
+  // can switch from its initially closed drawer state to a wide sidebar once
+  // ResizeObserver resolves the host width.
+  $: if (narrowQuery) applyLayout(narrowQuery.matches, layout);
 
   onDestroy(() => {
     observer?.disconnect();
@@ -139,10 +171,15 @@
   });
 </script>
 
-{#if !isNarrow}
+{#if !isNarrow && visible}
   <!-- Very large/wide screens (>=1440px): a floating sticky sidebar column,
-       scroll-spy highlighted via activeAnchor (see RichTocList). -->
+        scroll-spy highlighted via activeAnchor (see RichTocList). -->
   <aside class="rich-toc" aria-label="Table of contents" data-testid="rich-deliverable-toc">
+    {#if dismissibleSidebar}<header>
+      <button type="button" aria-label="Close table of contents" on:click={() => void closeSidebar()}>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg>
+      </button>
+    </header>{/if}
     <nav aria-label="Table of contents">
       <RichTocList {nodes} {activeAnchor} onNavigate={navigate} />
     </nav>
@@ -159,7 +196,7 @@
        how large its own z-index is, regardless of the drawer's own
        z-index. Without the portal, the drawer visibly mis-layers behind
        the app's own chrome (verified via rendered screenshots). -->
-  {#if open}
+   {#if visible && open}
     <div class="rich-toc-drawer-root" data-testid="rich-deliverable-toc" use:portal>
       <button
         class="rich-toc-backdrop"
@@ -187,18 +224,23 @@
         <RichTocList {nodes} {activeAnchor} onNavigate={navigate} />
       </nav>
     </div>
-  {:else}
+   {:else if visible}
     <div class="rich-toc-drawer-root" data-testid="rich-deliverable-toc">
       <nav class="rich-toc-drawer" aria-label="Table of contents">
         <header><strong>Contents</strong></header>
         <RichTocList {nodes} {activeAnchor} onNavigate={navigate} />
       </nav>
-    </div>
-  {/if}
+     </div>
+   {:else}
+     <div class="rich-toc-drawer-root" data-testid="rich-deliverable-toc"></div>
+   {/if}
 {/if}
 
 <style>
   .rich-toc { position: sticky; top: .85rem; align-self: start; z-index: 2; min-width: 0; }
+  .rich-toc > header { display: flex; justify-content: flex-end; }
+  .rich-toc > header button { display: inline-grid; width: 2rem; height: 2rem; place-items: center; border: 0; border-radius: .45rem; background: transparent; color: var(--rich-muted); }
+  .rich-toc > header button:hover, .rich-toc > header button:focus-visible { color: var(--rich-text); background: var(--rich-surface-raised); }
   nav { max-height: calc(100vh - 1.7rem); overflow: auto; border-left: 1px solid var(--rich-line); padding: .25rem 0 .25rem .65rem; }
   svg { width: 1.25rem; height: 1.25rem; fill: none; stroke: currentColor; stroke-linecap: round; stroke-width: 1.8; }
 
@@ -237,7 +279,7 @@
     border-left: 1px solid var(--rich-line);
     background: var(--rich-surface-solid);
     backdrop-filter: blur(20px);
-    padding: .7rem 1rem max(1rem, env(safe-area-inset-bottom));
+    padding: .7rem 1rem 1rem;
     box-shadow: -24px 0 60px rgb(0 0 0 / .45);
     transition: transform 180ms ease, visibility 180ms;
   }

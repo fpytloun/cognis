@@ -328,6 +328,25 @@ async def test_handle_event_require_mention_does_not_drop_direct_room_messages()
 
 
 @pytest.mark.asyncio
+async def test_chat_type_falls_back_when_summary_member_count_is_malformed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter()
+
+    async def fetch_joined_member_count(_room_id: str) -> int:
+        return 3
+
+    monkeypatch.setattr(adapter, "_fetch_joined_member_count", fetch_joined_member_count)
+
+    chat_type = await adapter._chat_type_for_room(  # noqa: SLF001
+        "!room:example.org",
+        {"summary": {"m.joined_member_count": "unknown"}},
+    )
+
+    assert chat_type == "group"
+
+
+@pytest.mark.asyncio
 async def test_group_context_dispatches_live_unmentioned_group_message_without_backfill() -> None:
     adapter = _adapter({"require_mention": True, "group_context_enabled": True})
     client = _EventLookupClient(

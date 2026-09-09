@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,10 +12,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.sql.dml import Update
 
 from cognis.bootstrap import run_schema_bootstrap
+from cognis.core.trusted_evidence import (
+    TRUSTED_EVIDENCE_ADMISSION_KEY,
+    build_evidence_admission,
+    build_evidence_event_binding,
+    serialize_evidence_admission,
+)
 from cognis.models.channel import ChannelDeliveryDescriptor
 from cognis.store.coordination import DatabaseLeaseStore, Lease
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.direct_turns import (
+    DirectTurnAdmissionRejected,
     DirectTurnConflictError,
     DirectTurnRecoveryConflict,
     DirectTurnRecoverySnapshot,
@@ -25,6 +33,198 @@ from cognis.store.direct_turns import (
 )
 from cognis.store.models import ArtifactRecordRow, AuditLog
 from cognis.store.queries import create_agent, create_conversation, create_user
+
+ADMISSION_KEY = b"trusted-evidence-direct-turn-test-key"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_successor_uses_real_admission_at_capacity(tmp_path):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from cognis.core.agent_loop import PauseWaiter
+    from cognis.core.events import EventBus
+    from cognis.core.followups import MID_STREAM_FAILURE_CONTINUATION_REASON
+    from cognis.core.turn_scheduler import TurnScheduler
+    from cognis.models.session import SessionStatus
+
+    harness = await _harness(tmp_path)
+    try:
+        predecessor = (await _admit(harness, key="parent", content="request")).request
+        lease = await _lease(harness)
+        await harness.store.claim(
+            predecessor.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        scheduler = TurnScheduler(
+            session_factory=harness.session_factory,
+            workflow_engine=SimpleNamespace(),
+            decision_engine=SimpleNamespace(),
+            task_queue=SimpleNamespace(),
+            session_manager=SimpleNamespace(),
+            session_cache=SimpleNamespace(),
+            compaction_strategy=SimpleNamespace(),
+            agent_loop=SimpleNamespace(),
+            pause_waiter=PauseWaiter(),
+            notification_service=SimpleNamespace(),
+            providers=SimpleNamespace(),
+            artifact_store=SimpleNamespace(),
+            workflow_registry=SimpleNamespace(),
+            event_bus=EventBus(),
+        )
+        scheduler._direct_turn_store = harness.store
+        scheduler._durable_request_by_conversation["conv-a"] = predecessor.request_id
+        scheduler._durable_fences[predecessor.request_id] = SimpleNamespace(lease=lease)
+        scheduler._load_conversation_runtime = AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    conversation_id="conv-a", user_email="user@example.com", status="active"
+                ),
+                SimpleNamespace(session_id=None, status=SessionStatus.ACTIVE),
+                SimpleNamespace(agent_id="agent-1"),
+                False,
+            )
+        )
+        scheduler._resolve_attachments_for_turn = AsyncMock(return_value=([], None))
+        scheduler._build_attachment_notice = AsyncMock(return_value=None)
+        scheduler._load_turn_limits = AsyncMock(return_value=(1, 0))
+        scheduler._notify_queue_updated = AsyncMock()
+        scheduler._publish_durable_turn_change = AsyncMock()
+        result = await scheduler._schedule_automatic_continuation(
+            conversation_id="conv-a",
+            session_id="session",
+            turn_id=predecessor.turn_id,
+            user_email="user@example.com",
+            metadata={"continuation_reason": MID_STREAM_FAILURE_CONTINUATION_REASON},
+            prior_follow_up=None,
+            turn_observers=(),
+        )
+        assert result.terminal_error is None
+        assert result.successor_turn_id is not None
+        parent = await harness.store.get(predecessor.request_id)
+        assert parent.status == "completed"
+        pending = await harness.store.list_conversation_pending("conv-a")
+        assert [row.turn_id for row in pending] == [result.successor_turn_id]
+        replay = await scheduler._schedule_automatic_continuation(
+            conversation_id="conv-a",
+            session_id="session",
+            turn_id=predecessor.turn_id,
+            user_email="user@example.com",
+            metadata={"continuation_reason": MID_STREAM_FAILURE_CONTINUATION_REASON},
+            prior_follow_up=None,
+            turn_observers=(),
+        )
+        assert replay.successor_turn_id == result.successor_turn_id
+        assert len(await harness.store.list_conversation_pending("conv-a")) == 1
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_first", [False, True])
+@pytest.mark.parametrize("clear_queue", [False, True])
+async def test_continuation_handoff_stop_orderings(tmp_path, cancel_first, clear_queue):
+    harness = await _harness(tmp_path)
+    try:
+        predecessor = (await _admit(harness, key="parent", content="request")).request
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            predecessor.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        unrelated = (await _admit(harness, key="unrelated", content="later")).request
+
+        async def participant(session, successor, created):
+            await harness.store.handoff(
+                session,
+                request_id=predecessor.request_id,
+                turn_id=predecessor.turn_id,
+                lease=lease,
+                successor=successor,
+            )
+
+        async def admit_successor():
+            return await harness.store.admit(
+                conversation_id="conv-a",
+                session_id=None,
+                agent_id="agent-1",
+                user_id="user@example.com",
+                idempotency_scope="continuation",
+                idempotency_key=predecessor.turn_id,
+                turn_id=f"{predecessor.turn_id}-successor",
+                payload={"schema_version": 1, "content": "", "attachments": []},
+                transaction_participant=participant,
+            )
+
+        if cancel_first:
+            await harness.store.cancel_conversation(
+                "conv-a", clear_queue=clear_queue, active_request_id=predecessor.request_id
+            )
+            with pytest.raises(DirectTurnAdmissionRejected):
+                await admit_successor()
+            pending = await harness.store.list_conversation_pending("conv-a")
+            assert all(row.turn_id != f"{predecessor.turn_id}-successor" for row in pending)
+        else:
+            first = await admit_successor()
+            replay = await admit_successor()
+            assert replay.request.request_id == first.request.request_id
+            assert replay.created is False
+            parent = await harness.store.get(predecessor.request_id)
+            assert parent.status == "completed"
+            assert parent.outcome["successor_request_id"] == first.request.request_id
+            # No local predecessor cache: another controller must find the chain.
+            await harness.store.cancel_conversation("conv-a", clear_queue=clear_queue)
+            assert (await harness.store.get(first.request.request_id)).status == "cancelled"
+        assert (await harness.store.get(unrelated.request_id)).status == (
+            "cancelled" if clear_queue else "queued"
+        )
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_handoff_participant_failure_rolls_back_both_rows(tmp_path):
+    harness = await _harness(tmp_path)
+    try:
+        predecessor = (await _admit(harness, key="parent", content="request")).request
+        lease = await _lease(harness)
+        await harness.store.claim(
+            predecessor.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+
+        async def participant(session, successor, created):
+            await harness.store.handoff(
+                session,
+                request_id=predecessor.request_id,
+                turn_id=predecessor.turn_id,
+                lease=lease,
+                successor=successor,
+            )
+            raise RuntimeError("managed link fence rejected")
+
+        with pytest.raises(RuntimeError, match="managed link fence rejected"):
+            await harness.store.admit(
+                conversation_id="conv-a",
+                session_id=None,
+                agent_id="agent-1",
+                user_id="user@example.com",
+                idempotency_scope="continuation",
+                idempotency_key=predecessor.turn_id,
+                payload={"schema_version": 1, "content": "", "attachments": []},
+                transaction_participant=participant,
+            )
+        pending = await harness.store.list_conversation_pending("conv-a")
+        assert [row.request_id for row in pending] == [predecessor.request_id]
+        assert pending[0].status == "claimed"
+    finally:
+        await harness.engine.dispose()
 
 
 @dataclass
@@ -131,6 +331,34 @@ async def _harness(tmp_path: Path) -> _Harness:
     )
 
 
+@pytest.mark.asyncio
+async def test_active_reads_reuse_caller_session_without_factory_checkout(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+
+        def _forbidden_factory():
+            raise AssertionError("caller-session read opened a nested checkout")
+
+        harness.store._session_factory = _forbidden_factory  # type: ignore[assignment]
+        async with harness.session_factory() as session:
+            assert (
+                await harness.store.get_conversation_active(
+                    "conv-a",
+                    session=session,
+                )
+                is None
+            )
+            assert (
+                await harness.store.list_conversations_active(
+                    ["conv-a", "conv-b"],
+                    session=session,
+                )
+                == {}
+            )
+    finally:
+        await harness.engine.dispose()
+
+
 async def _admit(
     harness: _Harness,
     *,
@@ -149,6 +377,148 @@ async def _admit(
     )
 
 
+def _evidence_admission(*, admitted: bool, fingerprint: str) -> dict[str, object]:
+    return serialize_evidence_admission(
+        build_evidence_admission(
+            key=ADMISSION_KEY,
+            admitted=admitted,
+            owner_id="user@example.com",
+            policy_fingerprint=fingerprint,
+            event_binding=build_evidence_event_binding(
+                intaris_session_id="stream-1",
+                cognis_session_id="session-1",
+                conversation_id="conv-a",
+                turn_id="turn-1",
+                user_id="user@example.com",
+                owner_id="user@example.com",
+                source="user_input",
+                role="user",
+                prompt_visibility="user_visible",
+                prompt_provenance={"kind": "user_authored"},
+                content_hash=hashlib.sha256(b"same event").hexdigest(),
+                attachment_refs_value=[],
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_duplicate_admission_keeps_first_frozen_evidence_decision(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        positive = _evidence_admission(
+            admitted=True,
+            fingerprint="0123456789abcdef",
+        )
+        negative = _evidence_admission(admitted=False, fingerprint="")
+        common = {
+            "schema_version": 1,
+            "content": "same event",
+            "attachments": [],
+        }
+        first = await harness.store.admit(
+            conversation_id="conv-a",
+            session_id=None,
+            agent_id="agent-1",
+            user_id="user@example.com",
+            idempotency_scope="web:conv-a:user@example.com",
+            idempotency_key="frozen-decision",
+            payload={
+                **common,
+                "metadata": {TRUSTED_EVIDENCE_ADMISSION_KEY: positive},
+            },
+        )
+        replay = await harness.store.admit(
+            conversation_id="conv-a",
+            session_id=None,
+            agent_id="agent-1",
+            user_id="user@example.com",
+            idempotency_scope="web:conv-a:user@example.com",
+            idempotency_key="frozen-decision",
+            payload={
+                **common,
+                "metadata": {TRUSTED_EVIDENCE_ADMISSION_KEY: negative},
+            },
+        )
+
+        assert first.created is True
+        assert replay.created is False
+        assert replay.request.payload["metadata"][TRUSTED_EVIDENCE_ADMISSION_KEY] == positive
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_edit_rejects_bound_content_and_preserves_frozen_evidence_decision(
+    tmp_path: Path,
+) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        positive = _evidence_admission(
+            admitted=True,
+            fingerprint="0123456789abcdef",
+        )
+        admission = await harness.store.admit(
+            conversation_id="conv-a",
+            session_id=None,
+            agent_id="agent-1",
+            user_id="user@example.com",
+            idempotency_scope="web:conv-a:user@example.com",
+            idempotency_key="immutable-decision",
+            payload={
+                "schema_version": 1,
+                "content": "before",
+                "attachments": [],
+                "metadata": {TRUSTED_EVIDENCE_ADMISSION_KEY: positive},
+            },
+        )
+        with pytest.raises(ValueError, match="content and attachments are immutable"):
+            await harness.store.edit(
+                admission.request.request_id,
+                payload={
+                    "schema_version": 1,
+                    "content": "after",
+                    "attachments": [],
+                    "metadata": {},
+                },
+                payload_version=1,
+                expected_payload_hash=admission.request.payload_hash,
+            )
+
+        edited = await harness.store.edit(
+            admission.request.request_id,
+            payload={
+                "schema_version": 1,
+                "content": "before",
+                "attachments": [],
+                "metadata": {"editor_note": "metadata-only"},
+            },
+            payload_version=1,
+            expected_payload_hash=admission.request.payload_hash,
+        )
+        assert edited is not None
+        assert edited.payload["metadata"][TRUSTED_EVIDENCE_ADMISSION_KEY] == positive
+        with pytest.raises(ValueError, match="admission is immutable"):
+            await harness.store.edit(
+                edited.request_id,
+                payload={
+                    "schema_version": 1,
+                    "content": "before",
+                    "attachments": [],
+                    "metadata": {
+                        TRUSTED_EVIDENCE_ADMISSION_KEY: _evidence_admission(
+                            admitted=False,
+                            fingerprint="",
+                        )
+                    },
+                },
+                payload_version=1,
+                expected_payload_hash=edited.payload_hash,
+            )
+    finally:
+        await harness.engine.dispose()
+
+
 async def _lease(
     harness: _Harness,
     *,
@@ -163,6 +533,27 @@ async def _lease(
     )
     assert lease is not None
     return lease
+
+
+@pytest.mark.asyncio
+async def test_admission_disposition_distinguishes_fifo_head_from_successor(
+    tmp_path: Path,
+) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        head = await _admit(harness, key="head", content="run now")
+        successor = await _admit(harness, key="successor", content="wait")
+
+        assert head.request.status == DirectTurnStatus.QUEUED.value
+        assert head.queued_behind_predecessor is False
+        assert successor.request.status == DirectTurnStatus.QUEUED.value
+        assert successor.queued_behind_predecessor is True
+
+        replay = await _admit(harness, key="head", content="run now")
+        assert replay.created is False
+        assert replay.queued_behind_predecessor is False
+    finally:
+        await harness.engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1390,6 +1781,41 @@ async def test_absorb_and_active_cancel_are_fenced(tmp_path: Path) -> None:
         assert absorbed is not None
         assert absorbed.status == DirectTurnStatus.ABSORBED.value
         assert absorbed.cancel_requested_at is not None
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recoverable_request_can_resume_absorption(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="message-recovered", content="follow-up")
+        lease = await _lease(harness)
+        claimed = await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        assert claimed is not None
+        recoverable = await harness.store.mark_recoverable(
+            admitted.request.request_id,
+            lease=lease,
+            outcome={"phase": "recovered_uncommitted_absorb"},
+        )
+        assert recoverable is not None
+
+        absorbing = await harness.store.begin_absorb(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            absorbed_by_turn_id="turn-active",
+        )
+
+        assert absorbing is not None
+        assert absorbing.status == DirectTurnStatus.ABSORBING.value
+        assert absorbing.absorbed_by_turn_id == "turn-active"
     finally:
         await harness.engine.dispose()
 

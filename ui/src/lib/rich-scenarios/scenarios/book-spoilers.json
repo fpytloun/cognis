@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "id": "book-spoilers",
+  "title": "Frankenstein: a reader’s guide",
+  "description": "A public-domain book summary with a spoiler-free guide and explicit collapsed plot and ending disclosures.",
+  "group": "learning",
+  "sort_key": 1320,
+  "content": "SPOILER WARNING: This Frankenstein reader's guide contains hidden plot and ending disclosures. Read the spoiler sections only after finishing Mary Shelley's public-domain novel.",
+  "visibility": ["gallery"],
+  "payload": {
+    "metadata": {"eyebrow": "Reader's guide", "subtitle": "Mary Shelley’s 1818 public-domain novel. Spoilers stay collapsed in the interactive view.", "density": "comfortable"},
+    "blocks": [
+      {"type": "hero", "eyebrow": "Public-domain classic", "title": "Frankenstein: a reader’s guide", "subtitle": "A spoiler-free entry point to Mary Shelley’s novel about creation, responsibility, and isolation."},
+      {"type": "figure", "title": "Frankenstein", "src": "/fixtures/rich-scenarios/book-spoilers/frankenstein-cover.svg", "alt": "Moonlit alpine laboratory and a solitary figure in a cover illustration for Frankenstein.", "caption": "Original fixture illustration inspired by the 1818 novel. No copyrighted cover art used.", "source": "Cognis fixture illustration", "source_url": "https://www.gutenberg.org/ebooks/84"},
+      {"type": "columns", "blocks": [{"type": "section", "title": "Spoiler-free premise", "content": "Victor Frankenstein pursues knowledge beyond ordinary limits and brings a living being into the world. The novel follows the consequences of his refusal to care for what he creates."}, {"type": "section", "title": "Why read it?", "content": "It is short, unsettling, and still useful for discussing scientific ambition, loneliness, and responsibility. Read it for a layered frame narrative, not the simplified popular image."}]},
+      {"type": "section", "title": "Characters, themes, and context", "blocks": [{"type": "table", "title": "Reader orientation", "columns": [{"key": "topic", "label": "Topic"}, {"key": "guide", "label": "Guide"}], "rows": [{"topic": "Victor Frankenstein", "guide": "A driven student whose choices test the duty of a creator."}, {"topic": "The creature", "guide": "An intelligent, abandoned being who asks for recognition and companionship."}, {"topic": "Themes", "guide": "Creation, rejection, ambition, empathy, and accountability."}, {"topic": "Context", "guide": "Written in 1816–1818 amid Romantic-era debates about science, nature, and the sublime."}]}]},
+      {"type": "section", "title": "Discussion questions", "blocks": [{"type": "markdown", "content": "1. What obligations follow from creating something capable of suffering?\n2. Where does the novel ask readers to sympathize, and why?\n3. How do the nested narrators change what you trust?\n4. Does the novel criticize knowledge itself, or careless ambition?"}]},
+      {"type": "callout", "tone": "warning", "title": "Spoiler warning", "content": "The next two disclosures reveal the full plot and the ending. They are collapsed in the interactive view, but static and Markdown versions must show this warning."},
+      {"type": "accordion", "title": "Spoiler sections", "items": [{"type": "section", "title": "Full plot summary — spoilers", "summary": "Collapsed disclosure: reveals major events and character outcomes.", "content": "Victor creates a living being, recoils from it, and abandons it. The creature learns language and seeks human connection, but repeated rejection turns its appeal for companionship into a demand. It kills people close to Victor and forces Victor into pursuit."}, {"type": "section", "title": "Ending explained — spoilers", "summary": "Collapsed disclosure: reveals the final confrontation and resolution.", "content": "Victor dies while pursuing the creature in the Arctic. The creature mourns him, accepts responsibility for its violence, and says it will end its own life. The novel closes without confirming that final act."}]},
+      {"type": "source_list", "title": "Edition and background sources"}
+    ],
+    "sources": [{"id": "gutenberg-frankenstein", "title": "Frankenstein; Or, The Modern Prometheus", "publisher": "Project Gutenberg", "url": "https://www.gutenberg.org/ebooks/84"}, {"id": "british-library-shelley", "title": "Mary Shelley’s Frankenstein", "publisher": "The British Library", "url": "https://www.bl.uk/collection-items/frankenstein-by-mary-shelley"}],
+    "assets": [], "datasets": [], "exports": []
+  }
+}

@@ -25,6 +25,16 @@
     condition: 'border-l-sky-400',
     complete: 'border-l-teal-400'
   };
+
+  $: stepsByPhase = steps.reduce(
+    (grouped, step, index) => {
+      const phaseSteps = grouped.get(step.phaseId) ?? [];
+      phaseSteps.push({ step, index });
+      grouped.set(step.phaseId, phaseSteps);
+      return grouped;
+    },
+    new Map<string, Array<{ step: WorkflowStepFormState; index: number }>>()
+  );
 </script>
 
 <div class="space-y-4" data-testid="workflow-step-canvas">
@@ -38,8 +48,7 @@
         <button class="h-9 rounded-xl border border-slate-700 px-3 text-xs text-slate-300 hover:border-slate-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400 disabled:opacity-40" type="button" disabled={disabled} onclick={() => onadd(phase.id)}>Add step</button>
       </div>
       <div class="space-y-2" role="list" aria-label={`${phase.title} steps`}>
-        {#each steps as step, index}
-          {#if step.phaseId === phase.id}
+        {#each stepsByPhase.get(phase.id) ?? [] as { step, index }}
             <div class="flex items-stretch gap-1">
               <button
                 type="button"
@@ -63,7 +72,6 @@
                 <button class="w-9 rounded-b-lg text-slate-400 hover:bg-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400 disabled:opacity-30" aria-label={`Move ${step.name || `step ${index + 1}`} down`} disabled={disabled || index === steps.length - 1} type="button" onclick={() => onmove(index, 1)}><ArrowDown class="mx-auto h-3.5 w-3.5" /></button>
               </div>
             </div>
-          {/if}
         {/each}
       </div>
     </section>

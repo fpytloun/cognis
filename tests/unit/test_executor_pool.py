@@ -14,6 +14,7 @@ from cognis.core.executor_pool import (
     ExecutorAvailability,
     ExecutorPool,
     ResolvedExecutorTarget,
+    _classify_state,
     parse_additional_executors,
     pick_initial_active,
     resolve_executor_pool,
@@ -38,6 +39,39 @@ class FakeExecutorRow:
     observed_tools: list[dict[str, Any]] = field(default_factory=list)
     config: dict[str, Any] | None = None
     last_observed_at: Any | None = None
+
+
+@pytest.mark.parametrize(
+    ("executor_type", "expected"),
+    [
+        ("in_process", ExecutorAvailability.USABLE),
+        ("subprocess", ExecutorAvailability.OFFLINE),
+        ("websocket", ExecutorAvailability.OFFLINE),
+    ],
+)
+def test_offline_observation_requires_transport_only_for_remote_executors(
+    executor_type: str, expected: ExecutorAvailability
+) -> None:
+    row = FakeExecutorRow("local", executor_type=executor_type, runtime_state="offline")
+    assert _classify_state(row, policy=ExecutorPolicy(), owner_email="user@example.com") == expected
+
+
+@pytest.mark.parametrize(
+    ("changes", "policy", "expected"),
+    [
+        ({"status": "disabled"}, ExecutorPolicy(), ExecutorAvailability.BLOCKED),
+        ({}, ExecutorPolicy(allow_in_process=False), ExecutorAvailability.POLICY_DENIED),
+        ({"owner_email": "other@example.com"}, ExecutorPolicy(), ExecutorAvailability.UNAUTHORIZED),
+        ({"desired_config_version": 1}, ExecutorPolicy(), ExecutorAvailability.RECONFIGURING),
+    ],
+)
+def test_in_process_availability_preserves_admission_gates(
+    changes: dict[str, Any], policy: ExecutorPolicy, expected: ExecutorAvailability
+) -> None:
+    row = FakeExecutorRow("local", runtime_state="offline")
+    for name, value in changes.items():
+        setattr(row, name, value)
+    assert _classify_state(row, policy=policy, owner_email="user@example.com") == expected
 
 
 class _FakeSession:

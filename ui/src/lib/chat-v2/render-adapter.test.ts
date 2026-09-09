@@ -5,7 +5,11 @@ import type {
   AssistantDeliverableTimelineItem,
   AuthChallengeTimelineItem,
   CompactionTimelineItem,
+  CredentialRequestTimelineItem,
+  ErrorTimelineItem,
   MessageTimelineItem,
+  QuestionSetTimelineItem,
+  TaskTimelineItem,
   ThinkingTimelineItem,
   TimelineItem,
   ToolCallTimelineItem,
@@ -131,6 +135,91 @@ describe('render-adapter', () => {
       originCallId: 'call-question',
       title: 'You answered questions',
       answers: [{ question: 'Target?', answer: 'Staging' }]
+    });
+  });
+
+  it('maps action requests and terminal activity to status-aware notice tones', () => {
+    const common = {
+      sort_key: '0000:000000000000004:000000:06:000000000',
+      source_refs: baseRefs(4),
+      stable: true
+    };
+    const waitingQuestion = toRenderItem({
+      ...common,
+      id: 'question:q1',
+      kind: 'question_set',
+      request_id: 'q1',
+      questions: [{
+        id: 'target',
+        question: 'Target?',
+        options: [],
+        multiple: false,
+        allow_custom: true,
+        required: true
+      }],
+      status: 'waiting'
+    } as QuestionSetTimelineItem);
+    const completedCredential = toRenderItem({
+      ...common,
+      id: 'credential:c1',
+      kind: 'credential_request',
+      credential_request_id: 'c1',
+      credential_id: 'provider',
+      credential_kind: 'token',
+      label: 'Provider token',
+      required_fields: ['token'],
+      status: 'complete'
+    } as CredentialRequestTimelineItem);
+    const failedTask = toRenderItem({
+      ...common,
+      id: 'task:t1',
+      kind: 'task',
+      task_id: 't1',
+      title: 'Background task',
+      status: 'failed',
+      deliverable_ids: []
+    } as TaskTimelineItem);
+
+    expect(waitingQuestion).toMatchObject({
+      kind: 'notice',
+      tone: 'warning',
+      status: 'waiting',
+      actionRequired: true
+    });
+    expect(completedCredential).toMatchObject({
+      kind: 'notice',
+      tone: 'info',
+      status: 'complete',
+      actionRequired: false
+    });
+    expect(failedTask).toMatchObject({
+      kind: 'notice',
+      tone: 'error',
+      status: 'failed'
+    });
+  });
+
+  it('preserves the complete safe error message and code in notice details', () => {
+    const rendered = toRenderItem({
+      id: 'error:e1',
+      kind: 'error',
+      sort_key: '0000:000000000000004:000000:06:000000000',
+      source_refs: baseRefs(4),
+      stable: true,
+      level: 'error',
+      title: 'Provider failure',
+      message: 'Provider message: incomplete chunked read',
+      error_detail: 'The provider closed the stream early.',
+      error_code: 'provider_stream_failure',
+      recoverable: true
+    } as ErrorTimelineItem);
+
+    expect(rendered).toMatchObject({
+      kind: 'notice',
+      tone: 'error',
+      code: 'provider_stream_failure',
+      status: 'recoverable',
+      details: 'Error code: provider_stream_failure\n\nProvider message: incomplete chunked read\n\nThe provider closed the stream early.'
     });
   });
 

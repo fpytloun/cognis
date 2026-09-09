@@ -9,8 +9,17 @@ interface OverlayEntry {
 }
 
 let entries: OverlayEntry[] = [];
-let savedScrollY = 0;
-let bodyLocked = false;
+interface ScrollLockState {
+  element: HTMLElement;
+  scrollTop: number;
+  scrollLeft: number;
+  overflow: string;
+  overflowX: string;
+  overflowY: string;
+  overscrollBehavior: string;
+}
+
+let scrollLock: ScrollLockState | null = null;
 const listeners = new Set<(value: OverlayEntry[]) => void>();
 
 function emit(): void {
@@ -19,39 +28,53 @@ function emit(): void {
   }
 }
 
-function lockBodyScroll(): void {
-  if (typeof document === 'undefined' || bodyLocked) return;
-  savedScrollY = window.scrollY || document.documentElement.scrollTop || 0;
-  document.body.style.position = 'fixed';
-  document.body.style.top = `-${savedScrollY}px`;
-  document.body.style.left = '0';
-  document.body.style.right = '0';
-  document.body.style.width = '100%';
-  document.body.style.overflow = 'hidden';
-  bodyLocked = true;
+function scrollContainer(): HTMLElement | null {
+  return document.querySelector<HTMLElement>('[data-app-content="true"]') ?? document.scrollingElement as HTMLElement | null;
 }
 
-function unlockBodyScroll(): void {
-  if (typeof document === 'undefined' || !bodyLocked) return;
-  document.body.style.position = '';
-  document.body.style.top = '';
-  document.body.style.left = '';
-  document.body.style.right = '';
-  document.body.style.width = '';
-  document.body.style.overflow = '';
-  if (savedScrollY > 0) {
-    window.scrollTo(0, savedScrollY);
-  }
-  savedScrollY = 0;
-  bodyLocked = false;
+function lockAppScroll(): void {
+  if (typeof document === 'undefined' || scrollLock) return;
+  const element = scrollContainer();
+  if (!element) return;
+  scrollLock = {
+    element,
+    scrollTop: element.scrollTop,
+    scrollLeft: element.scrollLeft,
+    overflow: element.style.overflow,
+    overflowX: element.style.overflowX,
+    overflowY: element.style.overflowY,
+    overscrollBehavior: element.style.overscrollBehavior,
+  };
+  element.style.overflow = 'hidden';
+  element.style.overflowX = 'hidden';
+  element.style.overflowY = 'hidden';
+  element.style.overscrollBehavior = 'none';
+  element.dataset.overlayScrollLocked = 'true';
 }
 
-function syncBodyLock(): void {
+function unlockAppScroll(): void {
+  if (!scrollLock) return;
+  const saved = scrollLock;
+  scrollLock = null;
+  saved.element.style.overflow = saved.overflow;
+  saved.element.style.overflowX = saved.overflowX;
+  saved.element.style.overflowY = saved.overflowY;
+  saved.element.style.overscrollBehavior = saved.overscrollBehavior;
+  delete saved.element.dataset.overlayScrollLocked;
+  const restore = (): void => {
+    saved.element.scrollTop = saved.scrollTop;
+    saved.element.scrollLeft = saved.scrollLeft;
+  };
+  restore();
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore);
+}
+
+function syncScrollLock(): void {
   if (entries.length > 0) {
-    lockBodyScroll();
+    lockAppScroll();
     return;
   }
-  unlockBodyScroll();
+  unlockAppScroll();
 }
 
 export const overlayStack = readable<OverlayEntry[]>(entries, (set) => {
@@ -73,7 +96,7 @@ export function registerOverlay(options: { kind: OverlayKind; blocksChrome: bool
 } {
   const id = `ov_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   entries = [...entries, { id, ...options }];
-  syncBodyLock();
+  syncScrollLock();
   emit();
   let active = true;
   return {
@@ -82,7 +105,7 @@ export function registerOverlay(options: { kind: OverlayKind; blocksChrome: bool
       if (!active) return;
       active = false;
       entries = entries.filter((entry) => entry.id !== id);
-      syncBodyLock();
+      syncScrollLock();
       emit();
     }
   };
@@ -95,6 +118,6 @@ export function isTopOverlay(id: string | null): boolean {
 
 export function resetOverlayState(): void {
   entries = [];
-  syncBodyLock();
+  syncScrollLock();
   emit();
 }

@@ -1,0 +1,126 @@
+{
+  "schema_version": 1,
+  "id": "product-comparison",
+  "title": "Product comparison and buying guide",
+  "description": "A consumer-style comparison with recommendation cards and trade-off matrix.",
+  "group": "comparison",
+  "sort_key": 300,
+  "content": "Product comparison fallback content.",
+  "payload": {
+    "metadata": {
+      "eyebrow": "Buying guide",
+      "subtitle": "Useful for shopping, vendor selection, and architectural trade-offs.",
+      "badges": [
+        "Recommendation",
+        "Trade-offs",
+        "Decision matrix"
+      ]
+    },
+    "blocks": [
+      {
+        "type": "hero",
+        "eyebrow": "Recommendation",
+        "title": "Choose the managed option unless you need custom policy hooks",
+        "subtitle": "The premium plan wins for reliability; the open-core option wins for extensibility."
+      },
+      {
+        "type": "comparison_matrix",
+        "title": "Decision matrix",
+        "columns": [
+          {
+            "key": "criteria",
+            "label": "Criteria"
+          },
+          {
+            "key": "managed",
+            "label": "Managed"
+          },
+          {
+            "key": "open_core",
+            "label": "Open core"
+          },
+          {
+            "key": "verdict",
+            "label": "Verdict"
+          }
+        ],
+        "rows": [
+          {
+            "criteria": "Time to value",
+            "managed": "Same day",
+            "open_core": "1–2 weeks",
+            "verdict": "Managed"
+          },
+          {
+            "criteria": "Policy control",
+            "managed": "Limited",
+            "open_core": "Deep hooks",
+            "verdict": "Open core"
+          },
+          {
+            "criteria": "Ops burden",
+            "managed": "Low",
+            "open_core": "Medium",
+            "verdict": "Managed"
+          },
+          {
+            "criteria": "Cost predictability",
+            "managed": "High",
+            "open_core": "Depends on usage",
+            "verdict": "Managed"
+          }
+        ]
+      },
+      {
+        "type": "card_grid",
+        "blocks": [
+          {
+            "type": "card",
+            "tone": "success",
+            "title": "Best default",
+            "content": "Managed plan: lower operational burden and faster rollout."
+          },
+          {
+            "type": "card",
+            "tone": "warning",
+            "title": "Best for teams with platform capacity",
+            "content": "Open core: use when policy control is worth owning the runtime."
+          },
+          {
+            "type": "card",
+            "title": "Avoid",
+            "content": "A bespoke internal fork before the core workflows are stable."
+          }
+        ]
+      },
+      {
+        "type": "quote",
+        "content": "The real decision is not hosted vs self-hosted; it is whether you need to own the policy surface.",
+        "byline": "Cognis product note"
+      }
+    ],
+    "sources": [
+      {
+        "title": "OpenAI — Structured Outputs",
+        "url": "https://platform.openai.com/docs/guides/structured-outputs",
+        "publisher": "OpenAI Docs",
+        "date": "2026-07-02"
+      },
+      {
+        "title": "Anthropic — Tool use and artifacts",
+        "url": "https://docs.anthropic.com/",
+        "publisher": "Anthropic Docs",
+        "date": "2026-06-28"
+      },
+      {
+        "title": "Cognis internal telemetry sample",
+        "url": "https://cognis.local/reports/rich-deliverables",
+        "publisher": "Cognis",
+        "date": "2026-07-09"
+      }
+    ],
+    "assets": [],
+    "datasets": [],
+    "exports": []
+  }
+}

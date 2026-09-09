@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { portal } from '$lib/actions/portal';
   import ArrowLeft from 'lucide-svelte/icons/arrow-left';
+  import Maximize2 from 'lucide-svelte/icons/maximize-2';
+  import Minimize2 from 'lucide-svelte/icons/minimize-2';
   import { api } from '$lib/api/client';
   import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import LiveDots from '$lib/components/LiveDots.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
-  import SessionDetailsPanel from '$lib/components/session/SessionDetailsPanel.svelte';
+  import SharedInspectorTabs from '$lib/components/inspector/SharedInspectorTabs.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import type { Agent, Escalation, Notification, StepRun } from '$lib/types/api';
@@ -45,6 +48,7 @@
   let escalations = $state<Escalation[]>([]);
   let escalationBusy = $state<string | null>(null);
   let sessionDetailsOpen = $state(false);
+  let fullscreen = $state(false);
 
   const scope = $derived.by<TimelineScope>(() => stepRunId && taskId
     ? {
@@ -68,6 +72,7 @@
     if (!isTopOverlay(overlayId)) return;
     if (event.key === 'Escape') {
       event.preventDefault();
+      event.stopImmediatePropagation();
       onclose();
       return;
     }
@@ -165,8 +170,23 @@
 <svelte:window onkeydown={handleKeydown} />
 
 <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-<div class="app-viewport-overlay z-[90] flex justify-end overflow-hidden bg-black/60" onclick={handleBackdropClick} role="presentation">
-  <div bind:this={panel} class="app-safe-side-panel ml-auto flex h-full min-h-0 w-full max-w-2xl flex-col overflow-hidden overscroll-contain border-l border-slate-700 bg-slate-900 shadow-2xl" role="dialog" aria-modal="true" aria-label="Session logs">
+<div
+  use:portal
+  class="app-viewport-overlay z-[95] flex justify-end overflow-hidden bg-black/60"
+  onclick={handleBackdropClick}
+  role="presentation"
+  data-testid="session-logs-overlay"
+  data-overlay-id={overlayId}
+>
+  <div
+    bind:this={panel}
+    class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-slate-700 bg-slate-900 shadow-2xl ${fullscreen ? 'max-w-none' : 'max-w-2xl'}`}
+    role="dialog"
+    aria-modal="true"
+    aria-label={`Session logs: ${stepName || sessionId}`}
+    data-testid="session-logs-panel"
+    data-fullscreen={fullscreen}
+  >
     <div class="flex shrink-0 items-center justify-between border-b border-slate-800 px-4 py-3">
       <div class="flex min-w-0 items-center gap-3">
         {#if onBack}
@@ -183,6 +203,15 @@
         </div>
       </div>
       <div class="flex items-center gap-2">
+        <button
+          class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white sm:h-8 sm:w-8"
+          onclick={() => { fullscreen = !fullscreen; }}
+          aria-label={fullscreen ? 'Exit fullscreen logs' : 'Open fullscreen logs'}
+          aria-pressed={fullscreen}
+          type="button"
+        >
+          {#if fullscreen}<Minimize2 class="h-4 w-4" />{:else}<Maximize2 class="h-4 w-4" />{/if}
+        </button>
         <SessionDetailsButton
           open={sessionDetailsOpen}
           ariaControls={`session-logs-info-${sessionId}`}
@@ -193,8 +222,8 @@
       </div>
     </div>
     {#if sessionDetailsOpen}
-      <div id={`session-logs-info-${sessionId}`}>
-        <SessionDetailsPanel {sessionId} />
+      <div id={`session-logs-info-${sessionId}`} class="min-h-0 flex-1 overflow-y-auto border-b border-slate-800 p-4">
+        <SharedInspectorTabs {scope} {sessionId} agents={agent ? [agent] : []} onViewSession={onViewSession ? (id) => { void onViewSession?.(id); } : undefined} />
       </div>
     {/if}
     {#if escalations.length > 0}

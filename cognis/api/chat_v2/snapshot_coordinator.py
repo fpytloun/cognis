@@ -2,21 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
-import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from time import monotonic
 from typing import Any, Literal, cast
-
-from sqlalchemy import select
 
 from cognis.api.chat_v2.background_event_reads import (
     AdmittedSessionEventStore,
     BackgroundEventReadAdmission,
 )
 from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
+from cognis.api.chat_v2.event_store_refs import session_read_refs
 from cognis.api.chat_v2.schemas import (
     ChatSnapshot,
     ConversationStateView,
@@ -36,22 +31,14 @@ from cognis.api.chat_v2.sync import (
     _runtime_overlay,
     build_chat_snapshot,
     conversation_summary_from_row,
+    invalidate_chat_v2_snapshot_projection,
     queue_state_from_messages,
     runtime_input_from_scheduler,
     state_view_from_snapshot,
 )
-from cognis.api.chat_v2.work_graph import (
-    WORK_GRAPH_MAX_SECONDS,
-    AuthorizedWorkRootNotReadyError,
-    resolve_authorized_work_graph,
-)
-from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
-from cognis.api.chat_v2.work_repository import read_activity_overview
 from cognis.api.common import api_exception
 from cognis.core.attachment_utils import hydrate_attachment_refs
 from cognis.core.conversation_state import snapshot_for_conversation
-from cognis.providers.guardrails.events import EventStoreAuthority
-from cognis.store.models import WorkSessionProjectionRow
 from cognis.store.queries import (
     get_conversation,
     get_root_session_chain,
@@ -73,8 +60,6 @@ class ConversationSnapshotContext:
     event_post_processor: EventPostProcessor
     owner_email: str
     conversation_id: str
-    work_overview_fence: str = ""
-    work_overview_coverage: tuple[tuple[str, int], ...] | None = None
 
 
 async def load_conversation_snapshot_context(
@@ -89,16 +74,10 @@ async def load_conversation_snapshot_context(
         row = await get_conversation(session, conversation_id)
         if row is None or getattr(row, "status", None) == "deleted" or row.user_email != user_email:
             raise api_exception(404, "not_found", "Conversation not found")
-        session_refs = await _conversation_session_refs(
-            app,
+        session_rows = await _conversation_session_rows(
             session,
             conversation_id,
             row.active_session_id,
-            user_email=user_email,
-        )
-        work_overview_fence, work_overview_coverage = await _work_overview_state(
-            session,
-            session_refs,
         )
         state_snapshot = await snapshot_for_conversation(
             session,
@@ -106,6 +85,13 @@ async def load_conversation_snapshot_context(
             conversation_id=conversation_id,
             turn_scheduler=getattr(app.state, "turn_scheduler", None),
         )
+
+    session_refs = await session_read_refs(
+        app,
+        session_rows,
+        user_email=user_email,
+        role="root",
+    )
 
     turn_scheduler = getattr(app.state, "turn_scheduler", None)
     queued_messages = (
@@ -143,8 +129,6 @@ async def load_conversation_snapshot_context(
         ),
         owner_email=user_email,
         conversation_id=conversation_id,
-        work_overview_fence=work_overview_fence,
-        work_overview_coverage=work_overview_coverage,
     )
 
 
@@ -162,6 +146,35 @@ async def build_chat_snapshot_coordinated(
         request_trace=request_trace,
     )
     return snapshot
+
+
+async def rebuild_chat_snapshot_coordinated(
+    app: Any,
+    context: ConversationSnapshotContext,
+) -> ChatSnapshot:
+    """Invalidate derived event views and rebuild one snapshot from upstream state."""
+
+    cached_event_store = getattr(app.state, "cached_event_store", None)
+    shared_snapshot_cache = getattr(app.state, "shared_chat_snapshot_cache", None)
+    for ref in context.session_refs:
+        if cached_event_store is not None:
+            await cached_event_store.invalidate_session(
+                ref.store,
+                ref.event_store_session_id,
+                source="explicit_refresh",
+            )
+            if shared_snapshot_cache is not None:
+                shared_snapshot_cache.invalidate_session_token(
+                    cached_event_store.session_token(ref.store, ref.event_store_session_id)
+                )
+    invalidate_chat_v2_snapshot_projection(context.scope.key)
+    fresh = await load_conversation_snapshot_context(
+        app,
+        user_email=context.owner_email,
+        conversation_id=context.conversation_id,
+    )
+    base = await _build_immutable_snapshot(fresh)
+    return await _apply_mutable_snapshot_overlay(app, base, fresh)
 
 
 def admit_background_snapshot_reads(
@@ -202,19 +215,14 @@ async def get_cached_chat_snapshot_coordinated(
         scope_key=context.scope.key,
         session_refs=context.session_refs,
         cursor_secret=context.cursor_secret,
-        overview_fence=context.work_overview_fence,
-        overview_coverage=context.work_overview_coverage,
     )
     if result.snapshot is None:
         return None, result.status
-    if result.snapshot.activity_overview is None:
-        return None, "miss"
     return (
         await _apply_mutable_snapshot_overlay(
             app,
             result.snapshot,
             context,
-            refresh_activity=False,
         ),
         result.status,
     )
@@ -234,13 +242,7 @@ async def _build_chat_snapshot_coordinated(
     async def build() -> ChatSnapshot:
         nonlocal built
         built = True
-        snapshot = await _build_immutable_snapshot(context)
-        overview = (
-            await _read_snapshot_activity_overview_bounded(app, context)
-            if hasattr(app.state, "session_factory")
-            else snapshot.activity_overview
-        )
-        return snapshot.model_copy(update={"activity_overview": overview})
+        return await _build_immutable_snapshot(context)
 
     if cache is None or any(token is None for token in tokens):
         if request_trace is not None:
@@ -253,8 +255,6 @@ async def _build_chat_snapshot_coordinated(
             scope_key=context.scope.key,
             session_refs=context.session_refs,
             cursor_secret=context.cursor_secret,
-            overview_fence=context.work_overview_fence,
-            overview_coverage=context.work_overview_coverage,
             build=build,
             request_trace=request_trace,
         )
@@ -287,28 +287,15 @@ async def _build_chat_snapshot_coordinated(
                     request_trace=request_trace,
                 )
             base = await _build_immutable_snapshot(fresh)
-            overview = (
-                await _read_snapshot_activity_overview_bounded(app, fresh)
-                if hasattr(app.state, "session_factory")
-                else None
-            )
-            base = base.model_copy(update={"activity_overview": overview})
         context = fresh
 
-    return await _apply_mutable_snapshot_overlay(
-        app,
-        base,
-        context,
-        refresh_activity=not built,
-    ), tier
+    return await _apply_mutable_snapshot_overlay(app, base, context), tier
 
 
 async def _apply_mutable_snapshot_overlay(
     app: Any,
     base: ChatSnapshot,
     context: ConversationSnapshotContext,
-    *,
-    refresh_activity: bool = True,
 ) -> ChatSnapshot:
     """Apply authorized mutable state and request-time attachment hydration."""
 
@@ -320,17 +307,10 @@ async def _apply_mutable_snapshot_overlay(
             "queue": context.queue,
             "state": context.state,
             "runtime": _runtime_overlay(context.runtime_input, generated_at=now),
+            "activity_overview": None,
             "server_time": now.isoformat(),
         }
     )
-    overview = base.activity_overview
-    if refresh_activity and hasattr(app.state, "session_factory"):
-        overview = await _read_snapshot_activity_overview_bounded(
-            app,
-            context,
-            stale=base.activity_overview,
-        )
-    overlaid = overlaid.model_copy(update={"activity_overview": overview})
     return await _hydrate_snapshot_attachments(
         app,
         overlaid,
@@ -338,57 +318,6 @@ async def _apply_mutable_snapshot_overlay(
         conversation_id=context.conversation_id,
         session_refs=context.session_refs,
     )
-
-
-async def _read_snapshot_activity_overview(
-    app: Any,
-    context: ConversationSnapshotContext,
-) -> Any:
-    registry = getattr(app.state, "tool_registry", None)
-    definitions = {
-        definition.name: definition
-        for definition in (registry.list_tools() if registry is not None else [])
-    }
-    async with app.state.session_factory() as db:
-        graph = await resolve_authorized_work_graph(
-            db,
-            user_email=context.owner_email,
-            scope=context.scope,
-            deadline=monotonic() + WORK_GRAPH_MAX_SECONDS,
-        )
-        return await read_activity_overview(
-            db,
-            owner_email=context.owner_email,
-            scope=context.scope,
-            session_rows=list(graph.session_rows),
-            workstreams=list(graph.nodes),
-            graph_fingerprint=graph.fingerprint,
-            graph_truncated=graph.truncated,
-            tool_definitions=definitions,
-            detail="lightweight",
-        )
-
-
-async def _read_snapshot_activity_overview_bounded(
-    app: Any,
-    context: ConversationSnapshotContext,
-    *,
-    stale: Any = None,
-) -> Any:
-    """Read the complete overview within one deadline and fail open to stale data."""
-
-    try:
-        async with asyncio.timeout(WORK_GRAPH_MAX_SECONDS):
-            return await _read_snapshot_activity_overview(app, context)
-    except TimeoutError:
-        return stale
-    except AuthorizedWorkRootNotReadyError:
-        if (
-            context.scope.kind == "conversation"
-            and context.scope.conversation_id == context.conversation_id
-        ):
-            return None
-        raise
 
 
 async def warm_chat_snapshot_coordinated(
@@ -407,21 +336,13 @@ async def warm_chat_snapshot_coordinated(
     scope_key = context.scope.key
 
     async def build() -> ChatSnapshot:
-        snapshot = await _build_immutable_snapshot(context)
-        overview = (
-            await _read_snapshot_activity_overview_bounded(app, context)
-            if hasattr(app.state, "session_factory")
-            else snapshot.activity_overview
-        )
-        return snapshot.model_copy(update={"activity_overview": overview})
+        return await _build_immutable_snapshot(context)
 
     result = await cache.get_or_build_result(
         authority_token=_conversation_authority_token(app, context),
         scope_key=scope_key,
         session_refs=context.session_refs,
         cursor_secret=context.cursor_secret,
-        overview_fence=context.work_overview_fence,
-        overview_coverage=context.work_overview_coverage,
         build=build,
         fail_open=False,
     )
@@ -476,7 +397,7 @@ def _conversation_authority_token(
 async def _build_immutable_snapshot(
     context: ConversationSnapshotContext,
 ) -> ChatSnapshot:
-    return await build_chat_snapshot(
+    snapshot = await build_chat_snapshot(
         scope=context.scope,
         conversation=None,
         session_refs=context.session_refs,
@@ -489,16 +410,14 @@ async def _build_immutable_snapshot(
         event_post_processor_cache_key=None,
         session_cache=context.session_cache,
     )
+    return snapshot.model_copy(update={"activity_overview": None})
 
 
-async def _conversation_session_refs(
-    app: Any,
+async def _conversation_session_rows(
     session: Any,
     conversation_id: str,
     active_session_id: str | None,
-    *,
-    user_email: str,
-) -> list[ConversationSessionRef]:
+) -> list[Any]:
     if active_session_id is None:
         latest_roots = await list_conversation_sessions(
             session,
@@ -515,102 +434,7 @@ async def _conversation_session_refs(
         conversation_id,
         active_session_id,
     )
-    return [
-        await _session_ref(app, row, user_email=user_email, ordinal=index)
-        for index, row in enumerate(chain)
-    ]
-
-
-async def _work_overview_state(
-    session: Any,
-    session_refs: list[ConversationSessionRef],
-) -> tuple[str, tuple[tuple[str, int], ...]]:
-    """Return the Work fence and source coverage used by the warmed overview."""
-
-    session_ids = [ref.session_id for ref in session_refs]
-    rows = (
-        (
-            await session.scalars(
-                select(WorkSessionProjectionRow).where(
-                    WorkSessionProjectionRow.session_id.in_(session_ids),
-                    WorkSessionProjectionRow.materializer_version == WORK_MATERIALIZER_VERSION,
-                )
-            )
-        ).all()
-        if session_ids
-        else []
-    )
-    by_session = {row.session_id: row for row in rows}
-    values = []
-    coverage: list[tuple[str, int]] = []
-    for ref in session_refs:
-        row = by_session.get(ref.session_id)
-        coverage.append(
-            (
-                ref.event_store_session_id,
-                row.covered_through_seq if row is not None else -1,
-            )
-        )
-        values.append(
-            (
-                ref.session_id,
-                None
-                if row is None
-                else (
-                    row.materializer_version,
-                    row.state,
-                    row.target_seq,
-                    row.covered_through_seq,
-                ),
-            )
-        )
-    encoded = json.dumps(values, separators=(",", ":"), sort_keys=False).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest(), tuple(coverage)
-
-
-async def _session_ref(
-    app: Any,
-    session_row: Any,
-    *,
-    user_email: str,
-    ordinal: int,
-) -> ConversationSessionRef:
-    if session_row.user_email != user_email:
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Session event-store authority does not match the authorized user",
-        )
-    agent = await app.state.agent_registry.get(
-        session_row.agent_id,
-        owner_email=user_email,
-        include_disabled=True,
-    )
-    agent_owner_email = agent.owner_email if agent is not None else None
-    if not agent_owner_email:
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Session agent authority is unavailable",
-        )
-    reader = app.state.cached_event_store.bind(
-        EventStoreAuthority(
-            user_email=user_email,
-            agent_id=session_row.agent_id,
-            agent_owner_email=agent_owner_email,
-        )
-    )
-    return ConversationSessionRef(
-        session_id=session_row.session_id,
-        event_store_session_id=session_row.intaris_session_id or session_row.session_id,
-        store="intaris",
-        role="root",
-        ordinal=ordinal,
-        status=session_row.status,
-        completion_reason=session_row.completion_reason,
-        reader=reader,
-        authority_token=reader.authority_token,
-    )
+    return list(chain)
 
 
 async def _hydrate_snapshot_attachments(

@@ -172,6 +172,12 @@ can use git read-only commands to examine status and obtain diffs.
   or data-loss risk, or violation of approved acceptance criteria.
 - If you are unsure whether something is a real issue, investigate further or
   say that you are unsure instead of flagging it as definite.
+- On repeated review, verify the previous findings and code changed by their
+  fixes. Do not repeat a full review unless the correction changes architecture,
+  a trust boundary, persistence, or another shared invariant.
+- State whether each blocking finding is unresolved from the previous review,
+  newly introduced by the correction, or newly discovered in changed or
+  directly affected code.
 
 ## Review Requirements
 
@@ -235,6 +241,14 @@ implementation plan.
   analysis unless the change clearly touches those concerns.
 - If the plan is overengineered for the problem, say so explicitly.
 - Prefer specific, actionable comments over broad design commentary.
+
+## Escalated Implementations
+
+When reviewing an escalated implementation, focus on why the previous bounded
+implementation failed. Decide whether to clarify the existing wiring and return
+the task to the same worker, narrow or repartition the scope, assign a stronger
+profile because meaningful ambiguity remains, or revise the architecture. Do
+not redo the whole plan when one local correction is sufficient.
 
 ## Review Checklist
 

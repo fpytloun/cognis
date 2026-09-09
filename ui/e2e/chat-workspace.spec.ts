@@ -18,7 +18,10 @@ test.describe('chat workspace inspector', () => {
       if (viewport.width >= 1024) {
         await expect(page.getByRole('separator', { name: 'Resize conversation inspector' })).toBeVisible();
       } else {
-        await expect(page.getByRole('dialog', { name: 'Conversation information' })).toBeVisible();
+        const dialog = page.getByRole('dialog', { name: 'Conversation information' });
+        await expect(dialog).toBeVisible();
+        const panel = dialog.locator('#conversation-info-drawer');
+        await expect(panel).toHaveCSS('background-color', 'rgb(2, 6, 23)');
       }
     });
   }

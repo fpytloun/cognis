@@ -11,15 +11,18 @@ from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.executor_calls import normalize_executor_call_snapshot
 from cognis.models.executor_inference import (
     executor_local_inference_config_confirmed,
     resolve_executor_local_inference_config,
 )
 from cognis.models.executor_resources import normalize_executor_resource_snapshot
 from cognis.models.local_models import OllamaRuntimeCapability
+from cognis.models.runtime_capabilities import normalize_runtime_capability_report
 from cognis.models.tool import ExecutorCapabilities, ToolDefinition
 from cognis.ownership import is_shared_owner_email
 from cognis.store.queries import (
+    bump_executor_reconfigure_generation,
     get_executor_row,
     normalize_executor_desired_config_version,
     update_executor_runtime_state,
@@ -29,6 +32,7 @@ from cognis.tools.skills import resolve_skills_for_agent
 _logger = get_logger(__name__)
 
 CONFIGURE_RPC_TIMEOUT_SECONDS = 120.0
+MCP_CREDENTIAL_RELOAD_TIMEOUT_SECONDS = 60.0
 RUNTIME_METADATA_SCHEMA_VERSION = 1
 CONFIGURE_CAPABILITY_MCP_RUNTIME_STATUS = "mcp_runtime_status_v1"
 MAX_SAFE_ERROR_LENGTH = 240
@@ -98,6 +102,137 @@ def schedule_executor_reconfigure(app: Any, executor_id: str) -> None:
                 schedule_executor_reconfigure(app, executor_id)
 
     tasks[executor_id] = asyncio.create_task(_run(), name=f"executor-reconcile-{executor_id}")
+
+
+def schedule_mcp_credential_reload(app: Any, executor_id: str, server_id: str) -> None:
+    """Coalesce credential-only reloads without changing executor availability."""
+
+    key = (executor_id, server_id)
+    tasks: dict[tuple[str, str], asyncio.Task[None]] = getattr(
+        app.state, "mcp_credential_reload_tasks", {}
+    )
+    if not hasattr(app.state, "mcp_credential_reload_tasks"):
+        app.state.mcp_credential_reload_tasks = tasks
+    pending: set[tuple[str, str]] = getattr(app.state, "mcp_credential_reload_pending", set())
+    if not hasattr(app.state, "mcp_credential_reload_pending"):
+        app.state.mcp_credential_reload_pending = pending
+    existing = tasks.get(key)
+    if existing is not None and not existing.done():
+        pending.add(key)
+        return
+
+    async def _run() -> None:
+        cancelled = False
+        try:
+            outcome = await reload_mcp_server_credentials(app, executor_id, server_id)
+            if outcome == "full_reconfigure_required":
+                async with app.state.session_factory() as session:
+                    updated = await bump_executor_reconfigure_generation(
+                        session,
+                        executor_id,
+                        runtime_state="reconfiguring",
+                    )
+                    await session.commit()
+                if updated:
+                    schedule_executor_reconfigure(app, executor_id)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as exc:
+            _logger.warning(
+                "executor_runtime: MCP credential reload failed for %s/%s: %s",
+                executor_id,
+                server_id,
+                _safe_error_message(str(exc)),
+                exc_info=True,
+            )
+        finally:
+            current = tasks.get(key)
+            if current is asyncio.current_task():
+                tasks.pop(key, None)
+            if cancelled:
+                pending.discard(key)
+            elif key in pending:
+                pending.discard(key)
+                schedule_mcp_credential_reload(app, executor_id, server_id)
+
+    tasks[key] = asyncio.create_task(
+        _run(), name=f"mcp-credential-reload-{executor_id}-{server_id}"
+    )
+
+
+async def reload_mcp_server_credentials(app: Any, executor_id: str, server_id: str) -> str:
+    """Reload one MCP credential while the current executor runtime keeps serving."""
+
+    lock = _get_executor_lock(app, executor_id)
+    async with lock:
+        websocket_provider = app.state.providers.executor.websocket
+        connection = websocket_provider.get_connection(executor_id)
+        if connection is None:
+            return "executor_unavailable"
+        async with app.state.session_factory() as session:
+            row = await get_executor_row(session, executor_id)
+        if row is None:
+            return "executor_missing"
+        payload = await _build_mcp_credential_reload_payload(app, row, server_id)
+        if payload is None:
+            return "server_unavailable"
+        if not _is_current_connection(app, executor_id, connection):
+            return "connection_replaced"
+        try:
+            result = await connection.rpc_call(
+                "executor.mcp.reload_credentials",
+                payload,
+                timeout=MCP_CREDENTIAL_RELOAD_TIMEOUT_SECONDS,
+                stable_call_id=(
+                    f"mcp-credential:{executor_id}:{server_id}:"
+                    f"{payload['credential_revision']['token_id']}:"
+                    f"{payload['credential_revision']['token_version']}"
+                ),
+                replay_safe=True,
+            )
+        except Exception as exc:
+            if getattr(exc, "code", None) == -32601:
+                return "full_reconfigure_required"
+            raise
+        state = str(result.get("state") or "failed")
+        if state == "full_reconfigure_required":
+            return state
+        if state not in {"applied", "unchanged"}:
+            _logger.warning(
+                "executor_runtime: MCP credential reload preserved existing runtime for %s/%s",
+                executor_id,
+                server_id,
+                extra={
+                    "extra_data": {
+                        "executor_id": executor_id,
+                        "server_id": server_id,
+                        "state": state,
+                        "error_class": result.get("error_class"),
+                    }
+                },
+            )
+            return state
+        revision = result.get("credential_revision")
+        if isinstance(revision, dict):
+            await _persist_mcp_credential_revision(
+                app,
+                row,
+                connection=connection,
+                server_id=server_id,
+                revision=revision,
+            )
+        _logger.info(
+            "executor_runtime: MCP credentials reloaded without executor reconfigure",
+            extra={
+                "extra_data": {
+                    "executor_id": executor_id,
+                    "server_id": server_id,
+                    "state": state,
+                }
+            },
+        )
+        return state
 
 
 async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | None = None) -> bool:
@@ -310,6 +445,24 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 configure_metadata,
                 result_runtime_metadata,
             )
+            if "observed_capabilities" in configure_result:
+                observed_capabilities = normalize_runtime_capability_report(
+                    configure_result.get("observed_capabilities")
+                )
+                if observed_capabilities is None:
+                    runtime_metadata.pop("observed_capabilities", None)
+                    runtime_metadata["observed_capabilities_state"] = "unknown"
+                else:
+                    runtime_metadata["observed_capabilities"] = observed_capabilities.model_dump(
+                        mode="json"
+                    )
+                    runtime_metadata.pop("observed_capabilities_state", None)
+            else:
+                # Old executors do not send this optional field. Do not make
+                # their configuration fail, and expose the absence as
+                # unknown telemetry rather than unavailable capability data.
+                runtime_metadata.pop("observed_capabilities", None)
+                runtime_metadata["observed_capabilities_state"] = "unknown"
             capabilities = ExecutorCapabilities(
                 tools=list(caps_raw.get("tools") or []),
                 inference=bool(caps_raw.get("inference", False)),
@@ -507,6 +660,49 @@ async def persist_executor_resource_snapshot(
     return True
 
 
+async def persist_executor_call_snapshot(
+    app: Any,
+    executor_id: str,
+    payload: Any,
+    *,
+    connection: Any,
+) -> bool:
+    """Persist a strictly newer call snapshot from the current connection."""
+
+    snapshot = normalize_executor_call_snapshot(payload)
+    if snapshot is None or snapshot.executor_instance_id != getattr(
+        connection, "executor_instance_id", None
+    ):
+        return False
+    lock = _get_executor_lock(app, executor_id)
+    async with lock:
+        if not _is_current_connection(app, executor_id, connection):
+            return False
+        async with app.state.session_factory() as session:
+            row = await get_executor_row(session, executor_id)
+            if row is None:
+                return False
+            runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})
+            previous = normalize_executor_call_snapshot(runtime_metadata.get("call_snapshot"))
+            if (
+                previous is not None
+                and previous.executor_instance_id == snapshot.executor_instance_id
+                and previous.snapshot_seq >= snapshot.snapshot_seq
+            ):
+                return False
+            runtime_metadata["call_snapshot"] = snapshot.model_dump(mode="json")
+            runtime_metadata["call_snapshot_received_at"] = datetime.now(UTC).isoformat()
+            updated = await _update_owned_runtime_state(
+                app,
+                session,
+                connection,
+                executor_id=executor_id,
+                runtime_metadata=runtime_metadata,
+            )
+            await session.commit()
+            return updated is not None
+
+
 async def _update_owned_runtime_state(
     app: Any,
     session: Any,
@@ -674,6 +870,65 @@ async def _mark_reconcile_failed(app: Any, executor_id: str, exc: Exception) -> 
     )
 
 
+async def _build_mcp_credential_reload_payload(
+    app: Any,
+    row: Any,
+    server_id: str,
+) -> dict[str, Any] | None:
+    from cognis.api.executor_ws import _resolve_executor_mcp_payload
+
+    servers, scoped_secrets, metadata = await _resolve_executor_mcp_payload(
+        row,
+        app.state.providers,
+        server_ids_override=[server_id],
+    )
+    if len(servers) != 1 or str(servers[0].server_id or "") != server_id:
+        return None
+    revisions = metadata.get("mcp_credential_revisions")
+    revision = revisions.get(server_id) if isinstance(revisions, dict) else None
+    if not isinstance(revision, dict):
+        return None
+    token_id = revision.get("token_id")
+    token_version = revision.get("token_version")
+    if not isinstance(token_id, str) or not token_id or not isinstance(token_version, int):
+        return None
+    return {
+        "server": servers[0].model_dump(mode="json"),
+        "secrets": scoped_secrets,
+        "credential_revision": {
+            "token_id": token_id,
+            "token_version": token_version,
+        },
+    }
+
+
+async def _persist_mcp_credential_revision(
+    app: Any,
+    row: Any,
+    *,
+    connection: Any,
+    server_id: str,
+    revision: dict[str, Any],
+) -> None:
+    runtime_metadata = dict(getattr(row, "runtime_metadata", None) or {})
+    current_value = runtime_metadata.get("mcp_credential_revisions")
+    revisions = dict(current_value) if isinstance(current_value, dict) else {}
+    revisions[server_id] = {
+        "token_id": str(revision.get("token_id") or ""),
+        "token_version": int(revision.get("token_version") or 0),
+    }
+    runtime_metadata["mcp_credential_revisions"] = revisions
+    await _persist_runtime_state(
+        app,
+        row.executor_id,
+        connection=connection,
+        runtime_state=str(getattr(row, "runtime_state", "active") or "active"),
+        applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
+        observed_tools=list(getattr(row, "observed_tools", None) or []),
+        runtime_metadata=runtime_metadata,
+    )
+
+
 async def _build_configure_payload(
     app: Any,
     row: Any,
@@ -791,6 +1046,7 @@ async def _build_configure_payload(
             ),
         },
         "mcp_servers": [server.model_dump(mode="json") for server in mcp_servers],
+        "mcp_credential_revisions": dict(mcp_metadata.get("mcp_credential_revisions") or {}),
         "secrets": scoped_secrets,
         "web_config": {
             "web_backend": web_config.get("web_backend", "direct"),

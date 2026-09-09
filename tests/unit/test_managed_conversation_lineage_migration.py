@@ -14,6 +14,7 @@ from alembic.script import ScriptDirectory
 
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.store.database import create_engine
+from cognis.store.migrations.versioning import ALEMBIC_VERSION_NUM_LENGTH
 
 
 @contextmanager
@@ -67,28 +68,28 @@ def test_migration_graph_has_single_linear_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["120_schedule_fire_kinds"]
-    revisions = list(script.walk_revisions("base", "120_schedule_fire_kinds"))
+    assert script.get_heads() == ["148_channel_delivery_route_release"]
+    revisions = list(script.walk_revisions("base", "144_work_v8_projection_repair"))
     assert [revision.revision for revision in revisions[:17]] == [
-        "120_schedule_fire_kinds",
-        "119_work_scope_revisions",
-        "118_channel_delivery_receipts",
-        "117_group_context",
-        "116_managed_resume_prepared",
-        "115_managed_channel_resume",
-        "114_managed_channel_fences",
-        "113_managed_channel_lifecycle",
-        "112_channel_observed_targets",
-        "111_managed_channel_foundation",
-        "110_conversation_lineage",
-        "109_task_control_conversation",
-        "108_kb_active_metadata",
-        "107_knowledgebase_grants",
-        "106_kb_index_lifecycle",
-        "105_managed_join_handoffs",
-        "104_channel_direct_turn_delivery",
+        "144_work_v8_projection_repair",
+        "143_schedule_terminal_task_correlation",
+        "142_schedule_action_issue_index",
+        "141_work_overview_evidence_index",
+        "140_work_retention_indexes",
+        "139_work_call_state_index",
+        "138_schedule_task_failure_options",
+        "137_work_live_projection",
+        "136_totp_mfa",
+        "135_native_sessions",
+        "134_work_activity_list_index",
+        "133_work_generation_snapshots",
+        "132_work_derived_file_state",
+        "131_work_cache_recovery_topology",
+        "130_work_reconstructable_cache",
+        "129_work_record_file_metadata",
+        "128_work_load_indexes",
     ]
-    assert all(len(revision.revision) <= 32 for revision in revisions[:16])
+    assert all(len(revision.revision) < ALEMBIC_VERSION_NUM_LENGTH for revision in revisions[:16])
 
 
 def test_artifact_source_migration_backfills_legacy_identity() -> None:

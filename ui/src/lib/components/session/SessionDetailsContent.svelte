@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { CodexUsage, CodexUsageWindow, ContextUsage, GenerationPerformanceSnapshot, TokenUsage } from '$lib/types/api';
+  import type { CodexUsage, CodexUsageWindow, ContextUsage, GenerationPerformanceSnapshot, RuntimeSelection, TokenUsage } from '$lib/types/api';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import Star from 'lucide-svelte/icons/star';
 
@@ -19,6 +19,7 @@
     context_usage?: ContextUsage | null;
     token_usage?: TokenUsage | null;
     last_generation?: GenerationPerformanceSnapshot | null;
+    runtime_selection?: RuntimeSelection | null;
   }
 
   let {
@@ -32,6 +33,14 @@
     starred = false,
     starBusy = false,
     onToggleStar,
+    canArchive = false,
+    canDelete = false,
+    archived = false,
+    archiveBusy = false,
+    deleteBusy = false,
+    onArchive,
+    onRestore,
+    onDelete,
   } = $props<{
     detail: SessionDetailsData;
     sessionId?: string;
@@ -43,6 +52,14 @@
     starred?: boolean;
     starBusy?: boolean;
     onToggleStar?: (() => void) | undefined;
+    canArchive?: boolean;
+    canDelete?: boolean;
+    archived?: boolean;
+    archiveBusy?: boolean;
+    deleteBusy?: boolean;
+    onArchive?: (() => void | Promise<void>) | undefined;
+    onRestore?: (() => void | Promise<void>) | undefined;
+    onDelete?: (() => void | Promise<void>) | undefined;
   }>();
   let codexUsage = $state<CodexUsage | null>(null);
   let codexUsageError = $state<string | null>(null);
@@ -185,6 +202,36 @@
     <span class="text-rose-400">{detail.denied_count} denied</span>
     <span class="text-sky-400">{detail.escalated_count} escalated</span>
   </div>
+  {#if detail.runtime_selection}
+    <section class="mt-3 rounded-2xl border border-sky-900/70 bg-sky-950/20 p-3" data-testid="session-selected-runtime">
+      <p class="text-[10px] font-semibold uppercase tracking-widest text-sky-400">Selected for next message</p>
+      <dl class="mt-2 grid gap-2 text-xs sm:grid-cols-3">
+        <div><dt class="text-slate-500">Profile</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.profile_id}</dd></div>
+        <div><dt class="text-slate-500">Model</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.provider_id ? `${detail.runtime_selection.provider_id}/` : ''}{detail.runtime_selection.model ?? 'Provider default'}</dd></div>
+        <div><dt class="text-slate-500">Thinking</dt><dd class="mt-0.5 text-slate-200">{detail.runtime_selection.reasoning_effort ?? 'Default'}</dd></div>
+      </dl>
+    </section>
+  {/if}
+  {#if (canArchive && ((archived && onRestore) || (!archived && onArchive))) || (canDelete && onDelete)}
+    <div class="mt-3 flex flex-wrap gap-2" aria-label="Conversation lifecycle actions">
+      {#if canArchive}
+        {#if archived && onRestore}
+          <Button size="sm" variant="secondary" disabled={archiveBusy || deleteBusy} onclick={() => void onRestore?.()}>
+            {archiveBusy ? 'Restoring…' : 'Restore'}
+          </Button>
+        {:else if onArchive}
+          <Button size="sm" variant="secondary" disabled={archiveBusy || deleteBusy} onclick={() => void onArchive?.()}>
+            {archiveBusy ? 'Archiving…' : 'Archive'}
+          </Button>
+        {/if}
+      {/if}
+      {#if canDelete && onDelete}
+        <Button size="sm" variant="danger" disabled={archiveBusy || deleteBusy} onclick={() => void onDelete?.()}>
+          {deleteBusy ? 'Deleting…' : 'Delete'}
+        </Button>
+      {/if}
+    </div>
+  {/if}
   <div class="mt-4 grid gap-3 lg:grid-cols-2">
   <section class="rounded-2xl border border-slate-800 bg-slate-950/50 p-3">
     <p class="text-[10px] font-semibold uppercase tracking-widest text-slate-500">Context window</p>
@@ -207,6 +254,7 @@
           <div class={`h-full rounded-full ${contextBarColor(usagePercent)}`} style={`width: ${usagePercent}%`}></div>
         </div>
         <p class="mt-2 text-xs text-slate-500">
+          Last context:
           {performance?.model ?? contextUsage.model}
           {contextUsage.agent_profile_id && contextUsage.agent_profile_id !== 'default' ? ` · profile ${contextUsage.agent_profile_id}` : ''}
         </p>
@@ -319,8 +367,8 @@
           {/if}
         </div>
         <dl class="grid content-start gap-2 text-xs">
-          <div><dt class="text-slate-500">Model / provider</dt><dd class="mt-0.5 text-slate-200">{performance?.model ?? contextUsage?.model ?? 'Unknown'} · {performance?.provider_name ?? performance?.provider_id ?? contextUsage?.provider_id ?? 'default'}</dd></div>
-          <div><dt class="text-slate-500">Agent profile</dt><dd class="mt-0.5 text-slate-200">{contextUsage?.agent_profile_id ?? 'Default'}</dd></div>
+          <div><dt class="text-slate-500">Last model / provider</dt><dd class="mt-0.5 text-slate-200">{performance?.model ?? contextUsage?.model ?? 'Unknown'} · {performance?.provider_name ?? performance?.provider_id ?? contextUsage?.provider_id ?? 'default'}</dd></div>
+          <div><dt class="text-slate-500">Last agent profile</dt><dd class="mt-0.5 text-slate-200">{contextUsage?.agent_profile_id ?? 'Default'}</dd></div>
           <div><dt class="text-slate-500">Projection budget</dt><dd class="mt-0.5 text-slate-200">{fmt(contextUsage?.available_prompt_tokens ?? contextUsage?.effective_prompt_budget)} tokens</dd></div>
           <div><dt class="text-slate-500">Provider</dt><dd class="mt-0.5 text-slate-200">{contextUsage?.provider_id ?? 'default'}</dd></div>
         </dl>

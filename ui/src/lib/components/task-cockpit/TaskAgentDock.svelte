@@ -14,7 +14,7 @@
   import { conversationActivityState } from '$lib/conversation-activity';
   import { addToast } from '$lib/stores/toasts';
   import { overlayStack, registerOverlay } from '$lib/stores/overlays';
-   import { isTextInputTarget, taskAgentDock, taskDockWorkKey } from '$lib/stores/taskAgentDock.svelte';
+    import { taskAgentDock, taskDockWorkKey } from '$lib/stores/taskAgentDock.svelte';
   import type { Agent, BackgroundWorkItem, CognisWebSocketEvent, Conversation, QuestionSetAnswer, TaskControlChatResponse, TaskDetail } from '$lib/types/api';
   import { wsClient } from '$lib/ws/client';
 
@@ -248,6 +248,7 @@
         if (
           generation === state.generation
           && conversation?.conversation_id === state.conversationId
+          && sidebar.background_work
         ) {
           backgroundWork = sidebar.background_work.items;
         }
@@ -270,7 +271,12 @@
 
   function handleConversationEvent(event: CognisWebSocketEvent): void {
     if (!conversation || !('conversation_id' in event) || event.conversation_id !== conversation.conversation_id) return;
-    if (event.type === 'conversation_updated') {
+    if (event.type === 'sidebar_conversation_upsert' && event.conversation) {
+      conversation = { ...conversation, ...event.conversation };
+      runtimeActive = event.conversation.has_active_turn;
+      if (event.conversation.has_unread) void markConversationReadIfOpen();
+      void refreshBackgroundWork();
+    } else if (event.type === 'conversation_updated') {
       conversation = {
         ...conversation,
         ...(event.has_unread !== undefined ? { has_unread: event.has_unread } : {}),
@@ -283,11 +289,12 @@
           ? { pending_notification_types: event.pending_notification_types }
           : {}),
       };
+      if (event.has_active_turn !== undefined) runtimeActive = event.has_active_turn;
       if (event.has_unread) void markConversationReadIfOpen();
       void refreshBackgroundWork();
     } else if (event.type === 'conversation_runtime_snapshot' && event.has_active_turn !== undefined) {
-      if (taskAgentDock.state === 'minimized' || taskAgentDock.tab !== 'chat') return;
       runtimeActive = event.has_active_turn;
+      conversation = { ...conversation, has_active_turn: event.has_active_turn };
       void refreshBackgroundWork();
     } else if (
       event.type === 'delegation_started'
@@ -312,7 +319,6 @@
   }
 
   function minimize(): void {
-    runtimeActive = false;
     taskAgentDock.minimize();
     void tick().then(() => {
       window.requestAnimationFrame(() => {
@@ -327,7 +333,6 @@
   }
 
   function selectTab(tab: 'chat' | 'work'): void {
-    if (tab !== 'chat') runtimeActive = false;
     taskAgentDock.tab = tab;
   }
 
@@ -397,12 +402,8 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
-    if (otherBlockingOverlay || isTextInputTarget(event.target) || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (event.key.toLowerCase() === 'a') {
-      event.preventDefault();
-      if (taskAgentDock.state === 'minimized') void openDock();
-      else minimize();
-    } else if (event.key === 'Escape' && taskAgentDock.state !== 'minimized') {
+    if (otherBlockingOverlay || event.key !== 'Escape' || taskAgentDock.state === 'minimized') return;
+    if (event.key === 'Escape') {
       event.preventDefault();
       minimize();
     }
@@ -416,7 +417,6 @@
   $effect(() => {
     const state = taskAgentDock.state;
     if (state !== observedDockState) {
-      if (state === 'minimized') runtimeActive = false;
       observedDockState = state;
     }
     if (state === 'minimized' || otherBlockingOverlay) return;
@@ -592,12 +592,12 @@
 {/if}
 
 <style>
-  .task-agent-fab { right: max(1rem, env(safe-area-inset-right)); bottom: calc(5rem + env(safe-area-inset-bottom)); }
+  .task-agent-fab { right: max(1rem, env(safe-area-inset-right)); bottom: 5rem; }
   .task-agent-panel { inset-block: 1rem; right: max(1rem, env(safe-area-inset-right)); width: min(420px, 92vw); border-radius: 1rem; }
   .task-agent-fullscreen { inset: 0; width: 100%; border-radius: 0; }
   .task-agent-fullscreen .task-agent-header { padding-top: max(0.75rem, env(safe-area-inset-top)); }
   @media (max-width: 1023px) {
-    .task-agent-panel:not(.task-agent-fullscreen) { inset: auto 0 0; width: 100%; height: min(88dvh, 760px); border-radius: 1rem 1rem 0 0; padding-bottom: env(safe-area-inset-bottom); }
+    .task-agent-panel:not(.task-agent-fullscreen) { inset: auto 0 0; width: 100%; height: min(88dvh, 760px); border-radius: 1rem 1rem 0 0; }
   }
   :global(body.task-agent-dock-modal nav[aria-label='Primary']) { display: none; }
 </style>

@@ -58,6 +58,14 @@ class ConversationTaskState(BaseModel):
 class ConversationPendingSummary(BaseModel):
     notification_id: str
     notification_type: str
+    call_id: str | None = None
+    session_id: str | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    arguments_display: Any | None = None
+    risk: str | None = None
+    reasoning: str | None = None
+    timeout_seconds: int | None = None
     task_id: str | None = None
     step_name: str | None = None
     step_run_id: str | None = None
@@ -65,7 +73,12 @@ class ConversationPendingSummary(BaseModel):
     label: str | None = None
     message: str | None = None
     options: list[Any] = Field(default_factory=list)
+    questions: list[Any] = Field(default_factory=list)
+    context: dict[str, Any] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    managed_conversation_title: str | None = None
+    managed_target_agent_id: str | None = None
+    managed_origin_conversation_id: str | None = None
     created_at: datetime | None = None
 
 

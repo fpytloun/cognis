@@ -18,6 +18,7 @@ from cognis.channels.protocol import (
     CHANNEL_DELIVERY_ERRORS,
     CHANNEL_OUTBOUND_TOTAL,
 )
+from cognis.channels.signal_failures import SignalDeliveryFailure
 from cognis.logging import get_logger
 from cognis.models.channel import (
     ChannelAccountConfig,
@@ -38,6 +39,7 @@ logger = get_logger(__name__)
 
 _SAFE_RECIPIENT_ERROR_CODE = re.compile(r"^[a-z0-9_]{1,64}$")
 _SAFE_SIDE_EFFECT_CERTAINTIES = {"none", "uncertain", "known"}
+_CHANNEL_SEND_RPC_TIMEOUT_SECONDS = 35.0
 
 
 def _parse_recipient_error(payload: Any) -> RemoteChannelRecipientError | None:
@@ -87,6 +89,28 @@ class RemoteChannelRecipientError(RuntimeError):
         self.code = code
         self.retryable = retryable
         self.side_effect_certainty = side_effect_certainty
+
+
+def _parse_signal_delivery_error(payload: Any) -> SignalDeliveryFailure | None:
+    if not isinstance(payload, dict) or payload.get("provider") != "signal-cli":
+        return None
+    required = {
+        "classification",
+        "challenge",
+        "retry_scheduled",
+        "side_effect_certainty",
+    }
+    if not required.issubset(payload):
+        raise ValueError("invalid structured Signal delivery error")
+    if (
+        not isinstance(payload["classification"], str)
+        or payload["classification"] not in {"rate_limit", "challenge", "send_failure", "unknown"}
+        or not isinstance(payload["challenge"], bool)
+        or payload["retry_scheduled"] is not False
+        or payload["side_effect_certainty"] != "uncertain"
+    ):
+        raise ValueError("invalid structured Signal delivery error")
+    return SignalDeliveryFailure(payload)
 
 
 class RemoteChannelAdapterProxy:
@@ -201,7 +225,7 @@ class RemoteChannelAdapterProxy:
         resolution_key: str,
     ) -> dict[str, Any]:
         try:
-            return await self._connection.rpc_call(
+            result = await self._connection.rpc_call(
                 "channel.resolve_recipient",
                 {
                     "account_id": self._account_id,
@@ -210,6 +234,9 @@ class RemoteChannelAdapterProxy:
                 },
                 timeout=30.0,
             )
+            if not isinstance(result, dict):
+                raise RuntimeError("Executor returned an invalid recipient resolution response")
+            return result
         except ExecutorRPCError as exc:
             try:
                 structured_error = _parse_recipient_error(exc.data)
@@ -248,13 +275,29 @@ class RemoteChannelAdapterProxy:
                     "account_id": self._account_id,
                     "message": message.model_dump(mode="json"),
                 },
-                timeout=30.0,
+                timeout=_CHANNEL_SEND_RPC_TIMEOUT_SECONDS,
             )
+            if not isinstance(result, dict):
+                raise RuntimeError("Executor returned an invalid channel delivery response")
+            if "error" in result:
+                error = result["error"]
+                try:
+                    structured = _parse_signal_delivery_error(error)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Executor returned an invalid Signal delivery error"
+                    ) from exc
+                if structured is not None:
+                    raise structured
+                raise RuntimeError("Executor returned a channel delivery error")
+            if result.get("status") != "sent":
+                raise RuntimeError("Executor returned an invalid channel delivery response")
             CHANNEL_OUTBOUND_TOTAL.labels(
                 channel_type=self.channel_type,
                 account_id=self._account_id,
             ).inc()
-            return result.get("platform_message_id")
+            platform_message_id = result.get("platform_message_id")
+            return platform_message_id if isinstance(platform_message_id, str) else None
         except Exception:
             CHANNEL_DELIVERY_ERRORS.labels(
                 channel_type=self.channel_type,
@@ -265,7 +308,7 @@ class RemoteChannelAdapterProxy:
                 extra={"extra_data": {"account_id": self._account_id}},
                 exc_info=True,
             )
-            return None
+            raise
 
     async def send_typing(self, chat_id: str) -> None:
         """Send typing indicator to the executor."""
@@ -435,10 +478,12 @@ class RemoteChannelAdapterProxy:
 
     async def health(self) -> ProviderHealth:
         if self._status == ChannelStatus.CONNECTED:
-            return ProviderHealth(status="healthy")
+            return ProviderHealth(name=self.channel_type, status="healthy")
         if self._status in {ChannelStatus.CONNECTING, ChannelStatus.RECONNECTING}:
-            return ProviderHealth(status="degraded", detail=self._last_error)
-        return ProviderHealth(status="unhealthy", detail=self._last_error)
+            return ProviderHealth(
+                name=self.channel_type, status="degraded", detail=self._last_error
+            )
+        return ProviderHealth(name=self.channel_type, status="unhealthy", detail=self._last_error)
 
     async def verify_webhook(
         self,

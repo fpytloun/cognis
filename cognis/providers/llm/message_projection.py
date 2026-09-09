@@ -51,6 +51,9 @@ def project_messages_for_provider(
 ) -> MessageProjectionResult:
     """Return provider-safe messages for the selected LLM API."""
 
+    from cognis.providers.llm.codex_artifacts import strip_cognis_artifact_metadata
+
+    messages = strip_cognis_artifact_metadata(messages)
     policy = resolve_message_projection_policy(provider=provider, llm_api=llm_api)
     if policy == "anthropic_messages":
         return _project_anthropic_messages(messages)

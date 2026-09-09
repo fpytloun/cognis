@@ -23,6 +23,7 @@ from cognis.store.queries import (
     delete_api_key,
     disable_user,
     get_api_key,
+    get_user,
 )
 
 
@@ -36,6 +37,49 @@ def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
 def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, str]:
     token = app.state.auth_provider.sign_access_token(email, email.split("@")[0].title(), role)  # type: ignore[attr-defined]
     return {"Authorization": f"Bearer {token}"}
+
+
+def test_legacy_access_token_only_matches_initial_auth_version(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="legacy@example.com",
+                    name="Legacy",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        legacy_token = app.state.auth_provider._sign(
+            {
+                "sub": "legacy@example.com",
+                "name": "Legacy",
+                "role": "user",
+                "aud": ["cognis", "intaris", "mnemory"],
+                "typ": "access",
+            },
+            app.state.auth_provider.token_ttl_seconds,
+        )
+        headers = {"Authorization": f"Bearer {legacy_token}"}
+        assert client.get("/api/auth/me", headers=headers).status_code == 200
+
+        async def _increment() -> None:
+            async with app.state.session_factory() as session:
+                user = await get_user(session, "legacy@example.com")
+                assert user is not None
+                user.auth_version += 1
+                await session.commit()
+
+        asyncio.run(_increment())
+        assert client.get("/api/auth/me", headers=headers).status_code == 401
 
 
 def test_public_health_route_bypasses_auth(monkeypatch: object, tmp_path: Path) -> None:
@@ -150,6 +194,50 @@ def test_middleware_rejects_wrong_audience_token(monkeypatch: object, tmp_path: 
         assert response.status_code == 401
 
 
+def test_middleware_rejects_refresh_token_as_bearer(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        token = client.app.state.auth_provider.sign_refresh_token("user@example.com")
+        response = client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 401
+
+
+def test_middleware_requires_existing_user(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        headers = _auth_headers(client.app, email="missing@example.com", role="admin")
+        assert client.get("/api/auth/me", headers=headers).status_code == 401
+
+
+def test_middleware_uses_current_user_role_and_name(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="Current Name",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        asyncio.run(_seed())
+        token = app.state.auth_provider.sign_access_token(
+            "user@example.com", "Forged Name", "admin"
+        )
+        response = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "email": "user@example.com",
+            "name": "Current Name",
+            "role": "user",
+        }
+
+
 def test_middleware_authenticates_browser_session_cookie(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -169,6 +257,7 @@ def test_middleware_authenticates_browser_session_cookie(
                     session,
                     user_email="user@example.com",
                     expires_at=datetime.now(UTC) + timedelta(days=1),
+                    auth_version=0,
                     user_agent="pytest",
                 )
                 await session.commit()

@@ -119,11 +119,19 @@ async def test_fresh_postgresql_upgrade_to_head() -> None:
             tables = set(await connection.run_sync(_table_names))
             version_length = await connection.run_sync(_version_column_length)
             revision = await connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            work_record_types = await connection.run_sync(
+                lambda sync_connection: {
+                    str(column["name"]): column["type"]
+                    for column in sa.inspect(sync_connection).get_columns("work_records")
+                }
+            )
             await connection.run_sync(_assert_schema_matches_metadata)
         assert {"users", "workflows", "tasks", "schedules", "managed_conversation_links"} <= tables
         config = Config("cognis/store/migrations/alembic.ini")
         assert revision == ScriptDirectory.from_config(config).get_current_head()
         assert version_length == 255
+        assert work_record_types["source_content_expires_at"].timezone is True
+        assert work_record_types["source_content_scrubbed_at"].timezone is True
         await _assert_agent_queries_work(engine)
     finally:
         await engine.dispose()
@@ -160,8 +168,17 @@ async def test_postgresql_bootstrap_at_113_upgrades_and_downgrades() -> None:
                     )
                 }
             )
+            binding_types = await connection.run_sync(
+                lambda sync_connection: {
+                    str(column["name"]): column["type"]
+                    for column in sa.inspect(sync_connection).get_columns(
+                        "managed_channel_bindings"
+                    )
+                }
+            )
             assert bool(indexes["uq_managed_signal_source_turn"]["unique"]) is True
             assert bool(indexes["uq_managed_signal_resume_request"]["unique"]) is True
+            assert binding_types["delivery_lease_expires_at"].timezone is True
             await connection.run_sync(_run_upgrade, "117_group_context")
             revision = await connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
         assert revision == "117_group_context"
@@ -197,6 +214,95 @@ async def test_postgresql_bootstrap_at_113_upgrades_and_downgrades() -> None:
         assert "resume_request_id" not in reflected["columns"]
         assert "uq_managed_signal_source_turn" not in reflected["unique_names"]
         assert "uq_managed_signal_resume_request" not in reflected["unique_names"]
+    finally:
+        await engine.dispose()
+        async with admin.begin() as connection:
+            await connection.execute(sa.schema.DropSchema(schema_name, cascade=True))
+        await admin.dispose()
+
+
+@pytest.mark.asyncio
+async def test_postgresql_bootstrap_at_129_then_upgrade_to_head() -> None:
+    url = _url()
+    schema_name = f"cognis_work_cache_bootstrap_{uuid.uuid4().hex}"
+    admin = create_async_engine(url)
+    async with admin.begin() as connection:
+        await connection.execute(sa.schema.CreateSchema(schema_name))
+
+    engine = create_async_engine(
+        url,
+        connect_args={"server_settings": {"search_path": f'"{schema_name}"'}},
+    )
+    try:
+        async with engine.connect() as connection:
+            await connection.run_sync(_run_upgrade, "129_work_record_file_metadata")
+        await run_schema_bootstrap(engine)
+        await run_schema_bootstrap(engine)
+        async with engine.connect() as connection:
+            bootstrap_metadata = await connection.run_sync(
+                lambda sync_connection: {
+                    "projection_checks": {
+                        str(item["name"])
+                        for item in sa.inspect(sync_connection).get_check_constraints(
+                            "work_session_projections"
+                        )
+                    },
+                    "projection_types": {
+                        str(column["name"]): column["type"]
+                        for column in sa.inspect(sync_connection).get_columns(
+                            "work_session_projections"
+                        )
+                    },
+                    "work_record_types": {
+                        str(column["name"]): column["type"]
+                        for column in sa.inspect(sync_connection).get_columns("work_records")
+                    },
+                }
+            )
+            for column_name in (
+                "source_content_expires_at",
+                "source_content_scrubbed_at",
+            ):
+                await connection.execute(
+                    sa.text(
+                        "ALTER TABLE work_records "
+                        f"ALTER COLUMN {column_name} "  # noqa: S608
+                        "TYPE TIMESTAMP WITHOUT TIME ZONE"
+                    )
+                )
+            await connection.run_sync(_run_upgrade)
+            revision = await connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+            upgraded_work_record_types = await connection.run_sync(
+                lambda sync_connection: {
+                    str(column["name"]): column["type"]
+                    for column in sa.inspect(sync_connection).get_columns("work_records")
+                }
+            )
+            row_count = 0
+            for table in (
+                "work_live_revisions",
+                "work_session_projections",
+                "work_records",
+                "work_record_files",
+                "work_current_files",
+            ):
+                row_count += int(
+                    await connection.scalar(
+                        sa.text(f"SELECT COUNT(*) FROM {table}")  # noqa: S608
+                    )
+                    or 0
+                )
+        assert "ck_work_session_projections_nonnegative" in bootstrap_metadata["projection_checks"]
+        assert bootstrap_metadata["projection_types"]["next_head_check_at"].timezone is True
+        assert bootstrap_metadata["work_record_types"]["source_content_expires_at"].timezone is True
+        assert (
+            bootstrap_metadata["work_record_types"]["source_content_scrubbed_at"].timezone is True
+        )
+        assert upgraded_work_record_types["source_content_expires_at"].timezone is True
+        assert upgraded_work_record_types["source_content_scrubbed_at"].timezone is True
+        config = Config("cognis/store/migrations/alembic.ini")
+        assert revision == ScriptDirectory.from_config(config).get_current_head()
+        assert row_count == 0
     finally:
         await engine.dispose()
         async with admin.begin() as connection:

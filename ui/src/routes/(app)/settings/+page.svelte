@@ -13,9 +13,11 @@
   import ProviderStatusBadge from '$lib/components/ProviderStatusBadge.svelte';
   import EnvVarEditor from '$lib/components/settings/EnvVarEditor.svelte';
   import ExecutorHealthPanel from '$lib/components/executors/ExecutorHealthPanel.svelte';
+  import ExecutorCapabilitiesPanel from '$lib/components/executors/ExecutorCapabilitiesPanel.svelte';
   import LocalInferenceSettings from '$lib/components/executors/LocalInferenceSettings.svelte';
   import ModelCard from '$lib/components/settings/ModelCard.svelte';
   import ModelEditModal from '$lib/components/settings/ModelEditModal.svelte';
+  import MfaSettings from '$lib/components/settings/MfaSettings.svelte';
   import ModelDiscoveryModal from '$lib/components/settings/ModelDiscoveryModal.svelte';
   import SystemSettingsEditor from '$lib/components/settings/SystemSettingsEditor.svelte';
   import WebBackendEditModal from '$lib/components/settings/WebBackendEditModal.svelte';
@@ -53,9 +55,13 @@
   } from '$lib/notifications';
   import {
     executorDegradedDetails,
+    executorTypeChoices,
+    executorUnavailable,
+    executorToolSelectionGuard,
     executorRuntimeBadgeStatus,
     executorRuntimeLabel,
     executorRuntimeSummary,
+    localExecutorTypesUnavailable,
     providerInferenceExecutors,
     providerSelectorCapabilityWarning,
     validateStdioCommand
@@ -65,6 +71,7 @@
     ApiKeyMetadata,
     CredentialMetadata,
     ExecutorConfig,
+    ExecutorStatus,
     ExecutorRuntimeConfig,
     ExecutorTokenResponse,
     HealthResponse,
@@ -236,6 +243,7 @@
   let health = $state<HealthResponse | null>(null);
   let diagnostics = $state<SystemDiagnostics | null>(null);
   let executorConfigs = $state<ExecutorConfig[]>([]);
+  let executorStatus = $state<ExecutorStatus | null>(null);
   let executorTools = $state<ToolDefinitionSummary[]>([]);
   let editingExecutor = $state<ExecutorConfig | null>(null);
   let webConfig = $state<WebConfigStatus>({
@@ -1532,14 +1540,15 @@
     if (!isAdmin && !USER_TABS.includes(activeTab)) {
       activeTab = 'account';
     }
-    [secrets, credentials, health, apiKeys, agents, executorConfigs, executorTools] = await Promise.all([
+    [secrets, credentials, health, apiKeys, agents, executorConfigs, executorTools, executorStatus] = await Promise.all([
       api.secrets.list(),
       api.credentials.list().catch(() => []),
       api.system.health(),
       api.auth.listApiKeys(),
       api.agents.list().then((page) => page.items.map((a) => ({ agent_id: a.agent_id, name: a.name, is_system: a.is_system }))),
       api.executor.list().catch(() => []),
-      api.tools.executorTools().catch(() => [])
+      api.tools.executorTools().catch(() => []),
+      api.executor.status().catch(() => null)
     ]);
     await loadUserPreferences(auth.getSnapshot().user?.email);
 
@@ -1738,6 +1747,10 @@
     return !exec.owner_email || exec.owner_email === currentUserEmail;
   }
 
+  function canConfigureExecutor(exec: ExecutorConfig): boolean {
+    return canManageExecutor(exec) && !executorUnavailable(exec);
+  }
+
   function canManageMcpServer(server: MCPServerConfigResponse): boolean {
     const currentUserEmail = auth.getSnapshot().user?.email ?? null;
     if (server.shared) {
@@ -1777,7 +1790,10 @@
   async function refreshExecutorsOnly(): Promise<void> {
     if (typeof document !== 'undefined' && document.hidden) return;
     if (savingExecutorIds.length > 0 || toolUpdateQueues.size > 0) return;
-    executorConfigs = await api.executor.list().catch(() => executorConfigs);
+    [executorConfigs, executorStatus] = await Promise.all([
+      api.executor.list().catch(() => executorConfigs),
+      api.executor.status().catch(() => executorStatus)
+    ]);
   }
 
   async function enableDeviceNotifications(): Promise<void> {
@@ -2276,7 +2292,7 @@
   const WEB_BACKEND_INFO: Record<string, { label: string; description: string; link?: string }> = {
     direct: {
       label: 'Direct',
-      description: 'Zero-setup path. DuckDuckGo powers direct search; httpx + trafilatura power direct fetch and extraction.'
+      description: 'Zero-setup path. DDGS metasearch powers direct search; httpx + trafilatura power direct fetch and extraction.'
     },
     tavily: {
       label: 'Tavily',
@@ -2301,7 +2317,7 @@
 
   function searchBackendDescription(backend: string): string {
     if (backend === 'direct') {
-      return 'Direct search uses DuckDuckGo. Free and zero-setup, but community-maintained and occasionally less reliable than Brave, Tavily, or your own SearXNG instance.';
+      return 'Direct search uses DDGS metasearch. Free and zero-setup, but community-maintained and occasionally less reliable than Brave, Tavily, or your own SearXNG instance.';
     }
     return WEB_BACKEND_INFO[backend]?.description ?? '';
   }
@@ -2869,7 +2885,7 @@
         <Card class="space-y-5 p-5">
           <!-- Identity -->
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-slate-200">
+           <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Name <span class="text-rose-300">*</span></span>
               <Input bind:value={providerForm.display_name} placeholder="My OpenAI" />
             </label>
@@ -3693,9 +3709,25 @@
               disabled={busy}
               onchange={(event) => void updateDisplayPreference('language', event.currentTarget.value.trim() || 'auto')}
             />
-            <span class="block text-xs text-slate-500">Use <code>auto</code> or a language tag such as <code>en</code> or <code>cs-CZ</code>.</span>
-          </label>
-        </Card>
+             <span class="block text-xs text-slate-500">Use <code>auto</code> or a language tag such as <code>en</code> or <code>cs-CZ</code>.</span>
+           </label>
+
+           <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+             <input
+               type="checkbox"
+               checked={$userPreferences.display.dashboard_workspace_windows}
+               disabled={busy}
+               class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+               onchange={(event) => void updateDisplayPreference('dashboard_workspace_windows', event.currentTarget.checked)}
+             />
+             <span>
+               <span class="block font-medium text-slate-100">Dashboard workspace windows</span>
+               <span class="mt-1 block text-xs leading-5 text-slate-500">
+                 Open Dashboard chats and task cockpits in non-blocking workspace windows on desktop and tablet. Phone behavior is unchanged.
+               </span>
+             </span>
+           </label>
+         </Card>
 
         <Card class="space-y-5 p-5">
           <div>
@@ -3704,8 +3736,22 @@
             <p class="mt-2 text-sm leading-6 text-slate-400">Control how much of the agent execution trace is shown in normal chat.</p>
           </div>
 
-          <div class="space-y-3">
-            <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+           <div class="space-y-3">
+             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
+               <input
+                 type="checkbox"
+                 checked={$userPreferences.chat.enter_to_send}
+                 disabled={busy}
+                 class="mt-1 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500/30 disabled:opacity-40"
+                 onchange={(event) => void updateChatPreference('enter_to_send', event.currentTarget.checked)}
+               />
+               <span>
+                 <span class="block font-medium text-slate-100">Enter sends messages with a physical keyboard</span>
+                 <span class="mt-1 block text-xs leading-5 text-slate-500">When disabled, Enter inserts a newline. Press Command+Enter on Apple devices or Ctrl+Enter elsewhere to send. The on-screen keyboard always uses Enter for a newline.</span>
+               </span>
+             </label>
+
+             <label class="flex items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3 text-sm">
               <input
                 type="checkbox"
                 checked={$userPreferences.chat.show_thinking_blocks}
@@ -3778,7 +3824,7 @@
             <label class="space-y-2 text-sm font-medium text-slate-200">
               <span>Search backend</span>
               <select bind:value={webSearchBackendForm} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100">
-                <option value="direct">Direct (DuckDuckGo)</option>
+                <option value="direct">Direct (DDGS metasearch)</option>
                 <option value="tavily" disabled={!webConfig.available_search_backends.includes('tavily')}>{WEB_BACKEND_INFO.tavily.label}{webConfig.available_search_backends.includes('tavily') ? '' : ' (unavailable)'}</option>
                 <option value="brave" disabled={!webConfig.available_search_backends.includes('brave')}>{WEB_BACKEND_INFO.brave.label}{webConfig.available_search_backends.includes('brave') ? '' : ' (unavailable)'}</option>
                 <option value="searxng" disabled={!webConfig.available_search_backends.includes('searxng')}>{WEB_BACKEND_INFO.searxng.label}{webConfig.available_search_backends.includes('searxng') ? '' : ' (unavailable)'}</option>
@@ -3848,7 +3894,7 @@
             <div class="flex items-center justify-between gap-3 rounded-2xl border border-slate-800 bg-slate-950/70 px-4 py-3">
               <div>
                 <p class="font-medium text-white">Direct search + fetch path</p>
-                <p class="text-xs text-slate-400">DuckDuckGo for direct search, httpx + trafilatura for direct fetch. Always available, free.</p>
+                <p class="text-xs text-slate-400">DDGS metasearch for direct search, httpx + trafilatura for direct fetch. Always available, free.</p>
               </div>
               <ProviderStatusBadge status="healthy" />
             </div>
@@ -3935,16 +3981,19 @@
                 <span>Name</span>
                 <Input bind:value={executorForm.name} placeholder="e.g. Local Developer" />
               </label>
-              <label class="space-y-1 text-sm text-slate-200">
-                <span>Type</span>
-                <select bind:value={executorForm.executor_type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!editingExecutor}>
-                  <option value="websocket">websocket</option>
-                  {#if isAdmin}
-                    <option value="subprocess">subprocess</option>
-                    <option value="in_process">in_process</option>
-                  {/if}
-                </select>
-              </label>
+               <label class="space-y-1 text-sm text-slate-200">
+                 <span>Type</span>
+                 <select bind:value={executorForm.executor_type} class="w-full rounded-xl border border-slate-700 bg-slate-950/80 px-3 py-2 text-sm text-slate-100" disabled={!!editingExecutor}>
+                   {#each executorTypeChoices(executorStatus, isAdmin) as executorType}
+                     <option value={executorType}>{executorType}</option>
+                   {/each}
+                 </select>
+                 {#if localExecutorTypesUnavailable(executorStatus)}
+                   <span class="block text-xs text-amber-200">
+                     Local types are unavailable. Install <code>cognis-executor</code> to enable in-process and subprocess executors.
+                   </span>
+                 {/if}
+               </label>
               <label class="space-y-1 text-sm text-slate-200">
                 <span>Labels (key=value, comma-separated)</span>
                 <Input bind:value={executorForm.labels} placeholder="tier=standard, gpu=false" />
@@ -3994,9 +4043,11 @@
         {/if}
 
         {#each executorConfigs as exec}
-          {@const toolGroups = [...new Set(executorTools.map(t => t.category))].sort()}
-          {@const canManage = canManageExecutor(exec)}
-          <Card class="p-5 space-y-4">
+           {@const toolGroups = [...new Set(executorTools.map(t => t.category))].sort()}
+           {@const canManage = canManageExecutor(exec)}
+           {@const unavailable = executorUnavailable(exec)}
+           {@const canConfigure = canManage && !unavailable}
+           <Card class="p-5 space-y-4">
             <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
               <div class="flex flex-wrap items-center gap-3">
                 <h3 class="text-lg font-medium text-white">{exec.name}</h3>
@@ -4009,15 +4060,18 @@
                 {#if exec.is_default}
                   <span class="px-2 py-0.5 bg-sky-500/20 text-sky-300 text-xs rounded">default</span>
                 {/if}
-                {#if exec.shared}
-                  <span class="px-2 py-0.5 bg-cyan-500/20 text-cyan-300 text-xs rounded">shared</span>
-                {/if}
+                 {#if exec.shared}
+                   <span class="px-2 py-0.5 bg-cyan-500/20 text-cyan-300 text-xs rounded">shared</span>
+                 {/if}
+                 {#if unavailable}
+                   <span class="px-2 py-0.5 rounded bg-rose-500/20 text-rose-200 text-xs">unavailable</span>
+                 {/if}
                 {#if !exec.local_inference_enabled}
                   <span class="px-2 py-0.5 rounded bg-amber-500/15 text-amber-200 text-xs">local inference disabled</span>
                 {/if}
               </div>
               <div class="flex flex-wrap gap-2">
-                {#if canManage}
+                 {#if canManage && !unavailable}
                   <Button variant="secondary" size="sm" onclick={() => {
                     editingExecutor = exec;
                     executorForm = {
@@ -4061,34 +4115,37 @@
                   <span class="px-2 py-0.5 bg-zinc-800 text-zinc-300 text-xs font-mono rounded border border-zinc-700">{k}={v}</span>
                 {/each}
               </div>
-            {/if}
+             {/if}
 
-            <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
-            <ExecutorHealthPanel executor={exec} />
-            {#if exec.executor_type === 'websocket'}
-              <LocalInferenceSettings
-                executor={exec}
-                editable={canManage}
-                saving={isExecutorSaving(exec.executor_id)}
-                onSave={(config) => saveExecutorLocalInference(exec.executor_id, config)}
-              />
-            {/if}
-            {#if executorRuntimeSummary(exec)}
-              <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-sky-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
-            {/if}
-            {#if executorDegradedDetails(exec).length > 0}
-              <div class="space-y-1 rounded-xl border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
-                <p class="font-medium text-sky-100">Degraded executor details</p>
-                {#each executorDegradedDetails(exec) as detail}
-                  <p>{detail}</p>
-                {/each}
-              </div>
-            {/if}
-            {#if exec.desired_config_version !== exec.applied_config_version}
-              <div class="text-xs text-sky-300">
-                config pending: desired v{exec.desired_config_version}, applied v{exec.applied_config_version}
-              </div>
-            {/if}
+             <div class="text-xs text-slate-500 font-mono">ID: {exec.executor_id}</div>
+             {#if !unavailable}
+               <ExecutorHealthPanel executor={exec} />
+               <ExecutorCapabilitiesPanel executor={exec} />
+               {#if exec.executor_type === 'websocket'}
+                 <LocalInferenceSettings
+                   executor={exec}
+                   editable={canManage}
+                   saving={isExecutorSaving(exec.executor_id)}
+                   onSave={(config) => saveExecutorLocalInference(exec.executor_id, config)}
+                 />
+               {/if}
+               {#if executorRuntimeSummary(exec)}
+                 <div class="text-xs {exec.runtime_state === 'degraded' ? 'text-sky-300' : 'text-slate-500'}">{executorRuntimeSummary(exec)}</div>
+               {/if}
+               {#if executorDegradedDetails(exec).length > 0}
+                 <div class="space-y-1 rounded-xl border border-sky-500/20 bg-sky-500/5 px-3 py-2 text-xs text-sky-100/90">
+                   <p class="font-medium text-sky-100">Degraded executor details</p>
+                   {#each executorDegradedDetails(exec) as detail}
+                     <p>{detail}</p>
+                   {/each}
+                 </div>
+               {/if}
+               {#if exec.desired_config_version !== exec.applied_config_version}
+                 <div class="text-xs text-sky-300">
+                   config pending: desired v{exec.desired_config_version}, applied v{exec.applied_config_version}
+                 </div>
+               {/if}
+             {/if}
 
             {#if canManage && executorToken && executorToken.executor_id === exec.executor_id}
               {@const execCommand = `cognis executor run --controller-url ${window.location.origin.replace('http', 'ws')}/api/executor/ws --token ${executorToken.token}`}
@@ -4104,7 +4161,7 @@
               </div>
             {/if}
 
-            {#if canManage}
+             {#if canConfigure}
             <!-- Quick presets -->
             <div class="flex flex-wrap gap-2">
               <span class="text-xs text-slate-400 self-center">Presets:</span>
@@ -4175,11 +4232,15 @@
                   {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
                   {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
                   {@const enabled = enabledByGroup || enabledByName}
+                  {@const guard = executorToolSelectionGuard(exec, tool.name, tool.category)}
+                  {@const guarded = guard.blocked && !enabled}
                   <button
-                    class="px-2.5 py-1.5 rounded text-xs text-left border transition-colors {enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-600'}"
-                    title="{tool.description} ({tool.category}){enabledByGroup ? ' — enabled via group' : ''}"
+                    class="px-2.5 py-1.5 rounded text-xs text-left border transition-colors {guarded ? 'border-amber-500/30 bg-amber-500/5 text-amber-200' : enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200' : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-slate-600'}"
+                    aria-disabled={guarded}
+                    title="{tool.description} ({tool.category}){enabledByGroup ? ' — enabled via group' : ''}{guarded ? ` — ${guard.reason}` : ''}"
                     onclick={async () => {
                       if (enabledByGroup) return;
+                      if (guarded) return;
                       const tools = [...(exec.enabled_tools || [])].filter((t: string) => t !== '*');
                       if (enabledByName) {
                         const idx = tools.indexOf(tool.name);
@@ -4192,6 +4253,9 @@
                     }}
                   >
                     <span class="font-mono">{tool.name}</span>
+                    {#if guarded}
+                      <span class="ml-1 text-[10px] text-amber-300" title={guard.reason ?? 'Not ready'}>not ready</span>
+                    {/if}
                     {#if tool.non_bypassable}
                       <span class="text-sky-400 ml-0.5" title="Non-bypassable">!</span>
                     {/if}
@@ -4927,6 +4991,18 @@
                 </div>
               </details>
             {/if}
+            {:else if unavailable}
+              <div class="space-y-2 rounded-2xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+                <p class="font-medium">Local executor configuration is unavailable</p>
+                <p class="text-xs text-rose-100/80">
+                  {exec.unavailable_reason || 'Install cognis-executor on the controller to use this executor.'}
+                </p>
+                <p class="text-xs text-slate-400">
+                  Saved configuration is preserved. Enabled tools:
+                  {exec.enabled_tools.length ? exec.enabled_tools.join(', ') : 'none'}.
+                  Tool groups: {exec.enabled_tool_groups.length ? exec.enabled_tool_groups.join(', ') : 'none'}.
+                </p>
+              </div>
             {:else}
               <div class="rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm text-slate-400">
                 This executor is available for use, but you do not have permission to change its configuration.
@@ -5680,6 +5756,7 @@
               <Button variant="secondary" onclick={() => openTargetUi('mnemory')}>Open Mnemory</Button>
               <Button variant="danger" onclick={async () => { await auth.logout(); await goto('/login'); }}>Sign out</Button>
             </div>
+            <MfaSettings />
           </div>
         </Card>
 
@@ -5725,7 +5802,7 @@
      Re-uses the same per-tool toggle logic as the desktop grid. -->
 {#if toolPickerExecutorId}
   {@const exec = executorConfigs.find((e) => e.executor_id === toolPickerExecutorId)}
-  {#if exec && canManageExecutor(exec)}
+   {#if exec && canManageExecutor(exec) && !executorUnavailable(exec)}
     {@const query = toolPickerQuery.trim().toLowerCase()}
     {@const filteredTools = query
       ? executorTools.filter((t) => t.name.toLowerCase().includes(query) || (t.description ?? '').toLowerCase().includes(query) || t.category.toLowerCase().includes(query))
@@ -5745,11 +5822,16 @@
           {@const enabledByGroup = (exec.enabled_tool_groups || []).includes(tool.category)}
           {@const enabledByName = (exec.enabled_tools || []).includes(tool.name) || (exec.enabled_tools || []).includes('*')}
           {@const enabled = enabledByGroup || enabledByName}
+          {@const guard = executorToolSelectionGuard(exec, tool.name, tool.category)}
+          {@const guarded = guard.blocked && !enabled}
           <button
             type="button"
-            class="w-full rounded-xl border px-3 py-3 text-left transition-colors {enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-100' : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'}"
+            aria-disabled={guarded}
+            class="w-full rounded-xl border px-3 py-3 text-left transition-colors {guarded ? 'border-amber-500/30 bg-amber-500/5 text-amber-100' : enabled ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-100' : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'}"
+            title={guarded ? guard.reason ?? 'This tool is not ready on this executor.' : undefined}
             onclick={() => {
               if (enabledByGroup) return;
+              if (guarded) return;
               // Compute the target list from the latest state: pending queue
               // if one is in flight, otherwise the current executor snapshot.
               // This prevents rapid taps from clobbering each other.
@@ -5779,6 +5861,9 @@
                 <span class="text-emerald-300">enabled</span>
               {:else}
                 <span class="text-slate-500">disabled</span>
+              {/if}
+              {#if guarded}
+                <span class="text-amber-300" title={guard.reason ?? 'Not ready'}>not ready: {guard.reason}</span>
               {/if}
               {#if tool.non_bypassable}
                 <span class="text-sky-400">non-bypassable</span>

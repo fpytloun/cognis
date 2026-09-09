@@ -2,9 +2,10 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { conversationTimelineScope, type WorkProjectionResponse } from '$lib/chat-v2/types';
-import { ChatV2ApiError } from '$lib/chat-v2/api';
+import { ChatV2ApiError, chatV2Api } from '$lib/chat-v2/api';
 import {
   clearWorkViewStates,
+  getWorkResponseCache,
   invalidateWorkScope,
   saveWorkViewState,
 } from '$lib/work/workViewState';
@@ -13,6 +14,7 @@ import WorkView from './WorkView.svelte';
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 beforeEach(clearWorkViewStates);
 
@@ -97,6 +99,26 @@ function projection(): WorkProjectionResponse {
 }
 
 describe('WorkView', () => {
+  it('reports the already-loaded summary and hides command controls when no commands exist', async () => {
+    const onSummaryChange = vi.fn();
+    const emptyCommands = {
+      ...projection(),
+      commands: [],
+      summary: { ...projection().summary, commands: 0 }
+    };
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-1'),
+      loadWork: vi.fn().mockResolvedValue(emptyCommands),
+      initialTab: 'commands',
+      forceInitialTab: true,
+      onSummaryChange,
+      refreshIntervalMs: 0,
+    });
+
+    await waitFor(() => expect(onSummaryChange).toHaveBeenCalledWith(emptyCommands.summary));
+    expect(screen.queryByTestId('work-command-label-mode')).toBeNull();
+  });
+
   it('hides scroll status when the first page is already complete', async () => {
     render(WorkView, {
       scope: conversationTimelineScope('conversation-1'),
@@ -160,8 +182,10 @@ describe('WorkView', () => {
     const first = { ...projection(), scope, work_revision: 1, graph_revision: 1 };
     const second = { ...projection(), scope, work_revision: 2, graph_revision: 1 };
     const loadWork = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(second);
-    render(WorkView, { scope, loadWork, refreshIntervalMs: 0 });
+    const refreshWork = vi.fn().mockResolvedValue({ status: 'accepted', scope });
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledOnce());
 
     invalidateWorkScope('conversation:conversation-b', {
       workRevision: 2,
@@ -175,6 +199,233 @@ describe('WorkView', () => {
       graphRevision: 1,
     });
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+  });
+
+  it('requests automatic recovery once per non-live scope and refetches on invalidation', async () => {
+    const scope = conversationTimelineScope('conversation-recovery');
+    const catchingUp = {
+      ...projection(),
+      scope,
+      work_revision: 7,
+      materialization: { state: 'catching_up' as const },
+    };
+    const live = {
+      ...projection(),
+      scope,
+      work_revision: 8,
+      materialization: { state: 'live' as const },
+    };
+    const loadWork = vi.fn().mockResolvedValueOnce(catchingUp).mockResolvedValue(live);
+    const refreshWork = vi.fn().mockResolvedValue({ status: 'accepted', scope });
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledOnce());
+    await Promise.resolve();
+    expect(refreshWork).toHaveBeenCalledOnce();
+
+    invalidateWorkScope(scope.key, { workRevision: 8 });
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('Catching up activity…')).toBeNull();
+  });
+
+  it('retries automatic recovery after a transient recovery request failure', async () => {
+    const scope = conversationTimelineScope('conversation-recovery-retry');
+    const first = {
+      ...projection(),
+      scope,
+      work_revision: 7,
+      materialization: { state: 'catching_up' as const },
+    };
+    const second = { ...first, work_revision: 8 };
+    const loadWork = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(second);
+    const refreshWork = vi.fn()
+      .mockRejectedValueOnce(new Error('temporary recovery failure'))
+      .mockResolvedValueOnce({ accepted: true, scope, session_count: 1 });
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledOnce());
+    invalidateWorkScope(scope.key, { workRevision: 8 });
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledTimes(2));
+  });
+
+  it('runs explicit recovery before refetch and retains rendered evidence while recovery settles', async () => {
+    const scope = conversationTimelineScope('conversation-explicit-recovery');
+    const initial = { ...projection(), scope, work_revision: 1 };
+    const refreshed = {
+      ...projection(),
+      scope,
+      work_revision: 2,
+      commands: [{
+        ...projection().commands[0],
+        id: 'latest-command',
+        call_id: 'latest-call',
+        command: 'npm run latest',
+      }],
+      summary: { ...projection().summary, commands: 1 },
+    };
+    const order: string[] = [];
+    const loadWork = vi.fn()
+      .mockImplementationOnce(async () => initial)
+      .mockImplementationOnce(async () => {
+        order.push('refetch');
+        return refreshed;
+      });
+    const refreshWork = vi.fn().mockImplementation(async () => {
+      order.push('recover');
+      return { status: 'accepted', scope };
+    });
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+    await waitFor(() => expect(screen.getByTestId('work-file-explorer')).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    expect(order).toEqual(['recover', 'recover', 'refetch']);
+    expect(screen.getByTestId('work-file-explorer')).toBeTruthy();
+  });
+
+  it('preserves an invalidation received while explicit recovery is pending', async () => {
+    const scope = conversationTimelineScope('conversation-explicit-recovery-race');
+    const oldCommand = projection().commands[0];
+    const initial = { ...projection(), scope, work_revision: 1 };
+    const stale = {
+      ...initial,
+      materialization: { state: 'catching_up' as const },
+    };
+    const fresh = {
+      ...initial,
+      work_revision: 2,
+      materialization: { state: 'live' as const },
+      commands: [
+        { ...oldCommand, id: 'new-command', call_id: 'new-call', command: 'npm run newest' },
+        oldCommand,
+      ],
+      summary: { ...initial.summary, commands: 2 },
+    };
+    const loadWork = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(stale)
+      .mockResolvedValue(fresh);
+    let acceptRecovery!: () => void;
+    const refreshWork = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { acceptRecovery = resolve; }),
+    );
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+    await waitFor(() => expect(screen.getByTestId('work-file-explorer')).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledOnce());
+    invalidateWorkScope(scope.key, { workRevision: 2 });
+    acceptRecovery();
+
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(3));
+    expect(screen.getByRole('tab', { name: /Commands 2/ })).toBeTruthy();
+  });
+
+  it('uses bounded short backoff when a recovered projection remains non-live', async () => {
+    vi.useFakeTimers();
+    const scope = conversationTimelineScope('conversation-reconcile-backoff');
+    const catchingUp = {
+      ...projection(),
+      scope,
+      work_revision: 9,
+      materialization: { state: 'catching_up' as const },
+    };
+    const loadWork = vi.fn().mockResolvedValue(catchingUp);
+    let acceptRecovery!: () => void;
+    const refreshWork = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { acceptRecovery = resolve; }),
+    );
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(loadWork).toHaveBeenCalledOnce();
+    expect(refreshWork).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(loadWork).toHaveBeenCalledOnce();
+    acceptRecovery();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(loadWork).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(loadWork).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(loadWork).toHaveBeenCalledTimes(3);
+    expect(refreshWork).toHaveBeenCalledOnce();
+  });
+
+  it('queues invalidation until pending recovery is accepted, then refetches once', async () => {
+    const scope = conversationTimelineScope('conversation-recovery-invalidation');
+    const catchingUp = {
+      ...projection(),
+      scope,
+      work_revision: 11,
+      materialization: { state: 'catching_up' as const },
+    };
+    const live = {
+      ...projection(),
+      scope,
+      work_revision: 12,
+      materialization: { state: 'live' as const },
+    };
+    const loadWork = vi.fn().mockResolvedValueOnce(catchingUp).mockResolvedValue(live);
+    let acceptRecovery!: () => void;
+    const refreshWork = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { acceptRecovery = resolve; }),
+    );
+    render(WorkView, { scope, loadWork, refreshWork, refreshIntervalMs: 0 });
+    await waitFor(() => expect(refreshWork).toHaveBeenCalledOnce());
+
+    invalidateWorkScope(scope.key, { workRevision: 12 });
+    await Promise.resolve();
+    expect(loadWork).toHaveBeenCalledOnce();
+    acceptRecovery();
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    await Promise.resolve();
+    expect(loadWork).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses push first and a two-minute visible fallback without overlapping refreshes', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const scope = conversationTimelineScope('conversation-push-first');
+    let finishRefresh!: (value: WorkProjectionResponse) => void;
+    const loadWork = vi.fn()
+      .mockResolvedValueOnce({ ...projection(), scope, work_revision: 1 })
+      .mockImplementationOnce(() => new Promise((resolve) => { finishRefresh = resolve; }));
+    render(WorkView, { scope, loadWork });
+    await vi.waitFor(() => expect(loadWork).toHaveBeenCalledOnce());
+
+    await vi.advanceTimersByTimeAsync(119_000);
+    expect(loadWork).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(loadWork).toHaveBeenCalledTimes(2);
+
+    invalidateWorkScope(scope.key, { workRevision: 2 });
+    invalidateWorkScope(scope.key, { workRevision: 3 });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(loadWork).toHaveBeenCalledTimes(2);
+    finishRefresh({ ...projection(), scope, work_revision: 3 });
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('pauses fallback refresh while hidden and catches up after becoming visible', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const scope = conversationTimelineScope('conversation-hidden-fallback');
+    const loadWork = vi.fn().mockResolvedValue({ ...projection(), scope });
+    const visibility = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    render(WorkView, { scope, loadWork });
+    await vi.waitFor(() => expect(loadWork).toHaveBeenCalledOnce());
+
+    visibility.mockReturnValue('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(loadWork).toHaveBeenCalledOnce();
+
+    visibility.mockReturnValue('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
   });
 
   it('hides lineage filters for one source and filters all tabs with provenance for multiple sources', async () => {
@@ -299,6 +550,7 @@ describe('WorkView', () => {
     render(WorkView, {
       scope: conversationTimelineScope('conversation-1'),
       loadWork,
+      refreshWork: vi.fn().mockResolvedValue({ status: 'accepted' }),
       refreshIntervalMs: 0,
     });
     await waitFor(() => expect(screen.getByTestId('workstream-filters')).toBeTruthy());
@@ -643,9 +895,10 @@ describe('WorkView', () => {
       return Promise.resolve(next);
     });
 
-    const view = render(WorkView, { scope, sessionId: 'session-a', loadWork, refreshIntervalMs: 0 });
+    const refreshWork = vi.fn().mockResolvedValue({ status: 'accepted' });
+    const view = render(WorkView, { scope, sessionId: 'session-a', loadWork, refreshWork, refreshIntervalMs: 0 });
     await screen.findAllByText('session-a.ts');
-    await view.rerender({ scope, sessionId: 'session-b', loadWork, refreshIntervalMs: 0 });
+    await view.rerender({ scope, sessionId: 'session-b', loadWork, refreshWork, refreshIntervalMs: 0 });
     await screen.findAllByText('session-b.ts');
     expect(screen.queryAllByText('session-a.ts')).toHaveLength(0);
     expect(loadWork.mock.calls[1][3]).toMatchObject({ sessionId: 'session-b' });
@@ -678,11 +931,12 @@ describe('WorkView', () => {
       }
       return Promise.resolve(response(options?.sessionId ?? 'all'));
     });
-    const view = render(WorkView, { scope, sessionId: 'session-a', loadWork, refreshIntervalMs: 0 });
+    const refreshWork = vi.fn().mockResolvedValue({ status: 'accepted' });
+    const view = render(WorkView, { scope, sessionId: 'session-a', loadWork, refreshWork, refreshIntervalMs: 0 });
     await screen.findAllByText('session-a.ts');
     await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
     await waitFor(() => expect(aRequests).toBe(2));
-    await view.rerender({ scope, sessionId: 'session-b', loadWork, refreshIntervalMs: 0 });
+    await view.rerender({ scope, sessionId: 'session-b', loadWork, refreshWork, refreshIntervalMs: 0 });
     await screen.findAllByText('session-b.ts');
     resolveLateA(response('stale-a'));
     await Promise.resolve();
@@ -755,7 +1009,12 @@ describe('WorkView', () => {
       return new Promise<WorkProjectionResponse>((resolve) => { resolveRefresh = resolve; });
     });
     const scope = conversationTimelineScope('conversation-1');
-    render(WorkView, { scope, loadWork, refreshIntervalMs: 0 });
+    render(WorkView, {
+      scope,
+      loadWork,
+      refreshWork: vi.fn().mockResolvedValue({ status: 'accepted' }),
+      refreshIntervalMs: 0,
+    });
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(1));
     await fireEvent.click(screen.getByTestId('work-tab-commands'));
     await screen.findByText('npm test');
@@ -909,6 +1168,35 @@ describe('WorkView', () => {
     expect(await screen.findByTestId('work-file-explorer')).toBeTruthy();
   });
 
+  it('propagates metadata-only path generation identity to lazy file history', async () => {
+    const next = projection();
+    next.mutations[0].file_diffs = [];
+    next.mutations[0].file_stats = [{
+      path: 'src/omitted.ts',
+      path_id: 'path-omitted',
+      path_generation_id: 'wpg-omitted',
+      additions: 2,
+      deletions: 1,
+      preview_available: false,
+    }];
+    next.summary.changed_files = 1;
+    const fileHistory = vi.spyOn(chatV2Api, 'fileHistory').mockResolvedValue({
+      scope: conversationTimelineScope('conversation-metadata-history'),
+      path_generation_id: 'wpg-omitted',
+      items: [{ path: 'src/omitted.ts', diff: '+loaded' }],
+      has_more_before: false,
+    });
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-metadata-history'),
+      loadWork: vi.fn().mockResolvedValue(next),
+      refreshIntervalMs: 0,
+    });
+    await vi.waitFor(() => expect(fileHistory).toHaveBeenCalledWith(
+      expect.objectContaining({ path_generation_id: 'wpg-omitted' }),
+      expect.anything(),
+    ));
+  });
+
   it('exposes one collapsed narrow filter control with active status and clear action', async () => {
     const next = projection();
     const root = {
@@ -1019,7 +1307,7 @@ describe('WorkView', () => {
 
     await waitFor(() => expect(screen.getByText('Projection unavailable')).toBeTruthy());
     await fireEvent.click(screen.getByRole('button', { name: 'Retry loading newest evidence' }));
-    await waitFor(() => expect(screen.getByText('No persisted work yet.')).toBeTruthy());
+    await waitFor(() => expect(screen.getByText('No activity yet.')).toBeTruthy());
     expect(loadWork).toHaveBeenCalledTimes(2);
   });
 
@@ -1072,83 +1360,6 @@ describe('WorkView', () => {
     await vi.waitFor(() => expect(loadWork).toHaveBeenCalledTimes(3));
   });
 
-  it('shows partial materialization without a false empty or exhausted state', async () => {
-    const next = projection();
-    next.mutations = [];
-    next.commands = [];
-    next.artifacts = [];
-    next.deliverables = [];
-    next.materialization = {
-      state: 'materializing',
-      completed_streams: 17,
-      total_streams: 195,
-      covered_events: 400,
-      target_events: 2_000,
-      failed_streams: 0,
-    };
-    render(WorkView, {
-      scope: conversationTimelineScope('conversation-1'),
-      loadWork: vi.fn().mockResolvedValue(next),
-      refreshIntervalMs: 0,
-    });
-
-    expect(await screen.findByText('Building Work history — 17 of 195 streams')).toBeTruthy();
-    expect(screen.getAllByText('Results below are partial.').length).toBeGreaterThan(0);
-    expect(screen.queryByText('No persisted work yet.')).toBeNull();
-    expect(screen.queryByText('All Work history loaded.')).toBeNull();
-  });
-
-  it('shows explicit repair counts', async () => {
-    const next = projection();
-    next.materialization = {
-      state: 'repair',
-      completed_streams: 3,
-      total_streams: 5,
-      covered_events: 40,
-      target_events: 60,
-      failed_streams: 1,
-      retry_after_ms: 1_000,
-    };
-    render(WorkView, {
-      scope: conversationTimelineScope('conversation-1'),
-      loadWork: vi.fn().mockResolvedValue(next),
-      refreshIntervalMs: 0,
-    });
-
-    expect(
-      await screen.findByText('Work history is incomplete — 3 of 5 streams are ready.')
-    ).toBeTruthy();
-    expect(screen.getByText('1 streams failed. Cognis will retry the background repair.')).toBeTruthy();
-  });
-
-  it.each([
-    ['suppresses a one-event live tail', 178, 179, 0, false],
-    ['shows a six-event backlog', 173, 179, 0, true],
-    ['shows a failed stream', 178, 179, 1, true],
-  ])('%s', async (_label, coveredEvents, targetEvents, failedStreams, visible) => {
-    const next = projection();
-    next.materialization = {
-      state: 'repair',
-      completed_streams: 178,
-      total_streams: 179,
-      covered_events: coveredEvents,
-      target_events: targetEvents,
-      failed_streams: failedStreams,
-    };
-    render(WorkView, {
-      scope: conversationTimelineScope('conversation-1'),
-      loadWork: vi.fn().mockResolvedValue(next),
-      refreshIntervalMs: 0,
-    });
-    await screen.findByTestId('work-panel-files');
-    if (visible) {
-      expect(screen.getByTestId('work-repair')).toBeTruthy();
-    } else {
-      expect(screen.queryByTestId('work-repair')).toBeNull();
-      expect(screen.queryByText('Results below are partial.')).toBeNull();
-    }
-  });
-
   it('restores a fresh same-scope response without another request', async () => {
     const scope = conversationTimelineScope('conversation-cache-remount');
     const loadWork = vi.fn().mockResolvedValue(projection());
@@ -1196,5 +1407,115 @@ describe('WorkView', () => {
     expect(screen.queryByTestId('work-diff-overlay')).toBeNull();
     expect(screen.getByTestId('work-file-src/app.ts')).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByText('Expand diff')).toBeTruthy();
+  });
+
+  it.each([
+    ['catching_up', 'Catching up activity…'],
+    ['partial', 'Activity is partially available.'],
+    ['failed', 'Activity refresh failed.'],
+  ] as const)('retains Work content with shared %s lifecycle presentation', async (state, message) => {
+    const next = projection();
+    next.materialization = { state };
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-live-lifecycle'),
+      loadWork: vi.fn().mockResolvedValue(next),
+      refreshIntervalMs: 0,
+    });
+    expect(await screen.findByText(message)).toBeTruthy();
+    expect(screen.getByTestId('work-file-explorer')).toBeTruthy();
+  });
+
+  it.each(['partial', 'failed'] as const)(
+    'retains prior files and selection when a %s refresh omits them',
+    async (state) => {
+      const live = projection();
+      live.materialization = { state: 'live' };
+      live.work_revision = 1;
+      const incomplete = projection();
+      incomplete.materialization = { state };
+      incomplete.work_revision = 2;
+      incomplete.mutations = [];
+      incomplete.commands = [];
+      incomplete.artifacts = [];
+      incomplete.deliverables = [];
+      incomplete.summary = { mutations: 0, commands: 0, changed_files: 0, artifacts: 0 };
+      const loadWork = vi.fn().mockResolvedValueOnce(live).mockResolvedValueOnce(incomplete);
+      render(WorkView, {
+        scope: conversationTimelineScope(`conversation-retained-${state}`),
+        loadWork,
+        refreshWork: vi.fn().mockResolvedValue({ status: 'accepted' }),
+        refreshIntervalMs: 0,
+      });
+      const selected = await screen.findByTestId('work-file-src/app.ts');
+      expect(selected).toHaveAttribute('aria-selected', 'true');
+      await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
+      await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+      expect(screen.getByTestId('work-file-src/app.ts')).toHaveAttribute('aria-selected', 'true');
+      expect(screen.getByTestId(`activity-lifecycle-${state}`)).toBeTruthy();
+    },
+  );
+
+  it('renders an empty live projection as No activity yet and replaces it after invalidation', async () => {
+    const empty = projection();
+    empty.materialization = { state: 'live' };
+    empty.mutations = [];
+    empty.commands = [];
+    empty.summary = { mutations: 0, commands: 0, changed_files: 0, artifacts: 0 };
+    empty.work_revision = 1;
+    const populated = projection();
+    populated.materialization = { state: 'live' };
+    populated.work_revision = 2;
+    const loadWork = vi.fn().mockResolvedValueOnce(empty).mockResolvedValueOnce(populated);
+    const scope = conversationTimelineScope('conversation-first-append');
+    render(WorkView, {
+      scope,
+      loadWork,
+      refreshWork: vi.fn().mockResolvedValue({ status: 'accepted' }),
+      refreshIntervalMs: 0,
+    });
+    expect(await screen.findByTestId('work-empty')).toHaveTextContent('No activity yet.');
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    expect(await screen.findByTestId('work-file-explorer')).toBeTruthy();
+    expect(loadWork).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces an in-flight invalidation and never renders or caches the older response', async () => {
+    const scope = conversationTimelineScope('conversation-inflight-revision');
+    let resolveRevision1!: (value: WorkProjectionResponse) => void;
+    const revision1 = projection();
+    revision1.work_revision = 1;
+    revision1.mutations[0].file_diffs[0].path = 'src/revision-1.ts';
+    revision1.mutations[0].file_diffs[0].path_id = 'revision-1';
+    const revision2 = projection();
+    revision2.work_revision = 2;
+    revision2.mutations[0].file_diffs[0].path = 'src/revision-2.ts';
+    revision2.mutations[0].file_diffs[0].path_id = 'revision-2';
+    const loadWork = vi.fn()
+      .mockImplementationOnce(() => new Promise<WorkProjectionResponse>((resolve) => {
+        resolveRevision1 = resolve;
+      }))
+      .mockResolvedValueOnce(revision2);
+
+    render(WorkView, { scope, loadWork, refreshIntervalMs: 0 });
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(1));
+    window.dispatchEvent(new CustomEvent('cognis:work-invalidated', {
+      detail: { scopeKey: scope.key, workRevision: 2 },
+    }));
+    expect(loadWork).toHaveBeenCalledTimes(1);
+    resolveRevision1(revision1);
+
+    await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('revision-2.ts')).toBeTruthy();
+    expect(screen.queryByText('revision-1.ts')).toBeNull();
+    const cached = getWorkResponseCache<{
+      state: { projection: WorkProjectionResponse };
+    }>(scope, 'files', null, {
+      from: null,
+      to: null,
+      admittedRevision: 2,
+    });
+    expect(cached?.state.projection.work_revision).toBe(2);
+    expect(JSON.stringify(cached)).not.toContain('revision-1.ts');
   });
 });

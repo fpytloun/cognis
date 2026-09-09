@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import time
+import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -180,6 +181,11 @@ def _start_service(
         "COGNIS_LOG_FORMAT",
         "COGNIS_LOG_LEVEL",
         "COGNIS_CORS_ORIGINS",
+        "COGNIS_CONTROLLER_URL",
+        "COGNIS_EXECUTOR_TOKEN",
+        "COGNIS_EXECUTOR_WORKSPACE",
+        "COGNIS_EXECUTOR_WORKDIR",
+        "COGNIS_EXECUTOR_ALLOW_INSECURE_WS",
     ):
         base.pop(key, None)
     base.update(env)
@@ -293,8 +299,8 @@ def integration_stack(
             "MCP_HOST": "127.0.0.1",
             "MCP_PORT": str(mnemory_port),
             "MNEMORY_JWT_PUBLIC_KEY": public_key_path,
-            "LLM_API_KEY": "test-api-key",
-            "OPENAI_API_KEY": "test-api-key",
+            "LLM_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
+            "OPENAI_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
             "LOG_LEVEL": "warning",
         },
         label="mnemory",
@@ -307,9 +313,11 @@ def integration_stack(
             "DATA_DIR": str(intaris_dir),
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
+            "METRICS_HOST": "127.0.0.1",
+            "METRICS_PORT": str(_free_port()),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
-            "LLM_API_KEY": "test-api-key",
-            "OPENAI_API_KEY": "test-api-key",
+            "LLM_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
+            "OPENAI_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
             "LOG_LEVEL": "warning",
         },
         label="intaris",
@@ -350,7 +358,7 @@ def integration_stack(
     # Get admin token first
     login_response = client.post(
         "/api/auth/login",
-        json={"email": admin_email, "password": admin_password},
+        json={"email": admin_email, "password": admin_password, "mode": "native"},
     )
     assert login_response.status_code == 200, f"Admin login failed: {login_response.text}"
     admin_token = login_response.json()["token"]
@@ -492,8 +500,8 @@ def live_stack(
             "MCP_HOST": "127.0.0.1",
             "MCP_PORT": str(mnemory_port),
             "MNEMORY_JWT_PUBLIC_KEY": public_key_path,
-            "LLM_API_KEY": "test-api-key",
-            "OPENAI_API_KEY": "test-api-key",
+            "LLM_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
+            "OPENAI_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
             "LOG_LEVEL": "warning",
         },
         label="mnemory",
@@ -507,9 +515,11 @@ def live_stack(
             "DATA_DIR": str(intaris_dir),
             "INTARIS_HOST": "127.0.0.1",
             "INTARIS_PORT": str(intaris_port),
+            "METRICS_HOST": "127.0.0.1",
+            "METRICS_PORT": str(_free_port()),
             "INTARIS_JWT_PUBLIC_KEY": public_key_path,
-            "LLM_API_KEY": "test-api-key",
-            "OPENAI_API_KEY": "test-api-key",
+            "LLM_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
+            "OPENAI_API_KEY": clean_env.get("OPENAI_API_KEY", "test-api-key"),
             "LOG_LEVEL": "warning",
         },
         label="intaris",
@@ -572,7 +582,7 @@ def live_stack(
     # Login and get admin token
     login_response = http_client.post(
         f"{cognis_url}/api/auth/login",
-        json={"email": admin_email, "password": admin_password},
+        json={"email": admin_email, "password": admin_password, "mode": "native"},
     )
     assert login_response.status_code == 200, f"Admin login failed: {login_response.text}"
     admin_token = login_response.json()["token"]
@@ -712,7 +722,11 @@ def live_create_agent(
     live: LiveStack,
     agent_id: str,
     *,
-    system_prompt: str = "You are a helpful test assistant. Keep responses brief.",
+    system_prompt: str = (
+        "You are a helpful test assistant. Do not use tools. Answer directly and briefly."
+    ),
+    capabilities: dict[str, Any] | None = None,
+    tool_permissions: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Create an active agent via live HTTP."""
     response = live.post(
@@ -724,12 +738,17 @@ def live_create_agent(
             "description": "Integration test agent",
             "system_prompt": system_prompt,
             "execution": {"executor_id": "default_inprocess"},
+            "capabilities": capabilities
+            or {"memory_backend": "none", "guardrails_backend": "none"},
             "personality": {
                 "tone": "concise",
                 "temperament": "cooperative",
                 "purpose": "integration testing",
             },
-            "permissions": {"tool_permissions": {"*": "allow"}, "can_delegate": True},
+            "permissions": {
+                "tool_permissions": tool_permissions or {"*": "deny"},
+                "can_delegate": False,
+            },
         },
     )
     assert response.status_code == 200, f"Agent creation failed: {response.text}"
@@ -803,6 +822,36 @@ def assistant_text_from_events(events: list[dict[str, Any]]) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _frame_contains_turn_activity(
+    frame: dict[str, Any],
+    *,
+    conversation_id: str,
+    client_message_id: str,
+) -> bool:
+    if (
+        frame.get("type") == "sidebar_conversation_upsert"
+        and frame.get("conversation_id") == conversation_id
+        and frame.get("conversation", {}).get("has_active_turn") is True
+    ):
+        return True
+    runtime = frame.get("runtime")
+    if isinstance(runtime, dict) and runtime.get("has_active_turn") is True:
+        return True
+
+    def visit(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("client_message_id") == client_message_id:
+                return True
+            if value.get("kind") == "message" and value.get("role") == "assistant":
+                return True
+            return any(visit(child) for child in value.values())
+        if isinstance(value, list):
+            return any(visit(child) for child in value)
+        return False
+
+    return visit(frame.get("ops"))
+
+
 def live_chat_ws(
     live: LiveStack,
     conversation_id: str,
@@ -810,12 +859,21 @@ def live_chat_ws(
     *,
     timeout: float = 90,
 ) -> list[dict[str, Any]]:
-    """Send a message over a real WebSocket and collect events until message_complete."""
+    """Submit a Chat v2 message and collect realtime frames through completion."""
     import json
 
     import websockets.sync.client as wsc
 
     events: list[dict[str, Any]] = []
+    snapshot_path = f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot"
+    initial_response = live.get(snapshot_path)
+    assert initial_response.status_code == 200, f"Snapshot failed: {initial_response.text}"
+    initial = initial_response.json()
+    initial_assistant_ids = {
+        item["id"]
+        for item in initial["timeline"]["items"]
+        if item.get("kind") == "message" and item.get("role") == "assistant"
+    }
     with wsc.connect(live.ws_url, close_timeout=5, open_timeout=10) as ws:
         ws.send(json.dumps({"type": "auth", "token": live.admin_token}))
         auth_msg = json.loads(ws.recv(timeout=15))
@@ -824,40 +882,112 @@ def live_chat_ws(
         ws.send(
             json.dumps(
                 {
-                    "type": "reconnect",
-                    "conversation_id": conversation_id,
-                    "last_seq": 0,
+                    "type": "chat_v2_subscribe",
+                    "scope": initial["scope"],
+                    "cursor": initial["cursor"],
                 }
             )
         )
 
-        # Small delay to ensure subscription is registered before sending
-        time.sleep(0.3)
-
-        ws.send(
-            json.dumps(
-                {
-                    "type": "message",
-                    "conversation_id": conversation_id,
-                    "content": message,
-                }
+        subscribe_deadline = time.monotonic() + 15
+        while True:
+            remaining = subscribe_deadline - time.monotonic()
+            assert remaining > 0, "Chat v2 subscription did not produce its initial frame"
+            initial_event = json.loads(ws.recv(timeout=remaining))
+            events.append(initial_event)
+            if initial_event.get("type") == "chat_v2_frame":
+                break
+            assert initial_event.get("type") != "error", (
+                f"Chat v2 subscription failed: {initial_event}"
             )
+
+        client_txn_id = f"integration-{uuid.uuid4().hex}"
+        client_message_id = f"message-{uuid.uuid4().hex}"
+        admission = live.put(
+            f"/api/v1/chat/v2/conversations/{conversation_id}/messages/{client_txn_id}",
+            json={
+                "client_message_id": client_message_id,
+                "content": message,
+                "attachments": [],
+            },
         )
+        assert admission.status_code == 202, f"Message admission failed: {admission.text}"
 
         deadline = time.monotonic() + timeout
+        post_admission_turn_frame_seen = False
+        last_snapshot: dict[str, Any] | None = None
+        idle_since: float | None = None
         while time.monotonic() < deadline:
             try:
-                remaining = max(1.0, deadline - time.monotonic())
-                raw = ws.recv(timeout=remaining)
+                remaining = max(0.1, deadline - time.monotonic())
+                raw = ws.recv(timeout=min(1.0, remaining))
                 event = json.loads(raw)
                 events.append(event)
-                if event.get("type") == "message_complete":
-                    break
+                post_admission_turn_frame_seen = (
+                    post_admission_turn_frame_seen
+                    or _frame_contains_turn_activity(
+                        event,
+                        conversation_id=conversation_id,
+                        client_message_id=client_message_id,
+                    )
+                )
                 if event.get("type") == "error":
                     break
             except TimeoutError:
-                break
+                pass
             except Exception:
                 break
 
+            snapshot_response = live.get(snapshot_path)
+            if (
+                snapshot_response.status_code == 503
+                and snapshot_response.json().get("error", {}).get("code")
+                == "event_store_inconsistent"
+            ):
+                time.sleep(0.1)
+                continue
+            assert snapshot_response.status_code == 200, (
+                f"Snapshot failed: {snapshot_response.text}"
+            )
+            snapshot = snapshot_response.json()
+            last_snapshot = snapshot
+            assistant_items = [
+                item
+                for item in snapshot["timeline"]["items"]
+                if item.get("kind") == "message"
+                and item.get("role") == "assistant"
+                and item.get("id") not in initial_assistant_ids
+            ]
+            settled = (
+                assistant_items
+                and not snapshot["runtime"]["has_active_turn"]
+                and not snapshot["state"]["active_turn"]["has_active_turn"]
+                and snapshot["queue"]["queued_count"] == 0
+            )
+            if not settled:
+                idle_since = None
+                continue
+            if idle_since is None:
+                idle_since = time.monotonic()
+                continue
+            if time.monotonic() - idle_since >= 1.0:
+                assert post_admission_turn_frame_seen, (
+                    "Chat v2 subscription did not receive a frame for the admitted turn"
+                )
+                events.append({"type": "chat_v2_snapshot", "snapshot": snapshot})
+                events.append(
+                    {
+                        "type": "message_complete",
+                        "cursor": snapshot["cursor"],
+                    }
+                )
+                break
+
+    if not any(event.get("type") in {"message_complete", "error"} for event in events):
+        raise AssertionError(
+            "Chat v2 turn did not complete before timeout: "
+            f"post_admission_turn_frame_seen={post_admission_turn_frame_seen}, "
+            f"runtime={None if last_snapshot is None else last_snapshot.get('runtime')}, "
+            f"timeline_items={0 if last_snapshot is None else len(last_snapshot['timeline']['items'])}"
+        )
     return events

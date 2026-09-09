@@ -79,7 +79,7 @@ def _intaris_filters(filters: Any, *, agent_id_override: str | None = None) -> S
 async def _display_min_score(request: Request) -> float:
     async with request.app.state.session_factory() as session:
         raw = await get_setting_value(session, "search.display_min_score", 0.2)
-    return float(raw)
+    return float(raw) if isinstance(raw, str | bytes | bytearray | int | float) else 0.2
 
 
 @router.get("/health", response_model=SearchHealth)
@@ -90,7 +90,9 @@ async def search_health(request: Request) -> SearchHealth:
     cached = _health_cache.get(key)
     if cached is not None and now - cached[0] < _HEALTH_TTL_SECONDS:
         return cached[1]
-    health = await request.app.state.providers.guardrails.search_health(user_email=user.email)
+    health = SearchHealth.model_validate(
+        await request.app.state.providers.guardrails.search_health(user_email=user.email)
+    )
     _health_cache[key] = (now, health)
     return health
 

@@ -238,6 +238,13 @@ admission limit. Intaris read failures cause bounded exponential backoff and
 one recovery probe. Foreground event writes and unrelated endpoint families do
 not use this backoff.
 
+Initial snapshot warming and active-snapshot reconciliation are optional
+accelerators. Startup marks the controller and directory ready before beginning
+this best-effort work; enumeration or reconciler failure is logged and must not
+withdraw readiness. Snapshot and Work projection builders must also release
+database sessions before event-store/artifact I/O or singleflight waits, opening
+a fresh session only for subsequent database work.
+
 The Intaris append listener performs only local, exception-isolated admissions.
 It invalidates L1 first. Then it records the warm mapping before it admits the
 generation dispatcher. Finally, it admits Work projection data to a bounded,
@@ -885,6 +892,17 @@ Client rules:
 Generic lifecycle events such as `message_complete` and `conversation_updated` may
 continue for notification/sidebar consumers; renderable timeline state is canonical ChatV2.
 migration. Chat v2 frontend must not use them to mutate timeline state.
+
+### Inspector overview demand
+
+`ActivityOverviewResponse` is demand-loaded for visible inspector consumers.
+Opening the Overview or Context inspector establishes demand; a closed inspector
+and the Work or Session modes do not. Conversation changes invalidate cached
+overview state but do not redundantly fetch both root and selected-scope
+overviews unless a visible consumer needs them. Concurrent consumers for the
+same scope share the overview cache/singleflight operation. A lightweight
+overview may still be present in a warmed snapshot, but clients must not require
+that embedding or use every conversation change as an overview fetch trigger.
 
 ---
 

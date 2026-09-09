@@ -21,6 +21,10 @@ from cognis.json_stream import merge_incremental_json_fragment
 from cognis.logging import get_logger
 from cognis.models.config import ModelInfo
 from cognis.providers.llm.errors import classify_response_failure
+from cognis.providers.llm.terminal import (
+    ResponseIncompleteDetails,
+    response_incomplete_details,
+)
 
 RESPONSES_MODE_ENV = "COGNIS_OPENAI_RESPONSES_MODE"
 RESPONSES_TOOL_CALL_TYPES = frozenset({"function_call", "apply_patch_call", "custom_tool_call"})
@@ -65,6 +69,7 @@ class NormalizedResponseEnvelope:
     status: str = "completed"
     finish_reason: str = "stop"
     usage: dict[str, Any] = field(default_factory=dict)
+    incomplete_details: ResponseIncompleteDetails | None = None
     content_source: str | None = None
     reasoning_source: str | None = None
 
@@ -208,9 +213,7 @@ def _extract_text_content(content: Any) -> str:
     return ""
 
 
-def _assistant_message_call_id_groups(
-    index: int, message: dict[str, Any]
-) -> list[set[str]]:
+def _assistant_message_call_id_groups(index: int, message: dict[str, Any]) -> list[set[str]]:
     """Return id aliases grouped by logical tool call in one assistant message.
 
     Both the raw ``_responses_output_items`` call ids and the normalized
@@ -280,9 +283,7 @@ def _paired_tool_call_ids_by_message(
 
         completed_aliases: set[str] = set()
         for alias_group in _assistant_message_call_id_groups(index, message):
-            matched_output_ids = (
-                alias_group & available_output_ids
-            ) - consumed_output_ids
+            matched_output_ids = (alias_group & available_output_ids) - consumed_output_ids
             if not matched_output_ids:
                 unpaired_group_count += 1
                 continue
@@ -309,9 +310,7 @@ def _record_unpaired_tool_calls(unpaired_call_count: int) -> None:
 
     if unpaired_call_count <= 0:
         return
-    RESPONSES_REPLAY_UNPAIRED_TOOL_CALLS_TOTAL.labels(resolution="dropped").inc(
-        unpaired_call_count
-    )
+    RESPONSES_REPLAY_UNPAIRED_TOOL_CALLS_TOTAL.labels(resolution="dropped").inc(unpaired_call_count)
     logger.warning(
         "Dropping unpaired prior tool calls from Responses input replay",
         extra={"extra_data": {"unpaired_tool_call_count": unpaired_call_count}},
@@ -494,9 +493,7 @@ def messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str
                 )
                 continue
             normalized_call_id = normalize_tool_call_id(call_id, call_id, str(index))
-            normalized_call_id = tool_call_id_aliases.get(
-                normalized_call_id, normalized_call_id
-            )
+            normalized_call_id = tool_call_id_aliases.get(normalized_call_id, normalized_call_id)
             if normalized_call_id in emitted_tool_output_ids:
                 logger.warning(
                     "Dropping duplicate tool output for Responses API",
@@ -740,7 +737,7 @@ def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
     """Normalize a Responses API payload into chat-completions-like shape."""
 
     envelope = _extract_response_envelope(payload)
-    return {
+    response = {
         "choices": [
             {
                 "message": {
@@ -757,6 +754,9 @@ def responses_to_chat_response(payload: dict[str, Any]) -> dict[str, Any]:
         "usage": envelope.usage,
         "response_status": envelope.status,
     }
+    if envelope.incomplete_details is not None:
+        response["response_incomplete_details"] = envelope.incomplete_details
+    return response
 
 
 async def responses_stream_to_chat_chunks(
@@ -1048,7 +1048,11 @@ async def responses_stream_to_chat_chunks(
                     final_chunk.update(provider_liveness_chunk)
                     yield final_chunk
                 continue
-            if event_type in {"response.completed", "response.completed.synthetic"}:
+            if event_type in {
+                "response.completed",
+                "response.completed.synthetic",
+                "response.incomplete",
+            }:
                 response_payload = _to_dict(event.get("response") or event)
                 for fallback_chunk in state.final_message_fallback(response_payload):
                     fallback_chunk.update(provider_liveness_chunk)
@@ -1057,7 +1061,7 @@ async def responses_stream_to_chat_chunks(
                     fallback_chunk.update(provider_liveness_chunk)
                     yield fallback_chunk
                 state.completed_seen = True
-                yield {
+                terminal_chunk = {
                     **provider_liveness_chunk,
                     "choices": [
                         {"delta": {}, "finish_reason": _extract_finish_reason(response_payload)}
@@ -1066,6 +1070,12 @@ async def responses_stream_to_chat_chunks(
                     "response_status": str(response_payload.get("status") or "completed"),
                     "response_instructions": response_payload.get("instructions"),
                 }
+                incomplete_details = response_incomplete_details(
+                    response_payload.get("incomplete_details")
+                )
+                if incomplete_details is not None:
+                    terminal_chunk["response_incomplete_details"] = incomplete_details
+                yield terminal_chunk
                 continue
             if event_type == "error":
                 last_error_event_details = _response_error_event_details(event)
@@ -1894,6 +1904,7 @@ def _extract_response_envelope(payload: dict[str, Any]) -> NormalizedResponseEnv
         status=str(payload.get("status") or "completed"),
         finish_reason=_extract_finish_reason(payload),
         usage=_extract_usage(payload),
+        incomplete_details=response_incomplete_details(payload.get("incomplete_details")),
     )
 
     content_parts: list[str] = []

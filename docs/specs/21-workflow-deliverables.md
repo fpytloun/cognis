@@ -40,7 +40,7 @@ Deliverables solve the class of problems by **decoupling authoring from delivery
 
 ### 1. Authoring is a tool call, not free text
 
-Inside a workflow step, the model authors the user-facing output by calling `write_deliverable(content, format, ...)`. Free-text assistant messages during a workflow step are reasoning; they are never delivered. This makes the output a typed object and makes duplicate delivery impossible by construction.
+Inside a workflow step, the model authors the user-facing output with one `write_deliverable` call. Text calls need only `content`. Rich calls use one canonical `payload` or `payload_artifact` source. Free-text assistant messages during a workflow step are reasoning; they are never delivered.
 
 ### 2. One delivery per workflow
 
@@ -142,12 +142,25 @@ The snapshot columns are audit metadata. Legacy rows read as `NULL` and render a
       "content":  {"type": "string", "description": "The final deliverable content."},
       "format":   {"type": "string", "enum": ["markdown", "plain", "html"], "default": "markdown"},
       "title":    {"type": "string", "description": "Optional title for the deliverable."},
-      "target":   {"type": "string", "enum": ["channel", "none"], "description": "Only meaningful for the final delivering step; workflow policy overrides this."},
       "outputs":  {"type": "object", "description": "Optional structured sidecar data for the evaluator or downstream steps."}
     }
   }
 }
 ```
+
+Generic Rich authoring uses:
+
+```json
+{"action": "rich", "payload": {"title": "Report", "blocks": []}}
+```
+
+The alternative source is
+`{"action":"rich","payload_artifact":{"artifact_id":"art_<32 lowercase hex characters>"}}`.
+The native dashboard uses `action="rich:dashboard"`. Pulse uses
+`action="rich:pulse"`. Both use the same source choice. Rich calls reject legacy
+`content`/`format`/`rich` fields and top-level title, target, or outputs. The
+controller owns presentation metadata and derives canonical Markdown from the
+normalized payload.
 
 ### Exposure
 
@@ -159,7 +172,8 @@ The snapshot columns are audit metadata. Legacy rows read as `NULL` and render a
 
 On invocation:
 
-1. Validate arguments (non-empty `content`, valid `format`).
+1. Validate the selected operation. Text requires non-empty `content`. Rich
+   requires exactly one validated `payload` or `payload_artifact`.
 2. Supersede any existing non-terminal deliverable version for this step_run (set `status="superseded"`).
 3. Insert a new `deliverables` row with `version = max_version + 1`, `status="buffered"`.
 4. Update `step_runs.deliverable_id` to point at the new row.

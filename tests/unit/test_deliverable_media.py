@@ -89,6 +89,8 @@ def _token(url: str) -> str:
 
 def _daily_brief_arguments() -> tuple[dict, dict[str, str]]:
     payload = deepcopy(PULSE_DAILY_SKELETON)
+    payload["title"] = "Daily Brief"
+    payload.get("metadata", {}).pop("presentation", None)
     source_urls = {source["id"]: source["url"] for source in payload["sources"]}
     evidence: dict[str, str] = {}
     article_number = 0
@@ -106,9 +108,7 @@ def _daily_brief_arguments() -> tuple[dict, dict[str, str]]:
     return (
         {
             "action": "rich:pulse",
-            "content": "Accessible Daily Brief fallback.",
-            "format": "rich",
-            "rich": payload,
+            "payload": payload,
         },
         evidence,
     )
@@ -161,11 +161,9 @@ def test_generic_block_contract_accepts_visual_fields_and_rejects_embeds() -> No
 
 def test_tool_v2_descriptor_exposes_generic_media_contract() -> None:
     operation = next(
-        item
-        for item in WRITE_DELIVERABLE_TOOL.native_operations or []
-        if item.operation == "write_deliverable"
+        item for item in WRITE_DELIVERABLE_TOOL.native_operations or [] if item.operation == "rich"
     )
-    rich_schema = operation.input_schema["properties"]["rich"]
+    rich_schema = operation.input_schema["properties"]["payload"]
     media_schema = rich_schema["properties"]["blocks"]["items"]["properties"]["media"]
     assert {"ref", "artifact_id", "content_ref", "alt", "focal_point"} <= set(
         media_schema["properties"]
@@ -267,7 +265,7 @@ async def test_daily_brief_preflight_and_execution_share_provenance_and_media_va
         error["code"] == "invalid_daily_brief"
         and "distinct artifact_read result" in error["message"]
         for error in preflight_missing["errors"]
-    )
+    ), preflight_missing["errors"]
 
     valid_context = NativeValidationContext(
         **context_kwargs,

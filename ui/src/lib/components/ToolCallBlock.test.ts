@@ -4,6 +4,15 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
 import ToolCallBlock from './ToolCallBlock.svelte';
 
+vi.mock('$lib/syntax/json', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('$lib/syntax/json')>();
+  return {
+    ...actual,
+    prettyPrintJson: vi.fn(actual.prettyPrintJson),
+    highlightJson: vi.fn(actual.highlightJson),
+  };
+});
+
 function writeDeliverableItem(): ToolCallTimelineItem {
   return {
     id: 'tool-call:write-deliverable',
@@ -154,6 +163,103 @@ describe('ToolCallBlock compact command rendering', () => {
     expect(screen.getByTestId('tool-terminal-description-scroll')).toHaveClass('command-scroll');
   });
 
+  it('shows semantic command status and omits completed from the terminal title', async () => {
+    const item: ToolCallTimelineItem = {
+      id: 'tool-call:command-status',
+      kind: 'tool_call',
+      callId: 'call_command_status',
+      toolName: 'bash',
+      status: 'completed',
+      timestamp: '2026-01-01T00:00:00Z',
+      arguments: { command: 'npm test', description: 'Run focused tests' },
+      result: 'passed',
+    };
+
+    const view = render(ToolCallBlock, {
+      item,
+      density: 'compact',
+      summaryMode: 'command',
+      compactLabelMode: 'description',
+    });
+    await fireEvent.click(screen.getByTestId('tool-command-summary-scroll'));
+
+    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Success');
+    expect(screen.queryByText('Executed')).toBeNull();
+    expect(screen.getByTestId('tool-terminal-description-scroll').parentElement).not.toHaveTextContent('completed');
+
+    await view.rerender({ item: { ...item, status: 'failed', isError: true } });
+    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Failure');
+
+    await view.rerender({ item: { ...item, status: 'started', isError: false } });
+    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Running');
+  });
+
+  it('renders `waiting` as blocked/pending approval, not failed', async () => {
+    const item: ToolCallTimelineItem = {
+      id: 'tool-call:waiting',
+      kind: 'tool_call',
+      callId: 'call_waiting',
+      toolName: 'run_shell',
+      status: 'waiting',
+      timestamp: '2026-01-01T00:00:00Z',
+      arguments: { command: 'rm -rf /tmp/x' },
+    };
+
+    render(ToolCallBlock, { item, density: 'compact', summaryMode: 'command' });
+    await fireEvent.click(screen.getByTestId('tool-command-summary-scroll'));
+
+    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Waiting');
+    expect(screen.queryByText('Failure')).toBeNull();
+    expect(screen.getByText('Waiting for approval')).toBeInTheDocument();
+  });
+
+  it('renders `denied` as a terminal rejected outcome, distinct from failed or active', async () => {
+    const item: ToolCallTimelineItem = {
+      id: 'tool-call:denied',
+      kind: 'tool_call',
+      callId: 'call_denied',
+      toolName: 'run_shell',
+      status: 'denied',
+      timestamp: '2026-01-01T00:00:00Z',
+      arguments: { command: 'rm -rf /tmp/x' },
+    };
+
+    render(ToolCallBlock, { item, density: 'compact', summaryMode: 'command' });
+    await fireEvent.click(screen.getByTestId('tool-command-summary-scroll'));
+
+    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Denied');
+    expect(screen.queryByText('Failure')).toBeNull();
+    expect(screen.queryByText('Waiting for approval')).toBeNull();
+  });
+
+  it('shows and updates elapsed time for a running command', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:01:05Z'));
+    try {
+      const item: ToolCallTimelineItem = {
+        id: 'tool-call:running-command',
+        kind: 'tool_call',
+        callId: 'call_running_command',
+        toolName: 'bash',
+        status: 'running',
+        timestamp: '2026-01-01T00:00:00Z',
+        arguments: { command: 'sleep 120' },
+      };
+
+      render(ToolCallBlock, {
+        item,
+        density: 'compact',
+        summaryMode: 'command',
+      });
+      expect(screen.getByText('1m 05s')).toBeTruthy();
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(screen.getByText('1m 06s')).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('links expanded Work evidence to its source session when available', async () => {
     const onViewSession = vi.fn();
     const item: ToolCallTimelineItem = {
@@ -262,5 +368,40 @@ describe('ToolCallBlock delegation lineage rendering', () => {
 
     expect(screen.getByText('Re-review the implementation after the fix.')).toBeTruthy();
     expect(screen.queryByText('Delegated sub-session')).toBeNull();
+  });
+});
+
+describe('ToolCallBlock collapsed output formatting', () => {
+  it('does not run JSON pretty-print/highlight for a collapsed item, only after expansion', async () => {
+    const { prettyPrintJson, highlightJson } = await import('$lib/syntax/json');
+    vi.mocked(prettyPrintJson).mockClear();
+    vi.mocked(highlightJson).mockClear();
+
+    const largeArguments: Record<string, unknown> = {};
+    for (let i = 0; i < 500; i += 1) largeArguments[`key_${i}`] = `value_${i}`.repeat(10);
+    const largeResult = JSON.stringify({ items: Array.from({ length: 500 }, (_, i) => ({ i, note: 'x'.repeat(20) })) });
+
+    const item: ToolCallTimelineItem = {
+      id: 'tool-call:large-json',
+      kind: 'tool_call',
+      callId: 'call_large_json',
+      toolName: 'some_tool',
+      status: 'completed',
+      timestamp: null,
+      arguments: largeArguments,
+      result: largeResult,
+    };
+
+    render(ToolCallBlock, { item });
+
+    // Collapsed by default: no expensive JSON formatting should have run yet.
+    expect(prettyPrintJson).not.toHaveBeenCalled();
+    expect(highlightJson).not.toHaveBeenCalled();
+
+    await fireEvent.click(screen.getByRole('button', { expanded: false }));
+
+    // Expanded: the formatter now runs for the visible input/output panes.
+    expect(prettyPrintJson).toHaveBeenCalled();
+    expect(highlightJson).toHaveBeenCalled();
   });
 });

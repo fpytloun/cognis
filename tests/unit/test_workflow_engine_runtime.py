@@ -13,11 +13,7 @@ import cognis.core.workflow_engine as workflow_engine_module
 from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause, StepContext
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.session_cache import CachedEvent
-from cognis.core.workflow_engine import (
-    TRANSIENT_EXECUTOR_MAX_DEFERRALS,
-    WorkflowEngine,
-    _resolve_task_execution_paths,
-)
+from cognis.core.workflow_engine import WorkflowEngine, _resolve_task_execution_paths
 from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext
@@ -533,6 +529,7 @@ async def test_build_result_data_uses_final_deliverable(
             title="Final summary",
             target="channel",
             outputs={"tests": "passed"},
+            attempt_number=1,
             status="approved",
             evaluator_feedback=None,
             created_at=None,
@@ -540,6 +537,12 @@ async def test_build_result_data_uses_final_deliverable(
         )
 
     monkeypatch.setattr("cognis.core.workflow_engine.get_deliverable", _get_deliverable)
+
+    async def _get_step_run(_session: object, step_run_id: str) -> SimpleNamespace:
+        assert step_run_id == "sr-final"
+        return SimpleNamespace(task_id="task-1", attempt_number=1)
+
+    monkeypatch.setattr("cognis.core.workflow_engine.get_step_run", _get_step_run)
 
     result = await engine._build_result_data(task, state, workflow)
 
@@ -2549,13 +2552,11 @@ async def test_evaluate_step_uses_persisted_deliverable_content(
 
 
 @pytest.mark.asyncio
-async def test_execute_workflow_pauses_after_transient_executor_deferral_budget(
+async def test_execute_workflow_never_pauses_for_transient_executor_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = _build_engine()
-    state = WorkflowState(
-        loop_iterations={"transient_executor_unavailable:run": TRANSIENT_EXECUTOR_MAX_DEFERRALS}
-    )
+    state = WorkflowState(loop_iterations={"transient_executor_unavailable:run": 200})
     task = TaskModel(
         task_id="task-executor-stuck",
         title="Task",
@@ -2590,16 +2591,18 @@ async def test_execute_workflow_pauses_after_transient_executor_deferral_budget(
         del args, kwargs
         return None
 
+    async def _defer_running_task(*args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
     monkeypatch.setattr(engine, "_execute_run_step", _transient_step)
     monkeypatch.setattr(engine, "_persist_workflow_state", _persist_workflow_state)
+    monkeypatch.setattr(workflow_engine_module, "defer_running_task", _defer_running_task)
 
     result = await engine.execute_workflow(task, workflow)
 
-    assert result.status == TaskStatus.PAUSED
-    assert state.status == "paused"
-    assert state.pending_pause_payload is not None
-    assert state.pending_pause_payload["kind"] == "infrastructure_blocked"
-    assert state.loop_iterations["transient_executor_unavailable:run"] == (
-        TRANSIENT_EXECUTOR_MAX_DEFERRALS + 1
-    )
+    assert result.status == TaskStatus.READY
+    assert state.status == "running"
+    assert state.pending_pause_payload is None
+    assert state.loop_iterations["transient_executor_unavailable:run"] == 201
     assert "attempts:run" not in state.loop_iterations

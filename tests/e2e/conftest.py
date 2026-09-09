@@ -318,7 +318,7 @@ def e2e_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[E2EStack]:
     http = httpx.Client(timeout=30.0)
     login_resp = http.post(
         f"{cognis_url}/api/auth/login",
-        json={"email": admin_email, "password": admin_password},
+        json={"email": admin_email, "password": admin_password, "mode": "native"},
     )
     assert login_resp.status_code == 200, f"Login failed: {login_resp.text}"
     admin_token = login_resp.json()["token"]
@@ -407,7 +407,7 @@ def _seed_e2e_resources(
         # Executor may already exist — try to continue
         pass
 
-    # Create e2e agent with capabilities disabled
+    # Use the stack-local memory service for scripted memory tool calls.
     agent_resp = http.post(
         f"{cognis_url}/api/v1/agents",
         headers=headers,
@@ -418,7 +418,7 @@ def _seed_e2e_resources(
             "description": "Deterministic e2e test agent",
             "system_prompt": "You are a deterministic test assistant. Respond concisely.",
             "capabilities": {
-                "memory_backend": "none",
+                "memory_backend": "mnemory",
                 "guardrails_backend": "none",
             },
             "tools": {
@@ -502,28 +502,31 @@ def capture_ws_events(
         ws.send(json.dumps({"type": "auth", "token": stack.admin_token}))
         auth_msg = json.loads(ws.recv(timeout=15))
         assert auth_msg["type"] == "authenticated", f"WS auth failed: {auth_msg}"
-        _subscribe_chat_v2(ws, stack, conversation_id, events=events)
-
-        ws.send(
-            json.dumps(
-                {
-                    "type": "reconnect",
-                    "conversation_id": conversation_id,
-                    "last_seq": 0,
-                }
+        initial = _subscribe_chat_v2(ws, stack, conversation_id, events=events)
+        subscription_deadline = time.monotonic() + 15
+        while True:
+            initial_frame = json.loads(
+                ws.recv(timeout=max(0.01, subscription_deadline - time.monotonic()))
             )
-        )
-        time.sleep(0.3)
+            assert initial_frame["type"] != "error", initial_frame
+            events.append(initial_frame)
+            if (
+                initial_frame["type"] == "chat_v2_frame"
+                and initial_frame["scope"]["key"] == initial["scope"]["key"]
+            ):
+                break
+            assert time.monotonic() < subscription_deadline, "No subscription frame"
+        previous_ids = {item["id"] for item in initial["timeline"]["items"]}
+        from uuid import uuid4
 
-        ws.send(
-            json.dumps(
-                {
-                    "type": "message",
-                    "conversation_id": conversation_id,
-                    "content": message,
-                }
-            )
+        txn = uuid4().hex
+        response = stack.http.put(
+            f"{stack.cognis_url}/api/v1/chat/v2/conversations/{conversation_id}/messages/{txn}",
+            headers=stack.admin_headers(),
+            json={"client_message_id": txn, "content": message, "attachments": []},
         )
+        assert response.status_code == 202, response.text
+        turn_frame_seen = False
 
         deadline = time.monotonic() + timeout
         message_complete_at: float | None = None
@@ -538,11 +541,13 @@ def capture_ws_events(
                     if remaining <= 0.05:
                         break
                 else:
-                    remaining = max(1.0, deadline - time.monotonic())
+                    remaining = min(0.2, max(0.05, deadline - time.monotonic()))
 
                 raw = ws.recv(timeout=remaining)
                 event = json.loads(raw)
                 events.append(event)
+                if event.get("type") == "chat_v2_frame":
+                    turn_frame_seen = True
 
                 # Track the highest seq and active session for the reconnect
                 if isinstance(event.get("seq"), int) and event["seq"] > last_seq:
@@ -562,53 +567,54 @@ def capture_ws_events(
                     # Continue for post_completion_window to capture trailing events
 
             except TimeoutError:
-                break
-            except Exception:
-                break
+                if message_complete_at is not None:
+                    continue
+                response = stack.get(f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot")
+                assert response.status_code == 200, response.text
+                snapshot = response.json()
+                completed = any(
+                    item["id"] not in previous_ids
+                    and item.get("kind") == "message"
+                    and item.get("role") == "assistant"
+                    and item.get("stable")
+                    for item in snapshot["timeline"]["items"]
+                )
+                if (
+                    turn_frame_seen
+                    and completed
+                    and not snapshot["runtime"]["has_active_turn"]
+                    and not snapshot["state"]["active_turn"]["has_active_turn"]
+                ):
+                    events.append({"type": "turn_completed", "snapshot": snapshot})
+                    message_complete_at = time.monotonic()
 
     if not capture_reconnect_snapshot or message_complete_at is None:
         return events
 
-    # Open a fresh WS connection and subscribe — the server sends a
-    # conversation_runtime_snapshot on every (re)connect.  Append it to the
-    # golden stream so the replay can assert no streaming items survive.
-    time.sleep(0.5)  # Brief pause so the server has settled after the turn
-    try:
-        with wsc.connect(stack.ws_url, close_timeout=5, open_timeout=10) as ws2:
-            ws2.send(json.dumps({"type": "auth", "token": stack.admin_token}))
-            auth2 = json.loads(ws2.recv(timeout=10))
-            if auth2.get("type") != "authenticated":
-                return events
-            _subscribe_chat_v2(ws2, stack, conversation_id, events=events)
-
-            ws2.send(
-                json.dumps(
-                    {
-                        "type": "reconnect",
-                        "conversation_id": conversation_id,
-                        "last_seq": last_seq,
-                        "session_id": active_session_id,
-                    }
-                )
-            )
-
-            # Collect the initial burst (state_snapshot + runtime_snapshot + reconnected)
-            reconnect_deadline = time.monotonic() + 5.0
-            while time.monotonic() < reconnect_deadline:
-                try:
-                    raw = ws2.recv(timeout=max(0.1, reconnect_deadline - time.monotonic()))
-                    event = json.loads(raw)
-                    events.append(event)
-                    # Stop after we've seen the reconnected ack — that's the
-                    # full initial burst (state_snapshot, runtime_snapshot, reconnected)
-                    if event.get("type") == "reconnected":
-                        break
-                except TimeoutError:
-                    break
-                except Exception:
-                    break
-    except Exception:
-        pass  # Best-effort — don't fail the test if reconnect capture fails
+    # A fresh connection must deliver the native scoped subscription frame.
+    with wsc.connect(stack.ws_url, close_timeout=5, open_timeout=10) as ws2:
+        ws2.send(json.dumps({"type": "auth", "token": stack.admin_token}))
+        auth2 = json.loads(ws2.recv(timeout=10))
+        assert auth2.get("type") == "authenticated", auth2
+        reconnect_snapshot = _subscribe_chat_v2(ws2, stack, conversation_id, events=events)
+        events.append(
+            {
+                "type": "reconnect",
+                "scope": reconnect_snapshot["scope"],
+                "cursor": reconnect_snapshot["cursor"],
+            }
+        )
+        reconnect_deadline = time.monotonic() + 15
+        while True:
+            event = json.loads(ws2.recv(timeout=max(0.01, reconnect_deadline - time.monotonic())))
+            assert event.get("type") != "error", event
+            events.append(event)
+            if (
+                event.get("type") == "chat_v2_frame"
+                and event["scope"]["key"] == reconnect_snapshot["scope"]["key"]
+            ):
+                break
+            assert time.monotonic() < reconnect_deadline, "No scoped reconnect frame"
 
     # Complete the canonical producer sequence with a server-owned reset and
     # recovery snapshot.  Use the first live frame cursor so the response is
@@ -747,7 +753,6 @@ def capture_scoped_scope_events(
         )
         return payload.get("scope", {}).get("status"), tools, completed_messages
 
-    conversation_id = scope["conversation_id"]
     events: list[dict[str, Any]] = []
     snapshot_response = stack.get(_scope_snapshot_path(scope))
     assert snapshot_response.status_code == 200, snapshot_response.text
@@ -773,17 +778,6 @@ def capture_scoped_scope_events(
         ws.send(
             json.dumps(
                 {
-                    "type": "reconnect",
-                    "conversation_id": conversation_id,
-                    "session_id": snapshot["scope"].get("session_id"),
-                    "last_seq": 0,
-                    "chat_v2_cursor": snapshot["cursor"],
-                }
-            )
-        )
-        ws.send(
-            json.dumps(
-                {
                     "type": "chat_v2_subscribe",
                     "scope": snapshot["scope"],
                     "cursor": snapshot["cursor"],
@@ -792,11 +786,15 @@ def capture_scoped_scope_events(
         )
 
         deadline = time.monotonic() + timeout
+        subscription_frame_seen = False
         while time.monotonic() < deadline:
             try:
                 event = json.loads(
                     ws.recv(timeout=min(0.1, max(0.05, deadline - time.monotonic())))
                 )
+                assert event.get("type") != "error", event
+                if event.get("type") == "chat_v2_frame":
+                    subscription_frame_seen = True
                 if (
                     event.get("type") == "chat_v2_frame"
                     and event.get("cursor_before") != current_cursor
@@ -809,6 +807,8 @@ def capture_scoped_scope_events(
                 if event.get("type") == "chat_v2_frame" and event.get("cursor_after"):
                     current_cursor = event["cursor_after"]
             except TimeoutError:
+                if not subscription_frame_seen:
+                    continue
                 # Capture authoritative lifecycle snapshots while the native
                 # subscription remains attached. A snapshot advances the
                 # replay boundary atomically, avoiding partial-sync cursors
@@ -823,8 +823,6 @@ def capture_scoped_scope_events(
                         last_lifecycle_signature = signature
                     last_snapshot_cursor = live_snapshot["cursor"]
                     current_cursor = live_snapshot["cursor"]
-            except Exception:
-                break
 
     # Anchor the reset request to a snapshot that is present in the promoted
     # sequence. Lifecycle-signature compaction may have skipped cursor-only

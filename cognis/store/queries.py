@@ -8,15 +8,17 @@ import os
 import secrets
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import sqlalchemy as sa
 from sqlalchemy import String, and_, case, delete, func, or_, select, update
 from sqlalchemy import event as sa_event
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -36,6 +38,7 @@ from cognis.store.deliverable_storage import (
     attach_deliverable_payload,
     store_deliverable_payload,
 )
+from cognis.store.direct_turns import NONTERMINAL_STATUSES, DirectTurnAdmissionRejected
 from cognis.store.models import (
     Agent,
     AgentGrantRow,
@@ -55,6 +58,7 @@ from cognis.store.models import (
     ConversationTodo,
     CredentialRow,
     DeliverableRow,
+    DirectTurnRequestRow,
     ExecutorRow,
     KnowledgebaseArtifactRow,
     KnowledgebaseChunkRow,
@@ -70,6 +74,7 @@ from cognis.store.models import (
     MCPOAuthTransactionRow,
     MCPServerRow,
     ModelRouting,
+    NativeSession,
     NotificationRow,
     ProjectGrantRow,
     ProjectRow,
@@ -102,10 +107,17 @@ logger = logging.getLogger(__name__)
 _DELIVERABLE_CLEANUP_REGISTERED = "_deliverable_cleanup_registered"
 _DELIVERABLE_DELETE_AFTER_COMMIT = "_deliverable_delete_after_commit"
 _DELIVERABLE_DELETE_AFTER_ROLLBACK = "_deliverable_delete_after_rollback"
+_SIDEBAR_METADATA_REVISION_KEY = "sidebar.metadata_revision"
 
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _rowcount(result: sa.Result[Any]) -> int:
+    """Return the affected-row count for a data mutation."""
+
+    return int(cast(CursorResult[Any], result).rowcount or 0)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -219,7 +231,10 @@ def _agent_direct_clause(user_email: str, agent_id: str) -> sa.ColumnElement[boo
 
 
 def _task_control_clause() -> sa.ColumnElement[bool]:
-    return Conversation.context_data["kind"].as_string() == "task_control"
+    return cast(
+        sa.ColumnElement[bool],
+        Conversation.context_data["kind"].as_string() == "task_control",
+    )
 
 
 def _exclude_task_control_clause() -> sa.ColumnElement[bool]:
@@ -620,11 +635,155 @@ def hash_browser_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def hash_native_refresh_token(token: str) -> str:
+    """Hash an opaque native refresh token before persisting it."""
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class NativeSessionRotation:
+    """Typed result of an opaque native refresh-token rotation."""
+
+    status: Literal["rotated", "replay", "stale", "invalid"]
+    session: NativeSession | None = None
+    refresh_token: str | None = None
+
+
+async def create_native_session(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    expires_at: datetime,
+    auth_version: int,
+    family_id: str | None = None,
+) -> tuple[NativeSession, str]:
+    """Create a native refresh session and return its credential once."""
+
+    raw_token = secrets.token_urlsafe(48)
+    row = NativeSession(
+        session_id=f"ns_{uuid.uuid4().hex}",
+        family_id=family_id or f"nf_{uuid.uuid4().hex}",
+        user_email=user_email,
+        token_hash=hash_native_refresh_token(raw_token),
+        auth_version=auth_version,
+        expires_at=expires_at,
+    )
+    session.add(row)
+    await session.flush()
+    return row, raw_token
+
+
+async def rotate_native_session(
+    session: AsyncSession,
+    *,
+    refresh_token: str,
+    expires_at: datetime,
+    now: datetime | None = None,
+) -> NativeSessionRotation:
+    """Atomically consume a refresh credential and replace its session."""
+
+    consumed_at = now or _utcnow()
+    token_hash = hash_native_refresh_token(refresh_token)
+    current_auth_version = (
+        select(User.auth_version).where(User.email == NativeSession.user_email).scalar_subquery()
+    )
+    result = await session.execute(
+        update(NativeSession)
+        .where(
+            NativeSession.token_hash == token_hash,
+            NativeSession.revoked_at.is_(None),
+            NativeSession.expires_at > consumed_at,
+            NativeSession.auth_version == current_auth_version,
+        )
+        .values(revoked_at=consumed_at)
+        .returning(
+            NativeSession.user_email,
+            NativeSession.family_id,
+            NativeSession.auth_version,
+        )
+    )
+    consumed = result.one_or_none()
+    if consumed is None:
+        known = (
+            await session.execute(
+                select(
+                    NativeSession.family_id,
+                    NativeSession.user_email,
+                    NativeSession.auth_version,
+                    NativeSession.revoked_at,
+                    NativeSession.expires_at,
+                ).where(NativeSession.token_hash == token_hash)
+            )
+        ).one_or_none()
+        if known is not None and known.revoked_at is None:
+            user_auth_version = await session.scalar(
+                select(User.auth_version).where(User.email == known.user_email)
+            )
+            if user_auth_version is not None and known.auth_version != user_auth_version:
+                await session.execute(
+                    update(NativeSession)
+                    .where(
+                        NativeSession.family_id == known.family_id,
+                        NativeSession.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=consumed_at)
+                )
+                return NativeSessionRotation(status="stale")
+        if known is not None and known.revoked_at is not None:
+            await session.execute(
+                update(NativeSession)
+                .where(
+                    NativeSession.family_id == known.family_id,
+                    NativeSession.revoked_at.is_(None),
+                )
+                .values(revoked_at=consumed_at)
+            )
+            return NativeSessionRotation(status="replay")
+        return NativeSessionRotation(status="invalid")
+    replacement, raw_token = await create_native_session(
+        session,
+        user_email=consumed.user_email,
+        expires_at=expires_at,
+        auth_version=consumed.auth_version,
+        family_id=consumed.family_id,
+    )
+    return NativeSessionRotation(
+        status="rotated",
+        session=replacement,
+        refresh_token=raw_token,
+    )
+
+
+async def revoke_native_session_by_token(session: AsyncSession, refresh_token: str) -> bool:
+    """Revoke the full native session family identified by an opaque credential."""
+
+    family_id = (
+        await session.execute(
+            select(NativeSession.family_id).where(
+                NativeSession.token_hash == hash_native_refresh_token(refresh_token)
+            )
+        )
+    ).scalar_one_or_none()
+    if family_id is None:
+        return False
+    await session.execute(
+        update(NativeSession)
+        .where(
+            NativeSession.family_id == family_id,
+            NativeSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=_utcnow())
+    )
+    return True
+
+
 async def create_browser_session(
     session: AsyncSession,
     *,
     user_email: str,
     expires_at: datetime,
+    auth_version: int,
     user_agent: str | None = None,
 ) -> tuple[BrowserSession, str]:
     """Create a new opaque browser session and return the raw token once."""
@@ -634,6 +793,7 @@ async def create_browser_session(
         session_id=f"bs_{uuid.uuid4().hex}",
         user_email=user_email,
         token_hash=hash_browser_session_token(raw_token),
+        auth_version=auth_version,
         user_agent=user_agent,
         expires_at=expires_at,
     )
@@ -647,7 +807,12 @@ async def get_browser_session_by_token(session: AsyncSession, token: str) -> Bro
 
     token_hash = hash_browser_session_token(token)
     result = await session.execute(
-        select(BrowserSession).where(BrowserSession.token_hash == token_hash)
+        select(BrowserSession)
+        .join(User, User.email == BrowserSession.user_email)
+        .where(
+            BrowserSession.token_hash == token_hash,
+            BrowserSession.auth_version == User.auth_version,
+        )
     )
     return result.scalar_one_or_none()
 
@@ -725,14 +890,14 @@ async def upsert_user_ui_state(
     normalized_value = dict(value or {})
     dialect_name = session.get_bind().dialect.name
     if dialect_name in {"postgresql", "sqlite"}:
-        if dialect_name == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert
-        else:
-            from sqlalchemy.dialects.sqlite import insert
+        stmt: Any = (
+            postgresql_insert(UserUiState)
+            if dialect_name == "postgresql"
+            else sqlite_insert(UserUiState)
+        )
 
         stmt = (
-            insert(UserUiState)
-            .values(
+            stmt.values(
                 user_email=user_email,
                 key=key,
                 value=normalized_value,
@@ -749,7 +914,7 @@ async def upsert_user_ui_state(
             .returning(UserUiState)
         )
         result = await session.execute(stmt)
-        row = result.scalar_one()
+        row = cast(UserUiState, result.scalar_one())
         await session.flush()
         return row
 
@@ -769,6 +934,18 @@ async def upsert_user_ui_state(
     session.add(row)
     await session.flush()
     return row
+
+
+async def _touch_sidebar_metadata_revision(session: AsyncSession, user_email: str | None) -> None:
+    if not user_email:
+        return
+    now = _utcnow()
+    await upsert_user_ui_state(
+        session,
+        user_email,
+        _SIDEBAR_METADATA_REVISION_KEY,
+        {"updated_at": now.isoformat()},
+    )
 
 
 # --- Settings ---
@@ -796,13 +973,14 @@ def _dialect_insert_do_nothing(
     index_elements: list[str],
 ) -> Any:
     dialect_name = session.get_bind().dialect.name
+    statement: Any
     if dialect_name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert
+        statement = postgresql_insert(table)
     elif dialect_name == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert
+        statement = sqlite_insert(table)
     else:
         raise RuntimeError(f"Unsupported database dialect for conflict-safe insert: {dialect_name}")
-    return insert(table).values(**values).on_conflict_do_nothing(index_elements=index_elements)
+    return statement.values(**values).on_conflict_do_nothing(index_elements=index_elements)
 
 
 async def insert_row_if_absent(
@@ -834,13 +1012,14 @@ async def upsert_setting(
     """Create or update a setting atomically across controller replicas."""
     now = datetime.now(UTC)
     dialect_name = session.get_bind().dialect.name
+    insert_statement: Any
     if dialect_name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert
+        insert_statement = postgresql_insert(Setting)
     elif dialect_name == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert
+        insert_statement = sqlite_insert(Setting)
     else:
         raise RuntimeError(f"Unsupported database dialect for setting upsert: {dialect_name}")
-    insert_statement = insert(Setting).values(
+    insert_statement = insert_statement.values(
         key=key,
         value=value,
         category=category,
@@ -1113,6 +1292,7 @@ async def create_agent_grant(
     )
     session.add(row)
     await session.flush()
+    await _touch_sidebar_metadata_revision(session, row.grantee_user_email)
     return row
 
 
@@ -1137,14 +1317,19 @@ async def update_agent_grant(
     if note is not None:
         row.note = note
     if grantee_overrides is not _UNSET:
-        row.grantee_overrides = grantee_overrides  # type: ignore[assignment]
+        row.grantee_overrides = cast(dict[str, Any] | None, grantee_overrides)
     if revoked_at is not _UNSET:
-        row.revoked_at = revoked_at
+        row.revoked_at = cast(datetime | None, revoked_at)
     if granted_at is not _UNSET:
-        row.granted_at = granted_at
+        if granted_at is None:
+            raise ValueError("granted_at cannot be cleared")
+        row.granted_at = cast(datetime, granted_at)
     if granted_by is not _UNSET:
-        row.granted_by = granted_by
+        if granted_by is None:
+            raise ValueError("granted_by cannot be cleared")
+        row.granted_by = cast(str, granted_by)
     await session.flush()
+    await _touch_sidebar_metadata_revision(session, row.grantee_user_email)
     return row
 
 
@@ -1156,6 +1341,7 @@ async def revoke_agent_grant(session: AsyncSession, grant_id: str) -> AgentGrant
         return None
     row.revoked_at = datetime.now(UTC)
     await session.flush()
+    await _touch_sidebar_metadata_revision(session, row.grantee_user_email)
     return row
 
 
@@ -1335,6 +1521,7 @@ async def upsert_system_agent_override(
     row.default_agent_profile_id_override = default_agent_profile_id_override
     row.updated_at = _utcnow()
     await session.flush()
+    await _touch_sidebar_metadata_revision(session, owner_email)
     return row
 
 
@@ -1350,7 +1537,10 @@ async def delete_system_agent_override(
         )
     )
     await session.flush()
-    return int(getattr(result, "rowcount", 0) or 0) > 0
+    deleted = int(getattr(result, "rowcount", 0) or 0) > 0
+    if deleted:
+        await _touch_sidebar_metadata_revision(session, owner_email)
+    return deleted
 
 
 async def list_secondary_bindings(session: AsyncSession, primary_agent_id: str) -> list[str]:
@@ -1418,7 +1608,7 @@ async def remove_secondary_binding(
             AgentSecondaryBinding.secondary_agent_id == secondary_agent_id,
         )
     )
-    return result.rowcount > 0  # type: ignore[union-attr]
+    return _rowcount(result) > 0
 
 
 async def get_llm_provider(session: AsyncSession, provider_id: str) -> LLMProvider | None:
@@ -2017,6 +2207,7 @@ async def list_conversations(
     include_agent_direct: bool = True,
     cursor_id: str | None = None,
     changed_since: datetime | None = None,
+    title_query: str | None = None,
     limit: int | None = None,
 ) -> list[Conversation]:
     """List conversations for a user, optionally filtered by context type and agent.
@@ -2046,6 +2237,19 @@ async def list_conversations(
             Conversation.conversation_id.asc(),
         )
     )
+    normalized_title_query = (title_query or "").strip()
+    if normalized_title_query:
+        display_title = sa.func.coalesce(
+            sa.func.nullif(sa.func.trim(Conversation.title), ""),
+            "Untitled conversation",
+        )
+        query = query.where(
+            sa.or_(
+                display_title.icontains(normalized_title_query, autoescape=True),
+                Conversation.conversation_id.icontains(normalized_title_query, autoescape=True),
+                Conversation.agent_id.icontains(normalized_title_query, autoescape=True),
+            )
+        )
     if changed_since is not None:
         query = query.where(Conversation.updated_at > changed_since)
 
@@ -2308,6 +2512,196 @@ async def list_agent_direct_conversations(
         .where(ranked.c.rank == 1)
     )
     return {row.agent_id: row for row in result.scalars().all()}
+
+
+async def list_agent_direct_chat_rows(
+    session: AsyncSession,
+    user_email: str,
+    *,
+    agent_ids: list[str] | None = None,
+    changed_since: datetime | None = None,
+) -> list[tuple[Agent, Conversation]]:
+    """Return visible direct chats and agents without scanning all visible agents."""
+
+    ids = sorted({agent_id for agent_id in (agent_ids or []) if agent_id})
+    has_sessions = (
+        select(sa.literal(1))
+        .where(Session.conversation_id == Conversation.conversation_id)
+        .limit(1)
+        .exists()
+    )
+    ranked_query = select(
+        Conversation.conversation_id.label("conversation_id"),
+        sa.func.row_number()
+        .over(
+            partition_by=Conversation.agent_id,
+            order_by=(
+                case((has_sessions, 1), else_=0).desc(),
+                Conversation.last_message_at.desc(),
+                Conversation.updated_at.desc(),
+                Conversation.created_at.desc(),
+                Conversation.conversation_id.asc(),
+            ),
+        )
+        .label("rank"),
+    ).where(
+        Conversation.user_email == user_email,
+        Conversation.status == "active",
+        Conversation.context_type == "web",
+        sa.or_(
+            Conversation.context_data["kind"].as_string() == "agent_direct",
+            Conversation.context_ref
+            == sa.literal(f"web:agent_direct:{user_email}:") + Conversation.agent_id,
+        ),
+    )
+    if ids:
+        ranked_query = ranked_query.where(Conversation.agent_id.in_(ids))
+    ranked = ranked_query.subquery()
+    visible_grant = (
+        select(sa.literal(1))
+        .where(
+            AgentGrantRow.agent_id == Agent.agent_id,
+            AgentGrantRow.grantee_type == "user",
+            AgentGrantRow.grantee_user_email == user_email,
+            AgentGrantRow.revoked_at.is_(None),
+        )
+        .exists()
+    )
+    query = (
+        select(Agent, Conversation)
+        .join(ranked, ranked.c.conversation_id == Conversation.conversation_id)
+        .join(Agent, Agent.agent_id == Conversation.agent_id)
+        .where(
+            ranked.c.rank == 1,
+            Agent.agent_type == "primary",
+            Agent.status == "active",
+            sa.or_(Agent.owner_email == user_email, visible_grant),
+        )
+    )
+    if changed_since is not None:
+        query = query.where(Conversation.updated_at > changed_since)
+    result = await session.execute(query)
+    return [(agent, conversation) for agent, conversation in result.all()]
+
+
+async def sidebar_background_work_changed_since(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    changed_since: datetime,
+) -> bool:
+    """Return whether any source backing background work changed after a cursor."""
+
+    changed = sa.union_all(
+        select(sa.literal(1)).where(
+            ManagedConversationLink.user_email == user_email,
+            ManagedConversationLink.updated_at > changed_since,
+        ),
+        select(sa.literal(1))
+        .select_from(DirectTurnRequestRow)
+        .join(
+            ManagedConversationLink,
+            ManagedConversationLink.target_conversation_id == DirectTurnRequestRow.conversation_id,
+        )
+        .where(
+            ManagedConversationLink.user_email == user_email,
+            DirectTurnRequestRow.updated_at > changed_since,
+        ),
+        select(sa.literal(1)).where(
+            Session.user_email == user_email,
+            Session.parent_session_id.is_not(None),
+            Session.updated_at > changed_since,
+        ),
+        select(sa.literal(1))
+        .select_from(Conversation)
+        .join(
+            ManagedConversationLink,
+            ManagedConversationLink.target_conversation_id == Conversation.conversation_id,
+        )
+        .where(
+            ManagedConversationLink.user_email == user_email,
+            Conversation.updated_at > changed_since,
+        ),
+        select(sa.literal(1))
+        .select_from(ConversationTodo)
+        .join(Conversation, Conversation.conversation_id == ConversationTodo.conversation_id)
+        .where(
+            Conversation.user_email == user_email,
+            ConversationTodo.updated_at > changed_since,
+        ),
+        select(sa.literal(1))
+        .select_from(SessionTodo)
+        .join(Session, Session.session_id == SessionTodo.session_id)
+        .where(
+            Session.user_email == user_email,
+            SessionTodo.updated_at > changed_since,
+        ),
+    ).limit(1)
+    return (await session.execute(changed)).first() is not None
+
+
+async def sidebar_metadata_changed_since(
+    session: AsyncSession,
+    *,
+    user_email: str,
+    changed_since: datetime,
+    status: str,
+) -> bool:
+    """Return whether omitted sidebar agent or context metadata may be stale."""
+
+    active_grant = (
+        select(sa.literal(1))
+        .where(
+            AgentGrantRow.agent_id == Agent.agent_id,
+            AgentGrantRow.grantee_type == "user",
+            AgentGrantRow.grantee_user_email == user_email,
+            AgentGrantRow.revoked_at.is_(None),
+        )
+        .exists()
+    )
+    context_scope = _conversation_scope_filters(
+        user_email,
+        status=status,
+        include_agent_direct=False,
+    )
+    context_visible = _conversation_status_clause(status)
+    changed = sa.union_all(
+        select(sa.literal(1)).where(
+            Agent.updated_at > changed_since,
+            sa.or_(Agent.owner_email == user_email, active_grant),
+        ),
+        select(sa.literal(1)).where(
+            AgentGrantRow.grantee_type == "user",
+            AgentGrantRow.grantee_user_email == user_email,
+            sa.or_(
+                AgentGrantRow.granted_at > changed_since,
+                AgentGrantRow.revoked_at > changed_since,
+            ),
+        ),
+        select(sa.literal(1)).where(
+            SystemAgentOverride.owner_email == user_email,
+            SystemAgentOverride.updated_at > changed_since,
+        ),
+        select(sa.literal(1)).where(
+            UserUiState.user_email == user_email,
+            UserUiState.key == _SIDEBAR_METADATA_REVISION_KEY,
+            UserUiState.updated_at > changed_since,
+        ),
+        select(sa.literal(1)).where(
+            *_conversation_list_filters(
+                user_email,
+                status=status,
+                include_agent_direct=False,
+            ),
+            Conversation.created_at > changed_since,
+        ),
+        select(sa.literal(1)).where(
+            *context_scope,
+            Conversation.updated_at > changed_since,
+            sa.not_(context_visible),
+        ),
+    ).limit(1)
+    return (await session.execute(changed)).first() is not None
 
 
 async def create_managed_conversation_link(
@@ -2703,12 +3097,17 @@ async def take_managed_channel_ownership(
     )
     if link is None or link.kind != "channel":
         return None
-    if binding is None or binding.state not in {"waiting_external", "waiting_controller"}:
+    now = _utcnow()
+    if (
+        binding.state not in {"waiting_external", "waiting_controller"}
+        or binding.active_route_key is None
+        or _as_utc(binding.expires_at) <= now
+    ):
         return None
     if (
         binding.delivery_lease_token
         and binding.delivery_lease_expires_at
-        and _as_utc(binding.delivery_lease_expires_at) > _utcnow()
+        and _as_utc(binding.delivery_lease_expires_at) > now
     ):
         return None
     result = await session.execute(
@@ -2726,14 +3125,39 @@ async def take_managed_channel_ownership(
             controller_conversation_id=controller_conversation_id,
             controller_session_id=controller_session_id,
             owner_epoch=ManagedConversationLink.owner_epoch + 1,
-            updated_at=datetime.now(UTC),
+            updated_at=now,
         )
         .execution_options(synchronize_session=False)
     )
     await session.flush()
-    if result.rowcount != 1:
+    if _rowcount(result) != 1:
         return None
+    from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+    await invalidate_live_work_explicit(
+        session,
+        session_ids={
+            link.controller_session_id,
+            link.target_session_id,
+            controller_session_id,
+        },
+        conversation_ids={
+            link.controller_conversation_id,
+            link.target_conversation_id,
+            controller_conversation_id,
+        },
+    )
     await session.refresh(link)
+    if link.turn_state == "waiting_controller":
+        await session.execute(
+            update(ManagedConversationSignal)
+            .where(
+                ManagedConversationSignal.link_id == link.link_id,
+                ManagedConversationSignal.owner_epoch == expected_owner_epoch,
+                ManagedConversationSignal.state == "waiting_controller",
+            )
+            .values(owner_epoch=link.owner_epoch)
+        )
     pending_notifications = list(
         (
             await session.execute(
@@ -3272,6 +3696,11 @@ async def update_managed_conversation_link(
     """Update managed conversation lifecycle state."""
 
     if preserve_terminal_state:
+        existing_link = (
+            await get_managed_conversation_link(session, link_id, for_update=True)
+            if target_session_id is not None
+            else None
+        )
         now = datetime.now(UTC)
         values: dict[str, Any] = {"updated_at": now}
         if conversation_state is not None:
@@ -3310,8 +3739,25 @@ async def update_managed_conversation_link(
             statement.values(**values).execution_options(synchronize_session=False)
         )
         await session.flush()
-        if not result.rowcount:
+        if not _rowcount(result):
             return None
+        if existing_link is not None:
+            from cognis.store.work_live_invalidation import (
+                invalidate_live_work_explicit,
+            )
+
+            await invalidate_live_work_explicit(
+                session,
+                session_ids={
+                    existing_link.controller_session_id,
+                    existing_link.target_session_id,
+                    cast(str, target_session_id),
+                },
+                conversation_ids={
+                    existing_link.controller_conversation_id,
+                    existing_link.target_conversation_id,
+                },
+            )
         return await get_managed_conversation_link(session, link_id)
 
     row = await get_managed_conversation_link(session, link_id)
@@ -3322,23 +3768,23 @@ async def update_managed_conversation_link(
     if turn_state is not None:
         row.turn_state = turn_state
     if not isinstance(target_session_id, _UnsetValue):
-        row.target_session_id = cast(str | None, target_session_id)
+        row.target_session_id = target_session_id
     if clear_active_turn_id:
         row.active_turn_id = None
     elif not isinstance(active_turn_id, _UnsetValue):
-        row.active_turn_id = cast(str | None, active_turn_id)
+        row.active_turn_id = active_turn_id
     if notify_on_completion is not None:
         row.notify_on_completion = notify_on_completion
     if not isinstance(last_result_summary, _UnsetValue):
-        row.last_result_summary = cast(str | None, last_result_summary)
+        row.last_result_summary = last_result_summary
     if not isinstance(last_result_turn_id, _UnsetValue):
-        row.last_result_turn_id = cast(str | None, last_result_turn_id)
+        row.last_result_turn_id = last_result_turn_id
     if not isinstance(last_error, _UnsetValue):
-        row.last_error = cast(str | None, last_error)
+        row.last_error = last_error
     if not isinstance(control_metadata, _UnsetValue):
-        row.control_metadata = cast(dict[str, Any] | None, control_metadata)
+        row.control_metadata = control_metadata
     if not isinstance(completed_at, _UnsetValue):
-        row.completed_at = cast(datetime | None, completed_at)
+        row.completed_at = completed_at
     if completed:
         row.completed_at = datetime.now(UTC)
     elif clear_completed:
@@ -3375,7 +3821,7 @@ async def arm_managed_conversation_notification_if_active(
         .values(notify_on_completion=True, updated_at=datetime.now(UTC))
     )
     await session.flush()
-    return bool(result.rowcount)
+    return bool(_rowcount(result))
 
 
 async def begin_managed_conversation_join_handoff(
@@ -3573,6 +4019,7 @@ async def settle_managed_conversation_link(
 
     if not expected_active_turn_id:
         return False
+    existing_link = await get_managed_conversation_link(session, link_id, for_update=True)
     now = datetime.now(UTC)
     values: dict[str, Any] = {
         "conversation_state": conversation_state,
@@ -3596,7 +4043,89 @@ async def settle_managed_conversation_link(
         .values(**values)
         .execution_options(synchronize_session=False)
     )
-    return int(getattr(result, "rowcount", 0) or 0) == 1
+    changed = int(getattr(result, "rowcount", 0) or 0) == 1
+    if changed and existing_link is not None:
+        from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+        await invalidate_live_work_explicit(
+            session,
+            session_ids={
+                existing_link.controller_session_id,
+                existing_link.target_session_id,
+                target_session_id,
+            },
+            conversation_ids={
+                existing_link.controller_conversation_id,
+                existing_link.target_conversation_id,
+            },
+        )
+    return changed
+
+
+async def advance_managed_conversation_continuation(
+    session: AsyncSession,
+    target_conversation_id: str,
+    *,
+    predecessor_turn_id: str,
+    successor_turn_id: str,
+    reason: str,
+) -> ManagedConversationLink | None:
+    """Atomically advance one managed logical request to its physical successor."""
+
+    result = await session.execute(
+        select(ManagedConversationLink)
+        .where(ManagedConversationLink.target_conversation_id == target_conversation_id)
+        .with_for_update()
+    )
+    link = result.scalar_one_or_none()
+    if link is None:
+        return None
+    if link.active_turn_id == successor_turn_id:
+        return link
+    if (
+        link.conversation_state != "open"
+        or link.turn_state not in {"queued", "running"}
+        or link.active_turn_id != predecessor_turn_id
+        or (
+            link.handoff_target_turn_id is not None
+            and link.handoff_target_turn_id != predecessor_turn_id
+        )
+    ):
+        return None
+
+    control_metadata = (
+        dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
+    )
+    logical_turn_id = str(control_metadata.get("logical_turn_id") or predecessor_turn_id)
+    physical_turn_ids = [
+        str(value)
+        for value in control_metadata.get("physical_turn_ids", [])
+        if isinstance(value, str)
+    ]
+    for turn_id in (predecessor_turn_id, successor_turn_id):
+        if turn_id not in physical_turn_ids:
+            physical_turn_ids.append(turn_id)
+    control_metadata.update(
+        {
+            "logical_turn_id": logical_turn_id,
+            "physical_turn_ids": physical_turn_ids,
+            "continuation_predecessor_turn_id": predecessor_turn_id,
+            "continuation_successor_turn_id": successor_turn_id,
+            "continuation_reason": reason,
+        }
+    )
+    link.turn_state = "running"
+    link.active_turn_id = successor_turn_id
+    if link.handoff_target_turn_id == predecessor_turn_id:
+        link.handoff_target_turn_id = successor_turn_id
+    link.last_result_summary = None
+    link.last_result_turn_id = None
+    link.last_error = None
+    link.completed_at = None
+    link.control_metadata = control_metadata
+    link.updated_at = datetime.now(UTC)
+    await session.flush()
+    return link
 
 
 async def admit_managed_conversation_turn(
@@ -3604,6 +4133,7 @@ async def admit_managed_conversation_turn(
     link_id: str,
     *,
     turn_id: str,
+    created: bool = True,
     turn_state: str,
     notify_on_completion: bool,
     control_metadata: dict[str, Any] | None,
@@ -3619,12 +4149,18 @@ async def admit_managed_conversation_turn(
     ID is rejected instead of silently orphaning the earlier turn.
     """
 
+    if not created:
+        link = await get_managed_conversation_link(session, link_id)
+        if link is None or link.active_turn_id != turn_id:
+            return None
+        return link
+
     result = await session.execute(
         update(ManagedConversationLink)
         .where(
             ManagedConversationLink.link_id == link_id,
             sa.or_(
-                ManagedConversationLink.turn_state != "queued",
+                ManagedConversationLink.active_turn_id.is_(None),
                 ManagedConversationLink.active_turn_id == turn_id,
             ),
             sa.or_(
@@ -3658,8 +4194,65 @@ async def admit_managed_conversation_turn(
     )
     if int(getattr(result, "rowcount", 0) or 0) != 1:
         return None
-    session.expire_all()
-    return await get_managed_conversation_link(session, link_id)
+    return (
+        await session.execute(
+            select(ManagedConversationLink)
+            .where(ManagedConversationLink.link_id == link_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
+async def admit_managed_conversation_direct_turn(
+    session: AsyncSession,
+    link_id: str,
+    *,
+    request: DirectTurnRequestRow,
+    created: bool,
+    turn_state: str,
+    notify_on_completion: bool,
+    control_metadata: dict[str, Any] | None,
+    handoff_state: str | None = None,
+    handoff_controller_session_id: str | None = None,
+    handoff_controller_turn_id: str | None = None,
+    handoff_tool_call_id: str | None = None,
+) -> ManagedConversationLink:
+    """Atomically bind one durable direct-turn admission to a managed link."""
+
+    has_competing_request = bool(
+        await session.scalar(
+            select(
+                sa.exists().where(
+                    DirectTurnRequestRow.conversation_id == request.conversation_id,
+                    DirectTurnRequestRow.request_id != request.request_id,
+                    DirectTurnRequestRow.turn_id != request.turn_id,
+                    DirectTurnRequestRow.status.in_(
+                        [status.value for status in NONTERMINAL_STATUSES]
+                    ),
+                )
+            )
+        )
+    )
+    if has_competing_request:
+        raise DirectTurnAdmissionRejected(
+            "managed conversation has another nonterminal direct turn"
+        )
+    admitted = await admit_managed_conversation_turn(
+        session,
+        link_id,
+        turn_id=request.turn_id,
+        created=created,
+        turn_state=turn_state,
+        notify_on_completion=notify_on_completion,
+        control_metadata=control_metadata,
+        handoff_state=handoff_state,
+        handoff_controller_session_id=handoff_controller_session_id,
+        handoff_controller_turn_id=handoff_controller_turn_id,
+        handoff_tool_call_id=handoff_tool_call_id,
+    )
+    if admitted is None:
+        raise DirectTurnAdmissionRejected("managed conversation admission fence changed")
+    return admitted
 
 
 async def mark_managed_conversation_turn_running(
@@ -3671,6 +4264,15 @@ async def mark_managed_conversation_turn_running(
 ) -> bool:
     """Mirror scheduler launch without overwriting a newer queued admission."""
 
+    existing_links = list(
+        (
+            await session.scalars(
+                select(ManagedConversationLink).where(
+                    ManagedConversationLink.target_conversation_id == target_conversation_id
+                )
+            )
+        ).all()
+    )
     result = await session.execute(
         update(ManagedConversationLink)
         .where(
@@ -3699,7 +4301,23 @@ async def mark_managed_conversation_turn_running(
         )
         .execution_options(synchronize_session=False)
     )
-    return int(getattr(result, "rowcount", 0) or 0) == 1
+    changed = int(getattr(result, "rowcount", 0) or 0) == 1
+    if changed:
+        from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+        await invalidate_live_work_explicit(
+            session,
+            session_ids={
+                target_session_id,
+                *(link.controller_session_id for link in existing_links),
+                *(link.target_session_id for link in existing_links),
+            },
+            conversation_ids={
+                target_conversation_id,
+                *(link.controller_conversation_id for link in existing_links),
+            },
+        )
+    return changed
 
 
 async def assign_managed_conversation_recovery_turn_id(
@@ -3906,9 +4524,43 @@ async def update_conversation_active_session(
     conversation = await get_conversation(session, conversation_id)
     if conversation is None:
         return False
-    conversation.active_session_id = active_session_id
-    conversation.updated_at = datetime.now(UTC)
-    await session.flush()
+    previous_active_session_id = conversation.active_session_id
+    await session.execute(
+        update(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .values(
+            active_session_id=active_session_id,
+            updated_at=datetime.now(UTC),
+        )
+        .execution_options(skip_live_work_invalidation=True)
+    )
+    if active_session_id:
+        from cognis.api.chat_v2.work_projection_eager import initialize_session_work_projection
+
+        session_row = await session.get(Session, active_session_id)
+        if session_row is not None:
+            await initialize_session_work_projection(session, session_row)
+    if previous_active_session_id is not None and previous_active_session_id != active_session_id:
+        if active_session_id is None:
+            from cognis.store.work_live_invalidation import (
+                invalidate_live_work_explicit,
+            )
+
+            await invalidate_live_work_explicit(
+                session,
+                session_ids={previous_active_session_id},
+                conversation_ids={conversation_id},
+            )
+        else:
+            from cognis.store.work_live_invalidation import (
+                invalidate_live_work_explicit,
+            )
+
+            await invalidate_live_work_explicit(
+                session,
+                session_ids={previous_active_session_id},
+                conversation_ids={conversation_id},
+            )
     return True
 
 
@@ -3931,8 +4583,24 @@ async def compare_and_set_conversation_active_session(
             active_session_id=active_session_id,
             updated_at=datetime.now(UTC),
         )
+        .execution_options(skip_live_work_invalidation=True)
     )
-    return int(getattr(result, "rowcount", 0) or 0) > 0
+    changed = int(getattr(result, "rowcount", 0) or 0) > 0
+    if changed:
+        from cognis.api.chat_v2.work_projection_eager import initialize_session_work_projection
+        from cognis.store.work_live_invalidation import (
+            invalidate_live_work_explicit,
+        )
+
+        await invalidate_live_work_explicit(
+            session,
+            session_ids={expected_session_id},
+            conversation_ids={conversation_id},
+        )
+        session_row = await session.get(Session, active_session_id)
+        if session_row is not None:
+            await initialize_session_work_projection(session, session_row)
+    return changed
 
 
 async def get_latest_root_session_for_conversation(
@@ -3975,8 +4643,23 @@ async def update_conversation_active_session_if_unset(
             active_session_id=active_session_id,
             updated_at=datetime.now(UTC),
         )
+        .execution_options(skip_live_work_invalidation=True)
     )
-    return bool(result.rowcount)
+    changed = bool(_rowcount(result))
+    if changed:
+        from cognis.api.chat_v2.work_projection_eager import initialize_session_work_projection
+        from cognis.store.work_live_invalidation import (
+            invalidate_live_work_explicit,
+        )
+
+        await invalidate_live_work_explicit(
+            session,
+            conversation_ids={conversation_id},
+        )
+        session_row = await session.get(Session, active_session_id)
+        if session_row is not None:
+            await initialize_session_work_projection(session, session_row)
+    return changed
 
 
 async def set_conversation_active_executor(
@@ -4010,7 +4693,7 @@ async def set_conversation_active_executor(
         update(Conversation).where(Conversation.conversation_id == conversation_id).values(**values)
     )
     await session.flush()
-    return bool(result.rowcount)
+    return bool(_rowcount(result))
 
 
 async def initialize_conversation_active_executor(
@@ -4045,7 +4728,7 @@ async def initialize_conversation_active_executor(
             updated_at=timestamp,
         )
     )
-    return bool(result.rowcount)
+    return bool(_rowcount(result))
 
 
 async def initialize_task_and_conversation_active_executor(
@@ -4102,10 +4785,10 @@ async def initialize_task_and_conversation_active_executor(
             updated_at=timestamp,
         )
     )
-    if conversation_result.rowcount != 1:
+    if _rowcount(conversation_result) != 1:
         raise RuntimeError("Task executor pin projection lost its locked conversation")
     await session.flush()
-    return bool(task_result.rowcount)
+    return bool(_rowcount(task_result))
 
 
 async def switch_task_and_conversation_active_executor(
@@ -4140,7 +4823,7 @@ async def switch_task_and_conversation_active_executor(
             updated_at=timestamp,
         )
     )
-    if not task_result.rowcount:
+    if not _rowcount(task_result):
         return False, 0
     task = await get_task(session, task_id)
     if task is None:
@@ -4159,7 +4842,7 @@ async def switch_task_and_conversation_active_executor(
             updated_at=timestamp,
         )
     )
-    if not conversation_result.rowcount:
+    if not _rowcount(conversation_result):
         return False, generation
     await session.flush()
     return True, generation
@@ -4210,7 +4893,7 @@ async def cas_executor_failover(
                 updated_at=timestamp,
             )
         )
-        if not result.rowcount:
+        if not _rowcount(result):
             return False, expected_generation, None
         generation = expected_generation + 1
     elif conversation_id:
@@ -4231,7 +4914,7 @@ async def cas_executor_failover(
                 updated_at=timestamp,
             )
         )
-        if not result.rowcount:
+        if not _rowcount(result):
             return False, expected_generation, None
         generation = expected_generation + 1
     else:
@@ -4251,7 +4934,7 @@ async def cas_executor_failover(
                 updated_at=timestamp,
             )
         )
-        if projection_result.rowcount != 1:
+        if _rowcount(projection_result) != 1:
             raise RuntimeError("Executor failover projection lost its locked conversation")
     authority_id = task_id if task_id is not None else conversation_id
     transition_id = f"epin_{authority_id}_{generation}"
@@ -4352,7 +5035,7 @@ async def canonicalize_executor_pin_source(
             )
             .values(active_executor_source=source)
         )
-        if not task_result.rowcount:
+        if not _rowcount(task_result):
             return False
         projection = await session.execute(
             update(Conversation)
@@ -4363,7 +5046,7 @@ async def canonicalize_executor_pin_source(
             )
             .values(active_executor_source=source)
         )
-        if projection.rowcount != 1:
+        if _rowcount(projection) != 1:
             raise RuntimeError("Executor provenance projection lost its locked conversation")
         await session.flush()
         return True
@@ -4379,7 +5062,7 @@ async def canonicalize_executor_pin_source(
             .values(active_executor_source=source)
         )
         await session.flush()
-        return bool(result.rowcount)
+        return bool(_rowcount(result))
     return False
 
 
@@ -4390,9 +5073,13 @@ async def mark_executor_unavailable(
     task_id: str | None,
     expected_executor_id: str,
     expected_generation: int,
-    observed_at: datetime,
+    observed_at: datetime | None = None,
 ) -> tuple[bool, datetime | None]:
     """Persist the first unavailable observation without changing the pin."""
+    if observed_at is None:
+        from cognis.store.coordination import database_now
+
+        observed_at = await database_now(session)
     if task_id and conversation_id:
         # All task+conversation pin mutations lock conversation first.  Keep the
         # projection in a savepoint so a stale/missing projection cannot leave
@@ -4419,9 +5106,13 @@ async def mark_executor_unavailable(
                     )
                     .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
                 )
-                if not result.rowcount:
-                    task = await get_task(session, task_id)
-                    return False, getattr(task, "active_executor_unavailable_since", None)
+                if not _rowcount(result):
+                    winning_timestamp = await session.scalar(
+                        select(Task.active_executor_unavailable_since).where(
+                            Task.task_id == task_id
+                        )
+                    )
+                    return False, winning_timestamp
                 projection = await session.execute(
                     update(Conversation)
                     .where(
@@ -4435,13 +5126,18 @@ async def mark_executor_unavailable(
                         updated_at=observed_at,
                     )
                 )
-                if projection.rowcount != 1:
+                if _rowcount(projection) != 1:
                     raise _ProjectionFailed
                 await session.flush()
         except _ProjectionFailed:
-            task = await get_task(session, task_id)
-            return False, getattr(task, "active_executor_unavailable_since", None)
-        return True, observed_at
+            winning_timestamp = await session.scalar(
+                select(Task.active_executor_unavailable_since).where(Task.task_id == task_id)
+            )
+            return False, winning_timestamp
+        winning_timestamp = await session.scalar(
+            select(Task.active_executor_unavailable_since).where(Task.task_id == task_id)
+        )
+        return True, winning_timestamp
     if task_id:
         result = await session.execute(
             update(Task)
@@ -4454,10 +5150,15 @@ async def mark_executor_unavailable(
             .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
         )
         await session.flush()
-        if result.rowcount:
-            return True, observed_at
-        task = await get_task(session, task_id)
-        return False, getattr(task, "active_executor_unavailable_since", None)
+        if _rowcount(result):
+            winning_timestamp = await session.scalar(
+                select(Task.active_executor_unavailable_since).where(Task.task_id == task_id)
+            )
+            return True, winning_timestamp
+        winning_timestamp = await session.scalar(
+            select(Task.active_executor_unavailable_since).where(Task.task_id == task_id)
+        )
+        return False, winning_timestamp
     if conversation_id:
         result = await session.execute(
             update(Conversation)
@@ -4470,10 +5171,19 @@ async def mark_executor_unavailable(
             .values(active_executor_unavailable_since=observed_at, updated_at=observed_at)
         )
         await session.flush()
-        if result.rowcount:
-            return True, observed_at
-        conversation = await get_conversation(session, conversation_id)
-        return False, getattr(conversation, "active_executor_unavailable_since", None)
+        if _rowcount(result):
+            winning_timestamp = await session.scalar(
+                select(Conversation.active_executor_unavailable_since).where(
+                    Conversation.conversation_id == conversation_id
+                )
+            )
+            return True, winning_timestamp
+        winning_timestamp = await session.scalar(
+            select(Conversation.active_executor_unavailable_since).where(
+                Conversation.conversation_id == conversation_id
+            )
+        )
+        return False, winning_timestamp
     return False, None
 
 
@@ -4496,7 +5206,7 @@ async def clear_executor_unavailable(
             )
             .values(active_executor_unavailable_since=None)
         )
-        if result.rowcount and conversation_id:
+        if _rowcount(result) and conversation_id:
             await session.execute(
                 update(Conversation)
                 .where(
@@ -4510,7 +5220,7 @@ async def clear_executor_unavailable(
                 )
             )
         await session.flush()
-        return bool(result.rowcount)
+        return bool(_rowcount(result))
     if conversation_id:
         result = await session.execute(
             update(Conversation)
@@ -4522,7 +5232,7 @@ async def clear_executor_unavailable(
             .values(active_executor_unavailable_since=None)
         )
         await session.flush()
-        return bool(result.rowcount)
+        return bool(_rowcount(result))
     return False
 
 
@@ -4615,7 +5325,7 @@ async def get_child_session_continuation_chain(
     *,
     max_depth: int = 1000,
 ) -> tuple[list[Session], bool]:
-    """Return one child session and its forward rotation successors."""
+    """Return the complete bounded rotation chain for one child session."""
 
     first = await session.get(Session, session_id)
     if first is None or first.parent_session_id is None:
@@ -4626,20 +5336,80 @@ async def get_child_session_continuation_chain(
         first.conversation_id,
         parent_session_id=first.parent_session_id,
     )
-    successor_by_previous = {
-        row.previous_session_id: row for row in rows if row.previous_session_id is not None
+    lane_rows = {
+        row.session_id: row
+        for row in rows
+        if row.user_email == first.user_email
+        and row.activity_scope_id == first.activity_scope_id
+        and row.agent_id == first.agent_id
+        and row.delegation_mode == first.delegation_mode
+        and row.delegation_task == first.delegation_task
     }
-    chain = [first]
+    if max_depth < 1:
+        return [first], True
+
     visited = {first.session_id}
     current = first
-    while len(chain) < max_depth:
-        successor = successor_by_previous.get(current.session_id)
-        if successor is None or successor.session_id in visited:
-            return chain, False
+    predecessors: list[Session] = []
+    invalid_lineage = False
+    while current.previous_session_id is not None:
+        predecessor = lane_rows.get(current.previous_session_id)
+        if predecessor is None:
+            # A predecessor outside this activity scope is an intentional
+            # lineage boundary. Any other missing or incompatible predecessor
+            # would silently omit history, so make the scoped route fail closed.
+            prior = await session.get(Session, current.previous_session_id)
+            is_scope_boundary = prior is not None and (
+                prior.conversation_id == first.conversation_id
+                and prior.parent_session_id == first.parent_session_id
+                and prior.user_email == first.user_email
+                and prior.agent_id == first.agent_id
+                and prior.delegation_mode == first.delegation_mode
+                and prior.delegation_task == first.delegation_task
+                and prior.activity_scope_id != first.activity_scope_id
+            )
+            if not is_scope_boundary:
+                invalid_lineage = True
+            break
+        if predecessor.session_id in visited:
+            invalid_lineage = True
+            break
+        if len(predecessors) + 1 >= max_depth:
+            invalid_lineage = True
+            break
+        predecessors.append(predecessor)
+        visited.add(predecessor.session_id)
+        current = predecessor
+
+    successors_by_previous: dict[str, list[Session]] = {}
+    for row in lane_rows.values():
+        if row.previous_session_id is not None:
+            successors_by_previous.setdefault(row.previous_session_id, []).append(row)
+
+    current = predecessors[-1] if predecessors else first
+    chain = [current]
+    forward_visited = {current.session_id}
+    while True:
+        successors = successors_by_previous.get(current.session_id, [])
+        if not successors:
+            break
+        if len(successors) != 1:
+            invalid_lineage = True
+            break
+        successor = successors[0]
+        if successor.session_id in forward_visited:
+            invalid_lineage = True
+            break
+        if len(chain) >= max_depth:
+            invalid_lineage = True
+            break
         chain.append(successor)
-        visited.add(successor.session_id)
+        forward_visited.add(successor.session_id)
         current = successor
-    return chain, current.session_id in successor_by_previous
+
+    if first.session_id not in forward_visited:
+        invalid_lineage = True
+    return chain, invalid_lineage
 
 
 async def list_active_delegation_sessions(
@@ -4833,6 +5603,11 @@ async def create_session(
     agent_id: str,
     *,
     agent_profile_id: str | None = None,
+    model_override: str | None = None,
+    model_override_provider_id: str | None = None,
+    reasoning_effort_override: str | None = None,
+    fast_mode_override: bool | None = None,
+    runtime_override_revision: int = 0,
     parent_session_id: str | None = None,
     previous_session_id: str | None = None,
     source_session_id: str | None = None,
@@ -4858,6 +5633,11 @@ async def create_session(
         user_email=user_email,
         agent_id=agent_id,
         agent_profile_id=agent_profile_id,
+        model_override=model_override,
+        model_override_provider_id=model_override_provider_id,
+        reasoning_effort_override=reasoning_effort_override,
+        fast_mode_override=fast_mode_override,
+        runtime_override_revision=runtime_override_revision,
         delegation_mode=delegation_mode,
         delegation_task=delegation_task,
         delegation_metadata=delegation_metadata or {},
@@ -4867,6 +5647,12 @@ async def create_session(
     )
     session.add(session_row)
     await session.flush()
+    if session_row.intaris_session_id:
+        from cognis.api.chat_v2.work_projection_eager import (
+            initialize_session_work_projection,
+        )
+
+        await initialize_session_work_projection(session, session_row)
     return session_row
 
 
@@ -4890,6 +5676,15 @@ async def get_session_row(session: AsyncSession, session_id: str) -> Session | N
     """Get a session row by ID."""
 
     result = await session.execute(select(Session).where(Session.session_id == session_id))
+    return result.scalar_one_or_none()
+
+
+async def get_session_for_update(session: AsyncSession, session_id: str) -> Session | None:
+    """Get and lock a session row for a lifecycle transition."""
+
+    result = await session.execute(
+        select(Session).where(Session.session_id == session_id).with_for_update()
+    )
     return result.scalar_one_or_none()
 
 
@@ -5140,9 +5935,9 @@ async def replace_session_todos(
 
     normalized = _normalize_session_todo_items(todos)
     await _lock_todo_replacement(session, "session", session_id)
+    now = datetime.now(UTC)
     await session.execute(delete(SessionTodo).where(SessionTodo.session_id == session_id))
     if normalized:
-        now = datetime.now(UTC)
         session.add_all(
             SessionTodo(
                 session_id=session_id,
@@ -5155,6 +5950,9 @@ async def replace_session_todos(
             )
             for position, item in enumerate(normalized)
         )
+    await session.execute(
+        update(Session).where(Session.session_id == session_id).values(updated_at=now)
+    )
     await session.flush()
     return normalized
 
@@ -5180,11 +5978,11 @@ async def replace_conversation_todos(
         origin_session_id=source_session_id,
     ):
         return normalized
+    now = datetime.now(UTC)
     await session.execute(
         delete(ConversationTodo).where(ConversationTodo.conversation_id == conversation_id)
     )
     if normalized:
-        now = datetime.now(UTC)
         session.add_all(
             ConversationTodo(
                 conversation_id=conversation_id,
@@ -5197,6 +5995,11 @@ async def replace_conversation_todos(
             )
             for position, item in enumerate(normalized)
         )
+    await session.execute(
+        update(Conversation)
+        .where(Conversation.conversation_id == conversation_id)
+        .values(updated_at=now)
+    )
     await session.flush()
     return normalized
 
@@ -5224,6 +6027,9 @@ async def set_session_intaris_session_id(
     session_row.intaris_session_id = intaris_session_id
     session_row.updated_at = datetime.now(UTC)
     await session.flush()
+    from cognis.api.chat_v2.work_projection_eager import initialize_session_work_projection
+
+    await initialize_session_work_projection(session, session_row)
     return True
 
 
@@ -5251,11 +6057,16 @@ async def set_session_status(
     result_summary: str | None = None,
     result_content: str | None = None,
     completion_reason: str | None = None,
+    allowed_from: set[str] | frozenset[str] | None = None,
 ) -> bool:
     """Update session lifecycle state and timestamps."""
 
-    session_row = await get_session_row(session, session_id)
+    session_row = await get_session_for_update(session, session_id)
     if session_row is None:
+        return False
+    if session_row.status in {"completed", "failed", "cancelled", "terminated"}:
+        return False
+    if allowed_from is not None and session_row.status not in allowed_from:
         return False
     session_row.status = status
     session_row.idle_since = idle_since
@@ -5275,11 +6086,25 @@ async def update_session_status(
     session: AsyncSession,
     session_id: str,
     status: str,
-    **kwargs: object,
+    *,
+    idle_since: datetime | None = None,
+    completed_at: datetime | None = None,
+    result_summary: str | None = None,
+    result_content: str | None = None,
+    completion_reason: str | None = None,
 ) -> bool:
     """Backward-compatible alias for updating session lifecycle state."""
 
-    return await set_session_status(session, session_id, status, **kwargs)
+    return await set_session_status(
+        session,
+        session_id,
+        status,
+        idle_since=idle_since,
+        completed_at=completed_at,
+        result_summary=result_summary,
+        result_content=result_content,
+        completion_reason=completion_reason,
+    )
 
 
 async def set_session_idle(
@@ -5292,20 +6117,19 @@ async def set_session_idle(
         session_id,
         "idle",
         idle_since=idle_since or datetime.now(UTC),
+        allowed_from={"active", "idle"},
     )
 
 
 async def set_session_active(session: AsyncSession, session_id: str) -> bool:
     """Mark a session active again after it was idle."""
 
-    session_row = await get_session_row(session, session_id)
-    if session_row is None:
-        return False
-    session_row.status = "active"
-    session_row.idle_since = None
-    session_row.updated_at = datetime.now(UTC)
-    await session.flush()
-    return True
+    return await set_session_status(
+        session,
+        session_id,
+        "active",
+        allowed_from={"active", "idle"},
+    )
 
 
 async def list_child_sessions(session: AsyncSession, parent_session_id: str) -> list[Session]:
@@ -5515,6 +6339,14 @@ async def claim_task_control_conversation(
         )
     )
     await session.flush()
+    if int(getattr(result, "rowcount", 0) or 0) == 1:
+        from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+        await invalidate_live_work_explicit(
+            session,
+            conversation_ids={conversation_id},
+            task_ids={task_id},
+        )
     return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
@@ -5538,6 +6370,14 @@ async def clear_task_control_conversation_claim(
         )
     )
     await session.flush()
+    if int(getattr(result, "rowcount", 0) or 0) == 1:
+        from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+        await invalidate_live_work_explicit(
+            session,
+            conversation_ids={conversation_id},
+            task_ids={task_id},
+        )
     return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
@@ -5565,6 +6405,14 @@ async def clear_stale_task_control_conversation_claim(
         )
     )
     await session.flush()
+    if int(getattr(result, "rowcount", 0) or 0) == 1:
+        from cognis.store.work_live_invalidation import invalidate_live_work_explicit
+
+        await invalidate_live_work_explicit(
+            session,
+            conversation_ids={conversation_id},
+            task_ids={task_id},
+        )
     return int(getattr(result, "rowcount", 0) or 0) == 1
 
 
@@ -5643,7 +6491,7 @@ async def set_task_active_executor(
         )
     )
     await session.flush()
-    return bool(result.rowcount)
+    return bool(_rowcount(result))
 
 
 async def initialize_task_active_executor(
@@ -5677,7 +6525,7 @@ async def initialize_task_active_executor(
             updated_at=timestamp,
         )
     )
-    return bool(result.rowcount)
+    return bool(_rowcount(result))
 
 
 async def create_task_comment(
@@ -5883,6 +6731,7 @@ async def update_task_status(
     applied_completion_mode: str | None = None,
     applied_completion_reason: str | None = None,
     delivery_mode: str | None = None,
+    expected_attempt: int | None = None,
 ) -> bool:
     """Update task status and optional lifecycle fields.
 
@@ -5916,9 +6765,10 @@ async def update_task_status(
     if delivery_mode is not None:
         values["delivery_mode"] = delivery_mode
 
-    stmt = (
-        update(Task).where(Task.task_id == task_id, Task.status.in_(allowed_from)).values(**values)
-    )
+    predicates = [Task.task_id == task_id, Task.status.in_(allowed_from)]
+    if expected_attempt is not None:
+        predicates.append(Task.attempt_number == expected_attempt)
+    stmt = update(Task).where(*predicates).values(**values)
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0
 
@@ -5945,6 +6795,39 @@ async def defer_running_task(
     stmt = update(Task).where(Task.task_id == task_id, Task.status == "running").values(**values)
     result = await session.execute(stmt)
     return int(getattr(result, "rowcount", 0) or 0) > 0
+
+
+async def pause_running_task_for_infrastructure(
+    session: AsyncSession,
+    task_id: str,
+    *,
+    workflow_state: dict[str, object],
+    result_summary: str,
+) -> bool:
+    """Pause one running task and its active step runs in one transaction."""
+    now = datetime.now(UTC)
+    result = await session.execute(
+        update(Task)
+        .where(Task.task_id == task_id, Task.status == "running")
+        .values(
+            status="paused",
+            workflow_state=workflow_state,
+            result_summary=result_summary,
+            updated_at=now,
+        )
+    )
+    if not getattr(result, "rowcount", 0):
+        return False
+    await session.execute(
+        update(StepRun)
+        .where(
+            StepRun.task_id == task_id,
+            StepRun.status.in_(["pending", "running", "evaluating"]),
+        )
+        .values(status="paused", updated_at=now)
+    )
+    await session.flush()
+    return True
 
 
 async def update_task_workflow_state(
@@ -6667,6 +7550,9 @@ async def create_step_run(
     )
     session.add(row)
     await session.flush()
+    from cognis.api.chat_v2.work_projection_eager import initialize_step_work_projection
+
+    await initialize_step_work_projection(session, row)
     return row
 
 
@@ -6718,6 +7604,14 @@ async def update_step_run(
     valid state transitions.  Invalid transitions are silently rejected
     (returns ``False``).
     """
+    previous = (
+        await session.get(StepRun, step_run_id)
+        if session_id is not _UNSET or conversation_id is not _UNSET
+        else None
+    )
+    previous_session_id = previous.session_id if previous is not None else None
+    previous_conversation_id = previous.conversation_id if previous is not None else None
+    previous_task_id = previous.task_id if previous is not None else None
     values: dict[str, object] = {}
     if status is not None:
         values["status"] = status
@@ -6769,8 +7663,45 @@ async def update_step_run(
     else:
         stmt = update(StepRun).where(StepRun.step_run_id == step_run_id).values(**values)
 
+    if previous is not None:
+        stmt = stmt.execution_options(skip_live_work_invalidation=True)
     result = await session.execute(stmt)
-    return int(getattr(result, "rowcount", 0) or 0) > 0
+    changed = int(getattr(result, "rowcount", 0) or 0) > 0
+    if changed and previous is not None:
+        assigned_session_id = cast(str | None, session_id) if session_id is not _UNSET else None
+        assigned_conversation_id = (
+            cast(str | None, conversation_id) if conversation_id is not _UNSET else None
+        )
+        additive_attachment = (
+            previous_session_id is None
+            and assigned_session_id is not None
+            and previous_conversation_id in {None, assigned_conversation_id}
+        )
+        if additive_attachment:
+            from cognis.store.work_live_invalidation import (
+                invalidate_live_work_explicit,
+            )
+
+            await invalidate_live_work_explicit(
+                session,
+                task_ids={previous_task_id} if previous_task_id else set(),
+                step_run_ids={step_run_id},
+            )
+        else:
+            from cognis.store.work_live_invalidation import (
+                invalidate_live_work_explicit,
+            )
+
+            await invalidate_live_work_explicit(
+                session,
+                session_ids={previous_session_id, assigned_session_id},
+                conversation_ids={
+                    previous_conversation_id,
+                    assigned_conversation_id,
+                },
+                task_ids={previous_task_id} if previous_task_id else set(),
+            )
+    return changed
 
 
 async def list_step_runs_for_task(
@@ -6954,7 +7885,10 @@ async def fail_running_step_runs_for_task(
     """
     stmt = (
         update(StepRun)
-        .where(StepRun.task_id == task_id, StepRun.status.in_(["running", "paused"]))
+        .where(
+            StepRun.task_id == task_id,
+            StepRun.status.in_(["pending", "running", "evaluating", "paused"]),
+        )
         .values(status=final_status, completed_at=completed_at)
     )
     result = await session.execute(stmt)
@@ -7315,6 +8249,8 @@ async def create_schedule(
     enabled: bool = True,
     max_concurrent_runs: int = 1,
     delete_after_run: bool = False,
+    retry_failed_tasks: bool = False,
+    fail_paused_task_on_next_fire: bool = True,
     completion_mode_family: str = "default",
     allow_silent_completion: bool = False,
     interaction_mode_override: str | None = "none",
@@ -7340,6 +8276,8 @@ async def create_schedule(
         enabled=enabled,
         max_concurrent_runs=max_concurrent_runs,
         delete_after_run=delete_after_run,
+        retry_failed_tasks=retry_failed_tasks,
+        fail_paused_task_on_next_fire=fail_paused_task_on_next_fire,
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
         interaction_mode_override=interaction_mode_override,
@@ -7408,10 +8346,14 @@ async def update_schedule(
         "enabled",
         "max_concurrent_runs",
         "delete_after_run",
+        "retry_failed_tasks",
+        "fail_paused_task_on_next_fire",
         "completion_mode_family",
         "allow_silent_completion",
         "interaction_mode_override",
         "next_fire_at",
+        "disabled_reason",
+        "consecutive_errors",
     }
     for key, value in fields.items():
         if key in allowed:
@@ -7451,7 +8393,8 @@ async def update_schedule_fire_state(
     next_fire_at: datetime | None,
     last_run_status: str,
     consecutive_errors: int,
-    disabled_reason: str | None = None,
+    disabled_reason: str | None | _UnsetValue = _UNSET,
+    last_terminal_task_id: str | None | _UnsetValue = _UNSET,
     enabled: bool | None = None,
 ) -> None:
     """Atomically update schedule state after a fire attempt."""
@@ -7462,8 +8405,10 @@ async def update_schedule_fire_state(
         "consecutive_errors": consecutive_errors,
         "updated_at": datetime.now(UTC),
     }
-    if disabled_reason is not None:
+    if disabled_reason is not _UNSET:
         values["disabled_reason"] = disabled_reason
+    if last_terminal_task_id is not _UNSET:
+        values["last_terminal_task_id"] = last_terminal_task_id
     if enabled is not None:
         values["enabled"] = enabled
     await session.execute(
@@ -7808,7 +8753,7 @@ async def set_current_version(session: AsyncSession, skill_id: str, version_id: 
     result = await session.execute(
         update(SkillRow).where(SkillRow.skill_id == skill_id).values(current_version_id=version_id)
     )
-    return result.rowcount > 0
+    return _rowcount(result) > 0
 
 
 async def set_current_version_if_matches(
@@ -7828,7 +8773,7 @@ async def set_current_version_if_matches(
         )
         .values(current_version_id=version_id)
     )
-    return result.rowcount > 0
+    return _rowcount(result) > 0
 
 
 # --- Skill Assets ---
@@ -8241,10 +9186,11 @@ async def upsert_tool_classification(
 
     dialect_name = session.get_bind().dialect.name
     if dialect_name in {"postgresql", "sqlite"}:
-        if dialect_name == "postgresql":
-            from sqlalchemy.dialects.postgresql import insert
-        else:
-            from sqlalchemy.dialects.sqlite import insert
+        stmt: Any = (
+            postgresql_insert(ToolClassificationRow)
+            if dialect_name == "postgresql"
+            else sqlite_insert(ToolClassificationRow)
+        )
 
         now = _utcnow()
         insert_values: dict[str, Any] = {
@@ -8287,8 +9233,7 @@ async def upsert_tool_classification(
             update_values["last_attempt_at"] = last_attempt_at
 
         stmt = (
-            insert(ToolClassificationRow)
-            .values(**insert_values)
+            stmt.values(**insert_values)
             .on_conflict_do_update(
                 index_elements=["scope_key", "tool_id"],
                 set_=update_values,
@@ -8296,19 +9241,19 @@ async def upsert_tool_classification(
             .returning(ToolClassificationRow)
         )
         result = await session.execute(stmt)
-        row = result.scalar_one()
+        row = cast(ToolClassificationRow, result.scalar_one())
         await session.flush()
         return row
 
-    result = await session.execute(
+    select_result = await session.execute(
         select(ToolClassificationRow).where(
             ToolClassificationRow.scope_key == scope_key,
             ToolClassificationRow.tool_id == tool_id,
         )
     )
-    row = result.scalar_one_or_none()
-    if row is None:
-        row = ToolClassificationRow(
+    existing_row = select_result.scalar_one_or_none()
+    if existing_row is None:
+        new_row = ToolClassificationRow(
             classification_id=f"tc_{uuid.uuid4().hex}",
             scope_key=scope_key,
             owner_email=owner_email,
@@ -8326,29 +9271,29 @@ async def upsert_tool_classification(
             last_attempt_at=last_attempt_at,
             last_error=last_error,
         )
-        session.add(row)
+        session.add(new_row)
         await session.flush()
-        return row
+        return new_row
 
-    row.owner_email = owner_email
-    row.source_type = source_type
-    row.fingerprint = fingerprint
-    row.tool_payload = tool_payload
-    row.status = status
-    row.category = category
-    row.capabilities = capabilities
-    row.classification_source = classification_source
-    row.classification_confidence = classification_confidence
+    existing_row.owner_email = owner_email
+    existing_row.source_type = source_type
+    existing_row.fingerprint = fingerprint
+    existing_row.tool_payload = tool_payload
+    existing_row.status = status
+    existing_row.category = category
+    existing_row.capabilities = capabilities
+    existing_row.classification_source = classification_source
+    existing_row.classification_confidence = classification_confidence
     if attempts is not None:
-        row.attempts = attempts
+        existing_row.attempts = attempts
     if next_retry_at is not None or status == "ready":
-        row.next_retry_at = next_retry_at
+        existing_row.next_retry_at = next_retry_at
     if last_attempt_at is not None or status == "pending":
-        row.last_attempt_at = last_attempt_at
-    row.last_error = last_error
-    row.updated_at = _utcnow()
+        existing_row.last_attempt_at = last_attempt_at
+    existing_row.last_error = last_error
+    existing_row.updated_at = _utcnow()
     await session.flush()
-    return row
+    return existing_row
 
 
 async def upsert_tool_classification_override(
@@ -8415,7 +9360,7 @@ async def ensure_default_executor(session: AsyncSession) -> ExecutorRow:
     now = datetime.now(UTC)
     await insert_row_if_absent(
         session,
-        ExecutorRow.__table__,
+        cast(sa.Table, ExecutorRow.__table__),
         {
             "executor_id": "default_inprocess",
             "name": "Local (in-process)",
@@ -9652,7 +10597,7 @@ async def mark_artifacts_attached(
             expires_at=None,
         )
     )
-    return int(result.rowcount or 0)
+    return _rowcount(result)
 
 
 async def list_expired_temporary_artifacts(
@@ -9716,7 +10661,7 @@ async def mark_artifact_deleted(session: AsyncSession, artifact_id: str) -> bool
         .where(ArtifactRecordRow.artifact_id == artifact_id)
         .values(status="deleted", deleted_at=_utcnow(), updated_at=_utcnow())
     )
-    if result.rowcount != 1:
+    if _rowcount(result) != 1:
         return False
     await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     await session.flush()
@@ -9729,7 +10674,7 @@ async def delete_artifact_record(session: AsyncSession, artifact_id: str) -> boo
         .where(ArtifactRecordRow.artifact_id == artifact_id)
         .values(status="deleted", deleted_at=_utcnow(), updated_at=_utcnow())
     )
-    if result.rowcount != 1:
+    if _rowcount(result) != 1:
         return False
     await mark_knowledgebase_artifact_removed(session, artifact_id=artifact_id)
     row = await get_artifact_record(session, artifact_id)
@@ -9787,7 +10732,7 @@ async def _lock_active_knowledgebase(session: AsyncSession, *, knowledgebase_id:
         )
         .values(updated_at=KnowledgebaseRow.updated_at)
     )
-    return result.rowcount == 1
+    return _rowcount(result) == 1
 
 
 async def _advance_attachment_generation(
@@ -9801,7 +10746,7 @@ async def _advance_attachment_generation(
             updated_at=_utcnow(),
         )
     )
-    if result.rowcount != 1:
+    if _rowcount(result) != 1:
         raise RuntimeError("knowledgebase attachment disappeared during generation allocation")
     await session.refresh(attachment)
     return attachment.desired_generation
@@ -10348,7 +11293,7 @@ async def attach_artifact_to_knowledgebase(
         )
         .values(status="attached", expires_at=None, updated_at=_utcnow())
     )
-    if artifact_update.rowcount != 1:
+    if _rowcount(artifact_update) != 1:
         return None
     await session.refresh(artifact)
     source_path = source_path.strip() if source_path and source_path.strip() else None
@@ -11603,11 +12548,11 @@ async def recover_stale_channel_delivery(
             if target_status == "uncertain"
             else "stale_sending_recovered"
         ),
+        "attempt_count": ChannelDeliveryOutboxRow.attempt_count + 1,
         "updated_at": _utcnow(),
     }
     if target_status == "failed":
         values["next_attempt_at"] = now
-        values["attempt_count"] = ChannelDeliveryOutboxRow.attempt_count + 1
 
     result = await session.execute(
         update(ChannelDeliveryOutboxRow)
@@ -11698,6 +12643,7 @@ async def mark_channel_delivery_uncertain(
         )
         .values(
             status="uncertain",
+            attempt_count=ChannelDeliveryOutboxRow.attempt_count + 1,
             lease_token=None,
             lease_expires_at=None,
             last_error=last_error,
@@ -11814,7 +12760,7 @@ async def expire_stale_pairing_requests(
         )
         .values(status="expired")
     )
-    return int(result.rowcount or 0)
+    return _rowcount(result)
 
 
 # --- TTS cache ---

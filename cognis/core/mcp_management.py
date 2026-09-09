@@ -120,8 +120,10 @@ async def handle_mcp_management_action(
     action = str(arguments.get("action") or "")
     if action == "servers_list":
         async with deps.session_factory() as session:
-            rows = await list_mcp_servers(session, owner_email=actor_email, include_shared=False)
-        return {"servers": [_server_payload(row) for row in rows]}
+            server_rows = await list_mcp_servers(
+                session, owner_email=actor_email, include_shared=False
+            )
+        return {"servers": [_server_payload(row) for row in server_rows]}
     if action == "servers_get":
         return {
             "server": _server_payload(
@@ -130,7 +132,9 @@ async def handle_mcp_management_action(
         }
     if action == "executors_list":
         async with deps.session_factory() as session:
-            rows = await list_executors(session, owner_email=actor_email, include_shared=False)
+            executor_rows = await list_executors(
+                session, owner_email=actor_email, include_shared=False
+            )
         return {
             "executors": [
                 {
@@ -140,7 +144,7 @@ async def handle_mcp_management_action(
                     "desired_config_version": row.desired_config_version,
                     "applied_config_version": row.applied_config_version,
                 }
-                for row in rows
+                for row in executor_rows
                 if row.executor_type == "websocket"
             ]
         }
@@ -176,7 +180,10 @@ async def handle_mcp_management_action(
                 args=config.args,
                 env=config.env,
                 headers=config.headers,
-                auth_config=config.auth_config.model_dump(mode="json"),
+                auth_config=effective_mcp_auth_config(
+                    config.auth_config,
+                    config.headers,
+                ).model_dump(mode="json"),
                 timeout_seconds=config.timeout_seconds,
                 description=arguments.get("description"),
                 owner_email=actor_email,
@@ -258,12 +265,14 @@ async def handle_mcp_management_action(
             if result.rowcount != 1:
                 raise MCPManagementError("MCP server changed; inspect it and retry")
             await session.commit()
-            row = await get_mcp_server(
+            updated_row = await get_mcp_server(
                 session, server_id, owner_email=actor_email, include_shared=False
             )
+        if updated_row is None:
+            raise MCPManagementError("MCP server not found after update")
         if deps.reconfigure_server is not None:
             await deps.reconfigure_server(server_id, "mcp_management_update")
-        return {"status": "updated", "server": _server_payload(row)}
+        return {"status": "updated", "server": _server_payload(updated_row)}
     if action == "servers_delete":
         server_id = str(arguments["server_id"])
         await _owned_server(deps, actor_email, server_id)
@@ -356,8 +365,8 @@ async def handle_mcp_management_action(
                 raise MCPManagementError(f"Unknown action: {action}")
             changed = updated != current
             if changed:
-                config = dict(row.config or {})
-                config[MCP_SERVER_IDS_KEY] = updated
+                executor_config: dict[str, Any] = dict(row.config or {})
+                executor_config[MCP_SERVER_IDS_KEY] = updated
                 desired = expected + 1
                 result = await session.execute(
                     update(ExecutorRow)
@@ -366,7 +375,7 @@ async def handle_mcp_management_action(
                         ExecutorRow.owner_email == actor_email,
                         ExecutorRow.desired_config_version == expected,
                     )
-                    .values(config=config, desired_config_version=desired)
+                    .values(config=executor_config, desired_config_version=desired)
                 )
                 if result.rowcount != 1:
                     raise MCPManagementError("Executor configuration changed; inspect it and retry")

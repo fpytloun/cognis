@@ -16,12 +16,14 @@ from jsonschema import Draft7Validator
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import cognis.core.agent_loop as agent_loop_module
+from cognis.channels.managed import ManagedChannelRecoveryResult, OneShotRouteRecoveryResult
 from cognis.core.agent_loop import (
     _DELEGATION_RESULT_MAX_CHARS,
     _MAX_TOOL_CALL_ARGUMENT_CHARS,
     _RECOVERY_NON_RETRYABLE_CATEGORIES,
     CHAT_POLICY,
     CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+    CONTROLLER_TOOL_SURFACE_TASK_CONTROL,
     CONTROLLER_TOOL_SURFACE_WORKFLOW,
     DELEGATION_POLICY,
     DIRECT_CHAT_DELEGATION_POLICY,
@@ -46,7 +48,9 @@ from cognis.core.agent_loop import (
     _build_delegation_message_result,
     _controller_builtin_enabled,
     _cycle_cache_breakpoints,
+    _deferred_integration_hint,
     _delegated_system_builtin_tool_ids,
+    _effective_tool_discovery_mode,
     _emit_token,
     _emit_tool_result_callback,
     _emit_with_optional_trailing_arg,
@@ -54,14 +58,17 @@ from cognis.core.agent_loop import (
     _has_compactable_pre_turn_history,
     _iterate_llm_stream_with_idle_timeout,
     _PreparedRegularToolCall,
+    _project_hidden_history_calls_through_bridge,
     _queue_assistant_deliverable_event,
     _queue_turn_presentation_ref,
     _reattach_anthropic_thinking_blocks,
     _reattach_responses_output_items,
     _record_tool_call_ledger_events,
     _regular_tool_call_event_data,
+    _resolve_call_tool_envelope,
     _responses_output_items_for_persistence,
     _result_sections_from_content,
+    _runtime_tool_presentation,
     _same_cycle_duplicate_tool_call_sources,
     _same_turn_duplicate_tool_call_indexes,
     _should_auto_continue_after_mid_stream_failure,
@@ -70,6 +77,7 @@ from cognis.core.agent_loop import (
     _should_run_pre_turn_auto_compaction,
     _step_complete_metadata,
     _strip_internal_message_fields,
+    _tool_visible_by_default,
     _turn_presentation_notice,
     _validate_step_completion_notification,
     _visible_allowed_tool_names,
@@ -83,6 +91,7 @@ from cognis.core.context_projection import (
     ProjectionTurnState,
 )
 from cognis.core.daily_brief_contract import CURRENT_DAILY_BRIEF_CONTRACT_VERSION
+from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
 from cognis.core.events import EventType
 from cognis.core.followups import LLM_CYCLE_CEILING_CONTINUATION_REASON, ContinuationFollowUp
 from cognis.core.harness_guards import SameTurnToolCallLedger
@@ -97,7 +106,16 @@ from cognis.core.prompts import PromptContext
 from cognis.core.runtime import ResolvedStepRuntime, build_local_executor_environment
 from cognis.core.session_cache import SessionCache
 from cognis.core.session_event_types import INTARIS_APPENDABLE_EVENT_TYPES
-from cognis.core.step_profiles import resolve_step_profile, step_profile_allows_tool
+from cognis.core.step_profiles import (
+    ResolvedStepProfile,
+    resolve_step_profile,
+    step_profile_allows_tool,
+)
+from cognis.core.task_execution import TaskExecutionFence
+from cognis.core.tool_result_settlement import (
+    CanonicalToolRepairUnavailable,
+    canonical_tool_continuation_events,
+)
 from cognis.core.tool_router import ToolRouter
 from cognis.core.turn_scheduler import TurnError, TurnResult
 from cognis.models.agent import AgentDefinition, AgentPermissions, AgentRuntimeProfile
@@ -161,6 +179,90 @@ from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 
+class _SessionStub(SimpleNamespace):
+    """Session test double with the persisted runtime model's defaults."""
+
+    model_override = None
+    model_override_provider_id = None
+    reasoning_effort_override = None
+    fast_mode_override = None
+    runtime_override_revision = 0
+
+
+def test_unreadable_tool_repair_uses_valid_continuation_without_redispatch() -> None:
+    call_event = SessionEvent(
+        type="tool_call",
+        data={
+            "turn_id": "turn-1",
+            "call_id": "call-1",
+            "name": "bash",
+            "arguments": {"command": "git status"},
+            "anthropic_native_envelope": {"id": "call-1"},
+            "responses_output_items": [{"call_id": "call-1"}],
+        },
+    )
+    result_event = SessionEvent(
+        type="tool_result",
+        data={
+            "turn_id": "turn-1",
+            "call_id": "call-1",
+            "name": "bash",
+            "result": "clean",
+            "is_error": False,
+        },
+    )
+    failure = CanonicalToolRepairUnavailable(
+        call_event=call_event,
+        append_result=EventAppendResult(ok=True, count=1, first_seq=501, last_seq=501),
+        result_event=result_event,
+    )
+    boundary = canonical_tool_continuation_events(
+        session_id="session-1",
+        call_event=failure.call_event,
+        result_event=result_event,
+    )
+
+    assert [event.type for event in boundary] == ["tool_call", "tool_result"]
+    assert boundary[0].data["canonical_recovery_boundary"] is True
+    assert boundary[0].data["call_id"] == boundary[1].data["call_id"]
+    assert boundary[0].data["call_id"] != "call-1"
+    assert "anthropic_native_envelope" not in boundary[0].data
+    assert "responses_output_items" not in boundary[0].data
+    assert boundary[1].data["result"] == "clean"
+    assert boundary[1].data["recovered_call_id"] == "call-1"
+
+
+def test_canonical_history_failure_boundary_is_ambiguous() -> None:
+    boundary = canonical_tool_continuation_events(
+        session_id="session-1",
+        call_event=SessionEvent(
+            type="tool_call",
+            data={
+                "turn_id": "turn-1",
+                "call_id": "call-1",
+                "name": "bash",
+                "arguments": {"command": "git status"},
+            },
+        ),
+        result_event=SessionEvent(
+            type="tool_result",
+            data={
+                "turn_id": "turn-1",
+                "call_id": "call-1",
+                "name": "bash",
+                "is_error": True,
+                "result": "Canonical history could not be reconciled.",
+                "recovery": True,
+                "uncertain": True,
+            },
+        ),
+    )
+
+    assert boundary[1].data["is_error"] is True
+    assert boundary[1].data["recovery"] is True
+    assert boundary[1].data["uncertain"] is True
+
+
 @pytest.mark.asyncio
 async def test_intaris_recovery_is_emitted_as_transient_system_notice(
     monkeypatch: pytest.MonkeyPatch,
@@ -187,7 +289,7 @@ async def test_intaris_recovery_is_emitted_as_transient_system_notice(
         SimpleNamespace(
             cancel_event=None,
             conversation=SimpleNamespace(conversation_id="conv-1"),
-            session=SimpleNamespace(session_id="sess-1"),
+            session=_SessionStub(session_id="sess-1"),
             turn_id="turn-1",
         ),
         operation="intaris_append",
@@ -207,6 +309,105 @@ async def test_intaris_recovery_is_emitted_as_transient_system_notice(
         "kind": "intaris_recovery",
         "scope": "transient_retry",
     }
+
+
+@pytest.mark.asyncio
+async def test_managed_turn_recovers_after_replacement_controller_is_ready() -> None:
+    draining = TurnError(
+        code="controller_draining",
+        message="draining",
+        recoverable=True,
+        transient=True,
+        turn_id="turn-1",
+    )
+    scheduler = SimpleNamespace(
+        submit_turn=AsyncMock(side_effect=[draining, None]),
+    )
+    directory = SimpleNamespace(
+        get_ready_replacement=AsyncMock(return_value=SimpleNamespace(incarnation_id="replacement"))
+    )
+    loop = object.__new__(AgentLoop)
+    loop._turn_scheduler = scheduler
+    loop._controller_directory = directory
+    loop._controller_runtime = SimpleNamespace(
+        controller_id="controller-a",
+        incarnation_id="old",
+        owner_id="controller-a:old",
+    )
+
+    error = await loop._submit_managed_turn(
+        "conv-1",
+        "continue",
+        turn_id="turn-1",
+        allow_queue=False,
+    )
+
+    assert error is None
+    assert scheduler.submit_turn.await_count == 2
+    first = scheduler.submit_turn.await_args_list[0]
+    retry = scheduler.submit_turn.await_args_list[1]
+    assert first.args == retry.args == ("conv-1", "continue")
+    assert first.kwargs["turn_id"] == retry.kwargs["turn_id"] == "turn-1"
+    assert "_replacement_admission" not in first.kwargs
+    assert retry.kwargs["_replacement_admission"] is True
+    directory.get_ready_replacement.assert_awaited_once_with("controller-a:old")
+
+
+@pytest.mark.asyncio
+async def test_managed_turn_replacement_timeout_preserves_draining_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draining = TurnError(
+        code="controller_draining",
+        message="draining",
+        recoverable=True,
+        transient=True,
+        turn_id="turn-1",
+    )
+    scheduler = SimpleNamespace(submit_turn=AsyncMock(return_value=draining))
+    directory = SimpleNamespace(get_ready_replacement=AsyncMock())
+    loop = object.__new__(AgentLoop)
+    loop._turn_scheduler = scheduler
+    loop._controller_directory = directory
+    loop._controller_runtime = SimpleNamespace(
+        controller_id="controller-a",
+        incarnation_id="old",
+        owner_id="controller-a:old",
+    )
+    monkeypatch.setattr(agent_loop_module, "_MANAGED_DRAINING_RECOVERY_TIMEOUT_SECONDS", 0.0)
+
+    error = await loop._submit_managed_turn("conv-1", "continue", turn_id="turn-1")
+
+    assert error is draining
+    scheduler.submit_turn.assert_awaited_once()
+    directory.get_ready_replacement.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_managed_turn_does_not_retry_non_draining_error() -> None:
+    busy = TurnError(
+        code="queueing_not_allowed",
+        message="busy",
+        recoverable=True,
+        transient=True,
+        turn_id="turn-1",
+    )
+    scheduler = SimpleNamespace(submit_turn=AsyncMock(return_value=busy))
+    directory = SimpleNamespace(get_ready_replacement=AsyncMock())
+    loop = object.__new__(AgentLoop)
+    loop._turn_scheduler = scheduler
+    loop._controller_directory = directory
+    loop._controller_runtime = SimpleNamespace(
+        controller_id="controller-a",
+        incarnation_id="old",
+        owner_id="controller-a:old",
+    )
+
+    error = await loop._submit_managed_turn("conv-1", "continue", turn_id="turn-1")
+
+    assert error is busy
+    scheduler.submit_turn.assert_awaited_once()
+    directory.get_ready_replacement.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +465,7 @@ def test_same_turn_duplicate_guard_rejects_successful_non_read_only_call() -> No
         get=lambda _name: SimpleNamespace(definition=SimpleNamespace(read_only=False))
     )
 
-    assert _same_turn_duplicate_tool_call_indexes(ledger, calls, registry) == {0}
+    assert _same_turn_duplicate_tool_call_indexes(ledger, calls, registry) == ({0}, set())
 
 
 def test_same_turn_duplicate_guard_allows_read_only_and_distinct_calls() -> None:
@@ -279,14 +480,45 @@ def test_same_turn_duplicate_guard_allows_read_only_and_distinct_calls() -> None
     def _get(name: str) -> SimpleNamespace:
         return SimpleNamespace(definition=SimpleNamespace(read_only=name == "read"))
 
-    assert (
-        _same_turn_duplicate_tool_call_indexes(
-            ledger,
-            calls,
-            SimpleNamespace(get=_get),
-        )
-        == set()
+    assert _same_turn_duplicate_tool_call_indexes(
+        ledger,
+        calls,
+        SimpleNamespace(get=_get),
+    ) == (set(), set())
+
+
+def test_same_turn_duplicate_guard_uses_classified_read_only_tool() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    ledger = SameTurnToolCallLedger()
+    tool_name = "mcp_mfg-portal__windmill_get_script"
+    arguments = {"workspace": "devtest", "path": "f/dataeng/switch_station"}
+    ledger.record(tool_name, arguments)
+    raw_tool = ToolDefinition(
+        name=tool_name,
+        description="Get a Windmill script",
+        parameters={},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="mcp_fddc5ac26b29",
+            server_name="mfg-portal",
+            raw_tool_name="windmill.get_script",
+        ),
+        read_only=False,
     )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=raw_tool))
+    ctx = SimpleNamespace(
+        classified_tool_definitions={
+            stable_tool_id(raw_tool): raw_tool.model_copy(update={"read_only": True})
+        }
+    )
+
+    assert agent_loop._same_turn_duplicate_tool_call_indexes(
+        ctx,
+        ledger,
+        [ToolCall(call_id="call_verify", name=tool_name, arguments=arguments)],
+        registry,
+    ) == (set(), set())
 
 
 def test_same_turn_ledger_uses_authoritative_tool_result_events() -> None:
@@ -336,6 +568,55 @@ def test_same_turn_ledger_uses_authoritative_tool_result_events() -> None:
         ],
     )
     assert ledger.already_executed("bash", {"command": "touch /tmp/x"}) is True
+
+
+def test_same_turn_ledger_uses_classified_read_only_tool() -> None:
+    agent_loop = AgentLoop.__new__(AgentLoop)
+    ledger = SameTurnToolCallLedger()
+    tool_name = "mcp_mfg-portal__windmill_get_script"
+    arguments = {"workspace": "devtest", "path": "f/dataeng/switch_station"}
+    raw_tool = ToolDefinition(
+        name=tool_name,
+        description="Get a Windmill script",
+        parameters={},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="mcp_fddc5ac26b29",
+            server_name="mfg-portal",
+            raw_tool_name="windmill.get_script",
+        ),
+        read_only=False,
+    )
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=raw_tool))
+    ctx = SimpleNamespace(
+        same_turn_tool_call_ledger=ledger,
+        tool_call_ledger_candidates={},
+        tool_registry=registry,
+        classified_tool_definitions={
+            stable_tool_id(raw_tool): raw_tool.model_copy(update={"read_only": True})
+        },
+    )
+
+    agent_loop._record_tool_call_ledger_events(
+        ctx,
+        [
+            SessionEvent(
+                type="tool_call",
+                data={
+                    "call_id": "call_read",
+                    "name": tool_name,
+                    "arguments": arguments,
+                },
+            ),
+            SessionEvent(
+                type="tool_result",
+                data={"call_id": "call_read", "is_error": False},
+            ),
+        ],
+    )
+
+    assert ledger.already_executed(tool_name, arguments) is False
 
 
 def test_same_turn_ledger_uses_full_argument_fingerprint_when_event_is_bounded() -> None:
@@ -397,7 +678,7 @@ def test_validate_tool_call_context_uses_provider_registry_dependencies() -> Non
     loop.artifact_store = artifact_store
     loop._session_factory = session_factory
     ctx = SimpleNamespace(
-        session=SimpleNamespace(user_email="owner@example.org"),
+        session=_SessionStub(user_email="owner@example.org"),
         agent=SimpleNamespace(agent_id="agent-1", permissions=None),
     )
 
@@ -429,7 +710,7 @@ async def test_validate_tool_call_live_path_passes_authoritative_context(
     loop.artifact_store = None
     loop._session_factory = object()
     ctx = SimpleNamespace(
-        session=SimpleNamespace(user_email="owner@example.org"),
+        session=_SessionStub(user_email="owner@example.org"),
         agent=SimpleNamespace(
             agent_id="agent-1",
             permissions=SimpleNamespace(allowed_knowledgebases=["kb-authorized"]),
@@ -507,6 +788,19 @@ def test_write_deliverable_revalidation_preserves_exact_valid_receipt() -> None:
     )
 
 
+def test_prior_rich_validation_does_not_require_validation_for_text_write() -> None:
+    assert (
+        agent_loop_module._write_deliverable_execution_rejection_reason(
+            {"content": "One-call Markdown"},
+            {"prior-rich-payload": "prior-rich-state"},
+            payload_fingerprint="text-payload",
+            current_state_fingerprint="current-state",
+            execution_valid=True,
+        )
+        is None
+    )
+
+
 def test_deterministic_deliverable_failure_state_is_bounded() -> None:
     state = agent_loop_module.DeterministicDeliverableFailureState()
     state.record_rejection("same")
@@ -551,7 +845,7 @@ async def test_cached_rich_deliverable_preserves_quality_metadata_for_step_compl
     agent_loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="pulse", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         deliverable_step_run_id="step-1",
@@ -605,8 +899,8 @@ def test_stream_accumulator_normalizes_cumulative_reasoning_snapshots() -> None:
 @pytest.mark.asyncio
 async def test_llm_stream_idle_timeout_resets_on_meaningful_activity() -> None:
     async def _stream():
-        for part in ("a", "b", "c", "d"):
-            await asyncio.sleep(0.35)
+        for part in ("a", "b"):
+            await asyncio.sleep(0.6)
             yield {"choices": [{"delta": {"content": part}}]}
 
     chunks = [
@@ -614,7 +908,7 @@ async def test_llm_stream_idle_timeout_resets_on_meaningful_activity() -> None:
         async for chunk in _iterate_llm_stream_with_idle_timeout(_stream(), idle_timeout_seconds=1)
     ]
 
-    assert len(chunks) == 4
+    assert len(chunks) == 2
 
 
 @pytest.mark.asyncio
@@ -671,6 +965,32 @@ async def test_llm_stream_idle_timeout_stops_on_cancel_event() -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_stream_cancel_interrupts_blocked_provider_read() -> None:
+    cancel_event = asyncio.Event()
+    provider_read_started = asyncio.Event()
+
+    async def _stream():
+        provider_read_started.set()
+        await asyncio.Event().wait()
+        yield {}  # pragma: no cover
+
+    async def _consume() -> None:
+        async for _chunk in _iterate_llm_stream_with_idle_timeout(
+            _stream(),
+            idle_timeout_seconds=30,
+            cancel_event=cancel_event,
+        ):
+            pass
+
+    consumer = asyncio.create_task(_consume())
+    await provider_read_started.wait()
+    cancel_event.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(consumer, timeout=1)
+
+
+@pytest.mark.asyncio
 async def test_llm_stream_provider_error_preserves_quota_payload() -> None:
     class _UsageLimitReached(Exception):
         status_code = 429
@@ -709,7 +1029,7 @@ def test_exhausted_idle_timeout_can_auto_continue() -> None:
         "Provider disconnected while streaming",
         {"category": "connection"},
     )
-    assert not _should_continue_after_exhausted_mid_stream_failure(
+    assert _should_continue_after_exhausted_mid_stream_failure(
         "429 rate_limit_error",
         {"category": "rate_limit"},
     )
@@ -717,7 +1037,7 @@ def test_exhausted_idle_timeout_can_auto_continue() -> None:
         "HTTP 429 usage_limit_reached",
         {"category": "quota_exhausted"},
     )
-    assert not _should_continue_after_exhausted_mid_stream_failure(
+    assert _should_continue_after_exhausted_mid_stream_failure(
         "TypeError: '<' not supported between instances of 'list' and 'int'",
         {"category": "other"},
     )
@@ -1235,7 +1555,7 @@ async def test_run_step_uses_configured_default_step_timeout(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1275,7 +1595,7 @@ async def test_run_step_prefers_agent_timeout_override(monkeypatch: pytest.Monke
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -1323,7 +1643,7 @@ async def test_run_step_continues_once_after_timeout(monkeypatch: pytest.MonkeyP
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1371,7 +1691,7 @@ async def test_run_step_timeout_error_carries_continuation_metadata(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1411,7 +1731,7 @@ def test_read_only_web_tools_parallelize_under_evaluate_permission() -> None:
     registry = {"web_fetch": SimpleNamespace(definition=tool)}
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -1451,7 +1771,7 @@ def test_classified_dynamic_read_only_tool_parallelizes() -> None:
     registry = {raw_tool.name: SimpleNamespace(definition=raw_tool)}
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1506,7 +1826,7 @@ async def test_classified_registry_overlay_updates_guardrails_tool_context() -> 
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1572,7 +1892,7 @@ def test_classified_registry_overlay_controls_same_executor_retry_safety() -> No
     classified_tool = ToolDefinition.model_validate(classified_payload)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1607,7 +1927,7 @@ def test_safe_executor_mutations_parallelize_under_evaluate_permission() -> None
     registry = {"write": SimpleNamespace(definition=tool)}
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -1659,7 +1979,7 @@ def test_unsafe_executor_mutations_stay_serial() -> None:
     }
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1711,7 +2031,7 @@ def test_artifact_executor_tools_parallelize() -> None:
     }
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -1738,7 +2058,7 @@ def test_artifact_executor_tools_parallelize() -> None:
 def _parallel_group_ctx() -> StepContext:
     return StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2014,13 +2334,13 @@ def test_parallelizability_marks_serial_regular_tool_as_batch_boundary() -> None
         category="web",
         read_only=True,
     )
-    write_tool = ToolDefinition(
-        name="memory_write_note",
-        description="Write a note",
+    memory_tool = ToolDefinition(
+        name="memory_search",
+        description="Search memories",
         parameters={},
-        source=ToolSource(type="executor"),
+        source=ToolSource(type="builtin"),
         category="memory",
-        read_only=False,
+        read_only=True,
     )
 
     class _ToolRouter:
@@ -2029,7 +2349,7 @@ def test_parallelizability_marks_serial_regular_tool_as_batch_boundary() -> None
 
     registry = ToolRegistry()
     registry.register(RegisteredTool(definition=read_tool, handler=None))
-    registry.register(RegisteredTool(definition=write_tool, handler=None))
+    registry.register(RegisteredTool(definition=memory_tool, handler=None))
     agent_loop = AgentLoop.__new__(AgentLoop)
     agent_loop.tool_router = _ToolRouter()
     ctx = _parallel_group_ctx()
@@ -2045,7 +2365,7 @@ def test_parallelizability_marks_serial_regular_tool_as_batch_boundary() -> None
     assert (
         agent_loop._is_parallelizable_regular_tool_call(
             ctx,
-            ToolCall(call_id="call-write", name="memory_write_note", arguments={}),
+            ToolCall(call_id="call-memory", name="memory_search", arguments={}),
             registry,
         )
         is False
@@ -2188,14 +2508,14 @@ async def test_run_step_uses_step_local_pending_events_on_concurrent_failures(
 
     ctx_a = StepContext(
         step_definition=StepDefinition(name="a", type="run"),
-        session=SimpleNamespace(session_id="sess-a", intaris_session_id="sess-a"),
+        session=_SessionStub(session_id="sess-a", intaris_session_id="sess-a"),
         conversation=SimpleNamespace(conversation_id="conv-a"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="A"),
         policy=CHAT_POLICY,
     )
     ctx_b = StepContext(
         step_definition=StepDefinition(name="b", type="run"),
-        session=SimpleNamespace(session_id="sess-b", intaris_session_id="sess-b"),
+        session=_SessionStub(session_id="sess-b", intaris_session_id="sess-b"),
         conversation=SimpleNamespace(conversation_id="conv-b"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="B"),
         policy=CHAT_POLICY,
@@ -2252,7 +2572,7 @@ async def test_record_outgoing_audit_messages_copies_replay_metadata(
 
     ctx = StepContext(
         step_definition=StepDefinition(name="step", type="run"),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2325,7 +2645,7 @@ async def test_emergency_flush_repairs_interrupted_tool_calls(
 
     ctx = StepContext(
         step_definition=StepDefinition(name="step", type="run"),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -2589,7 +2909,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
     monkeypatch.setattr("cognis.store.queries.set_session_status", _fake_set_session_status)
     try:
         output = await agent_loop._run_child_session(
-            child_session=SimpleNamespace(
+            child_session=_SessionStub(
                 session_id="child",
                 user_email="user@example.com",
                 agent_id="agent-a",
@@ -2609,7 +2929,7 @@ async def test_run_child_session_resolves_fresh_runtime() -> None:
         )
         cancel_event.set()
         stale_output = await agent_loop._run_child_session(
-            child_session=SimpleNamespace(
+            child_session=_SessionStub(
                 session_id="child-stale",
                 user_email="user@example.com",
                 agent_id="agent-a",
@@ -2728,7 +3048,7 @@ async def test_run_child_session_continues_after_tool_call_ceiling(
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     output = await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="agent-a",
@@ -2766,7 +3086,7 @@ async def test_run_child_session_continues_after_tool_call_ceiling(
 def test_prepare_child_context_for_llm_cycle_continuation_uses_reason_specific_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="delegate", type="run", prompt=""),
-        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        session=_SessionStub(session_id="child", intaris_session_id="child"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -2865,7 +3185,7 @@ async def test_run_child_session_fails_after_repeated_tool_call_ceilings(
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     output = await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="agent-a",
@@ -2960,7 +3280,7 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="system:code-review",
@@ -3057,7 +3377,7 @@ async def test_run_child_session_ignores_implicit_runtime_workdir() -> None:
             effective_working_directory="/home/user/src/codex/codex-rs/protocol/src",
         ):
             output = await agent_loop._run_child_session(
-                child_session=SimpleNamespace(
+                child_session=_SessionStub(
                     session_id="child",
                     user_email="user@example.com",
                     agent_id="agent-a",
@@ -3144,7 +3464,7 @@ async def test_run_child_session_uses_explicit_runtime_workdir() -> None:
     monkeypatch.setattr("cognis.store.queries.set_session_status", _fake_set_session_status)
     try:
         output = await agent_loop._run_child_session(
-            child_session=SimpleNamespace(
+            child_session=_SessionStub(
                 session_id="child",
                 user_email="user@example.com",
                 agent_id="agent-a",
@@ -3216,7 +3536,7 @@ async def test_run_child_session_async_preserves_explicit_workspace_context(
     execution_fence = SimpleNamespace()
 
     await agent_loop._run_child_session_async(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             parent_session_id="parent",
             user_email="user@example.com",
@@ -3341,7 +3661,7 @@ async def test_run_child_session_returns_selected_assistant_output_without_deliv
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     output = await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="system:explore",
@@ -3407,8 +3727,19 @@ async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch
             failed.append((session_id, result_summary))
 
     class _Guardrails:
-        async def record_events(self, **kwargs: object) -> None:
-            recorded_events.extend(kwargs.get("events", []))
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            events = kwargs.get("events", [])
+            assert isinstance(events, list)
+            recorded_events.extend(events)
+            return EventAppendResult(
+                ok=True,
+                count=len(events),
+                first_seq=1,
+                last_seq=len(events),
+            )
+
+        async def read_events(self, **_: object) -> EventReadResult:
+            return EventReadResult(events=[], last_seq=0, has_more=False)
 
     class _EventBus:
         async def publish(self, event: object) -> None:
@@ -3451,7 +3782,7 @@ async def test_run_child_session_treats_step_output_error_as_failure(monkeypatch
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     output = await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="agent-a",
@@ -3533,8 +3864,16 @@ async def test_run_child_session_prefers_rotated_saved_work_over_partial_error_o
             failed.append(session_id)
 
     class _Guardrails:
-        async def record_events(self, **kwargs: object) -> None:
-            recorded_events.extend(kwargs.get("events", []))
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            events = kwargs.get("events", [])
+            assert isinstance(events, list)
+            recorded_events.extend(events)
+            return EventAppendResult(
+                ok=True,
+                count=len(events),
+                first_seq=1,
+                last_seq=len(events),
+            )
 
         async def read_events(self, *, session_id: str, **_: object) -> SimpleNamespace:
             if session_id == "child-intaris":
@@ -3611,7 +3950,7 @@ async def test_run_child_session_prefers_rotated_saved_work_over_partial_error_o
     )
 
     async def _fake_run_step(ctx: StepContext, **_: object) -> StepOutput:
-        ctx.session = SimpleNamespace(
+        ctx.session = _SessionStub(
             session_id="child-successor",
             intaris_session_id="child-successor-intaris",
         )
@@ -3627,7 +3966,7 @@ async def test_run_child_session_prefers_rotated_saved_work_over_partial_error_o
     monkeypatch.setattr(agent_loop, "run_step", _fake_run_step)
 
     output = await agent_loop._run_child_session(
-        child_session=SimpleNamespace(
+        child_session=_SessionStub(
             session_id="child",
             user_email="user@example.com",
             agent_id="system:explore",
@@ -3812,6 +4151,48 @@ class _TodoCleanupOnlyDirectLLM:
         if False:
             yield {}
         return
+
+
+class _RepeatingTodoReminderLLM:
+    def __init__(self, tool_cycles: int, *, write_cycle: int | None = None) -> None:
+        self.tool_cycles = tool_cycles
+        self.write_cycle = write_cycle
+        self.calls: list[list[dict[str, object]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        call_index = len(self.calls)
+        if call_index <= self.tool_cycles:
+            tool_name = "todo_write" if call_index == self.write_cycle else "todo_list"
+            arguments = json.dumps({"todos": []}) if tool_name == "todo_write" else "{}"
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": f"call_todo_list_{call_index}",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": arguments,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+            return
+        yield {"choices": [{"delta": {"content": "Finished long turn."}}]}
 
 
 class _SilentThenRecoveredDirectLLM:
@@ -5103,8 +5484,14 @@ class _NoopGuardrails:
 class _RecordingGuardrails(_NoopGuardrails):
     def __init__(self) -> None:
         self.recorded_events: list[SessionEvent] = []
+        self.recorded_session_ids: list[str] = []
 
     async def record_events(self, *args: object, **kwargs: object) -> EventAppendResult:
+        session_id = kwargs.get("session_id")
+        if session_id is None and args:
+            session_id = args[0]
+        if isinstance(session_id, str):
+            self.recorded_session_ids.append(session_id)
         events = kwargs.get("events")
         if events is None and len(args) >= 2:
             events = args[1]
@@ -5136,11 +5523,18 @@ class _RecordedEventsGuardrails(_NoopGuardrails):
 class _NoopSessionManager:
     def __init__(self) -> None:
         self.rotations: list[dict[str, object]] = []
+        self.execution_rows: dict[str, SimpleNamespace] = {}
 
     def session_factory(self) -> object:
+        async def scalar(statement: Any) -> SimpleNamespace:
+            session_id = statement.compile().params["session_id_1"]
+            return self.execution_rows.setdefault(
+                session_id, SimpleNamespace(delegation_metadata={})
+            )
+
         class _Dummy:
             async def __aenter__(self) -> SimpleNamespace:
-                return SimpleNamespace()
+                return SimpleNamespace(scalar=scalar, commit=AsyncMock())
 
             async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
                 return False
@@ -5150,7 +5544,7 @@ class _NoopSessionManager:
     async def rotate_session(self, **kwargs: object) -> SimpleNamespace:
         self.rotations.append(dict(kwargs))
         current_session = kwargs.get("current_session")
-        return SimpleNamespace(
+        return _SessionStub(
             session_id="sess-rotated",
             intaris_session_id="sess-rotated",
             conversation_id=getattr(current_session, "conversation_id", "conv-1"),
@@ -5314,6 +5708,7 @@ async def _seed_managed_profile_runtime(session_factory) -> tuple[object, object
             agent_profile_id="developer",
             session_id="target-profile-session",
         )
+        target.active_session_id = target_session.session_id
         await create_managed_conversation_link(
             db_session,
             user_email="user@example.com",
@@ -5435,6 +5830,68 @@ async def test_agent_conversation_set_profile_reuses_link_and_next_send_uses_pro
 
 
 @pytest.mark.asyncio
+async def test_agent_conversation_set_profile_uses_active_session_after_rotation(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-profile-rotated.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller, target = await _seed_managed_profile_runtime(session_factory)
+    async with session_factory() as db_session:
+        previous_session = await queries.get_session_row(db_session, "target-profile-session")
+        assert previous_session is not None
+        previous_session.status = "completed"
+        active_session = await create_session(
+            db_session,
+            target.conversation_id,
+            "user@example.com",
+            "target-agent",
+            agent_profile_id="developer",
+            previous_session_id=previous_session.session_id,
+            session_id="target-profile-session-rotated",
+        )
+        conversation_row = await queries.get_conversation(db_session, target.conversation_id)
+        assert conversation_row is not None
+        conversation_row.active_session_id = active_session.session_id
+        await db_session.commit()
+
+    guardrails = _RecordingGuardrails()
+    agent_loop = _background_work_agent_loop(
+        session_factory,
+        _ProfileScheduler(),
+        guardrails=guardrails,
+    )
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="set-profile-after-rotation",
+            name="agent_conversation_set_profile",
+            arguments={
+                "conversation_id": target.conversation_id,
+                "agent_profile_id": "senior",
+                "reason": "Use the required profile after session rotation.",
+            },
+        ),
+        ctx=_background_work_ctx(controller.conversation_id),
+    )
+
+    assert result.is_error is False
+    assert json.loads(result.output)["changed"] is True
+    async with session_factory() as db_session:
+        previous_session = await queries.get_session_row(db_session, "target-profile-session")
+        active_session = await queries.get_session_row(db_session, "target-profile-session-rotated")
+        conversation_row = await queries.get_conversation(db_session, target.conversation_id)
+    assert previous_session is not None
+    assert active_session is not None
+    assert conversation_row is not None
+    assert previous_session.agent_profile_id == "developer"
+    assert active_session.agent_profile_id == "senior"
+    assert conversation_row.agent_profile_id == "senior"
+    assert guardrails.recorded_session_ids == ["target-profile-session-rotated"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_agent_conversation_set_profile_rejects_unauthorized_link(tmp_path: Path) -> None:
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'managed-profile-unauthorized.db'}"
@@ -5549,7 +6006,7 @@ def _background_work_ctx(
 ) -> StepContext:
     return StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id=session_id,
             intaris_session_id=session_id,
             user_email="user@example.com",
@@ -5577,6 +6034,107 @@ def _background_work_ctx(
         policy=CHAT_POLICY,
         orchestration_mode=OrchestrationMode.FULL,
         turn_id="controller-turn",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_recover_channel_returns_auditable_safe_result() -> None:
+    service = SimpleNamespace(
+        recover_expired_delivery_failure=AsyncMock(
+            return_value=ManagedChannelRecoveryResult(
+                status="released",
+                conversation_id="conv-target",
+                owner_epoch=3,
+                prior_state="delivery_failed",
+                binding_state="expired",
+                expires_at=datetime(2026, 9, 7, tzinfo=UTC),
+                outcome_uncertain=True,
+                route_reserved=False,
+                audit={
+                    "type": "agent",
+                    "action": "release_expired",
+                    "delivery_retried": False,
+                    "held_messages_replayed": False,
+                },
+            )
+        )
+    )
+    agent_loop = _background_work_agent_loop(
+        SimpleNamespace(),
+        _IdleWaitScheduler(),
+    )
+    agent_loop.providers.managed_channel_service = service
+
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="recover-channel",
+            name="agent_conversation_recover_channel",
+            arguments={
+                "conversation_id": "conv-target",
+                "expected_owner_epoch": 3,
+                "reason": "The reconciliation boundary passed.",
+            },
+        ),
+        ctx=_background_work_ctx("conv-controller"),
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["status"] == "released"
+    assert payload["outcome_uncertain"] is True
+    assert payload["delivery_retried"] is False
+    assert payload["held_messages_replayed"] is False
+    assert "reconcile externally" in payload["resend_guidance"].lower()
+    service.recover_expired_delivery_failure.assert_awaited_once_with(
+        target_conversation_id="conv-target",
+        user_email="user@example.com",
+        expected_owner_epoch=3,
+        actor_agent_id="controller-agent",
+        actor_conversation_id="conv-controller",
+        actor_session_id="controller-session",
+        reason="The reconciliation boundary passed.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_recover_channel_routes_one_shot_form() -> None:
+    service = SimpleNamespace(
+        recover_uncertain_one_shot_route=AsyncMock(
+            return_value=OneShotRouteRecoveryResult(
+                status="released",
+                delivery_id="cdel-target",
+                delivery_status="uncertain",
+                outcome_uncertain=True,
+                route_reserved=False,
+                audit={"action": "release_uncertain_one_shot_route"},
+            )
+        )
+    )
+    agent_loop = _background_work_agent_loop(SimpleNamespace(), _IdleWaitScheduler())
+    agent_loop.providers.managed_channel_service = service
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="recover-one-shot",
+            name="agent_conversation_recover_channel",
+            arguments={
+                "delivery_id": "cdel-target",
+                "reason": "The provider outcome was reconciled.",
+            },
+        ),
+        ctx=_background_work_ctx("conv-controller"),
+    )
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["delivery_status"] == "uncertain"
+    assert payload["delivery_retried"] is False
+    assert "idempotency key remains reserved" in payload["resend_guidance"]
+    service.recover_uncertain_one_shot_route.assert_awaited_once_with(
+        delivery_id="cdel-target",
+        user_email="user@example.com",
+        actor_agent_id="controller-agent",
+        actor_conversation_id="conv-controller",
+        actor_session_id="controller-session",
+        reason="The provider outcome was reconciled.",
     )
 
 
@@ -6090,6 +6648,295 @@ async def test_agent_conversation_wait_heals_missed_remote_settlement_signal(
 
 
 @pytest.mark.asyncio
+async def test_agent_conversation_wait_ignores_stale_result_for_running_turn(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-stale.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Remote target",
+            target_conversation_id="conv-stale-result",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-current",
+            last_result_summary="stale result",
+            last_result_turn_id="turn-current",
+            notify_on_completion=False,
+        )
+        await db_session.commit()
+
+    class _RemoteScheduler:
+        def __init__(self) -> None:
+            self.wait_started = asyncio.Event()
+
+        def has_running_turn(self, _conversation_id: str) -> bool:
+            return False
+
+        def turn_scope_change_generation(self, _conversation_id: str) -> int:
+            return 0
+
+        async def wait_for_turn_scope_change(
+            self,
+            _conversation_id: str,
+            *,
+            after_generation: int,
+            timeout_seconds: float,
+        ) -> bool:
+            del after_generation
+            self.wait_started.set()
+            await asyncio.sleep(min(timeout_seconds, 0.01))
+            return False
+
+    scheduler = _RemoteScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    wait_task = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-stale-wait",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-stale-result", "timeout_seconds": 30},
+            ),
+            ctx=_background_work_ctx(controller.conversation_id),
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+    assert not wait_task.done()
+
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="completed",
+            turn_state="completed",
+            active_turn_id=None,
+            last_result_summary="current result",
+            last_result_turn_id="turn-current",
+        )
+        await db_session.commit()
+
+    result = await asyncio.wait_for(wait_task, timeout=1)
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["turn"]["final_content"] == "current result"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_wait_follows_durable_physical_successor(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-wait-next.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        link = await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Remote target",
+            target_conversation_id="conv-remote-next",
+        )
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="open",
+            turn_state="running",
+            active_turn_id="turn-middle",
+            notify_on_completion=False,
+            control_metadata={
+                "logical_turn_id": "turn-root",
+                "physical_turn_ids": ["turn-root", "turn-middle"],
+                "continuation_successor_turn_id": "turn-middle",
+            },
+        )
+        await db_session.commit()
+
+    class _RemoteScheduler:
+        def __init__(self) -> None:
+            self.wait_started = asyncio.Event()
+
+        def has_running_turn(self, _conversation_id: str) -> bool:
+            return False
+
+        def turn_scope_change_generation(self, _conversation_id: str) -> int:
+            return 0
+
+        async def wait_for_turn_scope_change(
+            self,
+            _conversation_id: str,
+            *,
+            after_generation: int,
+            timeout_seconds: float,
+        ) -> bool:
+            del after_generation
+            self.wait_started.set()
+            await asyncio.sleep(min(timeout_seconds, 0.01))
+            return False
+
+    scheduler = _RemoteScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+    wait_task = asyncio.create_task(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-ha-next",
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-remote-next", "timeout_seconds": 30},
+            ),
+            ctx=_background_work_ctx(controller.conversation_id),
+        )
+    )
+    await asyncio.wait_for(scheduler.wait_started.wait(), timeout=1)
+
+    async with session_factory() as db_session:
+        advanced = await queries.advance_managed_conversation_continuation(
+            db_session,
+            "conv-remote-next",
+            predecessor_turn_id="turn-middle",
+            successor_turn_id="turn-successor",
+            reason="llm_cycle_ceiling_reached",
+        )
+        assert advanced is not None
+        await db_session.commit()
+    await asyncio.sleep(0.03)
+    assert not wait_task.done()
+
+    async with session_factory() as db_session:
+        await update_managed_conversation_link(
+            db_session,
+            link.link_id,
+            conversation_state="completed",
+            turn_state="completed",
+            active_turn_id=None,
+            last_result_summary="final successor result",
+            last_result_turn_id="turn-successor",
+        )
+        await db_session.commit()
+
+    result = await asyncio.wait_for(wait_task, timeout=1)
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["waited"] is True
+    assert payload["settled_turn_id"] == "turn-successor"
+    assert payload["observed_physical_turn_id"] == "turn-successor"
+    assert payload["logical_request"]["logical_turn_id"] == "turn-root"
+    assert payload["logical_request"]["continuation_successor_turn_id"] == "turn-successor"
+    assert payload["turn"]["final_content"] == "final successor result"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_agent_conversation_send_wait_uses_durable_remote_settlement_when_observer_is_local(
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'managed-send-wait-ha.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller = await _create_background_work_base(session_factory)
+    async with session_factory() as db_session:
+        await _create_managed_link_for_background_work(
+            db_session,
+            controller.conversation_id,
+            title="Remote target",
+            target_conversation_id="conv-remote",
+        )
+        await db_session.commit()
+
+    class _RemoteCompletionScheduler:
+        def has_active_turn(self, _conversation_id: str) -> bool:
+            return False
+
+        def queued_count(self, _conversation_id: str) -> int:
+            return 0
+
+        def attach_turn_observer(self, *_args: object, **_kwargs: object) -> bool:
+            return False
+
+        def turn_scope_change_generation(self, _conversation_id: str) -> int:
+            return 0
+
+        async def wait_for_turn_scope_change(
+            self,
+            _conversation_id: str,
+            *,
+            after_generation: int,
+            timeout_seconds: float,
+        ) -> bool:
+            del after_generation
+            await asyncio.sleep(min(timeout_seconds, 0.01))
+            return False
+
+        async def submit_turn(
+            self,
+            conversation_id: str,
+            *_args: object,
+            **kwargs: object,
+        ) -> None:
+            turn_id = str(kwargs["turn_id"])
+            await kwargs["admission_observer"](turn_id, False)
+
+            async def _settle_remotely() -> None:
+                await asyncio.sleep(0.02)
+                async with session_factory() as db_session:
+                    link = await get_managed_conversation_link_for_target(
+                        db_session, conversation_id
+                    )
+                    assert link is not None
+                    await update_managed_conversation_link(
+                        db_session,
+                        link.link_id,
+                        conversation_state="completed",
+                        turn_state="completed",
+                        clear_active_turn_id=True,
+                        notify_on_completion=False,
+                        last_result_summary="remote child result",
+                        last_result_turn_id=turn_id,
+                        completed=True,
+                    )
+                    await db_session.commit()
+
+            asyncio.create_task(_settle_remotely())
+            return None
+
+    agent_loop = _background_work_agent_loop(session_factory, _RemoteCompletionScheduler())
+    result = await asyncio.wait_for(
+        agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id="call-ha-send",
+                name="agent_conversation_send",
+                arguments={
+                    "conversation_id": "conv-remote",
+                    "message": "continue",
+                    "wait": True,
+                },
+            ),
+            ctx=_background_work_ctx(
+                controller.conversation_id,
+                context_ref="web:user:user@example.com:default",
+            ),
+        ),
+        timeout=1,
+    )
+
+    payload = json.loads(result.output)
+    assert payload["status"] == "completed"
+    assert payload["waited"] is True
+    assert payload["turn"]["final_content"] == "remote child result"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_agent_conversation_wait_timeout_race_keeps_result_fallback_owned(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6152,6 +6999,8 @@ async def test_agent_conversation_wait_timeout_race_keeps_result_fallback_owned(
     assert payload["waited"] is False
     assert payload["fallback_owned"] is True
     assert payload["wait_yield_reason"] == "timeout"
+    assert payload["continue_controller_turn"] is True
+    assert result.metadata is None
     assert "requested timeout" in payload["message"]
     assert "last_result_summary" not in payload["conversation"]
     assert "last_error" not in payload["conversation"]
@@ -6253,8 +7102,8 @@ async def test_agent_conversation_wait_yields_for_input_and_reattaches_same_pare
     assert first_payload["conversation"]["active_turn_id"] == "turn-child"
     assert ctx.turn_id == original_parent_turn_id == "controller-turn"
     assert scheduler.active_turns["conv-target"] == "turn-child"
-    assert first_result.metadata is not None
-    assert first_result.metadata["async_orchestration_spawned"] is True
+    assert first_result.metadata is None
+    assert first_payload["continue_controller_turn"] is True
 
     async with session_factory() as db_session:
         yielded_link = await queries.get_managed_conversation_link(
@@ -6265,6 +7114,30 @@ async def test_agent_conversation_wait_yields_for_input_and_reattaches_same_pare
     assert yielded_link is not None
     assert yielded_link.handoff_state == "fallback_claimed"
     assert yielded_link.handoff_target_turn_id == "turn-child"
+
+    # Repeated deadlines must not turn a cooperative reattachment into a
+    # background spawn, nor transfer completion content out of the fallback.
+    queued_input.clear()
+    original_wait = scheduler.wait_for_turn
+    scheduler.wait_for_turn = AsyncMock(return_value=None)
+    for call_id in ("call-timeout-first", "call-timeout-repeat"):
+        timeout_result = await agent_loop._handle_managed_conversation_tool(
+            ToolCall(
+                call_id=call_id,
+                name="agent_conversation_wait",
+                arguments={"conversation_id": "conv-target", "timeout_seconds": 1},
+            ),
+            ctx=ctx,
+        )
+        timeout_payload = json.loads(timeout_result.output)
+        assert timeout_payload["wait_yield_reason"] == "timeout"
+        assert timeout_payload["continue_controller_turn"] is True
+        assert timeout_payload["fallback_owned"] is True
+        assert timeout_result.metadata is None
+        assert not agent_loop._async_orchestration_ends_step(
+            ctx, bool((timeout_result.metadata or {}).get("delegation_spawned"))
+        )
+    scheduler.wait_for_turn = original_wait
 
     queued_input.clear()
     scheduler.wait_started.clear()
@@ -6316,6 +7189,8 @@ async def test_agent_conversation_wait_yields_for_input_and_reattaches_same_pare
     second_payload = json.loads(second_result.output)
 
     assert second_payload["status"] == "completed"
+    assert second_result.metadata is None
+    assert second_payload["continue_controller_turn"] is True
     assert second_payload["wait_yielded_for_input"] is False
     assert second_payload["settled_turn_id"] == "turn-child"
     assert "turn" not in second_payload
@@ -6345,6 +7220,7 @@ async def test_agent_conversation_wait_yields_for_input_and_reattaches_same_pare
     )
     interrupted_payload = json.loads(interrupted_result.output)
     assert interrupted_payload["status"] == "interrupted"
+    assert interrupted_result.metadata is None
     assert "turn" not in interrupted_payload
     assert "error" not in interrupted_payload
     await engine.dispose()
@@ -7299,7 +8175,7 @@ async def test_agent_conversation_wait_reports_running_when_link_still_active(
     agent_loop.set_turn_scheduler(scheduler)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="controller-session",
             intaris_session_id="controller-session",
             user_email="user@example.com",
@@ -8389,6 +9265,8 @@ async def test_agent_conversation_retry_replays_recorded_target_user_message(
     assert str(submission.pop("turn_id")).startswith("turn_")
     assert len(submission.pop("turn_observers")) == 1
     assert callable(submission.pop("admission_observer"))
+    assert callable(submission.pop("admission_transaction_participant"))
+    assert submission.pop("allow_queue") is False
     assert submission == {
         "conversation_id": "conv-target",
         "message": "latest continuation from send",
@@ -8436,7 +9314,7 @@ class _NoopSessionCache:
     def get_reasoning_effort_override(self, _: str) -> None:
         return None
 
-    def set_model_override(self, _: str, __: str | None) -> None:
+    def set_model_override(self, _: str, __: str | None, *, provider_id: str | None = None) -> None:
         return None
 
     def set_reasoning_effort_override(self, _: str, __: str | None) -> None:
@@ -8510,7 +9388,7 @@ async def test_handle_delegate_rejects_async_from_managed_agent_conversation() -
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="managed", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -8587,7 +9465,7 @@ async def test_handle_delegate_defaults_to_sync_from_managed_agent_conversation(
     monkeypatch.setattr(agent_loop, "_record_events_strict", _noop_record)
     ctx = StepContext(
         step_definition=StepDefinition(name="managed", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -8669,7 +9547,7 @@ async def test_handle_delegate_creation_failure_preserves_parent_cycle_metadata(
     monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _FakeAgentRegistry)
     ctx = StepContext(
         step_definition=StepDefinition(name="chat", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -8716,7 +9594,7 @@ def test_depth_one_managed_conversation_exposes_joined_conversation_tools() -> N
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="managed", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -8743,11 +9621,43 @@ def test_depth_one_managed_conversation_exposes_joined_conversation_tools() -> N
     assert "compose_and_run_workflow" not in by_name
 
 
+def test_managed_conversation_projects_explicit_task_tools() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="managed", type="run", prompt=""),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
+        conversation=ConversationModel(
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="worker",
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work", "managed_depth": 1},
+            ),
+        ),
+        agent=AgentDefinition(
+            agent_id="worker",
+            owner_email="user@example.com",
+            name="Worker",
+            tools={"builtin_tools": ["get_task", "cancel_task"]},
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+    deferred_names = {tool.name for tool in exposure.deferred_definitions}
+
+    assert "get_task" in deferred_names
+    assert "cancel_task" in deferred_names
+    assert "create_task" not in by_name
+
+
 def test_controller_orchestration_schema_and_validation_share_target_snapshot() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -8816,7 +9726,7 @@ def test_empty_orchestration_catalog_keeps_model_tool_schemas_valid() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -8847,7 +9757,7 @@ def test_depth_two_managed_conversation_hides_conversation_tools() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="managed", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-2", intaris_session_id="sess-2"),
+        session=_SessionStub(session_id="sess-2", intaris_session_id="sess-2"),
         conversation=ConversationModel(
             conversation_id="conv-2",
             user_email="user@example.com",
@@ -8872,7 +9782,7 @@ def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conver
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -8883,8 +9793,9 @@ def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conver
         policy=CHAT_POLICY,
     )
 
-    schemas = loop._build_controller_tool_schemas(ctx)
-    by_name = {schema["function"]["name"]: schema for schema in schemas}
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+    deferred_names = {tool.name for tool in exposure.deferred_definitions}
 
     delegate_schema = by_name["delegate"]["function"]["parameters"]
     assert "wait" not in delegate_schema["properties"]
@@ -8896,14 +9807,149 @@ def test_direct_topic_conversation_hides_async_delegate_but_keeps_managed_conver
         "agent_conversation_fork",
     ):
         assert by_name[tool_name]["function"]["parameters"]["properties"]["wait"]["default"] is True
-    assert "create_task" in by_name
+    assert "agent_conversation_interrupt" in by_name
+    assert "agent_conversation_close" in by_name
+    assert "create_task" not in by_name
+    assert {"create_task", "list_tasks", "get_task", "cancel_task"} <= deferred_names
+    assert not any(name.startswith("agent_conversation_") for name in deferred_names)
+
+
+def test_deferred_task_catalog_preserves_builtin_identity_and_historical_bridge() -> None:
+    from cognis.tools.builtin.tool_search import resolve_inventory_tool, search_inventory
+
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="managed", type="run", prompt=""),
+        session=_SessionStub(session_id="sess-task", intaris_session_id="sess-task"),
+        conversation=ConversationModel(
+            conversation_id="conv-task",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(
+                type="agent_work",
+                platform_data={"kind": "agent_work", "managed_depth": 1},
+            ),
+        ),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            tools={"builtin_tools": ["create_task"]},
+        ),
+        policy=CHAT_POLICY,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    deferred = exposure.deferred_definitions
+    create_task = resolve_inventory_tool(deferred, "builtin:create_task")
+
+    assert create_task is not None
+    assert create_task.source.type == "builtin"
+    assert stable_tool_id(create_task) == "builtin:create_task"
+    assert all(
+        definition.source.type == "builtin"
+        and stable_tool_id(definition) == f"builtin:{definition.name}"
+        for definition in deferred
+    )
+    matches = search_inventory(deferred, "create autonomous task", limit=5)
+    assert matches[0]["tool_id"] == "builtin:create_task"
+
+    envelope_call = ToolCall(
+        call_id="call_outer_create",
+        name="call_tool",
+        arguments={
+            "tool": "builtin:create_task",
+            "arguments": {"title": "Build", "description": "Implement"},
+        },
+    )
+    resolved = _resolve_call_tool_envelope(envelope_call, deferred)
+    assert resolved is not None
+    resolved_target, resolved_arguments = resolved
+    assert envelope_call.call_id == "call_outer_create"
+    assert resolved_target.name == "create_task"
+    assert stable_tool_id(resolved_target) == "builtin:create_task"
+    assert resolved_arguments == {"title": "Build", "description": "Implement"}
+
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_outer_create",
+                    "type": "function",
+                    "function": {
+                        "name": "create_task",
+                        "arguments": '{"title":"Build","description":"Implement"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_outer_create", "content": "created"},
+    ]
+    projected = _project_hidden_history_calls_through_bridge(
+        messages,
+        inventory_tools=deferred,
+        visible_tool_ids=set(),
+    )
+    projected_call = projected[0]["tool_calls"][0]
+    assert projected_call["id"] == "call_outer_create"
+    assert projected_call["function"]["name"] == "call_tool"
+    assert json.loads(projected_call["function"]["arguments"]) == {
+        "tool": "builtin:create_task",
+        "arguments": {"title": "Build", "description": "Implement"},
+    }
+    assert projected[1]["tool_call_id"] == "call_outer_create"
+
+    tc = ToolCall(
+        call_id="call_outer_create",
+        name=create_task.name,
+        arguments={"title": "Build", "description": "Implement"},
+        runtime_metadata={
+            "visible_arguments": {
+                "tool": "builtin:create_task",
+                "arguments": {"title": "Build", "description": "Implement"},
+            }
+        },
+    )
+    events: list[SessionEvent] = []
+    _append_tool_call_event(
+        events,
+        tc,
+        stable_tool_id(create_task),
+        visible_name="call_tool",
+    )
+    assert events[0].data["call_id"] == "call_outer_create"
+    assert events[0].data["tool_id"] == "builtin:create_task"
+    assert events[0].data["name"] == "create_task"
+    assert events[0].data["visible_name"] == "call_tool"
+
+
+def test_call_tool_bridge_runtime_presentation_uses_canonical_identity() -> None:
+    envelope = {
+        "tool": "builtin:get_task",
+        "arguments": {"task_id": "task_sched_123"},
+    }
+    tc = ToolCall(
+        call_id="call_get_task",
+        name="get_task",
+        arguments={"task_id": "task_sched_123"},
+    )
+
+    name, arguments = _runtime_tool_presentation(
+        tc,
+        {"call_get_task": "call_tool"},
+        {"call_get_task": envelope},
+    )
+
+    assert name == "get_task"
+    assert arguments == {"task_id": "task_sched_123"}
 
 
 def test_direct_chat_controller_tools_use_chat_aliases() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt="", allow_questions=True),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -8930,11 +9976,24 @@ def test_direct_chat_controller_tools_use_chat_aliases() -> None:
     assert "attach_artifact" in by_name
     assert "genuine multistep work" in by_name["todo_write"]["function"]["description"]
     assert (
-        "work that can be completed in a single response"
-        in by_name["todo_write"]["function"]["description"]
+        "Keep statuses current as work changes" in by_name["todo_write"]["function"]["description"]
     )
     assert "all work in this chat" not in by_name["todo_write"]["function"]["description"]
     assert by_name["attach_artifact"]["function"]["parameters"]["required"] == ["content_ref"]
+    compact_deliverable = by_name["write_deliverable"]["function"]["parameters"]
+    assert set(compact_deliverable["properties"]) == {
+        "content",
+        "format",
+        "title",
+        "outputs",
+        "action",
+        "payload",
+        "payload_artifact",
+    }
+    authoritative = next(
+        definition for definition in exposure.definitions if definition.name == "write_deliverable"
+    )
+    assert "oneOf" in authoritative.parameters
     assert exposure.alias_map == {
         "request_user_input": "step_request_questions",
         "todo_write": "step_todo_write",
@@ -9014,7 +10073,7 @@ def test_workflow_controller_tools_keep_step_names() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt="", allow_questions=True),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9047,7 +10106,7 @@ def test_direct_chat_delegation_policy_hides_workflow_finalization_tools() -> No
         step_definition=StepDefinition(
             name="delegation", type="run", prompt="", allow_questions=False
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9080,7 +10139,7 @@ def test_finalization_allowed_tools_use_visible_direct_chat_aliases() -> None:
         step_definition=StepDefinition(
             name="delegation", type="run", prompt="", allow_questions=False
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9103,7 +10162,7 @@ def test_finalization_allowed_tools_use_visible_direct_chat_aliases() -> None:
 
 def test_child_background_shell_status_requires_session_match() -> None:
     ctx = SimpleNamespace(
-        session=SimpleNamespace(session_id="sess-child", parent_session_id="sess-parent"),
+        session=_SessionStub(session_id="sess-child", parent_session_id="sess-parent"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=SimpleNamespace(agent_id="agent-1"),
     )
@@ -9136,7 +10195,7 @@ def test_web_main_chat_exposes_async_delegate_and_managed_conversations() -> Non
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="web-main", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9150,8 +10209,9 @@ def test_web_main_chat_exposes_async_delegate_and_managed_conversations() -> Non
         policy=CHAT_POLICY,
     )
 
-    schemas = loop._build_controller_tool_schemas(ctx)
-    by_name = {schema["function"]["name"]: schema for schema in schemas}
+    exposure = loop._build_controller_tool_exposure(ctx)
+    by_name = {schema["function"]["name"]: schema for schema in exposure.schemas}
+    deferred_names = {tool.name for tool in exposure.deferred_definitions}
 
     delegate_schema = by_name["delegate"]["function"]["parameters"]
     assert "wait" in delegate_schema["properties"]
@@ -9160,14 +10220,14 @@ def test_web_main_chat_exposes_async_delegate_and_managed_conversations() -> Non
         "wait"
     ]
     assert managed_wait["default"] is False
-    assert "create_task" in by_name
+    assert "create_task" in deferred_names
 
 
 def test_web_topic_exposes_async_managed_conversations_with_joined_default() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="web-topic", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9193,7 +10253,7 @@ def test_task_surface_hides_async_orchestration_tools() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="task", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9218,7 +10278,7 @@ def test_task_primary_surface_exposes_restricted_joined_orchestration() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="task", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             parent_session_id=None,
@@ -9252,7 +10312,7 @@ def test_task_primary_surface_exposes_restricted_joined_orchestration() -> None:
 def test_async_orchestration_does_not_end_task_primary_step() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="task", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=ConversationModel(
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9531,7 +10591,7 @@ async def test_historic_primary_delegate_is_readable_but_cannot_continue(
     monkeypatch.setattr(loop, "_require_orchestration_target", _reject_primary)
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="parent-session",
             conversation_id="conv-1",
             user_email="user@example.com",
@@ -9592,7 +10652,7 @@ async def test_handle_delegate_rejects_explicit_async_from_direct_topic_conversa
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -9711,15 +10771,18 @@ class _VisibleThenDisconnectLLM:
         "root_thinking_blocks",
     ],
 )
-async def test_executor_visible_chunk_disconnect_is_not_retried(visible_kind: str) -> None:
+async def test_executor_visible_chunk_disconnect_continues_without_same_call_retry(
+    visible_kind: str,
+) -> None:
     fake_llm = _VisibleThenDisconnectLLM(visible_kind)
+    tool_router = SimpleNamespace(execute=AsyncMock())
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
         session_manager=_NoopSessionManager(),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
+        tool_router=tool_router,
         remember_queue=_NoopRememberQueue(),
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
@@ -9729,7 +10792,7 @@ async def test_executor_visible_chunk_disconnect_is_not_retried(visible_kind: st
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="visible-disconnect",
             intaris_session_id="visible-disconnect",
             mnemory_session_id=None,
@@ -9758,7 +10821,8 @@ async def test_executor_visible_chunk_disconnect_is_not_retried(visible_kind: st
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
-    assert fake_llm.calls == 1
+    assert fake_llm.calls == 3
+    tool_router.execute.assert_not_awaited()
 
 
 class _StreamProviderContextOverflowThenTextLLM(_ContextOverflowThenTextLLM):
@@ -9892,7 +10956,7 @@ def test_post_turn_auto_compaction_preserves_conservative_fallback_without_proje
 
 
 def test_pre_turn_compaction_history_gate_skips_empty_history() -> None:
-    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    ctx = SimpleNamespace(session=_SessionStub(session_id="sess-1"))
     events = [
         SimpleNamespace(type="assistant_message"),
     ]
@@ -9905,7 +10969,7 @@ def test_pre_turn_compaction_history_gate_skips_empty_history() -> None:
 
 
 def test_pre_turn_compaction_history_gate_defers_exact_split_to_strategy() -> None:
-    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    ctx = SimpleNamespace(session=_SessionStub(session_id="sess-1"))
     events = [
         SimpleNamespace(type="user_message"),
         *[SimpleNamespace(type="tool_result") for _ in range(250)],
@@ -9919,7 +10983,7 @@ def test_pre_turn_compaction_history_gate_defers_exact_split_to_strategy() -> No
 
 
 def test_pre_turn_compaction_history_gate_preserves_unknown_cache_behavior() -> None:
-    ctx = SimpleNamespace(session=SimpleNamespace(session_id="sess-1"))
+    ctx = SimpleNamespace(session=_SessionStub(session_id="sess-1"))
     cache = SimpleNamespace(
         get_entry=lambda _session_id: None,
         get_events_since_compaction=lambda _session_id, _types=None: [],
@@ -9990,7 +11054,7 @@ async def test_pre_turn_pressure_delegates_history_decision_to_compaction_strate
 
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -10032,7 +11096,7 @@ def test_projection_exact_pressure_forces_critical_reproject_from_skip_path() ->
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=ProjectionPolicy.from_budget(
@@ -10129,7 +11193,7 @@ def test_projection_pressure_uses_projected_candidate_not_raw_transcript() -> No
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10173,7 +11237,7 @@ def test_projection_critical_demotes_after_projected_estimate_under_band() -> No
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10225,7 +11289,7 @@ def test_projection_critical_uses_exact_calibrated_estimate_for_reproject_decisi
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10312,7 +11376,7 @@ def test_projection_oversized_result_under_budget_preserves_normal_mode_evidence
         current_model_info=SimpleNamespace(max_input_tokens=272_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10379,7 +11443,7 @@ def test_projection_skip_reprojects_when_tool_prefix_mutates() -> None:
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10446,7 +11510,7 @@ def test_projection_telemetry_does_not_reintroduce_internal_token_markers() -> N
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10511,7 +11575,7 @@ def test_projection_skip_telemetry_does_not_mutate_cached_projection_messages() 
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(
             turn_id="turn-1",
             policy=policy,
@@ -10561,7 +11625,7 @@ def test_projection_attempt_state_commits_only_selected_mode() -> None:
         current_model_info=SimpleNamespace(max_input_tokens=100_000, max_output_tokens=0),
         agent=SimpleNamespace(llm_config=None),
         turn_id="turn-1",
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         projection_state=ProjectionTurnState(turn_id="turn-1", policy=policy),
     )
 
@@ -10634,7 +11698,7 @@ async def test_idle_timeout_retry_reuses_original_projection() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-idle-projection-retry",
             intaris_session_id="sess-idle-projection-retry",
             mnemory_session_id=None,
@@ -11164,7 +12228,7 @@ async def test_oversized_tool_arguments_return_tool_error_and_continue() -> None
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-oversized-tool-arguments",
             intaris_session_id="sess-oversized-tool-arguments",
             mnemory_session_id=None,
@@ -11218,7 +12282,7 @@ async def test_project_context_is_not_loaded_from_ambient_workdir_only() -> None
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-project",
             conversation_id="conv-project",
             intaris_session_id="sess-project",
@@ -11282,7 +12346,7 @@ async def test_explicit_cross_project_path_still_triggers_project_probe() -> Non
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-cross-project",
             conversation_id="conv-cross-project",
             intaris_session_id="sess-cross-project",
@@ -11356,7 +12420,7 @@ async def test_read_only_tool_continues_after_project_context_load() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-read-only-project",
             conversation_id="conv-read-only-project",
             intaris_session_id="sess-read-only-project",
@@ -11449,7 +12513,7 @@ async def test_mutating_trailing_tool_retries_after_read_only_project_context_lo
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-mixed-project",
             conversation_id="conv-mixed-project",
             intaris_session_id="sess-mixed-project",
@@ -11548,7 +12612,7 @@ async def test_cross_project_mutating_trailing_tool_loads_own_project_context() 
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-cross-mixed-project",
             conversation_id="conv-cross-mixed-project",
             intaris_session_id="sess-cross-mixed-project",
@@ -11630,7 +12694,7 @@ async def test_mutating_tool_retries_with_matching_earlier_project_context() -> 
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-multi-project",
             conversation_id="conv-multi-project",
             intaris_session_id="sess-multi-project",
@@ -11684,7 +12748,7 @@ def test_project_context_fallback_matches_relative_tool_path_to_workdir() -> Non
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-relative", intaris_session_id="sess-relative"),
+        session=_SessionStub(session_id="sess-relative", intaris_session_id="sess-relative"),
         conversation=SimpleNamespace(conversation_id="conv-relative"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -11727,7 +12791,7 @@ async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="task", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-explicit-project",
             conversation_id="conv-explicit-project",
             intaris_session_id="sess-explicit-project",
@@ -11765,7 +12829,7 @@ async def test_explicit_task_workdir_keeps_project_context_autoload() -> None:
 async def test_direct_todo_reprompt_is_system_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -11828,7 +12892,7 @@ async def test_direct_todo_cleanup_only_can_complete_silently() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-todo-cleanup",
             intaris_session_id="sess-todo-cleanup",
             mnemory_session_id=None,
@@ -11867,6 +12931,143 @@ async def test_direct_todo_cleanup_only_can_complete_silently() -> None:
 
 
 @pytest.mark.asyncio
+async def test_todo_freshness_reminder_repeats_every_ten_cycles_without_accumulating() -> None:
+    fake_llm = _RepeatingTodoReminderLLM(tool_cycles=21)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-todo-reminder",
+            intaris_session_id="sess-todo-reminder",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-todo-reminder"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+        user_message="Run a long multistep operation.",
+        user_attachments=[],
+        intention_eligible=False,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Finished long turn."
+    reminder = agent_loop_module._TODO_FRESHNESS_REMINDER
+    reminder_counts = [
+        sum(message.get("content") == reminder for message in call) for call in fake_llm.calls
+    ]
+    assert reminder_counts[10] == 1
+    assert reminder_counts[20] == 1
+    assert reminder_counts[11] == 0
+    assert reminder_counts[21] == 0
+    assert sum(reminder_counts) == 2
+    assert ctx.profile_switch_agentic_step_count == 22
+    assert ctx.profile_switch_todo_last_reminder_cycle == 20
+
+
+@pytest.mark.asyncio
+async def test_todo_write_resets_freshness_reminder_cycle_count() -> None:
+    fake_llm = _RepeatingTodoReminderLLM(tool_cycles=19, write_cycle=10)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-todo-reminder-reset",
+            intaris_session_id="sess-todo-reminder-reset",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-todo-reminder-reset"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+        user_message="Run work and refresh its todo state.",
+        user_attachments=[],
+        intention_eligible=False,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "Finished long turn."
+    reminder = agent_loop_module._TODO_FRESHNESS_REMINDER
+    assert all(message.get("content") != reminder for call in fake_llm.calls for message in call)
+    assert ctx.profile_switch_todo_last_write_cycle == 10
+
+
+@pytest.mark.asyncio
+async def test_todo_freshness_cadence_continues_after_same_turn_reentry() -> None:
+    fake_llm = _RepeatingTodoReminderLLM(tool_cycles=1)
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-todo-reminder-reentry",
+            intaris_session_id="sess-todo-reminder-reentry",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-todo-reminder-reentry"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+        user_message="Continue after compaction.",
+        user_attachments=[],
+        intention_eligible=False,
+        profile_switch_agentic_step_count=9,
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    reminder = agent_loop_module._TODO_FRESHNESS_REMINDER
+    assert all(message.get("content") != reminder for message in fake_llm.calls[0])
+    assert sum(message.get("content") == reminder for message in fake_llm.calls[1]) == 1
+
+
+@pytest.mark.asyncio
 async def test_responses_text_with_tool_call_is_streamed_persisted_and_replayed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11902,7 +13103,7 @@ async def test_responses_text_with_tool_call_is_streamed_persisted_and_replayed(
 
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-responses-tool-text",
             intaris_session_id="sess-responses-tool-text",
             mnemory_session_id=None,
@@ -12004,6 +13205,383 @@ def test_reattach_responses_output_items_matches_content_only_assistant_message(
     restored = _reattach_responses_output_items(projected_messages, source_messages)
 
     assert restored[0]["_responses_output_items"] == source_messages[0]["_responses_output_items"]
+
+
+def test_project_hidden_history_call_through_bridge_preserves_pairing() -> None:
+    hidden = ToolDefinition(
+        name="mcp_googleworkspace__search_gmail_messages",
+        description="Search Gmail",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="googleworkspace",
+            raw_tool_name="search_gmail_messages",
+        ),
+        category="mcp",
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_gmail",
+                    "type": "function",
+                    "function": {
+                        "name": hidden.name,
+                        "arguments": '{"query":"invoice"}',
+                    },
+                }
+            ],
+            "_responses_output_items": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_gmail",
+                    "name": hidden.name,
+                    "arguments": '{"query":"invoice"}',
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_gmail", "content": "found"},
+    ]
+
+    projected = _project_hidden_history_calls_through_bridge(
+        messages,
+        inventory_tools=[hidden],
+        visible_tool_ids=set(),
+    )
+
+    function = projected[0]["tool_calls"][0]["function"]
+    raw_call = projected[0]["_responses_output_items"][0]
+    assert function["name"] == "call_tool"
+    assert raw_call["name"] == "call_tool"
+    assert json.loads(function["arguments"]) == {
+        "tool": "mcp:googleworkspace:search_gmail_messages",
+        "arguments": {"query": "invoice"},
+    }
+    assert raw_call["call_id"] == "call_gmail"
+    assert projected[1]["tool_call_id"] == "call_gmail"
+
+
+def test_project_visible_history_call_remains_direct() -> None:
+    visible = ToolDefinition(
+        name="read",
+        description="Read a file",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(type="executor"),
+        category="filesystem",
+        read_only=True,
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_read",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        }
+    ]
+
+    projected = _project_hidden_history_calls_through_bridge(
+        messages,
+        inventory_tools=[visible],
+        visible_tool_ids={stable_tool_id(visible)},
+    )
+
+    assert projected[0]["tool_calls"][0]["function"]["name"] == "read"
+
+
+def test_native_search_limit_fallback_projects_hidden_history_through_bridge() -> None:
+    from cognis.core.tool_exposure import (
+        LLMApiMode,
+        ToolDiscoveryMode,
+        ToolExposureContract,
+        prepare_tool_exposure,
+    )
+    from cognis.models.config import ModelInfo
+    from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
+
+    hidden = ToolDefinition(
+        name="mcp_googleworkspace__search_gmail_messages",
+        description="Search Gmail",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="googleworkspace",
+            raw_tool_name="search_gmail_messages",
+        ),
+        category="mcp",
+    )
+    exposure = prepare_tool_exposure(
+        inventory_tools=[hidden],
+        controller_tool_schemas=[
+            {
+                "type": "function",
+                "function": {
+                    "name": SEARCH_TOOLS_TOOL.name,
+                    "description": SEARCH_TOOLS_TOOL.description,
+                    "parameters": SEARCH_TOOLS_TOOL.parameters,
+                },
+            }
+        ],
+        model_info=ModelInfo(
+            model_id="claude",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+            supports_pause_turn=True,
+            max_tools=1,
+        ),
+        contract=ToolExposureContract(
+            llm_api=LLMApiMode.CHAT_COMPLETIONS,
+            discovery_mode=ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH,
+            anthropic_schema_compatible=True,
+            anthropic_native_tool_search=True,
+        ),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids=set(),
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_gmail",
+                    "type": "function",
+                    "function": {"name": hidden.name, "arguments": '{"query":"invoice"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_gmail", "content": "found"},
+    ]
+
+    assert _effective_tool_discovery_mode(exposure) == ToolDiscoveryMode.CONTROLLER_SEARCH
+    projected = _project_hidden_history_calls_through_bridge(
+        messages,
+        inventory_tools=[hidden],
+        visible_tool_ids=exposure.visible_tool_ids,
+    )
+    call = projected[0]["tool_calls"][0]
+    assert call["id"] == "call_gmail"
+    assert call["function"]["name"] == "call_tool"
+    assert json.loads(call["function"]["arguments"]) == {
+        "tool": "mcp:googleworkspace:search_gmail_messages",
+        "arguments": {"query": "invoice"},
+    }
+    assert projected[1]["tool_call_id"] == "call_gmail"
+
+
+def test_dynamic_integration_is_deferred_unless_explicit_or_activated() -> None:
+    tool = ToolDefinition(
+        name="mcp_calendar__search",
+        description="Search calendar",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="calendar",
+            server_name="Calendar",
+            raw_tool_name="search",
+        ),
+        category="mcp",
+        read_only=True,
+    )
+    broad = ResolvedStepProfile(profile_id=None, mode=StepProfileMode.SOFT, config=None)
+    explicit = ResolvedStepProfile(
+        profile_id=None,
+        mode=StepProfileMode.SOFT,
+        config=StepProfileConfig(tool_overrides=StepToolOverrides(include=["mcp:calendar:search"])),
+    )
+
+    assert not _tool_visible_by_default(tool, broad, activated_tool_ids=set())
+    assert _tool_visible_by_default(tool, explicit, activated_tool_ids=set())
+    assert _tool_visible_by_default(
+        tool,
+        broad,
+        activated_tool_ids={"mcp:calendar:search"},
+    )
+
+
+def test_deferred_admin_tool_requires_explicit_include() -> None:
+    from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
+    from cognis.tools.builtin.mcp_management import MANAGE_MCP_TOOL
+    from cognis.tools.builtin.tool_search import search_inventory
+
+    broad = ResolvedStepProfile(profile_id=None, mode=StepProfileMode.SOFT, config=None)
+    explicit = ResolvedStepProfile(
+        profile_id=None,
+        mode=StepProfileMode.SOFT,
+        config=StepProfileConfig(
+            tool_overrides=StepToolOverrides(include=["manage_agents", "manage_mcp"])
+        ),
+    )
+
+    assert not _tool_visible_by_default(MANAGE_AGENTS_TOOL, broad, activated_tool_ids=set())
+    assert _tool_visible_by_default(MANAGE_AGENTS_TOOL, explicit, activated_tool_ids=set())
+    assert not _tool_visible_by_default(MANAGE_MCP_TOOL, broad, activated_tool_ids=set())
+    assert _tool_visible_by_default(MANAGE_MCP_TOOL, explicit, activated_tool_ids=set())
+    assert _tool_visible_by_default(
+        MANAGE_MCP_TOOL,
+        broad,
+        activated_tool_ids={stable_tool_id(MANAGE_MCP_TOOL)},
+    )
+    assert search_inventory([MANAGE_MCP_TOOL], "manage MCP servers")[0]["tool_id"] == (
+        stable_tool_id(MANAGE_MCP_TOOL)
+    )
+
+
+def test_low_frequency_builtins_are_deferred_unless_explicit_or_activated() -> None:
+    from cognis.core.tool_deferral import DEFAULT_DEFERRED_BUILTIN_NAMES
+    from cognis.tools.builtin.memory import MEMORY_DELETE_TOOL
+
+    broad = ResolvedStepProfile(profile_id=None, mode=StepProfileMode.SOFT, config=None)
+    explicit = ResolvedStepProfile(
+        profile_id=None,
+        mode=StepProfileMode.SOFT,
+        config=StepProfileConfig(tool_overrides=StepToolOverrides(include=["memory_delete"])),
+    )
+
+    assert MEMORY_DELETE_TOOL.name in DEFAULT_DEFERRED_BUILTIN_NAMES
+    assert not _tool_visible_by_default(MEMORY_DELETE_TOOL, broad, activated_tool_ids=set())
+    assert _tool_visible_by_default(MEMORY_DELETE_TOOL, explicit, activated_tool_ids=set())
+    assert _tool_visible_by_default(
+        MEMORY_DELETE_TOOL,
+        broad,
+        activated_tool_ids={stable_tool_id(MEMORY_DELETE_TOOL)},
+    )
+
+
+def test_memory_delete_remains_searchable_by_delete_and_forget_terms() -> None:
+    from cognis.tools.builtin.memory import MEMORY_DELETE_TOOL
+    from cognis.tools.builtin.tool_search import search_inventory
+
+    for query in ("memory delete", "forget memory"):
+        matches = search_inventory([MEMORY_DELETE_TOOL], query)
+        assert matches
+        assert matches[0]["tool_id"] == "builtin:memory_delete"
+
+
+def test_newly_deferred_builtin_siblings_remain_searchable() -> None:
+    from cognis.tools.builtin.channels import (
+        READ_CHANNEL_MESSAGES_TOOL,
+        SEARCH_CHANNEL_TARGETS_TOOL,
+        SEND_CHANNEL_MESSAGE_TOOL,
+    )
+    from cognis.tools.builtin.memory import MEMORY_FIND_TOOL
+    from cognis.tools.builtin.task_continuation import READ_TASK_DELIVERABLE_TOOL
+    from cognis.tools.builtin.tool_search import search_inventory
+
+    cases = (
+        (MEMORY_FIND_TOOL, "memory find"),
+        (READ_CHANNEL_MESSAGES_TOOL, "read channel messages"),
+        (SEARCH_CHANNEL_TARGETS_TOOL, "search channel targets"),
+        (SEND_CHANNEL_MESSAGE_TOOL, "send channel message"),
+        (READ_TASK_DELIVERABLE_TOOL, "read task deliverable"),
+    )
+
+    for tool, query in cases:
+        matches = search_inventory([tool], query)
+        assert matches
+        assert matches[0]["tool_id"] == stable_tool_id(tool)
+
+
+def test_common_builtin_and_executor_tools_remain_default_visible() -> None:
+    from cognis.tools.builtin.artifact_tools import ARTIFACT_READ_TOOL
+    from cognis.tools.builtin.memory import MEMORY_ADD_TOOL, MEMORY_RECENT_TOOL, MEMORY_SEARCH_TOOL
+    from cognis.tools.builtin.skill_management import SKILL_LOAD_TOOL
+    from cognis.tools.executor.definitions import WEB_FETCH_TOOL, WEB_SEARCH_TOOL
+
+    broad = ResolvedStepProfile(profile_id=None, mode=StepProfileMode.SOFT, config=None)
+
+    for tool in (
+        ARTIFACT_READ_TOOL,
+        MEMORY_ADD_TOOL,
+        MEMORY_RECENT_TOOL,
+        MEMORY_SEARCH_TOOL,
+        SKILL_LOAD_TOOL,
+        WEB_FETCH_TOOL,
+        WEB_SEARCH_TOOL,
+    ):
+        assert _tool_visible_by_default(tool, broad, activated_tool_ids=set())
+
+
+def test_riker_like_static_surface_reduces_schemas_without_losing_managed_controls() -> None:
+    from cognis.api.runtime_support import static_tool_definitions
+    from cognis.core.agent_loop import (
+        _DEFAULT_DEFERRED_ADMIN_TOOL_NAMES,
+        _DEFAULT_DEFERRED_SOURCE_TYPES,
+    )
+    from cognis.core.step_profiles import step_profile_visible_by_default
+    from cognis.core.tool_deferral import DEFAULT_DEFERRED_BUILTIN_NAMES
+    from cognis.models.tool import tool_provider_exposure_schema
+
+    inventory = static_tool_definitions(knowledgebase_enabled=True)
+    broad = ResolvedStepProfile(profile_id=None, mode=StepProfileMode.SOFT, config=None)
+    previous_default_surface = [
+        tool
+        for tool in inventory
+        if tool.source.type not in _DEFAULT_DEFERRED_SOURCE_TYPES
+        and tool.name not in _DEFAULT_DEFERRED_ADMIN_TOOL_NAMES
+        and step_profile_visible_by_default(tool, broad)
+    ]
+    reduced_surface = [
+        tool
+        for tool in inventory
+        if _tool_visible_by_default(tool, broad, activated_tool_ids=set())
+    ]
+    previous_names = {tool.name for tool in previous_default_surface}
+    reduced_names = {tool.name for tool in reduced_surface}
+    deferred_names = previous_names & DEFAULT_DEFERRED_BUILTIN_NAMES
+
+    assert deferred_names == DEFAULT_DEFERRED_BUILTIN_NAMES
+    assert len(previous_default_surface) - len(reduced_surface) == 37
+    assert sum(
+        len(json.dumps(tool_provider_exposure_schema(tool)).encode()) for tool in reduced_surface
+    ) < sum(
+        len(json.dumps(tool_provider_exposure_schema(tool)).encode())
+        for tool in previous_default_surface
+    )
+    assert {
+        "agent_conversation_create",
+        "agent_conversation_send",
+        "agent_conversation_get",
+        "agent_conversation_list",
+        "agent_conversation_wait",
+        "agent_conversation_close",
+        "agent_conversation_recover_channel",
+    } <= reduced_names
+
+
+def test_deferred_integration_hint_is_authorized_sorted_deduplicated_and_bounded() -> None:
+    tools = [
+        ToolDefinition(
+            name=f"mcp_server_{index}__read",
+            description="Read integration",
+            parameters={"type": "object", "properties": {}},
+            source=ToolSource(
+                type="local_mcp",
+                server_id=f"server-{index:02d}",
+                server_name=("Alpha" if index == 0 else f"Server {index:02d}"),
+                raw_tool_name="read",
+            ),
+            category="mcp",
+            read_only=True,
+        )
+        for index in range(25)
+    ]
+    tools.append(tools[0].model_copy(update={"name": "mcp_alpha__other"}))
+    hidden_ids = {stable_tool_id(tool) for tool in tools}
+    hidden_ids.remove(stable_tool_id(tools[5]))
+
+    hint = _deferred_integration_hint(tools, hidden_ids)
+
+    assert hint is not None
+    assert len(hint) <= 1000
+    names = hint.removeprefix("Available deferred integrations: ").removesuffix(".").split(", ")
+    assert names == sorted(set(names), key=str.casefold)
+    assert len(names) == 20
+    assert "Server 05" not in names
 
 
 def test_responses_output_items_for_persistence_filters_and_caps_payload() -> None:
@@ -12202,7 +13780,7 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -12286,16 +13864,19 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
         *,
         reason: str,
         on_token: object | None = None,
+        on_append_result: object | None = None,
     ) -> bool:
         del ctx, reason, on_token
         recorded_batches.append(list(events))
+        if callable(on_append_result):
+            await on_append_result(SimpleNamespace(first_seq=len(recorded_batches)))
         events.clear()
         return True
 
     agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
     ctx = StepContext(
         step_definition=StepDefinition(name="build", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -12353,8 +13934,9 @@ async def test_context_comment_persists_during_retry() -> None:
         *,
         reason: str,
         on_token: object | None = None,
+        on_append_result: object | None = None,
     ) -> bool:
-        del ctx, reason, on_token
+        del ctx, reason, on_token, on_append_result
         recorded.extend(events)
         return True
 
@@ -12364,7 +13946,7 @@ async def test_context_comment_persists_during_retry() -> None:
     agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
     ctx = StepContext(
         step_definition=StepDefinition(name="build", type="run"),
-        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
         conversation=SimpleNamespace(conversation_id="conv"),
         agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -12409,7 +13991,7 @@ async def test_context_comment_is_not_acknowledged_when_persistence_fails() -> N
     agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
     ctx = StepContext(
         step_definition=StepDefinition(name="build", type="run"),
-        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
         conversation=SimpleNamespace(conversation_id="conv"),
         agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -12458,7 +14040,7 @@ async def test_context_comment_event_uses_stable_idempotency_key() -> None:
     agent_loop.session_cache = _Cache()
     ctx = StepContext(
         step_definition=StepDefinition(name="build", type="run"),
-        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
         conversation=SimpleNamespace(conversation_id="conv"),
         agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -12484,12 +14066,91 @@ async def test_context_comment_event_uses_stable_idempotency_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_calls_are_persisted_as_deterministic_singletons() -> None:
+    recorded: list[tuple[str, list[str]]] = []
+
+    class _Guardrails:
+        next_seq = 1
+
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            events = cast(list[SessionEvent], kwargs["events"])
+            first_seq = self.next_seq
+            self.next_seq += len(events)
+            recorded.append((str(kwargs["idempotency_key"]), [event.type for event in events]))
+            return EventAppendResult(
+                ok=True,
+                count=len(events),
+                first_seq=first_seq,
+                last_seq=self.next_seq - 1,
+            )
+
+    class _Cache:
+        appended: list[list[str]]
+
+        def __init__(self) -> None:
+            self.appended = []
+
+        async def append_recorded_events(
+            self,
+            _: object,
+            events: list[SessionEvent],
+            __: EventAppendResult,
+        ) -> None:
+            self.appended.append([event.type for event in events])
+
+    agent_loop = object.__new__(AgentLoop)
+    agent_loop.providers = SimpleNamespace(guardrails=_Guardrails())
+    agent_loop.session_cache = _Cache()
+    ctx = StepContext(
+        step_definition=StepDefinition(name="build", type="run"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        turn_id="turn",
+    )
+    events = [
+        SessionEvent(type="assistant_message", data={"content": "running"}),
+        SessionEvent(
+            type="tool_call",
+            data={"call_id": "call-1", "name": "bash", "arguments": "{}"},
+        ),
+        SessionEvent(
+            type="tool_call",
+            data={"call_id": "call-2", "name": "read", "arguments": "{}"},
+        ),
+    ]
+
+    await agent_loop._record_events_strict(ctx, events, reason="tool_call_boundary")
+
+    assert events == []
+    assert recorded == [
+        (recorded[0][0], ["assistant_message"]),
+        ("intaris:turn:turn:tool-call:call-1", ["tool_call"]),
+        ("intaris:turn:turn:tool-call:call-2", ["tool_call"]),
+    ]
+    assert ctx.canonical_tool_call_snapshots["call-1"]["idempotency_key"] == (
+        "intaris:turn:turn:tool-call:call-1"
+    )
+    assert agent_loop.session_cache.appended == [
+        ["assistant_message"],
+        ["tool_call"],
+        ["tool_call"],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_recovered_context_comment_is_acknowledged_without_prompt_duplication() -> None:
     agent_loop = object.__new__(AgentLoop)
     acknowledged: list[str] = []
+    consumed_once = False
 
     async def _consume(reason: str) -> list[dict[str, object]]:
+        nonlocal consumed_once
         del reason
+        if consumed_once:
+            return []
+        consumed_once = True
         return [
             {
                 "content": (
@@ -12508,7 +14169,7 @@ async def test_recovered_context_comment_is_acknowledged_without_prompt_duplicat
 
     ctx = StepContext(
         step_definition=StepDefinition(name="build", type="run"),
-        session=SimpleNamespace(session_id="sess", intaris_session_id="intaris"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
         conversation=SimpleNamespace(conversation_id="conv"),
         agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
         policy=SECONDARY_POLICY,
@@ -12533,6 +14194,136 @@ async def test_recovered_context_comment_is_acknowledged_without_prompt_duplicat
     assert consumed is True
     assert acknowledged == ["tcmt-recovered"]
     assert sum(durable_content in str(message["content"]) for message in messages) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal_admission", [True, False])
+async def test_boundary_batch_collects_admission_after_initial_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    signal_admission: bool,
+) -> None:
+    agent_loop = object.__new__(AgentLoop)
+    consume_calls = 0
+    wait_calls = 0
+    second_admitted = False
+    second_returned = False
+    appended: list[str] = []
+    phase_advances = 0
+
+    monkeypatch.setattr(agent_loop_module, "_BOUNDARY_BATCH_QUIET_SECONDS", 0.005)
+    monkeypatch.setattr(agent_loop_module, "_BOUNDARY_BATCH_MAX_WAIT_SECONDS", 0.03)
+
+    async def _consume(_reason: str) -> list[dict[str, object]]:
+        nonlocal consume_calls, second_returned
+        consume_calls += 1
+        if consume_calls == 1:
+            return [{"content": "first", "system_initiated": False}]
+        if second_admitted and not second_returned:
+            second_returned = True
+            return [{"content": "second", "system_initiated": False}]
+        return []
+
+    async def _wait(_after_generation: int | None) -> str:
+        nonlocal second_admitted, wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            if signal_admission:
+                second_admitted = True
+                return "queued_user_input"
+            try:
+                await asyncio.sleep(1)
+            finally:
+                second_admitted = True
+        await asyncio.sleep(1)
+        return "queued_user_input"
+
+    async def _append_boundary_batch_item(
+        _ctx: StepContext,
+        *,
+        messages: list[dict[str, object]],
+        pending_audit_messages: list[dict[str, object]],
+        item: dict[str, object],
+        on_token: object | None,
+    ) -> None:
+        del pending_audit_messages, on_token
+        appended.append(str(item["content"]))
+        messages.append({"role": "user", "content": item["content"]})
+
+    def _advance_phase() -> int:
+        nonlocal phase_advances
+        phase_advances += 1
+        return phase_advances
+
+    agent_loop._append_boundary_batch_item = _append_boundary_batch_item  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        consume_boundary_batch=_consume,
+        wait_for_boundary_input=_wait,
+        advance_boundary_phase=_advance_phase,
+    )
+    messages: list[dict[str, object]] = []
+
+    consumed = await agent_loop._consume_boundary_batch_if_available(
+        ctx,
+        messages=messages,
+        pending_audit_messages=[],
+        reason="after_tool_cycle",
+        on_token=None,
+    )
+
+    assert consumed is True
+    assert appended == ["first", "second"]
+    assert [message["content"] for message in messages] == ["first", "second"]
+    assert phase_advances == 1
+
+
+@pytest.mark.asyncio
+async def test_boundary_batch_stops_at_drain_pass_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = object.__new__(AgentLoop)
+    appended: list[int] = []
+
+    monkeypatch.setattr(agent_loop_module, "_BOUNDARY_BATCH_QUIET_SECONDS", 1.0)
+    monkeypatch.setattr(agent_loop_module, "_BOUNDARY_BATCH_MAX_WAIT_SECONDS", 1.0)
+    monkeypatch.setattr(agent_loop_module, "_BOUNDARY_BATCH_MAX_DRAIN_PASSES", 3)
+
+    async def _consume(_reason: str) -> list[dict[str, object]]:
+        return [{"content": len(appended), "system_initiated": False}]
+
+    async def _append_boundary_batch_item(
+        _ctx: StepContext,
+        *,
+        messages: list[dict[str, object]],
+        pending_audit_messages: list[dict[str, object]],
+        item: dict[str, object],
+        on_token: object | None,
+    ) -> None:
+        del messages, pending_audit_messages, on_token
+        appended.append(int(item["content"]))
+
+    agent_loop._append_boundary_batch_item = _append_boundary_batch_item  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run"),
+        session=_SessionStub(session_id="sess", intaris_session_id="intaris"),
+        conversation=SimpleNamespace(conversation_id="conv"),
+        agent=AgentDefinition(agent_id="agent", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        consume_boundary_batch=_consume,
+    )
+
+    assert await agent_loop._consume_boundary_batch_if_available(
+        ctx,
+        messages=[],
+        pending_audit_messages=[],
+        reason="after_tool_cycle",
+        on_token=None,
+    )
+    assert appended == [0, 1, 2]
 
 
 def test_context_comment_id_mention_is_not_treated_as_durable_event() -> None:
@@ -12569,6 +14360,8 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
     fake_llm = _FakeReminderLLM()
     consumed_reasons: list[str] = []
     recorded_batches: list[list[SessionEvent]] = []
+    append_starts: list[tuple[str, str]] = []
+    persisted_requests: list[str] = []
 
     async def _consume_boundary_batch(reason: str) -> list[dict[str, object]]:
         consumed_reasons.append(reason)
@@ -12576,6 +14369,7 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
             return []
         return [
             {
+                "durable_request_id": "dtr-123",
                 "queue_id": "qmsg_123",
                 "client_message_id": "cmsg_abc",
                 "content": "Queued while streaming.",
@@ -12583,7 +14377,17 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
                 "attachments": [],
                 "system_initiated": False,
                 "follow_up": None,
-            }
+            },
+            {
+                "durable_request_id": "dtr-456",
+                "queue_id": "qmsg_456",
+                "client_message_id": "cmsg_def",
+                "content": "Then include the second queued message.",
+                "intention_eligible": True,
+                "attachments": [],
+                "system_initiated": False,
+                "follow_up": None,
+            },
         ]
 
     agent_loop = AgentLoop(
@@ -12599,24 +14403,36 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
         pause_waiter=PauseWaiter(),
     )
 
-    async def _record_events_strict(
+    async def _record_boundary_events(
         ctx: StepContext,
         events: list[SessionEvent],
         *,
         reason: str,
         on_token: object | None = None,
+        on_append_result: object | None = None,
     ) -> bool:
         del ctx, reason, on_token
         recorded_batches.append(list(events))
+        if callable(on_append_result):
+            await on_append_result(SimpleNamespace(first_seq=len(recorded_batches)))
         events.clear()
         return True
 
-    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    agent_loop._record_events_strict = _record_boundary_events  # type: ignore[method-assign]
+
+    async def _on_absorbed_append_start(
+        request_id: str, session_id: str, event_types: list[str]
+    ) -> None:
+        append_starts.append((request_id, session_id, event_types))
+
+    async def _on_absorbed_persisted(request_id: str) -> None:
+        persisted_requests.append(request_id)
+
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
-            intaris_session_id="sess-1",
+            intaris_session_id="sess-compacted",
             user_email="user@example.com",
             agent_id="agent-1",
         ),
@@ -12629,7 +14445,9 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
         attachment_notice=None,
         prior_context=None,
         system_initiated=True,
-        is_retry=False,
+        # Durable first attempts use retry projection after their admitted user
+        # message is already canonical.
+        is_retry=True,
         workflow_state=None,
         step_run_id="sr-1",
         orchestration_mode=OrchestrationMode.NONE,
@@ -12639,6 +14457,8 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
         tool_registry=None,
         executor_connection=None,
         consume_boundary_batch=_consume_boundary_batch,
+        on_absorbed_append_start=_on_absorbed_append_start,
+        on_absorbed_persisted=_on_absorbed_persisted,
     )
 
     await agent_loop.run_step(ctx)
@@ -12654,6 +14474,374 @@ async def test_boundary_absorbed_user_message_persists_client_identity() -> None
     assert absorbed[0].data["queue_id"] == "qmsg_123"
     assert absorbed[0].data["message_id"] == "cmsg_abc"
     assert absorbed[0].data["intention_eligible"] is False
+    second_absorbed = [
+        event
+        for event in recorded_events
+        if event.type == "user_message"
+        and event.data.get("content") == "Then include the second queued message."
+    ]
+    assert len(second_absorbed) == 1
+    assert second_absorbed[0].data["client_message_id"] == "cmsg_def"
+    assert second_absorbed[0].data["queue_id"] == "qmsg_456"
+    assert second_absorbed[0].data["message_id"] == "cmsg_def"
+    assert recorded_events.index(absorbed[0]) < recorded_events.index(second_absorbed[0])
+    assert append_starts == [
+        ("dtr-123", "sess-compacted", ["user_message"]),
+        ("dtr-456", "sess-compacted", ["user_message"]),
+    ]
+    assert persisted_requests == ["dtr-123", "dtr-456"]
+
+
+@pytest.mark.asyncio
+async def test_boundary_absorbed_user_message_failure_does_not_mark_absorbed() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FakeReminderLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    append_starts: list[tuple[str, str]] = []
+    persisted_requests: list[str] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+        on_append_result: object | None = None,
+    ) -> bool:
+        del ctx, events, reason, on_token, on_append_result
+        raise RuntimeError("Intaris append failed")
+
+    async def _on_absorbed_append_start(
+        request_id: str, session_id: str, event_types: list[str]
+    ) -> None:
+        append_starts.append((request_id, session_id, event_types))
+
+    async def _on_absorbed_persisted(request_id: str) -> None:
+        persisted_requests.append(request_id)
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-old",
+            intaris_session_id="sess-compacted",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        is_retry=True,
+        turn_id="turn-1",
+        on_absorbed_append_start=_on_absorbed_append_start,
+        on_absorbed_persisted=_on_absorbed_persisted,
+    )
+
+    with pytest.raises(RuntimeError, match="Intaris append failed"):
+        await agent_loop._append_boundary_batch_item(
+            ctx,
+            messages=[],
+            pending_audit_messages=[],
+            item={
+                "durable_request_id": "dtr-failed",
+                "queue_id": "queue-failed",
+                "client_message_id": "client-failed",
+                "content": "Persist me.",
+                "attachments": [],
+                "system_initiated": False,
+            },
+            on_token=None,
+        )
+
+    assert append_starts == [("dtr-failed", "sess-compacted", ["user_message"])]
+    assert persisted_requests == []
+
+
+@pytest.mark.asyncio
+async def test_retry_boundary_attachment_only_message_is_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FakeReminderLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    recorded_batches: list[list[SessionEvent]] = []
+    persisted_requests: list[str] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+        on_append_result: object | None = None,
+    ) -> bool:
+        del ctx, reason, on_token
+        recorded_batches.append(list(events))
+        if callable(on_append_result):
+            await on_append_result(SimpleNamespace(first_seq=len(recorded_batches)))
+        events.clear()
+        return True
+
+    async def _on_absorbed_persisted(request_id: str) -> None:
+        persisted_requests.append(request_id)
+
+    monkeypatch.setattr(
+        agent_loop_module,
+        "_native_attachment_blocks",
+        lambda _attachments, _model_info: ([], []),
+    )
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1",
+            intaris_session_id="sess-compacted",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        is_retry=True,
+        turn_id="turn-1",
+        on_absorbed_persisted=_on_absorbed_persisted,
+    )
+
+    await agent_loop._append_boundary_batch_item(
+        ctx,
+        messages=[],
+        pending_audit_messages=[],
+        item={
+            "durable_request_id": "dtr-attachment",
+            "queue_id": "queue-attachment",
+            "client_message_id": "client-attachment",
+            "content": "",
+            "attachments": [
+                {
+                    "artifact_id": "art-1",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "filename": "image.png",
+                    "size_bytes": 123,
+                }
+            ],
+            "system_initiated": False,
+        },
+        on_token=None,
+    )
+
+    recorded_events = [event for batch in recorded_batches for event in batch]
+    assert len(recorded_events) == 1
+    assert recorded_events[0].type == "user_message"
+    assert recorded_events[0].data["queue_id"] == "queue-attachment"
+    assert recorded_events[0].data["attachments"][0]["artifact_id"] == "art-1"
+    assert persisted_requests == ["dtr-attachment"]
+
+
+@pytest.mark.asyncio
+async def test_durable_system_follow_up_persists_before_absorbed_ack() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FakeReminderLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    continuation = ContinuationFollowUp(
+        follow_up_id="fup-system-1",
+        mode="integrate",
+        origin_kind="continuation",
+        relevance_hint="same_thread",
+        required_action="integrate_result",
+        topic_ref="turn-parent",
+        status="completed",
+        reason=LLM_CYCLE_CEILING_CONTINUATION_REASON,
+        attempt=1,
+        max_attempts=3,
+        cycle_count=150,
+        max_llm_cycles=150,
+    )
+    recorded_batches: list[list[SessionEvent]] = []
+    callbacks: list[object] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+    ) -> bool:
+        del ctx, on_token
+        callbacks.append(("persist", reason))
+        recorded_batches.append(list(events))
+        events.clear()
+        return True
+
+    async def _on_append_start(request_id: str, session_id: str, event_types: list[str]) -> None:
+        callbacks.append(("append_start", request_id, session_id, event_types))
+
+    async def _on_boundary_persisted(item: dict[str, object]) -> None:
+        callbacks.append(("boundary", item["durable_request_id"]))
+
+    async def _on_absorbed_persisted(request_id: str) -> None:
+        callbacks.append(("absorbed", request_id))
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-old",
+            intaris_session_id="sess-compacted",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        is_retry=True,
+        turn_id="turn-active",
+        on_absorbed_append_start=_on_append_start,
+        on_boundary_persisted=_on_boundary_persisted,
+        on_absorbed_persisted=_on_absorbed_persisted,
+    )
+    messages: list[dict[str, object]] = []
+
+    await agent_loop._append_boundary_batch_item(
+        ctx,
+        messages=messages,
+        pending_audit_messages=[],
+        item={
+            "durable_request_id": "dtr-system-1",
+            "queue_id": "dtr-system-1",
+            "content": "",
+            "attachments": [],
+            "system_initiated": True,
+            "follow_up": continuation,
+        },
+        on_token=None,
+    )
+
+    assert callbacks == [
+        ("append_start", "dtr-system-1", "sess-compacted", ["system_message"]),
+        ("persist", "system_follow_up_boundary"),
+        ("boundary", "dtr-system-1"),
+        ("absorbed", "dtr-system-1"),
+    ]
+    assert len(recorded_batches) == 1
+    event = recorded_batches[0][0]
+    assert event.type == "system_message"
+    assert event.data["source"] == "durable_boundary_follow_up"
+    assert event.data["follow_up_id"] == "fup-system-1"
+    assert event.data["queue_id"] == "dtr-system-1"
+    assert event.data["origin_kind"] == "continuation"
+    assert LLM_CYCLE_CEILING_CONTINUATION_REASON in event.data["content"]
+    assert (
+        sum(
+            LLM_CYCLE_CEILING_CONTINUATION_REASON in str(message.get("content"))
+            for message in messages
+            if message.get("role") == "system"
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_system_follow_up_failure_does_not_mark_absorbed() -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_FakeReminderLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    continuation = ContinuationFollowUp(
+        follow_up_id="fup-system-failed",
+        mode="integrate",
+        origin_kind="continuation",
+        relevance_hint="same_thread",
+        required_action="integrate_result",
+        topic_ref="turn-parent",
+        status="completed",
+        reason=LLM_CYCLE_CEILING_CONTINUATION_REASON,
+        attempt=1,
+        max_attempts=3,
+    )
+    absorbed_requests: list[str] = []
+
+    async def _record_events_strict(
+        ctx: StepContext,
+        events: list[SessionEvent],
+        *,
+        reason: str,
+        on_token: object | None = None,
+    ) -> bool:
+        del ctx, events, reason, on_token
+        raise RuntimeError("Intaris append failed")
+
+    async def _on_absorbed_persisted(request_id: str) -> None:
+        absorbed_requests.append(request_id)
+
+    agent_loop._record_events_strict = _record_events_strict  # type: ignore[method-assign]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        turn_id="turn-active",
+        on_absorbed_persisted=_on_absorbed_persisted,
+    )
+
+    with pytest.raises(RuntimeError, match="Intaris append failed"):
+        await agent_loop._append_boundary_batch_item(
+            ctx,
+            messages=[],
+            pending_audit_messages=[],
+            item={
+                "durable_request_id": "dtr-system-failed",
+                "queue_id": "dtr-system-failed",
+                "content": "",
+                "attachments": [],
+                "system_initiated": True,
+                "follow_up": continuation,
+            },
+            on_token=None,
+        )
+
+    assert absorbed_requests == []
 
 
 class _ResponsesApiToolCycleLLM:
@@ -12713,6 +14901,245 @@ class _LookupToolRouter:
         return ToolResult(output="lookup result", is_error=False)
 
 
+class _ExecutorDispatchingLookupToolRouter:
+    async def execute(self, *_: object, **kwargs: object) -> ToolResult:
+        before_send = kwargs["before_executor_send"]
+        after_send = kwargs["after_executor_send"]
+        await before_send("exec-scheduled-task", "instance-scheduled-task")
+        await after_send("exec-scheduled-task", "instance-scheduled-task")
+        return ToolResult(output="lookup result", is_error=False)
+
+
+@pytest.mark.asyncio
+async def test_direct_turn_fence_preserves_executor_dispatch_states() -> None:
+    bind_tool_dispatch = AsyncMock()
+    ctx = SimpleNamespace(execution_fence=SimpleNamespace(bind_tool_dispatch=bind_tool_dispatch))
+
+    await AgentLoop._bind_tool_dispatch_fence(
+        ctx,
+        call_id="call-lookup",
+        executor_id="exec-direct-turn",
+        executor_instance_id="instance-direct-turn",
+        dispatch_state="dispatching",
+    )
+    await AgentLoop._bind_tool_dispatch_fence(
+        ctx,
+        call_id="call-lookup",
+        executor_id="exec-direct-turn",
+        executor_instance_id="instance-direct-turn",
+        dispatch_state="sent",
+    )
+
+    assert bind_tool_dispatch.await_args_list == [
+        (
+            ("call-lookup", "exec-direct-turn", "instance-direct-turn"),
+            {"dispatch_state": "dispatching"},
+        ),
+        (
+            ("call-lookup", "exec-direct-turn", "instance-direct-turn"),
+            {"dispatch_state": "sent"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_task_dispatches_executor_tool_with_task_execution_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="lookup",
+                description="Lookup evidence",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ResponsesApiToolCycleLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ExecutorDispatchingLookupToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    execution_fence = TaskExecutionFence(
+        store=SimpleNamespace(),
+        claim=SimpleNamespace(task_id="task-scheduled"),
+        cancel_event=asyncio.Event(),
+    )
+    assert_current = AsyncMock()
+    monkeypatch.setattr(execution_fence, "assert_current", assert_current)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="collect_brief", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-scheduled-task",
+            intaris_session_id="sess-scheduled-task",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-scheduled-task",
+            context=SimpleNamespace(type="task", ref="task-scheduled", platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=WORKFLOW_POLICY,
+        user_message="Collect the daily brief.",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=True,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id="step-run-scheduled-task",
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-scheduled-task",
+            executor_type="in_process",
+            source="test",
+        ),
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=registry,
+        executor_connection=SimpleNamespace(),
+        execution_fence=execution_fence,
+    )
+
+    result = await agent_loop.execute_controller_tool(
+        ctx,
+        ToolCall(call_id="call-lookup", name="lookup", arguments={}),
+    )
+
+    assert result.output == "lookup result"
+    assert result.is_error is False
+    assert_current.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_direct_turn_fence_loss_propagates_before_executor_dispatch() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="lookup",
+                description="Lookup evidence",
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="executor"),
+                read_only=True,
+            ),
+            handler=None,
+        )
+    )
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_ResponsesApiToolCycleLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ExecutorDispatchingLookupToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    bind_tool_dispatch = AsyncMock(
+        side_effect=StaleDirectTurnOwner("Lost direct-turn fence for dtr-test")
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-direct-turn",
+            intaris_session_id="sess-direct-turn",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-direct-turn",
+            context=SimpleNamespace(type="web", ref=None, platform_data={}),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Use lookup.",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=False,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id=None,
+        executor_environment=build_local_executor_environment(
+            executor_id="exec-direct-turn",
+            executor_type="in_process",
+            source="test",
+        ),
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=registry,
+        executor_connection=SimpleNamespace(),
+        execution_fence=SimpleNamespace(bind_tool_dispatch=bind_tool_dispatch),
+    )
+
+    with pytest.raises(StaleDirectTurnOwner, match="dtr-test"):
+        await agent_loop.execute_controller_tool(
+            ctx,
+            ToolCall(call_id="call-lookup", name="lookup", arguments={}),
+        )
+
+    bind_tool_dispatch.assert_awaited_once_with(
+        "call-lookup",
+        "exec-scheduled-task",
+        "instance-scheduled-task",
+        dispatch_state="dispatching",
+    )
+
+
+@pytest.mark.asyncio
+async def test_parallel_direct_turn_fence_loss_cancels_sibling_tool() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    sibling_started = asyncio.Event()
+    sibling_cancelled = asyncio.Event()
+
+    async def execute_regular_tool(_ctx: StepContext, tc: ToolCall) -> ToolResult:
+        if tc.call_id == "call-stale":
+            await sibling_started.wait()
+            raise StaleDirectTurnOwner("Lost direct-turn fence for dtr-test")
+        sibling_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            sibling_cancelled.set()
+            raise
+
+    agent_loop._execute_regular_tool = execute_regular_tool  # type: ignore[method-assign]
+    group = [
+        _PreparedRegularToolCall(
+            tool_call=ToolCall(call_id="call-stale", name="lookup", arguments={}),
+            tool_id="tool-lookup",
+        ),
+        _PreparedRegularToolCall(
+            tool_call=ToolCall(call_id="call-sibling", name="lookup", arguments={}),
+            tool_id="tool-lookup",
+        ),
+    ]
+
+    with pytest.raises(StaleDirectTurnOwner, match="dtr-test"):
+        await agent_loop._execute_parallel_regular_tool_group(  # noqa: SLF001
+            cast(StepContext, SimpleNamespace()),
+            group,
+        )
+
+    assert sibling_cancelled.is_set()
+
+
 @pytest.mark.asyncio
 async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
     """Responses API must send canonical projection on every cycle.
@@ -12750,7 +15177,7 @@ async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-responses-canonical",
             intaris_session_id="sess-responses-canonical",
             mnemory_session_id=None,
@@ -12809,7 +15236,7 @@ async def test_responses_api_tool_cycle_uses_canonical_projection() -> None:
 async def test_step_complete_reprompt_is_system_message() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="step-a", type="run", prompt="", allow_questions=False),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -12855,7 +15282,7 @@ async def test_direct_empty_response_reprompts_instead_of_failing_step() -> None
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-empty",
             intaris_session_id="sess-empty",
             mnemory_session_id=None,
@@ -12909,7 +15336,7 @@ async def test_direct_repeated_empty_responses_fail_gracefully() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-empty-fail",
             intaris_session_id="sess-empty-fail",
             mnemory_session_id=None,
@@ -12963,7 +15390,7 @@ async def test_direct_idle_timeout_retries_before_auto_continuation() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-idle",
             intaris_session_id="sess-idle",
             mnemory_session_id=None,
@@ -13021,7 +15448,7 @@ async def test_direct_idle_timeout_continues_after_retry_budget() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-idle-exhausted",
             intaris_session_id="sess-idle-exhausted",
             mnemory_session_id=None,
@@ -13097,7 +15524,7 @@ async def test_direct_model_error_auto_continues_after_retry_budget() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-model-error",
             intaris_session_id="sess-model-error",
             mnemory_session_id=None,
@@ -13160,7 +15587,7 @@ async def test_rate_limit_retry_notice_includes_countdown_metadata() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-rate-limit-retry",
             intaris_session_id="sess-rate-limit-retry",
             mnemory_session_id=None,
@@ -13211,8 +15638,30 @@ async def test_rate_limit_retry_notice_includes_countdown_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_exhausted_rate_limit_persists_provider_specific_model_error_notice() -> None:
-    fake_llm = _AlwaysRateLimitedDirectLLM()
+@pytest.mark.parametrize(
+    ("category", "attempts", "successor"),
+    [
+        ("rate_limit", 3, True),
+        ("connection", 3, True),
+        ("provider_5xx", 3, True),
+        ("idle_timeout_activity", 4, True),
+        ("quota_exhausted", 1, False),
+        ("content_policy", 1, False),
+    ],
+)
+async def test_exhausted_model_stream_requests_bounded_successor(
+    category: str, attempts: int, successor: bool
+) -> None:
+    class FailingLLM(_AlwaysRateLimitedDirectLLM):
+        async def stream_generate(self, messages, **kwargs):
+            self.calls.append([dict(message) for message in messages])
+            yield {"choices": [{"delta": {"content": "Incomplete output"}}]}
+            raise LLMStreamProviderError(
+                "Stream failed",
+                payload={"category": category, "message": "Stream failed"},
+            )
+
+    fake_llm = FailingLLM()
     guardrails = _RecordingGuardrails()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=guardrails),
@@ -13230,7 +15679,7 @@ async def test_exhausted_rate_limit_persists_provider_specific_model_error_notic
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-rate-limit",
             intaris_session_id="sess-rate-limit",
             mnemory_session_id=None,
@@ -13263,34 +15712,37 @@ async def test_exhausted_rate_limit_persists_provider_specific_model_error_notic
     assert output.summary == output.error
     assert output.outcome.status == "failed"
     assert output.outcome.reason == "mid_stream_failure_exhausted"
+    assert output.metadata.get("continuation_reason") == (
+        "mid_stream_failure_exhausted" if successor else None
+    )
     assert output.metadata["model_error"] == {
-        "provider_id": "anthropic-lumilens",
+        "provider_id": None,
         "model": "test-model",
-        "reason_class": MidStreamErrorCategory.RATE_LIMIT.value,
-        "attempts": 1,
-        "continuation_attempts": 0,
+        "reason_class": category,
+        "attempts": attempts,
+        "continuation_attempts": attempts - 1,
         "tool_results_saved": True,
-        "recoverable": True,
+        "recoverable": successor,
+        "transient": False,
+        "retry_after_seconds": None,
+        "recovery_strategy": "automatic_continuation" if successor else "terminal",
     }
-    assert len(fake_llm.calls) == 1
+    assert len(fake_llm.calls) == attempts
+    assert "Incomplete output" not in output.content
     notices = [event.data for event in guardrails.recorded_events if event.type == "lifecycle"]
-    final_notice = next(
+    final_notice = [
         notice
         for notice in notices
-        if notice.get("kind") == "model_error" and notice.get("scope") == "failed_turn"
-    )
-    assert final_notice["reason_class"] == MidStreamErrorCategory.RATE_LIMIT.value
-    assert final_notice["recoverable"] is True
-    assert final_notice["provider_id"] == "anthropic-lumilens"
+        if notice.get("kind") == ("model_recovery" if successor else "model_error")
+    ][-1]
+    assert final_notice["reason_class"] == category
+    assert final_notice["recoverable"] is successor
     assert final_notice["model"] == "test-model"
     assert final_notice["attempts"] == len(fake_llm.calls)
     assert final_notice["attempts_per_cycle"] == 1
-    assert final_notice["continuation_attempts"] == 0
-    assert (
-        "anthropic-lumilens rate-limited test-model after 1 attempt(s)" in final_notice["message"]
-    )
-    assert "This request would exceed your account's rate limit" in final_notice["message"]
-    assert "A model error occurred while generating the response" not in final_notice["message"]
+    assert final_notice["continuation_attempts"] == attempts - 1
+    if successor:
+        assert not any(notice.get("scope") == "failed_turn" for notice in notices)
 
 
 @pytest.mark.asyncio
@@ -13313,7 +15765,7 @@ async def test_long_rate_limit_retry_after_reports_actual_attempts() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-rate-limit-long",
             intaris_session_id="sess-rate-limit-long",
             mnemory_session_id=None,
@@ -13345,6 +15797,10 @@ async def test_long_rate_limit_retry_after_reports_actual_attempts() -> None:
     assert output.error is not None
     assert output.outcome.status == "failed"
     assert output.outcome.reason == "mid_stream_failure_exhausted"
+    assert output.metadata["model_error"]["transient"] is True
+    assert output.metadata["model_error"]["retry_after_seconds"] == 300
+    assert output.metadata["model_error"]["recovery_strategy"] == "durable_delayed_retry"
+    assert "continuation_reason" not in output.metadata
     assert len(fake_llm.calls) == 1
     notices = [event.data for event in guardrails.recorded_events if event.type == "lifecycle"]
     final_notice = next(
@@ -13379,7 +15835,7 @@ async def test_native_image_input_error_strips_image_url_and_retries() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-image-input-error",
             intaris_session_id="sess-image-input-error",
             mnemory_session_id=None,
@@ -13436,7 +15892,7 @@ async def test_codex_attachment_download_timeout_strips_image_url_and_retries() 
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-codex-attachment-timeout",
             intaris_session_id="sess-codex-attachment-timeout",
             mnemory_session_id=None,
@@ -13502,7 +15958,7 @@ async def test_mid_stream_retry_keeps_notice_until_saved_state_continuation() ->
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-model-retry-notice",
             intaris_session_id="sess-model-retry-notice",
             mnemory_session_id=None,
@@ -13573,7 +16029,7 @@ async def test_direct_context_overflow_compacts_rotates_and_replays() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-overflow",
             intaris_session_id="sess-overflow",
             mnemory_session_id=None,
@@ -13632,7 +16088,7 @@ async def test_stream_provider_context_overflow_compacts_without_mid_stream_retr
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-provider-overflow",
             intaris_session_id="sess-provider-overflow",
             mnemory_session_id=None,
@@ -13690,7 +16146,7 @@ async def test_stream_failure_chunk_context_overflow_compacts_without_mid_stream
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-chunk-overflow",
             intaris_session_id="sess-chunk-overflow",
             mnemory_session_id=None,
@@ -13746,7 +16202,7 @@ async def test_direct_token_callback_errors_are_not_retried_as_model_errors() ->
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-token-error",
             intaris_session_id="sess-token-error",
             mnemory_session_id=None,
@@ -13800,7 +16256,7 @@ def test_todo_schema_uses_completed_status() -> None:
     loop = object.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="step-a", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         todos=[],
@@ -13865,7 +16321,7 @@ def test_step_complete_metadata_array_schema_includes_items() -> None:
                 ]
             ),
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -13906,7 +16362,7 @@ def test_delegated_child_hides_parent_owned_controller_tools(
             prompt="",
             allow_questions=True,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id=session_id,
             intaris_session_id=session_id,
             parent_session_id="parent",
@@ -13945,7 +16401,7 @@ def test_actual_workflow_step_retains_parent_owned_controller_tools() -> None:
             prompt="",
             allow_questions=True,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="workflow-step",
             intaris_session_id="workflow-step",
             parent_session_id=None,
@@ -14026,7 +16482,7 @@ async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_e
             prompt="Investigate the issue.",
             require_deliverable=False,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id=session_id,
             intaris_session_id=session_id,
             mnemory_session_id=None,
@@ -14096,7 +16552,7 @@ async def test_delegated_daily_brief_child_completes_with_assistant_text(
             prompt="Research Daily Brief sources.",
             require_deliverable=False,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="daily-brief-child",
             intaris_session_id="daily-brief-child",
             mnemory_session_id=None,
@@ -14126,7 +16582,7 @@ async def test_delegated_daily_brief_child_completes_with_assistant_text(
 def test_actual_workflow_daily_brief_retains_strict_activation() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="daily", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="daily-brief-step",
             intaris_session_id="daily-brief-step",
             parent_session_id=None,
@@ -14135,12 +16591,75 @@ def test_actual_workflow_daily_brief_retains_strict_activation() -> None:
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
         task_title="Daily Brief",
+        step_run_id="sr-daily-brief",
     )
 
     activation = AgentLoop._strict_daily_brief_activation(ctx)
 
     assert activation is not None
     assert activation.version == CURRENT_DAILY_BRIEF_CONTRACT_VERSION
+
+
+@pytest.mark.asyncio
+async def test_parent_turn_does_not_inherit_loaded_daily_brief_completion_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    llm = _SingleAssistantTextLLM()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    get_deliverable = AsyncMock(side_effect=AssertionError("task deliverable was read"))
+    monkeypatch.setattr(agent_loop, "_get_current_deliverable", get_deliverable)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="daily-brief-parent",
+            intaris_session_id="daily-brief-parent",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            parent_session_id=None,
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conv-parent",
+            title=None,
+            title_source="unset",
+            context=SimpleNamespace(
+                type="matrix",
+                ref="matrix:acct:room",
+                platform_data={"assistant_delivery_mode": "final_only"},
+            ),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Thanks. What is next?",
+        deliverable_step_run_id="sr-completed-daily-brief-task",
+        loaded_skill_names={"daily-brief"},
+        loaded_skill_snapshots={
+            "daily-brief": {
+                "name": "daily-brief",
+                "contract_version": CURRENT_DAILY_BRIEF_CONTRACT_VERSION,
+            }
+        },
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert AgentLoop._strict_daily_brief_activation(ctx) is None
+    assert llm.calls == 1
+    get_deliverable.assert_not_awaited()
+    assert output is not None
+    assert output.error is None
+    assert output.content == "Delegated Daily Brief research result."
 
 
 def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
@@ -14156,7 +16675,7 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
     )
     ctx_secondary = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt=""),
-        session=SimpleNamespace(session_id="child", intaris_session_id="child"),
+        session=_SessionStub(session_id="child", intaris_session_id="child"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=user_secondary,
         policy=SECONDARY_AGENT_DELEGATION_POLICY,
@@ -14176,7 +16695,7 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
     )
     ctx_system = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt=""),
-        session=SimpleNamespace(session_id="child2", intaris_session_id="child2"),
+        session=_SessionStub(session_id="child2", intaris_session_id="child2"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=system_explore,
         policy=SECONDARY_AGENT_DELEGATION_POLICY,
@@ -14194,7 +16713,7 @@ def test_secondary_agent_delegation_uses_slim_policy_not_is_system() -> None:
     )
     ctx_primary = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt=""),
-        session=SimpleNamespace(session_id="child3", intaris_session_id="child3"),
+        session=_SessionStub(session_id="child3", intaris_session_id="child3"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=primary_agent,
         policy=DELEGATION_POLICY,
@@ -14249,7 +16768,7 @@ def test_secondary_agent_delegation_slim_prompt_has_minimal_completion_hint() ->
             prompt="Review the changes in this PR.",
             require_deliverable=False,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="child",
             intaris_session_id="child",
             parent_session_id="parent",
@@ -14433,7 +16952,7 @@ def test_select_delegation_result_reads_paginated_child_events() -> None:
             if after_seq == 0:
                 return SimpleNamespace(
                     events=first_page_events,
-                    last_seq=500,
+                    last_seq=1201,
                     has_more=True,
                     missing_stream_fallback_used=False,
                 )
@@ -14676,7 +17195,7 @@ def test_get_subsession_returns_durable_result_content(monkeypatch: pytest.Monke
             return None
 
     agent_loop.session_manager = SimpleNamespace(session_factory=lambda: _SessionFactory())  # type: ignore[attr-defined]
-    ctx = SimpleNamespace(session=SimpleNamespace(session_id="parent-1"))
+    ctx = SimpleNamespace(session=_SessionStub(session_id="parent-1"))
     row = SimpleNamespace(
         session_id="child-1",
         parent_session_id="parent-1",
@@ -14760,7 +17279,7 @@ async def test_write_deliverable_wraps_non_os_storage_failure(
     monkeypatch.setattr(agent_loop_module, "create_deliverable", _storage_failure)
     ctx = StepContext(
         step_definition=StepDefinition(name="write", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-runtime", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-runtime", user_email="user@example.com"),
         conversation=SimpleNamespace(
             conversation_id="conv-runtime",
             user_email="user@example.com",
@@ -14773,11 +17292,13 @@ async def test_write_deliverable_wraps_non_os_storage_failure(
     with pytest.raises(agent_loop_module.DeliverablePersistenceError, match="RuntimeError"):
         await agent_loop._write_step_deliverable(
             ctx,
-            content="fallback",
-            format="markdown",
-            title=None,
-            target=None,
-            outputs={},
+            authoring=agent_loop_module.ResolvedDeliverableAuthoring(
+                content="fallback",
+                format="markdown",
+                title=None,
+                outputs={},
+                rich=None,
+            ),
         )
 
 
@@ -14816,7 +17337,7 @@ async def test_write_deliverable_publication_scope_follows_runtime_context(
     monkeypatch.setattr(agent_loop_module, "create_deliverable", _capture)
     ctx = StepContext(
         step_definition=StepDefinition(name="write", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-runtime", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-runtime", user_email="user@example.com"),
         conversation=SimpleNamespace(
             conversation_id="conv-runtime",
             user_email="user@example.com",
@@ -14830,11 +17351,13 @@ async def test_write_deliverable_publication_scope_follows_runtime_context(
     with pytest.raises(agent_loop_module.DeliverablePersistenceError, match="captured"):
         await agent_loop._write_step_deliverable(
             ctx,
-            content="fallback",
-            format="markdown",
-            title=None,
-            target=None,
-            outputs={},
+            authoring=agent_loop_module.ResolvedDeliverableAuthoring(
+                content="fallback",
+                format="markdown",
+                title=None,
+                outputs={},
+                rich=None,
+            ),
         )
 
     assert captured["published_owner_email"] == expected_owner
@@ -14876,7 +17399,7 @@ async def test_secondary_delegation_ignores_parent_deliverable_when_limit_forces
 
     ctx = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="child-limit",
             intaris_session_id="child-limit",
             mnemory_session_id=None,
@@ -14932,7 +17455,7 @@ async def test_delegation_prompt_uses_user_message_role() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="child-role",
             intaris_session_id="child-role",
             mnemory_session_id=None,
@@ -14988,7 +17511,7 @@ async def test_secondary_delegation_steps_count_llm_turns_not_tool_calls() -> No
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="child-steps",
             intaris_session_id="child-steps",
             mnemory_session_id=None,
@@ -15053,7 +17576,7 @@ async def test_malformed_tool_arguments_do_not_drop_valid_siblings(
     monkeypatch.setattr(agent_loop, "_stale_session_step_output", _not_stale)
     ctx = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="malformed-sibling",
             intaris_session_id="malformed-sibling",
             mnemory_session_id=None,
@@ -15138,7 +17661,7 @@ async def test_secondary_delegation_max_steps_cancels_open_todos() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="delegation", type="run", prompt="Investigate."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="child-todos",
             intaris_session_id="child-todos",
             mnemory_session_id=None,
@@ -15224,7 +17747,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -15264,7 +17787,7 @@ async def test_delegation_progress_callback_tolerates_variadic_on_tool_result_si
 def test_step_request_questions_schema_only_exposed_for_question_enabled_steps() -> None:
     loop = object.__new__(AgentLoop)
     base = dict(
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -15320,7 +17843,7 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="implement", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="intaris-1",
             user_email="user@example.com",
@@ -15384,11 +17907,14 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
         "preferred_tool": "follow_up_subsession",
         "guidance": (
             "For same-problem continuation, corrections, deeper analysis, or "
-            "rechecks, use follow_up_subsession only when this child's specialist "
-            "role, tool/authority scope, and expected output remain compatible. "
-            "Follow-up and fork preserve this child's agent identity and "
-            "capabilities; create a fresh delegate for a different specialist. "
-            "Use fork_subsession only for a compatible independent branch."
+            "rechecks, use follow_up_subsession only when this child's bounded "
+            "problem, specialist role, responsibilities, tool/authority scope, "
+            "and expected output remain compatible and retained context is "
+            "materially useful. Send the context delta only. Follow-up preserves "
+            "this child's identity and capabilities; create a fresh isolated "
+            "delegate for changed compatibility or an independent workstream. "
+            "Use fork_subsession only for an independent branch requiring "
+            "inherited context, not an ordinary handoff or review."
         ),
     }
     assert captured["agent"] is primary_agent
@@ -15397,12 +17923,26 @@ async def test_handle_delegate_returns_deliverable_metadata_and_clears_parent_ca
     assert ctx.current_deliverable_content is None
 
 
+def test_delegate_continuation_failed_guidance_keeps_only_compatible_delta() -> None:
+    continuation = agent_loop_module._delegate_continuation(
+        "child-failed",
+        status="failed",
+    )
+
+    assert continuation["preferred_tool"] == "retry_subsession"
+    guidance = str(continuation["guidance"])
+    assert "same bounded problem" in guidance
+    assert "responsibilities" in guidance
+    assert "retained context is materially useful" in guidance
+    assert "context delta only" in guidance
+
+
 @pytest.mark.asyncio
 async def test_agent_loop_passes_routing_reminder_for_eligible_chat_turn() -> None:
     assembler = _FakeContextAssembler()
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -15428,7 +17968,7 @@ async def test_agent_loop_skips_routing_reminder_for_system_initiated_and_workfl
     system_assembler = _FakeContextAssembler()
     system_ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -15450,7 +17990,7 @@ async def test_agent_loop_skips_routing_reminder_for_system_initiated_and_workfl
         step_definition=StepDefinition(
             name="implement", type="run", prompt="", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -15475,7 +18015,7 @@ async def test_agent_loop_skips_routing_reminder_for_secondary_policy_turns() ->
         step_definition=StepDefinition(
             name="secondary", type="run", prompt="", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -15566,7 +18106,7 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
 
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -15615,7 +18155,7 @@ async def test_user_message_is_persisted_before_reasoning_and_tool_execution() -
     assert output is not None
     assert order[0] == "record:user_message"
     assert order[1] == "reasoning"
-    assert "record:system_message" in order
+    assert "record:developer_message" in order
     assert order.index("record:tool_call") < order.index("record:tool_result")
     assert "record:tool_result" in order
     assert "record:assistant_message" in order
@@ -15807,7 +18347,7 @@ async def test_switch_agent_profile_reassembles_same_turn_with_new_reasoning(
         },
         default_agent_profile_id="developer",
     )
-    session = SimpleNamespace(
+    session = _SessionStub(
         session_id="sess-1",
         intaris_session_id="sess-1",
         mnemory_session_id=None,
@@ -15865,6 +18405,13 @@ async def test_switch_agent_profile_reassembles_same_turn_with_new_reasoning(
     ]
     assert len({call["memory_policy"].policy_fingerprint for call in assembler.calls}) == 1
     assert llm.reasoning_efforts == ["low", "low", "high", "high"]
+    runtime = agent_loop.session_manager.execution_rows["sess-1"].delegation_metadata[
+        "execution_runtime"
+    ]
+    assert runtime["model"] == "test-model"
+    assert runtime["provider_id"] == "test-provider"
+    assert runtime["profile_id"] == "senior"
+    assert runtime["reasoning_effort"] == "high"
     assert all(schema == llm.tool_schemas[0] for schema in llm.tool_schemas)
     assert sum(event.type == "user_message" for event in recorded_events) == 1
     rejected_batches = [
@@ -15899,6 +18446,277 @@ async def test_switch_agent_profile_reassembles_same_turn_with_new_reasoning(
         if event.type == "tool_result" and event.data.get("name") == "switch_agent_profile"
     ]
     assert any("switch_limit_reached" in str(event.data.get("result")) for event in profile_results)
+
+
+@pytest.mark.asyncio
+async def test_switch_executor_refreshes_policy_before_same_turn_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.core.executor_pool import (
+        ExecutorAvailability,
+        ExecutorPool,
+        ResolvedExecutorTarget,
+    )
+    from cognis.core.executor_switching import SwitchOutcome
+    from cognis.core.runtime import environment_from_metadata
+    from cognis.runtime_context import (
+        current_effective_working_directory,
+        current_executor_environment,
+        current_workspace_root,
+    )
+
+    order: list[str] = []
+    old_connection = object()
+    new_connection = object()
+    old_target = ResolvedExecutorTarget(
+        executor_id="maitrea_riker",
+        executor_type="websocket",
+        is_primary=True,
+        selection_source="primary",
+        description=None,
+        state=ExecutorAvailability.USABLE,
+        observed_tools=[{"name": "bash"}],
+    )
+    new_target = ResolvedExecutorTarget(
+        executor_id="olorin",
+        executor_type="websocket",
+        is_primary=False,
+        selection_source="additional",
+        description="MacBook",
+        state=ExecutorAvailability.USABLE,
+        observed_tools=[{"name": "bash"}],
+    )
+    executor_pool = ExecutorPool(primary=[old_target], additional=[new_target])
+
+    class _Websocket:
+        def get_ready_connection(self, executor_id: str) -> object | None:
+            return new_connection if executor_id == "olorin" else old_connection
+
+        def get_handle_metadata(self, executor_id: str) -> dict[str, object]:
+            assert executor_id == "olorin"
+            return {
+                "environment": {
+                    "home": "/Users/fpytloun",
+                    "cwd": "/Users/fpytloun/src/cognis",
+                    "tmpdir": "/var/folders/cognis/tmp",
+                    "hostname": "olorin",
+                }
+            }
+
+    class _Guardrails(_NoopGuardrails):
+        async def record_events(self, **kwargs: object) -> EventAppendResult:
+            events = cast(list[SessionEvent], kwargs["events"])
+            if any(
+                event.type == "tool_result" and event.data.get("name") == "switch_executor"
+                for event in events
+            ):
+                order.append("record:switch_result")
+            return EventAppendResult(ok=True, count=len(events), first_seq=1, last_seq=len(events))
+
+    class _SessionManager(_NoopSessionManager):
+        def __init__(self) -> None:
+            super().__init__()
+            self.policy_refreshes: list[dict[str, object]] = []
+
+        async def refresh_intaris_session_policy(
+            self,
+            session: object,
+            *,
+            session_policy_override: dict[str, Any] | None = None,
+            additional_allowed_paths: list[str] | None = None,
+        ) -> None:
+            order.append("refresh")
+            self.policy_refreshes.append(
+                {
+                    "session": session,
+                    "workspace_root": current_workspace_root.get(),
+                    "working_directory": current_effective_working_directory.get(),
+                    "environment": current_executor_environment.get(),
+                    "session_policy_override": session_policy_override,
+                    "additional_allowed_paths": additional_allowed_paths,
+                }
+            )
+
+    class _LLM:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_model_info(self, model: str | None) -> SimpleNamespace:
+            del model
+            return _test_model_info()
+
+        def count_tokens(self, text: str, model: str | None = None) -> int:
+            del model
+            return len(text)
+
+        async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+            del messages
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_switch_executor",
+                                        "function": {
+                                            "name": "switch_executor",
+                                            "arguments": '{"executor_id":"olorin"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                yield {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}
+                return
+            if self.calls == 2:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_bash_after_switch",
+                                        "function": {
+                                            "name": "bash",
+                                            "arguments": '{"command":"pwd"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+                yield {"choices": [{"finish_reason": "tool_calls", "delta": {}}]}
+                return
+            yield {"choices": [{"delta": {"content": "done"}}]}
+
+    class _ToolRouter:
+        def _is_non_bypassable(self, _name: str, non_bypassable: bool) -> bool:
+            return non_bypassable
+
+        async def execute(self, *args: object, **kwargs: object) -> ToolResult:
+            del kwargs
+            order.append("execute:bash")
+            assert order.index("refresh") < order.index("execute:bash")
+            assert args[4] is new_connection
+            return ToolResult(output="ok", is_error=False)
+
+    async def _perform_switch(**_: object) -> SwitchOutcome:
+        return SwitchOutcome(
+            status="ok",
+            target=new_target,
+            is_primary=False,
+            available_tools=["bash"],
+        )
+
+    monkeypatch.setattr(
+        "cognis.core.executor_switching.perform_executor_switch",
+        _perform_switch,
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name="bash",
+                description="Run a shell command",
+                parameters={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+                source=ToolSource(type="executor"),
+            ),
+            handler=None,
+        )
+    )
+    old_environment = environment_from_metadata(
+        {
+            "environment": {
+                "home": "/home/riker",
+                "cwd": "/home/riker/src/cognis",
+                "hostname": "maitrea",
+            }
+        },
+        executor_id="maitrea_riker",
+        executor_type="websocket",
+        fallback_source="test",
+    )
+    session = _SessionStub(
+        session_id="sess-executor-switch",
+        intaris_session_id="sess-executor-switch",
+        mnemory_session_id=None,
+        user_email="user@example.com",
+        agent_id="agent-1",
+        parent_session_id=None,
+    )
+    conversation = SimpleNamespace(
+        conversation_id="conv-executor-switch",
+        agent_id="agent-1",
+        active_executor_id="maitrea_riker",
+        title=None,
+        title_source="unset",
+        context=SimpleNamespace(type="web", ref=None, platform_data={}),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=session,
+        conversation=conversation,
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        user_message="Switch executor, then run pwd.",
+        user_attachments=[],
+        system_initiated=False,
+        tool_registry=registry,
+        executor_connection=old_connection,
+        executor_environment=old_environment,
+        executor_pool=executor_pool,
+        active_executor_id="maitrea_riker",
+        workspace_root="/home/riker/src/cognis",
+        working_directory="/home/riker/src/cognis",
+        session_policy={"allow_policies": ["shell"]},
+        turn_id="turn-executor-switch",
+    )
+    session_manager = _SessionManager()
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(
+            llm=_LLM(),
+            guardrails=_Guardrails(),
+            executor=SimpleNamespace(websocket=_Websocket()),
+        ),
+        session_manager=session_manager,
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=_ToolRouter(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None
+    assert output.content == "done"
+    assert order.index("refresh") < order.index("record:switch_result")
+    assert order.index("record:switch_result") < order.index("execute:bash")
+    assert len(session_manager.policy_refreshes) == 1
+    refresh = session_manager.policy_refreshes[0]
+    assert refresh["session"] is session
+    assert refresh["workspace_root"] == "/Users/fpytloun/src/cognis"
+    assert refresh["working_directory"] == "/Users/fpytloun/src/cognis"
+    assert cast(Any, refresh["environment"]).executor_id == "olorin"
+    assert refresh["session_policy_override"] == {"allow_policies": ["shell"]}
+    assert refresh["additional_allowed_paths"] is None
+    assert ctx.active_executor_id == "olorin"
+    assert ctx.executor_connection is new_connection
+    assert ctx.workspace_root == "/Users/fpytloun/src/cognis"
+    assert ctx.working_directory == "/Users/fpytloun/src/cognis"
 
 
 def test_switch_to_concrete_default_profile_is_not_synthetic_noop() -> None:
@@ -16054,7 +18872,7 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
             prompt="",
             step_profile_id="system:direct-default",
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-fallback",
             conversation_id="conv-fallback",
             intaris_session_id="sess-fallback",
@@ -16093,7 +18911,7 @@ async def test_agent_loop_retries_with_cached_openai_tool_search_fallback() -> N
 
 
 @pytest.mark.asyncio
-async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
+async def test_search_tools_discovery_is_not_promoted_on_next_user_turn() -> None:
     class _DiscoveryLLM:
         def __init__(self) -> None:
             self.calls = 0
@@ -16187,7 +19005,7 @@ async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
-    session = SimpleNamespace(
+    session = _SessionStub(
         session_id="sess-discovery",
         conversation_id="conv-discovery",
         intaris_session_id="sess-discovery",
@@ -16220,9 +19038,8 @@ async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
     )
 
     assert first_output is not None
-    assert "mcp_rohlik__fetch_orders" in fake_llm.tool_sets[0]
     assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[0]
-    assert session_cache.get_discovered_tool_ids(session.session_id) == {stable_tool_id(get_events)}
+    assert stable_tool_id(get_events) in session_cache.get_discovered_tool_ids(session.session_id)
 
     second_output = await agent_loop.run_step(
         StepContext(
@@ -16243,7 +19060,34 @@ async def test_search_tools_discovery_is_promoted_on_next_user_turn() -> None:
     )
 
     assert second_output is not None
-    assert "mcp_googleworkspace__get_events" in fake_llm.tool_sets[2]
+    assert "mcp_googleworkspace__get_events" not in fake_llm.tool_sets[2]
+
+
+def test_task_control_surface_keeps_task_operations_direct() -> None:
+    loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="control", type="run", prompt=""),
+        session=_SessionStub(session_id="sess-task", intaris_session_id="sess-task"),
+        conversation=ConversationModel(
+            conversation_id="conv-task",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(
+                type="task",
+                ref="task-1",
+                platform_data={"kind": "task_control"},
+            ),
+        ),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_TASK_CONTROL,
+    )
+
+    exposure = loop._build_controller_tool_exposure(ctx)
+    direct_names = {schema["function"]["name"] for schema in exposure.schemas}
+
+    assert {"get_task", "get_task_output", "update_task", "cancel_task"} <= direct_names
+    assert exposure.deferred_definitions == []
 
 
 @pytest.mark.asyncio
@@ -16289,7 +19133,7 @@ async def test_cached_discovered_tool_is_revalidated_against_permissions() -> No
     registry = ToolRegistry()
     registry.register(RegisteredTool(definition=get_events, handler=None))
     session_cache = SessionCache(_NoopGuardrails(), max_entries=10)
-    session = SimpleNamespace(
+    session = _SessionStub(
         session_id="sess-discovery-denied",
         conversation_id="conv-discovery-denied",
         intaris_session_id="sess-discovery-denied",
@@ -16378,7 +19222,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
                         "message": {
                             "content": (
                                 '{"tool_ids": ["builtin:read_tool_output", '
-                                '"builtin:browser_snapshot"]}'
+                                '"mcp:browser:browser_snapshot"]}'
                             )
                         }
                     }
@@ -16397,8 +19241,13 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
         name="browser_snapshot",
         description="Capture the current browser state.",
         parameters={"type": "object", "properties": {}},
-        source=ToolSource(type="builtin"),
-        category="browser",
+        source=ToolSource(
+            type="local_mcp",
+            server_id="browser",
+            server_name="Browser",
+            raw_tool_name="browser_snapshot",
+        ),
+        category="mcp",
         read_only=True,
     )
     visible_tool = ToolDefinition(
@@ -16433,7 +19282,7 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-skill", intaris_session_id="sess-skill"),
+        session=_SessionStub(session_id="sess-skill", intaris_session_id="sess-skill"),
         conversation=SimpleNamespace(conversation_id="conv-skill"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16543,9 +19392,7 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(
-            session_id="sess-skill-chunk", intaris_session_id="sess-skill-chunk"
-        ),
+        session=_SessionStub(session_id="sess-skill-chunk", intaris_session_id="sess-skill-chunk"),
         conversation=SimpleNamespace(conversation_id="conv-skill-chunk"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16624,7 +19471,7 @@ async def test_skill_activation_cache_key_changes_when_tags_change() -> None:
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-cache", intaris_session_id="sess-cache"),
+        session=_SessionStub(session_id="sess-cache", intaris_session_id="sess-cache"),
         conversation=SimpleNamespace(conversation_id="conv-cache"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16731,7 +19578,7 @@ async def test_skill_activation_classifier_scopes_to_policy_hidden_tools_only() 
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-b1", intaris_session_id="sess-b1"),
+        session=_SessionStub(session_id="sess-b1", intaris_session_id="sess-b1"),
         conversation=SimpleNamespace(conversation_id="conv-b1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16811,7 +19658,7 @@ async def test_skill_activation_classifier_receives_tags_and_referenced_services
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-a1", intaris_session_id="sess-a1"),
+        session=_SessionStub(session_id="sess-a1", intaris_session_id="sess-a1"),
         conversation=SimpleNamespace(conversation_id="conv-a1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16896,7 +19743,7 @@ async def test_skill_activation_emits_transparency_notice_to_model() -> None:
             prompt="",
             step_profile_id="system:general-task",
         ),
-        session=SimpleNamespace(session_id="sess-b2", intaris_session_id="sess-b2"),
+        session=_SessionStub(session_id="sess-b2", intaris_session_id="sess-b2"),
         conversation=SimpleNamespace(conversation_id="conv-b2"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         tool_registry=registry,
@@ -16947,7 +19794,7 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
         step_definition=StepDefinition(
             name="commit", type="run", prompt="", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -16996,7 +19843,7 @@ def _step_complete_test_loop(fake_llm: object) -> AgentLoop:
 def _step_complete_test_context(step_definition: StepDefinition) -> StepContext:
     return StepContext(
         step_definition=step_definition,
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-step-complete-metadata",
             intaris_session_id="sess-step-complete-metadata",
             mnemory_session_id=None,
@@ -17168,7 +20015,7 @@ async def test_step_complete_must_be_last_tool_call_in_response() -> None:
         step_definition=StepDefinition(
             name="commit", type="run", prompt="", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17216,7 +20063,7 @@ async def test_terminal_todos_block_non_finalization_tool() -> None:
         step_definition=StepDefinition(
             name="plan", type="run", prompt="Plan the change.", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-finalization",
             intaris_session_id="sess-finalization",
             mnemory_session_id=None,
@@ -17272,7 +20119,7 @@ async def test_terminal_todos_still_allow_todo_write() -> None:
         step_definition=StepDefinition(
             name="plan", type="run", prompt="Plan the change.", require_deliverable=False
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-todo-correction",
             intaris_session_id="sess-todo-correction",
             mnemory_session_id=None,
@@ -17425,7 +20272,7 @@ async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-hung-llm",
             intaris_session_id="sess-hung-llm",
             mnemory_session_id=None,
@@ -17486,7 +20333,7 @@ async def test_llm_stream_idle_timeout_after_todo_write_auto_continues() -> None
 def test_step_complete_rejects_silent_notification_when_not_allowed() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="check", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17520,7 +20367,7 @@ def test_step_complete_rejects_silent_notification_when_not_allowed() -> None:
 def test_step_complete_allows_direct_notification_for_success() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="brief", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17551,10 +20398,10 @@ def test_step_complete_allows_direct_notification_for_success() -> None:
     _validate_step_completion_notification(ctx, step_output)
 
 
-def test_step_complete_rejects_direct_notification_for_failed_outcome() -> None:
+def test_step_complete_drops_direct_notification_for_failed_outcome() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="brief", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17582,14 +20429,42 @@ def test_step_complete_rejects_direct_notification_for_failed_outcome() -> None:
         notification={"mode": "direct"},
     )
 
-    with pytest.raises(ValueError, match="only valid for successful completion"):
-        _validate_step_completion_notification(ctx, step_output)
+    _validate_step_completion_notification(ctx, step_output)
+
+    assert step_output.notification is None
+
+
+@pytest.mark.asyncio
+async def test_task_owner_controller_can_access_cross_agent_task() -> None:
+    agent_loop = object.__new__(AgentLoop)
+    ctx = StepContext(
+        step_definition=StepDefinition(name="control", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(
+            agent_id="controller",
+            owner_email="user@example.com",
+            name="Controller",
+        ),
+        policy=CHAT_POLICY,
+    )
+    task = SimpleNamespace(
+        created_by="user@example.com",
+        created_by_agent_id=None,
+        agent_id="other-agent",
+    )
+
+    assert await agent_loop._can_access_task(task, ctx)
 
 
 def test_step_complete_rejects_direct_notification_without_written_deliverable() -> None:
     ctx = StepContext(
         step_definition=StepDefinition(name="brief", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17638,7 +20513,7 @@ def test_build_step_prompt_includes_revision_context() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt="Produce a plan."),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -17659,7 +20534,7 @@ def test_build_tool_attachment_context_uses_user_blocks_for_vision_models() -> N
     loop = AgentLoop.__new__(AgentLoop)
     ctx = StepContext(
         step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         current_model_info=SimpleNamespace(
@@ -17701,7 +20576,7 @@ def test_context_pressure_exceeded_counts_exposed_tool_schemas() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -17742,7 +20617,7 @@ def test_context_pressure_snapshot_clamps_oversized_output_reserve() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="execute", type="run", prompt="Do work"),
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -17787,7 +20662,7 @@ async def test_tool_call_ceiling_returns_partial_step_output_without_second_llm_
 
     ctx = StepContext(
         step_definition=StepDefinition(name="execute", type="run", prompt="Do the task."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17879,7 +20754,7 @@ async def test_llm_cycle_ceiling_flushes_lifecycle_event_and_returns_continuatio
 
     ctx = StepContext(
         step_definition=StepDefinition(name="execute", type="run", prompt="Do the task."),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -17947,7 +20822,7 @@ def test_build_step_prompt_includes_operator_instruction() -> None:
     workflow_state = WorkflowState(last_operator_instruction="Incorporate the review and continue.")
     ctx = StepContext(
         step_definition=StepDefinition(name="implement", type="run", prompt="Implement the plan."),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -17963,7 +20838,7 @@ def test_build_step_prompt_includes_operator_instruction() -> None:
     assert "Incorporate the review and continue." in prompt
 
 
-def test_filter_model_inventory_tools_hides_unattached_skill_tools_until_discovered() -> None:
+def test_filter_model_inventory_tools_hides_attached_skill_tools_until_activated() -> None:
     agent = AgentDefinition(
         agent_id="agent-1",
         owner_email="user@example.com",
@@ -18000,15 +20875,9 @@ def test_filter_model_inventory_tools_hides_unattached_skill_tools_until_discove
         {"skill:unattached-skill:run_unattached"},
     )
 
-    assert [tool.name for tool in filtered] == ["skill_attached-skill__run_attached"]
-    assert [tool.name for tool in discovered] == [
-        "skill_attached-skill__run_attached",
-        "skill_unattached-skill__run_unattached",
-    ]
-    assert [tool.name for tool in activated] == [
-        "skill_attached-skill__run_attached",
-        "skill_unattached-skill__run_unattached",
-    ]
+    assert filtered == []
+    assert [tool.name for tool in discovered] == ["skill_unattached-skill__run_unattached"]
+    assert [tool.name for tool in activated] == ["skill_unattached-skill__run_unattached"]
 
 
 def test_initial_skill_tool_ids_include_auto_loaded_skill_tools() -> None:
@@ -18028,7 +20897,7 @@ def test_initial_skill_tool_ids_include_auto_loaded_skill_tools() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(
             agent_id="agent-1",
@@ -18042,7 +20911,6 @@ def test_initial_skill_tool_ids_include_auto_loaded_skill_tools() -> None:
     )
 
     assert agent_loop._get_initial_promoted_tool_ids(ctx) == {
-        "builtin:attached",
         "builtin:auto",
     }
     assert agent_loop._get_initial_activated_tool_ids(ctx) == {
@@ -18092,7 +20960,7 @@ def test_format_prior_step_outputs_full_includes_full_content() -> None:
             type="run",
             input=StepInputConfig(type="full", source="plan"),
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -18138,7 +21006,7 @@ def test_format_prior_step_outputs_summary_includes_deliverable_content() -> Non
             type="run",
             input=StepInputConfig(type="summary", source="implement"),
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -18184,7 +21052,7 @@ def test_format_prior_step_outputs_last_includes_deliverable_content() -> None:
             type="run",
             input=StepInputConfig(type="last", source="plan"),
         ),
-        session=SimpleNamespace(session_id="sess-1", intaris_session_id="sess-1"),
+        session=_SessionStub(session_id="sess-1", intaris_session_id="sess-1"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -18249,7 +21117,7 @@ async def test_resolve_task_pause_tool_retries_gate_with_note() -> None:
     agent_loop._task_queue = SimpleNamespace()
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18331,7 +21199,7 @@ async def test_resolve_task_pause_tool_does_not_bypass_non_retryable_gate() -> N
     agent_loop._task_queue = _TaskQueue()
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18399,7 +21267,7 @@ async def test_retry_task_tool_paused_task_without_gate_returns_tool_error() -> 
     agent_loop._task_queue = task_queue
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18447,7 +21315,7 @@ async def test_respond_task_input_tool_returns_error_without_answers() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18505,7 +21373,7 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18608,7 +21476,7 @@ async def test_get_task_tool_allows_bound_secondary_agent_access(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="review", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18700,7 +21568,7 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18768,7 +21636,7 @@ def test_tool_runtime_metadata_uses_executor_agent_for_runtime_access() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="implement", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -18826,7 +21694,7 @@ async def test_get_task_tool_allows_exact_creator_agent_for_delegated_task(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18881,7 +21749,7 @@ async def test_get_task_tool_allows_exact_creator_agent_for_delegated_task(
 
 
 @pytest.mark.asyncio
-async def test_get_task_tool_still_rejects_unrelated_agent(
+async def test_get_task_tool_still_rejects_unrelated_owner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _UnboundAgentRegistry:
@@ -18918,7 +21786,7 @@ async def test_get_task_tool_still_rejects_unrelated_agent(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -18928,7 +21796,7 @@ async def test_get_task_tool_still_rejects_unrelated_agent(
 
     async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
         del args, kwargs
-        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+        return SimpleNamespace(task_id="task-1", created_by="other@example.com", agent_id="agent-1")
 
     monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
     monkeypatch.setattr("cognis.core.agent_registry.AgentRegistry", _UnboundAgentRegistry)
@@ -18981,7 +21849,7 @@ async def test_get_task_tool_rejects_cross_user_task_even_for_system_agent(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="review", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -19199,7 +22067,7 @@ async def test_tool_output_artifact_uses_store_ttl_and_records_metadata(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -19276,7 +22144,7 @@ async def test_tool_output_artifact_cleanup_on_record_failure(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=CHAT_POLICY,
@@ -19474,6 +22342,119 @@ def test_append_tool_events_omit_phase_when_not_stamped() -> None:
     assert "assistant_phase_index" not in events[1].data
 
 
+def test_call_tool_event_rehydrates_visible_envelope_with_canonical_audit_identity() -> None:
+    from cognis.core.context import events_to_messages
+
+    envelope = {
+        "tool": "mcp:googleworkspace:search_gmail_messages",
+        "arguments": {"query": "invoice"},
+    }
+    tc = ToolCall(
+        call_id="call_gmail",
+        name="mcp_googleworkspace__search_gmail_messages",
+        arguments={"query": "invoice"},
+    )
+    tc.runtime_metadata["visible_arguments"] = envelope
+    events: list[SessionEvent] = []
+
+    _append_tool_call_event(
+        events,
+        tc,
+        "mcp:googleworkspace:search_gmail_messages",
+        visible_name="call_tool",
+    )
+    _append_tool_result_event(
+        events,
+        tc,
+        "found",
+        False,
+        tool_id="mcp:googleworkspace:search_gmail_messages",
+    )
+
+    assert events[0].data["name"] == "mcp_googleworkspace__search_gmail_messages"
+    assert events[0].data["canonical_name"] == "mcp_googleworkspace__search_gmail_messages"
+    assert events[0].data["tool_id"] == "mcp:googleworkspace:search_gmail_messages"
+    assert events[0].data["arguments"] == {"query": "invoice"}
+    assert events[0].data["visible_arguments"] == envelope
+
+    messages = events_to_messages(events)
+    tool_call = messages[0]["tool_calls"][0]
+    assert tool_call["id"] == "call_gmail"
+    assert tool_call["function"]["name"] == "call_tool"
+    assert json.loads(tool_call["function"]["arguments"]) == envelope
+    assert messages[1]["tool_call_id"] == "call_gmail"
+    assert messages[1]["content"] == "found"
+
+
+def test_regular_tool_event_preserves_bridge_envelope_for_replay() -> None:
+    from cognis.core.context import events_to_messages
+
+    envelope = {
+        "tool": "mcp:googleworkspace:search_gmail_messages",
+        "arguments": {"query": "invoice"},
+    }
+    tc = ToolCall(
+        call_id="call_gmail",
+        name="mcp_googleworkspace__search_gmail_messages",
+        arguments={"query": "invoice"},
+        runtime_metadata={
+            "visible_name": "call_tool",
+            "visible_arguments": envelope,
+        },
+    )
+    ctx = SimpleNamespace(tool_registry=None, current_turn_cycle_index=0)
+    event_data = _regular_tool_call_event_data(
+        ctx,
+        _PreparedRegularToolCall(
+            tool_call=tc,
+            tool_id="mcp:googleworkspace:search_gmail_messages",
+        ),
+    )
+    events = [SessionEvent(type="tool_call", data=event_data)]
+    _append_tool_result_event(
+        events,
+        tc,
+        "found",
+        False,
+        tool_id="mcp:googleworkspace:search_gmail_messages",
+    )
+
+    assert event_data["name"] == "mcp_googleworkspace__search_gmail_messages"
+    assert event_data["visible_name"] == "call_tool"
+    assert event_data["visible_arguments"] == envelope
+
+    messages = events_to_messages(events)
+    tool_call = messages[0]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "call_tool"
+    assert json.loads(tool_call["function"]["arguments"]) == envelope
+
+
+def test_mid_stream_notices_preserve_complete_provider_message() -> None:
+    provider_message = "provider detail " * 40
+    details = {"message": provider_message}
+
+    retry_notice = agent_loop_module._mid_stream_retry_notice(
+        provider_id="codex",
+        model="gpt-test",
+        details=details,
+        error="fallback",
+        delay_seconds=1.0,
+        attempt=1,
+        max_attempts=3,
+    )
+    exhausted_notice = agent_loop_module._mid_stream_exhausted_failure_notice(
+        provider_id="codex",
+        model="gpt-test",
+        details=details,
+        error="fallback",
+        attempts=3,
+        idle_timeout_seconds=30,
+    )
+
+    assert provider_message.strip() in retry_notice
+    assert provider_message.strip() in exhausted_notice
+
+
 def test_truncation_detection_prefers_post_rewrite_compact_output_size() -> None:
     complete_output = "image: tool_artifact:call-real-with-long-id:media:1"
     result, declared, detected = agent_loop_module._normalize_producer_truncation_metadata(
@@ -19493,7 +22474,10 @@ def test_truncation_detection_prefers_post_rewrite_compact_output_size() -> None
     assert result.metadata["compact_output_size"] == len(complete_output)
 
 
-def test_replay_recovers_exact_write_deliverable_validation_fingerprint() -> None:
+@pytest.mark.parametrize("tool_ref", ["write_deliverable", "builtin:write_deliverable"])
+def test_replay_recovers_exact_write_deliverable_validation_fingerprint(
+    tool_ref: str,
+) -> None:
     arguments = {
         "action": "rich:pulse",
         "format": "rich",
@@ -19509,9 +22493,7 @@ def test_replay_recovers_exact_write_deliverable_validation_fingerprint() -> Non
                     "type": "function",
                     "function": {
                         "name": "validate_tool_call",
-                        "arguments": json.dumps(
-                            {"tool": "write_deliverable", "arguments": arguments}
-                        ),
+                        "arguments": json.dumps({"tool": tool_ref, "arguments": arguments}),
                     },
                 }
             ],
@@ -19528,7 +22510,10 @@ def test_replay_recovers_exact_write_deliverable_validation_fingerprint() -> Non
     }
 
 
-def test_replay_accepts_only_receipt_from_matching_successful_validation_call() -> None:
+@pytest.mark.parametrize("tool_ref", ["write_deliverable", "builtin:write_deliverable"])
+def test_replay_accepts_only_receipt_from_matching_successful_validation_call(
+    tool_ref: str,
+) -> None:
     arguments = {"action": "write_deliverable", "content": "fallback"}
     payload_fingerprint = agent_loop_module.tool_call_fingerprint("write_deliverable", arguments)
     receipt = {
@@ -19543,9 +22528,7 @@ def test_replay_accepts_only_receipt_from_matching_successful_validation_call() 
                     "id": "validation",
                     "function": {
                         "name": "validate_tool_call",
-                        "arguments": json.dumps(
-                            {"tool": "write_deliverable", "arguments": arguments}
-                        ),
+                        "arguments": json.dumps({"tool": tool_ref, "arguments": arguments}),
                     },
                 },
                 {
@@ -19601,7 +22584,7 @@ def test_auto_loaded_skill_snapshot_remains_pinned_for_session() -> None:
         loaded_skill_snapshots={},
         loaded_skill_names=set(),
         agent=SimpleNamespace(skills={"_runtime_skill_summaries": [summary]}),
-        session=SimpleNamespace(session_id="session-daily"),
+        session=_SessionStub(session_id="session-daily"),
     )
     loop._initialize_loaded_skill_snapshots(first)
     summary.update(
@@ -19673,6 +22656,7 @@ def test_task_step_logs_promote_only_verified_nested_lazy_refs() -> None:
         ],
         last_seq=4,
         has_more=False,
+        next_after_seq=None,
         after_seq=0,
         limit=50,
         missing_stream=False,
@@ -19680,6 +22664,33 @@ def test_task_step_logs_promote_only_verified_nested_lazy_refs() -> None:
 
     assert result.metadata["recovered_lazy_artifact_refs"] == ["tool_artifact:call-child:media:1"]
     assert "tool_artifact:forged:media:1" not in result.output
+
+
+def test_task_step_logs_use_page_event_cursor_instead_of_stream_high_water() -> None:
+    result = AgentLoop._build_task_step_logs_result(
+        task_id="task-1",
+        step_run=SimpleNamespace(
+            step_name="brief",
+            attempt=1,
+            session_id="session-child",
+        ),
+        events=[
+            {
+                "type": "assistant_message",
+                "seq": 200,
+                "data": {"content": "page tail"},
+            }
+        ],
+        last_seq=1201,
+        has_more=True,
+        next_after_seq=200,
+        after_seq=0,
+        limit=200,
+        missing_stream=False,
+    )
+
+    assert "after_seq=200" in result.output
+    assert "after_seq=1201" not in result.output
 
 
 @pytest.mark.asyncio
@@ -19764,7 +22775,7 @@ async def test_finalize_regular_tool_result_derives_producer_truncation_and_reco
         )
         ctx = StepContext(
             step_definition=StepDefinition(name="direct", type="run", prompt=""),
-            session=SimpleNamespace(
+            session=_SessionStub(
                 session_id="sess-1",
                 intaris_session_id="sess-1",
                 user_email="user@example.com",
@@ -19877,7 +22888,7 @@ async def test_finalize_regular_tool_result_does_not_claim_disabled_store_recove
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -19941,7 +22952,7 @@ async def test_finalize_skill_load_emits_persisted_and_live_system_notice() -> N
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-skill-load",
             intaris_session_id="sess-skill-load",
             user_email="user@example.com",
@@ -20049,7 +23060,7 @@ async def test_finalize_regular_tool_result_uses_pressure_aware_ingestion_cap(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -20138,7 +23149,7 @@ async def test_tool_output_helper_results_recover_via_helper_call_id() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -20209,7 +23220,7 @@ async def test_finalize_regular_tool_result_records_file_diffs() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -20307,7 +23318,7 @@ async def test_finalize_regular_tool_result_never_promotes_tool_attachments() ->
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -20386,7 +23397,7 @@ async def test_finalize_persisted_output_attachments_do_not_advertise_redundant_
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             user_email="user@example.com",
@@ -20466,7 +23477,7 @@ async def test_get_task_step_output_returns_anchored_result(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -20545,6 +23556,89 @@ async def test_get_task_step_output_returns_anchored_result(
 
 
 @pytest.mark.asyncio
+async def test_get_task_step_output_selects_historical_run_by_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        policy=CHAT_POLICY,
+    )
+
+    async def _get_task(*args: object, **kwargs: object) -> SimpleNamespace:
+        del args, kwargs
+        return SimpleNamespace(task_id="task-1", created_by="user@example.com", agent_id="agent-1")
+
+    async def _list_step_runs(*args: object, **kwargs: object) -> list[SimpleNamespace]:
+        del args, kwargs
+        return [
+            SimpleNamespace(
+                step_run_id="sr-first",
+                step_name="execute",
+                status="failed",
+                attempt=1,
+                attempt_number=1,
+                session_id="sess-first",
+                conversation_id="conv-task-1",
+                started_at=None,
+                completed_at=None,
+                output={"summary": "First failure", "error": "Original error"},
+                evaluation=None,
+                todos=None,
+            ),
+            SimpleNamespace(
+                step_run_id="sr-second",
+                step_name="execute",
+                status="approved",
+                attempt=1,
+                attempt_number=2,
+                session_id="sess-second",
+                conversation_id="conv-task-2",
+                started_at=None,
+                completed_at=None,
+                output={"summary": "Retry succeeded"},
+                evaluation=None,
+                todos=None,
+            ),
+        ]
+
+    monkeypatch.setattr("cognis.store.queries.get_task", _get_task)
+    monkeypatch.setattr("cognis.store.queries.list_step_runs_for_task", _list_step_runs)
+
+    result = await agent_loop._handle_task_tool(
+        ToolCall(
+            call_id="call-history",
+            name="get_task_step_output",
+            arguments={"task_id": "task-1", "step_run_id": "sr-first"},
+        ),
+        ctx=ctx,
+        events_to_record=[],
+    )
+
+    payload = json.loads(result.output)
+    assert result.is_error is False
+    assert payload["step_run_id"] == "sr-first"
+    assert payload["summary"] == "First failure"
+    assert "Task attempt: 1" in str(result.metadata["stored_output"])
+
+
+@pytest.mark.asyncio
 async def test_get_task_step_logs_returns_anchored_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -20562,7 +23656,7 @@ async def test_get_task_step_logs_returns_anchored_result(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -20678,7 +23772,7 @@ async def test_get_task_step_logs_returns_structured_error_on_read_failure(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -20742,7 +23836,7 @@ async def test_workflow_tools_are_main_chat_only_in_delegate_sync_mode() -> None
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -20779,7 +23873,7 @@ async def test_create_workflow_tool_returns_created_workflow(
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="direct", type="run", prompt=""),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1", intaris_session_id="sess-1", user_email="user@example.com"
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
@@ -20834,7 +23928,7 @@ async def test_step_complete_uses_only_final_assistant_message_for_content() -> 
             prompt="Produce the final briefing.",
             require_deliverable=False,
         ),
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_id="sess-1",
             intaris_session_id="sess-1",
             mnemory_session_id=None,
@@ -20870,7 +23964,7 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="summary", type="run", prompt="Write the summary."),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -20904,7 +23998,7 @@ def test_plan_step_prompt_has_read_only_boundaries() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt="Create a plan."),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -20935,7 +24029,7 @@ def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
     )
     ctx = StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt="Create a plan."),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=WORKFLOW_POLICY,
@@ -20954,7 +24048,7 @@ def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
 def _post_deliverable_ctx() -> StepContext:
     return StepContext(
         step_definition=StepDefinition(name="plan", type="run", prompt="Plan."),
-        session=SimpleNamespace(session_id="sess-1", user_email="user@example.com"),
+        session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="A"),
         policy=WORKFLOW_POLICY,

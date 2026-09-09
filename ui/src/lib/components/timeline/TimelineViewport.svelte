@@ -37,6 +37,7 @@
     onJumpToBottom = undefined,
     onJumpToActiveStart = undefined,
     autoScrollOnResize = true,
+    interactionEnabled = true,
     testId = undefined,
     children
   } = $props<{
@@ -68,16 +69,20 @@
     onJumpToBottom?: (() => void) | undefined;
     onJumpToActiveStart?: ((request: { scrollTop: number; rowKey: string | null }) => void) | undefined;
     autoScrollOnResize?: boolean;
+    interactionEnabled?: boolean;
     testId?: string | undefined;
     children?: Snippet;
   }>();
 
   let programmaticScroll = false;
+  let programmaticScrollTarget: number | null = null;
+  let programmaticScrollGeneration = 0;
   let lastScrollTop = 0;
   let wasStreaming = $state(false);
   let activeContextElement = $state<HTMLElement | null>(null);
   let activeContextScrollable = $state(false);
   let contextNavigationRequested = $state(false);
+  let trustedScrollIntent = false;
   const computedHasStreamingItems = $derived(
     items.some((item: TimelineItem) => (
       item.stable === false || item.status === 'running'
@@ -98,15 +103,41 @@
   function viewportEvents(node: HTMLDivElement, handlers: ViewportEventHandlers) {
     let current = handlers;
     const handleScrollEvent = (event: Event): void => {
+      if (!interactionEnabled) return;
       handleScroll(event);
       current.onScroll?.(event);
     };
-    const handleWheelEvent = (event: WheelEvent): void => current.onWheel?.(event);
-    const handleTouchStartEvent = (event: TouchEvent): void => current.onTouchStart?.(event);
-    const handleTouchMoveEvent = (event: TouchEvent): void => current.onTouchMove?.(event);
-    const handleTouchEndEvent = (event: TouchEvent): void => current.onTouchEnd?.(event);
-    const handleKeydownEvent = (event: KeyboardEvent): void => current.onKeydown?.(event);
-    const handlePointerDownEvent = (): void => current.onPointerDown?.();
+    const handleWheelEvent = (event: WheelEvent): void => {
+      if (!interactionEnabled) return;
+      programmaticScrollTarget = null;
+      trustedScrollIntent = true;
+      current.onWheel?.(event);
+    };
+    const handleTouchStartEvent = (event: TouchEvent): void => {
+      if (!interactionEnabled) return;
+      programmaticScrollTarget = null;
+      trustedScrollIntent = true;
+      current.onTouchStart?.(event);
+    };
+    const handleTouchMoveEvent = (event: TouchEvent): void => {
+      if (interactionEnabled) current.onTouchMove?.(event);
+    };
+    const handleTouchEndEvent = (event: TouchEvent): void => {
+      if (interactionEnabled) current.onTouchEnd?.(event);
+    };
+    const handleKeydownEvent = (event: KeyboardEvent): void => {
+      if (!interactionEnabled) return;
+      if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+        programmaticScrollTarget = null;
+        trustedScrollIntent = true;
+      }
+      current.onKeydown?.(event);
+    };
+    const handlePointerDownEvent = (): void => {
+      if (!interactionEnabled) return;
+      programmaticScrollTarget = null;
+      current.onPointerDown?.();
+    };
 
     node.addEventListener('scroll', handleScrollEvent);
     node.addEventListener('wheel', handleWheelEvent);
@@ -134,32 +165,63 @@
 
   function scrollToBottom(force = false): void {
     if (!viewportElement || (!force && userScrolledUp)) return;
-    programmaticScroll = true;
+    const viewport = viewportElement;
     requestAnimationFrame(() => {
-      if (viewportElement) {
-        viewportElement.scrollTop = viewportElement.scrollHeight;
-        lastScrollTop = viewportElement.scrollTop;
-      }
-      programmaticScroll = false;
+      if (viewportElement === viewport) setProgrammaticScrollTop(viewport.scrollHeight);
     });
+  }
+
+  export function setProgrammaticScrollTop(scrollTop: number): void {
+    if (!viewportElement) return;
+    const viewport = viewportElement;
+    const generation = ++programmaticScrollGeneration;
+    programmaticScroll = true;
+    contextNavigationRequested = false;
+    viewport.scrollTop = scrollTop;
+    lastScrollTop = viewport.scrollTop;
+    programmaticScrollTarget = lastScrollTop;
+    requestAnimationFrame(() => {
+      if (generation === programmaticScrollGeneration && viewportElement === viewport) {
+        programmaticScroll = false;
+      }
+    });
+  }
+
+  export function scrollProgrammaticallyToBottom(): void {
+    if (!viewportElement) return;
+    userScrolledUp = false;
+    setProgrammaticScrollTop(viewportElement.scrollHeight);
   }
 
   function handleScroll(event: Event): void {
     if (!viewportElement) return;
-    if (!event.isTrusted || !programmaticScroll) contextNavigationRequested = true;
+    const hasTrustedIntent = trustedScrollIntent;
+    trustedScrollIntent = false;
     const currentScrollTop = viewportElement.scrollTop;
+    const reachedProgrammaticTarget = (
+      programmaticScrollTarget !== null
+      && Math.abs(currentScrollTop - programmaticScrollTarget) <= 1
+    );
+    if (programmaticScroll || reachedProgrammaticTarget || (!event.isTrusted && !hasTrustedIntent)) {
+      if (reachedProgrammaticTarget) programmaticScrollTarget = null;
+      lastScrollTop = currentScrollTop;
+      updateActiveContext();
+      return;
+    }
+    const direction = Math.sign(currentScrollTop - lastScrollTop);
     const distanceFromBottom = viewportElement.scrollHeight - viewportElement.scrollTop - viewportElement.clientHeight;
 
-    if (distanceFromBottom > 24) {
+    if (direction < 0 && distanceFromBottom > 24) {
       userScrolledUp = true;
-    } else {
+      contextNavigationRequested = true;
+    } else if (distanceFromBottom <= 24) {
       userScrolledUp = false;
       contextNavigationRequested = false;
     }
 
     lastScrollTop = currentScrollTop;
     updateActiveContext();
-    if (currentScrollTop <= 24) onNearTop?.();
+    if (direction < 0 && currentScrollTop <= 24) onNearTop?.();
   }
 
   function updateActiveContext(): void {
@@ -302,7 +364,7 @@
 
   {#if userScrolledUp || (contextNavigationRequested && activeContextScrollable)}
     <nav
-      class="sticky bottom-[max(.25rem,env(safe-area-inset-bottom))] left-1/2 z-10 flex w-fit max-w-[calc(100%-env(safe-area-inset-left)-env(safe-area-inset-right)-1rem)] -translate-x-1/2 items-center gap-1 rounded-full border border-slate-700 bg-slate-900/95 p-1 shadow-lg backdrop-blur"
+      class="sticky bottom-1 left-1/2 z-10 flex w-fit max-w-[calc(100%-env(safe-area-inset-left)-env(safe-area-inset-right)-1rem)] -translate-x-1/2 items-center gap-1 rounded-full border border-slate-700 bg-slate-900/95 p-1 shadow-lg backdrop-blur"
       aria-label="Message navigation"
       data-testid={testId ? `${testId}-navigation-cluster` : undefined}
     >

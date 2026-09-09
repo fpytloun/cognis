@@ -22,6 +22,9 @@ HA_E2E_PROJECT ?= cognis-ha-e2e
 COMPOSE_HA_E2E := $(DOCKER_COMPOSE) --project-name $(HA_E2E_PROJECT) --env-file .local/cognis-ha-e2e/current/compose.env -f compose.local.yml -f compose.e2e.yml -f compose.ha-e2e.yml
 COMPOSE_REDIS_HA_E2E := $(COMPOSE_HA_E2E) -f compose.redis-ha-e2e.yml
 PYTHON ?= python3
+# The unit suite loads a large application graph per worker. Leave capacity for
+# the controller and concurrent development tools on typical 8-core/16-GiB hosts.
+PYTEST_XDIST_WORKERS ?= 2
 
 # ---------------------------------------------------------------------------
 # E2E stack lifecycle
@@ -44,10 +47,12 @@ e2e-seed:
 	$(COMPOSE_E2E) up -d --force-recreate --no-deps cognis-executor
 	@EMAIL=$${COGNIS_LOCAL_ADMIN_EMAIL:-admin@cognis-e2e.localdev.me}; \
 	PASSWORD=$${COGNIS_LOCAL_ADMIN_PASSWORD:-cognis-local-admin}; \
+	COOKIE_JAR=$$(mktemp); \
+	trap 'rm -f "$$COOKIE_JAR"' EXIT; \
 	READY=0; \
 	for i in $$(seq 1 24); do \
-		TOKEN=$$(curl -s -X POST http://localhost:8080/api/auth/login -H 'Content-Type: application/json' --data "{\"email\":\"$$EMAIL\",\"password\":\"$$PASSWORD\"}" | $(PYTHON) -c 'import json,sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || true); \
-		STATE=$$(curl -s -H "Authorization: Bearer $$TOKEN" http://localhost:8080/api/v1/executors | $(PYTHON) -c 'import json,sys; data=json.load(sys.stdin); print(next((e.get("runtime_state") for e in data if e.get("executor_id")=="local-compose-executor"), "missing"))' 2>/dev/null || true); \
+		curl -s -c "$$COOKIE_JAR" -X POST http://localhost:8080/api/auth/login -H 'Content-Type: application/json' --data "{\"email\":\"$$EMAIL\",\"password\":\"$$PASSWORD\"}" >/dev/null; \
+		STATE=$$(curl -s -b "$$COOKIE_JAR" http://localhost:8080/api/v1/executors | $(PYTHON) -c 'import json,sys; data=json.load(sys.stdin); print(next((e.get("runtime_state") for e in data if e.get("executor_id")=="local-compose-executor"), "missing"))' 2>/dev/null || true); \
 		echo "E2E executor state: $$STATE"; \
 		if [ "$$STATE" = "active" ]; then READY=1; break; fi; \
 		sleep 5; \
@@ -59,8 +64,17 @@ e2e-seed:
 	$(PYTHON) scripts/wait_e2e_chat_ready.py
 	@echo "E2E environment seeded."
 
+.PHONY: e2e-seed-work-conformance
+e2e-seed-work-conformance:
+	$(COMPOSE_E2E) run --rm -e WORK_CONFORMANCE_CONFIGURE_ONLY=true seed-work-conformance
+	$(COMPOSE_E2E) restart cognis
+	$(COMPOSE_E2E) up -d --wait --no-deps cognis
+	$(COMPOSE_E2E) run --rm seed-work-conformance
+	@echo "Work Activity conformance fixtures seeded."
+
 .PHONY: e2e-down
 e2e-down:
+	@$(COMPOSE_E2E) run --rm --no-deps -e WORK_CONFORMANCE_RESTORE_ONLY=true seed-work-conformance
 	$(COMPOSE_E2E) down
 
 .PHONY: e2e-logs
@@ -133,9 +147,12 @@ e2e-promote:
 # Regular test targets
 # ---------------------------------------------------------------------------
 
-.PHONY: test
+.PHONY: test test-serial
 test:
-	uv run pytest tests/unit/ -v
+	uv run pytest tests/unit/ -v -n $(PYTEST_XDIST_WORKERS)
+
+test-serial:
+	uv run pytest tests/unit/ -v -n 0
 
 .PHONY: test-ui
 test-ui:

@@ -14,20 +14,27 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 from cognis.core.agent_direct import is_agent_direct_context
-from cognis.core.agent_loop import PauseResolution
+from cognis.core.agent_loop import PauseResolution, PendingPause
 from cognis.core.agent_profiles import (
     resolve_agent_profile,
     resolve_conversation_agent_profile,
 )
 from cognis.core.chat_modes import CHAT_MODE_CONTEXT_KEY, ChatMode, chat_mode_system_message
 from cognis.core.compaction import CompactionModelContext
+from cognis.core.events import Event, EventType
 from cognis.core.long_lived_chat import is_channel_context_type
 from cognis.core.notifications import NotificationType
+from cognis.core.runtime_selection import (
+    RuntimeSelectionPlan,
+    persist_runtime_selection,
+    resolve_runtime_selection,
+)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import NORMALIZED_REASONING_LEVELS
@@ -349,6 +356,24 @@ class CommandDispatcher:
     def _agent_loop(self) -> Any | None:
         return getattr(self._turn_scheduler, "_agent_loop", None)
 
+    async def _publish_compaction_event(
+        self,
+        event_type: EventType,
+        data: dict[str, Any],
+        *,
+        session: SessionModel | None = None,
+    ) -> None:
+        if event_type == EventType.SESSION_COMPACTION_FINISHED:
+            persist_terminal = getattr(self._agent_loop(), "persist_compaction_terminal", None)
+            if callable(persist_terminal):
+                if session is None:
+                    raise RuntimeError("Cannot persist terminal compaction event without a session")
+                await persist_terminal(session, data)
+        event_bus = getattr(self._agent_loop(), "event_bus", None)
+        publish = getattr(event_bus, "publish", None)
+        if callable(publish):
+            await publish(Event(type=event_type, data=data))
+
     @contextlib.asynccontextmanager
     async def _hold_session_lock(self, session_id: str) -> AsyncIterator[None]:
         agent_loop = self._agent_loop()
@@ -540,11 +565,7 @@ class CommandDispatcher:
         if not available and current_model:
             available = _infer_reasoning_efforts(current_model)
         levels = list(dict.fromkeys(["default", "off", *available, *NORMALIZED_REASONING_LEVELS]))
-        current_effort = (
-            self._session_cache.get_reasoning_effort_override(session.session_id)
-            if session is not None
-            else None
-        )
+        current_effort = session.reasoning_effort_override if session is not None else None
         matches = [level for level in levels if _matches_suggestion(partial, level)]
         matches = _ranked(matches, partial, lambda item: item, lambda item: item)
         suggestions: list[SlashCommandSuggestion] = []
@@ -736,7 +757,7 @@ class CommandDispatcher:
     def _current_model_id(self, session: SessionModel | None) -> str | None:
         if session is None:
             return None
-        current = self._session_cache.get_model_override(session.session_id)
+        current = session.model_override
         if current:
             return str(current)
         usage = self._session_cache.get_context_usage(session.session_id)
@@ -754,6 +775,7 @@ class CommandDispatcher:
         user_email: str,
         has_active_turn: bool = False,
         has_busy_turn: bool | None = None,
+        runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult | None:
         """Dispatch a slash command. Returns None if not a command."""
         stripped = normalize_slash_command_message(command)
@@ -833,13 +855,13 @@ class CommandDispatcher:
 
         # /benchmark [quick|full]
         if stripped == "/benchmark" or stripped.startswith("/benchmark "):
-            mode = stripped.removeprefix("/benchmark").strip() or "quick"
-            return self._handle_benchmark(session, mode)
+            benchmark_mode = stripped.removeprefix("/benchmark").strip() or "quick"
+            return self._handle_benchmark(session, benchmark_mode)
 
         # /plan, /build, /default persistent chat mode switches. One-shot
         # forms with trailing text are parsed by turn submission.
         if stripped in ("/plan", "/build", "/default"):
-            mode: ChatMode = stripped[1:]  # type: ignore[assignment]
+            mode: ChatMode = cast(ChatMode, stripped[1:])
             return await self._handle_chat_mode(conversation, mode)
         if stripped.startswith(("/plan ", "/build ", "/default ")):
             return None
@@ -847,7 +869,9 @@ class CommandDispatcher:
         # /info
         if stripped == "/info":
             return await self._handle_info(
+                conversation,
                 session,
+                agent,
                 has_active_turn=has_active_turn,
                 has_busy_turn=has_busy_turn,
             )
@@ -856,20 +880,39 @@ class CommandDispatcher:
         if stripped == "/model" or stripped.startswith("/model "):
             arg = stripped[6:].strip() if len(stripped) > 6 else ""
             return self._mark_command_result(
-                await self._handle_model(session, arg, user_email=user_email),
+                await self._handle_model(
+                    conversation,
+                    session,
+                    agent,
+                    arg,
+                    user_email=user_email,
+                    runtime_plan=runtime_plan,
+                ),
                 "/model",
             )
 
         # /thinking [level]
         if stripped == "/thinking" or stripped.startswith("/thinking "):
             arg = stripped[9:].strip() if len(stripped) > 9 else ""
-            return self._mark_command_result(await self._handle_thinking(session, arg), "/thinking")
+            return self._mark_command_result(
+                await self._handle_thinking(
+                    conversation, session, agent, arg, runtime_plan=runtime_plan
+                ),
+                "/thinking",
+            )
 
         # /fast [on|off|default]
         if stripped == "/fast" or stripped.startswith("/fast "):
             arg = stripped[len("/fast") :].strip()
             return self._mark_command_result(
-                await self._handle_fast(session, agent, arg, user_email=user_email),
+                await self._handle_fast(
+                    conversation,
+                    session,
+                    agent,
+                    arg,
+                    user_email=user_email,
+                    runtime_plan=runtime_plan,
+                ),
                 "/fast",
             )
 
@@ -877,7 +920,9 @@ class CommandDispatcher:
         if stripped == "/profile" or stripped.startswith("/profile "):
             arg = stripped[len("/profile") :].strip() if len(stripped) > len("/profile") else ""
             return self._mark_command_result(
-                await self._handle_profile(conversation, session, agent, arg),
+                await self._handle_profile(
+                    conversation, session, agent, arg, runtime_plan=runtime_plan
+                ),
                 "/profile",
             )
 
@@ -968,26 +1013,10 @@ class CommandDispatcher:
         agent: AgentDefinition,
         user_email: str | None,
     ) -> CompactionModelContext:
-        resolved_profile = resolve_conversation_agent_profile(agent, session)
-        model_override = self._session_cache.get_model_override(session.session_id)
-        model_override_provider_id = self._session_cache.get_model_override_provider_id(
-            session.session_id
-        )
-        reasoning_override = self._session_cache.get_reasoning_effort_override(session.session_id)
-        if model_override:
-            explicit_model = model_override
-            provider_id = model_override_provider_id
-        else:
-            explicit_model = resolved_profile.model or (
-                agent.llm_config.model if agent.llm_config else None
-            )
-            provider_id = resolved_profile.provider_id or (
-                agent.llm_config.provider_id if agent.llm_config else None
-            )
-        reasoning_effort = reasoning_override or (
-            resolved_profile.reasoning_effort
-            or (agent.llm_config.reasoning_effort if agent.llm_config else None)
-        )
+        selection = resolve_runtime_selection(agent, session)
+        explicit_model = selection.model
+        provider_id = selection.provider_id
+        reasoning_effort = selection.reasoning_effort
         if explicit_model:
             return CompactionModelContext(
                 model=explicit_model,
@@ -1043,15 +1072,39 @@ class CommandDispatcher:
                     lock_session_id = session.session_id
                     continue
 
+                compaction_id = f"compact_{uuid.uuid4().hex[:12]}"
+                await self._publish_compaction_event(
+                    EventType.SESSION_COMPACTION_STARTED,
+                    {
+                        "conversation_id": conversation_id,
+                        "session_id": session.session_id,
+                        "trigger": "manual",
+                        "status": "running",
+                        "reason": "manual_request",
+                        "compaction_id": compaction_id,
+                    },
+                )
                 try:
+                    model_context = await self._compaction_model_context(session, agent, user_email)
+                    model_context.compaction_id = compaction_id
                     compaction_result = await self._compaction_strategy.compact(
                         session,
                         trigger="manual",
-                        model_context=await self._compaction_model_context(
-                            session, agent, user_email
-                        ),
+                        model_context=model_context,
                     )
                 except Exception:
+                    await self._publish_compaction_event(
+                        EventType.SESSION_COMPACTION_FINISHED,
+                        {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "trigger": "manual",
+                            "status": "failed",
+                            "reason": "compaction_failed",
+                            "compaction_id": compaction_id,
+                        },
+                        session=session,
+                    )
                     logger.exception(
                         "Command /compact failed",
                         extra={"extra_data": {"session_id": session.session_id}},
@@ -1063,6 +1116,18 @@ class CommandDispatcher:
                     )
 
                 if not compaction_result.compacted or compaction_result.turns_compacted <= 0:
+                    await self._publish_compaction_event(
+                        EventType.SESSION_COMPACTION_FINISHED,
+                        {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "trigger": "manual",
+                            "status": "skipped",
+                            "reason": "not_enough_history",
+                            "compaction_id": compaction_id,
+                        },
+                        session=session,
+                    )
                     if compaction_result.method == "llm_failed":
                         return CommandResult(
                             type="error",
@@ -1085,11 +1150,33 @@ class CommandDispatcher:
                         completion_reason="compacted",
                         transition=SessionTransition.COMPACT,
                         compaction_summary=compaction_result.summary,
+                        compaction_summary_event_data={
+                            "method": compaction_result.method,
+                            "turns_compacted": compaction_result.turns_compacted,
+                            "trigger": "manual",
+                            "status": "compacted",
+                            "tokens_before": getattr(compaction_result, "tokens_before", None),
+                            "tokens_after": getattr(compaction_result, "tokens_after", None),
+                            "reason": getattr(compaction_result, "reason", None),
+                            "compaction_id": compaction_id,
+                        },
                         tail_events=getattr(compaction_result, "preserved_tail_events", None),
                     )
                     if compaction_result.summary:
                         await self._session_cache.refresh(new_session)
                 except Exception:
+                    await self._publish_compaction_event(
+                        EventType.SESSION_COMPACTION_FINISHED,
+                        {
+                            "conversation_id": conversation_id,
+                            "session_id": session.session_id,
+                            "trigger": "manual",
+                            "status": "failed",
+                            "reason": "rotation_failed",
+                            "compaction_id": compaction_id,
+                        },
+                        session=session,
+                    )
                     logger.exception(
                         "Command /compact rotation failed",
                         extra={"extra_data": {"session_id": session.session_id}},
@@ -1104,6 +1191,20 @@ class CommandDispatcher:
                     )
 
                 summary_preview = (compaction_result.summary or "")[:500]
+                await self._publish_compaction_event(
+                    EventType.SESSION_COMPACTED,
+                    {
+                        "conversation_id": conversation_id,
+                        "session_id": new_session.session_id,
+                        "previous_session_id": session.session_id,
+                        "summary_preview": summary_preview,
+                        "method": compaction_result.method,
+                        "compaction_id": compaction_id,
+                        "turns_compacted": compaction_result.turns_compacted,
+                        "trigger": "manual",
+                        "status": "compacted",
+                    },
+                )
                 return CommandResult(
                     type="session_compacted",
                     text="Conversation history compacted.",
@@ -1339,6 +1440,7 @@ class CommandDispatcher:
                 new_conversation.conversation_id,
                 fork_message,
                 user_email=user_email,
+                admission_origin=None,
             )
             data["initial_message_submitted"] = turn_error is None
             if turn_error is not None:
@@ -1640,7 +1742,9 @@ class CommandDispatcher:
 
     async def _handle_info(
         self,
+        conversation: ConversationModel,
         session: SessionModel,
+        agent: AgentDefinition,
         *,
         has_active_turn: bool = False,
         has_busy_turn: bool | None = None,
@@ -1673,10 +1777,26 @@ class CommandDispatcher:
         lines.append(f"Session lifecycle: {current_session.status}")
         self._append_session_metadata(lines, current_session)
 
-        # Context usage + model + thinking effort
+        # Selected runtime describes the next turn. Usage and generation data
+        # describe completed provider calls and must remain visibly separate.
+        runtime_selection = resolve_runtime_selection(agent, current_session, conversation)
+        selected_model = runtime_selection.model or "provider default"
+        if runtime_selection.provider_id and runtime_selection.model:
+            selected_model = f"{runtime_selection.provider_id}/{runtime_selection.model}"
+        lines.append(
+            f"Selected model: {selected_model} ({runtime_selection.model_source.replace('_', ' ')})"
+        )
+        lines.append(
+            "Selected thinking effort: "
+            f"{runtime_selection.reasoning_effort or 'default'} "
+            f"({runtime_selection.reasoning_effort_source})"
+        )
+        lines.append(
+            f"Selected profile: {runtime_selection.profile_id} ({runtime_selection.profile_source})"
+        )
         usage = self._session_cache.get_context_usage(current_session.session_id)
         if usage:
-            lines.append(f"Model: {usage['model']}")
+            lines.append(f"Last context model: {usage['model']}")
             model_info = await self._get_context_usage_model_info(usage)
             if model_info is not None:
                 lines.append(f"Model context window: {model_info.context_window:,} tokens")
@@ -1757,9 +1877,6 @@ class CommandDispatcher:
             if performance.get("digest"):
                 lines.append(f"  Digest: {performance['digest']}")
             lines.append(f"  Measured: {performance['measured_at']}")
-        reasoning = self._session_cache.get_reasoning_effort_override(current_session.session_id)
-        if reasoning:
-            lines.append(f"Thinking effort: {reasoning}")
         tool_runtime = self._session_cache.get_tool_runtime_info(current_session.session_id)
         if tool_runtime:
             executor_id = tool_runtime.get("executor_id")
@@ -2035,14 +2152,15 @@ class CommandDispatcher:
 
     async def _handle_model(
         self,
+        conversation: ConversationModel,
         session: SessionModel,
+        agent: AgentDefinition,
         arg: str,
         *,
         user_email: str,
+        runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult:
         """Handle /model [name] — list or switch LLM model."""
-        session_id = session.session_id
-
         if not arg:
             # List available models
             try:
@@ -2058,12 +2176,13 @@ class CommandDispatcher:
             except Exception:
                 model_refs = []
 
-            current = self._session_cache.get_model_override(session_id)
-            current_provider = self._session_cache.get_model_override_provider_id(session_id)
+            selection = resolve_runtime_selection(agent, session, conversation)
+            current = selection.model
+            current_provider = selection.provider_id
             if not current:
-                usage = self._session_cache.get_context_usage(session_id)
-                current = usage["model"] if usage else None
-                current_provider = usage.get("provider_id") if usage else None
+                usage = self._session_cache.get_context_usage(session.session_id)
+                current = str((usage or {}).get("model") or "") or None
+                current_provider = str((usage or {}).get("provider_id") or "") or None
 
             if not model_refs:
                 return CommandResult(
@@ -2117,22 +2236,37 @@ class CommandDispatcher:
             model_id = arg
             provider_id = None
 
-        self._session_cache.set_model_override(session_id, model_id, provider_id=provider_id)
+        await persist_runtime_selection(
+            session_factory=self._session_factory,
+            session_cache=self._session_cache,
+            conversation=conversation,
+            session=session,
+            model_override=model_id,
+            model_override_provider_id=provider_id,
+            runtime_plan=runtime_plan,
+        )
+        selection = resolve_runtime_selection(agent, session, conversation)
         selected = f"{provider_id}/{model_id}" if provider_id else model_id
         return CommandResult(
             type="system_message",
             text=f"Model switched to: {selected}\nTakes effect on next message.",
+            data={"runtime_selection": selection.as_dict()},
         )
 
-    async def _handle_thinking(self, session: SessionModel, arg: str) -> CommandResult:
+    async def _handle_thinking(
+        self,
+        conversation: ConversationModel,
+        session: SessionModel,
+        agent: AgentDefinition,
+        arg: str,
+        *,
+        runtime_plan: RuntimeSelectionPlan | None = None,
+    ) -> CommandResult:
         """Handle /thinking [level] — list or switch reasoning effort."""
-        session_id = session.session_id
-
         # Determine current model for effort level inference
-        current_model = self._session_cache.get_model_override(session_id)
-        if not current_model:
-            usage = self._session_cache.get_context_usage(session_id)
-            current_model = usage["model"] if usage else ""
+        selection = resolve_runtime_selection(agent, session, conversation)
+        usage = self._session_cache.get_context_usage(session.session_id)
+        current_model = selection.model or str((usage or {}).get("model") or "")
 
         # Get supported effort levels
         capability_lookup_succeeded = False
@@ -2149,7 +2283,7 @@ class CommandDispatcher:
         if not available and current_model and not capability_lookup_succeeded:
             available = _infer_reasoning_efforts(current_model)
 
-        current_effort = self._session_cache.get_reasoning_effort_override(session_id)
+        current_effort = session.reasoning_effort_override
 
         if not arg:
             lines = []
@@ -2177,10 +2311,19 @@ class CommandDispatcher:
 
         # Reset
         if normalized_arg == "default":
-            self._session_cache.set_reasoning_effort_override(session_id, None)
+            await persist_runtime_selection(
+                session_factory=self._session_factory,
+                session_cache=self._session_cache,
+                conversation=conversation,
+                session=session,
+                reasoning_effort_override=None,
+                runtime_plan=runtime_plan,
+            )
+            selection = resolve_runtime_selection(agent, session, conversation)
             return CommandResult(
                 type="system_message",
                 text="Thinking effort reset to default.",
+                data={"runtime_selection": selection.as_dict()},
             )
 
         if current_model and capability_lookup_succeeded and not available:
@@ -2195,38 +2338,39 @@ class CommandDispatcher:
                 text=f"Unsupported level: {normalized_arg}\nAvailable: {', '.join(available)}",
             )
 
-        self._session_cache.set_reasoning_effort_override(session_id, normalized_arg)
+        await persist_runtime_selection(
+            session_factory=self._session_factory,
+            session_cache=self._session_cache,
+            conversation=conversation,
+            session=session,
+            reasoning_effort_override=normalized_arg,
+            runtime_plan=runtime_plan,
+        )
+        selection = resolve_runtime_selection(agent, session, conversation)
         return CommandResult(
             type="system_message",
             text=f"Thinking effort set to: {normalized_arg}\nTakes effect on next message.",
+            data={"runtime_selection": selection.as_dict()},
         )
 
     async def _handle_fast(
         self,
+        conversation: ConversationModel,
         session: SessionModel,
         agent: AgentDefinition,
         arg: str,
         *,
         user_email: str | None,
+        runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult:
         """Handle /fast [on|off|default] for the current session model."""
         session_id = session.session_id
-        current_model = self._session_cache.get_model_override(session_id)
+        selection = resolve_runtime_selection(agent, session, conversation)
+        current_model = selection.model
         usage = self._session_cache.get_context_usage(session_id)
         if not current_model:
             current_model = str((usage or {}).get("model") or "")
-        resolved_profile = resolve_conversation_agent_profile(agent, session)
-        if not current_model:
-            current_model = resolved_profile.model or (
-                agent.llm_config.model if agent.llm_config else ""
-            )
-        provider_id = self._session_cache.get_model_override_provider_id(session_id) or (
-            str((usage or {}).get("provider_id") or "") or None
-        )
-        if provider_id is None:
-            provider_id = resolved_profile.provider_id or (
-                agent.llm_config.provider_id if agent.llm_config else None
-            )
+        provider_id = selection.provider_id or (str((usage or {}).get("provider_id") or "") or None)
 
         supports_fast_mode = False
         if current_model and self._providers is not None and getattr(self._providers, "llm", None):
@@ -2247,7 +2391,7 @@ class CommandDispatcher:
                     exc_info=True,
                 )
 
-        current = self._session_cache.get_fast_mode_override(session_id)
+        current = session.fast_mode_override
         if not arg:
             state = "default" if current is None else ("on" if current else "off")
             support = "supported" if supports_fast_mode else "not supported"
@@ -2261,10 +2405,19 @@ class CommandDispatcher:
 
         normalized = arg.strip().lower()
         if normalized in {"default", "reset"}:
-            self._session_cache.set_fast_mode_override(session_id, None)
+            await persist_runtime_selection(
+                session_factory=self._session_factory,
+                session_cache=self._session_cache,
+                conversation=conversation,
+                session=session,
+                fast_mode_override=None,
+                runtime_plan=runtime_plan,
+            )
+            selection = resolve_runtime_selection(agent, session, conversation)
             return CommandResult(
                 type="system_message",
                 text="Fast mode reset to the agent/profile default.",
+                data={"runtime_selection": selection.as_dict()},
             )
         if normalized not in {"on", "off"}:
             return CommandResult(type="system_message", text="Usage: /fast <on|off|default>")
@@ -2273,10 +2426,19 @@ class CommandDispatcher:
                 type="system_message",
                 text=f"Current model {current_model!r} does not support fast mode.",
             )
-        self._session_cache.set_fast_mode_override(session_id, normalized == "on")
+        await persist_runtime_selection(
+            session_factory=self._session_factory,
+            session_cache=self._session_cache,
+            conversation=conversation,
+            session=session,
+            fast_mode_override=normalized == "on",
+            runtime_plan=runtime_plan,
+        )
+        selection = resolve_runtime_selection(agent, session, conversation)
         return CommandResult(
             type="system_message",
             text=f"Fast mode {'enabled' if normalized == 'on' else 'disabled'}.\nTakes effect on next message.",
+            data={"runtime_selection": selection.as_dict()},
         )
 
     async def _handle_profile(
@@ -2285,6 +2447,8 @@ class CommandDispatcher:
         session: SessionModel,
         agent: AgentDefinition,
         arg: str,
+        *,
+        runtime_plan: RuntimeSelectionPlan | None = None,
     ) -> CommandResult:
         """Handle /profile [id] — list or switch the current agent runtime profile."""
 
@@ -2327,14 +2491,19 @@ class CommandDispatcher:
             session=session,
             profile_id=resolved.profile_id,
             persist_conversation=True,
+            runtime_plan=runtime_plan,
         )
+        selection = resolve_runtime_selection(agent, session, conversation)
         return CommandResult(
             type="system_message",
             text=(
                 f"Agent profile switched to: {resolved.profile_id}\n"
                 "Cleared /model, /thinking, and /fast overrides. Takes effect on next message."
             ),
-            data=resolved.audit_metadata(),
+            data={
+                **resolved.audit_metadata(),
+                "runtime_selection": selection.as_dict(),
+            },
         )
 
     async def _handle_skill(
@@ -2908,6 +3077,25 @@ class CommandDispatcher:
             pause_type="escalation",
             conversation_id=conversation_id,
         )
+        find_durable = getattr(
+            self._notification_service,
+            "find_oldest_pending_escalation",
+            None,
+        )
+        if pending is None and callable(find_durable):
+            durable = await find_durable(user_email=user_email, conversation_id=conversation_id)
+            if durable is not None:
+                pending = PendingPause(
+                    pause_id=durable.notification_id,
+                    pause_type="escalation",
+                    session_id=durable.session_id,
+                    conversation_id=durable.conversation_id,
+                    context={
+                        "call_id": durable.payload.get("call_id"),
+                        "tool_call_id": durable.payload.get("tool_call_id"),
+                        "tool_name": durable.payload.get("tool_name"),
+                    },
+                )
         if pending is None:
             return CommandResult(
                 type="system_message",

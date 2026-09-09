@@ -1,8 +1,11 @@
 import type {
+  BackgroundWorkProjection,
   ChatMode,
   ChatModeSource,
   Conversation,
+  ConversationPendingSummary,
   ConversationStateEnvelope,
+  Escalation,
   LastOpenedConversationCandidate,
   QuestionSetQuestion,
   QuestionSetReply,
@@ -11,11 +14,27 @@ import type {
 } from '$lib/types/api';
 import { isAuthChallengeToolCall } from '$lib/chat-v2/selectors';
 import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
-import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
+import type { ChatSnapshot, TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 
 export interface ConversationRetryScope {
   sessions: boolean;
   history: boolean;
+}
+
+export function canShowConversationLifecycleActions(
+  scope: TimelineScope | null,
+  rootConversationId: string | null,
+  childViewActive: boolean,
+  taskControlMode: boolean,
+  agentDirectConversation: boolean,
+): boolean {
+  return (
+    !childViewActive
+    && scope?.kind === 'conversation'
+    && scope.conversation_id === rootConversationId
+    && !taskControlMode
+    && !agentDirectConversation
+  );
 }
 
 export type ConversationStatusFilter = 'active' | 'starred' | 'archived' | 'all' | 'task';
@@ -26,19 +45,43 @@ export const DEFAULT_INITIAL_TIMELINE_LIMIT = 200;
 export const DIRECT_CHAT_INITIAL_SESSION_LIMIT = 20;
 export const DIRECT_CHAT_INITIAL_TIMELINE_LIMIT = 80;
 
+export function managedEscalationPending(
+  escalations: Array<Pick<Escalation, 'managed_origin_conversation_id'>>,
+  selectedManagedChildConversationId: string | null,
+): boolean {
+  return escalations.some((item) => managedInteractionVisibleInScope(
+    item.managed_origin_conversation_id,
+    selectedManagedChildConversationId,
+  ));
+}
+
 export async function refreshCachedTimeline<Snapshot, Watermark>(operations: {
   captureWatermark: () => Watermark;
   probe: () => Promise<Snapshot | null>;
   applyIfUnchanged: (snapshot: Snapshot, watermark: Watermark) => boolean;
+  snapshot: () => Promise<void>;
   sync: () => Promise<void>;
-}): Promise<'snapshot' | 'sync'> {
+}): Promise<'cache-hit' | 'snapshot' | 'sync'> {
   const watermark = operations.captureWatermark();
   const snapshot = await operations.probe();
-  if (snapshot !== null && operations.applyIfUnchanged(snapshot, watermark)) {
+  if (snapshot === null) {
+    // A cache-only miss provides no trustworthy base for a cursor-based delta.
+    await operations.snapshot();
     return 'snapshot';
+  }
+  if (operations.applyIfUnchanged(snapshot, watermark)) {
+    return 'cache-hit';
   }
   await operations.sync();
   return 'sync';
+}
+
+export function snapshotNeedsHistoryRecovery(snapshot: ChatSnapshot): boolean {
+  return Boolean(
+    snapshot.conversation.has_message_history
+    && snapshot.timeline.items.length === 0
+    && !snapshot.timeline.has_more_before
+  );
 }
 
 export function shouldApplyLegacyLifecycleFrame(chatV2OwnsConversation: boolean): boolean {
@@ -115,8 +158,21 @@ export interface SidebarProjectionFilter {
   selectedConversationStatus: ConversationStatusFilter;
 }
 
+/**
+ * Safe managed-child origin metadata for a direct question or auth
+ * challenge. Sourced from a notification whose conversation is a managed
+ * target. `originConversationId`, when present, authorizes an
+ * acknowledgement navigation link; it is never an internal session id.
+ */
+export interface ManagedQuestionOrigin {
+  title?: string;
+  targetAgentId?: string;
+  originConversationId?: string;
+}
+
 export interface PendingDirectQuestion {
   notificationId: string;
+  observedStateVersion?: number;
   stepName?: string;
   question: string;
   questionId?: string;
@@ -125,6 +181,37 @@ export interface PendingDirectQuestion {
   context: string;
   kind?: PendingDirectQuestionKind;
   structured?: boolean;
+  managedOrigin?: ManagedQuestionOrigin;
+}
+
+/**
+ * Sanitize raw managed-origin fields (from a notification payload, pending
+ * summary, or push event) into a safe display-only shape. Blank/whitespace
+ * values and non-string types are dropped. Returns `undefined` when no
+ * managed-origin field carries a usable value, so callers can omit the
+ * field entirely instead of storing an empty object.
+ */
+export function sanitizeManagedQuestionOrigin(raw: {
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
+} | null | undefined): ManagedQuestionOrigin | undefined {
+  if (!raw) return undefined;
+  const title = typeof raw.managed_conversation_title === 'string'
+    ? raw.managed_conversation_title.trim()
+    : '';
+  const targetAgentId = typeof raw.managed_target_agent_id === 'string'
+    ? raw.managed_target_agent_id.trim()
+    : '';
+  const originConversationId = typeof raw.managed_origin_conversation_id === 'string'
+    ? raw.managed_origin_conversation_id.trim()
+    : '';
+  if (!title && !targetAgentId && !originConversationId) return undefined;
+  const origin: ManagedQuestionOrigin = {};
+  if (title) origin.title = title;
+  if (targetAgentId) origin.targetAgentId = targetAgentId;
+  if (originConversationId) origin.originConversationId = originConversationId;
+  return origin;
 }
 
 export interface ConversationPendingSnapshotFlags {
@@ -132,6 +219,14 @@ export interface ConversationPendingSnapshotFlags {
   hasCredentialRequest: boolean;
   hasEscalation: boolean;
   hasAnyPendingInput: boolean;
+}
+
+export function canonicalStateCanSettleDirectQuestion(
+  stateVersion: number,
+  question: PendingDirectQuestion | null | undefined,
+): boolean {
+  return question?.observedStateVersion !== undefined
+    && stateVersion > question.observedStateVersion;
 }
 
 const DIRECT_QUESTION_NOTIFICATION_TYPES = new Set([
@@ -174,6 +269,162 @@ export function conversationPendingSnapshotFlags(
   };
 }
 
+function directQuestionSummaryOptions(options: unknown): string[] {
+  if (!Array.isArray(options)) return [];
+  return options
+    .map((option) => {
+      if (typeof option === 'string') return option;
+      if (!option || typeof option !== 'object') return '';
+      const label = (option as Record<string, unknown>).label;
+      return typeof label === 'string' ? label : '';
+    })
+    .filter((option) => option.length > 0);
+}
+
+function directQuestionSummaryContext(context: unknown): string {
+  if (typeof context === 'string') return context;
+  if (!context || typeof context !== 'object') return '';
+  const record = context as Record<string, unknown>;
+  const text = record.context ?? record.note;
+  return typeof text === 'string' ? text : '';
+}
+
+export function directQuestionFromPendingSummary(
+  summary: ConversationPendingSummary | null | undefined,
+): PendingDirectQuestion | null {
+  if (!summary || !['step_question', 'auth_challenge'].includes(summary.notification_type)) {
+    return null;
+  }
+  if (summary.task_id) return null;
+
+  const kind: PendingDirectQuestionKind = summary.notification_type === 'auth_challenge'
+    ? 'auth_challenge'
+    : 'question';
+  const questions = Array.isArray(summary.questions) ? summary.questions : [];
+  const firstQuestion = questions[0];
+  const question = (
+    firstQuestion?.question
+    ?? summary.question
+    ?? summary.message
+    ?? summary.label
+    ?? (kind === 'auth_challenge'
+      ? 'Authentication is required to continue.'
+      : 'The assistant needs more input to continue.')
+  ).trim();
+  const options = directQuestionSummaryOptions(firstQuestion?.options ?? summary.options);
+  return {
+    notificationId: summary.notification_id,
+    stepName: summary.step_name ?? undefined,
+    question,
+    questionId: firstQuestion?.id,
+    options,
+    questions,
+    context: directQuestionSummaryContext(summary.context),
+    kind,
+    structured: questions.length > 1
+      || questions.some((item) => Array.isArray(item.options) && item.options.length > 0),
+    managedOrigin: sanitizeManagedQuestionOrigin(summary),
+  };
+}
+
+/**
+ * Convert the canonical `pending.escalation` summary into the same
+ * `Escalation` shape the legacy push frame and REST catch-up paths produce,
+ * so the approval card can hydrate immediately from a conversation-state
+ * snapshot/delta without waiting for (or requiring) a matching legacy
+ * `escalation` WebSocket frame.
+ */
+export function escalationFromPendingSummary(
+  summary: ConversationPendingSummary | null | undefined,
+  now: () => number = Date.now,
+): Escalation | null {
+  if (!summary || summary.notification_type !== 'escalation') return null;
+  const callId = summary.call_id ?? summary.notification_id;
+  if (!callId) return null;
+  return {
+    call_id: callId,
+    session_id: summary.session_id ?? null,
+    tool_name: summary.tool_name ?? null,
+    arguments_display: summary.arguments_display ?? null,
+    decision: 'escalate',
+    resolved: false,
+    reasoning: summary.reasoning ?? null,
+    risk: summary.risk ?? null,
+    timeout_seconds: summary.timeout_seconds ?? undefined,
+    received_at: summary.created_at ? Date.parse(summary.created_at) : now(),
+    ...(summary.managed_conversation_title
+      ? { managed_conversation_title: summary.managed_conversation_title }
+      : {}),
+    ...(summary.managed_target_agent_id
+      ? { managed_target_agent_id: summary.managed_target_agent_id }
+      : {}),
+    ...(summary.managed_origin_conversation_id
+      ? { managed_origin_conversation_id: summary.managed_origin_conversation_id }
+      : {}),
+  };
+}
+
+/**
+ * Merge a canonical-state-hydrated escalation into the existing (push/REST
+ * sourced) escalation queue, deduplicated by call_id. `excludedCallIds`
+ * covers both an escalation currently being resolved locally (in-flight
+ * REST call) and any already locally settled (REST-resolved) call, so a
+ * settled or in-flight prompt does not reappear from a state snapshot that
+ * has not yet observed the resolution.
+ */
+export function mergeHydratedEscalation(
+  existing: Escalation[],
+  hydrated: Escalation | null,
+  excludedCallIds: ReadonlySet<string>,
+): Escalation[] {
+  if (!hydrated) return existing;
+  if (excludedCallIds.has(hydrated.call_id)) return existing;
+  const existingIndex = existing.findIndex((item) => item.call_id === hydrated.call_id);
+  if (existingIndex >= 0) {
+    const current = existing[existingIndex];
+    const enriched: Escalation = {
+      ...current,
+      session_id: hydrated.session_id ?? current.session_id,
+      tool_name: hydrated.tool_name ?? current.tool_name,
+      arguments_display: hydrated.arguments_display ?? current.arguments_display,
+      reasoning: hydrated.reasoning ?? current.reasoning,
+      risk: hydrated.risk ?? current.risk,
+      timeout_seconds: hydrated.timeout_seconds ?? current.timeout_seconds,
+      managed_conversation_title:
+        hydrated.managed_conversation_title ?? current.managed_conversation_title,
+      managed_target_agent_id:
+        hydrated.managed_target_agent_id ?? current.managed_target_agent_id,
+      managed_origin_conversation_id:
+        hydrated.managed_origin_conversation_id ?? current.managed_origin_conversation_id,
+    };
+    if (
+      enriched.session_id === current.session_id
+      && enriched.tool_name === current.tool_name
+      && enriched.arguments_display === current.arguments_display
+      && enriched.reasoning === current.reasoning
+      && enriched.risk === current.risk
+      && enriched.timeout_seconds === current.timeout_seconds
+      && enriched.managed_conversation_title === current.managed_conversation_title
+      && enriched.managed_target_agent_id === current.managed_target_agent_id
+      && enriched.managed_origin_conversation_id === current.managed_origin_conversation_id
+    ) {
+      return existing;
+    }
+    const merged = [...existing];
+    merged[existingIndex] = enriched;
+    return merged;
+  }
+  return [...existing, hydrated].sort((left, right) => (left.received_at ?? 0) - (right.received_at ?? 0));
+}
+
+export function managedInteractionVisibleInScope(
+  managedOriginConversationId: string | null | undefined,
+  selectedManagedConversationId: string | null | undefined,
+): boolean {
+  if (!selectedManagedConversationId) return true;
+  return managedOriginConversationId === selectedManagedConversationId;
+}
+
 export interface ConversationInitialLoadPolicy {
   historyLimit: number;
   sessionOptions?: {
@@ -213,6 +464,33 @@ export interface ChatV2ViewProjection {
   turnInProgress: boolean;
   awaitingAssistantStart: boolean;
   currentActiveTurnId: string | null;
+}
+
+export function chatV2RuntimeConversationPatch(
+  state: ChatV2ClientState,
+): Partial<Conversation> | null {
+  const runtime = state.runtime;
+  if (!runtime) return null;
+  const activeTurn = runtime.has_active_turn ? runtime.active_turn : null;
+  const chatMode = activeTurn?.chat_mode;
+  const chatModeSource = activeTurn?.chat_mode_source;
+  return {
+    has_active_turn: runtime.has_active_turn,
+    active_turn_chat_mode:
+      runtime.has_active_turn && (chatMode === 'plan' || chatMode === 'build')
+        ? chatMode
+        : null,
+    active_turn_chat_mode_source:
+      runtime.has_active_turn
+      && (
+        chatModeSource === 'one_shot'
+        || chatModeSource === 'conversation_override'
+        || chatModeSource === 'agent_default'
+        || chatModeSource === 'system_default'
+      )
+        ? chatModeSource
+        : null,
+  };
 }
 
 export function deriveChatV2ViewProjection(state: ChatV2ClientState): ChatV2ViewProjection {
@@ -443,6 +721,52 @@ export function shouldApplyPendingNotificationRefresh(params: {
   return params.currentEpoch === params.requestEpoch;
 }
 
+/**
+ * Guards a pending-notification consumer (escalations, direct-question,
+ * combined refresh) that fetches via `api.notifications.list(...)` outside
+ * the canonical `refreshConversationPendingNotificationTypes` path.
+ *
+ * A response may only be applied when all of the following hold:
+ * - the per-conversation epoch has not advanced past the request (no newer
+ *   fetch and no server push landed while this request was in flight);
+ * - `currentConversation` still reports the same conversation the request
+ *   was made for; and
+ * - `loadRequestId`/`activeLoadRequestId` are given, no newer conversation
+ *   load/switch (route change) has started since the request was made.
+ *
+ * `currentConversation` alone is not sufficient: `openConversation()` can
+ * leave `currentConversation` pointing at the outgoing conversation for the
+ * whole duration of an uncached detail fetch for the incoming one, so a
+ * stale request for the outgoing conversation would otherwise still pass
+ * the conversation-id check while the switch is in flight. The load
+ * generation check (backed by the existing `conversationLoadRequestId`
+ * counter via `isCurrentConversationLoad`) closes that gap, including the
+ * A→B→A case where the per-conversation epoch for A may not have advanced.
+ * `loadRequestId`/`activeLoadRequestId` are optional so existing pure-epoch
+ * scenarios can still be exercised without modeling a load generation.
+ */
+export function shouldApplyPendingNotificationConsumerRefresh(params: {
+  activeConversationId: string | null | undefined;
+  refreshConversationId: string;
+  requestEpoch: number;
+  currentEpoch: number | undefined;
+  loadRequestId?: number;
+  activeLoadRequestId?: number;
+}): boolean {
+  if (params.activeConversationId !== params.refreshConversationId) return false;
+  if (
+    params.loadRequestId !== undefined
+    && params.activeLoadRequestId !== undefined
+    && !isCurrentConversationLoad(params.loadRequestId, params.activeLoadRequestId)
+  ) {
+    return false;
+  }
+  return shouldApplyPendingNotificationRefresh({
+    requestEpoch: params.requestEpoch,
+    currentEpoch: params.currentEpoch,
+  });
+}
+
 export function shouldApplySidebarProjectionRefresh(params: {
   requestEpoch: number;
   currentEpoch: number;
@@ -469,6 +793,16 @@ export function shouldApplyChatSendFailureSideEffects(
   routeConversationId: string,
 ): boolean {
   return Boolean(sendConversationId) && sendConversationId === routeConversationId;
+}
+
+export function shouldApplyChatMutationResponse(
+  requestConversationId: string,
+  routeConversationId: string | null,
+  storeConversationId: string | null,
+): boolean {
+  return Boolean(requestConversationId)
+    && requestConversationId === routeConversationId
+    && requestConversationId === storeConversationId;
 }
 
 const TERMINAL_RETRY_REJECTION_CODES = new Set([
@@ -670,6 +1004,234 @@ export function mergeConversationPreservingActivity(
   });
 }
 
+export function mergeAuthoritativeSidebarConversation(
+  existing: Conversation | null | undefined,
+  incoming: Conversation,
+): Conversation {
+  if (!existing) return incoming;
+  const merged = mergeConversationPreservingActivity(existing, incoming);
+  return {
+    ...merged,
+    has_active_turn: incoming.has_active_turn,
+    active_turn_chat_mode: incoming.active_turn_chat_mode,
+    active_turn_chat_mode_source: incoming.active_turn_chat_mode_source,
+    active_session_status: incoming.active_session_status,
+    active_session_completion_reason: incoming.active_session_completion_reason,
+    pending_notification_types: incoming.pending_notification_types,
+    managed_agent: incoming.managed_agent,
+    conversation_state: incoming.conversation_state ?? existing.conversation_state,
+    root_controller_conversation_id: (
+      incoming.root_controller_conversation_id ?? existing.root_controller_conversation_id
+    ),
+  };
+}
+
+export type SidebarPushAdmission = {
+  apply: boolean;
+  reconcile: boolean;
+};
+
+export class SerialInvalidationCoalescer {
+  private dirty = false;
+  private disposed = false;
+  private flight: Promise<void> | null = null;
+
+  constructor(private readonly run: () => Promise<void>) {}
+
+  invalidate(): void {
+    if (this.disposed) return;
+    this.dirty = true;
+    if (!this.flight) this.flight = this.drain();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.dirty = false;
+  }
+
+  async whenIdle(): Promise<void> {
+    while (this.flight) await this.flight;
+  }
+
+  private async drain(): Promise<void> {
+    try {
+      while (!this.disposed && this.dirty) {
+        // Consume the dirty state only when the next attempt is admitted.
+        this.dirty = false;
+        try {
+          await this.run();
+        } catch {
+          // A later invalidation can start another attempt after this failure.
+        }
+      }
+    } finally {
+      this.flight = null;
+      if (!this.disposed && this.dirty) this.flight = this.drain();
+    }
+  }
+}
+
+export async function reconcileRenderedOverviewSources(options: {
+  focusedScopeKey: string;
+  rootScopeKey: string;
+  currentFocusedScopeKey: () => string | null;
+  loadRoot: () => Promise<boolean>;
+  loadFocused: () => Promise<boolean>;
+}): Promise<boolean> {
+  if (options.focusedScopeKey === options.rootScopeKey) {
+    const applied = await options.loadFocused();
+    return applied && options.currentFocusedScopeKey() === options.focusedScopeKey;
+  }
+  const [rootApplied, focusedApplied] = await Promise.all([
+    options.loadRoot(),
+    options.loadFocused(),
+  ]);
+  return rootApplied
+    && focusedApplied
+    && options.currentFocusedScopeKey() === options.focusedScopeKey;
+}
+
+function isDurableSidebarRevision(revision: string | null | undefined): boolean {
+  return typeof revision === 'string' && /^\d+$/.test(revision);
+}
+
+function compareDurableSidebarRevisions(left: string, right: string): number {
+  const normalizedLeft = left.replace(/^0+(?=\d)/, '');
+  const normalizedRight = right.replace(/^0+(?=\d)/, '');
+  if (normalizedLeft.length !== normalizedRight.length) {
+    return normalizedLeft.length < normalizedRight.length ? -1 : 1;
+  }
+  return normalizedLeft === normalizedRight ? 0 : normalizedLeft < normalizedRight ? -1 : 1;
+}
+
+/**
+ * Owns admission for the durable sidebar revision domain.
+ *
+ * REST responses are full authoritative reconciliations whenever their input
+ * revision is stale. Pushes are per-conversation hints. An owner-wide push
+ * watermark is only a recovery target because unrelated owner changes also
+ * advance the shared durable revision.
+ */
+export class SidebarRevisionAdmission {
+  private restCursor: string | null = null;
+  private observedDurableRevision: string | null = null;
+  private readonly conversationRevisions = new Map<string, string>();
+  private readonly legacyConversationRevisions = new Map<string, string>();
+
+  get authoritativeRestCursor(): string | null {
+    return this.restCursor;
+  }
+
+  get observedDurableHighWatermark(): string | null {
+    return this.observedDurableRevision;
+  }
+
+  get needsReconciliation(): boolean {
+    return this.observedDurableRevision !== null
+      && (
+        this.restCursor === null
+        || compareDurableSidebarRevisions(
+          this.restCursor,
+          this.observedDurableRevision,
+        ) < 0
+      );
+  }
+
+  observeInvalidation(revision: string | null | undefined): void {
+    const durableRevision = isDurableSidebarRevision(revision) ? revision as string : null;
+    if (
+      durableRevision !== null
+      && (
+        this.observedDurableRevision === null
+        || compareDurableSidebarRevisions(durableRevision, this.observedDurableRevision) > 0
+      )
+    ) {
+      this.observedDurableRevision = durableRevision;
+    }
+  }
+
+  admitProjection(revision: string | null | undefined): SidebarPushAdmission {
+    const durableRevision = isDurableSidebarRevision(revision) ? revision as string : null;
+    if (durableRevision === null) {
+      return { apply: this.observedDurableRevision === null, reconcile: true };
+    }
+    if (
+      this.observedDurableRevision !== null
+      && compareDurableSidebarRevisions(durableRevision, this.observedDurableRevision) < 0
+    ) {
+      return { apply: false, reconcile: true };
+    }
+    return { apply: true, reconcile: false };
+  }
+
+  recordProjection(
+    revision: string | null | undefined,
+    conversationIds: Iterable<string>,
+  ): void {
+    const durableRevision = isDurableSidebarRevision(revision) ? revision as string : null;
+    if (durableRevision === null) return;
+    this.restCursor = durableRevision;
+    if (
+      this.observedDurableRevision === null
+      || compareDurableSidebarRevisions(durableRevision, this.observedDurableRevision) > 0
+    ) {
+      this.observedDurableRevision = durableRevision;
+    }
+    for (const conversationId of conversationIds) {
+      this.conversationRevisions.set(conversationId, durableRevision);
+      this.legacyConversationRevisions.delete(conversationId);
+    }
+  }
+
+  admitPush(
+    conversationId: string,
+    revision: string | null | undefined,
+  ): SidebarPushAdmission {
+    const durableRevision = isDurableSidebarRevision(revision) ? revision as string : null;
+    if (durableRevision === null) {
+      const durableRevision = this.conversationRevisions.get(conversationId);
+      const previousLegacy = this.legacyConversationRevisions.get(conversationId);
+      const apply = durableRevision === undefined
+        && (
+          revision === null
+          || revision === undefined
+          || previousLegacy === undefined
+          || revision > previousLegacy
+        );
+      if (apply && revision) this.legacyConversationRevisions.set(conversationId, revision);
+      return { apply, reconcile: true };
+    }
+
+    const previousConversationRevision = this.conversationRevisions.get(conversationId);
+    const apply = previousConversationRevision === undefined
+      || compareDurableSidebarRevisions(durableRevision, previousConversationRevision) > 0;
+    const previousObserved = this.observedDurableRevision;
+    const observedComparison = previousObserved === null
+      ? 0
+      : compareDurableSidebarRevisions(durableRevision, previousObserved);
+    const reconcile = previousObserved !== null
+      && (
+        observedComparison < 0
+        || (
+          observedComparison > 0
+          && BigInt(durableRevision) > BigInt(previousObserved) + 1n
+        )
+      );
+
+    if (apply) {
+      this.conversationRevisions.set(conversationId, durableRevision);
+      this.legacyConversationRevisions.delete(conversationId);
+    }
+    if (
+      previousObserved === null
+      || compareDurableSidebarRevisions(durableRevision, previousObserved) > 0
+    ) {
+      this.observedDurableRevision = durableRevision;
+    }
+    return { apply, reconcile };
+  }
+}
+
 /**
  * A pending-input event is replayable across reconnects. Rebuilding the same
  * form must retain its in-memory answers, page, collapsed state, and submit
@@ -740,6 +1302,11 @@ export function cloneSidebarProjection(projection: SidebarProjection): SidebarPr
       has_more: projection.conversations.has_more,
     },
     context_types: [...projection.context_types],
+    removed_conversation_ids: [...(projection.removed_conversation_ids ?? [])],
+    full_resync_required: projection.full_resync_required,
+    is_delta: projection.is_delta,
+    sidebar_revision: projection.sidebar_revision,
+    sync_timestamp: projection.sync_timestamp,
     background_work: {
       ...backgroundWork,
       items: backgroundWork.items.map((item) => ({
@@ -748,6 +1315,13 @@ export function cloneSidebarProjection(projection: SidebarProjection): SidebarPr
       })),
     },
   };
+}
+
+export function mergeSidebarBackgroundWork(
+  current: BackgroundWorkProjection,
+  projection: SidebarProjection,
+): BackgroundWorkProjection {
+  return projection.background_work ?? current;
 }
 
 export function rememberSidebarProjectionSnapshot(
@@ -892,7 +1466,6 @@ const CONVERSATION_STATUS_FILTERS = new Set<ConversationStatusFilter>([
 ]);
 
 export const CHAT_STORAGE_KEYS = {
-  enterToSend: 'cognis-chat-enter-to-send',
   selectedAgent: 'cognis-chat-selected-agent',
   selectedChannel: 'cognis-chat-selected-channel',
   sidebarCollapsed: 'cognis-chat-sidebar-collapsed',
@@ -908,9 +1481,23 @@ export const SESSION_LOG_POLL_INTERVAL_MS = 3000;
 export const SESSION_LOG_POLL_MAX_INTERVAL_MS = 30000;
 export const CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX = 24;
 export const CHAT_USER_SCROLL_DELTA_THRESHOLD_PX = 2;
-export const CHAT_PINNED_INSPECTOR_MIN_WIDTH = 384;
-export const CHAT_PINNED_INSPECTOR_MIN_CHAT_WIDTH = 512;
-export const CHAT_PINNED_INSPECTOR_GAP = 16;
+export const CHAT_PINNED_INSPECTOR_MIN_WIDTH = 320;
+export const CHAT_PINNED_INSPECTOR_MIN_CHAT_WIDTH = 480;
+export const CHAT_PINNED_INSPECTOR_GAP = 12;
+
+export function initialConversationFiltersOpen(viewportWidth: number): boolean {
+  return viewportWidth >= 1024;
+}
+
+export function mobileConversationStatusLabel(
+  lifecycleStatus: string,
+  turnActive: boolean,
+  waitingForInput: boolean,
+): string {
+  if (waitingForInput) return 'Waiting for input';
+  if (turnActive) return 'Running';
+  return lifecycleStatus;
+}
 
 export function conversationInspectorFits(availableWidth: number): boolean {
   return availableWidth
@@ -1134,6 +1721,27 @@ export function timelineWindowEnd(window: TimelineWindow, total: number): number
 /** Number of currently rendered rows. */
 export function timelineWindowSize(window: TimelineWindow, total: number): number {
   return Math.max(0, timelineWindowEnd(window, total) - Math.min(window.start, timelineWindowEnd(window, total)));
+}
+
+/** Whether a stale live-tail start would hide every available timeline row. */
+export function shouldRebaseLiveTailWindow(window: TimelineWindow, total: number): boolean {
+  return total > 0 && window.end === null && timelineWindowSize(window, total) === 0;
+}
+
+/** Reconcile a tail-pinned window after canonical timeline membership changes. */
+export function reconcileLiveTailWindow(
+  window: TimelineWindow,
+  total: number,
+  targetRows = TIMELINE_WINDOW_TARGET_ROWS,
+): TimelineWindow {
+  if (
+    window.end !== null
+    || shouldRebaseLiveTailWindow(window, total)
+    || timelineWindowSize(window, total) > targetRows
+  ) {
+    return { start: Math.max(0, total - targetRows), end: null };
+  }
+  return clampWindow(window, total);
 }
 
 /** Whether rows newer than the window's end are hidden (unmounted). */
@@ -1442,6 +2050,7 @@ export interface ConversationUpdatedRowPatchEvent {
   last_read_at?: string | null;
   last_message_at?: string | null;
   updated_at?: string | null;
+  turn_id?: string | null;
 }
 
 export function conversationUpdatedRowPatch(
@@ -1466,6 +2075,59 @@ export function conversationUpdatedRowPatch(
   if (typeof event.last_message_at === 'string') patch.last_message_at = event.last_message_at;
   if (typeof event.updated_at === 'string') patch.updated_at = event.updated_at;
   return patch;
+}
+
+export interface ConversationRuntimeLifecycleState {
+  updatedAt: string | null;
+  activeTurnId: string | null;
+}
+
+export function orderedConversationUpdatedRowPatch(
+  event: ConversationUpdatedRowPatchEvent,
+  state: ConversationRuntimeLifecycleState,
+): {
+  patch: Partial<Conversation>;
+  state: ConversationRuntimeLifecycleState;
+  runtimeApplied: boolean;
+} {
+  const patch = conversationUpdatedRowPatch(event);
+  if (typeof event.has_active_turn !== 'boolean') {
+    return { patch, state, runtimeApplied: false };
+  }
+
+  const incomingUpdatedAt = typeof event.updated_at === 'string' ? event.updated_at : null;
+  const incomingValue = timestampValue(incomingUpdatedAt);
+  const currentValue = timestampValue(state.updatedAt);
+  const incomingTurnId = typeof event.turn_id === 'string' ? event.turn_id : null;
+  const terminalTurnMismatch = (
+    !event.has_active_turn
+    && state.activeTurnId !== null
+    && incomingTurnId !== null
+    && incomingTurnId !== state.activeTurnId
+  );
+  const staleTimestamp = (
+    currentValue > 0
+    && (incomingValue <= 0 || incomingValue < currentValue)
+  );
+
+  if (terminalTurnMismatch || staleTimestamp) {
+    delete patch.has_active_turn;
+    delete patch.active_turn_chat_mode;
+    delete patch.active_turn_chat_mode_source;
+    delete patch.updated_at;
+    return { patch, state, runtimeApplied: false };
+  }
+
+  return {
+    patch,
+    state: {
+      updatedAt: incomingUpdatedAt ?? state.updatedAt,
+      activeTurnId: event.has_active_turn
+        ? incomingTurnId ?? state.activeTurnId
+        : null,
+    },
+    runtimeApplied: true,
+  };
 }
 
 export function pendingNotificationTypesFromNotifications(
@@ -1667,6 +2329,9 @@ export function pendingDirectQuestionFromAuthChallengeEvent(event: {
   message?: string | null;
   label?: string | null;
   metadata?: unknown;
+  managed_conversation_title?: string | null;
+  managed_target_agent_id?: string | null;
+  managed_origin_conversation_id?: string | null;
 }): PendingDirectQuestion | null {
   if (!event.notification_id) return null;
   const question = typeof event.message === 'string' && event.message.trim().length > 0
@@ -1682,6 +2347,7 @@ export function pendingDirectQuestionFromAuthChallengeEvent(event: {
     options: [],
     context: directQuestionContext(event.metadata),
     kind: 'auth_challenge',
+    managedOrigin: sanitizeManagedQuestionOrigin(event),
   };
 }
 
@@ -1703,6 +2369,78 @@ export function pendingInputRequestKind(params: {
     return isAuthChallengeToolCall(params.pendingStepTool) ? 'auth_challenge' : 'question';
   }
   return params.pendingDirectKind === 'auth_challenge' ? 'auth_challenge' : 'question';
+}
+
+export type DirectQuestionAckKind = 'sent' | 'cancelled';
+
+/**
+ * Compact, notification-scoped acknowledgement shown immediately on submit
+ * or cancel, before the resolve REST call returns. Keeping it keyed by
+ * `notificationId` prevents a delayed terminal event for a different
+ * notification (A) from clearing or being confused with an in-flight
+ * acknowledgement for another (B).
+ */
+export interface DirectQuestionAck {
+  notificationId: string;
+  kind: DirectQuestionAckKind;
+  managedOrigin?: ManagedQuestionOrigin;
+}
+
+export function buildDirectQuestionAck(
+  notificationId: string,
+  kind: DirectQuestionAckKind,
+  managedOrigin?: ManagedQuestionOrigin,
+): DirectQuestionAck {
+  return managedOrigin ? { notificationId, kind, managedOrigin } : { notificationId, kind };
+}
+
+export function directQuestionAckMessage(kind: DirectQuestionAckKind): string {
+  return kind === 'cancelled' ? 'Request cancelled' : 'Response sent';
+}
+
+/**
+ * Human-readable managed-child label for the acknowledgement, e.g.
+ * "Research helper · lumi". Returns `null` when no managed-origin metadata
+ * is available, so the caller can omit the detail line entirely.
+ */
+export function directQuestionAckManagedLabel(ack: DirectQuestionAck | null | undefined): string | null {
+  const origin = ack?.managedOrigin;
+  if (!origin) return null;
+  if (origin.title && origin.targetAgentId) return `${origin.title} · ${origin.targetAgentId}`;
+  return origin.title ?? origin.targetAgentId ?? null;
+}
+
+/**
+ * The safe navigation target for the acknowledgement, or `null` when the
+ * backend did not provide a `managed_origin_conversation_id`. Never derived
+ * from an internal session id.
+ */
+export function directQuestionAckOriginConversationId(
+  ack: DirectQuestionAck | null | undefined,
+): string | null {
+  return ack?.managedOrigin?.originConversationId ?? null;
+}
+
+/**
+ * A submit/cancel REST failure should restore the visible form (clear the
+ * optimistic acknowledgement) only when no authoritative terminal event or
+ * canonical state has already settled the same notification. Otherwise the
+ * settlement that arrived out-of-band (for example forwarded child
+ * resolution) must win and stay settled.
+ */
+export function shouldRestoreDirectQuestionOnSubmitFailure(
+  notificationId: string,
+  authoritativelySettledIds: ReadonlySet<string>,
+): boolean {
+  return !authoritativelySettledIds.has(notificationId);
+}
+
+/** "Submitting approval…" / "Submitting denial…" — shown while the policy
+ * decision REST call is in flight. Escalation resolution stays synchronous
+ * (no optimistic approval), so this only changes the wording, not the
+ * busy/disabled state. */
+export function escalationSubmittingLabel(decision: 'approve' | 'deny'): string {
+  return decision === 'approve' ? 'Submitting approval…' : 'Submitting denial…';
 }
 
 export function buildConversationUrl(
@@ -1757,32 +2495,73 @@ export function shouldRecoverChatV2ForInvalidation(params: {
 
 export class ChatV2CanonicalRecoveryCoalescer {
   private readonly states = new Map<string, {
-    operation: () => Promise<void>;
     promise: Promise<void>;
-    rerun: boolean;
+    phase: 'initial' | 'rerun';
+    rerunOperation?: () => Promise<void>;
+    nextOperation?: () => Promise<void>;
+    nextPromise?: Promise<void>;
+    resolveNext?: () => void;
+    rejectNext?: (error: unknown) => void;
+    nextTimer?: ReturnType<typeof setTimeout>;
   }>();
 
   run(scopeKey: string, operation: () => Promise<void>): Promise<void> {
     const current = this.states.get(scopeKey);
     if (current) {
-      current.operation = operation;
-      current.rerun = true;
-      return current.promise;
+      if (current.phase === 'initial') {
+        current.rerunOperation = operation;
+        return current.promise;
+      }
+      current.nextOperation = operation;
+      if (!current.nextPromise) {
+        current.nextPromise = new Promise<void>((resolve, reject) => {
+          current.resolveNext = resolve;
+          current.rejectNext = reject;
+        });
+      }
+      return current.nextPromise;
     }
-    const state = {
-      operation,
-      rerun: false,
-      promise: Promise.resolve()
+    const state: {
+      promise: Promise<void>;
+      phase: 'initial' | 'rerun';
+      rerunOperation?: () => Promise<void>;
+      nextOperation?: () => Promise<void>;
+      nextPromise?: Promise<void>;
+      resolveNext?: () => void;
+      rejectNext?: (error: unknown) => void;
+      nextTimer?: ReturnType<typeof setTimeout>;
+    } = {
+      phase: 'initial',
+      promise: Promise.resolve(),
     };
     state.promise = (async () => {
       try {
-        do {
-          state.rerun = false;
-          await state.operation();
-        } while (state.rerun);
+        await operation();
+        const rerun = state.rerunOperation;
+        if (rerun) {
+          state.phase = 'rerun';
+          await rerun();
+        }
       } finally {
-        if (this.states.get(scopeKey) === state) {
+        const nextOperation = state.nextOperation;
+        if (!nextOperation && this.states.get(scopeKey) === state) {
           this.states.delete(scopeKey);
+        }
+        if (nextOperation) {
+          state.nextTimer = setTimeout(() => {
+            if (this.states.get(scopeKey) === state) {
+              this.states.delete(scopeKey);
+            }
+            const latestOperation = state.nextOperation;
+            if (!latestOperation) {
+              state.resolveNext?.();
+              return;
+            }
+            this.run(scopeKey, latestOperation).then(
+              () => state.resolveNext?.(),
+              (error) => state.rejectNext?.(error),
+            );
+          }, 0);
         }
       }
     })();
@@ -1790,9 +2569,125 @@ export class ChatV2CanonicalRecoveryCoalescer {
     return state.promise;
   }
 
+  has(scopeKey: string): boolean {
+    return this.states.has(scopeKey);
+  }
+
   clear(): void {
+    for (const state of this.states.values()) {
+      if (state.nextTimer) clearTimeout(state.nextTimer);
+      state.rerunOperation = undefined;
+      state.nextOperation = undefined;
+      state.resolveNext?.();
+    }
     this.states.clear();
   }
+}
+
+export interface CanonicalTimelineAuthority {
+  conversationId: string | null;
+  routeGeneration: number;
+  status: 'loading' | 'ready' | 'error';
+  baseAccepted: boolean;
+}
+
+export function beginCanonicalTimelineAuthority(
+  conversationId: string,
+  routeGeneration: number,
+): CanonicalTimelineAuthority {
+  return {
+    conversationId,
+    routeGeneration,
+    status: 'loading',
+    baseAccepted: false,
+  };
+}
+
+export function transitionCanonicalTimelineAuthority(
+  current: CanonicalTimelineAuthority,
+  conversationId: string,
+  routeGeneration: number,
+  status: CanonicalTimelineAuthority['status'],
+): CanonicalTimelineAuthority {
+  if (
+    current.conversationId !== conversationId
+    || current.routeGeneration !== routeGeneration
+  ) return current;
+  return { ...current, status };
+}
+
+export function acceptCanonicalTimelineBase(
+  current: CanonicalTimelineAuthority,
+  conversationId: string,
+  routeGeneration: number,
+): CanonicalTimelineAuthority {
+  if (
+    current.conversationId !== conversationId
+    || current.routeGeneration !== routeGeneration
+  ) return current;
+  return { ...current, baseAccepted: true };
+}
+
+export function canonicalTimelineBaseIsAccepted(
+  authority: CanonicalTimelineAuthority,
+  conversationId: string,
+  routeGeneration: number,
+): boolean {
+  return (
+    authority.conversationId === conversationId
+    && authority.routeGeneration === routeGeneration
+    && authority.baseAccepted
+  );
+}
+
+export function canonicalTimelineAuthorityIsReady(
+  authority: CanonicalTimelineAuthority,
+  conversationId: string,
+  routeGeneration: number,
+): boolean {
+  return (
+    authority.conversationId === conversationId
+    && authority.routeGeneration === routeGeneration
+    && authority.baseAccepted
+    && authority.status === 'ready'
+  );
+}
+
+export type InitialHistoryBackfillStatus =
+  | 'visible'
+  | 'exhausted'
+  | 'budget_exhausted'
+  | 'rejected'
+  | 'stale';
+
+export async function backfillInitialVisibleHistory<T>(options: {
+  maxPages: number;
+  getState: () => {
+    visibleCount: number;
+    hasMoreBefore: boolean;
+    beforeCursor: string | null;
+  };
+  loadPage: (beforeCursor: string) => Promise<T>;
+  applyPage: (page: T) => boolean;
+  isCurrent: () => boolean;
+}): Promise<InitialHistoryBackfillStatus> {
+  for (let page = 0; page < options.maxPages; page += 1) {
+    if (!options.isCurrent()) return 'stale';
+    const state = options.getState();
+    if (state.visibleCount > 0) return 'visible';
+    if (!state.hasMoreBefore || !state.beforeCursor) return 'exhausted';
+    const beforeCursor = state.beforeCursor;
+    const response = await options.loadPage(beforeCursor);
+    if (!options.isCurrent()) return 'stale';
+    if (!options.applyPage(response)) return 'rejected';
+    const next = options.getState();
+    if (next.visibleCount > 0) return 'visible';
+    if (!next.hasMoreBefore || !next.beforeCursor) return 'exhausted';
+    if (next.beforeCursor === beforeCursor) return 'budget_exhausted';
+  }
+  const finalState = options.getState();
+  if (finalState.visibleCount > 0) return 'visible';
+  return finalState.hasMoreBefore ? 'budget_exhausted' : 'exhausted';
 }
 
 export function shouldSnapshotAfterChatV2Sync(params: {

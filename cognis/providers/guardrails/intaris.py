@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any, TypeVar, cast
 
 import httpx
+from prometheus_client import Counter, Histogram
 
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
@@ -43,6 +44,17 @@ logger = get_logger(__name__)
 T = TypeVar("T")
 MAX_EVENT_APPEND_LISTENERS = 16
 DEFAULT_EVENT_APPEND_LISTENER_TIMEOUT = 0.1
+INTARIS_OPERATION_DURATION = Histogram(
+    "cognis_intaris_operation_duration_seconds",
+    "Duration of Intaris operations including retries.",
+    ["operation", "outcome"],
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120),
+)
+INTARIS_OPERATION_FAILURES = Counter(
+    "cognis_intaris_operation_failures_total",
+    "Exhausted Intaris operation failures.",
+    ["operation", "error_type"],
+)
 
 
 def _coerce_attachment_b64(value: str) -> str:
@@ -190,9 +202,27 @@ class IntarisProvider:
                 **kwargs,
             )
 
-        if breaker is not None:
-            return await breaker.call(_with_retries)
-        return await _with_retries()
+        started = perf_counter()
+        metric_operation = operation.split("(", 1)[0].removeprefix("intaris ")
+        try:
+            result = (
+                await breaker.call(_with_retries) if breaker is not None else await _with_retries()
+            )
+        except Exception as exc:
+            INTARIS_OPERATION_DURATION.labels(
+                operation=metric_operation,
+                outcome="failure",
+            ).observe(perf_counter() - started)
+            INTARIS_OPERATION_FAILURES.labels(
+                operation=metric_operation,
+                error_type=type(exc).__name__,
+            ).inc()
+            raise
+        INTARIS_OPERATION_DURATION.labels(
+            operation=metric_operation,
+            outcome="success",
+        ).observe(perf_counter() - started)
+        return result
 
     def _headers(
         self,
@@ -348,11 +378,26 @@ class IntarisProvider:
                     "tool": tool_name,
                     "args": arguments,
                     "context": context or {},
+                    **(
+                        {
+                            "minimum_outcome": context["minimum_outcome"],
+                            "approval_call_id": context.get("approval_call_id"),
+                        }
+                        if context and context.get("minimum_outcome") is not None
+                        else {}
+                    ),
                 },
                 headers=self._headers(user_email=current_user_email.get()),
             )
             response.raise_for_status()
-            return EvaluationResult.model_validate(response.json())
+            data = response.json()
+            if (
+                context
+                and context.get("minimum_outcome") is not None
+                and data.get("minimum_outcome") != context["minimum_outcome"]
+            ):
+                raise ValueError("Intaris did not acknowledge minimum_outcome.")
+            return EvaluationResult.model_validate(data)
 
         return await self._call_with_retry(
             _do,
@@ -713,7 +758,7 @@ class IntarisProvider:
                     )
                     session_response.raise_for_status()
                     logger.debug(
-                        "intaris: read_events 404 — verified empty session stream",
+                        "intaris: read_events 404 — existing session has no event stream",
                         extra={"extra_data": {"session_id": session_id}},
                     )
                     return EventReadResult(

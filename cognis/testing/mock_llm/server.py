@@ -38,6 +38,7 @@ _catalog = ScenarioCatalog()
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _last_user_message(messages: list[dict[str, Any]]) -> str:
     for msg in reversed(messages):
         if msg.get("role") == "user":
@@ -47,7 +48,8 @@ def _last_user_message(messages: list[dict[str, Any]]) -> str:
             if isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")
+                        text = part.get("text", "")
+                        return text if isinstance(text, str) else ""
     return ""
 
 
@@ -61,7 +63,8 @@ def _first_user_message(messages: list[dict[str, Any]]) -> str:
             if isinstance(content, list):
                 for part in content:
                     if isinstance(part, dict) and part.get("type") == "text":
-                        return part.get("text", "")
+                        text = part.get("text", "")
+                        return text if isinstance(text, str) else ""
     return ""
 
 
@@ -81,6 +84,7 @@ def _conversation_turn_index(messages: list[dict[str, Any]]) -> int:
 # ---------------------------------------------------------------------------
 # Chat completions endpoint
 # ---------------------------------------------------------------------------
+
 
 async def chat_completions(request: Request) -> Response:
     try:
@@ -125,16 +129,25 @@ async def chat_completions(request: Request) -> Response:
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant", "content": "Mock response — no scenario matched."},
-                        "finish_reason": None,
-                    }],
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "content": "Mock response — no scenario matched.",
+                            },
+                            "finish_reason": None,
+                        }
+                    ],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
-                stop_chunk = {**chunk, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+                stop_chunk = {
+                    **chunk,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
                 yield f"data: {json.dumps(stop_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+
             return StreamingResponse(_default_stream(), media_type="text/event-stream")
         return JSONResponse(build_default_response(model))
 
@@ -158,29 +171,38 @@ async def chat_completions(request: Request) -> Response:
     turns = scenario.get("turns", [])
     # Select the right turn for multi-turn scenarios
     assistant_turns = [t for t in turns if t.get("role") == "assistant"]
-    active_turn = assistant_turns[turn_index] if turn_index < len(assistant_turns) else (assistant_turns[-1] if assistant_turns else {})
+    active_turn = (
+        assistant_turns[turn_index]
+        if turn_index < len(assistant_turns)
+        else (assistant_turns[-1] if assistant_turns else {})
+    )
     for step in active_turn.get("steps", []):
-            if step.get("type") == "text":
-                chunks_list = step.get("chunks", [step.get("content", "")])
-                all_content += "".join(chunks_list)
+        if step.get("type") == "text":
+            chunks_list = step.get("chunks", [step.get("content", "")])
+            all_content += "".join(chunks_list)
 
-    return JSONResponse({
-        "id": request_id,
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": all_content or "Mock response."},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
-    })
+    return JSONResponse(
+        {
+            "id": request_id,
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": all_content or "Mock response."},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Responses API endpoint (for Codex/GPT-5 paths)
 # ---------------------------------------------------------------------------
+
 
 async def responses_api(request: Request) -> Response:
     """Minimal Responses API — delegates to chat completions logic."""
@@ -212,6 +234,7 @@ async def responses_api(request: Request) -> Response:
 # Embeddings endpoint
 # ---------------------------------------------------------------------------
 
+
 async def embeddings(request: Request) -> Response:
     """Return deterministic fixed-dim embeddings (zeros with a hash seed)."""
     try:
@@ -237,31 +260,37 @@ async def embeddings(request: Request) -> Response:
         for i, inp in enumerate(input_data)
     ]
 
-    return JSONResponse({
-        "object": "list",
-        "data": data,
-        "model": body.get("model", "mock-embedding"),
-        "usage": {"prompt_tokens": len(input_data) * 5, "total_tokens": len(input_data) * 5},
-    })
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": data,
+            "model": body.get("model", "mock-embedding"),
+            "usage": {"prompt_tokens": len(input_data) * 5, "total_tokens": len(input_data) * 5},
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Models endpoint
 # ---------------------------------------------------------------------------
 
+
 async def list_models(request: Request) -> Response:
-    return JSONResponse({
-        "object": "list",
-        "data": [
-            {"id": "mock-model", "object": "model", "created": 0, "owned_by": "mock"},
-            {"id": "mock-embedding", "object": "model", "created": 0, "owned_by": "mock"},
-        ],
-    })
+    return JSONResponse(
+        {
+            "object": "list",
+            "data": [
+                {"id": "mock-model", "object": "model", "created": 0, "owned_by": "mock"},
+                {"id": "mock-embedding", "object": "model", "created": 0, "owned_by": "mock"},
+            ],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Control-plane endpoints (/__mock/*)
 # ---------------------------------------------------------------------------
+
 
 async def mock_upsert_scenario(request: Request) -> Response:
     """POST /__mock/scenario — inject or replace a scenario at runtime."""
@@ -316,6 +345,7 @@ async def health(request: Request) -> Response:
 # App factory
 # ---------------------------------------------------------------------------
 
+
 def create_app(scenarios_dir: Path | None = None) -> Starlette:
     """Create the mock LLM Starlette app.
 
@@ -330,7 +360,9 @@ def create_app(scenarios_dir: Path | None = None) -> Starlette:
             scenarios_dir = Path(env_dir)
         else:
             # Default: tests/e2e/scenarios/ relative to repo root
-            scenarios_dir = Path(__file__).parent.parent.parent.parent / "tests" / "e2e" / "scenarios"
+            scenarios_dir = (
+                Path(__file__).parent.parent.parent.parent / "tests" / "e2e" / "scenarios"
+            )
 
     _catalog.load_directory(scenarios_dir)
 

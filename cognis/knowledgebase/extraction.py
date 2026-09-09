@@ -185,6 +185,7 @@ def _extract_document_worker(
         resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
         memory_limit = 512 * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    result: tuple[str, ExtractedDocument | None]
     try:
         result = (
             "ok",
@@ -383,23 +384,23 @@ def extract_artifact_bytes(content: bytes, *, filename: str, mime_type: str) -> 
             from docx import Document
         except ImportError as exc:
             raise RuntimeError("python-docx is required for DOCX knowledgebase indexing") from exc
-        document = Document(io.BytesIO(content))
-        if len(document.paragraphs) > _MAX_SOURCE_SPANS:
+        docx_document = Document(io.BytesIO(content))
+        if len(docx_document.paragraphs) > _MAX_SOURCE_SPANS:
             raise KnowledgebaseExtractionLimitExceeded("document exceeds source span limit")
         extracted_characters = 0
-        spans: list[SourceSpan] = []
-        for index, paragraph in enumerate(document.paragraphs, start=1):
+        docx_spans: list[SourceSpan] = []
+        for index, paragraph in enumerate(docx_document.paragraphs, start=1):
             if not paragraph.text.strip():
                 continue
             extracted_characters += len(paragraph.text)
             if extracted_characters > _MAX_EXTRACTED_CHARACTERS:
                 raise KnowledgebaseExtractionLimitExceeded("extracted text exceeds character limit")
-            spans.append(
+            docx_spans.append(
                 SourceSpan(
                     text=paragraph.text,
                     locator={"paragraph_start": index, "paragraph_end": index},
                 )
             )
-        return ExtractedDocument(spans=spans, extraction_method="docx")
+        return ExtractedDocument(spans=docx_spans, extraction_method="docx")
 
     raise RuntimeError(f"Unsupported artifact type for knowledgebase indexing: {mime_type}")

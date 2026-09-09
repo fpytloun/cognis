@@ -9,7 +9,7 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import select, update
 
@@ -167,10 +167,17 @@ async def handle_agent_management_action(
     actor_email: str,
     current_agent_id: str,
     arguments: dict[str, Any],
+    self_mutation_approved: bool = False,
 ) -> dict[str, Any]:
     """Execute a single owner-scoped agent-management action."""
 
     action = str(arguments.get("action") or "").strip()
+    if str(arguments.get("agent_id") or "").strip() == current_agent_id:
+        from cognis.core.chat_modes import is_plan_mutating_tool_call
+        from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
+
+        if is_plan_mutating_tool_call(MANAGE_AGENTS_TOOL, arguments) and not self_mutation_approved:
+            raise AgentManagementError("Self mutation requires explicit user approval.")
     if not action:
         raise AgentManagementError("action is required")
 
@@ -752,7 +759,7 @@ async def _replace_live_agent_profile_references(
         result = await session.execute(
             update(model)
             .where(
-                model.agent_id == agent_id,
+                cast(Any, model).agent_id == agent_id,
                 profile_column == source_profile_id,
             )
             .values({profile_column.key: replacement_profile_id})
@@ -1278,8 +1285,6 @@ async def _require_owned_target(
     agent_id = str(arguments.get("agent_id") or "").strip()
     if not agent_id:
         raise AgentManagementError("agent_id is required")
-    if agent_id == current_agent_id:
-        raise AgentManagementError("An agent cannot manage itself")
     if agent_id in SYSTEM_AGENTS:
         raise AgentManagementError("System agents are read-only")
     async with deps.session_factory() as session:
@@ -1590,7 +1595,9 @@ def _apply_llm_setting(
     elif field == "model":
         model = _nullable_string(value, field)
         provider_id = llm_config.get("provider_id")
-        allowed_models = provider_models.get(provider_id, set())
+        allowed_models = (
+            provider_models.get(provider_id, set()) if isinstance(provider_id, str) else set()
+        )
         if model is not None and allowed_models and model not in allowed_models:
             raise AgentManagementError(f"Invalid model for provider {provider_id}: {model}")
         llm_config[field] = model
@@ -1740,7 +1747,11 @@ def _configured_tool_assignment(row: Any) -> dict[str, list[str]]:
 def _tool_assignment_from_arguments(
     arguments: dict[str, Any], row: Any, *, default_empty: bool = False
 ) -> dict[str, list[str]]:
-    current = {"tool_groups": [], "allow_tools": [], "deny_tools": []}
+    current: dict[str, list[str]] = {
+        "tool_groups": [],
+        "allow_tools": [],
+        "deny_tools": [],
+    }
     if not default_empty:
         current = _configured_tool_assignment(row)
     raw_tools = arguments.get("tools")
@@ -2026,7 +2037,7 @@ async def _generate_avatar(
         image.content_type,
         owner_email=actor_email,
     )
-    return image_id
+    return str(image_id)
 
 
 async def _generate_avatar_prompt(

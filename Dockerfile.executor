@@ -1,32 +1,125 @@
 # syntax=docker/dockerfile:1.7
 
-FROM python:3.12-bookworm AS runtime
+ARG PYTHON_VERSION=3.12
+
+FROM node:22-bookworm-slim AS node-runtime
+
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS python-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV COGNIS_DATA_DIR=/home/cognis/.cognis
-ENV COGNIS_EXECUTOR_SHELL=/bin/bash
-ENV COGNIS_LSP_AUTO_INSTALL=true
-ENV COGNIS_OFFICECLI_AUTO_INSTALL=true
-ENV COGNIS_LOG_LEVEL=info
 ENV COGNIS_SKIP_UI_BUILD=1
-ENV HOME=/home/cognis
-ENV LANG=C.UTF-8
-ENV LC_ALL=C.UTF-8
-ENV PATH=/home/cognis/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV SHELL=/bin/bash
+ENV UV_PROJECT_ENVIRONMENT=/opt/cognis
 
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        build-essential \
+        libffi-dev \
+        libpq-dev \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY packages/common/ ./packages/common/
+COPY packages/executor/ ./packages/executor/
+
+RUN python -m pip install --no-cache-dir --upgrade pip uv \
+    && uv venv /opt/cognis \
+    && uv pip install --python /opt/cognis/bin/python --no-cache-dir ./packages/common \
+    && uv pip install --python /opt/cognis/bin/python --no-cache-dir ./packages/executor \
+    && rm -rf /root/.cache /tmp/*
+
+
+FROM python:${PYTHON_VERSION}-slim-bookworm AS minimal
+
+LABEL org.opencontainers.image.title="cognis-executor-minimal"
+LABEL org.opencontainers.image.description="Minimal Cognis remote executor"
+LABEL org.opencontainers.image.cognis.executor.variant="minimal"
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV COGNIS_DATA_DIR=/home/cognis/.cognis
+ENV COGNIS_EXECUTOR_SHELL=/bin/bash
+ENV COGNIS_EXECUTOR_VARIANT=minimal
+ENV COGNIS_LSP_AUTO_INSTALL=false
+ENV COGNIS_OFFICECLI_AUTO_INSTALL=false
+ENV COGNIS_LOG_LEVEL=info
+ENV HOME=/home/cognis
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PATH=/opt/cognis/bin:/home/cognis/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV SHELL=/bin/bash
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
         bash \
-        bzip2 \
         ca-certificates \
-        cargo \
-        clang \
-        clangd \
-        cmake \
+        gosu \
+        libnss-wrapper \
+        sudo \
+        tini \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/*
+
+COPY --from=python-builder /opt/cognis /opt/cognis
+
+RUN groupadd --gid 1000 cognis \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash cognis \
+    && mkdir -p \
+        /home/cognis/.cache \
+        /home/cognis/.cognis/cache/browser \
+        /home/cognis/.cognis/cache/lsp \
+        /home/cognis/.cognis/cache/officecli \
+        /home/cognis/.config \
+        /home/cognis/.local/bin \
+        /home/cognis/workspace \
+        /ms-playwright \
+    && chown -R cognis:cognis /home/cognis \
+    && chmod -R g+rwX /home/cognis \
+    && chmod 2775 \
+        /home/cognis \
+        /home/cognis/.cache \
+        /home/cognis/.cognis \
+        /home/cognis/.cognis/cache \
+        /home/cognis/.cognis/cache/browser \
+        /home/cognis/.cognis/cache/lsp \
+        /home/cognis/.cognis/cache/officecli \
+        /home/cognis/.config \
+        /home/cognis/.local \
+        /home/cognis/.local/bin \
+        /home/cognis/workspace
+
+COPY docker/executor/entrypoint.sh /usr/local/bin/cognis-executor-entrypoint
+RUN chmod 0755 /usr/local/bin/cognis-executor-entrypoint
+
+WORKDIR /home/cognis/workspace
+
+STOPSIGNAL SIGTERM
+USER 1000:1000
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cognis-executor-entrypoint"]
+CMD ["cognis-executor"]
+
+
+FROM minimal AS general
+
+LABEL org.opencontainers.image.title="cognis-executor"
+LABEL org.opencontainers.image.description="General-purpose Cognis remote executor"
+LABEL org.opencontainers.image.cognis.executor.variant="general"
+
+ENV COGNIS_EXECUTOR_VARIANT=general
+ENV COGNIS_OFFICECLI_AUTO_INSTALL=true
+
+ARG COGNIS_EXECUTOR_BROWSERS="chrome"
+ARG TARGETARCH
+ARG OFFICECLI_VERSION="v1.0.102"
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bzip2 \
         curl \
         dbus \
         dbus-x11 \
@@ -35,33 +128,17 @@ RUN apt-get update \
         file \
         fontconfig \
         fonts-liberation \
-        fonts-noto-cjk \
         fonts-noto-color-emoji \
         git \
         git-lfs \
         gnupg \
-        golang-go \
-        gosu \
         jq \
         less \
-        libffi-dev \
-        libnss-wrapper \
-        libpq-dev \
-        libssl-dev \
-        make \
-        nodejs \
-        npm \
         openssh-client \
         patch \
-        pkg-config \
-        postgresql-client \
         procps \
         psmisc \
         ripgrep \
-        shellcheck \
-        sqlite3 \
-        sudo \
-        tini \
         unzip \
         vim-tiny \
         wget \
@@ -70,41 +147,38 @@ RUN apt-get update \
         xz-utils \
         zip \
         zstd \
-    && rm -rf /var/lib/apt/lists/*
+    && /usr/local/bin/python -m pip install --no-cache-dir --upgrade uv \
+    && rm -rf \
+        /home/cognis/.cache/uv \
+        /root/.cache \
+        /root/.npm \
+        /var/cache/apt/* \
+        /var/lib/apt/lists/* \
+        /tmp/*
 
-COPY pyproject.toml uv.lock README.md build.py ./
-COPY cognis/ ./cognis/
-COPY docs/ ./docs/
+COPY --from=python-builder /app/packages/executor /tmp/cognis-executor
+RUN /usr/local/bin/python -m pip install --no-cache-dir uv \
+    && uv pip install --python /opt/cognis/bin/python --no-cache-dir '/tmp/cognis-executor[full]' \
+    && rm -rf /tmp/cognis-executor /root/.cache/uv
 
-# Default browser pre-warm matrix. Override via:
-#   docker build --build-arg COGNIS_EXECUTOR_BROWSERS="chromium,chrome,firefox,webkit" .
-# Accepts any space- or comma-separated list of `playwright install` targets.
-# Default: chromium (Playwright bundled) + chrome stable (used by Patchright +
-# `channel=chrome`). Firefox/WebKit are auto-installed lazily on first use,
-# or pre-bundle them by adding to this list.
-ARG COGNIS_EXECUTOR_BROWSERS="chromium chrome"
-ARG TARGETARCH
-ARG OFFICECLI_VERSION="v1.0.102"
+RUN /opt/cognis/bin/python -m patchright install --with-deps $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') \
+    && rm -rf \
+        /home/cognis/.cache/uv \
+        /root/.cache \
+        /root/.npm \
+        /var/cache/apt/* \
+        /var/lib/apt/lists/* \
+        /tmp/*
 
-ENV UV_PROJECT_ENVIRONMENT=/usr/local
+RUN rm -f \
+    /etc/apt/sources.list.d/google-chrome.list \
+    /etc/apt/sources.list.d/google-chrome.sources \
+    /usr/share/keyrings/google-chrome.gpg
 
-RUN python -m pip install --no-cache-dir --upgrade pip uv \
-    && uv sync --locked --no-dev --extra postgres --extra s3 --extra redis \
-    && python -m pip install --no-cache-dir "ruff>=0.5.0" \
-    && python -m playwright install --with-deps $(echo "$COGNIS_EXECUTOR_BROWSERS" | tr ',' ' ') \
-    && npm install -g --ignore-scripts \
-        @vue/language-server@2.2.8 \
-        bash-language-server@5.4.2 \
-        dockerfile-language-server-nodejs@0.13.0 \
-        prettier@3.4.2 \
-        pyright@1.1.390 \
-        svelte-language-server@0.17.8 \
-        typescript \
-        typescript-language-server@4.3.3 \
-        vscode-langservers-extracted@4.10.0 \
-        yaml-language-server@1.15.0 \
-    && npm cache clean --force \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 RUN set -eux; \
     case "${TARGETARCH:-amd64}" in \
@@ -118,21 +192,47 @@ RUN set -eux; \
     OFFICECLI_SKIP_UPDATE=1 officecli --version | grep -F "${OFFICECLI_VERSION#v}"; \
     rm -f /tmp/officecli
 
-RUN groupadd --gid 1000 cognis \
-    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash cognis \
-    && mkdir -p /home/cognis/.cache /home/cognis/.cognis/cache/browser /home/cognis/.cognis/cache/lsp /home/cognis/.cognis/cache/officecli /home/cognis/.local/bin /home/cognis/workspace /ms-playwright \
-    && chown -R cognis:cognis /home/cognis \
-    && chmod -R g+rwX /home/cognis \
-    && chmod 2775 /home/cognis /home/cognis/.cache /home/cognis/.cognis /home/cognis/.cognis/cache /home/cognis/.cognis/cache/browser /home/cognis/.cognis/cache/lsp /home/cognis/.cognis/cache/officecli /home/cognis/.local /home/cognis/.local/bin /home/cognis/workspace \
-    && chmod -R a+rX /ms-playwright
-
-COPY docker/executor/entrypoint.sh /usr/local/bin/cognis-executor-entrypoint
-RUN chmod 0755 /usr/local/bin/cognis-executor-entrypoint
-
-WORKDIR /home/cognis/workspace
-
-STOPSIGNAL SIGTERM
 USER 1000:1000
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cognis-executor-entrypoint"]
-CMD ["cognis-executor"]
+
+FROM general AS development
+
+LABEL org.opencontainers.image.title="cognis-executor-development"
+LABEL org.opencontainers.image.description="Cognis remote executor with preinstalled language servers"
+LABEL org.opencontainers.image.cognis.executor.variant="development"
+
+ENV COGNIS_EXECUTOR_VARIANT=development
+ENV COGNIS_LSP_AUTO_INSTALL=true
+
+USER root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        clangd \
+        shellcheck \
+    && /usr/local/bin/python -m pip install --no-cache-dir "ruff>=0.5.0" \
+    && npm install -g --ignore-scripts \
+        @vue/language-server@2.2.8 \
+        bash-language-server@5.4.2 \
+        dockerfile-language-server-nodejs@0.13.0 \
+        prettier@3.4.2 \
+        pyright@1.1.390 \
+        svelte-language-server@0.17.8 \
+        typescript \
+        typescript-language-server@4.3.3 \
+        vscode-langservers-extracted@4.10.0 \
+        yaml-language-server@1.15.0 \
+    && npm cache clean --force \
+    && rm -rf \
+        /home/cognis/.cache/uv \
+        /root/.cache \
+        /root/.npm \
+        /var/cache/apt/* \
+        /var/lib/apt/lists/* \
+        /tmp/*
+
+USER 1000:1000
+
+
+# Untargeted local builds use the recommended general image.
+FROM general AS runtime

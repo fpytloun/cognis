@@ -87,6 +87,21 @@ app.kubernetes.io/instance: {{ .Release.Name }}
   value: {{ .Values.shutdownDrainTimeoutSeconds | quote }}
 - name: COGNIS_SHUTDOWN_CANCEL_TIMEOUT_SECONDS
   value: {{ .Values.shutdownCancelTimeoutSeconds | quote }}
+- name: COGNIS_TRUSTED_EVIDENCE_ENABLED
+  value: {{ .Values.trustedEvidence.enabled | quote }}
+- name: COGNIS_TRUSTED_EVIDENCE_OWNER_ALLOWLIST
+  {{- if .Values.trustedEvidence.ownerAllowlistSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.trustedEvidence.ownerAllowlistSecret | quote }}
+      key: {{ .Values.trustedEvidence.ownerAllowlistSecretKey | quote }}
+  {{- else }}
+  value: ""
+  {{- end }}
+- name: COGNIS_TRUSTED_EVIDENCE_MAX_ATTEMPTS
+  value: {{ int .Values.trustedEvidence.maxAttempts | quote }}
+- name: COGNIS_TRUSTED_EVIDENCE_MAX_AGE_SECONDS
+  value: {{ int .Values.trustedEvidence.maxAgeSeconds | quote }}
 - name: COGNIS_ARTIFACT_BACKEND
   value: {{ .Values.artifacts.backend | quote }}
 - name: COGNIS_ARTIFACT_PATH

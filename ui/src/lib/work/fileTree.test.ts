@@ -29,6 +29,36 @@ describe('fileTree', () => {
     expect(new Set(fileNodes(tree).map((node) => node.id)).size).toBe(input.length);
   });
 
+  it('does not merge the same relative path edited by two different source workstreams in a shared repo root', () => {
+    const commonRootFields = { path_id: 'shared:src/app.ts', root_id: 'shared-repo' };
+    const first = diff('repo/src/app.ts', '+child-a-change', {
+      ...commonRootFields,
+      source_workstream: { key: 'session:child-a', title: 'Child A', agent_id: 'agent-a', status: 'ongoing' },
+    });
+    const second = diff('repo/src/app.ts', '+child-b-change', {
+      ...commonRootFields,
+      source_workstream: { key: 'session:child-b', title: 'Child B', agent_id: 'agent-b', status: 'ongoing' },
+    });
+    const files = fileNodes(buildFileTree([first, second]));
+
+    // Same path_id/root_id but different source workstreams must remain two
+    // distinct file nodes, not one merged diff history.
+    expect(files).toHaveLength(2);
+    expect(new Set(files.map((node) => node.id)).size).toBe(2);
+    expect(files.every((node) => node.diffs.length === 1)).toBe(true);
+    expect(files.map((node) => node.diff.source_workstream?.key).sort()).toEqual(['session:child-a', 'session:child-b']);
+  });
+
+  it('still merges repeated diffs for the same file from the same source workstream into one history', () => {
+    const source = { key: 'session:child-a', title: 'Child A', agent_id: 'agent-a', status: 'ongoing' };
+    const first = diff('repo/src/app.ts', '+first-change', { path_id: 'shared:src/app.ts', root_id: 'shared-repo', source_workstream: source });
+    const second = diff('repo/src/app.ts', '+second-change', { path_id: 'shared:src/app.ts', root_id: 'shared-repo', source_workstream: source });
+    const files = fileNodes(buildFileTree([first, second]));
+
+    expect(files).toHaveLength(1);
+    expect(files[0].diffs).toHaveLength(2);
+  });
+
   it('keeps same-label roots separate by root identity and trusts explicit stats', () => {
     const tree = buildFileTree([
       diff('repo/src/app.ts', '+partial', {
@@ -75,6 +105,63 @@ describe('fileTree', () => {
       '@@ -1 +1 @@\n-old\n+middle\n@@ -1 +1 @@\n-middle\n+new'
     );
     expect(files[0].counts).toEqual({ files: 1, additions: 2, deletions: 2 });
+  });
+
+  it('renders a rename chain as one latest node while keeping other roots isolated', () => {
+    const files = fileNodes(buildFileTree([
+      diff('root-a/new.py', '-old\n+mid', {
+        path_id: 'root-a:new.py', root_id: 'root-a', additions: 1, deletions: 1,
+      }),
+      diff('root-a/new.py', '-mid\n+renamed', {
+        path_id: 'root-a:new.py', root_id: 'root-a', old_path: 'root-a/old.py',
+        status: 'renamed', additions: 2, deletions: 1,
+      }),
+      diff('root-a/new.py', '-renamed\n+final', {
+        path_id: 'root-a:new.py', root_id: 'root-a', old_path: 'root-a/mid.py',
+        status: 'modified', additions: 3, deletions: 1,
+      }),
+      diff('root-b/old.py', '-other\n+updated', {
+        path_id: 'root-b:old.py', root_id: 'root-b', additions: 4, deletions: 1,
+      }),
+    ]));
+
+    expect(files).toHaveLength(2);
+    const renamed = files.find((file) => file.path === 'root-a/new.py');
+    expect(renamed).toMatchObject({
+      status: 'modified',
+      counts: { files: 1, additions: 6, deletions: 3 },
+    });
+    expect(renamed?.diffs).toHaveLength(3);
+    expect(files.find((file) => file.path === 'root-b/old.py')?.id).not.toBe(renamed?.id);
+  });
+
+  it('keeps a recreated rename source separate from its pre-rename history', () => {
+    const files = fileNodes(buildFileTree([
+      diff('repo/B.py', '-old\n+before-rename', {
+        path_id: 'root:B.py', root_id: 'root', additions: 1, deletions: 1,
+      }),
+      diff('repo/B.py', '-before-rename\n+renamed', {
+        path_id: 'root:B.py', root_id: 'root', old_path: 'repo/A.py',
+        status: 'renamed', additions: 2, deletions: 1,
+      }),
+      diff('repo/A.py', '-created\n+edited', {
+        path_id: 'root:A.py', root_id: 'root', status: 'modified',
+        additions: 7, deletions: 2,
+      }),
+    ]));
+
+    expect(files).toHaveLength(2);
+    const recreated = files.find((file) => file.path === 'repo/A.py');
+    const renamed = files.find((file) => file.path === 'repo/B.py');
+    expect(recreated).toMatchObject({
+      status: 'modified', counts: { files: 1, additions: 7, deletions: 2 },
+    });
+    expect(recreated?.diffs).toHaveLength(1);
+    expect(renamed).toMatchObject({
+      status: 'renamed', counts: { files: 1, additions: 3, deletions: 2 },
+    });
+    expect(renamed?.diffs).toHaveLength(2);
+    expect(recreated?.id).not.toBe(renamed?.id);
   });
 
   it('combines text edits while excluding unavailable binary and generated previews', () => {

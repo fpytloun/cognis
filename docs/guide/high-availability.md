@@ -87,6 +87,11 @@ Service becomes `COGNIS_CONTROLLER_INTERNAL_URL`. The headless Service is intern
 discovery, not another public endpoint. Browser/API traffic and executor
 outbound WebSockets use the single public Service/Ingress.
 
+The internal headless Service publishes unready addresses. This keeps a draining
+controller reachable for bridge calls that were admitted before readiness
+withdrawal. The public Service remains readiness-filtered. Exact incarnation
+checks and executor lease fencing continue to control internal admission.
+
 HA startup validation requires PostgreSQL, S3-compatible artifact and
 tool-output stores, shared ES256 keys, shared secrets-encryption key, shared
 artifact signing secret, controller identity/internal URL, and schema validation
@@ -127,10 +132,15 @@ old and new executors and the factual reason. It never runs in the middle of an
 accepted operation.
 
 Only an allowlist of read-only unary RPCs may retry with a stable call ID and
-executor-local result cache. Tool execution, streaming inference, and mutations
-are not replayed after `accepted_unknown` or partial delivery. Executor restart
-loses that unary cache. An external side effect remains ambiguous when Cognis
-did not observe a terminal result.
+executor-local result cache. For tool execution, the accepting executor process
+retains active and terminal call state across WebSocket reconnects. Cognis first
+queries that same process after `accepted_unknown`: a retained terminal result
+is recovered, while an authoritative `unknown` proves the call never ran and
+permits normal dispatch recovery. If reconciliation itself remains unavailable,
+only explicitly read-only tools may be replayed; mutations are never replayed
+and remain ambiguous. Executor process restart loses retained call state, so an
+external side effect remains ambiguous when Cognis did not observe a terminal
+result.
 
 ### Stateful executor pools
 
@@ -225,10 +235,19 @@ considering the upgrade complete.
 
 ## Draining and reconnect
 
-On SIGTERM readiness changes to 503 before draining. The controller stops new
-admissions, waits for active turns, requests cancellation after the drain
-timeout, settles durable ownership, and closes WebSockets. Termination grace
-must exceed preStop plus drain and cancellation timeouts.
+On SIGTERM, the server starts the application drain before it closes listeners
+or WebSockets. Readiness changes to 503 and the controller stops new admission.
+The controller first waits for local turns. It requests cancellation after the
+turn drain timeout. It then uses the remaining shutdown budget to wait for
+accepted local, bridged, and detached executor tool calls. Status, result, and
+cancel traffic remains available during this wait. The tool wait does not
+cancel tool calls.
+
+After the shutdown deadline, the server can close transports. Existing durable
+recovery rules handle interrupted work. A second termination signal stops the
+graceful wait. Set termination grace to more than the preStop delay plus the
+configured drain and cancellation timeouts. Include two additional seconds for
+the bounded admission and readiness transition.
 
 Browser and executor WebSockets reconnect through the load balancer. Durable
 turn, task, schedule, pause, channel, worker, and executor ownership prevents a

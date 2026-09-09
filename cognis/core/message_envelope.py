@@ -48,18 +48,28 @@ def normalize_message_metadata(
     raw_ts = raw.get("ts") or fallback_ts
     if raw_ts is None:
         return None
-    provenance = {
-        "channel": raw.get("channel") if isinstance(raw.get("channel"), str) else None,
-        "sender": raw.get("sender") if isinstance(raw.get("sender"), str) else None,
-        "untrusted": raw.get("untrusted") is True,
-    }
+    channel = raw.get("channel")
+    sender = raw.get("sender")
+    provenance_channel = channel if isinstance(channel, str) else None
+    provenance_sender = sender if isinstance(sender, str) else None
+    provenance_untrusted = raw.get("untrusted") is True
     try:
-        result = message_metadata(ts=raw_ts, **provenance)
+        result = message_metadata(
+            ts=raw_ts,
+            channel=provenance_channel,
+            sender=provenance_sender,
+            untrusted=provenance_untrusted,
+        )
     except (TypeError, ValueError):
         if fallback_ts is None or raw_ts == fallback_ts:
             return None
         try:
-            result = message_metadata(ts=fallback_ts, **provenance)
+            result = message_metadata(
+                ts=fallback_ts,
+                channel=provenance_channel,
+                sender=provenance_sender,
+                untrusted=provenance_untrusted,
+            )
         except (TypeError, ValueError):
             return None
     return result

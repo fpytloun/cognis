@@ -6,6 +6,7 @@ from fastapi import APIRouter, Request
 
 from cognis.api.common import api_exception, require_admin
 from cognis.api.models import CursorPage, UserCreateRequest, UserResponse, UserUpdateRequest
+from cognis.mfa import revoke_user_auth_sessions
 from cognis.store.queries import (
     count_admins,
     create_user,
@@ -121,8 +122,14 @@ async def admin_update_user(
             raise api_exception(404, "not_found", f"User {email} not found")
         if user.role == _SYSTEM_ROLE:
             raise api_exception(403, "forbidden", "Cannot modify system user")
+        if password_hash is not None:
+            await revoke_user_auth_sessions(session, user_email=email)
         await session.commit()
         await session.refresh(user)
+    if password_hash is not None:
+        ws_manager = getattr(request.app.state, "ws_manager", None)
+        if ws_manager is not None:
+            await ws_manager.disconnect_user(email)
     return _user_response(user)
 
 
@@ -146,6 +153,13 @@ async def admin_disable_user(request: Request, email: str) -> UserResponse:
         user = await disable_user(session, email, disabled_by=admin.email)
         await session.commit()
         await session.refresh(user)
+    ws_manager = getattr(request.app.state, "ws_manager", None)
+    if ws_manager is not None:
+        await ws_manager.disconnect_user(
+            email,
+            code=4403,
+            reason="Account disabled",
+        )
     return _user_response(user)
 
 

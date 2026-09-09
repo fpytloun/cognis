@@ -670,6 +670,10 @@ to a specific diff — all keyboard-only.
   INV-STABLE-ORDER / INV-NO-DUP as the pattern).
 - Work fetch fails on one step run → other runs still render; explicit
   retryable error, existing projection retained (`WorkView.svelte:58-97`).
+- Live Work refresh is push-first through scope invalidation. While the view is
+  visible, a jittered approximately two-minute timer is only a correctness
+  fallback; it pauses while hidden, catches up when visibility returns, and
+  does not overlap an in-flight refresh.
 - Dock/iframe/session reconnect (within task detail) → transcript and decision
   card restored from the persistent server-side conversation.
 - Navigate away from the task while a decision is pending → dock unmounts; the
@@ -931,6 +935,12 @@ derived **client-side** from the diff paths.
 
 - Input: the authorized `WorkProjectionResponse` already loaded by `WorkView`
   (`file_diffs[]` with `path` + change status; `summary.changed_files`).
+- The Files category is a complete latest-per-path projection across the full
+  authorized root/descendant session tree, not a mutation-history page. Each
+  path carries its latest status/preview metadata and cumulative additions and
+  deletions across the filtered history; summary totals use the same cumulative
+  data. Query/result bounds are based on unique file paths, so repeated edits do
+  not consume pagination budget or hide older-but-still-current files.
 - `lib/work/fileTree.ts` folds `path` on `/` into a folder/file tree, carrying
   per-node **status** (added/modified/deleted/renamed) and **aggregate counts**
   (changed files, +adds/−dels when available) up each folder.

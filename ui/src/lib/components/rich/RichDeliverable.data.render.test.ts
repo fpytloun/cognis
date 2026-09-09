@@ -2,7 +2,9 @@ import { fireEvent, render as renderComponent, screen } from '@testing-library/s
 import { describe, expect, it, vi } from 'vitest';
 
 import RichDeliverable from './RichDeliverable.svelte';
-import { richDeliverableDataScenario } from './rich-deliverable-data.fixture';
+import { requireRichScenario } from '$lib/rich-scenarios/registry';
+
+const richDeliverableDataScenario = requireRichScenario('interactive-data-dashboard');
 
 function render(_: typeof RichDeliverable, props: { payload: unknown; surface?: 'embedded' | 'standalone' } & Record<string, unknown>) {
   return renderComponent(RichDeliverable, { surface: 'standalone', ...props });

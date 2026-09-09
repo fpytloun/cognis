@@ -12,11 +12,12 @@ from typing import Any, cast
 
 from fastapi import APIRouter, Query, Request, Response
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from cognis.api.chat_v2.cursors import ChatCursorError
 from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
+from cognis.api.chat_v2.event_store_refs import session_read_ref, session_read_refs
 from cognis.api.chat_v2.request_metrics import (
     CHAT_V2_REQUEST_METRICS,
     CacheOnlyOutcome,
@@ -45,12 +46,17 @@ from cognis.api.chat_v2.schemas import (
     WorkDeliverable,
     WorkProjectionResponse,
 )
+from cognis.api.chat_v2.scope_projection import (
+    project_session_scope,
+    project_task_step_scope,
+)
 from cognis.api.chat_v2.shared_snapshot_cache import SnapshotRequestTrace
 from cognis.api.chat_v2.snapshot_coordinator import (
     ConversationSnapshotContext,
     build_chat_snapshot_coordinated,
     get_cached_chat_snapshot_coordinated,
     load_conversation_snapshot_context,
+    rebuild_chat_snapshot_coordinated,
 )
 from cognis.api.chat_v2.snapshot_metrics import (
     SNAPSHOT_CACHE_METRICS,
@@ -73,21 +79,21 @@ from cognis.api.chat_v2.sync import (
     conversation_summary_from_row,
     queue_state_from_messages,
     runtime_input_from_scheduler,
+    runtime_overlay_from_input,
     state_view_from_snapshot,
 )
 from cognis.api.chat_v2.work_graph import (
-    WORK_GRAPH_MAX_SECONDS,
     AuthorizedWorkGraph,
-    resolve_authorized_work_graph,
 )
 from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
+from cognis.api.chat_v2.work_overview_metrics import WORK_OVERVIEW_METRICS
 from cognis.api.chat_v2.work_projection import build_work_projection
 from cognis.api.chat_v2.work_repository import (
     WorkCursorError,
+    enrich_workstream_lifecycle,
     read_activity_overview,
     read_work_page,
 )
-from cognis.api.chat_v2.work_revisions import WorkRevisionSnapshot
 from cognis.api.common import (
     api_exception,
     check_agent_access,
@@ -101,14 +107,17 @@ from cognis.core.attachment_utils import hydrate_attachment_refs
 from cognis.core.chat_modes import parse_chat_mode_directive
 from cognis.core.command_notices import persist_command_system_notice
 from cognis.core.commands import is_system_slash_command_message
+from cognis.core.historical_tool_output import tool_event_storage_id
+from cognis.core.trusted_evidence import authenticated_direct_user_origin
 from cognis.core.turn_scheduler import TurnError
 from cognis.core.user_message_overflow import TextArtifact, normalize_user_message_content
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.retry import RetryReason
+from cognis.models.session import SessionModel
 from cognis.providers.circuit_breaker import CircuitBreakerError
-from cognis.providers.guardrails.events import EventStoreAuthority
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
+from cognis.store.direct_turns import AdmissionResult
 from cognis.store.models import ChatClientTransactionRow, DeliverableRow, WorkRecordRow
 from cognis.store.queries import (
     claim_chat_client_transaction,
@@ -125,6 +134,7 @@ from cognis.store.queries import (
     list_conversation_sessions,
     mark_artifacts_attached,
 )
+from cognis.store.work_live_invalidation import read_live_work_revision
 
 router = APIRouter(prefix="/api/v1/chat/v2", tags=["chat-v2"])
 logger = logging.getLogger(__name__)
@@ -173,15 +183,10 @@ async def _scoped_tool_output_page(
                 direction="backward",
             )
             for event in page.events:
-                event_call_id = event.data.get("call_id")
-                recovery_call_id = event.data.get("recovery_call_id")
-                if call_id not in {event_call_id, recovery_call_id}:
+                matched_storage_id = tool_event_storage_id(event.data, call_id)
+                if matched_storage_id is None:
                     continue
-                storage_call_id = (
-                    recovery_call_id
-                    if isinstance(recovery_call_id, str) and recovery_call_id
-                    else str(event_call_id)
-                )
+                storage_call_id = matched_storage_id
                 if event.type == "tool_result":
                     event_data = event.data
                     resolved_session_id = ref.session_id
@@ -326,6 +331,15 @@ async def chat_v2_snapshot(request: Request, conversation_id: str) -> ChatSnapsh
             context,
             request_trace=trace,
         )
+        if _snapshot_is_unexpectedly_empty(snapshot):
+            snapshot = await rebuild_chat_snapshot_coordinated(request.app, context)
+            trace.select("bypass")
+        if _snapshot_is_unexpectedly_empty(snapshot):
+            raise api_exception(
+                503,
+                "event_store_inconsistent",
+                "Conversation history is temporarily unavailable",
+            )
         outcome = "success"
         return snapshot
     except CircuitBreakerError as exc:
@@ -338,6 +352,18 @@ async def chat_v2_snapshot(request: Request, conversation_id: str) -> ChatSnapsh
         raise api_exception(400, exc.code, str(exc)) from exc
     finally:
         SNAPSHOT_CACHE_METRICS.request(trace.tier, outcome, monotonic() - started)
+
+
+def _snapshot_is_unexpectedly_empty(snapshot: ChatSnapshot) -> bool:
+    conversation = getattr(snapshot, "conversation", None)
+    timeline = getattr(snapshot, "timeline", None)
+    return bool(
+        conversation is not None
+        and timeline is not None
+        and conversation.has_message_history
+        and not timeline.items
+        and not timeline.has_more_before
+    )
 
 
 @router.get(
@@ -404,17 +430,20 @@ async def chat_v2_client_performance(request: Request) -> None:
 async def chat_v2_conversation_work(
     request: Request,
     conversation_id: str,
+    response: Response = None,  # type: ignore[assignment]
     before: str | None = None,
     category: WorkCategory | None = None,
     from_time: datetime | None = Query(default=None, alias="from"),
     to_time: datetime | None = Query(default=None, alias="to"),
     filter_session_id: str | None = Query(default=None, alias="session_id"),
+    detail: ActivityOverviewDetail = "full",
     limit: int = Query(
         default=BACKFILL_DEFAULT_LIMIT, ge=BACKFILL_MIN_LIMIT, le=WORK_PAGE_MAX_LIMIT
     ),
 ) -> WorkProjectionResponse:
     """Project persisted mutation evidence for the conversation's current window."""
 
+    _set_work_response_headers(response)
     context = await _load_read_context(request, conversation_id)
     return await _build_work_graph_projection(
         request,
@@ -425,6 +454,7 @@ async def chat_v2_conversation_work(
         from_time=from_time if isinstance(from_time, datetime) else None,
         to_time=to_time if isinstance(to_time, datetime) else None,
         exact_session_id=filter_session_id if isinstance(filter_session_id, str) else None,
+        detail=detail,
     )
 
 
@@ -435,8 +465,10 @@ async def chat_v2_conversation_work(
 async def chat_v2_conversation_activity_overview(
     request: Request,
     conversation_id: str,
+    response: Response = None,  # type: ignore[assignment]
     detail: ActivityOverviewDetail = Query(default="lightweight"),
 ) -> ActivityOverviewResponse:
+    _set_work_response_headers(response)
     return await _build_activity_overview(
         request, await _load_read_context(request, conversation_id), detail=detail
     )
@@ -642,15 +674,23 @@ async def chat_v2_send_message(
     )
     attachments = [*payload.attachments, *generated_attachments]
     turn_scheduler = request.app.state.turn_scheduler
+    durable_admission: AdmissionResult | None = None
+
+    async def _observe_durable_admission(admission: AdmissionResult) -> None:
+        nonlocal durable_admission
+        durable_admission = admission
+
     error = await turn_scheduler.submit_turn(
         conversation_id,
         normalized.content,
         user_email=user.email,
+        admission_origin=authenticated_direct_user_origin(),
         attachments=[item.model_dump(mode="json") for item in attachments],
         client_message_id=payload.client_message_id,
         one_shot_chat_mode=payload.chat_mode,
         idempotency_scope=f"chat-v2:{conversation_id}:{user.email}",
         idempotency_key=client_txn_id,
+        durable_admission_observer=_observe_durable_admission,
     )
     if error is not None:
         await _complete_transaction(
@@ -666,18 +706,31 @@ async def chat_v2_send_message(
         raise _turn_error_to_http(error)
 
     await _mark_attachments_attached(request, row, user.email, attachments)
-    queued_message = _queued_message_for_client(
-        await request.app.state.turn_scheduler.get_queued_messages(conversation_id),
-        payload.client_message_id,
+    queued_message = None
+    if durable_admission is None:
+        queued_message = _queued_message_for_client(
+            await request.app.state.turn_scheduler.get_queued_messages(conversation_id),
+            payload.client_message_id,
+        )
+    queued = (
+        durable_admission.queued_behind_predecessor
+        if durable_admission is not None
+        else queued_message is not None
     )
-    result_status = "queued" if queued_message is not None else "accepted"
+    result_status = "queued" if queued else "accepted"
     result = {
         "status": result_status,
         "client_txn_id": client_txn_id,
         "client_message_id": payload.client_message_id,
         "conversation_id": conversation_id,
         "message_id": None,
-        "queue_id": queued_message.get("queue_id") if queued_message else None,
+        "queue_id": (
+            durable_admission.request.request_id
+            if queued and durable_admission is not None
+            else queued_message.get("queue_id")
+            if queued_message
+            else None
+        ),
         "cursor": None,
         "server_time": _server_time(),
     }
@@ -713,6 +766,14 @@ async def chat_v2_execute_command(
         operation="execute_command",
         payload_hash=payload_hash,
     )
+    from cognis.core.command_notices import PERSISTED_COMMAND_NOTICE_COMMANDS
+    from cognis.core.commands import normalize_slash_command_message
+
+    runtime_command = normalize_slash_command_message(content).split(" ", 1)[0]
+    if runtime_command in PERSISTED_COMMAND_NOTICE_COMMANDS:
+        return await _execute_runtime_command(
+            request, conversation_row, tx_row, user.email, content, payload_hash, runtime_command
+        )
     if not created:
         _ensure_replayable_transaction(tx_row, payload_hash)
         return _command_response_from_transaction(tx_row, duplicate=True)
@@ -797,11 +858,6 @@ async def chat_v2_execute_command(
         raise api_exception(422, "invalid_command", "Slash command was not handled")
 
     if command_result.type == "system_message":
-        command = command_result.data.get("command")
-        if isinstance(command, str) and command in {"/profile", "/model", "/thinking", "/fast"}:
-            command_result.data["notice_id"] = (
-                f"command:{command.lstrip('/')}:{tx_row.transaction_id}"
-            )
         notice_persisted = await persist_command_system_notice(
             conversation_id=conversation_id,
             result=command_result,
@@ -844,6 +900,134 @@ async def chat_v2_execute_command(
     return _command_response_from_transaction(tx_row, duplicate=False)
 
 
+async def _execute_runtime_command(
+    request: Request,
+    conversation_row: Any,
+    tx_row: Any,
+    user_email: str,
+    content: str,
+    payload_hash: str,
+    command: str,
+) -> CommandV2Response:
+    """Stage external validation, then atomically commit selection and receipt."""
+    from cognis.api.serializers import agent_to_response
+    from cognis.core.commands import CommandResult
+    from cognis.core.runtime_selection import RuntimeSelectionPlan, resolve_runtime_selection
+    from cognis.core.session import _to_conversation_model, _to_session_model
+
+    conversation_id = conversation_row.conversation_id
+    scheduler = request.app.state.turn_scheduler
+    async with scheduler.turn_admission_lock(conversation_id):
+        async with request.app.state.session_factory() as db:
+            # Reload after admission serialization; never use the request's stale pointer.
+            conversation_row = await get_conversation(db, conversation_id)
+            agent_row = await get_agent(db, conversation_row.agent_id)
+            session_row = (
+                await get_session_row(db, conversation_row.active_session_id)
+                if conversation_row.active_session_id
+                else None
+            )
+            tx_row = await db.get(ChatClientTransactionRow, tx_row.transaction_id)
+        if tx_row.payload_hash != payload_hash or tx_row.status != "pending":
+            _ensure_replayable_transaction(tx_row, payload_hash)
+            duplicate = True
+        else:
+            if agent_row is None:
+                raise api_exception(404, "not_found", "Agent not found")
+            agent = AgentDefinition.model_validate(agent_to_response(agent_row).model_dump())
+            conversation = _to_conversation_model(conversation_row)
+            active_session = (
+                _to_session_model(session_row)
+                if session_row is not None
+                else await request.app.state.session_manager.ensure_root_session(
+                    conversation_id=conversation_id,
+                    user_email=user_email,
+                    agent_id=conversation.agent_id,
+                    intention=content,
+                )
+            )
+            conversation.active_session_id = active_session.session_id
+            plan = RuntimeSelectionPlan()
+            # Provider discovery can do external I/O. It precedes the database transaction.
+            command_result = await request.app.state.command_dispatcher.dispatch(
+                content,
+                conversation=conversation,
+                session=active_session,
+                agent=agent,
+                user_email=user_email,
+                runtime_plan=plan,
+            )
+            if command_result is None:
+                raise api_exception(422, "invalid_command", "Slash command was not handled")
+            command_result.data["session_id"] = active_session.session_id
+            command_result.data["notice_id"] = (
+                f"command:{command.lstrip('/')}:{tx_row.transaction_id}"
+            )
+            async with request.app.state.session_factory() as db:
+                tx_row = (
+                    await db.execute(
+                        select(ChatClientTransactionRow)
+                        .where(ChatClientTransactionRow.transaction_id == tx_row.transaction_id)
+                        .with_for_update()
+                    )
+                ).scalar_one()
+                if tx_row.payload_hash != payload_hash or tx_row.status != "pending":
+                    _ensure_replayable_transaction(tx_row, payload_hash)
+                    duplicate = True
+                else:
+                    await plan.apply(db, conversation, active_session)
+                    if plan.change is not None:
+                        command_result.data["runtime_selection"] = resolve_runtime_selection(
+                            agent, active_session, conversation
+                        ).as_dict()
+                    await complete_chat_client_transaction(
+                        db,
+                        tx_row,
+                        status="completed",
+                        result={
+                            "conversation_id": conversation_id,
+                            "client_txn_id": tx_row.client_txn_id,
+                            "status": "completed",
+                            "result_type": command_result.type,
+                            "text": command_result.text or "",
+                            "data": command_result.data,
+                            "server_time": _server_time(),
+                        },
+                    )
+                    await db.commit()
+                    duplicate = False
+            if not duplicate:
+                plan.publish(request.app.state.session_cache, active_session)
+
+    # Notices are derived Intaris events. A replay heals a crash after the DB commit.
+    result = tx_row.result or {}
+    async with request.app.state.session_factory() as db:
+        notice_session_id = (result.get("data") or {}).get("session_id")
+        notice_session = (
+            await get_session_row(db, notice_session_id)
+            if isinstance(notice_session_id, str)
+            else None
+        )
+    notice_result = CommandResult(
+        type=result["result_type"], text=result["text"], data=dict(result["data"])
+    )
+    if notice_result.type == "system_message":
+        persisted = await persist_command_system_notice(
+            conversation_id=conversation_id,
+            result=notice_result,
+            providers=request.app.state.providers,
+            session_cache=getattr(request.app.state, "session_cache", None),
+            session=_to_session_model(notice_session) if notice_session else None,
+            agent=agent_row,
+            user_email=user_email,
+        )
+        if not persisted:
+            response = _command_response_from_transaction(tx_row, duplicate=duplicate)
+            response.data["notice_persisted"] = False
+            return response
+    return _command_response_from_transaction(tx_row, duplicate=duplicate)
+
+
 @router.post(
     "/conversations/{conversation_id}/assistant-messages/fork",
     response_model=ForkAssistantMessageV2Response,
@@ -869,17 +1053,17 @@ async def chat_v2_fork_assistant_message(
         ):
             raise api_exception(404, "not_found", "Assistant message not found")
         agent_row = await get_agent(session, conversation_row.agent_id)
-        source_ref = await _session_read_ref(
-            request,
-            source_session_row,
-            user_email=user.email,
-            role="root",
-            ordinal=0,
-        )
 
     if agent_row is None:
         raise api_exception(404, "not_found", "Agent not found")
 
+    source_ref = await _session_read_ref(
+        request,
+        source_session_row,
+        user_email=user.email,
+        role="root",
+        ordinal=0,
+    )
     source_session = _to_session_model(source_session_row)
     page = await _required_ref_reader(source_ref).read_session_events(
         session_id=source_ref.event_store_session_id,
@@ -932,7 +1116,7 @@ async def chat_v2_cancel_turn(
 ) -> CancelTurnV2Response:
     """Cancel the active Chat v2 turn without clearing queued messages."""
 
-    user, _row = await _require_mutable_conversation(request, conversation_id)
+    user, row = await _require_mutable_conversation(request, conversation_id)
     payload_hash = _payload_hash("cancel_turn", {"clear_queue": False})
     tx_row, created = await _claim_transaction(
         request,
@@ -950,11 +1134,17 @@ async def chat_v2_cancel_turn(
         conversation_id,
         clear_queue=False,
     )
+    runtime_input = await runtime_input_from_scheduler(
+        conversation_id=conversation_id,
+        active_session_id=getattr(row, "active_session_id", None),
+        turn_scheduler=request.app.state.turn_scheduler,
+        session_cache=getattr(request.app.state, "session_cache", None),
+    )
     result = {
         "conversation_id": conversation_id,
         "client_txn_id": payload.client_txn_id,
         "status": "cancelled" if cancelled else "idle",
-        "runtime": None,
+        "runtime": runtime_overlay_from_input(runtime_input).model_dump(mode="json"),
         "server_time": _server_time(),
     }
     tx_row = await _complete_transaction(
@@ -1042,6 +1232,7 @@ async def chat_v2_retry_turn(
             conversation_id,
             retry_source["content"],
             user_email=user.email,
+            admission_origin=None,
             attachments=retry_source["attachments"],
             client_message_id=retry_source["client_message_id"],
             is_retry=True,
@@ -1221,9 +1412,7 @@ async def _build_scoped_snapshot(
     try:
         if isinstance(context, ConversationSnapshotContext):
             return await build_chat_snapshot_coordinated(request.app, context)
-        snapshot = await build_chat_snapshot(**context)
-        overview = await _build_activity_overview(request, context)
-        return snapshot.model_copy(update={"activity_overview": overview})
+        return await build_chat_snapshot(**context)
     except CircuitBreakerError as exc:
         raise api_exception(
             503, "event_store_unavailable", "Session event store is temporarily unavailable"
@@ -1317,17 +1506,18 @@ async def _load_session_context(request: Request, session_id: str) -> dict[str, 
         if conversation_row is None or getattr(conversation_row, "status", None) == "deleted":
             raise api_exception(404, "not_found", "Owning conversation not found")
         require_resource_owner(request, conversation_row.user_email)
-        session_rows, _truncated = await get_child_session_continuation_chain(session, session_id)
+        session_rows, truncated = await get_child_session_continuation_chain(session, session_id)
+        if truncated:
+            raise api_exception(
+                409,
+                "session_lineage_conflict",
+                "Session continuation lineage is ambiguous or incomplete",
+            )
 
     current_session_row = session_rows[-1] if session_rows else session_row
-    scope = TimelineScope(
-        key=f"session:{session_id}",
-        kind="session",
-        conversation_id=session_row.conversation_id,
-        session_id=session_id,
-        parent_session_id=session_row.parent_session_id,
-        label=session_row.delegation_task or session_row.agent_id,
-        status=current_session_row.status,
+    scope = project_session_scope(
+        root_session=session_row,
+        current_session=current_session_row,
     )
     return await _single_session_context(
         request,
@@ -1359,6 +1549,17 @@ async def _load_task_step_context(request: Request, step_run_id: str) -> dict[st
                 and session_row.conversation_id != step_run.conversation_id
             ):
                 raise api_exception(404, "not_found", "Task step session linkage is invalid")
+            session_rows, truncated = await get_child_session_continuation_chain(
+                session, session_row.session_id
+            )
+            if truncated:
+                raise api_exception(
+                    409,
+                    "session_lineage_conflict",
+                    "Session continuation lineage is ambiguous or incomplete",
+                )
+        else:
+            session_rows = []
         effective_conversation_id = step_run.conversation_id or (
             session_row.conversation_id if session_row is not None else None
         )
@@ -1377,17 +1578,10 @@ async def _load_task_step_context(request: Request, step_run_id: str) -> dict[st
                 raise api_exception(404, "not_found", "Owning conversation not found")
             require_resource_owner(request, conversation_row.user_email)
 
-    scope = TimelineScope(
-        key=f"task_step:{step_run_id}",
-        kind="task_step",
+    scope = project_task_step_scope(
+        step_run=step_run,
+        session_row=session_row,
         conversation_id=effective_conversation_id,
-        session_id=step_run.session_id,
-        task_id=step_run.task_id,
-        step_run_id=step_run_id,
-        parent_session_id=session_row.parent_session_id if session_row is not None else None,
-        label=f"{step_run.step_name} (attempt {step_run.attempt_number})",
-        status=step_run.status,
-        missing_stream=session_row is None,
     )
     if session_row is None:
         now = datetime.now(UTC)
@@ -1417,6 +1611,7 @@ async def _load_task_step_context(request: Request, step_run_id: str) -> dict[st
         user_email=user.email,
         conversation_row=conversation_row,
         session_row=session_row,
+        session_rows=session_rows,
         scope=scope,
     )
 
@@ -1432,13 +1627,19 @@ async def _single_session_context(
 ) -> dict[str, Any]:
     session_rows = session_rows or [session_row]
     current_session_row = session_rows[-1]
+    session_cache = getattr(request.app.state, "session_cache", None)
+    ensure_runtime_metadata = getattr(session_cache, "ensure_runtime_metadata", None)
+    if callable(ensure_runtime_metadata):
+        await ensure_runtime_metadata(
+            SessionModel.model_validate(current_session_row, from_attributes=True)
+        )
     conversation_id = str(session_row.conversation_id)
     runtime_input = await runtime_input_from_scheduler(
         conversation_id=conversation_id,
         scope_key=scope.key,
         active_session_id=current_session_row.session_id,
         turn_scheduler=getattr(request.app.state, "turn_scheduler", None),
-        session_cache=getattr(request.app.state, "session_cache", None),
+        session_cache=session_cache,
     )
     if (
         runtime_input.active_turn is not None
@@ -1454,22 +1655,18 @@ async def _single_session_context(
             if conversation_row is not None
             else None
         ),
-        "session_refs": [
-            await _session_read_ref(
-                request,
-                row,
-                user_email=user_email,
-                role="session",
-                ordinal=ordinal,
-            )
-            for ordinal, row in enumerate(session_rows)
-        ],
+        "session_refs": await _session_read_refs(
+            request,
+            session_rows,
+            user_email=user_email,
+            role="session",
+        ),
         "event_store": None,
         "cursor_secret": _cursor_secret(request),
         "queue": None,
         "state": state_view_from_snapshot(None),
         "runtime_input": runtime_input,
-        "session_cache": getattr(request.app.state, "session_cache", None),
+        "session_cache": session_cache,
         "event_post_processor_cache_key": f"attachments:{scope.key}:{user_email}",
         "event_post_processor": _event_attachment_hydrator(
             request,
@@ -1490,15 +1687,18 @@ async def chat_v2_session_snapshot(request: Request, session_id: str) -> ChatSna
 async def chat_v2_session_work(
     request: Request,
     session_id: str,
+    response: Response = None,  # type: ignore[assignment]
     before: str | None = None,
     category: WorkCategory | None = None,
     from_time: datetime | None = Query(default=None, alias="from"),
     to_time: datetime | None = Query(default=None, alias="to"),
     filter_session_id: str | None = Query(default=None, alias="session_id"),
+    detail: ActivityOverviewDetail = "full",
     limit: int = Query(
         default=BACKFILL_DEFAULT_LIMIT, ge=BACKFILL_MIN_LIMIT, le=WORK_PAGE_MAX_LIMIT
     ),
 ) -> WorkProjectionResponse:
+    _set_work_response_headers(response)
     context = await _load_session_context(request, session_id)
     return await _build_work_graph_projection(
         request,
@@ -1509,6 +1709,7 @@ async def chat_v2_session_work(
         from_time=from_time if isinstance(from_time, datetime) else None,
         to_time=to_time if isinstance(to_time, datetime) else None,
         exact_session_id=filter_session_id if isinstance(filter_session_id, str) else None,
+        detail=detail,
     )
 
 
@@ -1519,8 +1720,10 @@ async def chat_v2_session_work(
 async def chat_v2_session_activity_overview(
     request: Request,
     session_id: str,
+    response: Response = None,  # type: ignore[assignment]
     detail: ActivityOverviewDetail = Query(default="lightweight"),
 ) -> ActivityOverviewResponse:
+    _set_work_response_headers(response)
     return await _build_activity_overview(
         request, await _load_session_context(request, session_id), detail=detail
     )
@@ -1563,15 +1766,18 @@ async def chat_v2_task_step_snapshot(request: Request, step_run_id: str) -> Chat
 async def chat_v2_task_step_work(
     request: Request,
     step_run_id: str,
+    response: Response = None,  # type: ignore[assignment]
     before: str | None = None,
     category: WorkCategory | None = None,
     from_time: datetime | None = Query(default=None, alias="from"),
     to_time: datetime | None = Query(default=None, alias="to"),
     filter_session_id: str | None = Query(default=None, alias="session_id"),
+    detail: ActivityOverviewDetail = "full",
     limit: int = Query(
         default=BACKFILL_DEFAULT_LIMIT, ge=BACKFILL_MIN_LIMIT, le=WORK_PAGE_MAX_LIMIT
     ),
 ) -> WorkProjectionResponse:
+    _set_work_response_headers(response)
     context = await _load_task_step_context(request, step_run_id)
     return await _build_work_graph_projection(
         request,
@@ -1582,6 +1788,7 @@ async def chat_v2_task_step_work(
         from_time=from_time if isinstance(from_time, datetime) else None,
         to_time=to_time if isinstance(to_time, datetime) else None,
         exact_session_id=filter_session_id if isinstance(filter_session_id, str) else None,
+        detail=detail,
     )
 
 
@@ -1592,8 +1799,10 @@ async def chat_v2_task_step_work(
 async def chat_v2_task_step_activity_overview(
     request: Request,
     step_run_id: str,
+    response: Response = None,  # type: ignore[assignment]
     detail: ActivityOverviewDetail = Query(default="lightweight"),
 ) -> ActivityOverviewResponse:
+    _set_work_response_headers(response)
     return await _build_activity_overview(
         request, await _load_task_step_context(request, step_run_id), detail=detail
     )
@@ -1977,13 +2186,17 @@ async def _retry_source_from_failed_turn(
 ) -> tuple[dict[str, Any] | None, bool]:
     user = require_current_user(request)
     async with request.app.state.session_factory() as session:
-        session_refs = await _session_refs(
-            request,
+        session_rows = await _session_rows(
             session,
             conversation_row.conversation_id,
             conversation_row.active_session_id,
-            user_email=user.email,
         )
+    session_refs = await _session_read_refs(
+        request,
+        session_rows,
+        user_email=user.email,
+        role="root",
+    )
     failed_turn_found = False
     completed_turn_found = False
     user_event: RawSessionEvent | None = None
@@ -2080,14 +2293,11 @@ def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-async def _session_refs(
-    request: Request,
+async def _session_rows(
     session: Any,
     conversation_id: str,
     active_session_id: str | None,
-    *,
-    user_email: str,
-) -> list[ConversationSessionRef]:
+) -> list[Any]:
     if active_session_id is None:
         latest_roots = await list_conversation_sessions(
             session,
@@ -2105,16 +2315,7 @@ async def _session_refs(
         conversation_id,
         active_session_id,
     )
-    return [
-        await _session_read_ref(
-            request,
-            row,
-            user_email=user_email,
-            role="root",
-            ordinal=index,
-        )
-        for index, row in enumerate(chain)
-    ]
+    return list(chain)
 
 
 async def _session_read_ref(
@@ -2125,54 +2326,38 @@ async def _session_read_ref(
     role: str,
     ordinal: int,
 ) -> ConversationSessionRef:
-    if session_row.user_email != user_email:
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Session event-store authority does not match the authorized user",
-        )
-    agent = await request.app.state.agent_registry.get(
-        session_row.agent_id,
-        owner_email=user_email,
-        include_disabled=True,
-    )
-    agent_owner_email = agent.owner_email if agent is not None else None
-    if not agent_owner_email:
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Session agent authority is unavailable",
-        )
-    authority = EventStoreAuthority(
+    return await session_read_ref(
+        request.app,
+        session_row,
         user_email=user_email,
-        agent_id=session_row.agent_id,
-        agent_owner_email=agent_owner_email,
-    )
-    cached_store = getattr(request.app.state, "cached_event_store", None)
-    if cached_store is None or not callable(getattr(cached_store, "bind", None)):
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Cached session event store is not configured",
-        )
-    reader = cached_store.bind(authority)
-    authority_token = getattr(reader, "authority_token", None)
-    if not isinstance(authority_token, str) or not authority_token:
-        raise api_exception(
-            500,
-            "event_store_authority_unavailable",
-            "Cached session event-store authority token is unavailable",
-        )
-    return ConversationSessionRef(
-        session_id=session_row.session_id,
-        event_store_session_id=session_row.intaris_session_id or session_row.session_id,
-        store="intaris",
         role=role,
         ordinal=ordinal,
-        status=session_row.status,
-        completion_reason=session_row.completion_reason,
-        reader=reader,
-        authority_token=authority_token,
+    )
+
+
+async def _session_read_refs(
+    request: Request,
+    session_rows: list[Any],
+    *,
+    user_email: str,
+    role: str,
+) -> list[ConversationSessionRef]:
+    if not callable(getattr(request.app.state.agent_registry, "get_system_agent", None)):
+        return [
+            await _session_read_ref(
+                request,
+                row,
+                user_email=user_email,
+                role=role,
+                ordinal=ordinal,
+            )
+            for ordinal, row in enumerate(session_rows)
+        ]
+    return await session_read_refs(
+        request.app,
+        session_rows,
+        user_email=user_email,
+        role=role,
     )
 
 
@@ -2200,29 +2385,40 @@ async def _build_work_graph_projection_with_stages(
     from_time: datetime | None,
     to_time: datetime | None,
     exact_session_id: str | None,
+    detail: ActivityOverviewDetail = "full",
 ) -> WorkProjectionResponse:
     from_time, to_time = _normalized_work_range(from_time, to_time)
     user = require_current_user(request)
     scope = context.scope if isinstance(context, ConversationSnapshotContext) else context["scope"]
     definitions = _work_tool_definitions(request)
-    revision = WorkRevisionSnapshot(scope_key=scope.key, work_revision=0, graph_revision=0)
+    try:
+        graph = await request.app.state.work_graph_resolver.resolve(
+            user_email=user.email,
+            scope=scope,
+        )
+    except ChatV2SyncError as exc:
+        status = 503 if exc.code == "work_graph_timeout" else 400
+        raise api_exception(status, exc.code, str(exc)) from exc
+
     async with request.app.state.session_factory() as db:
         try:
-            graph = await resolve_authorized_work_graph(
+            lifecycle = await enrich_workstream_lifecycle(
                 db,
-                user_email=user.email,
-                scope=scope,
-                deadline=monotonic() + WORK_GRAPH_MAX_SECONDS,
+                owner_email=user.email,
+                session_rows=graph.session_rows,
+                workstreams=graph.nodes,
             )
-        except ChatV2SyncError as exc:
-            status = 503 if exc.code == "work_graph_timeout" else 400
-            raise api_exception(status, exc.code, str(exc)) from exc
-        try:
+            graph = AuthorizedWorkGraph(
+                nodes=tuple(lifecycle.workstreams),
+                session_rows=graph.session_rows,
+                fingerprint=graph.fingerprint,
+                truncated=graph.truncated,
+            )
             page = await read_work_page(
                 db,
                 owner_email=user.email,
                 scope=scope,
-                session_rows=graph.session_rows,
+                session_rows=list(graph.session_rows),
                 graph_fingerprint=graph.fingerprint,
                 cursor_secret=(
                     context.cursor_secret
@@ -2236,7 +2432,9 @@ async def _build_work_graph_projection_with_stages(
                 to_time=to_time,
                 tool_definitions=definitions,
                 exact_session_id=exact_session_id,
+                detail=detail,
             )
+            work_revision = await read_live_work_revision(db, user.email)
         except WorkCursorError as exc:
             raise api_exception(
                 400,
@@ -2259,6 +2457,18 @@ async def _build_work_graph_projection_with_stages(
         root_nodes = [node for node in graph.nodes if node.session_id in root_rotation_ids]
         root_session_ids = {node.session_id for node in root_nodes}
         root_step_ids = {node.step_run_id for node in root_nodes if node.step_run_id}
+        graph_session_ids = {row.session_id for row in graph.session_rows}
+        graph_step_ids = {node.step_run_id for node in graph.nodes if node.step_run_id}
+        canonical_deliverable_ids = frozenset(
+            await db.scalars(
+                select(DeliverableRow.deliverable_id).where(
+                    or_(
+                        DeliverableRow.session_id.in_(graph_session_ids or {""}),
+                        DeliverableRow.step_run_id.in_(graph_step_ids or {""}),
+                    )
+                )
+            )
+        )
         candidates: list[DeliverableRow] = []
         if root_session_ids:
             candidates.extend(
@@ -2299,11 +2509,6 @@ async def _build_work_graph_projection_with_stages(
             key=lambda row: (row.created_at, row.version),
             default=None,
         )
-        if primary_row is not None:
-            await hydrate_deliverable_payload(
-                primary_row,
-                request.app.state.artifact_store,
-            )
         primary_materialized = bool(
             primary_row is not None
             and await db.scalar(
@@ -2323,16 +2528,18 @@ async def _build_work_graph_projection_with_stages(
                 .limit(1)
             )
         )
-        await db.commit()
-    materializer = getattr(request.app.state, "work_materializer", None)
-    if materializer is not None and page.materialization.state != "caught_up":
-        await materializer.prioritize_sessions(graph.session_rows)
+    if primary_row is not None:
+        await hydrate_deliverable_payload(
+            primary_row,
+            request.app.state.artifact_store,
+        )
     projection = _work_from_page(
         request,
         page,
         graph=graph,
-        revision=revision,
+        work_revision=work_revision,
         definitions=definitions,
+        canonical_deliverable_ids=canonical_deliverable_ids,
     )
     primary_created_at = primary_row.created_at if primary_row is not None else None
     if primary_created_at is not None and primary_created_at.tzinfo is None:
@@ -2416,27 +2623,21 @@ async def _build_work_graph_projection(
     from_time: datetime | None = None,
     to_time: datetime | None = None,
     exact_session_id: str | None = None,
+    detail: ActivityOverviewDetail = "full",
 ) -> WorkProjectionResponse:
-    """Bound the complete Work request while each I/O stage keeps its own budget."""
+    """Build Work directly from the authorized SQL graph and normalized rows."""
 
-    try:
-        async with asyncio.timeout(WORK_REQUEST_MAX_SECONDS):
-            return await _build_work_graph_projection_with_stages(
-                request,
-                context,
-                before=before,
-                limit=limit,
-                category=category,
-                from_time=from_time,
-                to_time=to_time,
-                exact_session_id=exact_session_id,
-            )
-    except TimeoutError as exc:
-        raise api_exception(
-            503,
-            "work_request_timeout",
-            "Work projection exceeded the total request deadline",
-        ) from exc
+    return await _build_work_graph_projection_with_stages(
+        request,
+        context,
+        before=before,
+        limit=limit,
+        category=category,
+        from_time=from_time,
+        to_time=to_time,
+        exact_session_id=exact_session_id,
+        detail=detail,
+    )
 
 
 async def _build_activity_overview(
@@ -2445,26 +2646,67 @@ async def _build_activity_overview(
     *,
     detail: ActivityOverviewDetail = "lightweight",
 ) -> ActivityOverviewResponse:
+    started = monotonic()
     user = require_current_user(request)
     scope = context.scope if isinstance(context, ConversationSnapshotContext) else context["scope"]
-    async with request.app.state.session_factory() as db:
-        graph = await resolve_authorized_work_graph(
-            db,
-            user_email=user.email,
-            scope=scope,
-            deadline=monotonic() + WORK_GRAPH_MAX_SECONDS,
-        )
-        return await read_activity_overview(
-            db,
-            owner_email=user.email,
-            scope=scope,
-            session_rows=list(graph.session_rows),
-            workstreams=list(graph.nodes),
-            graph_fingerprint=graph.fingerprint,
-            graph_truncated=graph.truncated,
-            tool_definitions=_work_tool_definitions(request),
-            detail=detail,
-        )
+    outcome = "error"
+    try:
+        for attempt in range(2):
+            async with request.app.state.session_factory() as db:
+                revision_before = await read_live_work_revision(db, user.email)
+            try:
+                graph = await request.app.state.work_graph_resolver.resolve(
+                    user_email=user.email,
+                    scope=scope,
+                    source_revision=revision_before,
+                )
+            except ChatV2SyncError as exc:
+                status = 503 if exc.code == "work_graph_timeout" else 400
+                raise api_exception(status, exc.code, str(exc)) from exc
+            async with request.app.state.session_factory() as db:
+                revision_after_graph = await read_live_work_revision(db, user.email)
+                if revision_after_graph != revision_before:
+                    if attempt == 0:
+                        continue
+                    raise api_exception(
+                        503,
+                        "activity_overview_changed",
+                        "Activity state changed during projection",
+                    )
+                overview = await read_activity_overview(
+                    db,
+                    owner_email=user.email,
+                    scope=scope,
+                    session_rows=list(graph.session_rows),
+                    workstreams=list(graph.nodes),
+                    graph_fingerprint=graph.fingerprint,
+                    graph_truncated=graph.truncated,
+                    work_revision=revision_after_graph,
+                    tool_definitions=_work_tool_definitions(request),
+                    session_cache=getattr(request.app.state, "session_cache", None),
+                    detail=detail,
+                )
+                revision_after_projection = await read_live_work_revision(db, user.email)
+            if revision_after_projection != revision_after_graph:
+                if attempt == 0:
+                    continue
+                raise api_exception(
+                    503,
+                    "activity_overview_changed",
+                    "Activity state changed during projection",
+                )
+            outcome = "success"
+            return overview
+        raise AssertionError("unreachable")
+    finally:
+        WORK_OVERVIEW_METRICS.overview_request(outcome, monotonic() - started)
+
+
+def _set_work_response_headers(response: Response | None) -> None:
+    if response is None:
+        return
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie"
 
 
 def _work_from_page(
@@ -2472,8 +2714,10 @@ def _work_from_page(
     page: Any,
     *,
     graph: AuthorizedWorkGraph | None = None,
-    revision: WorkRevisionSnapshot | None = None,
+    revision: Any | None = None,
+    work_revision: int | None = None,
     definitions: dict[str, Any] | None = None,
+    canonical_deliverable_ids: frozenset[str] | None = None,
 ) -> WorkProjectionResponse:
     definitions = definitions or _work_tool_definitions(request)
     return build_work_projection(
@@ -2491,13 +2735,21 @@ def _work_from_page(
         workstreams=graph.nodes if graph is not None else (),
         graph_fingerprint=graph.fingerprint if graph is not None else None,
         graph_truncated=graph.truncated if graph is not None else False,
-        work_revision=revision.work_revision if revision is not None else 0,
+        work_revision=(
+            work_revision
+            if work_revision is not None
+            else revision.work_revision
+            if revision is not None
+            else 0
+        ),
         graph_revision=revision.graph_revision if revision is not None else 0,
         materialization=getattr(page, "materialization", None),
         removed_call_ids=getattr(page, "removed_call_ids", ()),
         summary=getattr(page, "summary", None),
         newest_first=getattr(page, "category", None) is not None,
         complete_files=getattr(page, "category", None) == "files",
+        canonical_deliverable_ids=canonical_deliverable_ids,
+        detail=getattr(page, "detail", "full"),
     )
 
 

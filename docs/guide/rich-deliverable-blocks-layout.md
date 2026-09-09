@@ -17,13 +17,33 @@ Purpose: introduce a meaningful narrative group. It can contain child blocks.
 
 ![Section block](../assets/screenshots/rich-deliverables/section.png)
 
+### Section header
+
+Purpose: divide a dashboard or report with an eyebrow, title, subtitle, and
+optional semantic status. Use it for hierarchy, not as a content card.
+
+![Section header block](../assets/screenshots/rich-deliverables/section_header.png)
+
 ### Stack, columns, and grid
 Purpose: arrange related blocks vertically, side by side, or in a responsive
 grid. Use layout blocks to establish hierarchy, not to add decoration.
 
+New `grid` payloads can set `layout` to `"auto"`, `"equal"`,
+`"split-2-1"`, or `"split-1-2"`. Narrow component containers stack every
+layout in source order. Child blocks can set `span` from 1 through 4 and
+`surface` to `"plain"`, `"subtle"`, `"outlined"`, `"raised"`, or `"accent"`.
+
 ![Stack block](../assets/screenshots/rich-deliverables/stack.png)
 ![Columns block](../assets/screenshots/rich-deliverables/columns.png)
 ![Grid block](../assets/screenshots/rich-deliverables/grid.png)
+
+Grid layouts support `auto`, `equal`, `split-2-1`, and `split-1-2`. Columns
+remain limited to one through four. Narrow renderers stack blocks in source
+order. Blocks can span one through four grid tracks.
+
+### Metric progress
+Metrics can include `progress: { value, max, label? }`. The renderer exposes
+the value through an accessible progress bar. Keep `value` and `max` numeric.
 
 ### Tabs, accordion, and modal
 Purpose: disclose secondary information without making the primary reading path
@@ -41,6 +61,7 @@ Purpose: ordinary prose, headings, lists, and lightweight technical writing.
 Prefer it when a specialized visual block would not improve comprehension.
 
 ![Markdown block](../assets/screenshots/rich-deliverables/markdown.png)
+![Markdown list markers](../assets/screenshots/rich-deliverables/markdown-list-markers.png)
 
 ### Callout, quote, and divider
 Purpose: emphasize one important caveat, preserve a direct quotation, or
@@ -90,6 +111,13 @@ be meaningful values, not decorative labels.
 ![Status block](../assets/screenshots/rich-deliverables/status.png)
 ![Status grid block](../assets/screenshots/rich-deliverables/status_grid.png)
 ![Metric block](../assets/screenshots/rich-deliverables/metric.png)
+
+Use `action: "rich:dashboard"` for a strict dashboard composition. It requires
+a title, at least two metric or status blocks, and a table or chart. The action
+owns presentation metadata and normalizes the canvas to `wide` and density to
+`compact`.
+Use metric progress for bounded values. The text label and numeric ratio remain
+visible on non-visual surfaces.
 
 ### Action, checklist, and incident checklist
 Purpose: turn a finding into a concrete next step or track completion. An

@@ -16,8 +16,10 @@ import random
 from collections import OrderedDict
 from datetime import datetime
 from enum import StrEnum
+from time import monotonic
 from typing import Any, Protocol
 
+from prometheus_client import Counter, Gauge, Histogram
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.engine import make_url
@@ -36,8 +38,8 @@ from cognis.store.models import (
     Session,
     StepRun,
     Task,
-    WorkScopeState,
 )
+from cognis.store.work_live_invalidation import read_live_work_revision
 
 logger = get_logger(__name__)
 
@@ -49,6 +51,30 @@ MAX_RECONCILE_SCOPES = 256
 MAX_RECONCILE_CONCURRENCY = 8
 RECONCILE_SCOPE_TIMEOUT_SECONDS = 3.0
 MAX_SIGNAL_REVISION_LENGTH = 160
+MAX_DISPATCH_CONCURRENCY = 32
+MAX_DISPATCH_LANES = 2048
+
+CLUSTER_SIGNAL_PUBLISH_DURATION = Histogram(
+    "cognis_cluster_signal_publish_duration_seconds",
+    "Duration of PostgreSQL cluster signal publication.",
+    ["kind", "outcome"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2),
+)
+CLUSTER_SIGNAL_DISPATCH_DURATION = Histogram(
+    "cognis_cluster_signal_dispatch_duration_seconds",
+    "Duration of local cluster signal dispatch.",
+    ["kind"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10),
+)
+CLUSTER_SIGNAL_QUEUE_DEPTH = Gauge(
+    "cognis_cluster_signal_queue_depth",
+    "Pending remote cluster signals.",
+)
+CLUSTER_SIGNAL_DROPPED = Counter(
+    "cognis_cluster_signal_dropped_total",
+    "Remote cluster signals dropped before dispatch.",
+    ["reason"],
+)
 
 
 def _bounded_revision(revision: str | int | datetime) -> str:
@@ -62,6 +88,7 @@ class ClusterSignalKind(StrEnum):
     CHAT_SCOPE_CHANGED = "chat_scope_changed"
     TASK_PROGRESS_CHANGED = "task_progress_changed"
     NOTIFICATION_STATE_CHANGED = "notification_state_changed"
+    SCHEDULE_ACTION_CHANGED = "schedule_action_changed"
     EXECUTOR_STATE_CHANGED = "executor_state_changed"
     SIDEBAR_CHANGED = "sidebar_changed"
     EVENT_STORE_SESSION_INVALIDATED = "event_store_session_invalidated"
@@ -79,6 +106,7 @@ class ClusterSignalScope(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=160)
     session_id: str | None = Field(default=None, max_length=160)
     task_id: str | None = Field(default=None, max_length=160)
+    schedule_id: str | None = Field(default=None, max_length=160)
     step_run_id: str | None = Field(default=None, max_length=160)
     notification_id: str | None = Field(default=None, max_length=160)
     executor_id: str | None = Field(default=None, max_length=160)
@@ -86,6 +114,7 @@ class ClusterSignalScope(BaseModel):
     event_store_id: ClusterEventStoreId | None = None
     event_session_token: str | None = Field(default=None, min_length=64, max_length=64)
     work_scope_key: str | None = Field(default=None, min_length=1, max_length=320)
+    work_materialized: bool | None = None
     direct_request_id: str | None = Field(default=None, min_length=1, max_length=160)
 
 
@@ -109,11 +138,13 @@ class ClusterSignal(BaseModel):
                     self.scope.conversation_id,
                     self.scope.session_id,
                     self.scope.task_id,
+                    self.scope.schedule_id,
                     self.scope.step_run_id,
                     self.scope.notification_id,
                     self.scope.executor_id,
                     self.scope.owner_token,
                     self.scope.work_scope_key,
+                    self.scope.work_materialized,
                     self.scope.direct_request_id,
                 )
             ):
@@ -148,7 +179,7 @@ class AsyncpgClusterSignalTransport:
         self._publisher_lock = asyncio.Lock()
 
     async def listen(self, channel: str, callback: Any) -> Any:
-        import asyncpg
+        import asyncpg  # type: ignore[import-untyped]
 
         await self.close()
         self._connection = await asyncpg.connect(self._dsn)
@@ -220,6 +251,7 @@ class ClusterSignalService:
         self._reconcile_offset = 0
         self._listener_task: asyncio.Task[None] | None = None
         self._dispatch_task: asyncio.Task[None] | None = None
+        self._dispatch_locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
         self._reconcile_task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._reconcile_now = asyncio.Event()
@@ -267,6 +299,7 @@ class ClusterSignalService:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         self._listener_task = self._dispatch_task = self._reconcile_task = None
+        self._dispatch_locks.clear()
         if self._transport is not None:
             with contextlib.suppress(Exception):
                 await self._transport.close()
@@ -287,11 +320,18 @@ class ClusterSignalService:
             revision=_bounded_revision(revision),
         )
         payload = signal.encoded()
+        started = monotonic()
         try:
             async with asyncio.timeout(2.0):
                 await self._transport.publish(CHANNEL, payload)
+            CLUSTER_SIGNAL_PUBLISH_DURATION.labels(kind=kind, outcome="success").observe(
+                monotonic() - started
+            )
             return True
         except Exception:
+            CLUSTER_SIGNAL_PUBLISH_DURATION.labels(kind=kind, outcome="failure").observe(
+                monotonic() - started
+            )
             logger.warning(
                 "cluster_signals: publish failed; reconciliation will heal",
                 extra={"extra_data": {"kind": kind}},
@@ -393,6 +433,7 @@ class ClusterSignalService:
         scope_key: str,
         user_email: str,
         revision: int,
+        materialized: bool = False,
     ) -> bool:
         """Publish a durable Work revision locally and across controllers."""
 
@@ -402,6 +443,7 @@ class ClusterSignalService:
             scope=ClusterSignalScope(
                 owner_token=self.owner_token(user_email),
                 work_scope_key=scope_key,
+                work_materialized=True if materialized else None,
             ),
             revision=str(revision),
         )
@@ -438,7 +480,9 @@ class ClusterSignalService:
             self._dedup.popitem(last=False)
         try:
             self._pending.put_nowait(signal)
+            CLUSTER_SIGNAL_QUEUE_DEPTH.set(self._pending.qsize())
         except asyncio.QueueFull:
+            CLUSTER_SIGNAL_DROPPED.labels(reason="queue_full").inc()
             self._reconcile_now.set()
 
     async def reconcile_once(self) -> None:
@@ -466,12 +510,12 @@ class ClusterSignalService:
         async def _read(
             scope: ClusterSignalScope, owner_email: str | None
         ) -> tuple[ClusterSignalScope, str | None, str | None]:
-            try:
-                async with asyncio.timeout(RECONCILE_SCOPE_TIMEOUT_SECONDS):
-                    async with semaphore:
+            async with semaphore:
+                try:
+                    async with asyncio.timeout(RECONCILE_SCOPE_TIMEOUT_SECONDS):
                         return scope, owner_email, await self._scope_watermark(scope, owner_email)
-            except Exception:
-                return scope, owner_email, None
+                except Exception:
+                    return scope, owner_email, None
 
         results = await asyncio.gather(
             *(_read(scope, owner_email) for scope, owner_email in selected)
@@ -487,8 +531,8 @@ class ClusterSignalService:
                 continue
             key = scope.model_dump_json(exclude_none=True)
             previous = self._watermarks.get(key)
-            self._watermarks[key] = watermark
             if previous is None or watermark != previous:
+                await self._invalidate_reconciled_event_cache(scope)
                 kind = (
                     ClusterSignalKind.WORK_INVALIDATED
                     if scope.work_scope_key
@@ -498,6 +542,7 @@ class ClusterSignalService:
                             scope.conversation_id,
                             scope.session_id,
                             scope.task_id,
+                            scope.schedule_id,
                             scope.step_run_id,
                             scope.notification_id,
                             scope.executor_id,
@@ -513,6 +558,7 @@ class ClusterSignalService:
                         revision=_bounded_revision(watermark),
                     )
                 )
+            self._watermarks[key] = watermark
         self._watermarks = {
             key: value for key, value in self._watermarks.items() if key in all_keys
         }
@@ -541,12 +587,67 @@ class ClusterSignalService:
                 await asyncio.sleep(delay)
 
     async def _dispatch_loop(self) -> None:
+        workers = [
+            asyncio.create_task(
+                self._dispatch_worker(),
+                name=f"cluster-signal-worker:{index}",
+            )
+            for index in range(MAX_DISPATCH_CONCURRENCY)
+        ]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _dispatch_worker(self) -> None:
         while not self._stopping.is_set():
             signal = await self._pending.get()
-            try:
+            await self._dispatch_signal(signal)
+
+    async def _dispatch_signal(self, signal: ClusterSignal) -> None:
+        lane_key = self._dispatch_lane_key(signal.scope)
+        lock = self._dispatch_locks.get(lane_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._dispatch_locks[lane_key] = lock
+            while len(self._dispatch_locks) > MAX_DISPATCH_LANES:
+                evicted = next(
+                    (
+                        key
+                        for key, candidate in self._dispatch_locks.items()
+                        if key != lane_key and not candidate.locked()
+                    ),
+                    None,
+                )
+                if evicted is None:
+                    break
+                self._dispatch_locks.pop(evicted)
+        else:
+            self._dispatch_locks.move_to_end(lane_key)
+        started = monotonic()
+        try:
+            async with lock:
                 await self._emit_local(signal)
-            finally:
-                self._pending.task_done()
+        finally:
+            CLUSTER_SIGNAL_DISPATCH_DURATION.labels(kind=signal.kind).observe(monotonic() - started)
+            self._pending.task_done()
+            CLUSTER_SIGNAL_QUEUE_DEPTH.set(self._pending.qsize())
+
+    @staticmethod
+    def _dispatch_lane_key(scope: ClusterSignalScope) -> str:
+        if scope.conversation_id:
+            return f"conversation:{scope.conversation_id}"
+        if scope.task_id:
+            return f"task:{scope.task_id}"
+        if scope.notification_id:
+            return f"notification:{scope.notification_id}"
+        if scope.event_session_token:
+            return f"event:{scope.event_session_token}"
+        if scope.work_scope_key:
+            return f"work:{scope.work_scope_key}"
+        return scope.model_dump_json(exclude_none=True)
 
     async def _reconcile_loop(self) -> None:
         while not self._stopping.is_set():
@@ -583,11 +684,15 @@ class ClusterSignalService:
         event_store_read: tuple[str, str, str, str] | None = None
         trailing_values: list[str] = []
         async with self._session_factory() as session:
+            if scope.work_scope_key and owner_email:
+                revision = await read_live_work_revision(session, owner_email)
+                trailing_values.append(f"work:{revision}")
             if owner_email and not any(
                 (
                     scope.conversation_id,
                     scope.session_id,
                     scope.task_id,
+                    scope.schedule_id,
                     scope.step_run_id,
                     scope.notification_id,
                     scope.executor_id,
@@ -669,18 +774,6 @@ class ClusterSignalService:
                         session_row.agent_id,
                         agent_owner_email,
                     )
-            if scope.work_scope_key:
-                work_scope = await session.get(WorkScopeState, scope.work_scope_key)
-                if work_scope is not None and (
-                    owner_email is None or work_scope.user_email == owner_email
-                ):
-                    trailing_values.extend(
-                        [
-                            f"work:{work_scope.work_revision}",
-                            f"graph:{work_scope.graph_revision}",
-                            f"fingerprint:{work_scope.graph_fingerprint or ''}",
-                        ]
-                    )
         if event_store_read is not None:
             event_store_session_id, user_email, agent_id, agent_owner_email = event_store_read
             with scoped_runtime_context(
@@ -698,9 +791,22 @@ class ClusterSignalService:
                             agent_owner_email=agent_owner_email,
                         )
                     )
-                watermark = await event_store.read_session_high_watermark(
+                watermark = await event_store.read_authoritative_session_high_watermark(
                     session_id=event_store_session_id
                 )
             values.append(f"event_store:{watermark.last_seq}")
         values.extend(trailing_values)
         return json.dumps(values, separators=(",", ":"))
+
+    async def _invalidate_reconciled_event_cache(self, scope: ClusterSignalScope) -> None:
+        if scope.session_id is None or self._event_store is None:
+            return
+        async with self._session_factory() as session:
+            session_row = await session.get(Session, scope.session_id)
+        if session_row is None or not session_row.intaris_session_id:
+            return
+        await self._event_store.invalidate_session(
+            ClusterEventStoreId.INTARIS,
+            session_row.intaris_session_id,
+            source="cluster_signal",
+        )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import pytest
 
@@ -8,13 +9,15 @@ from cognis.core.tool_exposure import (
     LLMApiMode,
     ToolDiscoveryMode,
     ToolExposureContract,
+    filter_edit_tools_for_model,
     prepare_tool_exposure,
     reverse_tool_argument_aliases,
+    validate_direct_schema_sizes,
 )
 from cognis.models.config import ModelInfo
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolSource, sanitize_mcp_tool_name, stable_tool_id
-from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL
+from cognis.tools.builtin.tool_search import CALL_TOOL_TOOL, DESCRIBE_TOOL_TOOL, SEARCH_TOOLS_TOOL
 
 
 def _tool(name: str, *, source_type: str = "builtin", category: str = "system") -> ToolDefinition:
@@ -79,12 +82,134 @@ def _search_schema() -> dict[str, object]:
     }
 
 
+def _controller_schema(tool: ToolDefinition) -> dict[str, object]:
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        },
+    }
+
+
 def _native_anthropic_contract() -> ToolExposureContract:
     return _contract(
         discovery_mode=ToolDiscoveryMode.ANTHROPIC_NATIVE_SEARCH,
         anthropic_schema_compatible=True,
         anthropic_native_tool_search=True,
     )
+
+
+@pytest.mark.parametrize("model_id", ["gpt-5-codex", "gpt-6-astra"])
+def test_codex_models_do_not_fall_back_to_exact_edit_tools(model_id: str) -> None:
+    tools = [_write_tool("edit"), _write_tool("multiedit"), _write_tool("write")]
+
+    visible_tools = filter_edit_tools_for_model(tools, model_id)
+
+    assert visible_tools == []
+
+
+def test_codex_models_expose_apply_patch_without_exact_edit_tools() -> None:
+    patch = _write_tool("apply_patch")
+    tools = [patch, _write_tool("edit"), _write_tool("multiedit"), _write_tool("write")]
+
+    visible_tools = filter_edit_tools_for_model(tools, "gpt-5-codex")
+
+    assert visible_tools == [patch]
+
+
+def test_search_description_lists_only_authorized_hidden_deferred_families() -> None:
+    memory_delete = _tool("memory_delete", category="memory")
+    memory_list = _tool("memory_list", category="memory")
+    artifact_search = _tool("artifact_search", category="artifact")
+    visible_web_map = _tool("web_map", source_type="executor", category="web")
+    forbidden_skill_list = _tool("skill_list", category="skill")
+    inventory = [
+        memory_delete,
+        memory_list,
+        artifact_search,
+        visible_web_map,
+        _mcp("Todoist", "find/tasks"),
+    ]
+    visible_ids = {stable_tool_id(visible_web_map)}
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5", max_tools=128),
+        contract=_contract(),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids=visible_ids,
+    )
+
+    search_schema = next(
+        tool["function"]
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == "search_tools"
+    )
+    description = search_schema["description"]
+    assert description.endswith(
+        "Use search_tools to find other authorized operations in these deferred "
+        "capabilities: artifacts, memory, Todoist."
+    )
+    assert "web research" not in description
+    assert "skills" not in description
+    assert forbidden_skill_list.name not in {tool.name for tool in inventory}
+
+
+def test_deferred_hint_preserves_families_under_integration_limit() -> None:
+    inventory = [
+        _tool("skill_list", category="skill"),
+        _tool("web_map", source_type="executor", category="web"),
+        _mcp("Skills", "read"),
+        *[_mcp(f"Server {index:02d}", "read") for index in range(25)],
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5", max_tools=128),
+        contract=_contract(),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids=set(),
+    )
+
+    search_schema = next(
+        tool["function"]
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == "search_tools"
+    )
+    names = (
+        search_schema["description"]
+        .split("capabilities: ", maxsplit=1)[1]
+        .removesuffix(".")
+        .split(", ")
+    )
+    assert names == sorted(names, key=str.casefold)
+    assert len(names) == 20
+    assert {"skills", "web research"} <= set(names)
+    assert "Skills" not in names
+
+
+def test_promoted_only_family_is_not_advertised_as_deferred() -> None:
+    memory_delete = _tool("memory_delete", category="memory")
+
+    result = prepare_tool_exposure(
+        inventory_tools=[memory_delete],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5", max_tools=128),
+        contract=_contract(),
+        promoted_tool_ids={stable_tool_id(memory_delete)},
+        default_visible_tool_ids=set(),
+    )
+
+    search_schema = next(
+        tool["function"]
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == "search_tools"
+    )
+    assert "deferred capabilities" not in search_schema["description"]
 
 
 def test_prepare_tool_exposure_uses_native_anthropic_search_with_full_deferred_inventory() -> None:
@@ -247,6 +372,67 @@ def test_prepare_tool_exposure_controller_search_never_uses_anthropic_deferred_l
     assert not any(tool.get("function", {}).get("defer_loading") is True for tool in result.tools)
 
 
+def test_prepare_tool_exposure_exposes_controller_dispatch_kernel_only_with_hidden_tools() -> None:
+    read = _tool("read", source_type="executor", category="filesystem")
+    hidden = _mcp("gmail", "search_messages")
+    controller_schemas = [
+        _search_schema(),
+        _controller_schema(DESCRIBE_TOOL_TOOL),
+        _controller_schema(CALL_TOOL_TOOL),
+    ]
+
+    with_hidden = prepare_tool_exposure(
+        inventory_tools=[read, hidden],
+        controller_tool_schemas=controller_schemas,
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(read)},
+    )
+    without_hidden = prepare_tool_exposure(
+        inventory_tools=[read],
+        controller_tool_schemas=controller_schemas,
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(read)},
+    )
+
+    assert {
+        tool["function"]["name"] for tool in with_hidden.tools if tool["type"] == "function"
+    } >= {"search_tools", "describe_tool", "call_tool"}
+    assert {
+        tool["function"]["name"] for tool in without_hidden.tools if tool["type"] == "function"
+    } == {"read"}
+
+
+def test_prepare_tool_exposure_native_anthropic_omits_controller_dispatch_kernel() -> None:
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read"), _mcp("gmail", "search_messages")],
+        controller_tool_schemas=[
+            _search_schema(),
+            _controller_schema(DESCRIBE_TOOL_TOOL),
+            _controller_schema(CALL_TOOL_TOOL),
+        ],
+        model_info=ModelInfo(
+            model_id="claude",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+            supports_pause_turn=True,
+        ),
+        contract=_native_anthropic_contract(),
+        promoted_tool_ids=set(),
+    )
+
+    names = {
+        tool.get("function", {}).get("name")
+        for tool in result.tools
+        if tool.get("type") == "function"
+    }
+    assert names.isdisjoint({"search_tools", "describe_tool", "call_tool"})
+
+
 def test_prepare_tool_exposure_strips_schema_metadata_recursively() -> None:
     inventory = [
         ToolDefinition(
@@ -281,6 +467,95 @@ def test_prepare_tool_exposure_strips_schema_metadata_recursively() -> None:
     assert "$schema" not in parameters
     assert "$id" not in parameters["properties"]["query"]
     assert "$comment" not in parameters["properties"]["query"]
+
+
+def test_prepare_tool_exposure_uses_explicit_compact_schema_only_for_provider() -> None:
+    authoritative = {
+        "type": "object",
+        "properties": {"rich": {"type": "object", "properties": {"blocks": {"type": "array"}}}},
+    }
+    compact = {"type": "object", "properties": {"rich": {"type": "object"}}}
+    tool = ToolDefinition(
+        name="compact_tool",
+        description="compact",
+        parameters=authoritative,
+        provider_exposure_schema=compact,
+        source=ToolSource(type="builtin"),
+        category="system",
+    )
+
+    result = prepare_tool_exposure(
+        inventory_tools=[tool],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5"),
+        contract=_contract(discovery_mode=ToolDiscoveryMode.NONE),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(tool)},
+        allow_tool_search=False,
+    )
+
+    assert result.tools[0]["function"]["parameters"] == compact
+    assert tool.parameters == authoritative
+
+
+def test_direct_schema_size_guard_warns_without_blocking_exposure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    oversized = ToolDefinition(
+        name="oversized",
+        description="oversized",
+        parameters={
+            "type": "object",
+            "description": "x" * 9000,
+            "properties": {},
+        },
+        source=ToolSource(type="builtin"),
+        category="system",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cognis.core.tool_exposure"):
+        validate_direct_schema_sizes([oversized])
+    assert "Oversized direct tool schema" in caplog.text
+
+    compact = oversized.model_copy(
+        update={"provider_exposure_schema": {"type": "object", "properties": {}}}
+    )
+    waived = oversized.model_copy(update={"provider_exposure_waiver": "Protocol-owned schema."})
+    validate_direct_schema_sizes([compact, waived])
+
+
+def test_search_description_lists_authorized_task_management_only_in_fallback() -> None:
+    task_tool = _tool("create_task")
+    result = prepare_tool_exposure(
+        inventory_tools=[_tool("read"), task_tool],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5"),
+        contract=_contract(),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={"builtin:read"},
+    )
+    search = next(
+        tool["function"]
+        for tool in result.tools
+        if tool.get("function", {}).get("name") == "search_tools"
+    )
+    assert "task management" in search["description"]
+
+    native = prepare_tool_exposure(
+        inventory_tools=[_tool("read"), task_tool],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(
+            model_id="claude",
+            supports_tool_search=True,
+            supports_native_tool_search=True,
+            supports_defer_loading=True,
+            supports_pause_turn=True,
+        ),
+        contract=_native_anthropic_contract(),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={"builtin:read"},
+    )
+    assert all(tool.get("function", {}).get("name") != "search_tools" for tool in native.tools)
 
 
 def test_prepare_tool_exposure_can_disable_anthropic_deferred_loading() -> None:
@@ -385,6 +660,78 @@ def test_prepare_tool_exposure_uses_responses_controller_search_for_openai() -> 
     assert all(tool["type"] != "namespace" for tool in result.tools)
     assert all(tool["type"] != "tool_search" for tool in result.tools)
     assert any(tool.get("function", {}).get("name") == "search_tools" for tool in result.tools)
+
+
+def test_prepare_tool_exposure_reports_visible_and_hidden_source_counts() -> None:
+    builtin = _tool("web_crawl", category="web")
+    executor = _tool("read", source_type="executor", category="filesystem")
+    local = ToolDefinition(
+        name="mcp_local__search",
+        description="local search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="local_mcp",
+            server_id="local",
+            raw_tool_name="search",
+        ),
+        category="mcp",
+    )
+    intaris = ToolDefinition(
+        name="mcp_remote__search",
+        description="remote search",
+        parameters={"type": "object", "properties": {}},
+        source=ToolSource(
+            type="intaris_mcp",
+            server_id="remote",
+            raw_tool_name="search",
+        ),
+        category="mcp",
+    )
+    result = prepare_tool_exposure(
+        inventory_tools=[builtin, executor, local, intaris],
+        controller_tool_schemas=[_search_schema()],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=128),
+        contract=_contract(llm_api=LLMApiMode.RESPONSES),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(builtin), stable_tool_id(executor)},
+    )
+
+    assert result.debug_metadata["visible_source_counts"] == {
+        "builtin": 1,
+        "executor": 1,
+        "local_mcp": 0,
+        "intaris_mcp": 0,
+        "skill_other": 0,
+    }
+    assert result.debug_metadata["hidden_source_counts"] == {
+        "builtin": 0,
+        "executor": 0,
+        "local_mcp": 1,
+        "intaris_mcp": 1,
+        "skill_other": 0,
+    }
+
+
+def test_source_counts_include_policy_visible_tools_truncated_by_provider_cap() -> None:
+    tools = [_tool(f"builtin_{index}") for index in range(5)]
+    result = prepare_tool_exposure(
+        inventory_tools=tools,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id="gpt-5.4", supports_responses_api=True, max_tools=2),
+        contract=_contract(
+            llm_api=LLMApiMode.RESPONSES,
+            discovery_mode=ToolDiscoveryMode.NONE,
+        ),
+        promoted_tool_ids=set(),
+        default_visible_tool_ids={stable_tool_id(tool) for tool in tools},
+        allow_tool_search=False,
+    )
+
+    assert result.debug_metadata["visible_source_counts"]["builtin"] == 2
+    assert result.debug_metadata["hidden_source_counts"]["builtin"] == 3
+    assert sum(result.debug_metadata["visible_source_counts"].values()) + sum(
+        result.debug_metadata["hidden_source_counts"].values()
+    ) == len(tools)
 
 
 def test_prepare_tool_exposure_responses_visible_only_when_search_disabled() -> None:
@@ -1270,6 +1617,39 @@ def test_gpt5_prefers_patch_over_exact_edit_tools() -> None:
     assert result.debug_metadata["edit_tool_mode"] == "apply_patch"
 
 
+def test_gpt6_astra_prefers_patch_over_exact_edit_tools() -> None:
+    inventory = [
+        _tool("read", source_type="executor", category="filesystem"),
+        _write_tool("write"),
+        _write_tool("edit"),
+        _write_tool("multiedit"),
+        _write_tool("apply_patch"),
+    ]
+
+    result = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=[],
+        model_info=ModelInfo(
+            model_id="gpt-6-astra",
+            supports_responses_api=True,
+            max_tools=128,
+        ),
+        contract=_contract(
+            llm_api=LLMApiMode.RESPONSES,
+            discovery_mode=ToolDiscoveryMode.NONE,
+        ),
+        promoted_tool_ids=set(),
+        allow_tool_search=False,
+    )
+
+    function_names = [tool["function"]["name"] for tool in result.tools]
+    assert "apply_patch" in function_names
+    assert "write" not in function_names
+    assert "edit" not in function_names
+    assert "multiedit" not in function_names
+    assert result.debug_metadata["edit_tool_mode"] == "apply_patch"
+
+
 def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
     for model_id in [
         "claude-sonnet-4-5",
@@ -1301,7 +1681,7 @@ def test_non_gpt5_models_prefer_exact_edit_tools() -> None:
         assert result.debug_metadata["edit_tool_mode"] == "exact"
 
 
-def test_single_allowed_edit_surface_is_preserved_for_any_model() -> None:
+def test_gpt5_hides_exact_edit_tools_when_patch_is_absent() -> None:
     inventory = [
         _tool("read", source_type="executor", category="filesystem"),
         _write_tool("edit"),
@@ -1318,10 +1698,10 @@ def test_single_allowed_edit_surface_is_preserved_for_any_model() -> None:
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert {"read", "edit", "write"} <= set(function_names)
+    assert function_names == ["read"]
 
 
-def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> None:
+def test_gpt5_makes_authorized_patch_default_visible() -> None:
     read = _tool("read", source_type="executor", category="filesystem")
     edit = _write_tool("edit")
     write = _write_tool("write")
@@ -1342,11 +1722,10 @@ def test_gpt5_preserves_exact_edit_tools_when_patch_is_not_default_visible() -> 
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert "apply_patch" not in function_names
-    assert {"edit", "write"} <= set(function_names)
+    assert set(function_names) == {"read", "apply_patch"}
 
 
-def test_controller_search_preserves_currently_visible_edit_surface() -> None:
+def test_controller_search_selects_anthropic_edit_surface_before_deferral() -> None:
     read = _tool("read", source_type="executor", category="filesystem")
     edit = _write_tool("edit")
     patch = _write_tool("apply_patch")
@@ -1366,8 +1745,92 @@ def test_controller_search_preserves_currently_visible_edit_surface() -> None:
     )
 
     function_names = [tool["function"]["name"] for tool in result.tools]
-    assert "apply_patch" in function_names
-    assert "edit" not in function_names
+    assert set(function_names) == {"read", "edit"}
+    assert stable_tool_id(patch) not in result.hidden_searchable_tool_ids
+
+
+@pytest.mark.parametrize(
+    "model_id,selected,rejected",
+    [
+        ("gpt-6-astra", "apply_patch", "edit"),
+        ("claude-sonnet-4-5", "edit", "apply_patch"),
+    ],
+)
+@pytest.mark.parametrize("llm_api", list(LLMApiMode))
+def test_editors_survive_slot_pressure_without_discovery(
+    model_id: str, selected: str, rejected: str, llm_api: LLMApiMode
+) -> None:
+    editor = _write_tool(selected)
+    incompatible = _write_tool(rejected)
+    promoted = _tool("web_fetch")
+    result = prepare_tool_exposure(
+        inventory_tools=[editor, incompatible, promoted, _tool("skill_load")],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id=model_id, max_tools=1),
+        contract=_contract(llm_api=llm_api),
+        promoted_tool_ids={stable_tool_id(incompatible), stable_tool_id(promoted)},
+        default_visible_tool_ids=set(),
+        allow_tool_search=True,
+    )
+    assert result.visible_tool_ids == {stable_tool_id(editor)}
+    assert stable_tool_id(incompatible) not in result.hidden_searchable_tool_ids
+
+
+@pytest.mark.parametrize("model_id", ["gpt-6-astra", "claude-sonnet-4-5"])
+def test_editing_policy_does_not_add_unauthorized_tools(model_id: str) -> None:
+    read = _tool("read")
+    result = prepare_tool_exposure(
+        inventory_tools=[read],
+        controller_tool_schemas=[],
+        model_info=ModelInfo(model_id=model_id),
+        contract=_contract(),
+        promoted_tool_ids={"builtin:apply_patch", "builtin:edit"},
+        allow_tool_search=True,
+    )
+    assert result.visible_tool_ids == {stable_tool_id(read)}
+
+
+def test_external_edit_name_is_not_a_cognis_editor() -> None:
+    external = _tool("edit", source_type="local_mcp")
+    assert filter_edit_tools_for_model([external], "gpt-6-astra") == [external]
+
+
+def test_anthropic_does_not_fall_back_to_patch() -> None:
+    assert filter_edit_tools_for_model([_write_tool("apply_patch")], "claude-sonnet-4-5") == []
+
+
+def test_editor_selection_recomputes_after_model_switch() -> None:
+    inventory = [_write_tool("apply_patch"), _write_tool("edit")]
+    defaults: set[str] = set()
+    for model_id, expected in [
+        ("gpt-6-astra", "apply_patch"),
+        ("claude-sonnet-4-5", "edit"),
+        ("gpt-6-astra", "apply_patch"),
+    ]:
+        result = prepare_tool_exposure(
+            inventory_tools=inventory,
+            controller_tool_schemas=[],
+            model_info=ModelInfo(model_id=model_id),
+            contract=_contract(),
+            promoted_tool_ids={stable_tool_id(t) for t in inventory},
+            default_visible_tool_ids=defaults,
+            allow_tool_search=True,
+        )
+        assert [t["function"]["name"] for t in result.tools] == [expected]
+    assert defaults == set()
+    assert len(inventory) == 2
+
+
+def test_editor_surface_rejects_insufficient_slots() -> None:
+    with pytest.raises(ValueError, match="cannot fit"):
+        prepare_tool_exposure(
+            inventory_tools=[_write_tool("edit"), _write_tool("write")],
+            controller_tool_schemas=[],
+            model_info=ModelInfo(model_id="claude-sonnet-4-5", max_tools=1),
+            contract=_contract(),
+            promoted_tool_ids=set(),
+            allow_tool_search=True,
+        )
 
 
 def test_responses_native_apply_patch_replaces_function_schema() -> None:

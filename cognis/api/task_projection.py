@@ -323,12 +323,13 @@ async def _resolve_workflow(task: TaskModel, workflow_registry: Any) -> Workflow
     state = task.workflow_state
     if state is not None and state.effective_workflow_definition is not None:
         return Workflow.model_validate(state.effective_workflow_definition)
-    return await workflow_registry.get(
+    resolved = await workflow_registry.get(
         task.workflow_id,
         owner_email=task.created_by,
         include_disabled=True,
         project_id=task.project_id,
     )
+    return Workflow.model_validate(resolved) if resolved is not None else None
 
 
 def _attempts_by_step(step_runs: list[Any]) -> dict[str, list[Any]]:
@@ -555,7 +556,7 @@ def _duration_seconds(started_at: Any, completed_at: Any) -> float | None:
         return None
     end = completed_at or datetime.now(UTC)
     try:
-        return max(0.0, (end - started_at).total_seconds())
+        return float(max(0.0, (end - started_at).total_seconds()))
     except (TypeError, ValueError):
         return None
 

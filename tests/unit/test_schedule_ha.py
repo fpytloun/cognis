@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import select, text
 
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.events import Event, EventBus, EventType
@@ -12,6 +13,7 @@ from cognis.core.scheduler import Scheduler
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Schedule, ScheduleFireRow, Task
 from cognis.store.queries import create_agent, create_schedule, create_task, create_user
+from cognis.store.schedule_fires import get_task_schedule_trigger_context
 from cognis.tools.builtin.schedule import _handle_trigger
 
 
@@ -121,6 +123,93 @@ async def test_two_schedulers_dispatch_one_logical_fire(tmp_path: Any) -> None:
             assert len(fires) == 1
             assert fires[0].scheduled_fire_at.replace(tzinfo=UTC) == fire_at
             assert fires[0].status == "dispatched"
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.timezone = "Europe/Prague"
+            await session.flush()
+            trigger = await get_task_schedule_trigger_context(session, next(iter(task_ids)))
+            assert trigger == {
+                "type": "schedule",
+                "fire_id": fires[0].fire_id,
+                "schedule_id": "schedule-1",
+                "scheduled_fire_at": fire_at.isoformat(),
+                "timezone": "UTC",
+            }
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_old_controller_insert_snapshots_timezone_before_schedule_mutation(
+    tmp_path: Any,
+) -> None:
+    engine, factory, _fire_at = await _setup(tmp_path)
+    try:
+        queue = _DatabaseTaskQueue(factory)
+        scheduler = Scheduler(
+            factory,
+            queue,
+            EventBus(),
+            controller_owner_id="controller-rolling",
+        )
+        task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert task_id is not None
+
+        async with factory() as session:
+            fire = await session.scalar(
+                select(ScheduleFireRow).where(ScheduleFireRow.task_id == task_id)
+            )
+            schedule = await session.get(Schedule, "schedule-1")
+            assert fire is not None
+            assert schedule is not None
+            await session.delete(fire)
+            await session.flush()
+            await session.execute(
+                text(
+                    """
+                    CREATE TRIGGER trg_schedule_fire_timezone_snapshot_test
+                    AFTER INSERT ON schedule_fires
+                    FOR EACH ROW
+                    WHEN NEW.schedule_timezone IS NULL
+                    BEGIN
+                        UPDATE schedule_fires
+                        SET schedule_timezone = (
+                            SELECT timezone FROM schedules
+                            WHERE schedule_id = NEW.schedule_id
+                        )
+                        WHERE fire_id = NEW.fire_id;
+                    END
+                    """
+                )
+            )
+            await session.execute(
+                ScheduleFireRow.__table__.insert().values(
+                    fire_id=fire.fire_id,
+                    schedule_id=fire.schedule_id,
+                    fire_kind=fire.fire_kind,
+                    scheduled_fire_at=fire.scheduled_fire_at,
+                    task_id=task_id,
+                    status=fire.status,
+                    attempt_count=fire.attempt_count,
+                    created_at=fire.created_at,
+                    updated_at=fire.updated_at,
+                    dispatched_at=fire.dispatched_at,
+                )
+            )
+            schedule.timezone = "Europe/Prague"
+            await session.commit()
+
+        async with factory() as session:
+            trigger = await get_task_schedule_trigger_context(session, task_id)
+            await session.commit()
+        assert trigger is not None
+        assert trigger["timezone"] == "UTC"
+
+        async with factory() as session:
+            persisted = await session.scalar(
+                select(ScheduleFireRow.schedule_timezone).where(ScheduleFireRow.task_id == task_id)
+            )
+            assert persisted == "UTC"
     finally:
         await engine.dispose()
 
@@ -557,7 +646,7 @@ async def test_manual_one_shot_delete_is_atomic_after_task_activation(tmp_path: 
         ("cancelled", EventType.TASK_CANCELLED),
     ],
 )
-async def test_manual_task_terminal_event_preserves_recurring_schedule_state(
+async def test_manual_task_terminal_event_projects_result_without_changing_cadence(
     tmp_path: Any,
     task_status: str,
     event_type: EventType,
@@ -580,19 +669,36 @@ async def test_manual_task_terminal_event_preserves_recurring_schedule_state(
             task.status = task_status
             schedule.last_run_status = "baseline"
             schedule.consecutive_errors = 3
+            schedule.disabled_reason = "stale failure"
             await session.commit()
 
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=event_type, data={"task_id": task_id})
+        )
         await scheduler._handle_task_terminal_event(  # noqa: SLF001
             Event(type=event_type, data={"task_id": task_id})
         )
         async with factory() as session:
             schedule = await session.get(Schedule, "schedule-1")
             assert schedule is not None
-            assert schedule.enabled is True
-            assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
-            assert schedule.last_fired_at is None
-            assert schedule.last_run_status == "baseline"
-            assert schedule.consecutive_errors == 3
+            assert schedule.last_fired_at == task.scheduled_for
+            if task_status == "completed":
+                assert schedule.enabled is True
+                assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
+                assert schedule.last_run_status == "success"
+                assert schedule.consecutive_errors == 0
+                assert schedule.disabled_reason == "stale failure"
+            elif task_status == "failed":
+                assert schedule.enabled is False
+                assert schedule.next_fire_at is None
+                assert schedule.last_run_status == "failed"
+                assert schedule.consecutive_errors == 4
+                assert schedule.disabled_reason == "auto_consecutive_failures:4"
+            else:
+                assert schedule.enabled is True
+                assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
+                assert schedule.last_run_status == "cancelled"
+                assert schedule.consecutive_errors == 0
     finally:
         await engine.dispose()
 
@@ -606,7 +712,7 @@ async def test_manual_task_terminal_event_preserves_recurring_schedule_state(
         ("cancelled", EventType.TASK_CANCELLED),
     ],
 )
-async def test_manual_terminal_event_before_dispatch_settlement_is_identified(
+async def test_manual_terminal_event_before_dispatch_settlement_projects_result(
     tmp_path: Any,
     task_status: str,
     event_type: EventType,
@@ -641,11 +747,520 @@ async def test_manual_terminal_event_before_dispatch_settlement_is_identified(
         async with factory() as session:
             schedule = await session.get(Schedule, "schedule-1")
             assert schedule is not None
-            assert schedule.enabled is True
-            assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
-            assert schedule.last_fired_at is None
-            assert schedule.last_run_status == "baseline"
-            assert schedule.consecutive_errors == 3
+            assert schedule.last_fired_at is not None
+            if task_status == "completed":
+                assert schedule.enabled is True
+                assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
+                assert schedule.last_run_status == "success"
+                assert schedule.consecutive_errors == 0
+            elif task_status == "failed":
+                assert schedule.enabled is False
+                assert schedule.next_fire_at is None
+                assert schedule.last_run_status == "failed"
+                assert schedule.consecutive_errors == 4
+            else:
+                assert schedule.enabled is True
+                assert schedule.next_fire_at.replace(tzinfo=UTC) == fire_at
+                assert schedule.last_run_status == "cancelled"
+                assert schedule.consecutive_errors == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_recurring_failure_projection_is_idempotent_and_preserves_cadence(
+    tmp_path: Any,
+) -> None:
+    engine, factory, fire_at = await _setup(tmp_path)
+    try:
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            EventBus(),
+            controller_owner_id="controller-1",
+            max_consecutive_errors=3,
+        )
+        task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert task_id is not None
+        async with factory() as session:
+            task = await session.get(Task, task_id)
+            schedule = await session.get(Schedule, "schedule-1")
+            assert task is not None and schedule is not None
+            task.status = "failed"
+            regular_next_fire = schedule.next_fire_at
+            await session.commit()
+
+        event = Event(type=EventType.TASK_FAILED, data={"task_id": task_id})
+        await scheduler._handle_task_terminal_event(event)  # noqa: SLF001
+        await scheduler._handle_task_terminal_event(event)  # noqa: SLF001
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.consecutive_errors == 1
+            assert schedule.next_fire_at == regular_next_fire
+            assert schedule.next_fire_at is not None
+            assert schedule.next_fire_at.replace(tzinfo=UTC) > fire_at
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_successful_manual_run_keeps_auto_disabled_recurring_schedule_disabled(
+    tmp_path: Any,
+) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.enabled = False
+            schedule.next_fire_at = None
+            schedule.consecutive_errors = 5
+            schedule.disabled_reason = "auto_consecutive_failures:5"
+            await session.commit()
+
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            EventBus(),
+            controller_owner_id="controller-1",
+        )
+        task_id = await scheduler.trigger_now("schedule-1")
+        assert task_id is not None
+        async with factory() as session:
+            task = await session.get(Task, task_id)
+            assert task is not None
+            task.status = "completed"
+            await session.commit()
+
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_COMPLETED, data={"task_id": task_id})
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.enabled is False
+            assert schedule.consecutive_errors == 0
+            assert schedule.disabled_reason == "auto_consecutive_failures:5"
+            assert schedule.next_fire_at is None
+            assert schedule.last_run_status == "success"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_next_recurring_fire_fails_and_replaces_paused_task(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+        )
+        paused_task_id = await scheduler.trigger_now("schedule-1")
+        assert paused_task_id is not None
+        async with factory() as session:
+            paused_task = await session.get(Task, paused_task_id)
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.retry_failed_tasks = True
+            assert paused_task is not None
+            paused_task.status = "paused"
+            await session.commit()
+
+        replacement_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert replacement_task_id is not None
+        assert replacement_task_id != paused_task_id
+        async with factory() as session:
+            paused_task = await session.get(Task, paused_task_id)
+            assert paused_task is not None
+            assert paused_task.status == "failed"
+            assert paused_task.result_summary == (
+                "Replaced at the next scheduled firing while still paused."
+            )
+            assert paused_task.workflow_state["status"] == "failed"
+            assert paused_task.workflow_state["current_step_status"] is None
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.consecutive_errors == 1
+            assert schedule.last_terminal_task_id == paused_task_id
+        assert len(schedule_events) == 1
+        assert schedule_events[0].type == EventType.SCHEDULE_ERROR
+        assert schedule_events[0].data["task_id"] == paused_task_id
+        assert schedule_events[0].data["consecutive_errors"] == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_paused_replacement_auto_disable_emits_one_correlated_event(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+        )
+        paused_task_id = await scheduler.trigger_now("schedule-1")
+        assert paused_task_id is not None
+        async with factory() as session:
+            paused_task = await session.get(Task, paused_task_id)
+            assert paused_task is not None
+            paused_task.status = "paused"
+            await session.commit()
+
+        assert await scheduler._fire_schedule("schedule-1") is None  # noqa: SLF001
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.enabled is False
+            assert schedule.disabled_reason == "auto_consecutive_failures:1"
+            assert schedule.last_terminal_task_id == paused_task_id
+        assert len(schedule_events) == 1
+        assert schedule_events[0].type == EventType.SCHEDULE_DISABLED
+        assert schedule_events[0].data["task_id"] == paused_task_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_manual_failures_emit_one_auto_disable_event(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.max_concurrent_runs = 2
+            await session.commit()
+
+        first_task_id = await scheduler.trigger_now("schedule-1")
+        second_task_id = await scheduler.trigger_now("schedule-1")
+        assert first_task_id is not None and second_task_id is not None
+        for task_id in (first_task_id, second_task_id):
+            async with factory() as session:
+                task = await session.get(Task, task_id)
+                assert task is not None
+                task.status = "failed"
+                await session.commit()
+            await scheduler._handle_task_terminal_event(  # noqa: SLF001
+                Event(type=EventType.TASK_FAILED, data={"task_id": task_id})
+            )
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.disabled_reason == "auto_consecutive_failures:2"
+            assert schedule.last_terminal_task_id == second_task_id
+        assert [event.type for event in schedule_events] == [EventType.SCHEDULE_DISABLED]
+        assert schedule_events[0].data["task_id"] == first_task_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_recurring_failures_emit_one_auto_disable_event(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.max_concurrent_runs = 2
+            await session.commit()
+
+        first_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        second_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert first_task_id is not None and second_task_id is not None
+        for task_id in (first_task_id, second_task_id):
+            async with factory() as session:
+                task = await session.get(Task, task_id)
+                assert task is not None
+                task.status = "failed"
+                await session.commit()
+            await scheduler._handle_task_terminal_event(  # noqa: SLF001
+                Event(type=EventType.TASK_FAILED, data={"task_id": task_id})
+            )
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.disabled_reason == "auto_consecutive_failures:2"
+            assert schedule.last_terminal_task_id == second_task_id
+        assert [event.type for event in schedule_events] == [EventType.SCHEDULE_DISABLED]
+        assert schedule_events[0].data["task_id"] == first_task_id
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_late_success_keeps_auto_disabled_incident_actionable(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+
+        class _NotificationService:
+            def __init__(self) -> None:
+                self.upserts: list[dict[str, Any]] = []
+                self.resolutions: list[dict[str, Any]] = []
+
+            async def upsert_schedule_action(self, **kwargs: Any) -> None:
+                self.upserts.append(kwargs)
+
+            async def resolve_schedule_action(self, *_args: Any, **kwargs: Any) -> bool:
+                self.resolutions.append(kwargs)
+                return True
+
+        notifications = _NotificationService()
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            EventBus(),
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+            notification_service=notifications,
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.max_concurrent_runs = 2
+            await session.commit()
+
+        failed_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        successful_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert failed_task_id is not None and successful_task_id is not None
+
+        async with factory() as session:
+            failed_task = await session.get(Task, failed_task_id)
+            assert failed_task is not None
+            failed_task.status = "failed"
+            await session.commit()
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_FAILED, data={"task_id": failed_task_id})
+        )
+
+        async with factory() as session:
+            successful_task = await session.get(Task, successful_task_id)
+            assert successful_task is not None
+            successful_task.status = "completed"
+            await session.commit()
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_COMPLETED, data={"task_id": successful_task_id})
+        )
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.enabled is False
+            assert schedule.disabled_reason == "auto_consecutive_failures:1"
+            assert schedule.last_run_status == "success"
+            assert schedule.last_terminal_task_id == successful_task_id
+        assert notifications.resolutions == []
+        assert len(notifications.upserts) == 2
+        assert notifications.upserts[-1]["auto_disabled"] is True
+        assert notifications.upserts[-1]["task_id"] == successful_task_id
+        assert "remains automatically disabled" in notifications.upserts[-1]["error_summary"]
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.enabled = True
+            schedule.disabled_reason = None
+            await session.commit()
+        repaired_task_id = await scheduler.trigger_now("schedule-1")
+        assert repaired_task_id is not None
+        async with factory() as session:
+            repaired_task = await session.get(Task, repaired_task_id)
+            assert repaired_task is not None
+            repaired_task.status = "completed"
+            await session.commit()
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_COMPLETED, data={"task_id": repaired_task_id})
+        )
+        assert len(notifications.resolutions) == 1
+        assert notifications.resolutions[0]["expected_terminal_task_id"] == repaired_task_id
+        assert notifications.resolutions[0]["require_canonical_success"] is True
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manual", [False, True])
+async def test_late_cancellation_updates_auto_disabled_incident(
+    tmp_path: Any,
+    manual: bool,
+) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+
+        class _NotificationService:
+            def __init__(self) -> None:
+                self.upserts: list[dict[str, Any]] = []
+                self.resolutions: list[dict[str, Any]] = []
+
+            async def upsert_schedule_action(self, **kwargs: Any) -> None:
+                self.upserts.append(kwargs)
+
+            async def resolve_schedule_action(self, *_args: Any, **kwargs: Any) -> bool:
+                self.resolutions.append(kwargs)
+                return True
+
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        notifications = _NotificationService()
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+            notification_service=notifications,
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            schedule.max_concurrent_runs = 2
+            await session.commit()
+
+        if manual:
+            failed_task_id = await scheduler.trigger_now("schedule-1")
+            cancelled_task_id = await scheduler.trigger_now("schedule-1")
+        else:
+            failed_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+            cancelled_task_id = await scheduler._fire_schedule("schedule-1")  # noqa: SLF001
+        assert failed_task_id is not None and cancelled_task_id is not None
+
+        async with factory() as session:
+            failed_task = await session.get(Task, failed_task_id)
+            assert failed_task is not None
+            failed_task.status = "failed"
+            await session.commit()
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_FAILED, data={"task_id": failed_task_id})
+        )
+        async with factory() as session:
+            cancelled_task = await session.get(Task, cancelled_task_id)
+            assert cancelled_task is not None
+            cancelled_task.status = "cancelled"
+            await session.commit()
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_CANCELLED, data={"task_id": cancelled_task_id})
+        )
+
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.enabled is False
+            assert schedule.disabled_reason == "auto_consecutive_failures:1"
+            assert schedule.last_run_status == "cancelled"
+            assert schedule.last_terminal_task_id == cancelled_task_id
+        assert [event.type for event in schedule_events] == [EventType.SCHEDULE_DISABLED]
+        assert notifications.resolutions == []
+        assert len(notifications.upserts) == 2
+        assert notifications.upserts[-1]["task_id"] == cancelled_task_id
+        assert "was cancelled" in notifications.upserts[-1]["error_summary"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_late_failure_preserves_explicit_schedule_disablement(tmp_path: Any) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    try:
+        schedule_events: list[Event] = []
+        bus = EventBus()
+
+        async def _capture_schedule_event(event: Event) -> None:
+            schedule_events.append(event)
+
+        bus.subscribe(EventType.SCHEDULE_ERROR, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_DISABLED, _capture_schedule_event)
+        bus.subscribe(EventType.SCHEDULE_ACTION_CHANGED, _capture_schedule_event)
+        scheduler = Scheduler(
+            factory,
+            _DatabaseTaskQueue(factory),
+            bus,
+            controller_owner_id="controller-1",
+            max_consecutive_errors=1,
+        )
+        task_id = await scheduler.trigger_now("schedule-1")
+        assert task_id is not None
+        async with factory() as session:
+            task = await session.get(Task, task_id)
+            schedule = await session.get(Schedule, "schedule-1")
+            assert task is not None and schedule is not None
+            task.status = "failed"
+            schedule.enabled = False
+            schedule.disabled_reason = "disabled_by_user"
+            schedule.next_fire_at = None
+            await session.commit()
+
+        await scheduler._handle_task_terminal_event(  # noqa: SLF001
+            Event(type=EventType.TASK_FAILED, data={"task_id": task_id})
+        )
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule is not None
+            assert schedule.enabled is False
+            assert schedule.disabled_reason == "disabled_by_user"
+            assert schedule.last_run_status == "failed"
+        assert [event.type for event in schedule_events] == [EventType.SCHEDULE_ERROR]
+        assert schedule_events[0].data["task_id"] == task_id
+        assert schedule_events[0].data.get("reason") == "disabled_by_user"
+        assert await scheduler.trigger_now("schedule-1") is None
     finally:
         await engine.dispose()
 
@@ -1054,7 +1669,10 @@ async def test_catchup_waits_for_contended_schedule_before_completion(tmp_path: 
         )
         assert held is not None
         catchup = asyncio.create_task(scheduler._catch_up_missed())  # noqa: SLF001
-        await asyncio.sleep(0.1)
+        async with asyncio.timeout(5):
+            while not await scheduler._fire_store.catchup_active():  # noqa: SLF001
+                assert not catchup.done()
+                await asyncio.sleep(0.01)
         assert not catchup.done()
         assert await scheduler._fire_store.catchup_active()  # noqa: SLF001
         await blocker._lease_store.release(held)  # noqa: SLF001

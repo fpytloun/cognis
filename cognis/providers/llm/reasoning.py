@@ -456,9 +456,13 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
         if not _is_known_anthropic_reasoning_model(normalized_model):
             return "unsupported"
         return "anthropic"
-    if any(normalized_model.startswith(prefix) for prefix in ("gpt-5", "o1", "o3", "o4")) or (
+    if any(
+        normalized_model.startswith(prefix) for prefix in ("gpt-5", "gpt-6", "o1", "o3", "o4")
+    ) or (
         preset in _OPENAI_PRESETS
-        and any(normalized_model.startswith(prefix) for prefix in ("gpt-5", "o1", "o3", "o4"))
+        and any(
+            normalized_model.startswith(prefix) for prefix in ("gpt-5", "gpt-6", "o1", "o3", "o4")
+        )
     ):
         return "openai"
     if (
@@ -469,7 +473,7 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
     ):
         return "google"
     if preset == "groq" and re.search(
-        r"(reason|think|o1|o3|o4|gpt-5|deepseek-r1|qwq|qwen3)", normalized_model
+        r"(reason|think|o1|o3|o4|gpt-[56]|deepseek-r1|qwq|qwen3)", normalized_model
     ):
         return "groq"
     if re.search(r"(reason|think|deepseek-r1|qwq|qwen3|grok-4|kimi-k2)", normalized_model):
@@ -479,7 +483,7 @@ def _detect_reasoning_family(model_id: str, provider_preset: str) -> str:
 
 def _is_openai_reasoning_model(model_id: str) -> bool:
     normalized = model_id.lower()
-    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
+    return normalized.startswith(("gpt-5", "gpt-6", "o1", "o3", "o4"))
 
 
 def _strip_sampling_params(request_kwargs: dict[str, Any]) -> list[str]:
@@ -591,21 +595,21 @@ def reasoning_mode_for_model(
     return "adaptive"
 
 
-def _looks_like_gpt5_candidate(model_name: str) -> bool:
+def _looks_like_openai_gpt_reasoning_candidate(model_name: str) -> bool:
     normalized = _normalize_model_name(model_name).replace("_", "-").replace(" ", "-")
-    return normalized.startswith("gpt-5")
+    return normalized.startswith(("gpt-5", "gpt-6"))
 
 
 def _supports_openai_none(model_id: str, model_info: ModelInfo | None) -> bool:
     return any(
-        _looks_like_gpt5_candidate(candidate)
+        _looks_like_openai_gpt_reasoning_candidate(candidate)
         for candidate in _candidate_model_names(model_id, model_info)
     )
 
 
 def _supports_openai_xhigh(model_id: str, model_info: ModelInfo | None) -> bool:
     return any(
-        _looks_like_gpt5_candidate(candidate)
+        _looks_like_openai_gpt_reasoning_candidate(candidate)
         for candidate in _candidate_model_names(model_id, model_info)
     )
 

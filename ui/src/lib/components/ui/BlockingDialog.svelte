@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
+  import { portal } from '$lib/actions/portal';
   import { cn } from '$lib/utils';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
 
@@ -10,8 +11,12 @@
     label: string;
     titleId?: string;
     class?: string;
+    viewportClass?: string;
     panelClass?: string;
+    bodyClass?: string;
+    viewportStyle?: string;
     dismissible?: boolean;
+    onEscape?: (() => boolean) | undefined;
     children: Snippet;
     header?: Snippet;
     footer?: Snippet;
@@ -23,8 +28,12 @@
     label,
     titleId,
     class: className = '',
+    viewportClass = '',
     panelClass = '',
+    bodyClass = '',
+    viewportStyle = '',
     dismissible = true,
+    onEscape,
     children,
     header,
     footer
@@ -54,10 +63,18 @@
   }
 
   function handleKeydown(event: KeyboardEvent): void {
+    if (event.defaultPrevented) return;
     if (!open || !isTopOverlay(overlayId)) return;
-    if (event.key === 'Escape' && dismissible) {
-      event.preventDefault();
-      onClose();
+    if (event.key === 'Escape') {
+      if (onEscape?.()) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
+      }
+      if (dismissible) {
+        event.preventDefault();
+        onClose();
+      }
       return;
     }
     if (event.key !== 'Tab') return;
@@ -111,7 +128,11 @@
 <svelte:window onkeydown={handleKeydown} />
 
 {#if open}
-  <div class={cn('fixed inset-0 z-[90] isolate', className)} role="presentation">
+  <div
+    use:portal
+    class={cn('app-viewport-frame fixed inset-x-0 z-[90] isolate', className)}
+    role="presentation"
+  >
     <button
       aria-label={`Dismiss ${label}`}
       class="absolute inset-0 bg-slate-950/80 backdrop-blur"
@@ -121,8 +142,11 @@
     ></button>
 
     <div
-      class="relative z-10 flex h-full w-full items-center justify-center px-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]"
-      style={`padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + 1rem); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + env(safe-area-inset-bottom) + 1rem);`}
+      class={cn(
+        'relative z-10 flex h-full w-full items-center justify-center px-[max(1rem,env(safe-area-inset-left))] pr-[max(1rem,env(safe-area-inset-right))]',
+        viewportClass
+      )}
+      style={viewportStyle || `padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + 1rem); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + 1rem);`}
     >
       <div
         bind:this={panelEl}
@@ -143,7 +167,10 @@
           </div>
         {/if}
 
-        <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-5 sm:px-6">
+        <div
+          class={cn('min-h-0 flex-1 touch-pan-y overflow-y-auto overscroll-contain px-5 py-5 sm:px-6', bodyClass)}
+          data-blocking-dialog-scroll
+        >
           {@render children()}
         </div>
 

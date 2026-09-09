@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,6 +67,13 @@ describe('standalone client', () => {
     document.body.append(link);
     link.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
     expect(link.target).toBe('_self');
+  });
+
+  it('uses the full available width for the standalone deliverable root', async () => {
+    const stylesheet = await readFile(path.resolve(process.cwd(), 'src', 'standalone.css'), 'utf8');
+
+    expect(stylesheet).toMatch(/#cognis-deliverable-root\s*\{\s*width:\s*100%;\s*\}/);
+    expect(stylesheet).not.toContain('width: min(100%, 90rem)');
   });
 });
 

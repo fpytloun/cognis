@@ -251,8 +251,8 @@ async def _seed_model_routing(session: AsyncSession, config: LocalSeedConfig) ->
     print(f"Seeded model routing for: {', '.join(TEXT_ROUTE_TYPES)}")
 
 
-def _executor_config() -> dict[str, Any]:
-    return {
+def _executor_config(existing: dict[str, Any] | None = None) -> dict[str, Any]:
+    config: dict[str, Any] = {
         "browser": {
             "enabled": True,
             "auto_install": True,
@@ -262,7 +262,8 @@ def _executor_config() -> dict[str, Any]:
             "realistic_launch": True,
             "xvfb_auto": True,
             "engine": "chromium",
-            "runtime": "playwright",
+            "runtime": "patchright",
+            "channel": "chrome",
             "stealth_enabled": True,
             "realistic_user_agent": True,
             "default_timezone_id": "UTC",
@@ -271,6 +272,12 @@ def _executor_config() -> dict[str, Any]:
         "lsp": {"enabled": True, "auto_install": True},
         "officecli": {"enabled": True, "auto_install": True},
     }
+    for key, value in (existing or {}).items():
+        if isinstance(value, dict) and isinstance(config.get(key), dict):
+            config[key] = {**config[key], **value}
+        else:
+            config[key] = value
+    return config
 
 
 async def _seed_executor(
@@ -311,7 +318,7 @@ async def _seed_executor(
             labels=labels,
             enabled_tools=[],
             enabled_tool_groups=enabled_tool_groups,
-            config=_executor_config(),
+            config=_executor_config(existing.config if isinstance(existing.config, dict) else None),
             is_default=True,
             shared=False,
         )

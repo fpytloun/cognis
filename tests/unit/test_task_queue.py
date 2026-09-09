@@ -6,13 +6,17 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from cognis.core.agent_registry import AgentRegistry
+from cognis.core.events import EventBus
+from cognis.core.task_execution import TaskExecutionClaim
 from cognis.core.task_queue import TaskQueue, TaskRerunResult, _row_to_task_model
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.models.task import TaskModel, TaskStatus
+from cognis.models.workflow import StepDefinition, Workflow, WorkflowState
 from cognis.store.database import create_engine, create_session_factory
-from cognis.store.models import Agent, Base, User
+from cognis.store.models import Agent, Base, StepRun, User
 from cognis.store.queries import (
     add_task_dependency,
     create_conversation,
@@ -80,6 +84,98 @@ async def test_create_and_get_task(tmp_path: object) -> None:
             assert task is not None
             assert task.title == "Test Task"
             assert task.status == "draft"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            task = await create_task(
+                session,
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Retry task",
+                status="failed",
+                workflow_state=WorkflowState(
+                    status="failed",
+                    current_step="execute",
+                    loop_iterations={"execute": 3},
+                ).model_dump(mode="json"),
+                task_id="task-retry-history",
+            )
+            task.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+            task.result_summary = "Original failure"
+            task.result_data = {"error": "Original error"}
+            await create_step_run(
+                session,
+                task_id=task.task_id,
+                step_name="execute",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr-original",
+                attempt=1,
+                attempt_number=1,
+                status="failed",
+                completed_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+            await session.commit()
+
+        original_claim = TaskExecutionClaim(
+            task_id="task-retry-history",
+            agent_id="agent-1",
+            attempt_number=1,
+            task_lease=SimpleNamespace(),
+            global_capacity_lease=None,
+            agent_capacity_lease=None,
+        )
+
+        class _ExecutionStore:
+            async def claim_existing(
+                self, task_id: str, *, statuses: set[str]
+            ) -> TaskExecutionClaim:
+                assert task_id == "task-retry-history"
+                assert statuses == {"failed"}
+                return original_claim
+
+            async def release(self, claim: TaskExecutionClaim) -> None:
+                del claim
+
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=SimpleNamespace(),
+            workflow_registry=SimpleNamespace(),
+            event_bus=EventBus(),
+        )
+        queue._execution_store = _ExecutionStore()  # type: ignore[assignment]
+        launched: list[TaskExecutionClaim] = []
+        queue._launch_claimed_task_run = (  # type: ignore[method-assign]
+            lambda task, claim: launched.append(claim)
+        )
+
+        retried = await queue.retry_failed_task("task-retry-history")
+
+        assert retried.attempt_number == 2
+        assert retried.status == TaskStatus.RUNNING
+        assert len(launched) == 1
+        assert launched[0].attempt_number == 2
+        assert launched[0].task_lease is original_claim.task_lease
+        async with factory() as session:
+            persisted = await get_task(session, "task-retry-history")
+            original_run = await get_step_run(session, "sr-original")
+            assert persisted is not None
+            assert persisted.attempt_number == 2
+            assert persisted.completed_at is None
+            assert persisted.result_summary is None
+            assert persisted.result_data is None
+            assert persisted.workflow_state["loop_iterations"] == {}
+            assert original_run is not None
+            assert original_run.status == "failed"
+            assert original_run.attempt_number == 1
     finally:
         await engine.dispose()
 
@@ -190,21 +286,25 @@ async def test_crash_recovery_classifies_tool_event_pairs(
             assert row is not None
 
         class _Guardrails:
+            cursors: list[int] = []
+
             async def read_events(self, **kwargs: object) -> object:
                 after_seq = int(kwargs.get("after_seq", 0))
+                self.cursors.append(after_seq)
                 page_index = 0 if after_seq == 0 else 1
                 events = event_pages[page_index]
                 stalled = any(event.get("_stalled") for event in events)
                 return SimpleNamespace(
                     events=events,
                     has_more=page_index < len(event_pages) - 1,
-                    last_seq=after_seq if stalled else (500 if page_index == 0 else 501),
+                    last_seq=after_seq if stalled else 10_000,
                     missing_stream_fallback_used=not events,
                 )
 
+        guardrails = _Guardrails()
         queue = TaskQueue(
             session_factory=factory,
-            workflow_engine=SimpleNamespace(_providers=SimpleNamespace(guardrails=_Guardrails())),
+            workflow_engine=SimpleNamespace(_providers=SimpleNamespace(guardrails=guardrails)),
             workflow_registry=SimpleNamespace(),
             event_bus=SimpleNamespace(),
         )
@@ -212,6 +312,11 @@ async def test_crash_recovery_classifies_tool_event_pairs(
             _row_to_task_model(row)
         )
         assert classification == expected
+        if len(event_pages) > 1 and not any(event.get("_stalled") for event in event_pages[0]):
+            first_page_seqs = [
+                int(event["seq"]) for event in event_pages[0] if isinstance(event.get("seq"), int)
+            ]
+            assert guardrails.cursors == [0, max(first_page_seqs)]
     finally:
         await engine.dispose()
 
@@ -1336,5 +1441,155 @@ async def test_recover_paused_tasks_credential_pending_stays_paused(tmp_path: ob
         assert "cred_2" in waiter.registered
         assert waiter.resolved == []
         assert [task.task_id for task in queue.launch_calls] == ["task_cred_pending"]  # type: ignore[attr-defined]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_request_revision_reopens_selected_step_and_supersedes_later_runs(
+    tmp_path: object,
+) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    workflow = Workflow(
+        workflow_id="wf-revision",
+        name="Revision",
+        steps=[
+            StepDefinition(name="plan", type="run"),
+            StepDefinition(name="build", type="run"),
+            StepDefinition(name="review", type="run"),
+        ],
+    )
+    state = WorkflowState(
+        current_step_index=2,
+        status="completed",
+        step_outputs={
+            "plan": {"summary": "plan"},
+            "build": {"summary": "build"},
+            "review": {"summary": "review"},
+        },
+        effective_workflow_definition=workflow.model_dump(mode="json"),
+    )
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task-revision",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Revision",
+                status="completed",
+                workflow_id=workflow.workflow_id,
+                workflow_state=state.model_dump(mode="json"),
+            )
+            for name in ("plan", "build", "review"):
+                await create_step_run(
+                    session,
+                    task_id="task-revision",
+                    step_name=name,
+                    step_type="run",
+                    agent_id="agent-1",
+                    step_run_id=f"sr-{name}",
+                    status="approved",
+                    attempt_number=1,
+                )
+            await session.commit()
+
+        workflow_engine = SimpleNamespace(
+            _notification_service=None,
+            _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None),
+        )
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=workflow_engine,
+            workflow_registry=SimpleNamespace(),
+            event_bus=EventBus(),
+            max_active_steps_global=1,
+            max_active_steps_per_agent=1,
+        )
+        launched: list[object] = []
+        queue._launch_claimed_task_run = lambda task, claim: launched.extend([task, claim])  # type: ignore[method-assign]  # noqa: SLF001
+        old_owner = await queue._execution_store.claim_existing(  # noqa: SLF001
+            "task-revision",
+            statuses={"completed"},
+        )
+        assert old_owner is not None
+
+        revised = await queue.request_revision(
+            "task-revision",
+            target_step="build",
+            instruction="Correct the implementation",
+            expected_attempt=1,
+        )
+
+        assert revised.attempt_number == 2
+        assert revised.status == TaskStatus.RUNNING
+        assert revised.relaunched is False
+        assert revised.target_step == "build"
+        assert revised.superseded_count == 2
+        assert revised.task.workflow_state is not None
+        assert revised.task.workflow_state.current_step_index == 1
+        assert set(revised.task.workflow_state.step_outputs) == {"plan"}
+        async with factory() as session:
+            rows = {
+                row.step_name: row
+                for row in await session.scalars(
+                    select(StepRun).where(StepRun.task_id == "task-revision")
+                )
+            }
+        assert rows["plan"].status == "approved"
+        assert rows["build"].status == "superseded"
+        assert rows["review"].status == "superseded"
+        assert launched == []
+        await queue._execution_store.release(old_owner)  # noqa: SLF001
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_second_queue_cancellation_is_durable_and_idempotent(tmp_path: object) -> None:
+    engine, factory = await _bootstrap_db(tmp_path)
+    try:
+        async with factory() as session:
+            await create_task(
+                session,
+                task_id="task-cancel",
+                created_by="user@test.com",
+                agent_id="agent-1",
+                title="Cancel",
+                status="running",
+            )
+            await create_step_run(
+                session,
+                task_id="task-cancel",
+                step_name="run",
+                step_type="run",
+                agent_id="agent-1",
+                step_run_id="sr-cancel",
+                status="evaluating",
+            )
+            await session.commit()
+
+        workflow_engine = SimpleNamespace(
+            _notification_service=None,
+            _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None),
+        )
+        queue = TaskQueue(
+            session_factory=factory,
+            workflow_engine=workflow_engine,
+            workflow_registry=SimpleNamespace(),
+            event_bus=EventBus(),
+            controller_owner_id="controller-b",
+        )
+
+        first = await queue.cancel_task("task-cancel", expected_attempt=1)
+        second = await queue.cancel_task("task-cancel", expected_attempt=1)
+
+        assert first.status == TaskStatus.CANCELLED
+        assert second.status == TaskStatus.CANCELLED
+        async with factory() as session:
+            task = await get_task(session, "task-cancel")
+            step = await get_step_run(session, "sr-cancel")
+        assert task is not None and task.status == "cancelled"
+        assert step is not None and step.status == "cancelled"
     finally:
         await engine.dispose()

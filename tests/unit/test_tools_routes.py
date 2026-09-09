@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.store.queries import create_user
 
 
 def _create_test_client(monkeypatch: object, tmp_path: Path) -> TestClient:
@@ -24,6 +25,19 @@ def test_list_tools_includes_executor_and_controller_tools(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await session.commit()
+
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/tools",
             headers=_auth_headers(client.app, email="user@example.com"),
@@ -37,7 +51,7 @@ def test_list_tools_includes_executor_and_controller_tools(
     assert "artifact_search" in names
     assert "artifact_get_metadata" in names
     assert "artifact_get_url" in names
-    assert "artifact_publish" in names
+    assert "artifact_publish" not in names
     assert "artifact_save" in names
     assert "step_request_questions" in names
     assert "step_todo_write" in names
@@ -48,7 +62,6 @@ def test_list_tools_includes_executor_and_controller_tools(
     assert sources["artifact_search"] == "builtin"
     assert sources["artifact_get_metadata"] == "builtin"
     assert sources["artifact_get_url"] == "builtin"
-    assert sources["artifact_publish"] == "executor"
     assert sources["artifact_save"] == "executor"
     assert sources["step_request_questions"] == "controller"
     question_tool = next(tool for tool in tools if tool["name"] == "step_request_questions")

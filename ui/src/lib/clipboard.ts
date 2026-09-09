@@ -48,6 +48,29 @@ export async function pastedFilesFromClipboardEvent(
   return readPastedFilesFromNavigator(navigatorLike);
 }
 
+export async function handleClipboardFilePaste(
+  event: ClipboardEvent,
+  onFiles: (files: File[]) => void | Promise<void>,
+  options: {
+    navigatorLike?: Pick<Navigator, 'clipboard'> | null;
+    filterFiles?: (files: File[]) => File[];
+  } = {},
+): Promise<boolean> {
+  let files = pastedFilesFromClipboardData(event.clipboardData);
+  if (files.length === 0) {
+    files = await readPastedFilesFromNavigator(
+      options.navigatorLike === undefined
+        ? (typeof navigator === 'undefined' ? null : navigator)
+        : options.navigatorLike,
+    );
+  }
+  if (options.filterFiles) files = options.filterFiles(files);
+  if (files.length === 0) return false;
+  event.preventDefault();
+  await onFiles(files);
+  return true;
+}
+
 export function pastedFilesFromClipboardData(data: DataTransfer | null): File[] {
   const files: File[] = [];
   const seen = new Set<string>();

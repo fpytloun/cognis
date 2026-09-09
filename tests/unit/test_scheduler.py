@@ -518,7 +518,6 @@ async def test_scheduler_task_failure_propagates_to_schedule_state(
         created_at=datetime(2026, 5, 4, 7, 1, tzinfo=UTC),
     )
     sched_row = _schedule_row(consecutive_errors=1)
-    updates: list[dict[str, Any]] = []
     events: list[Event] = []
     bus = EventBus()
 
@@ -533,36 +532,63 @@ async def test_scheduler_task_failure_propagates_to_schedule_state(
         assert schedule_id == "sched_1"
         return sched_row
 
-    async def _update_schedule_fire_state(_db: object, schedule_id: str, **kwargs: Any) -> None:
-        assert schedule_id == "sched_1"
-        updates.append(kwargs)
-
     bus.subscribe_all(_capture)
     monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
     monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
-    monkeypatch.setattr(
-        "cognis.core.scheduler.update_schedule_fire_state",
-        _update_schedule_fire_state,
-    )
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = bus  # type: ignore[attr-defined]
-    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
+    fire_store = _NonManualFireStore()
+    scheduler._fire_store = fire_store  # type: ignore[attr-defined]
     scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
         Event(type=EventType.TASK_FAILED, data={"task_id": "task_1"})
     )
 
-    assert len(updates) == 1
-    assert updates[0]["last_run_status"] == "failed"
-    assert updates[0]["consecutive_errors"] == 2
-    assert updates[0]["next_fire_at"] is not None
+    assert fire_store.projections[0]["status"] == "failed"
+    assert fire_store.projections[0]["next_fire_at"] == sched_row.next_fire_at
     assert events[-1].type == EventType.SCHEDULE_ERROR
     assert events[-1].data["schedule_id"] == "sched_1"
     assert events[-1].data["consecutive_errors"] == 2
     assert events[-1].data["task_id"] == "task_1"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_task_failure_retries_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_row = SimpleNamespace(
+        task_id="task_1",
+        source_type="scheduler",
+        source_ref="sched_1",
+        status="failed",
+        result_summary="failed",
+        created_at=datetime(2026, 5, 4, 7, 1, tzinfo=UTC),
+    )
+    sched_row = _schedule_row(consecutive_errors=0, retry_failed_tasks=True)
+
+    async def _get_task(_db: object, _task_id: str) -> Any:
+        return task_row
+
+    async def _get_schedule(_db: object, _schedule_id: str) -> Any:
+        return sched_row
+
+    monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
+    monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
+    scheduler._event_bus = EventBus()  # type: ignore[attr-defined]
+    fire_store = _NonManualFireStore()
+    scheduler._fire_store = fire_store  # type: ignore[attr-defined]
+    scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
+
+    await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
+        Event(type=EventType.TASK_FAILED, data={"task_id": "task_1"})
+    )
+
+    assert fire_store.projections[0]["next_fire_at"] != sched_row.next_fire_at
 
 
 @pytest.mark.asyncio
@@ -578,7 +604,6 @@ async def test_scheduler_task_success_resets_consecutive_errors(
         created_at=datetime(2026, 5, 4, 7, 1, tzinfo=UTC),
     )
     sched_row = _schedule_row(consecutive_errors=3)
-    updates: list[dict[str, Any]] = []
 
     async def _get_task(_db: object, task_id: str) -> Any:
         assert task_id == "task_1"
@@ -588,34 +613,26 @@ async def test_scheduler_task_success_resets_consecutive_errors(
         assert schedule_id == "sched_1"
         return sched_row
 
-    async def _update_schedule_fire_state(_db: object, schedule_id: str, **kwargs: Any) -> None:
-        assert schedule_id == "sched_1"
-        updates.append(kwargs)
-
     monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
     monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
-    monkeypatch.setattr(
-        "cognis.core.scheduler.update_schedule_fire_state",
-        _update_schedule_fire_state,
-    )
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = EventBus()  # type: ignore[attr-defined]
-    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
+    fire_store = _NonManualFireStore()
+    scheduler._fire_store = fire_store  # type: ignore[attr-defined]
+    scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
         Event(type=EventType.TASK_COMPLETED, data={"task_id": "task_1"})
     )
 
-    assert len(updates) == 1
-    assert updates[0]["last_run_status"] == "success"
-    assert updates[0]["consecutive_errors"] == 0
-    assert updates[0]["next_fire_at"] is not None
+    assert fire_store.projections[0]["status"] == "completed"
+    assert fire_store.projections[0]["next_fire_at"] == sched_row.next_fire_at
 
 
 @pytest.mark.asyncio
-async def test_scheduler_ignores_stale_task_terminal_event(
+async def test_scheduler_projects_older_task_terminal_event_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     task_row = SimpleNamespace(
@@ -630,7 +647,6 @@ async def test_scheduler_ignores_stale_task_terminal_event(
         last_fired_at=datetime(2026, 5, 4, 8, 0, tzinfo=UTC),
         consecutive_errors=0,
     )
-    updates: list[dict[str, Any]] = []
     events: list[Event] = []
     bus = EventBus()
 
@@ -645,30 +661,23 @@ async def test_scheduler_ignores_stale_task_terminal_event(
         assert schedule_id == "sched_1"
         return sched_row
 
-    async def _update_schedule_fire_state(_db: object, schedule_id: str, **kwargs: Any) -> None:
-        assert schedule_id == "sched_1"
-        updates.append(kwargs)
-
     bus.subscribe_all(_capture)
     monkeypatch.setattr("cognis.core.scheduler.get_task", _get_task)
     monkeypatch.setattr("cognis.core.scheduler.get_schedule", _get_schedule)
-    monkeypatch.setattr(
-        "cognis.core.scheduler.update_schedule_fire_state",
-        _update_schedule_fire_state,
-    )
 
     scheduler = Scheduler.__new__(Scheduler)
     scheduler._db_session = lambda: _Session()  # type: ignore[attr-defined]
     scheduler._event_bus = bus  # type: ignore[attr-defined]
-    scheduler._fire_store = _NonManualFireStore()  # type: ignore[attr-defined]
+    fire_store = _NonManualFireStore()
+    scheduler._fire_store = fire_store  # type: ignore[attr-defined]
     scheduler._max_consecutive_errors = 3  # type: ignore[attr-defined]
 
     await scheduler._handle_task_terminal_event(  # type: ignore[attr-defined]
         Event(type=EventType.TASK_FAILED, data={"task_id": "task_old"})
     )
 
-    assert updates == []
-    assert events == []
+    assert fire_store.projections[0]["task_id"] == "task_old"
+    assert events[-1].type == EventType.SCHEDULE_ERROR
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1221,8 @@ def _schedule_row(**overrides: Any) -> SimpleNamespace:
         "enabled": True,
         "max_concurrent_runs": 2,
         "delete_after_run": False,
+        "retry_failed_tasks": False,
+        "fail_paused_task_on_next_fire": True,
         "completion_mode_family": "direct",
         "allow_silent_completion": True,
         "interaction_mode_override": "none",
@@ -1240,8 +1251,25 @@ class _Session:
 
 
 class _NonManualFireStore:
+    def __init__(self) -> None:
+        self.projections: list[dict[str, Any]] = []
+
     async def is_manual_task(self, _task_id: str) -> bool:
         return False
+
+    async def project_recurring_terminal_result(self, **kwargs: Any) -> dict[str, Any]:
+        self.projections.append(kwargs)
+        return {
+            "schedule_id": "sched_1",
+            "errors": 2,
+            "disabled": False,
+            "auto_disabled": False,
+            "auto_disabled_state": False,
+            "disabled_reason": None,
+            "created_by": "user@example.com",
+            "agent_id": "agent_1",
+            "schedule_name": "Daily check",
+        }
 
 
 class _FakeSchedule:

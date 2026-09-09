@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from cognis.api.chat_v2 import snapshot_coordinator as coordinator
+from cognis.api.chat_v2 import work_graph, work_materializer, work_repository
 from cognis.api.chat_v2.event_store import RawSessionEvent
+from cognis.api.chat_v2.event_store_refs import session_read_refs
 from cognis.api.chat_v2.schemas import (
     ConversationStateView,
     ConversationSummary,
@@ -23,8 +25,10 @@ from cognis.api.chat_v2.shared_snapshot_cache import (
 from cognis.api.chat_v2.snapshot_coordinator import ConversationSnapshotContext
 from cognis.api.chat_v2.snapshot_warmer import ChatSnapshotWarmer
 from cognis.api.chat_v2.sync import ConversationSessionRef, RuntimeOverlayInput
-from cognis.api.chat_v2.work_graph import AuthorizedWorkRootNotReadyError
+from cognis.bootstrap import run_schema_bootstrap
 from cognis.providers.guardrails.events import EventStoreAuthority
+from cognis.store.database import create_engine, create_session_factory
+from cognis.store.models import Agent, Conversation, Session, User
 from tests.unit.api.chat_v2.test_cached_event_store import (
     AUTHORITY,
     Delegate,
@@ -32,6 +36,7 @@ from tests.unit.api.chat_v2.test_cached_event_store import (
     FakeRedis,
     build_test_snapshot,
     make_cache,
+    make_snapshot_cache,
 )
 
 
@@ -77,8 +82,39 @@ def _context(bound, session_id: str) -> ConversationSnapshotContext:
     )
 
 
+def _forbid_work_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        work_graph,
+        "resolve_authorized_work_graph",
+        AsyncMock(side_effect=AssertionError("snapshot resolved Work graph")),
+    )
+    monkeypatch.setattr(
+        work_repository,
+        "read_activity_overview",
+        AsyncMock(side_effect=AssertionError("snapshot read Work overview")),
+    )
+    monkeypatch.setattr(
+        work_repository,
+        "read_work_projection_states",
+        AsyncMock(side_effect=AssertionError("snapshot created Work projection state")),
+    )
+    monkeypatch.setattr(
+        work_materializer.WorkMaterializer,
+        "prioritize_sessions",
+        AsyncMock(side_effect=AssertionError("snapshot prioritized Work materialization")),
+    )
+    original_session_read_refs = coordinator.session_read_refs
+
+    async def guarded_session_read_refs(*args, role, **kwargs):
+        if role == "work":
+            raise AssertionError("snapshot resolved Work event-store watermarks")
+        return await original_session_read_refs(*args, role=role, **kwargs)
+
+    monkeypatch.setattr(coordinator, "session_read_refs", guarded_session_read_refs)
+
+
 @pytest.mark.anyio
-async def test_snapshot_overlay_atomically_replaces_cached_activity_overview(
+async def test_snapshot_overlay_always_removes_embedded_activity_overview(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = FakeClock()
@@ -87,260 +123,188 @@ async def test_snapshot_overlay_atomically_replaces_cached_activity_overview(
     base = (await build_test_snapshot(bound)).model_copy(
         update={"activity_overview": "stale-overview"}
     )
-    fresh_overview = SimpleNamespace(overview_revision="revision-fresh")
-    monkeypatch.setattr(
-        coordinator,
-        "_read_snapshot_activity_overview",
-        AsyncMock(return_value=fresh_overview),
-    )
     monkeypatch.setattr(
         coordinator,
         "_hydrate_snapshot_attachments",
         AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
     )
-    app = SimpleNamespace(state=SimpleNamespace(session_factory=object()))
-
-    snapshot = await coordinator._apply_mutable_snapshot_overlay(  # noqa: SLF001
-        app,
-        base,
-        context,
-    )
-
-    assert snapshot.activity_overview is fresh_overview
-
-
-@pytest.mark.anyio
-async def test_snapshot_overlay_keeps_cached_overview_when_refresh_times_out(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    context = _context(bound, "session-a")
-    stale = SimpleNamespace(overview_revision="revision-stale")
-    base = (await build_test_snapshot(bound)).model_copy(update={"activity_overview": stale})
-    monkeypatch.setattr(
-        coordinator,
-        "_read_snapshot_activity_overview",
-        AsyncMock(side_effect=TimeoutError),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_hydrate_snapshot_attachments",
-        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
-    )
-    app = SimpleNamespace(state=SimpleNamespace(session_factory=object()))
-
-    snapshot = await coordinator._apply_mutable_snapshot_overlay(  # noqa: SLF001
-        app,
-        base,
-        context,
-    )
-
-    assert snapshot.activity_overview is stale
-
-
-@pytest.mark.anyio
-async def test_snapshot_overview_uses_same_service_with_bounded_graph_deadline(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    context = _context(bound, "session-a")
-    expected = SimpleNamespace(overview_revision="same-service")
-    deadlines: list[float] = []
-
-    class SessionFactory:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    async def resolve_graph(_db, *, deadline, **_kwargs):
-        deadlines.append(deadline)
-        return SimpleNamespace(
-            session_rows=[],
-            nodes=[],
-            fingerprint="graph",
-            truncated=False,
-        )
-
-    read_overview = AsyncMock(return_value=expected)
-    monkeypatch.setattr(coordinator, "resolve_authorized_work_graph", resolve_graph)
-    monkeypatch.setattr(coordinator, "read_activity_overview", read_overview)
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            session_factory=lambda: SessionFactory(),
-            tool_registry=None,
-        )
-    )
-
-    actual = await coordinator._read_snapshot_activity_overview(app, context)  # noqa: SLF001
-
-    assert actual is expected
-    assert deadlines
-    assert read_overview.await_args.kwargs["scope"] == context.scope
-    assert read_overview.await_args.kwargs["graph_fingerprint"] == "graph"
-    assert read_overview.await_args.kwargs["detail"] == "lightweight"
-
-
-@pytest.mark.anyio
-async def test_cold_snapshot_succeeds_before_authorized_work_root_is_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    context = _context(bound, "session-a")
-    base = await build_test_snapshot(bound)
-
-    class SessionFactory:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", AsyncMock(return_value=base))
-    monkeypatch.setattr(
-        coordinator,
-        "load_conversation_snapshot_context",
-        AsyncMock(return_value=context),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "resolve_authorized_work_graph",
-        AsyncMock(
-            side_effect=AuthorizedWorkRootNotReadyError(
-                "Authorized Work conversation root was not found"
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_hydrate_snapshot_attachments",
-        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
-    )
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            shared_chat_snapshot_cache=None,
-            cached_event_store=bound._cache,
-            session_factory=lambda: SessionFactory(),
-            tool_registry=None,
-        )
-    )
-
-    snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
-
-    assert snapshot.timeline == base.timeline
-    assert snapshot.activity_overview is None
-
-
-@pytest.mark.anyio
-async def test_cold_snapshot_succeeds_before_conversation_has_an_active_session(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    initial = _context(bound, "session-a")
-    context = replace(
-        initial,
-        scope=initial.scope.model_copy(update={"session_id": None}),
-        conversation=initial.conversation.model_copy(update={"active_session_id": None}),
-        session_refs=[],
-    )
-    base = await build_test_snapshot(bound)
-
-    class SessionFactory:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", AsyncMock(return_value=base))
-    monkeypatch.setattr(
-        coordinator,
-        "load_conversation_snapshot_context",
-        AsyncMock(return_value=context),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "resolve_authorized_work_graph",
-        AsyncMock(
-            side_effect=AuthorizedWorkRootNotReadyError(
-                "Authorized Work conversation root was not found"
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_hydrate_snapshot_attachments",
-        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
-    )
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            shared_chat_snapshot_cache=None,
-            cached_event_store=bound._cache,
-            session_factory=lambda: SessionFactory(),
-            tool_registry=None,
-        )
-    )
-
-    snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
-
-    assert snapshot.timeline == base.timeline
-    assert snapshot.activity_overview is None
-
-
-@pytest.mark.anyio
-async def test_snapshot_overview_recovers_when_first_activity_becomes_visible(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    context = _context(bound, "session-a")
-    expected = SimpleNamespace(overview_revision="first-activity")
-    read_overview = AsyncMock(
-        side_effect=[
-            AuthorizedWorkRootNotReadyError("Authorized Work active root session was not found"),
-            expected,
-        ]
-    )
-    monkeypatch.setattr(coordinator, "_read_snapshot_activity_overview", read_overview)
     app = SimpleNamespace(state=SimpleNamespace())
 
-    first = await coordinator._read_snapshot_activity_overview_bounded(  # noqa: SLF001
+    snapshot = await coordinator._apply_mutable_snapshot_overlay(  # noqa: SLF001
         app,
-        context,
-        stale=SimpleNamespace(overview_revision="stale"),
-    )
-    second = await coordinator._read_snapshot_activity_overview_bounded(  # noqa: SLF001
-        app,
+        base,
         context,
     )
 
-    assert first is None
-    assert second is expected
+    assert snapshot.activity_overview is None
 
 
 @pytest.mark.anyio
-async def test_snapshot_overview_does_not_mask_other_graph_failures(
+async def test_session_read_refs_batches_database_authority_resolution() -> None:
+    active_sessions = 0
+    session_opens = 0
+
+    class Result:
+        def all(self):
+            return [("agent-a", "owner-a@example.com"), ("agent-b", "owner-b@example.com")]
+
+    class Session:
+        async def execute(self, _statement):
+            assert active_sessions == 1
+            return Result()
+
+    class SessionContext:
+        async def __aenter__(self):
+            nonlocal active_sessions, session_opens
+            active_sessions += 1
+            session_opens += 1
+            return Session()
+
+        async def __aexit__(self, *_args):
+            nonlocal active_sessions
+            active_sessions -= 1
+
+    class Registry:
+        get = AsyncMock(side_effect=AssertionError("per-agent lookup used"))
+
+        def get_system_agent(self, _agent_id):
+            return None
+
+    class Store:
+        def bind(self, authority):
+            assert active_sessions == 0
+            return SimpleNamespace(authority_token=f"token-{authority.agent_id}")
+
+    rows = [
+        SimpleNamespace(
+            session_id=f"session-{suffix}",
+            intaris_session_id=None,
+            user_email="user@example.com",
+            agent_id=f"agent-{suffix}",
+            status="active",
+            completion_reason=None,
+        )
+        for suffix in ("a", "b")
+    ]
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=lambda: SessionContext(),
+            agent_registry=Registry(),
+            cached_event_store=Store(),
+        )
+    )
+
+    refs = await session_read_refs(
+        app,
+        rows,
+        user_email="user@example.com",
+        role="work",
+    )
+
+    assert session_opens == 1
+    assert active_sessions == 0
+    assert [ref.ordinal for ref in refs] == [0, 1]
+
+
+@pytest.mark.anyio
+async def test_cold_snapshot_performs_no_work_queries_or_computation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = FakeClock()
     bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
     context = _context(bound, "session-a")
+
     monkeypatch.setattr(
         coordinator,
-        "_read_snapshot_activity_overview",
-        AsyncMock(side_effect=ValueError("Authorized Work graph root session was not resolved")),
+        "load_conversation_snapshot_context",
+        AsyncMock(return_value=context),
+    )
+    _forbid_work_calls(monkeypatch)
+    monkeypatch.setattr(
+        coordinator,
+        "_hydrate_snapshot_attachments",
+        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            shared_chat_snapshot_cache=None,
+            cached_event_store=bound._cache,
+        )
     )
 
-    with pytest.raises(ValueError, match="graph root session"):
-        await coordinator._read_snapshot_activity_overview_bounded(  # noqa: SLF001
-            SimpleNamespace(state=SimpleNamespace()),
-            context,
+    snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
+
+    assert len(snapshot.timeline.items) == 1
+    assert snapshot.activity_overview is None
+
+
+@pytest.mark.anyio
+async def test_context_loading_and_cold_build_perform_no_work_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'snapshot-context.db'}")
+    session_factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+    async with session_factory() as session:
+        session.add(User(email="user@example.com", name="User", role="user"))
+        await session.flush()
+        session.add(Agent(agent_id="agent-a", owner_email="user@example.com", name="Agent"))
+        await session.flush()
+        session.add(
+            Conversation(
+                conversation_id="conversation-a",
+                user_email="user@example.com",
+                agent_id="agent-a",
+                context_type="web",
+                title_source="unset",
+                active_session_id="session-a",
+            )
         )
+        await session.flush()
+        session.add(
+            Session(
+                session_id="session-a",
+                conversation_id="conversation-a",
+                user_email="user@example.com",
+                agent_id="agent-a",
+                intaris_session_id="session-a",
+                delegation_metadata={},
+            )
+        )
+        await session.commit()
+
+    clock = FakeClock()
+    events = make_cache(Delegate(), FakeRedis(clock), clock)
+    _forbid_work_calls(monkeypatch)
+    monkeypatch.setattr(
+        coordinator,
+        "_hydrate_snapshot_attachments",
+        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=session_factory,
+            agent_registry=SimpleNamespace(get_system_agent=lambda _agent_id: None),
+            cached_event_store=events,
+            shared_chat_snapshot_cache=None,
+            chat_v2_cursor_secret="cursor-secret",
+            turn_scheduler=None,
+            session_cache=None,
+            artifact_store=None,
+        )
+    )
+    try:
+        context = await coordinator.load_conversation_snapshot_context(
+            app,
+            user_email="user@example.com",
+            conversation_id="conversation-a",
+        )
+        snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
+    finally:
+        await engine.dispose()
+
+    assert snapshot.activity_overview is None
 
 
 @pytest.mark.anyio
@@ -353,6 +317,7 @@ async def test_cache_hit_uses_one_context_load_and_rehydrates_attachments(
     base = await build_test_snapshot(bound)
     hydrated = 0
     trace = SnapshotRequestTrace()
+    _forbid_work_calls(monkeypatch)
 
     class Cache:
         async def get_or_build_result(self, *, request_trace, **_kwargs):
@@ -383,6 +348,55 @@ async def test_cache_hit_uses_one_context_load_and_rehydrates_attachments(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("entry_state", ["hit", "incompatible"])
+async def test_shared_cache_paths_perform_no_work_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    entry_state: str,
+) -> None:
+    clock = FakeClock()
+    redis = FakeRedis(clock)
+    events = make_cache(Delegate(), redis, clock)
+    bound = events.bind(AUTHORITY)
+    cache = make_snapshot_cache(events, redis, clock)
+    context = _context(bound, "session-a")
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            shared_chat_snapshot_cache=cache,
+            cached_event_store=events,
+        )
+    )
+    _forbid_work_calls(monkeypatch)
+    monkeypatch.setattr(
+        coordinator,
+        "load_conversation_snapshot_context",
+        AsyncMock(return_value=context),
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_hydrate_snapshot_attachments",
+        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
+    )
+
+    warm_outcome, _failure = await coordinator.warm_chat_snapshot_coordinated(app, context)
+    assert warm_outcome == "succeeded"
+    identity = await cache._identity(  # noqa: SLF001
+        authority_token=coordinator._conversation_authority_token(app, context),  # noqa: SLF001
+        scope_key=context.scope.key,
+        session_refs=context.session_refs,
+    )
+    assert identity is not None
+    if entry_state == "incompatible":
+        cache._l1.clear()  # noqa: SLF001
+        redis.values[identity.value_key] = (b"incompatible", clock() + 60)
+
+    snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
+
+    assert snapshot.activity_overview is None
+    if entry_state == "incompatible":
+        assert identity.value_key in redis.deleted
+
+
+@pytest.mark.anyio
 async def test_cache_only_hit_applies_fresh_mutable_overlay(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -392,6 +406,7 @@ async def test_cache_only_hit_applies_fresh_mutable_overlay(
     base = (await build_test_snapshot(bound)).model_copy(
         update={"activity_overview": SimpleNamespace()}
     )
+    _forbid_work_calls(monkeypatch)
 
     class Cache:
         async def get_cached_result(self, **_kwargs):
@@ -401,11 +416,6 @@ async def test_cache_only_hit_applies_fresh_mutable_overlay(
         return snapshot
 
     monkeypatch.setattr(coordinator, "_hydrate_snapshot_attachments", hydrate)
-    monkeypatch.setattr(
-        coordinator,
-        "_read_snapshot_activity_overview_bounded",
-        AsyncMock(side_effect=AssertionError("cache-only hit refreshed Work")),
-    )
     app = SimpleNamespace(
         state=SimpleNamespace(
             shared_chat_snapshot_cache=Cache(),
@@ -420,10 +430,11 @@ async def test_cache_only_hit_applies_fresh_mutable_overlay(
     assert snapshot.queue == context.queue
     assert snapshot.state == context.state
     assert snapshot.runtime.runtime_revision == 1
+    assert snapshot.activity_overview is None
 
 
 @pytest.mark.anyio
-async def test_cache_only_hit_without_warmed_overview_returns_miss() -> None:
+async def test_cache_only_hit_accepts_snapshot_without_activity_overview() -> None:
     clock = FakeClock()
     bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
     context = _context(bound, "session-a")
@@ -442,8 +453,9 @@ async def test_cache_only_hit_without_warmed_overview_returns_miss() -> None:
 
     snapshot, outcome = await coordinator.get_cached_chat_snapshot_coordinated(app, context)
 
-    assert snapshot is None
-    assert outcome == "miss"
+    assert snapshot is not None
+    assert snapshot.activity_overview is None
+    assert outcome == "hit_redis"
 
 
 @pytest.mark.anyio
@@ -515,141 +527,12 @@ async def test_lineage_change_during_build_restarts_with_fresh_context(
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("timeout_stage", ["graph", "repository"])
-async def test_cold_snapshot_overview_timeout_returns_canonical_snapshot(
+async def test_snapshot_warmer_stores_null_activity_overview(
     monkeypatch: pytest.MonkeyPatch,
-    timeout_stage: str,
 ) -> None:
     clock = FakeClock()
     bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
     context = _context(bound, "session-a")
-    base = await build_test_snapshot(bound)
-
-    class SessionFactory:
-        async def __aenter__(self):
-            return object()
-
-        async def __aexit__(self, *_args):
-            return None
-
-    async def resolve_graph(*_args, **_kwargs):
-        if timeout_stage == "graph":
-            raise TimeoutError
-        return SimpleNamespace(
-            session_rows=[],
-            nodes=[],
-            fingerprint="graph",
-            truncated=False,
-        )
-
-    async def read_overview(*_args, **_kwargs):
-        raise TimeoutError
-
-    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", AsyncMock(return_value=base))
-    monkeypatch.setattr(
-        coordinator,
-        "load_conversation_snapshot_context",
-        AsyncMock(return_value=context),
-    )
-    monkeypatch.setattr(coordinator, "resolve_authorized_work_graph", resolve_graph)
-    monkeypatch.setattr(coordinator, "read_activity_overview", read_overview)
-    monkeypatch.setattr(
-        coordinator,
-        "_hydrate_snapshot_attachments",
-        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
-    )
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            shared_chat_snapshot_cache=None,
-            cached_event_store=bound._cache,
-            session_factory=lambda: SessionFactory(),
-            tool_registry=None,
-        )
-    )
-
-    snapshot = await coordinator.build_chat_snapshot_coordinated(app, context)
-
-    assert snapshot.timeline == base.timeline
-    assert snapshot.activity_overview is None
-
-
-@pytest.mark.anyio
-async def test_second_lineage_change_rebuilds_overview_for_final_lineage(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    contexts = [
-        _context(bound, "session-a"),
-        _context(bound, "session-b"),
-        _context(bound, "session-c"),
-    ]
-    base = await build_test_snapshot(bound)
-    builds: list[str] = []
-    overview_reads: list[str] = []
-    reloads = iter(contexts[1:])
-
-    class Cache:
-        async def get_or_build_result(self, *, build, **_kwargs):
-            return SnapshotCacheResult(await build(), "build")
-
-    async def build_immutable(context):
-        builds.append(context.session_refs[0].session_id)
-        return base
-
-    async def read_overview(_app, context, **_kwargs):
-        session_id = context.session_refs[0].session_id
-        overview_reads.append(session_id)
-        return session_id
-
-    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", build_immutable)
-    monkeypatch.setattr(
-        coordinator,
-        "load_conversation_snapshot_context",
-        AsyncMock(side_effect=lambda *_args, **_kwargs: next(reloads)),
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_read_snapshot_activity_overview_bounded",
-        read_overview,
-    )
-    monkeypatch.setattr(
-        coordinator,
-        "_hydrate_snapshot_attachments",
-        AsyncMock(side_effect=lambda _app, snapshot, **_kwargs: snapshot),
-    )
-    app = SimpleNamespace(
-        state=SimpleNamespace(
-            shared_chat_snapshot_cache=Cache(),
-            cached_event_store=bound._cache,
-            session_factory=object(),
-        )
-    )
-
-    snapshot = await coordinator.build_chat_snapshot_coordinated(app, contexts[0])
-
-    assert builds == ["session-a", "session-b", "session-c"]
-    assert overview_reads == ["session-a", "session-b", "session-c"]
-    assert snapshot.activity_overview == "session-c"
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize(
-    "overview_error",
-    [
-        TimeoutError(),
-        AuthorizedWorkRootNotReadyError("Authorized Work conversation root was not found"),
-    ],
-    ids=["timeout", "root-not-ready"],
-)
-async def test_snapshot_warmer_overview_failure_stores_canonical_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-    overview_error: Exception,
-) -> None:
-    clock = FakeClock()
-    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
-    context = _context(bound, "session-a")
-    base = await build_test_snapshot(bound)
     stored = None
 
     class Cache:
@@ -663,17 +546,11 @@ async def test_snapshot_warmer_overview_failure_stores_canonical_snapshot(
         def warm_outcome(self, _scope_key):
             return "succeeded"
 
-    monkeypatch.setattr(coordinator, "_build_immutable_snapshot", AsyncMock(return_value=base))
-    monkeypatch.setattr(
-        coordinator,
-        "_read_snapshot_activity_overview",
-        AsyncMock(side_effect=overview_error),
-    )
+    _forbid_work_calls(monkeypatch)
     app = SimpleNamespace(
         state=SimpleNamespace(
             shared_chat_snapshot_cache=Cache(),
             cached_event_store=bound._cache,
-            session_factory=object(),
         )
     )
 

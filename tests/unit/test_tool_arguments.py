@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from cognis.core.tool_arguments import ToolArgumentError, validate_tool_arguments
+from cognis.models.tool import tool_provider_exposure_schema
+from cognis.tools.builtin.orchestration import AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL
 from cognis.tools.builtin.workflow import (
     ATTACH_ARTIFACT_TOOL,
     REQUEST_CREDENTIAL_TOOL,
@@ -30,6 +32,50 @@ _STEP_TODO_SCHEMA = {
     },
     "required": ["todos"],
 }
+
+
+def test_channel_recovery_schema_requires_exactly_one_target_form() -> None:
+    schema = AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL.parameters
+    managed = {
+        "conversation_id": "conv_target",
+        "expected_owner_epoch": 2,
+        "reason": "Externally reconciled.",
+    }
+    one_shot = {
+        "delivery_id": "cdel_target",
+        "reason": "Externally reconciled.",
+    }
+    assert (
+        validate_tool_arguments("agent_conversation_recover_channel", managed, schema=schema)
+        is None
+    )
+    assert (
+        validate_tool_arguments("agent_conversation_recover_channel", one_shot, schema=schema)
+        is None
+    )
+    assert (
+        validate_tool_arguments(
+            "agent_conversation_recover_channel",
+            {**managed, "delivery_id": "cdel_target"},
+            schema=schema,
+        )
+        is not None
+    )
+    assert (
+        validate_tool_arguments(
+            "agent_conversation_recover_channel",
+            {"reason": "Missing target."},
+            schema=schema,
+        )
+        is not None
+    )
+
+
+def test_write_deliverable_provider_schema_has_no_top_level_union() -> None:
+    schema = tool_provider_exposure_schema(WRITE_DELIVERABLE_TOOL)
+
+    assert schema["type"] == "object"
+    assert not {"oneOf", "anyOf", "allOf", "not"} & schema.keys()
 
 
 def test_valid_arguments_return_none() -> None:
@@ -140,7 +186,8 @@ def test_write_deliverable_content_schema_rejects_non_string() -> None:
 
     assert isinstance(error, ToolArgumentError)
     assert error.reason == "schema_violation"
-    assert any("content" in line and "string" in line for line in error.errors)
+    # The union reports a rejected content property when no authoring branch fits.
+    assert any("content" in line for line in error.errors)
 
 
 def test_generic_write_deliverable_missing_content_reports_only_generic_branch() -> None:
@@ -166,10 +213,8 @@ def test_generic_write_deliverable_complete_payload_is_valid() -> None:
     error = validate_tool_arguments(
         "write_deliverable",
         {
-            "action": "write_deliverable",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {"blocks": [{"type": "callout", "content": "hi"}]},
+            "action": "rich",
+            "payload": {"title": "Report", "blocks": [{"type": "callout", "content": "hi"}]},
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,
     )
@@ -180,10 +225,9 @@ def test_generic_write_deliverable_preserves_compatible_source_shapes() -> None:
     error = validate_tool_arguments(
         "write_deliverable",
         {
-            "action": "write_deliverable",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {
+            "action": "rich",
+            "payload": {
+                "title": "Report",
                 "blocks": [
                     {
                         "type": "day_agenda",
@@ -194,7 +238,7 @@ def test_generic_write_deliverable_preserves_compatible_source_shapes() -> None:
                         },
                     },
                     {"type": "source_list", "sources": "calendar"},
-                ]
+                ],
             },
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,
@@ -207,10 +251,8 @@ def test_generic_write_deliverable_rejects_empty_markdown_block() -> None:
     error = validate_tool_arguments(
         "write_deliverable",
         {
-            "action": "write_deliverable",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {"blocks": [{"type": "markdown"}]},
+            "action": "rich",
+            "payload": {"title": "Report", "blocks": [{"type": "markdown"}]},
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,
     )
@@ -224,10 +266,8 @@ def test_generic_write_deliverable_rejects_empty_mermaid_block() -> None:
     error = validate_tool_arguments(
         "write_deliverable",
         {
-            "action": "write_deliverable",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {"blocks": [{"type": "mermaid", "title": "Empty"}]},
+            "action": "rich",
+            "payload": {"title": "Report", "blocks": [{"type": "mermaid", "title": "Empty"}]},
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,
     )
@@ -242,14 +282,13 @@ def test_pulse_write_deliverable_rejects_empty_markdown_block() -> None:
         "write_deliverable",
         {
             "action": "rich:pulse",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {
+            "payload": {
+                "title": "Pulse",
                 "blocks": [
                     {"type": "markdown"},
                     *[{"type": "card", "content": "Body"} for _ in range(6)],
                 ],
-                "metadata": {"presentation": "pulse", "pulse_version": 2},
+                "metadata": {"pulse_version": 2},
             },
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,
@@ -266,14 +305,13 @@ def test_pulse_write_deliverable_accepts_every_mermaid_source_alias() -> None:
             "write_deliverable",
             {
                 "action": "rich:pulse",
-                "content": "fallback text",
-                "format": "rich",
-                "rich": {
+                "payload": {
+                    "title": "Pulse",
                     "blocks": [
                         {"type": "mermaid", field: "flowchart LR; A-->B"},
                         *[{"type": "card", "content": "Body"} for _ in range(6)],
                     ],
-                    "metadata": {"presentation": "pulse", "pulse_version": 2},
+                    "metadata": {"pulse_version": 2},
                 },
             },
             schema=WRITE_DELIVERABLE_TOOL.parameters,
@@ -287,14 +325,13 @@ def test_pulse_write_deliverable_rejects_whitespace_mermaid_alias() -> None:
         "write_deliverable",
         {
             "action": "rich:pulse",
-            "content": "fallback text",
-            "format": "rich",
-            "rich": {
+            "payload": {
+                "title": "Pulse",
                 "blocks": [
                     {"type": "mermaid", "code": "   "},
                     *[{"type": "card", "content": "Body"} for _ in range(6)],
                 ],
-                "metadata": {"presentation": "pulse", "pulse_version": 2},
+                "metadata": {"pulse_version": 2},
             },
         },
         schema=WRITE_DELIVERABLE_TOOL.parameters,

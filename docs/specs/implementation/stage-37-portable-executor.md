@@ -32,7 +32,7 @@ workflow engine, providers, and admin CLI.
 can still be installed normally:
 
 ```bash
-uvx cognis-executor --controller-url wss://cognis.example.com/api/executor/ws --token <token>
+uvx --from 'cognis-executor[full]' cognis-executor --controller-url wss://cognis.example.com/api/executor/ws --token <token>
 ```
 
 Optional extras provide larger capabilities:

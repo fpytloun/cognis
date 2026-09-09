@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
+from cognis.core.executor_availability import unavailable_executor_reason
 from cognis.core.executor_policy import (
     ExecutorPolicy,
     is_executor_type_allowed,
@@ -57,6 +58,7 @@ class ExecutorAvailability(StrEnum):
     POLICY_DENIED = "policy_denied"
     NOT_FOUND = "not_found"  # executor row missing
     UNAUTHORIZED = "unauthorized"  # row exists but not visible to user
+    UNAVAILABLE = "unavailable"  # local executor package is absent
 
 
 _USABLE_STATES = frozenset({ExecutorAvailability.USABLE, ExecutorAvailability.DEGRADED})
@@ -211,6 +213,9 @@ def _classify_state(
     if getattr(row, "status", None) != "active":
         return ExecutorAvailability.BLOCKED
 
+    if unavailable_executor_reason(getattr(row, "executor_type", "")) is not None:
+        return ExecutorAvailability.UNAVAILABLE
+
     if not is_executor_type_allowed(getattr(row, "executor_type", ""), policy):
         return ExecutorAvailability.POLICY_DENIED
 
@@ -218,6 +223,11 @@ def _classify_state(
     applied = int(getattr(row, "applied_config_version", 0) or 0)
     if desired != applied:
         return ExecutorAvailability.RECONFIGURING
+
+    # In-process execution has no transport heartbeat. Bootstrap rows retain
+    # the default offline observation even while the local provider is usable.
+    if getattr(row, "executor_type", "") == "in_process":
+        return ExecutorAvailability.USABLE
 
     runtime_state = str(getattr(row, "runtime_state", "offline") or "offline")
     if runtime_state == "active":

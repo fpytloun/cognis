@@ -16,6 +16,7 @@
     searchSelected = false,
     getToolCall = () => null,
     onViewSession,
+    pinnedTransient = false,
     scope
   } = $props<{
     item: ChatV2TimelineItem;
@@ -26,6 +27,7 @@
     searchSelected?: boolean;
     getToolCall?: (callId: string) => ToolCallTimelineItem | null;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    pinnedTransient?: boolean;
     scope?: TimelineScope | undefined;
   }>();
 
@@ -71,6 +73,7 @@
     {searchSelected}
     {getToolCall}
     {onViewSession}
+    {pinnedTransient}
     {scope}
   />
 {/if}

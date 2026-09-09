@@ -700,12 +700,12 @@ async def test_multipart_send_heartbeat_renews_lease_while_adapter_is_active(
         monkeypatch.setattr(
             delivery_module,
             "_DELIVERY_LEASE_DURATION",
-            timedelta(milliseconds=30),
+            timedelta(seconds=2),
         )
         monkeypatch.setattr(
             delivery_module,
             "_DELIVERY_LEASE_HEARTBEAT_SECONDS",
-            0.005,
+            0.1,
         )
         adapter_started = asyncio.Event()
 
@@ -715,7 +715,7 @@ async def test_multipart_send_heartbeat_renews_lease_while_adapter_is_active(
             async def send_message(self, message: OutboundMessage) -> str:
                 del message
                 adapter_started.set()
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(3)
                 return "message-1"
 
         service = ChannelDeliveryService(
@@ -733,7 +733,7 @@ async def test_multipart_send_heartbeat_renews_lease_while_adapter_is_active(
             )
         )
         await asyncio.wait_for(adapter_started.wait(), timeout=1)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(1.5)
         async with factory() as session:
             assert (
                 await list_channel_delivery_outbox_stale_sending(
@@ -927,6 +927,7 @@ async def test_restart_recovers_committed_non_idempotent_inflight_as_uncertain(
             assert row is not None
             assert row.status == "uncertain"
             assert row.last_error == "stale_non_idempotent_send"
+            assert row.attempt_count == 1
         assert adapter.calls == 0
     finally:
         await engine.dispose()

@@ -33,6 +33,58 @@ describe('ChatV2ApiClient', () => {
     });
   });
 
+  it('forwards abort signals for scoped timeline reads', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse({}))
+      .mockResolvedValueOnce(jsonResponse({}));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    const controller = new AbortController();
+
+    await client.snapshot('conv-1', { signal: controller.signal, timeoutMs: 1234 });
+    await client.sync('conv-1', 'cursor-1', { signal: controller.signal, timeoutMs: 1234 });
+    await client.timeline('conv-1', { before: 'older', signal: controller.signal, timeoutMs: 1234 });
+
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]?.signal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('requests an opaque paginated Work activity list without decoding the cursor', async () => {
+    const payload = { items: [], next_cursor: null, has_more: false };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    const controller = new AbortController();
+
+    await expect(client.workActivities({
+      limit: 20,
+      cursor: 'opaque+/=tenant-bound',
+      signal: controller.signal,
+    })).resolves.toEqual(payload);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/work/activities?limit=20&cursor=opaque%2B%2F%3Dtenant-bound'
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+  });
+
+  it('requests scoped Work recovery through the stable refresh endpoint', async () => {
+    const scope = sessionTimelineScope('session-1', 'conversation-1');
+    const payload = { status: 'accepted', scope, work_revision: 42 };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    const controller = new AbortController();
+
+    await expect(client.refreshWork(scope, { signal: controller.signal })).resolves.toEqual(payload);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe('/api/v1/work/refresh');
+    expect(init?.method).toBe('POST');
+    expect(init?.signal).toBeInstanceOf(AbortSignal);
+    expect(JSON.parse(String(init?.body))).toEqual({ scope });
+  });
+
   it('returns a warmed cache-only snapshot', async () => {
     const payload = { schema_version: 2, cursor: 'cursor-1' };
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
@@ -79,6 +131,10 @@ describe('ChatV2ApiClient', () => {
 
     fetchMock.mockRejectedValueOnce(new Error('offline'));
     await expect(client.clientPerformance('timeline_fresh_ms', 50)).resolves.toBeUndefined();
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(
+      client.clientPerformance('activity_overview_request_success_ms', 10),
+    ).resolves.toBeUndefined();
   });
 
   it('sends idempotent messages with PUT and JSON payload', async () => {

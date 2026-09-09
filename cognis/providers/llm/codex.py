@@ -16,7 +16,7 @@ CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 CODEX_USAGE_DASHBOARD_URL = "https://chatgpt.com/codex/settings/usage"
-CODEX_CLIENT_VERSION = "0.144.1"
+CODEX_CLIENT_VERSION = "0.153.4"
 CODEX_MODEL_CACHE_TTL_SECONDS = 300.0
 
 _CODEX_CATALOG: dict[str, dict[str, Any]] | None = None
@@ -36,6 +36,7 @@ _CODEX_NATIVE_PDF_MODELS = {
     # Keep the downstreamed Codex catalog JSON intact. The upstream catalog
     # currently advertises text/image modalities only, while the Responses
     # transport accepts PDFs for these models.
+    "gpt-6-astra",
     "gpt-5.5",
     "gpt-5.6-sol",
     "gpt-5.6-terra",

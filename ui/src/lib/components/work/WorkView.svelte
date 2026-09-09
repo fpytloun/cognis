@@ -23,9 +23,11 @@
   import { commandToToolCall, mutationToToolCall } from '$lib/work/workEventAdapter';
   import {
     appendOlderWorkPage,
+    applyExactWorkSummary,
     createAccumulatedWorkState,
     orderedWorkDeliverables,
     refreshNewestWorkPage,
+    retainExactWorkSummary,
     restartAccumulatedWorkTraversal,
     resolvedAccumulatedWorkProjection,
     type AccumulatedWorkState,
@@ -38,28 +40,38 @@
     setWorkResponseCache,
     type WorkViewTab,
   } from '$lib/work/workViewState';
+  import type { ActivityMaterialization } from '$lib/work/activityLifecycle';
+  import ActivityLifecycleStatus from './ActivityLifecycleStatus.svelte';
   import WorkFileTree from './WorkFileTree.svelte';
+  import type { WorkInitialFocus } from '$lib/work/workFocus';
 
   type WorkTab = WorkViewTab;
   const PAGE_LIMIT = 100;
   const MAX_EMPTY_PAGE_REQUESTS_PER_TRIGGER = 12;
+  const RECONCILIATION_BACKOFF_MS = [250, 500, 1_000, 2_000] as const;
+  const RECONCILIATION_TIMEOUT_MS = 15_000;
   const COMMAND_LABEL_MODE_KEY = 'cognis:work-command-label-mode';
-  type CachedWorkCategory = { state: AccumulatedWorkState; shell: WorkProjectionResponse };
+  type CachedWorkCategory = {
+    state: AccumulatedWorkState;
+    shell: WorkProjectionResponse;
+  };
 
   let {
     scope,
-    refreshIntervalMs = 15_000,
+    refreshIntervalMs = 120_000,
     live = true,
     onViewSession,
     initialTab = 'files',
     forceInitialTab = false,
     sessionId,
+    initialFocus,
     onClearSessionFilter,
+    onSummaryChange,
     loadWork = (
       nextScope: TimelineScope,
       signal: AbortSignal,
       before?: string,
-      options?: { category: WorkCategory; from: string | null; to: string | null; sessionId?: string },
+      options?: { category: WorkCategory; from: string | null; to: string | null; sessionId?: string; detail?: 'lightweight' | 'full' },
     ) => chatV2Api.work(nextScope, {
       signal,
       before,
@@ -68,7 +80,10 @@
       from: options?.from ?? undefined,
       to: options?.to ?? undefined,
       sessionId: options?.sessionId,
+      detail: options?.detail,
     }),
+    refreshWork = (nextScope: TimelineScope, signal: AbortSignal) =>
+      chatV2Api.refreshWork(nextScope, { signal }),
   } = $props<{
     scope: TimelineScope;
     refreshIntervalMs?: number;
@@ -77,13 +92,16 @@
     initialTab?: WorkViewTab;
     forceInitialTab?: boolean;
     sessionId?: string | undefined;
+    initialFocus?: WorkInitialFocus | null;
     onClearSessionFilter?: (() => void) | undefined;
+    onSummaryChange?: ((summary: WorkProjectionResponse['summary'] | null) => void) | undefined;
     loadWork?: (
       scope: TimelineScope,
       signal: AbortSignal,
       before?: string,
-      options?: { category: WorkCategory; from: string | null; to: string | null; sessionId?: string },
+      options?: { category: WorkCategory; from: string | null; to: string | null; sessionId?: string; detail?: 'lightweight' | 'full' },
     ) => Promise<WorkProjectionResponse>;
+    refreshWork?: (scope: TimelineScope, signal: AbortSignal) => Promise<unknown>;
   }>();
 
   let workState = $state<AccumulatedWorkState | null>(null);
@@ -108,34 +126,41 @@
   let filtersOpen = $state(false);
   let filterGraphFingerprint = '';
   let latestController: AbortController | null = null;
+  let exactSummaryController: AbortController | null = null;
+  let exactSummaryGeneration = 0;
+  const exactSummaries = new Map<string, WorkProjectionResponse>();
   let pageController: AbortController | null = null;
   let continuationTimer: number | null = null;
+  let recoveryController: AbortController | null = null;
+  let recoveryPromise = $state<Promise<boolean> | null>(null);
+  let reconciliationTimer: number | null = null;
+  let reconciliationStartedAt = 0;
+  let reconciliationAttempt = 0;
+  let recoveryConfirmationDeadline = 0;
+  const recoveredScopeRevisions = new Set<string>();
   let latestGeneration = 0;
+  let queryGeneration = 0;
   let pageGeneration = 0;
   let previousScope: TimelineScope | null = null;
   let previousSessionId: string | null = null;
   let restoredTab = false;
   let workRevision: number | null = null;
   let graphRevision: number | null = null;
+  let requiredWorkRevision = 0;
+  let followUpLatestRequired = false;
+  const followUpLatestWaiters: Array<() => void> = [];
   let timeRange = $state(ALL_TIME_RANGE);
   let timeRangeOpen = $state(false);
   let rangeFromInput = $state('');
   let rangeToInput = $state('');
   let rangeError = $state<string | null>(null);
   let commandLabelMode = $state<'command' | 'description'>('command');
+  let reportedSummaryFingerprint = '';
 
   const stableScopeKey = $derived(scope.key);
   const rawProjection = $derived(workState ? resolvedAccumulatedWorkProjection(workState) : null);
-  const materialization = $derived(rawProjection?.materialization);
-  const quietLiveTail = $derived(Boolean(
-    materialization
-    && materialization.failed_streams === 0
-    && materialization.total_streams - materialization.completed_streams <= 1
-    && materialization.target_events - materialization.covered_events <= 5
-  ));
-  const historyPartial = $derived(
-    Boolean(materialization && materialization.state !== 'caught_up' && !quietLiveTail)
-  );
+  const visibleSummary = $derived((rawProjection ?? shellProjection)?.summary ?? null);
+  const materialization = $derived<ActivityMaterialization | undefined>(rawProjection?.materialization);
   const activeCategory = $derived<WorkCategory>(
     activeTab === 'results' ? 'deliverables' : activeTab
   );
@@ -166,6 +191,14 @@
     if (statusFilter !== 'all' && !statusOptions.includes(statusFilter)) {
       statusFilter = 'all';
     }
+  });
+
+  $effect(() => {
+    const summary = visibleSummary;
+    const fingerprint = summary ? JSON.stringify(summary) : '';
+    if (fingerprint === reportedSummaryFingerprint) return;
+    reportedSummaryFingerprint = fingerprint;
+    onSummaryChange?.(summary);
   });
   const projection = $derived.by((): WorkProjectionResponse | null => {
     if (!rawProjection) return null;
@@ -219,6 +252,8 @@
     projection ? [...projection.mutations].reverse().flatMap((event) => {
       const previews = event.file_diffs.map((diff) => ({
         ...diff,
+        occurred_at: diff.occurred_at ?? event.created_at ?? event.updated_at ?? null,
+        source_item_id: event.id,
         source_workstream: event.source_workstream,
         truncated: diff.content_truncated === true || diff.truncated === true,
       }));
@@ -228,13 +263,17 @@
         .map((stat) => ({
           path: stat.path,
           path_id: stat.path_id,
+          path_generation_id: stat.path_generation_id,
           root_name: stat.root_name,
           root_id: stat.root_id,
           additions: stat.additions,
           deletions: stat.deletions,
           diff: '',
           preview_omitted: true,
+          preview_omission_reason: 'not_persisted' as const,
+          occurred_at: event.created_at ?? event.updated_at ?? null,
           source_workstream: event.source_workstream,
+          source_item_id: event.id,
         }));
       return [...previews, ...metadataOnly];
     }) : []
@@ -310,8 +349,73 @@
     return 'results';
   }
 
+  function summaryKey(
+    scopeKey: string,
+    category: WorkCategory,
+    from: string | null,
+    to: string | null,
+    filteredSessionId: string | null,
+  ): string {
+    return JSON.stringify([scopeKey, category, from, to, filteredSessionId]);
+  }
+
+  async function loadExactSummary(
+    key: string,
+    revision: number | null,
+    requestTab: WorkTab,
+    requestCategory: WorkCategory,
+    requestFrom: string | null,
+    requestTo: string | null,
+    requestSessionId: string | null,
+  ): Promise<void> {
+    exactSummaryController?.abort();
+    exactSummaryController = new AbortController();
+    const signal = exactSummaryController.signal;
+    const generation = ++exactSummaryGeneration;
+    try {
+      const exact = await loadWork(scope, signal, undefined, {
+        category: requestCategory,
+        from: requestFrom,
+        to: requestTo,
+        sessionId: requestSessionId ?? undefined,
+        detail: 'full',
+      });
+      if (
+        signal.aborted
+        || generation !== exactSummaryGeneration
+        || summaryKey(scope.key, activeCategory, timeRange.from, timeRange.to, sessionId ?? null) !== key
+        || revision === null
+        || exact.work_revision !== revision
+      ) return;
+      exactSummaries.set(key, exact);
+      const state = categoryStates.get(requestTab);
+      if (!state) return;
+      const projection = applyExactWorkSummary(state.projection, exact);
+      const updated = { ...state, projection };
+      categoryStates.set(requestTab, updated);
+      if (activeTab === requestTab) workState = updated;
+      if (shellProjection) shellProjection = applyExactWorkSummary(shellProjection, exact);
+      setWorkResponseCache<CachedWorkCategory>(scope, requestTab, {
+        state: updated,
+        shell: shellProjection ?? projection,
+      }, requestSessionId, {
+        from: requestFrom,
+        to: requestTo,
+        admittedRevision: revision,
+      });
+    } catch {
+      // Keep the latest evidence and the prior exact summary.
+    }
+  }
+
   async function loadLatest(background = false): Promise<void> {
-    if (background && (loading || refreshing)) return;
+    if (background && (loading || refreshing)) {
+      followUpLatestRequired = true;
+      await new Promise<void>((resolve) => {
+        followUpLatestWaiters.push(resolve);
+      });
+      return;
+    }
     cancelHydration();
     latestController?.abort();
     latestController = new AbortController();
@@ -320,17 +424,59 @@
     const requestTab = activeTab;
     const requestCategory = activeCategory;
     const requestSessionId = sessionId ?? null;
+    const requestScopeKey = scope.key;
+    const requestFrom = timeRange.from;
+    const requestTo = timeRange.to;
     const requestState = categoryStates.get(requestTab) ?? workState;
+    const requestQueryGeneration = queryGeneration;
     if (background) refreshing = true;
     else loading = true;
     try {
-      const next = await loadWork(scope, signal, undefined, {
+      const loaded = await loadWork(scope, signal, undefined, {
         category: requestCategory,
-        from: timeRange.from,
-        to: timeRange.to,
+        from: requestFrom,
+        to: requestTo,
         sessionId: requestSessionId ?? undefined,
+        detail: 'lightweight',
       });
-      if (generation !== latestGeneration || signal.aborted) return;
+      const requestSummaryKey = summaryKey(
+        requestScopeKey,
+        requestCategory,
+        requestFrom,
+        requestTo,
+        requestSessionId,
+      );
+      const next = retainExactWorkSummary(
+        loaded,
+        exactSummaries.get(requestSummaryKey) ?? requestState?.projection,
+      );
+      const requestStillCurrent = (
+        scope.key === requestScopeKey
+        && activeTab === requestTab
+        && activeCategory === requestCategory
+        && (sessionId ?? null) === requestSessionId
+        && timeRange.from === requestFrom
+        && timeRange.to === requestTo
+        && queryGeneration === requestQueryGeneration
+      );
+      if (!requestStillCurrent) return;
+      const nextWorkRevision = next.work_revision ?? null;
+      const nextGraphRevision = next.graph_revision ?? null;
+      if (requiredWorkRevision > 0 && (nextWorkRevision === null || nextWorkRevision < requiredWorkRevision)) {
+        return;
+      }
+      if (
+        (workRevision !== null && nextWorkRevision !== null && nextWorkRevision < workRevision)
+        || (
+          workRevision !== null
+          && nextWorkRevision === workRevision
+          && graphRevision !== null
+          && nextGraphRevision !== null
+          && nextGraphRevision < graphRevision
+        )
+      ) {
+        return;
+      }
       if (!requestState) {
         let compatibilityTab: WorkTab | null = null;
         if (
@@ -371,15 +517,50 @@
         ? categoryStates.get(requestTab) ?? null
         : null);
       workRevision = next.work_revision ?? workRevision;
+      requiredWorkRevision = Math.max(requiredWorkRevision, next.work_revision ?? 0);
       graphRevision = next.graph_revision ?? graphRevision;
       shellProjection = next;
+      const activeState = categoryStates.get(requestTab)!;
       setWorkResponseCache<CachedWorkCategory>(scope, requestTab, {
-        state: categoryStates.get(requestTab)!,
+        state: activeState,
         shell: next,
-      }, requestSessionId);
+      }, requestSessionId, {
+        from: timeRange.from,
+        to: timeRange.to,
+        admittedRevision: next.work_revision ?? null,
+      });
       initialized = true;
+      if (loaded.detail === 'lightweight') {
+        void loadExactSummary(
+          requestSummaryKey,
+          next.work_revision ?? null,
+          requestTab,
+          requestCategory,
+          requestFrom,
+          requestTo,
+          requestSessionId,
+        );
+      }
       cancelHydration();
       latestError = null;
+      if (next.materialization?.state === 'live') {
+        recoveredScopeRevisions.delete(scope.key);
+        if (Date.now() < recoveryConfirmationDeadline) scheduleReconciliation();
+        else stopReconciliation();
+      } else if (next.materialization?.state) {
+        const recoveryScopeKey = scope.key;
+        if (recoveredScopeRevisions.has(recoveryKey())) {
+          scheduleReconciliation();
+        } else void requestRecoveryOnce().then((accepted) => {
+          if (!accepted || scope.key !== recoveryScopeKey) return;
+          if (followUpLatestRequired) {
+            followUpLatestRequired = false;
+            void loadLatest(true);
+          } else if (shellProjection?.materialization?.state !== 'live') {
+            scheduleReconciliation();
+          }
+        });
+      }
     } catch (nextError) {
       if (generation !== latestGeneration || signal.aborted) return;
       const apiError = workApiError(nextError);
@@ -396,8 +577,80 @@
       if (generation === latestGeneration) {
         loading = false;
         refreshing = false;
+        if (followUpLatestRequired) {
+          followUpLatestRequired = false;
+          void loadLatest(true);
+        } else {
+          for (const resolve of followUpLatestWaiters.splice(0)) resolve();
+        }
       }
     }
+  }
+
+  function recoveryKey(): string {
+    return scope.key;
+  }
+
+  async function requestRecoveryOnce(force = false): Promise<boolean> {
+    const key = recoveryKey();
+    if (!force && recoveredScopeRevisions.has(key)) return false;
+    if (recoveryPromise) return recoveryPromise;
+    recoveredScopeRevisions.add(key);
+    recoveryController?.abort();
+    recoveryController = new AbortController();
+    const signal = recoveryController.signal;
+    const pending = refreshWork(scope, signal)
+      .then(() => {
+        recoveryConfirmationDeadline = Math.max(
+          recoveryConfirmationDeadline,
+          Date.now() + RECONCILIATION_TIMEOUT_MS,
+        );
+        return true;
+      })
+      .catch((error: unknown) => {
+        recoveredScopeRevisions.delete(key);
+        if (!signal.aborted) latestError = workApiError(error).message;
+        return false;
+      })
+      .finally(() => {
+        if (recoveryController?.signal === signal) recoveryController = null;
+        if (recoveryPromise === pending) recoveryPromise = null;
+      });
+    recoveryPromise = pending;
+    return pending;
+  }
+
+  function stopReconciliation(): void {
+    if (reconciliationTimer !== null) window.clearTimeout(reconciliationTimer);
+    reconciliationTimer = null;
+    reconciliationStartedAt = 0;
+    reconciliationAttempt = 0;
+  }
+
+  function scheduleReconciliation(): void {
+    if (typeof window === 'undefined' || reconciliationTimer !== null) return;
+    if (reconciliationStartedAt === 0) reconciliationStartedAt = Date.now();
+    if (Date.now() - reconciliationStartedAt >= RECONCILIATION_TIMEOUT_MS) {
+      recoveryConfirmationDeadline = 0;
+      stopReconciliation();
+      return;
+    }
+    const delay = RECONCILIATION_BACKOFF_MS[
+      Math.min(reconciliationAttempt, RECONCILIATION_BACKOFF_MS.length - 1)
+    ];
+    reconciliationAttempt += 1;
+    reconciliationTimer = window.setTimeout(() => {
+      reconciliationTimer = null;
+      if (document.visibilityState === 'visible') void loadLatest(true);
+      else scheduleReconciliation();
+    }, delay);
+  }
+
+  async function refreshExplicitly(): Promise<void> {
+    const refreshScopeKey = scope.key;
+    const accepted = await requestRecoveryOnce(true);
+    if (!accepted || scope.key !== refreshScopeKey) return;
+    await loadLatest(true);
   }
 
   function evidenceCount(value: WorkProjectionResponse): number {
@@ -493,6 +746,7 @@
               from: requestRange.from,
               to: requestRange.to,
               sessionId: requestSessionId ?? undefined,
+              detail: 'lightweight',
             });
             if (generation !== pageGeneration || signal.aborted) return;
             const graphChanged = Boolean(
@@ -500,7 +754,9 @@
               && newest.graph_fingerprint
               && requestState.projection.graph_fingerprint !== newest.graph_fingerprint,
             );
-            requestState = refreshNewestWorkPage(requestState, newest);
+            requestState = refreshNewestWorkPage(requestState, newest, {
+              replaceCumulativeFiles: requestCategory === 'files',
+            });
             if (graphChanged) {
               restartedInvalidCursor = true;
               requests = 0;
@@ -517,10 +773,15 @@
         if (generation !== pageGeneration || signal.aborted) return;
         requestState = appendOlderWorkPage(requestState, page);
         categoryStates.set(requestTab, requestState);
+        const completeShell = shellProjection ?? page;
         setWorkResponseCache<CachedWorkCategory>(scope, requestTab, {
           state: requestState,
-          shell: shellProjection ?? page,
-        }, requestSessionId);
+          shell: completeShell,
+        }, requestSessionId, {
+          from: requestRange.from,
+          to: requestRange.to,
+          admittedRevision: page.work_revision ?? workRevision,
+        });
         if (activeTab === requestTab) workState = requestState;
         requests += 1;
         if (evidenceCount(requestState.projection) > initialEvidenceCount) break;
@@ -540,7 +801,12 @@
     } finally {
       if (generation === pageGeneration) {
         loadingOlder = false;
-        if (sentinelVisible && activeTab === requestTab && !requestState.exhausted && !olderError) {
+        if (
+          sentinelVisible
+          && activeTab === requestTab
+          && !requestState.exhausted
+          && !olderError
+        ) {
           const continuationGeneration = generation;
           const continuationCursor = requestState.beforeCursor;
           continuationTimer = window.setTimeout(() => {
@@ -602,6 +868,7 @@
     cancelHydration();
     latestController?.abort();
     latestGeneration += 1;
+    queryGeneration += 1;
     loading = false;
     refreshing = false;
     pageController?.abort();
@@ -611,11 +878,19 @@
     loadingOlder = false;
     olderError = null;
     activeTab = next;
+    const cachedEntry = getWorkResponseCache<CachedWorkCategory>(scope, next, sessionId, {
+      from: timeRange.from,
+      to: timeRange.to,
+      admittedRevision: workRevision,
+    });
     const cached = categoryStates.get(next)
-      ?? getWorkResponseCache<CachedWorkCategory>(scope, next, sessionId)?.state
+      ?? cachedEntry?.state
       ?? null;
     if (cached) categoryStates.set(next, cached);
     workState = cached;
+    if (cachedEntry?.shell ?? cached?.projection) {
+      shellProjection = cachedEntry?.shell ?? cached!.projection;
+    }
     if (!workState || staleCategories.has(next)) void loadLatest();
   }
 
@@ -623,6 +898,7 @@
     cancelHydration();
     latestController?.abort();
     latestGeneration += 1;
+    queryGeneration += 1;
     loading = false;
     refreshing = false;
     pageController?.abort();
@@ -670,9 +946,14 @@
   function stopScopeActivity(): void {
     cancelHydration();
     latestController?.abort();
+    exactSummaryController?.abort();
+    exactSummaryGeneration += 1;
     pageController?.abort();
     cancelContinuation();
     latestGeneration += 1;
+    queryGeneration += 1;
+    followUpLatestRequired = false;
+    for (const resolve of followUpLatestWaiters.splice(0)) resolve();
     pageGeneration += 1;
   }
 
@@ -685,6 +966,15 @@
       saveWorkViewState(previousScope, { activeTab, workstreamFilter, agentFilter, statusFilter, workstreamSearch, timeRange }, previousSessionId);
     }
     stopScopeActivity();
+    recoveryController?.abort();
+    recoveryController = null;
+    recoveryPromise = null;
+    stopReconciliation();
+    recoveryConfirmationDeadline = 0;
+    recoveredScopeRevisions.clear();
+    workRevision = null;
+    graphRevision = null;
+    requiredWorkRevision = 0;
     const restored = restoreWorkViewState(nextScope, nextSessionId);
     previousScope = nextScope;
     previousSessionId = nextSessionId;
@@ -700,7 +990,11 @@
     statusFilter = restored?.statusFilter ?? 'all';
     workstreamSearch = restored?.workstreamSearch ?? '';
     timeRange = restored?.timeRange ?? ALL_TIME_RANGE;
-    const cached = getWorkResponseCache<CachedWorkCategory>(nextScope, activeTab, nextSessionId);
+    const cached = getWorkResponseCache<CachedWorkCategory>(nextScope, activeTab, nextSessionId, {
+      from: timeRange.from,
+      to: timeRange.to,
+      admittedRevision: workRevision,
+    });
     if (cached) {
       categoryStates.set(activeTab, cached.state);
       workState = cached.state;
@@ -715,7 +1009,15 @@
     hydrating = false;
     hydrationAttempt = 0;
     untrack(() => {
-      if (!cached) void loadLatest();
+      void (async () => {
+        if (!cached) await loadLatest();
+        if (scope.key !== nextScope.key) return;
+        void requestRecoveryOnce().then((accepted) => {
+          if (!accepted || scope.key !== nextScope.key || !followUpLatestRequired) return;
+          followUpLatestRequired = false;
+          void loadLatest(true);
+        });
+      })();
     });
   });
 
@@ -741,6 +1043,9 @@
         reconnect?: boolean;
       }>).detail;
       if (detail?.scopeKey && detail.scopeKey !== scopeKey) return;
+      if (Number.isSafeInteger(detail?.workRevision)) {
+        requiredWorkRevision = Math.max(requiredWorkRevision, detail!.workRevision!);
+      }
       if (
         !detail?.reconnect
         && detail?.workRevision
@@ -750,29 +1055,64 @@
       for (const tab of categoryStates.keys()) {
         if (tab !== activeTab) staleCategories.add(tab);
       }
-      void loadLatest(true);
+      if (loading || refreshing) followUpLatestRequired = true;
+      else if (recoveryPromise) followUpLatestRequired = true;
+      else void loadLatest(true);
     };
     window.addEventListener('cognis:work-invalidated', invalidate);
-    const interval = live && refreshIntervalMs > 0
-      ? window.setInterval(() => {
-          if (document.visibilityState === 'visible') void loadLatest(true);
-        }, refreshIntervalMs)
-      : null;
+    let fallbackTimer: number | null = null;
+    let fallbackDueAt = Date.now() + refreshIntervalMs;
+    const scheduleFallback = (): void => {
+      if (!live || refreshIntervalMs <= 0 || document.visibilityState !== 'visible') return;
+      const jitter = refreshIntervalMs * 0.1 * (Math.random() * 2 - 1);
+      const delay = Math.max(1, Math.round(refreshIntervalMs + jitter));
+      fallbackDueAt = Date.now() + delay;
+      fallbackTimer = window.setTimeout(() => {
+        fallbackTimer = null;
+        if (document.visibilityState === 'visible') {
+          if (recoveryPromise) followUpLatestRequired = true;
+          else void loadLatest(true);
+        }
+        scheduleFallback();
+      }, delay);
+    };
+    const visibilityChanged = (): void => {
+      if (document.visibilityState !== 'visible') {
+        if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+        return;
+      }
+      if (live && refreshIntervalMs > 0 && Date.now() >= fallbackDueAt) {
+        if (recoveryPromise) followUpLatestRequired = true;
+        else void loadLatest(true);
+      }
+      if (fallbackTimer === null) scheduleFallback();
+    };
+    document.addEventListener('visibilitychange', visibilityChanged);
+    scheduleFallback();
     return () => {
-      if (interval !== null) window.clearInterval(interval);
+      if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+      document.removeEventListener('visibilitychange', visibilityChanged);
       window.removeEventListener('cognis:work-invalidated', invalidate);
     };
   });
 
   onDestroy(() => {
     stopScopeActivity();
+    recoveryController?.abort();
+    stopReconciliation();
+    recoveryConfirmationDeadline = 0;
     if (previousScope) {
       saveWorkViewState(previousScope, { activeTab, workstreamFilter, agentFilter, statusFilter, workstreamSearch, timeRange }, previousSessionId);
     }
   });
 </script>
 
-<section class="work-view min-w-0 max-w-full space-y-4 overflow-x-hidden" aria-label="Conversation work" data-testid="work-view">
+<section
+  class="work-view min-w-0 max-w-full space-y-4 overflow-x-hidden"
+  aria-label="Conversation work"
+  data-testid="work-view"
+>
   <header class="flex flex-wrap items-center justify-between gap-3">
     <div class="min-w-0">
       <h2 class="text-sm font-semibold text-white">Work</h2>
@@ -817,7 +1157,7 @@
           <button type="button" class="mt-3 w-full rounded bg-sky-500 px-2 py-1.5 text-xs font-medium text-slate-950" onclick={applyAbsoluteTimeRange}>Apply range</button>
         </div>
       {/if}
-      <button type="button" class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800" disabled={refreshing || hydrating} onclick={() => void loadLatest(true)} aria-label="Refresh work" title="Refresh work">
+       <button type="button" class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800" disabled={refreshing || hydrating || recoveryPromise !== null} onclick={() => void refreshExplicitly()} aria-label="Refresh work" title="Refresh work">
         <RefreshCw class={`h-3.5 w-3.5 ${refreshing || hydrating ? 'animate-spin' : ''}`} />
       </button>
     </div>
@@ -861,23 +1201,13 @@
     <div class="rounded-xl border border-rose-500/30 bg-rose-500/10 p-4 text-sm text-rose-100"><p>{latestError}</p><button class="mt-2 underline" type="button" onclick={() => void loadLatest()}>Retry loading newest evidence</button></div>
   {:else if initialized && shellProjection}
     {#if latestError && workState}<div class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100"><p>{latestError}</p><button type="button" class="mt-1 underline" onclick={() => void loadLatest(true)}>Retry refreshing newest evidence</button></div>{/if}
-    {#if materialization?.state === 'materializing' && !quietLiveTail}
-      <div class="rounded-lg border border-sky-500/20 bg-sky-500/10 px-3 py-2 text-xs text-sky-100" data-testid="work-materializing" role="status">
-        <p>Building Work history — {materialization.completed_streams} of {materialization.total_streams} streams</p>
-        <p class="mt-1">Results below are partial.</p>
-      </div>
-    {:else if (materialization?.state === 'repair' || materialization?.state === 'failed') && !quietLiveTail}
-      <div class="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-100" data-testid="work-repair" role="status">
-        <p>Work history is incomplete — {materialization.completed_streams} of {materialization.total_streams} streams are ready.</p>
-        <p class="mt-1">{materialization.failed_streams} streams failed. Cognis will retry the background repair.</p>
-      </div>
-    {/if}
+    <ActivityLifecycleStatus {materialization} onRetry={() => void loadLatest(true)} />
 
-    {#if rawProjection?.graph_truncated}<p class="text-xs text-amber-200" data-testid="work-graph-truncated">The authorized work graph reached its safety limit.</p>{/if}
+      {#if rawProjection?.graph_truncated}<p class="text-xs text-amber-200" data-testid="work-graph-truncated">The authorized work graph reached its safety limit.</p>{/if}
 
-    <AccessibleTabs {tabs} activeId={activeTab} idPrefix="work" ariaLabel="Work content" onChange={setActiveTab} sticky={true} testIdPrefix="work-tab" />
+      <AccessibleTabs {tabs} activeId={activeTab} idPrefix="work" ariaLabel="Work content" onChange={setActiveTab} sticky={true} testIdPrefix="work-tab" />
 
-    <div id={`work-panel-${activeTab}`} aria-labelledby={`work-tab-${activeTab}`} role="tabpanel" class="min-w-0" data-testid={`work-panel-${activeTab}`}>
+      <div id={`work-panel-${activeTab}`} aria-labelledby={`work-tab-${activeTab}`} role="tabpanel" class="min-w-0" data-testid={`work-panel-${activeTab}`}>
       {#if !projection && (loading || hydrating)}
         <div class="rounded-xl border border-slate-700 p-8 text-center text-sm text-slate-400" data-testid="work-panel-loading" role="status">
           <RefreshCw class="mx-auto mb-2 h-4 w-4 animate-spin" />Loading {tabs.find((tab) => tab.id === activeTab)?.label.toLowerCase()}…
@@ -888,7 +1218,13 @@
         </div>
       {:else if projection && activeTab === 'files'}
         {#if fileDiffs.length > 0}
-          <WorkFileTree diffs={fileDiffs} cacheKey={`${scope.key}:${timeRange.from ?? ''}:${timeRange.to ?? ''}`} />
+          <WorkFileTree
+            {scope}
+            diffs={fileDiffs}
+            cacheKey={`${scope.key}:${timeRange.from ?? ''}:${timeRange.to ?? ''}`}
+            refreshMissingIdentity={() => loadLatest(true)}
+            {initialFocus}
+          />
           {#if projection.summary.omitted_files}
             <p class="mt-2 text-xs text-amber-200">{projection.summary.omitted_files} changed files do not have diff previews. Exact page totals and available bounded file metadata remain visible.</p>
           {/if}
@@ -897,6 +1233,7 @@
           {/if}
         {:else}<p class="rounded-xl border border-dashed border-slate-700 p-8 text-center text-sm text-slate-500">No changed files.</p>{/if}
       {:else if projection && activeTab === 'commands'}
+        {#if projection.commands.length > 0}
         <div class="mb-2 flex justify-end" data-testid="work-command-label-mode">
           <div class="inline-flex rounded-lg border border-slate-700 p-0.5" role="group" aria-label="Command label">
             {#each ['command', 'description'] as mode}
@@ -904,6 +1241,7 @@
             {/each}
           </div>
         </div>
+        {/if}
         <ol class="work-evidence-list space-y-1">
           {#each projection.commands as command (command.id)}
             <li data-testid={`work-command-${command.call_id}`}>
@@ -971,8 +1309,6 @@
           Loading older evidence…
         {:else if olderError && workState.beforeCursor}
           <span>{olderError} </span><button type="button" class="text-sky-200 underline" onclick={() => void loadOlder()}>Retry loading older evidence</button>
-        {:else if historyPartial}
-          Results below are partial.
         {:else if workState.exhausted}
           All Work history loaded.
         {:else}
@@ -983,7 +1319,7 @@
         <span class="sr-only">Older evidence is available.</span>
       {/if}
     {/if}
-    {#if projection && !historyPartial && !deliverables.length && fileDiffs.length === 0 && projection.commands.length === 0 && genericMutations.length === 0 && projection.artifacts.length === 0}<p class="text-center text-xs text-slate-500">No persisted work yet.</p>{/if}
+    {#if projection && (!materialization || materialization.state === 'live') && !deliverables.length && fileDiffs.length === 0 && projection.commands.length === 0 && genericMutations.length === 0 && projection.artifacts.length === 0}<p class="text-center text-xs text-slate-500" data-testid="work-empty">No activity yet.</p>{/if}
   {/if}
 </section>
 

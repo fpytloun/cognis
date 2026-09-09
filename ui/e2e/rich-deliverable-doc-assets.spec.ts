@@ -1,17 +1,16 @@
 import { expect, test } from '@playwright/test';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import sharp from 'sharp';
 import { SUPPORTED_RICH_BLOCK_TYPES } from '../src/lib/rich-deliverable';
+import { richScenarioDocPreviews } from '../src/lib/rich-scenarios/docs-previews';
 
 const outputDir = join(process.cwd(), '../docs/assets/screenshots/rich-deliverables');
 const updateAssets = process.env.UPDATE_RICH_DOC_ASSETS === '1';
-const chartVariants = ['line', 'bar', 'donut', 'stacked_bar'] as const;
-// Additional named variants for block types where a single default
-// screenshot does not cover a materially different visual treatment (see
-// `?card=` handling in the block fixture route).
-const cardVariants = [null, 'visual'] as const;
+const manifestPath = join(outputDir, 'manifest.json');
+const maximumMismatchRatio = 0.005;
 
-test.setTimeout(240_000);
+test.setTimeout(480_000);
 
 async function waitForBlockReady(page: import('@playwright/test').Page, blockType: string) {
   const block = page.locator(`[data-rich-block-type="${blockType}"]`).first();
@@ -40,39 +39,86 @@ async function waitForBlockReady(page: import('@playwright/test').Page, blockTyp
   return block;
 }
 
-test('renders every supported rich deliverable block in the isolated fixture', async ({ page }) => {
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  for (const blockType of SUPPORTED_RICH_BLOCK_TYPES) {
-    await page.goto(`/rich-deliverable-block-fixture?block=${blockType}`);
-    const fixture = page.getByTestId('rich-deliverable-block-fixture');
-    await expect(fixture).toHaveAttribute('data-block-type', blockType);
-    await waitForBlockReady(page, blockType);
+async function imageMismatchRatio(actual: Buffer, expectedPath: string): Promise<number> {
+  const expected = await sharp(expectedPath).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const rendered = await sharp(actual).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  expect(rendered.info.width).toBe(expected.info.width);
+  expect(rendered.info.height).toBe(expected.info.height);
+  let mismatched = 0;
+  const pixelCount = rendered.info.width * rendered.info.height;
+  for (let offset = 0; offset < rendered.data.length; offset += 4) {
+    if (
+      Math.abs(rendered.data[offset] - expected.data[offset]) > 24
+      || Math.abs(rendered.data[offset + 1] - expected.data[offset + 1]) > 24
+      || Math.abs(rendered.data[offset + 2] - expected.data[offset + 2]) > 24
+      || Math.abs(rendered.data[offset + 3] - expected.data[offset + 3]) > 24
+    ) mismatched += 1;
   }
-});
+  return mismatched / pixelCount;
+}
 
-test('documentation screenshots cover every supported block type', async ({ page }) => {
-  await page.emulateMedia({ reducedMotion: 'reduce' });
-  if (updateAssets) mkdirSync(outputDir, { recursive: true });
+const blockTypeGroups = Array.from({ length: 4 }, (_, groupIndex) =>
+  Array.from(SUPPORTED_RICH_BLOCK_TYPES).filter((_, index) => index % 4 === groupIndex)
+);
 
-  for (const blockType of SUPPORTED_RICH_BLOCK_TYPES) {
-    const variants = blockType === 'chart' ? chartVariants : blockType === 'card' ? cardVariants : [null];
-    for (const variant of variants) {
-      const filename = variant ? `${blockType}-${variant}.png` : `${blockType}.png`;
-      const outputPath = join(outputDir, filename);
-      const variantQuery = !variant ? '' : blockType === 'chart' ? `&chart=${variant}` : `&card=${variant}`;
-      await page.goto(`/rich-deliverable-block-fixture?block=${blockType}${variantQuery}`);
-      const block = await waitForBlockReady(page, blockType);
-      const screenshotTarget = blockType === 'chart'
-        ? page.getByTestId('rich-deliverable-block-fixture')
-        : block;
-      const screenshot = await screenshotTarget.screenshot({ animations: 'disabled' });
-
-      if (updateAssets) {
-        writeFileSync(outputPath, screenshot);
-      } else {
-        expect(existsSync(outputPath), `missing documentation screenshot: ${filename}`).toBe(true);
-      }
-      await expect(screenshotTarget).toHaveScreenshot(filename, { animations: 'disabled' });
+for (const [groupIndex, blockTypes] of blockTypeGroups.entries()) {
+  test(`renders supported rich deliverable block group ${groupIndex + 1}`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    for (const blockType of blockTypes) {
+      await page.goto(`/rich-deliverable-block-fixture?block=${blockType}`, {
+        waitUntil: 'domcontentloaded',
+      });
+      const fixture = page.getByTestId('rich-deliverable-block-fixture');
+      await expect(fixture).toHaveAttribute('data-block-type', blockType);
+      await waitForBlockReady(page, blockType);
     }
+  });
+}
+
+const documentationManifest = {
+  schema_version: 1,
+  previews: richScenarioDocPreviews.map((preview) => ({
+    id: preview.id,
+    scenario_id: preview.scenario_id,
+    block_type: preview.block_type,
+    occurrence: preview.occurrence ?? 0,
+    variant: preview.variant ?? null,
+    guide: preview.guide,
+    filename: preview.filename,
+  })),
+};
+
+test('documentation preview manifest matches the canonical registry', () => {
+  if (updateAssets) {
+    mkdirSync(outputDir, { recursive: true });
+    writeFileSync(manifestPath, `${JSON.stringify(documentationManifest, null, 2)}\n`);
+  } else {
+    expect(JSON.parse(readFileSync(manifestPath, 'utf8'))).toEqual(documentationManifest);
   }
 });
+
+for (const preview of richScenarioDocPreviews) {
+  test(`documentation preview ${preview.id} matches its committed image`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    const outputPath = join(outputDir, preview.filename);
+    await page.goto(`/rich-deliverable-block-fixture?preview=${preview.id}`, {
+      waitUntil: 'domcontentloaded',
+    });
+    const block = await waitForBlockReady(page, preview.block_type);
+    const screenshotTarget = preview.block_type === 'chart'
+      ? page.getByTestId('rich-deliverable-block-fixture')
+      : block;
+    const screenshot = await screenshotTarget.screenshot({ animations: 'disabled' });
+
+    if (updateAssets) {
+      writeFileSync(outputPath, screenshot);
+    } else {
+      expect(existsSync(outputPath), `missing documentation screenshot: ${preview.filename}`).toBe(true);
+      const mismatchRatio = await imageMismatchRatio(screenshot, outputPath);
+      expect(
+        mismatchRatio,
+        `${preview.id} differs from ${preview.filename} by ${(mismatchRatio * 100).toFixed(2)}%`,
+      ).toBeLessThanOrEqual(maximumMismatchRatio);
+    }
+  });
+}

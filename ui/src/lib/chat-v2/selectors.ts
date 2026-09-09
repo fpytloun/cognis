@@ -3,6 +3,7 @@ import type {
   AuthChallengeTimelineItem,
   MessageTimelineItem,
   QuestionSetTimelineItem,
+  RuntimeOverlaySnapshot,
   TodoStateTimelineItem,
   TimelineItem,
   ToolCallTimelineItem,
@@ -39,6 +40,32 @@ export function isRenderableTimelineItem(item: TimelineItem): boolean {
 
 export function selectRenderableTimeline(items: TimelineItem[]): TimelineItem[] {
   return items.filter(isRenderableTimelineItem);
+}
+
+export function isPinnedTransientNotice(item: TimelineItem): boolean {
+  if (item.stable !== false) return false;
+  if (item.kind === 'error') return true;
+  return item.kind === 'message'
+    && item.role === 'system'
+    && (
+      item.notice_kind === 'model_error'
+      || (item.notice_kind === 'model_recovery' && item.notice_scope === 'retry')
+    );
+}
+
+export function selectPinnedTransientNotice(items: TimelineItem[]): TimelineItem | null {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item && isPinnedTransientNotice(item)) return item;
+  }
+  return null;
+}
+
+export function selectActivePinnedTransientNotice(
+  runtime: RuntimeOverlaySnapshot | null | undefined
+): TimelineItem | null {
+  if (!runtime?.has_active_turn) return null;
+  return selectPinnedTransientNotice(runtime.volatile_items);
 }
 
 function normalizedToolName(tool: ToolCallTimelineItem): string {

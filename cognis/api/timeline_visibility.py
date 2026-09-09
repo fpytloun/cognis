@@ -29,7 +29,9 @@ def is_transient_compaction_start_notice(data: dict[str, Any]) -> bool:
         return True
 
     return (
-        text.startswith("the model provider rejected the request because the context window is full")
+        text.startswith(
+            "the model provider rejected the request because the context window is full"
+        )
         and "compacting the saved conversation" in text
         and data.get("status") in {"started", "running"}
     )

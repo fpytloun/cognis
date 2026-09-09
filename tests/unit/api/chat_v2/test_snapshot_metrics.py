@@ -1,3 +1,4 @@
+import pytest
 from prometheus_client import generate_latest
 
 from cognis.api.chat_v2.snapshot_metrics import SNAPSHOT_CACHE_METRICS
@@ -6,6 +7,7 @@ from cognis.api.chat_v2.snapshot_metrics import SNAPSHOT_CACHE_METRICS
 def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> None:
     SNAPSHOT_CACHE_METRICS.request("l1", "success", 0.01)
     SNAPSHOT_CACHE_METRICS.warm_failure("internal")
+    SNAPSHOT_CACHE_METRICS.warm_event("debounced")
     SNAPSHOT_CACHE_METRICS.l1_resident(2, 128)
     SNAPSHOT_CACHE_METRICS.inflight_builds(1)
     SNAPSHOT_CACHE_METRICS.owned_locks(1)
@@ -14,6 +16,7 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
     SNAPSHOT_CACHE_METRICS.resolver_active(2)
     SNAPSHOT_CACHE_METRICS.redis_value(1024)
     SNAPSHOT_CACHE_METRICS.client_performance("cached_restore_ms", 25)
+    SNAPSHOT_CACHE_METRICS.client_performance("activity_overview_request_success_ms", 10)
 
     exposition = generate_latest().decode()
 
@@ -26,6 +29,7 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
         in exposition
     )
     assert 'cognis_chat_snapshot_warm_failures_total{reason="internal"}' in exposition
+    assert 'cognis_chat_snapshot_warm_total{outcome="debounced"}' in exposition
     assert "cognis_chat_snapshot_cache_l1_entries 2.0" in exposition
     assert "cognis_chat_snapshot_cache_l1_bytes 128.0" in exposition
     assert "cognis_chat_snapshot_cache_inflight_builds 1.0" in exposition
@@ -39,6 +43,10 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
         'cognis_chat_v2_client_performance_milliseconds_count{metric="cached_restore_ms"}'
         in exposition
     )
+    assert (
+        "cognis_chat_v2_client_performance_milliseconds_count"
+        '{metric="activity_overview_request_success_ms"}' in exposition
+    )
 
     SNAPSHOT_CACHE_METRICS.l1_resident(0, 0)
     SNAPSHOT_CACHE_METRICS.inflight_builds(0)
@@ -46,3 +54,8 @@ def test_snapshot_metrics_are_exposed_with_fixed_labels_and_process_gauges() -> 
     SNAPSHOT_CACHE_METRICS.warmer(0, 0)
     SNAPSHOT_CACHE_METRICS.append_mapping(0)
     SNAPSHOT_CACHE_METRICS.resolver_active(0)
+
+
+def test_snapshot_warm_metric_rejects_unbounded_outcomes() -> None:
+    with pytest.raises(ValueError, match="invalid snapshot warm outcome"):
+        SNAPSHOT_CACHE_METRICS.warm_event("conversation-1")  # type: ignore[arg-type]

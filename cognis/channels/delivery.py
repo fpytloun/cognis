@@ -11,6 +11,7 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import json
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from cognis.channels.rich_markdown import (
     rich_media_manifest,
 )
 from cognis.channels.route_admission import active_managed_binding_id, lock_channel_route
+from cognis.channels.signal_failures import SignalDeliveryFailure
 from cognis.core.artifact_inputs import (
     authorize_outbound_artifact_refs_in_session,
     outbound_artifact_grant_is_valid,
@@ -93,6 +95,7 @@ class ChannelDeliveryStatus(StrEnum):
 _TASK_FINAL_SOURCE_TYPE = "task_final_result"
 _TASK_RESULT_FOLLOW_UP_SOURCE_TYPE = "task_result_follow_up"
 _FOLLOW_UP_RESULT_SOURCE_TYPE = "follow_up_result"
+_NOTIFICATION_SOURCE_TYPE = "notification"
 _MANAGED_DELIVERY_MAX_ATTEMPTS = 3
 _MANAGED_DELIVERY_MAX_PENDING_AGE = timedelta(minutes=5)
 
@@ -289,6 +292,7 @@ class ChannelDeliveryService:
         self._turn_scheduler = turn_scheduler
         self._public_base_url = public_base_url.rstrip("/")
         self._retry_task: asyncio.Task[None] | None = None
+        self._retry_wakeup = asyncio.Event()
         self._managed_channel_service: Any | None = None
         self._recipient_resolution_service: Any | None = None
 
@@ -317,7 +321,13 @@ class ChannelDeliveryService:
         """Start lightweight in-process retry loop."""
 
         if self._retry_task is None or self._retry_task.done():
+            self._retry_wakeup.set()
             self._retry_task = asyncio.create_task(self._retry_loop())
+
+    def wake_pending_deliveries(self) -> None:
+        """Wake the tracked worker after a durable enqueue."""
+
+        self._retry_wakeup.set()
 
     async def stop(self) -> None:
         """Stop retry loop."""
@@ -535,6 +545,7 @@ class ChannelDeliveryService:
         delivery_conversation_id: str | None = None,
         workflow_task_id: str | None = None,
         reject_active_managed_binding: bool = False,
+        failure_metadata: dict[str, Any] | None = None,
     ) -> ChannelDeliveryStatus:
         """Send content to a resolved channel route.
 
@@ -761,6 +772,18 @@ class ChannelDeliveryService:
                             if chunk_idempotent
                             else ChannelDeliveryStatus.UNCERTAIN
                         )
+            except SignalDeliveryFailure as exc:
+                if failure_metadata is not None:
+                    failure_metadata.update(exc.safe_metadata())
+                logger.warning(
+                    "channel delivery: Signal send outcome is uncertain",
+                    extra={"extra_data": {"channel_type": channel_type, "account_id": account_id}},
+                )
+                CHANNEL_DELIVERY_ERRORS.labels(
+                    channel_type=channel_type,
+                    account_id=account_id,
+                ).inc()
+                return ChannelDeliveryStatus.UNCERTAIN
             except NonRetryableChannelError as exc:
                 logger.error(
                     "channel delivery: permanent adapter failure",
@@ -937,6 +960,49 @@ class ChannelDeliveryService:
 
         await self.send_to_conversation(conversation_id, content)
 
+    async def _enqueue_notification_delivery(
+        self,
+        *,
+        notification_id: str,
+        conversation_id: str,
+        session_id: str | None,
+        content: str,
+    ) -> None:
+        """Persist one retryable channel delivery per durable notification."""
+        from cognis.store.queries import create_or_get_channel_delivery_outbox
+
+        stable_key = hashlib.sha256(
+            f"{_NOTIFICATION_SOURCE_TYPE}:{notification_id}:{conversation_id}".encode()
+        ).hexdigest()[:20]
+        delivery_id = f"cdel_{stable_key}"
+        async with self._session_factory() as session:
+            route = await get_conversation_channel_route(session, conversation_id)
+            if route is None:
+                return
+            channel_type, account_id, chat_id, thread_id, user_email = route
+            await create_or_get_channel_delivery_outbox(
+                session,
+                delivery_id=delivery_id,
+                user_email=user_email,
+                conversation_id=conversation_id,
+                session_id=session_id,
+                source_type=_NOTIFICATION_SOURCE_TYPE,
+                source_id=notification_id,
+                channel_type=channel_type,
+                account_id=account_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                fallback_text=content,
+                next_attempt_at=datetime.now(UTC),
+            )
+            await session.commit()
+        await self._deliver_outbox(
+            delivery_id=delivery_id,
+            final_content=None,
+            fallback_text=None,
+            ignore_next_attempt=True,
+        )
+
     async def _handle_turn_completed_event(self, event: Event) -> None:
         grace_delivery_id = event.data.get("delivery_id")
         if not isinstance(grace_delivery_id, str) or not event.data.get("channel_deliverable"):
@@ -1100,7 +1166,17 @@ class ChannelDeliveryService:
             f'Escalation: The agent wants to use tool "{tool_name}" '
             "but needs your approval. Reply /approve or /deny."
         )
-        await self.send_to_conversation(conversation_id, content)
+        notification_id = event.data.get("notification_id") or event.data.get("call_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            return
+        await self._enqueue_notification_delivery(
+            notification_id=notification_id,
+            conversation_id=conversation_id,
+            session_id=event.data.get("session_id")
+            if isinstance(event.data.get("session_id"), str)
+            else None,
+            content=content,
+        )
 
     async def _handle_notification_event(self, event: Event) -> None:
         """Handle generic notification events."""
@@ -1149,7 +1225,18 @@ class ChannelDeliveryService:
                 origin = managed_title or managed_agent
                 content = f"_From managed conversation: {origin}_\n\n{content}"
 
-        await self.send_to_conversation(conversation_id, content)
+        notification_id = event.data.get("notification_id")
+        if not isinstance(notification_id, str) or not notification_id:
+            await self.send_to_conversation(conversation_id, content)
+            return
+        await self._enqueue_notification_delivery(
+            notification_id=notification_id,
+            conversation_id=conversation_id,
+            session_id=event.data.get("session_id")
+            if isinstance(event.data.get("session_id"), str)
+            else None,
+            content=content,
+        )
 
     def _render_step_question_notification(self, payload: dict[str, Any]) -> str:
         """Render a question set prompt for plain-text channel integrations."""
@@ -1432,7 +1519,9 @@ class ChannelDeliveryService:
     async def _retry_loop(self) -> None:
         while True:
             try:
-                await asyncio.sleep(30)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._retry_wakeup.wait(), timeout=30)
+                self._retry_wakeup.clear()
                 await self.recover_pending_deliveries()
             except asyncio.CancelledError:
                 raise
@@ -1564,6 +1653,7 @@ class ChannelDeliveryService:
             return
 
         delivery_status = ChannelDeliveryStatus.FAILED
+        failure_metadata: dict[str, Any] = {}
         lease_lost = asyncio.Event()
 
         async def save_chunk_start(
@@ -1742,6 +1832,7 @@ class ChannelDeliveryService:
                 reject_active_managed_binding=(
                     getattr(row, "source_type", None) == "channel_recipient"
                 ),
+                failure_metadata=failure_metadata,
             )
         except Exception:
             logger.warning(
@@ -1848,7 +1939,17 @@ class ChannelDeliveryService:
                     session,
                     delivery_id=delivery_id,
                     lease_token=lease_token,
-                    last_error="external_send_outcome_uncertain",
+                    last_error=(
+                        json.dumps(
+                            {
+                                "kind": "signal_delivery_failure",
+                                **failure_metadata,
+                            },
+                            sort_keys=True,
+                        )
+                        if failure_metadata
+                        else "external_send_outcome_uncertain"
+                    ),
                 )
             elif delivery_status == ChannelDeliveryStatus.PERMANENT:
                 await mark_channel_delivery_permanent_failure(
@@ -1966,7 +2067,7 @@ class ChannelDeliveryService:
         projected_media: tuple[MediaAttachment, ...] = ()
         media_complete = True
         is_rich = format_name == "rich" and isinstance(rich_payload, dict)
-        if is_rich:
+        if format_name == "rich" and isinstance(rich_payload, dict):
             media_manifest = rich_media_manifest(rich_payload)
             if materialize_media and media_manifest and capabilities.supports_inline_media:
                 prepared: list[MediaAttachment] = []
@@ -1978,16 +2079,17 @@ class ChannelDeliveryService:
                 ]
                 if canonical:
                     workflow_media_authorized = False
+                    step_run_id = getattr(row, "step_run_id", None)
                     if (
                         row is not None
-                        and getattr(row, "step_run_id", None) is not None
+                        and isinstance(step_run_id, str)
                         and workflow_task_id
                         and owner_email
                     ):
                         from cognis.store.queries import get_step_run, get_task
 
                         async with self._session_factory() as session:
-                            step_run = await get_step_run(session, row.step_run_id)
+                            step_run = await get_step_run(session, step_run_id)
                             task = await get_task(session, workflow_task_id)
                         workflow_media_authorized = bool(
                             step_run is not None

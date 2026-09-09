@@ -8,14 +8,14 @@ import pytest
 from cognis.api.runtime_support import select_static_tools
 from cognis.core.agent_management import TOOL_GROUP_DEFINITIONS
 from cognis.core.executor_resolution import is_tool_enabled
-from cognis.models.agent import AgentDefinition
-from cognis.models.tool import ExecutorHandle, ToolCapability
-from cognis.tools.executor.definitions import (
+from cognis.executor.tool_definitions_runtime import (
     OFFICE_EXECUTOR_TOOLS,
     executor_tool_definitions,
     executor_tool_handlers,
     office_executor_tool_definitions,
 )
+from cognis.models.agent import AgentDefinition
+from cognis.models.tool import ExecutorHandle, ToolCapability
 from cognis.tools.executor.officecli.install import OfficeCliRuntimeConfig, _cache_binary_path
 from cognis.tools.executor.officecli.manifest import (
     OFFICECLI_ASSETS,
@@ -202,7 +202,7 @@ def test_office_tool_group_is_available_for_agent_assignment() -> None:
     }
 
 
-def test_office_tool_group_selects_static_office_tools() -> None:
+def test_office_tool_group_selects_only_certified_runtime_office_tools() -> None:
     agent = AgentDefinition(
         agent_id="agent-1",
         owner_email="user@example.com",
@@ -211,6 +211,14 @@ def test_office_tool_group_selects_static_office_tools() -> None:
     )
 
     selected = {tool.name for tool in select_static_tools(agent) if tool.category == "office"}
+    assert selected == set()
+    selected = {
+        tool.name
+        for tool in office_executor_tool_definitions(
+            {"officecli": {"available": True, "version": OFFICECLI_CERTIFIED_VERSION}}
+        )
+        if is_tool_enabled(tool, [], ["office"])
+    }
 
     assert selected == {
         "office_read",

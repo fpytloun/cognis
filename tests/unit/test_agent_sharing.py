@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -58,6 +59,41 @@ async def _agent_management_test_deps(tmp_path: Path) -> AgentManagementDependen
         session_factory=create_session_factory(engine),
         assignable_tools=static_tool_definitions(knowledgebase_enabled=True),
     )
+
+
+def test_builtin_owner_self_get(tmp_path: Path) -> None:
+    async def run() -> None:
+        deps = await _agent_management_test_deps(tmp_path)
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="test"
+            )
+            await create_agent(
+                session,
+                agent_id="reader",
+                owner_email="owner@example.com",
+                name="Reader",
+                status="active",
+            )
+            await session.commit()
+        access = RuntimeAccessContext(
+            user_email="owner@example.com",
+            agent_id="reader",
+            agent_owner_email="owner@example.com",
+            agent_type="primary",
+        )
+        result = await handle_agent_management_tool(
+            tool_name="manage_agents",
+            arguments={"action": "get", "agent_id": "reader"},
+            deps=deps,
+            user_email="owner@example.com",
+            current_agent_id="reader",
+            runtime_access=access,
+        )
+        assert not result.is_error, result.output
+        assert json.loads(result.output)["agent"]["agent_id"] == "reader"
+
+    asyncio.run(run())
 
 
 def test_grantee_can_list_and_view_shared_agent(monkeypatch: object, tmp_path: Path) -> None:

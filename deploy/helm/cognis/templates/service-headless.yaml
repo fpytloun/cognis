@@ -10,7 +10,8 @@ metadata:
   {{- end }}
 spec:
   clusterIP: None
-  publishNotReadyAddresses: false
+  # Keep draining owners reachable for already-admitted bridge calls.
+  publishNotReadyAddresses: true
   selector:
     {{- include "cognis.selectorLabels" . | nindent 4 }}
   ports:

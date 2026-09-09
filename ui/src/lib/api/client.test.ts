@@ -120,6 +120,31 @@ describe('conversation API client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/v1/conversations/context-types?status=archived');
   });
 
+  it('sends the title query with paginated conversation filters', async () => {
+    const payload = { items: [], cursor: null, has_more: false };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: jsonHeaders
+      })
+    );
+    global.fetch = fetchMock;
+
+    await expect(
+      api.conversations.list(null, {
+        contextTypes: ['web', 'signal'],
+        agentIds: ['riker'],
+        status: 'active',
+        query: 'release notes'
+      })
+    ).resolves.toEqual(payload);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      '/api/v1/conversations?limit=50&context_types=web&context_types=signal&agent_ids=riker&status=active&q=release+notes'
+    );
+  });
+
   it('requests a backend-shaped sidebar projection', async () => {
     const payload = {
       agents: [],
@@ -198,12 +223,13 @@ describe('conversation API client', () => {
 
     await expect(
       api.conversations.sidebar(null, { contextType: 'web' }, {
-        changedSince: '2026-01-01T00:00:00Z'
+        changedSince: '2026-01-01T00:00:00Z',
+        sidebarRevision: '900719925474099300001'
       })
     ).resolves.toEqual(payload);
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/v1/conversations/sidebar?limit=50&changed_since=2026-01-01T00%3A00%3A00Z&context_type=web'
+      '/api/v1/conversations/sidebar?limit=50&changed_since=2026-01-01T00%3A00%3A00Z&sidebar_revision=900719925474099300001&context_type=web'
     );
   });
 
