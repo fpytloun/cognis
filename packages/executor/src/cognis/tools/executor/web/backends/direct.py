@@ -10,6 +10,7 @@ when a provider changes its frontend.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import multiprocessing
 import queue
@@ -38,11 +39,25 @@ from cognis.tools.executor.web.headers import (
 from cognis.tools.executor.web.public_adapters import dispatch_public_adapter
 
 logger = logging.getLogger(__name__)
-_DDGS_REQUEST_TIMEOUT_SECONDS = 15
+_DDGS_PROVIDER_TIMEOUT_SECONDS = 4
+_DDGS_SEARCH_BUDGET_SECONDS = 12
+_DDGS_ENGINES: dict[str, tuple[str, ...]] = {
+    "text": ("yahoo", "duckduckgo", "brave", "mojeek"),
+    "news": ("bing", "duckduckgo", "yahoo"),
+    "images": ("bing", "duckduckgo"),
+    "videos": ("duckduckgo",),
+}
 
 _MAX_ORIGIN_BREAKERS = 256
 _fetch_breakers: OrderedDict[str, CircuitBreaker] = OrderedDict()
 _search_breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
+
+
+class _DDGSSearchError(RuntimeError):
+    def __init__(self, category: str, metadata: dict[str, object]) -> None:
+        super().__init__(f"DDGS search failed ({category.replace('_', ' ')}).")
+        self.category = category
+        self.metadata = metadata
 
 
 class DirectBackend:
@@ -213,7 +228,9 @@ class DirectBackend:
                 },
             )
         except Exception as exc:
-            category = _ddgs_failure_category(exc)
+            category = (
+                exc.category if isinstance(exc, _DDGSSearchError) else _ddgs_failure_category(exc)
+            )
             logger.warning(
                 "web: DDGS search failed: %s (%s)",
                 type(exc).__name__,
@@ -227,6 +244,7 @@ class DirectBackend:
                     "provider": "ddgs",
                     "failure_category": category,
                     "exception_type": type(exc).__name__,
+                    **(exc.metadata if isinstance(exc, _DDGSSearchError) else {}),
                 },
             )
 
@@ -252,6 +270,155 @@ def _ddgs_failure_category(exc: Exception) -> str:
     if isinstance(exc, (ValueError, TypeError, KeyError)):
         return "invalid_response"
     return "unexpected"
+
+
+def _ddgs_vertical(mode: str) -> str:
+    return "text" if mode == "web" else mode
+
+
+def _ddgs_provider_search(
+    *,
+    provider: str,
+    vertical: str,
+    query: str,
+    max_results: int,
+    region: str,
+    safesearch: str,
+    timelimit: str | None,
+) -> dict[str, object]:
+    """Run one explicit DDGS provider and retain its real index provenance."""
+    from ddgs import DDGS
+    from ddgs.engines import ENGINES
+
+    ddgs = DDGS(timeout=_DDGS_PROVIDER_TIMEOUT_SECONDS)
+    engine = ENGINES.get(vertical, {}).get(provider)
+    if engine is None:
+        return {
+            "provider": provider,
+            "index_family": "unknown",
+            "vertical": vertical,
+            "failure_category": "unsupported_engine",
+            "exception_type": "LookupError",
+        }
+    index_family = str(engine.provider)
+    try:
+        method = getattr(ddgs, vertical)
+        kwargs: dict[str, object] = {
+            "backend": provider,
+            "max_results": max_results,
+            "region": region,
+            "safesearch": safesearch,
+        }
+        if vertical in {"text", "news"}:
+            kwargs["timelimit"] = timelimit
+        rows = list(method(query, **kwargs))
+    except Exception as exc:
+        return {
+            "provider": provider,
+            "index_family": index_family,
+            "vertical": vertical,
+            "failure_category": _ddgs_failure_category(exc),
+            "exception_type": type(exc).__name__,
+        }
+
+    for row in rows:
+        row["_cognis_search_engine"] = provider
+        row["_cognis_index_family"] = index_family
+    return {
+        "provider": provider,
+        "index_family": index_family,
+        "vertical": vertical,
+        "results": rows,
+    }
+
+
+def _ddgs_search_worker(
+    result_queue: Any,
+    query: str,
+    max_results: int,
+    region: str,
+    safesearch: str,
+    timelimit: str | None,
+    include_images: bool,
+    mode: str,
+    image_limit: int,
+) -> None:
+    """Run the complete synchronous DDGS request inside one killable process."""
+    verticals = [_ddgs_vertical(mode)]
+    if include_images and mode != "images":
+        verticals.append("images")
+    requests = [
+        {
+            "provider": provider,
+            "vertical": vertical,
+            "query": query,
+            "max_results": image_limit if vertical == "images" else max_results,
+            "region": region,
+            "safesearch": safesearch,
+            "timelimit": timelimit,
+        }
+        for vertical in verticals
+        for provider in _DDGS_ENGINES[vertical]
+    ]
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(requests)) as executor:
+            outcomes = list(executor.map(lambda values: _ddgs_provider_search(**values), requests))
+        result_queue.put(("ok", outcomes))
+    except BaseException as exc:  # pragma: no cover - process safety boundary
+        result_queue.put(("error", type(exc).__name__))
+
+
+async def _run_ddgs_search_process(
+    query: str,
+    *,
+    max_results: int,
+    region: str,
+    safesearch: str,
+    timelimit: str | None,
+    include_images: bool,
+    mode: str,
+    image_limit: int,
+) -> list[dict[str, object]]:
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue(maxsize=1)
+    process = context.Process(
+        target=_ddgs_search_worker,
+        args=(
+            result_queue,
+            query,
+            max_results,
+            region,
+            safesearch,
+            timelimit,
+            include_images,
+            mode,
+            image_limit,
+        ),
+        daemon=True,
+    )
+    process.start()
+    try:
+        try:
+            status, payload = await asyncio.to_thread(
+                result_queue.get,
+                True,
+                _DDGS_SEARCH_BUDGET_SECONDS,
+            )
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"DDGS search exceeded its {_DDGS_SEARCH_BUDGET_SECONDS}s safety budget."
+            ) from exc
+        if status != "ok" or not isinstance(payload, list):
+            raise RuntimeError(f"DDGS search worker failed ({payload}).")
+        return payload
+    finally:
+        if process.is_alive():
+            process.terminate()
+        await asyncio.to_thread(process.join, 2.0)
+        if process.is_alive():
+            process.kill()
+            await asyncio.to_thread(process.join, 2.0)
+        result_queue.close()
 
 
 def _looks_like_pdf_response(response: httpx.Response) -> bool:
@@ -510,86 +677,105 @@ async def _ddg_search(
     preferred_type: str | None = None,
     image_limit: int = 10,
 ) -> ToolResult:
-    """Execute DDGS metasearch in a thread (the library is sync)."""
-    import asyncio
-
+    """Execute explicit DDGS providers within one hard process deadline."""
     opts = options or {}
+    outcomes = await _run_ddgs_search_process(
+        query,
+        max_results=max_results,
+        region=region,
+        safesearch=safesearch,
+        timelimit=timelimit,
+        include_images=include_images,
+        mode=mode,
+        image_limit=image_limit,
+    )
+    primary_vertical = _ddgs_vertical(mode)
+    results: list[dict[str, Any]] = []
+    raw_images: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    successful_providers: list[str] = []
+    engine_provenance: list[dict[str, object]] = []
+    for outcome in outcomes:
+        provider = str(outcome.get("provider") or "unknown")
+        vertical = str(outcome.get("vertical") or primary_vertical)
+        rows = outcome.get("results")
+        if isinstance(rows, list):
+            successful_providers.append(provider)
+            engine_provenance.append(
+                {
+                    "vertical": vertical,
+                    "search_engine": provider,
+                    "index_family": outcome.get("index_family"),
+                    "status": "success",
+                    "result_count": len(rows),
+                }
+            )
+            if vertical == "images":
+                raw_images.extend(row for row in rows if isinstance(row, dict))
+            else:
+                results.extend(row for row in rows if isinstance(row, dict))
+        else:
+            failure = {
+                "vertical": vertical,
+                "provider": provider,
+                "engine": provider,
+                "index_family": outcome.get("index_family"),
+                "failure_category": outcome.get("failure_category", "unexpected"),
+                "reason": outcome.get("failure_category", "unexpected"),
+                "exception_type": outcome.get("exception_type", "Exception"),
+            }
+            failures.append(failure)
+            engine_provenance.append(
+                {
+                    "vertical": vertical,
+                    "search_engine": provider,
+                    "index_family": outcome.get("index_family"),
+                    "status": "failed",
+                    "failure_category": failure["failure_category"],
+                }
+            )
 
-    def _sync_search() -> tuple[list[dict[str, Any]], list[dict[str, object]]]:
-        from ddgs import DDGS
-
-        ddgs = DDGS(timeout=_DDGS_REQUEST_TIMEOUT_SECONDS)
-        text_results: list[dict[str, Any]] = []
-        if mode in {"web", "news", "videos"}:
-            for attempt in range(3):
-                try:
-                    if mode == "web":
-                        text_results = list(
-                            ddgs.text(
-                                query,
-                                max_results=max_results,
-                                region=region,
-                                safesearch=safesearch,
-                                timelimit=timelimit,
-                            )
-                        )
-                    elif mode == "news":
-                        text_results = list(
-                            ddgs.news(
-                                query,
-                                max_results=max_results,
-                                region=region,
-                                safesearch=safesearch,
-                                timelimit=timelimit,
-                            )
-                        )
-                    else:
-                        text_results = list(
-                            ddgs.videos(
-                                query,
-                                max_results=max_results,
-                                region=region,
-                                safesearch=safesearch,
-                            )
-                        )
-                    break
-                except Exception as exc:
-                    if _ddgs_failure_category(exc) != "no_results":
-                        raise
-                    if attempt == 2:
-                        text_results = []
-
-        image_results: list[dict[str, object]] = []
-        if include_images or mode == "images":
-            for attempt in range(3):
-                try:
-                    image_results = list(
-                        ddgs.images(
-                            query,
-                            max_results=image_limit,
-                            region=region,
-                            safesearch=safesearch,
-                        )
-                    )
-                    break
-                except Exception as exc:
-                    if _ddgs_failure_category(exc) != "no_results":
-                        raise
-                    if attempt == 2:
-                        image_results = []
-        return text_results, image_results
-
-    results, raw_images = await asyncio.to_thread(_sync_search)
-
-    if not results and not raw_images:
-        return build_search_tool_result(
-            answer=None,
-            results=[],
-            metadata={
-                "requested_time_range": str((options or {}).get("time_range") or "any").lower()
+    metadata: dict[str, object] = {
+        "requested_time_range": str(opts.get("time_range") or "any").lower(),
+        "search_engines": list(_DDGS_ENGINES[primary_vertical]),
+        "successful_search_engines": list(dict.fromkeys(successful_providers)),
+        "engine_provenance": engine_provenance,
+        "engine_failures": failures,
+        "search_deadline_seconds": _DDGS_SEARCH_BUDGET_SECONDS,
+    }
+    if failures:
+        metadata.update(
+            {
+                "search_degraded": True,
+                "search_quality": "degraded",
+                "degraded_reason": "One or more DDGS search engines failed.",
+            }
+        )
+    if not results and not raw_images and failures:
+        categories = {str(item["failure_category"]) for item in failures}
+        category = categories.pop() if len(categories) == 1 else "provider_failures"
+        raise _DDGSSearchError(
+            category,
+            {
+                **metadata,
+                "failure_category": category,
             },
         )
 
+    results = list(
+        {
+            str(row.get("url") or row.get("href") or row.get("link", "")): row
+            for row in results
+            if row.get("url") or row.get("href") or row.get("link")
+        }.values()
+    )
+    raw_images = list(
+        {
+            str(row.get("image") or row.get("thumbnail") or ""): row
+            for row in raw_images
+            if row.get("image") or row.get("thumbnail")
+        }.values()
+    )[:image_limit]
     formatted_results: list[dict[str, object]] = [
         {
             "title": r.get("title", ""),
@@ -600,9 +786,9 @@ async def _ddg_search(
             "source_metadata": {
                 "author": r.get("publisher") or r.get("uploader"),
                 "duration": r.get("duration"),
-            }
-            if mode == "videos"
-            else {},
+                "search_engine": r.get("_cognis_search_engine"),
+                "index_family": r.get("_cognis_index_family"),
+            },
             "cognis_score": semantic_score(
                 preferred_type,
                 str(r.get("url") or r.get("href") or r.get("link", "")),
@@ -619,6 +805,7 @@ async def _ddg_search(
             -float(score) if isinstance((score := row.get("cognis_score")), int | float) else 0.0
         )
     )
+    formatted_results = formatted_results[:max_results]
     images = [
         {
             "url": image.get("image") or image.get("thumbnail"),
@@ -626,6 +813,10 @@ async def _ddg_search(
             "caption": image.get("title"),
             "source": "ddgs_image_search",
             "source_page_url": image.get("url"),
+            "metadata": {
+                "search_engine": image.get("_cognis_search_engine"),
+                "index_family": image.get("_cognis_index_family"),
+            },
         }
         for image in raw_images
         if isinstance(image.get("image") or image.get("thumbnail"), str)
@@ -635,7 +826,7 @@ async def _ddg_search(
         answer=None,
         results=formatted_results,
         images=images,
-        metadata={"requested_time_range": str(opts.get("time_range") or "any").lower()},
+        metadata=metadata,
     )
 
 

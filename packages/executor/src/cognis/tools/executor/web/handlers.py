@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import random
 import re
 from datetime import date
 from typing import Any
@@ -27,10 +26,6 @@ from cognis.tools.executor.web.concurrency import (
 )
 from cognis.tools.executor.web.semantic_quality import STATUS_RANKS
 from cognis.tools.registry import ToolExecutionContext
-
-_DIRECT_SEARCH_MAX_ATTEMPTS = 3
-_DIRECT_SEARCH_RETRY_BASE_SECONDS = 0.5
-_RETRYABLE_DIRECT_SEARCH_FAILURES = {"blocked", "network", "rate_limited", "timeout"}
 
 logger = logging.getLogger(__name__)
 
@@ -978,30 +973,15 @@ async def handle_web_search(arguments: dict[str, Any], context: ToolExecutionCon
             return ToolResult(output=str(exc), is_error=True)
         query_to_run, options, query_normalized = _normalize_tavily_query(query_to_run, options)
 
-    max_attempts = _DIRECT_SEARCH_MAX_ATTEMPTS if backend_label == "direct" else 1
-    retry_failure_categories: list[str] = []
-    for attempt in range(1, max_attempts + 1):
-        async with controller.acquire(backend=concurrency_label, op="search"):
-            result = await backend.search(
-                query_to_run,
-                num_results=num_results,
-                options=options if options else None,
-            )
-        if backend_label == "direct":
-            result = _merge_result_metadata(result, {"attempts": attempt})
-        failure_category = str((result.metadata or {}).get("failure_category") or "")
-        if (
-            not result.is_error
-            or failure_category not in _RETRYABLE_DIRECT_SEARCH_FAILURES
-            or attempt >= max_attempts
-        ):
-            break
-        retry_failure_categories.append(failure_category)
-        delay = _DIRECT_SEARCH_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-        await asyncio.sleep(delay + random.uniform(0, delay / 2))
+    async with controller.acquire(backend=concurrency_label, op="search"):
+        result = await backend.search(
+            query_to_run,
+            num_results=num_results,
+            options=options if options else None,
+        )
+    if backend_label == "direct":
+        result = _merge_result_metadata(result, {"attempts": 1})
     search_metadata: dict[str, Any] = {"backend": backend_label}
-    if retry_failure_categories:
-        search_metadata["retry_failure_categories"] = retry_failure_categories
     result = _merge_result_metadata(result, search_metadata)
 
     if is_tavily_backend and _is_empty_search_result(result):

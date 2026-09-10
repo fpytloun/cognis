@@ -215,7 +215,7 @@ use through the `web_search`, `web_fetch`, `web_crawl`, `web_map`, and
 
 | Backend | Search | Fetch | Notes |
 | --- | --- | --- | --- |
-| `direct` | DuckDuckGo (`ddgs`) | httpx + trafilatura | Free; no API key. The default. |
+| `direct` | DDGS metasearch | httpx + trafilatura | Free; no API key. The default. |
 | `tavily` | tavily.com | tavily.com | Paid. Also unlocks Tavily-native `web_crawl` / `web_map` / `web_research`. |
 | `brave` | api.search.brave.com | — | Paid. Search-only. |
 | `searxng` | self-hosted SearXNG | — | Free; user runs the SearXNG instance. |
@@ -236,6 +236,17 @@ Turnstile) can still fail; HTTP error documents and short provider-generated
 error pages are reported as failures rather than successful extractions.
 Upgraded installations retain an explicitly stored headed-fallback choice;
 new installations default it to enabled.
+
+### Direct search limitations
+
+Direct search uses explicit free DDGS engines for each search type. General web
+search excludes encyclopedia-first engines. The result metadata identifies the
+engines that returned results and their underlying index families.
+
+These engines scrape public search pages. They have no availability contract.
+Cognis reports provider failures instead of treating them as an empty search.
+Each search has one 12-second process deadline. Cognis terminates the process
+when this deadline expires.
 
 ### `web_crawl` / `web_map` / `web_research` availability
 

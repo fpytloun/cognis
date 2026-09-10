@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import sys
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import httpx
@@ -23,7 +22,10 @@ from cognis.tools.executor.web.backends import (
 from cognis.tools.executor.web.backends.direct import (
     DirectBackend,
     _ddg_search,
+    _ddgs_provider_search,
+    _DDGSSearchError,
     _request_error_result,
+    _run_ddgs_search_process,
 )
 from cognis.tools.executor.web.backends.tavily import TavilyBackend
 from cognis.tools.executor.web.handlers import (
@@ -1584,18 +1586,49 @@ class TestDirectBackend:
         )
 
     @pytest.mark.asyncio()
-    async def test_search_retries_transient_ddg_failure(self) -> None:
+    async def test_search_preserves_provider_failure_diagnostics(self) -> None:
+        backend = DirectBackend()
+        failure_metadata = {
+            "engine_failures": [
+                {
+                    "engine": "brave",
+                    "index_family": "brave",
+                    "failure_category": "rate_limited",
+                    "reason": "rate_limited",
+                }
+            ],
+            "search_engines": ["brave"],
+            "search_deadline_seconds": 12,
+        }
+
+        async def _call(fn):
+            return await fn()
+
+        with (
+            patch("cognis.tools.executor.web.backends.direct._search_breaker") as mock_breaker,
+            patch(
+                "cognis.tools.executor.web.backends.direct._ddg_search",
+                new=AsyncMock(side_effect=_DDGSSearchError("rate_limited", failure_metadata)),
+            ),
+        ):
+            mock_breaker.call = AsyncMock(side_effect=_call)
+            result = await backend.search("test query")
+
+        assert result.is_error
+        assert result.metadata["failure_category"] == "rate_limited"
+        assert result.metadata["engine_failures"] == failure_metadata["engine_failures"]
+        assert result.metadata["search_deadline_seconds"] == 12
+
+    @pytest.mark.asyncio()
+    async def test_search_uses_one_bounded_direct_attempt(self) -> None:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         backend = AsyncMock(spec=DirectBackend)
-        backend.search.side_effect = [
-            ToolResult(
-                output="DDGS search failed (timeout).",
-                is_error=True,
-                metadata={"backend": "direct", "failure_category": "timeout"},
-            ),
-            ToolResult(output="recovered", metadata={"backend": "direct"}),
-        ]
+        backend.search.return_value = ToolResult(
+            output="DDGS search failed (timeout).",
+            is_error=True,
+            metadata={"backend": "direct", "failure_category": "timeout"},
+        )
         controller = MagicMock()
         gate = MagicMock()
         gate.__aenter__ = AsyncMock(return_value=None)
@@ -1610,22 +1643,16 @@ class TestDirectBackend:
                 "cognis.tools.executor.web.handlers._concurrency_controller",
                 return_value=controller,
             ),
-            patch(
-                "cognis.tools.executor.web.handlers.asyncio.sleep",
-                new=AsyncMock(),
-            ) as mock_sleep,
         ):
             result = await handle_web_search({"query": "retry me"}, _DUMMY_CONTEXT)
 
-        assert not result.is_error
-        assert backend.search.await_count == 2
-        assert controller.acquire.call_count == 2
-        mock_sleep.assert_awaited_once()
-        assert (result.metadata or {}).get("attempts") == 2
-        assert (result.metadata or {}).get("retry_failure_categories") == ["timeout"]
+        assert result.is_error
+        assert backend.search.await_count == 1
+        assert controller.acquire.call_count == 1
+        assert (result.metadata or {}).get("attempts") == 1
 
     @pytest.mark.asyncio()
-    async def test_search_reports_typed_error_after_retries(self) -> None:
+    async def test_search_reports_typed_error_without_outer_retry(self) -> None:
         from cognis.tools.executor.web.handlers import handle_web_search
 
         backend = AsyncMock(spec=DirectBackend)
@@ -1640,26 +1667,19 @@ class TestDirectBackend:
             },
         )
 
-        with (
-            patch(
-                "cognis.tools.executor.web.handlers.resolve_search_backend", return_value=backend
-            ),
-            patch(
-                "cognis.tools.executor.web.handlers.asyncio.sleep",
-                new=AsyncMock(),
-            ),
+        with patch(
+            "cognis.tools.executor.web.handlers.resolve_search_backend", return_value=backend
         ):
             result = await handle_web_search({"query": "retry me"}, _DUMMY_CONTEXT)
 
         assert result.is_error
-        assert backend.search.await_count == 3
+        assert backend.search.await_count == 1
         assert result.metadata == {
             "backend": "direct",
             "provider": "ddgs",
-            "attempts": 3,
+            "attempts": 1,
             "failure_category": "rate_limited",
             "exception_type": "RuntimeError",
-            "retry_failure_categories": ["rate_limited", "rate_limited"],
         }
 
     @pytest.mark.asyncio()
@@ -1683,57 +1703,140 @@ class TestDirectBackend:
         backend.search.assert_awaited_once()
         assert (result.metadata or {}).get("attempts") == 1
 
-    @pytest.mark.asyncio()
-    async def test_ddg_search_uses_bounded_request_timeout(
+    def test_ddg_provider_uses_explicit_engine_and_records_provenance(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         constructor_kwargs: list[dict[str, object]] = []
+        calls: list[tuple[str, dict[str, object]]] = []
 
         class _FakeDDGS:
             def __init__(self, **kwargs: object) -> None:
                 constructor_kwargs.append(kwargs)
 
-            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
-                return []
+            def text(self, query: str, **kwargs: object) -> list[dict[str, str]]:
+                calls.append((query, kwargs))
+                return [{"title": "Result", "href": "https://example.com"}]
 
-        fake_module = MagicMock()
-        fake_module.DDGS = _FakeDDGS
-        monkeypatch.setitem(sys.modules, "ddgs", fake_module)
+        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
 
-        await _ddg_search("bounded")
+        outcome = _ddgs_provider_search(
+            provider="yahoo",
+            vertical="text",
+            query="unchanged query",
+            max_results=8,
+            region="us-en",
+            safesearch="moderate",
+            timelimit="w",
+        )
 
-        assert constructor_kwargs == [{"timeout": 15}]
+        assert constructor_kwargs == [{"timeout": 4}]
+        assert calls == [
+            (
+                "unchanged query",
+                {
+                    "backend": "yahoo",
+                    "max_results": 8,
+                    "region": "us-en",
+                    "safesearch": "moderate",
+                    "timelimit": "w",
+                },
+            )
+        ]
+        assert outcome["provider"] == "yahoo"
+        assert outcome["index_family"] == "bing"
+        assert outcome["results"][0]["_cognis_search_engine"] == "yahoo"
+
+    @pytest.mark.asyncio()
+    async def test_ddg_process_timeout_terminates_worker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class _FakeQueue:
+            def get(self, *_args: object) -> object:
+                raise __import__("queue").Empty
+
+            def close(self) -> None:
+                pass
+
+        class _FakeProcess:
+            alive = True
+            terminated = False
+            killed = False
+
+            def start(self) -> None:
+                pass
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+                self.alive = False
+
+            def join(self, _timeout: float) -> None:
+                pass
+
+        process = _FakeProcess()
+        context = MagicMock()
+        context.Queue.return_value = _FakeQueue()
+        context.Process.return_value = process
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct.multiprocessing.get_context",
+            lambda _method: context,
+        )
+
+        with pytest.raises(TimeoutError, match="12s safety budget"):
+            await _run_ddgs_search_process(
+                "bounded query",
+                max_results=8,
+                region="us-en",
+                safesearch="moderate",
+                timelimit=None,
+                include_images=False,
+                mode="web",
+                image_limit=10,
+            )
+
+        assert process.terminated
+        assert process.killed
+        assert not process.is_alive()
 
     @pytest.mark.asyncio()
     async def test_ddg_news_normalizes_url_and_filters_domains_locally(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        queries: list[str] = []
+        async def _run(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            assert args == ("Python release",)
+            return [
+                {
+                    "provider": "bing",
+                    "index_family": "bing",
+                    "vertical": "news",
+                    "results": [
+                        {
+                            "title": "Wrong domain",
+                            "url": "https://example.com/news.html",
+                            "body": "Unrelated news.",
+                            "date": "2026-08-22",
+                            "source": "Example",
+                        },
+                        {
+                            "title": "Python release",
+                            "url": "https://docs.python.org/news.html",
+                            "body": "Python release news.",
+                            "date": "2026-08-22",
+                            "source": "Python",
+                        },
+                    ],
+                }
+            ]
 
-        class _FakeDDGS:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
-
-            def news(self, query: str, **_kwargs: object) -> list[dict[str, str]]:
-                queries.append(query)
-                return [
-                    {
-                        "title": "Wrong domain",
-                        "url": "https://example.com/news.html",
-                        "body": "Unrelated news.",
-                        "date": "2026-08-22",
-                        "source": "Example",
-                    },
-                    {
-                        "title": "Python release",
-                        "url": "https://docs.python.org/news.html",
-                        "body": "Python release news.",
-                        "date": "2026-08-22",
-                        "source": "Python",
-                    },
-                ]
-
-        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
 
         result = await _ddg_search(
             "Python release",
@@ -1741,95 +1844,171 @@ class TestDirectBackend:
             options={"include_domains": ["docs.python.org"]},
         )
 
-        assert queries == ["Python release"]
         assert "https://docs.python.org/news.html" in result.output
         assert "https://example.com/news.html" not in result.output
 
     @pytest.mark.asyncio()
-    async def test_ddg_no_results_exception_returns_empty_result(
+    async def test_ddg_provider_failures_do_not_become_empty_success(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls = 0
+        async def _run(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "provider": provider,
+                    "index_family": index_family,
+                    "vertical": "text",
+                    "failure_category": "no_results",
+                    "exception_type": "DDGSException",
+                }
+                for provider, index_family in (
+                    ("yahoo", "bing"),
+                    ("duckduckgo", "bing"),
+                    ("brave", "brave"),
+                    ("mojeek", "mojeek"),
+                )
+            ]
 
-        class _FakeDDGS:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
 
-            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
-                nonlocal calls
-                calls += 1
-                raise RuntimeError("No results found.")
+        with pytest.raises(_DDGSSearchError) as exc_info:
+            await _ddg_search("no matching result")
 
-        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
-
-        result = await _ddg_search("no matching result")
-
-        assert not result.is_error
-        assert result.output == "No search results found."
-        assert calls == 3
+        assert exc_info.value.category == "no_results"
+        assert len(exc_info.value.metadata["engine_failures"]) == 4
 
     @pytest.mark.asyncio()
-    async def test_ddg_retries_no_results_before_success(
+    async def test_ddg_merges_results_and_reports_partial_provider_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        calls = 0
+        async def _run(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "provider": "yahoo",
+                    "index_family": "bing",
+                    "vertical": "text",
+                    "results": [
+                        {
+                            "title": "Result",
+                            "href": "https://example.com/result",
+                            "body": "Found.",
+                            "_cognis_search_engine": "yahoo",
+                            "_cognis_index_family": "bing",
+                        }
+                    ],
+                },
+                {
+                    "provider": "brave",
+                    "index_family": "brave",
+                    "vertical": "text",
+                    "failure_category": "rate_limited",
+                    "exception_type": "DDGSException",
+                },
+            ]
 
-        class _FakeDDGS:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
-
-            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
-                nonlocal calls
-                calls += 1
-                if calls < 3:
-                    raise RuntimeError("No results found.")
-                return [
-                    {
-                        "title": "Result",
-                        "href": "https://example.com/result",
-                        "body": "Found.",
-                    }
-                ]
-
-        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
 
         result = await _ddg_search("eventual result")
 
         assert not result.is_error
         assert "https://example.com/result" in result.output
-        assert calls == 3
+        assert result.metadata["search_quality"] == "degraded"
+        assert result.metadata["successful_search_engines"] == ["yahoo"]
+        assert result.metadata["engine_failures"][0]["provider"] == "brave"
+
+    @pytest.mark.asyncio()
+    async def test_ddg_ranks_all_engines_before_truncating(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def _run(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            generic = [
+                {
+                    "title": f"Generic {index}",
+                    "href": f"https://example.com/{index}",
+                    "body": "Generic result.",
+                    "_cognis_search_engine": "yahoo",
+                    "_cognis_index_family": "bing",
+                }
+                for index in range(8)
+            ]
+            preferred = {
+                "title": "owner project",
+                "href": "https://github.com/owner/project",
+                "body": "Canonical repository.",
+                "_cognis_search_engine": "brave",
+                "_cognis_index_family": "brave",
+            }
+            return [
+                {
+                    "provider": "yahoo",
+                    "index_family": "bing",
+                    "vertical": "text",
+                    "results": generic,
+                },
+                {
+                    "provider": "brave",
+                    "index_family": "brave",
+                    "vertical": "text",
+                    "results": [preferred],
+                },
+            ]
+
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
+
+        result = await _ddg_search(
+            "owner project",
+            max_results=8,
+            preferred_type="repository",
+        )
+
+        normalized = result.metadata["normalized_results"]
+        assert len(normalized) == 8
+        assert normalized[0]["url"] == "https://github.com/owner/project"
 
     @pytest.mark.asyncio()
     async def test_ddg_preserves_text_when_optional_images_have_no_results(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        image_calls = 0
+        async def _run(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "provider": "yahoo",
+                    "index_family": "bing",
+                    "vertical": "text",
+                    "results": [
+                        {
+                            "title": "Result",
+                            "href": "https://example.com/result",
+                            "body": "Found.",
+                        }
+                    ],
+                },
+                {
+                    "provider": "bing",
+                    "index_family": "bing",
+                    "vertical": "images",
+                    "failure_category": "no_results",
+                    "exception_type": "DDGSException",
+                },
+            ]
 
-        class _FakeDDGS:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
-
-            def text(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
-                return [
-                    {
-                        "title": "Result",
-                        "href": "https://example.com/result",
-                        "body": "Found.",
-                    }
-                ]
-
-            def images(self, _query: str, **_kwargs: object) -> list[dict[str, str]]:
-                nonlocal image_calls
-                image_calls += 1
-                raise RuntimeError("No results found.")
-
-        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
 
         result = await _ddg_search("text only", include_images=True)
 
         assert not result.is_error
         assert "https://example.com/result" in result.output
-        assert image_calls == 3
 
     @pytest.mark.asyncio()
     async def test_search_returns_lazy_artifact_candidates_for_direct_image_results(
@@ -1837,25 +2016,28 @@ class TestDirectBackend:
     ) -> None:
         from cognis.tools.executor.web.backends.direct import _ddg_search
 
-        class _FakeDDGS:
-            def __init__(self, **_kwargs: object) -> None:
-                pass
+        async def _run(*_args: object, **_kwargs: object) -> list[dict[str, object]]:
+            return [
+                {
+                    "provider": "bing",
+                    "index_family": "bing",
+                    "vertical": "images",
+                    "results": [
+                        {
+                            "image": "https://images.example.com/chart.png",
+                            "title": "Revenue chart",
+                            "url": "https://example.com/article",
+                            "_cognis_search_engine": "bing",
+                            "_cognis_index_family": "bing",
+                        }
+                    ],
+                }
+            ]
 
-            def text(self, *args: object, **kwargs: object) -> list[dict[str, str]]:
-                return [
-                    {"title": "Article", "href": "https://example.com/article", "body": "Snippet"}
-                ]
-
-            def images(self, *args: object, **kwargs: object) -> list[dict[str, str]]:
-                return [
-                    {
-                        "image": "https://images.example.com/chart.png",
-                        "title": "Revenue chart",
-                        "url": "https://example.com/article",
-                    }
-                ]
-
-        monkeypatch.setattr("ddgs.DDGS", _FakeDDGS)
+        monkeypatch.setattr(
+            "cognis.tools.executor.web.backends.direct._run_ddgs_search_process",
+            _run,
+        )
 
         result = await _ddg_search("example chart", include_images=True, mode="images")
 
