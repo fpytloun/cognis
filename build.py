@@ -24,7 +24,7 @@ class CustomBuildHook(BuildHookInterface):
         del version
         self._maybe_build_ui()
         self._stage_built_assets()
-        if self.target_name == "sdist" and PACKAGE_UI_DIR.exists():
+        if PACKAGE_UI_DIR.exists():
             force_include = build_data.setdefault("force_include", {})
             if isinstance(force_include, dict):
                 force_include[str(PACKAGE_UI_DIR)] = "cognis/ui_dist"

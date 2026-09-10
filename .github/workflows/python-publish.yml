@@ -3,12 +3,14 @@ name: Upload Python Packages
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   common-build:
+    if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -31,6 +33,7 @@ jobs:
           path: dist-common/
 
   common-publish:
+    if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
     needs: common-build
     permissions:
@@ -54,6 +57,7 @@ jobs:
   controller-build:
     runs-on: ubuntu-latest
     needs: common-publish
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.common-publish.result == 'success') }}
 
     steps:
       - uses: actions/checkout@v4
@@ -85,6 +89,7 @@ jobs:
     needs:
       - controller-build
       - executor-publish
+    if: ${{ always() && needs.controller-build.result == 'success' && (github.event_name == 'workflow_dispatch' || needs.executor-publish.result == 'success') }}
     permissions:
       id-token: write
 
@@ -104,6 +109,7 @@ jobs:
           packages-dir: dist/
 
   executor-build:
+    if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
     needs: common-publish
 
@@ -128,6 +134,7 @@ jobs:
           path: dist-executor/
 
   executor-publish:
+    if: ${{ github.event_name == 'release' }}
     runs-on: ubuntu-latest
     needs:
       - executor-build
