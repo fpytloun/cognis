@@ -35,6 +35,7 @@ from cognis.channels.rich_markdown import (
 )
 from cognis.channels.route_admission import active_managed_binding_id, lock_channel_route
 from cognis.channels.signal_failures import SignalDeliveryFailure
+from cognis.channels.signal_policy import SignalPolicyBlocked
 from cognis.core.artifact_inputs import (
     authorize_outbound_artifact_refs_in_session,
     outbound_artifact_grant_is_valid,
@@ -730,8 +731,11 @@ class ChannelDeliveryService:
                             is not None
                         ):
                             return ChannelDeliveryStatus.PERMANENT
-                        message_id = await adapter.send_message(outbound)
                         await session.commit()
+                    # The persisted sending outbox owns the route reservation.
+                    # Do not retain the account lock during transport: Signal
+                    # destination admission uses that same serialization owner.
+                    message_id = await adapter.send_message(outbound)
                 else:
                     message_id = await adapter.send_message(outbound)
                 if (channel_type == "signal" or chunk_idempotent) and (
@@ -784,6 +788,14 @@ class ChannelDeliveryService:
                     account_id=account_id,
                 ).inc()
                 return ChannelDeliveryStatus.UNCERTAIN
+            except SignalPolicyBlocked as exc:
+                if failure_metadata is not None:
+                    failure_metadata.update(
+                        kind="signal_policy_blocked",
+                        side_effect_certainty="not_attempted",
+                        **exc.diagnostics,
+                    )
+                return ChannelDeliveryStatus.PERMANENT
             except NonRetryableChannelError as exc:
                 logger.error(
                     "channel delivery: permanent adapter failure",
@@ -1896,6 +1908,7 @@ class ChannelDeliveryService:
                     if delivery_status == ChannelDeliveryStatus.UNCERTAIN
                     else "suppressed"
                 ),
+                failure_metadata=failure_metadata or None,
             )
             return
 
@@ -1956,7 +1969,11 @@ class ChannelDeliveryService:
                     session,
                     delivery_id=delivery_id,
                     lease_token=lease_token,
-                    last_error="nonretryable_channel_failure",
+                    last_error=(
+                        json.dumps(failure_metadata, sort_keys=True)
+                        if failure_metadata
+                        else "nonretryable_channel_failure"
+                    ),
                 )
             else:
                 await mark_channel_delivery_failed(

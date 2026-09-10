@@ -68,7 +68,7 @@ def test_migration_graph_has_single_linear_head() -> None:
     config = Config("cognis/store/migrations/alembic.ini")
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_heads() == ["148_channel_delivery_route_release"]
+    assert script.get_heads() == ["149_signal_destination_policy"]
     revisions = list(script.walk_revisions("base", "144_work_v8_projection_repair"))
     assert [revision.revision for revision in revisions[:17]] == [
         "144_work_v8_projection_repair",

@@ -132,6 +132,9 @@ class ChannelManager:
         self._ws_provider = ws_provider
         self._controller_owner_id = controller_owner_id
         self._lease_store = DatabaseLeaseStore(session_factory)
+        from cognis.channels.signal_policy import SignalDestinationPolicy
+
+        self._signal_policy = SignalDestinationPolicy(session_factory)
 
         # account_id → adapter instance (local BaseChannelAdapter or RemoteChannelAdapterProxy)
         self._adapters: dict[str, Any] = {}
@@ -942,7 +945,9 @@ class ChannelManager:
         current_task = asyncio.current_task()
         operation_key = (id(self), account_id, generation, id(current_task))
         if _ACTIVE_CHANNEL_OPERATION.get() == operation_key:
-            return await operation(*args, **kwargs)
+            return await self._invoke_adapter_operation(
+                account_id, adapter, operation, args, kwargs
+            )
         lease = self._leases.get(account_id)
         if (
             lease is None
@@ -954,10 +959,26 @@ class ChannelManager:
         await self._admit_operation(account_id, lease)
         token = _ACTIVE_CHANNEL_OPERATION.set(operation_key)
         try:
-            return await operation(*args, **kwargs)
+            return await self._invoke_adapter_operation(
+                account_id, adapter, operation, args, kwargs
+            )
         finally:
             _ACTIVE_CHANNEL_OPERATION.reset(token)
             await self._finish_operation(account_id, lease)
+
+    async def _invoke_adapter_operation(
+        self, account_id: str, adapter: Any, operation: Any, args: Any, kwargs: Any
+    ) -> Any:
+        if adapter.channel_type == "signal" and operation == adapter.send_message:
+            message = args[0] if args else kwargs["message"]
+            config = self._configs[account_id]
+            return await self._signal_policy.send(
+                config.user_email,
+                account_id,
+                message.chat_id,
+                lambda: operation(*args, **kwargs),
+            )
+        return await operation(*args, **kwargs)
 
     async def _admit_operation(self, account_id: str, lease: Lease) -> None:
         async with self._session_factory() as session:

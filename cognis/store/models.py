@@ -2377,6 +2377,19 @@ class ScheduleCatchupStateRow(Base):
     )
 
 
+class SignalDestinationPolicyRow(Base):
+    """Local Signal send admission; transport uncertainty is never age-cleared."""
+
+    __tablename__ = "signal_destination_policies"
+
+    account_id: Mapped[str] = mapped_column(
+        String, ForeignKey("channel_accounts.account_id", ondelete="CASCADE"), primary_key=True
+    )
+    destination: Mapped[str] = mapped_column(String, primary_key=True)
+    user_email: Mapped[str] = mapped_column(String, nullable=False)
+    state_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class ChannelAccountOperationRow(Base):
     """Durable in-flight operation count for channel ownership drain."""
 

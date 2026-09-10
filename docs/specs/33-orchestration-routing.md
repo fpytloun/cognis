@@ -18,6 +18,33 @@ safety net.
 
 ## Runtime invariants
 
+### Signal destination policy
+
+Signal sends use local destination admission through the channel manager.
+The key contains the owner, account and transport chat ID, not the reply thread.
+This is an operational restriction, not a claim about Signal's platform block scope.
+Other destinations remain independent. Group responses can contain partial success.
+
+The database serializes admission before transport. No database lock spans RPC.
+A successful receipt or complete structured provider failure settles admission.
+Provider failure can still leave the delivery outcome uncertain.
+Timeout, cancellation and missing receipts leave an unresolved transport fence.
+Lease age and executor restart never prove external completion or non-delivery.
+No current API can clear an unresolved transport fence.
+A future evidence-backed operator protocol is necessary for that case.
+
+Rate-limit observations extend a durable destination cooldown from the observation time.
+Without a usable retry delay, the destination requires manual action.
+`reconcile_signal_destination_policy` clears only this local policy after explicit reconciliation.
+It preserves diagnostics and audits the action. It never resends or clears transport fences.
+`search_channel_targets` and `get_channel_delivery` expose sanitized diagnostics.
+Challenge tokens and CAPTCHA results are not diagnostic fields.
+Historical failures without retained structured data cannot establish a cooldown retroactively.
+
+Managed controllers can supply `reconciliation_evidence` to release an uncertain failed
+route before expiry. The existing expiry-only call remains supported.
+Route release preserves uncertain outcomes and does not clear destination policy or replay input.
+
 ### Managed-channel final delivery
 
 The scheduler commits the final outbox row with the managed turn result and

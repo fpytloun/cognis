@@ -883,6 +883,8 @@ class TestDirectSendBehavior:
             ),
             "retry_scheduled": False,
             "side_effect_certainty": "uncertain",
+            "result_count": 1,
+            "success_count": 0,
         }
         assert "secret-token" not in str(failure)
         assert "+420" not in str(failure)

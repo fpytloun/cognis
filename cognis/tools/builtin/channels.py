@@ -220,10 +220,23 @@ READ_CHANNEL_MESSAGES_TOOL = _tool(
 )
 GET_CHANNEL_DELIVERY_TOOL = _tool(
     "get_channel_delivery",
-    "Inspect one channel delivery owned by the current user.",
+    "Inspect an owned one-shot or managed final delivery and its local Signal policy.",
     {"delivery_id": {"type": "string"}},
     required=["delivery_id"],
     read_only=True,
+)
+
+RECONCILE_SIGNAL_POLICY_TOOL = _tool(
+    "reconcile_signal_destination_policy",
+    "Clear only an owned destination's local Signal cooldown/manual gate after explicit "
+    "external reconciliation. Never clears unresolved transport, releases routes or resends. "
+    "Do not include CAPTCHA/challenge tokens in evidence.",
+    {
+        "target_ref": {"type": "string"},
+        "evidence": {"type": "string", "minLength": 1, "maxLength": 500},
+    },
+    required=["target_ref", "evidence"],
+    read_only=False,
 )
 
 
@@ -233,6 +246,7 @@ def channel_tools() -> list[ToolDefinition]:
         SEARCH_CHANNEL_TARGETS_TOOL,
         SEND_CHANNEL_MESSAGE_TOOL,
         GET_CHANNEL_DELIVERY_TOOL,
+        RECONCILE_SIGNAL_POLICY_TOOL,
         READ_CHANNEL_MESSAGES_TOOL,
     ]
 
@@ -386,6 +400,12 @@ def build_channel_tool_handlers(
                 result["latest_one_shot_delivery"] = (
                     _delivery_response(latest) if latest is not None else None
                 )
+                if decoded.channel_type == "signal" and decoded.chat_id:
+                    from cognis.channels.signal_policy import SignalDestinationPolicy
+
+                    result["signal_policy"] = await SignalDestinationPolicy(
+                        session_factory
+                    ).inspect(user_email, decoded.account_id, decoded.chat_id)
         return {
             "targets": targets,
             "capabilities": {
@@ -618,10 +638,20 @@ def build_channel_tool_handlers(
                 row is None
                 or row.user_email != _user(context)
                 or row.source_type
-                not in {CHANNEL_TOOL_MESSAGE_SOURCE, CHANNEL_RECIPIENT_MESSAGE_SOURCE}
+                not in {
+                    CHANNEL_TOOL_MESSAGE_SOURCE,
+                    CHANNEL_RECIPIENT_MESSAGE_SOURCE,
+                    "managed_channel_final",
+                }
             ):
                 raise ValueError("Channel delivery not found")
             response = _delivery_response(row)
+            if row.channel_type == "signal":
+                from cognis.channels.signal_policy import SignalDestinationPolicy
+
+                response["signal_policy"] = await SignalDestinationPolicy(session_factory).inspect(
+                    row.user_email, row.account_id, row.chat_id
+                )
             if (
                 row.source_type == CHANNEL_RECIPIENT_MESSAGE_SOURCE
                 and row.completed_chunk_count > 0
@@ -651,6 +681,25 @@ def build_channel_tool_handlers(
                         )
                     )
             return response
+
+    async def reconcile_signal_policy_handler(
+        arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> dict[str, Any]:
+        from cognis.channels.signal_policy import SignalDestinationPolicy
+
+        owner = _user(context)
+        target = codec.decode(
+            str(arguments["target_ref"]), user_email=owner, expected_kind="target"
+        )
+        if target.channel_type != "signal" or not target.chat_id:
+            raise ValueError("A Signal destination is required")
+        return await SignalDestinationPolicy(session_factory).clear(
+            owner,
+            target.account_id,
+            target.chat_id,
+            evidence=str(arguments["evidence"]),
+            actor=_runtime_access_string(context, "conversation_id"),
+        )
 
     async def read_messages_handler(
         arguments: dict[str, Any], context: ToolExecutionContext
@@ -775,6 +824,7 @@ def build_channel_tool_handlers(
         SEARCH_CHANNEL_TARGETS_TOOL.name: search_targets_handler,
         SEND_CHANNEL_MESSAGE_TOOL.name: send_handler,
         GET_CHANNEL_DELIVERY_TOOL.name: get_delivery_handler,
+        RECONCILE_SIGNAL_POLICY_TOOL.name: reconcile_signal_policy_handler,
         READ_CHANNEL_MESSAGES_TOOL.name: read_messages_handler,
     }
 
@@ -988,10 +1038,27 @@ def _delivery_response(row: ChannelDeliveryOutboxRow) -> dict[str, Any]:
                     "next_step",
                     "retry_scheduled",
                     "side_effect_certainty",
+                    "result_count",
+                    "success_count",
                 )
                 if key in decoded
             }
             public_last_error = "external_send_outcome_uncertain"
+        elif isinstance(decoded, dict) and decoded.get("kind") == "signal_policy_blocked":
+            structured_error = {
+                key: decoded[key]
+                for key in (
+                    "state",
+                    "platform_scope",
+                    "enforcement_scope",
+                    "cooldown_until",
+                    "side_effect_certainty",
+                    "retry_scheduled",
+                    "next_step",
+                )
+                if key in decoded
+            }
+            public_last_error = "signal_policy_blocked"
     return {
         "delivery_id": row.delivery_id,
         "status": row.status,

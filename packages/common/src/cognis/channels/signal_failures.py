@@ -104,6 +104,8 @@ def sanitize_signal_failure(
         ),
         "retry_scheduled": False,
         "side_effect_certainty": "uncertain",
+        "result_count": len(results),
+        "success_count": sum(item.get("type") == "SUCCESS" for item in results),
     }
 
 
@@ -135,6 +137,16 @@ class SignalDeliveryFailure(RuntimeError):
             ),
             "retry_scheduled": False,
             "side_effect_certainty": "uncertain",
+            "result_count": (
+                metadata["result_count"]
+                if type(metadata.get("result_count")) is int and metadata["result_count"] >= 0
+                else 0
+            ),
+            "success_count": (
+                metadata["success_count"]
+                if type(metadata.get("success_count")) is int and metadata["success_count"] >= 0
+                else 0
+            ),
         }
         super().__init__(self.message)
 

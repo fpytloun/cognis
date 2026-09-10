@@ -1328,13 +1328,21 @@ AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL = ToolDefinition(
         "route. Supply conversation_id with expected_owner_epoch for a managed route, or "
         "delivery_id for a one-shot route. The authority-checked action never retries delivery "
         "or replays held participant messages. Reconcile an uncertain outcome externally before "
-        "any resend because the original one-shot idempotency key remains reserved."
+        "any resend because the original one-shot idempotency key remains reserved. "
+        "For early managed uncertain-route release, its controller must supply "
+        "reconciliation_evidence. This never clears Signal cooldown or transport fences."
     ),
     parameters={
         "type": "object",
         "properties": {
             "conversation_id": {"type": "string"},
             "delivery_id": {"type": "string"},
+            "reconciliation_evidence": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 500,
+                "description": "External reconciliation evidence for early managed release. No secrets.",
+            },
             "expected_owner_epoch": {"type": "integer", "minimum": 1},
             "reason": {
                 "type": "string",
@@ -1355,6 +1363,7 @@ AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL = ToolDefinition(
                     "anyOf": [
                         {"required": ["conversation_id"]},
                         {"required": ["expected_owner_epoch"]},
+                        {"required": ["reconciliation_evidence"]},
                     ]
                 },
             },

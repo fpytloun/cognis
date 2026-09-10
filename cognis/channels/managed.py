@@ -1207,6 +1207,7 @@ class ManagedChannelService:
         reason: str,
         outbox_status: str = "suppressed",
         expected_outbox_statuses: set[str] | None = None,
+        failure_metadata: dict[str, Any] | None = None,
     ) -> bool:
         """Stop automatic progress after an unsafe or permanent final failure."""
 
@@ -1255,7 +1256,11 @@ class ManagedChannelService:
                 outbox.attempt_count += 1
             outbox.lease_token = None
             outbox.lease_expires_at = None
-            outbox.last_error = reason
+            outbox.last_error = (
+                json.dumps({"kind": "signal_delivery_failure", **failure_metadata}, sort_keys=True)
+                if failure_metadata
+                else reason
+            )
             outbox.updated_at = now
             binding.state = "delivery_failed"
             binding.last_error = reason
@@ -1970,11 +1975,30 @@ class ManagedChannelService:
         actor_session_id: str,
         reason: str,
         now: datetime | None = None,
+        reconciliation_evidence: str | None = None,
     ) -> ManagedChannelRecoveryResult:
         """Release one expired failed route without retrying its delivery."""
 
         current = now or datetime.now(UTC)
+        if reconciliation_evidence is not None and not (
+            1 <= len(reconciliation_evidence.strip()) <= 500
+        ):
+            raise ValueError("Reconciliation evidence must contain 1–500 characters")
         async with self._session_factory() as session:
+            account_id = await session.scalar(
+                select(ManagedChannelBinding.account_id)
+                .join(
+                    ManagedConversationLink,
+                    ManagedConversationLink.link_id == ManagedChannelBinding.link_id,
+                )
+                .where(
+                    ManagedConversationLink.target_conversation_id == target_conversation_id,
+                    ManagedChannelBinding.user_email == user_email,
+                )
+            )
+            if account_id is None:
+                return ManagedChannelRecoveryResult(status="not_found")
+            await lock_channel_route(session, account_id)
             binding = await queries.get_managed_channel_binding_for_target(
                 session,
                 target_conversation_id,
@@ -1989,6 +2013,11 @@ class ManagedChannelService:
                 for_update=True,
             )
             if link is None or link.kind != "channel":
+                return ManagedChannelRecoveryResult(status="not_found")
+            if reconciliation_evidence is not None and (
+                link.controller_conversation_id != actor_conversation_id
+                or link.controller_agent_id != actor_agent_id
+            ):
                 return ManagedChannelRecoveryResult(status="not_found")
             metadata = (
                 dict(link.control_metadata) if isinstance(link.control_metadata, dict) else {}
@@ -2024,7 +2053,7 @@ class ManagedChannelService:
             if (
                 binding.state != "delivery_failed"
                 or binding.active_route_key is None
-                or _as_utc(binding.expires_at) > current
+                or (reconciliation_evidence is None and _as_utc(binding.expires_at) > current)
                 or _delivery_lease_active(binding, current)
             ):
                 return ManagedChannelRecoveryResult(
@@ -2037,6 +2066,26 @@ class ManagedChannelService:
                     outcome_uncertain=await managed_delivery_outcome_uncertain(session, binding),
                     route_reserved=binding.active_route_key is not None,
                 )
+            if reconciliation_evidence is not None:
+                from cognis.store.models import SignalDestinationPolicyRow
+
+                policy = await session.get(
+                    SignalDestinationPolicyRow, (binding.account_id, binding.chat_id)
+                )
+                if policy is not None and policy.state_json.get("admission"):
+                    return ManagedChannelRecoveryResult(status="not_eligible")
+                if not await managed_delivery_outcome_uncertain(session, binding):
+                    return ManagedChannelRecoveryResult(status="not_eligible")
+                active_send = await session.scalar(
+                    select(ChannelDeliveryOutboxRow.delivery_id)
+                    .where(
+                        ChannelDeliveryOutboxRow.managed_binding_id == binding.binding_id,
+                        ChannelDeliveryOutboxRow.status == "sending",
+                    )
+                    .limit(1)
+                )
+                if active_send is not None:
+                    return ManagedChannelRecoveryResult(status="not_eligible")
             audit = await _expire_binding(
                 session,
                 binding,
@@ -2044,12 +2093,16 @@ class ManagedChannelService:
                 now=current,
                 actor={
                     "type": "agent",
-                    "action": "release_expired",
+                    "action": "release_reconciled"
+                    if reconciliation_evidence
+                    else "release_expired",
                     "agent_id": actor_agent_id,
                     "conversation_id": actor_conversation_id,
                     "session_id": actor_session_id,
                     "reason": reason,
+                    "reconciliation_evidence": reconciliation_evidence,
                 },
+                require_expired=reconciliation_evidence is None,
             )
             if audit is None:
                 conflict_conversation_id = link.target_conversation_id
@@ -2286,6 +2339,7 @@ async def _expire_binding(
     *,
     now: datetime,
     actor: dict[str, Any],
+    require_expired: bool = True,
 ) -> dict[str, Any] | None:
     """Expire and audit one locked route without replaying input or delivery."""
 
@@ -2313,7 +2367,7 @@ async def _expire_binding(
                 ManagedChannelBinding.version == binding.version,
                 ManagedChannelBinding.state == prior_state,
                 ManagedChannelBinding.active_route_key == binding.active_route_key,
-                ManagedChannelBinding.expires_at <= now,
+                *([ManagedChannelBinding.expires_at <= now] if require_expired else []),
             )
             .values(
                 state="expired",

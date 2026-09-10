@@ -13,6 +13,28 @@ import {
 } from './tool-call-summary';
 
 describe('tool call summaries', () => {
+  it('keeps early reconciliation distinct from a successful resend', () => {
+    const presentation = managedConversationToolPresentation({
+      toolName: 'agent_conversation_recover_channel',
+      status: 'completed',
+      arguments: {
+        conversation_id: 'managed-target',
+        expected_owner_epoch: 2,
+        reason: 'Reconciled externally',
+        reconciliation_evidence: 'Recipient confirmed no arrival'
+      },
+      result: JSON.stringify({
+        status: 'released',
+        action: 'release_reconciled',
+        conversation_id: 'managed-target',
+        outcome_uncertain: true,
+        delivery_retried: false,
+        message: 'The route was released. Delivery remains uncertain; Signal policy is unchanged.'
+      })
+    });
+    expect(presentation?.resultSummary).toContain('Delivery remains uncertain');
+  });
+
   it('accepts one-shot recovery without fabricating a managed conversation', () => {
     const presentation = managedConversationToolPresentation({
       toolName: 'agent_conversation_recover_channel',

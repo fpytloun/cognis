@@ -500,6 +500,42 @@ async def test_wired_managed_channel_lifecycle(
         assert binding.delivery_lease_token is None
         if delivery_failure:
             assert binding.state == "delivery_failed"
+            from cognis.channels.signal_policy import SignalPolicyBlocked
+            from cognis.models.channel import OutboundMessage
+            from cognis.tools.builtin.channels import build_channel_tool_handlers
+            from tests.unit.test_channel_tools import _context
+
+            handlers = build_channel_tool_handlers(factory, application_secret="policy-test-secret")
+            detail = await handlers["get_channel_delivery"](
+                {"delivery_id": row.delivery_id}, _context()
+            )
+            assert detail["signal_policy"]["state"] == "manual_action_required"
+            assert json.loads(row.last_error)["provider_code"] == -5
+            guarded = app.state.channel_manager.get_adapter("account-1")
+            with pytest.raises(SignalPolicyBlocked):
+                await guarded.send_message(
+                    OutboundMessage(
+                        channel_type="signal",
+                        account_id="account-1",
+                        chat_id="chat-1",
+                        content="Must not be sent",
+                        thread_id="different-thread",
+                    )
+                )
+            await app.state.channel_manager._inbound_pipeline._send_system_message(
+                InboundMessage(
+                    channel_type="signal",
+                    account_id="account-1",
+                    chat_id="chat-1",
+                    sender_id="sender-1",
+                    message_id="reset-test",
+                    content="/reset",
+                    timestamp=datetime.now(UTC),
+                ),
+                app.state.channel_manager._configs["account-1"],
+                "Must not bypass local policy",
+            )
+            assert adapter.send_message.await_count == 1
             await stack.aclose()
             app = app_module.create_app()
             await stack.enter_async_context(app.router.lifespan_context(app))

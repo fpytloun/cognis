@@ -19325,7 +19325,15 @@ class AgentLoop:
             delivery_id = str(tc.arguments.get("delivery_id") or "").strip()
             expected_owner_epoch = int(tc.arguments.get("expected_owner_epoch") or 0)
             reason = str(tc.arguments.get("reason") or "").strip()
-            if bool(conversation_id) == bool(delivery_id) or (delivery_id and expected_owner_epoch):
+            evidence = tc.arguments.get("reconciliation_evidence")
+            if (
+                bool(conversation_id) == bool(delivery_id)
+                or (delivery_id and (expected_owner_epoch or evidence is not None))
+                or (
+                    evidence is not None
+                    and (not isinstance(evidence, str) or not 1 <= len(evidence.strip()) <= 500)
+                )
+            ):
                 return ToolResult(
                     output=json.dumps(
                         {
@@ -19410,10 +19418,11 @@ class AgentLoop:
                 actor_conversation_id=controller_conversation_id,
                 actor_session_id=controller_session_id,
                 reason=reason,
+                reconciliation_evidence=evidence,
             )
             payload = {
                 "status": result.status,
-                "action": "release_expired",
+                "action": "release_reconciled" if evidence is not None else "release_expired",
                 "conversation_id": result.conversation_id,
                 "owner_epoch": result.owner_epoch,
                 "prior_state": result.prior_state,
@@ -19448,16 +19457,17 @@ class AgentLoop:
                 payload.update(
                     code="managed_channel_recovery_not_eligible",
                     message=(
-                        "Recovery requires an expired delivery_failed route with no active "
-                        "delivery lease. No delivery was retried."
+                        "Recovery requires an expired delivery_failed route, or controller "
+                        "reconciliation of an uncertain failed route with no transport fence "
+                        "or active delivery lease. No delivery was retried."
                     ),
                 )
                 return ToolResult(output=json.dumps(payload, default=str), is_error=True)
             payload["message"] = (
-                "The expired managed route was already released."
+                "The managed route was already released."
                 if result.status == "already_released"
                 else (
-                    "The expired managed route was released. Delivery evidence remains "
+                    "The managed route was released. Delivery evidence and Signal policy remain "
                     "unchanged and held messages were not replayed."
                 )
             )
