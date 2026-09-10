@@ -2098,7 +2098,10 @@ async def test_failed_append_and_repair_persistence_retain_monotonic_intent(
     async with factory() as db:
         state = await db.scalar(select(WorkSessionProjectionRow))
     assert state is not None
-    assert (state.state, state.target_seq) == ("repair", 2)
+    # The normal repair worker can claim the persisted intent before this
+    # assertion. Both states preserve the monotonic target.
+    assert state.state in {"repair", "materializing"}
+    assert state.target_seq == 2
     assert "repair persisted" in caplog.text
     assert WORK_APPEND_PENDING._value.get() == 0
     assert WORK_APPEND_PENDING_BYTES._value.get() == 0
