@@ -8,6 +8,13 @@ import { sessionTimelineScope } from '$lib/chat-v2/types';
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   dispatch: vi.fn(),
+  sidebar: vi.fn(),
+}));
+vi.mock('$lib/api/client', () => ({
+  api: {
+    artifacts: { upload: vi.fn() },
+    conversations: { sidebar: mocks.sidebar },
+  },
 }));
 vi.mock('$lib/chat-v2/outbox', () => ({
   MemoryChatV2Outbox: class { list = mocks.list; },
@@ -36,6 +43,60 @@ describe('CompactConversationChat auxiliary content', () => {
   beforeEach(() => {
     mocks.list.mockReset().mockResolvedValue([]);
     mocks.dispatch.mockReset();
+    mocks.sidebar.mockReset().mockResolvedValue({
+      background_work: {
+        items: [{
+          kind: 'managed_conversation',
+          work_id: 'managed-one',
+          controller_conversation_id: 'conversation-one',
+          controller_session_id: 'session-root',
+          target_conversation_id: 'conversation-child',
+          title: 'Managed follow-up',
+          agent_id: 'riker',
+          status: 'running',
+          todos: [],
+        }, {
+          kind: 'background_command',
+          work_id: 'command-one',
+          controller_conversation_id: 'conversation-one',
+          controller_session_id: 'session-root',
+          title: 'Build frontend',
+          agent_id: 'riker',
+          status: 'running',
+          todos: [],
+        }, {
+          kind: 'delegated_session',
+          work_id: 'session-child',
+          controller_conversation_id: 'conversation-one',
+          parent_session_id: 'session-root',
+          session_id: 'session-child',
+          title: 'Stale projected title',
+          agent_id: 'riker',
+          status: 'running',
+          todos: [],
+        }, {
+          kind: 'background_command',
+          work_id: 'other-root-command',
+          controller_conversation_id: 'conversation-one',
+          controller_session_id: 'session-other-root',
+          title: 'Other root command',
+          agent_id: 'riker',
+          status: 'running',
+          todos: [],
+        }, {
+          kind: 'background_command',
+          work_id: 'other-command',
+          controller_conversation_id: 'conversation-other',
+          title: 'Other conversation command',
+          agent_id: 'riker',
+          status: 'running',
+          todos: [],
+        }],
+        active_count: 5,
+        truncated: false,
+        generated_at: '2026-09-10T07:51:00Z',
+      },
+    });
   });
   beforeAll(() => {
     vi.stubGlobal('ResizeObserver', class {
@@ -47,12 +108,14 @@ describe('CompactConversationChat auxiliary content', () => {
   it('renders one editable queue inside a bounded panel while preserving timeline and composer', async () => {
     render(CompactConversationChat, {
       conversationId: 'conversation-one',
+      controllerSessionIds: ['session-root'],
       embedded: true,
     });
 
     expect(await screen.findByText('Queued once')).toBeInTheDocument();
     expect(screen.getAllByText('Queued once')).toHaveLength(1);
     expect(screen.getByTestId('compact-timeline-fixture')).toHaveAttribute('data-show-queue', 'false');
+    expect(screen.getByTestId('compact-timeline-fixture')).toHaveAttribute('data-show-todo-drawer', 'false');
     expect(screen.getByTestId('pending-interactions-fixture')).toBeInTheDocument();
     expect(screen.getByTestId('pending-interactions-fixture')).toHaveAttribute(
       'data-presentation',
@@ -71,6 +134,8 @@ describe('CompactConversationChat auxiliary content', () => {
     expect(screen.getByTestId('compact-timeline-fixture')).toHaveClass('min-h-0', 'flex-1');
     expect(screen.getByTestId('compact-composer-fixture')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Ongoing work/ })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: /Ongoing work · 3 running · 2 sessions · 1 command · 1 todo/ })).toBeInTheDocument();
+    expect(screen.getAllByRole('button', { name: /Ongoing work/ })).toHaveLength(1);
   });
 
   it('does not expose parent conversation controls while viewing a child session', async () => {

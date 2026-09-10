@@ -52,6 +52,43 @@ function overview(targetScope: TimelineScope = scope): ActivityOverviewResponse 
   };
 }
 
+function overviewWithFocusedSession(): ActivityOverviewResponse {
+  return {
+    ...overview(),
+    workstreams: [{
+      key: 'root',
+      kind: 'conversation',
+      parent_key: null,
+      root_key: 'root',
+      edge_kind: 'root',
+      ordinal: 0,
+      conversation_id: 'conversation-1',
+      session_id: 'session-1',
+      event_store_session_id: 'session-1',
+      title: 'Focused root session',
+      agent_id: 'riker',
+      status: 'running',
+      current: true,
+      superseded: false,
+      activity_state: 'ongoing',
+      execution_state: 'running',
+    }],
+  };
+}
+
+function overviewWithRotatedFocusedSession(): ActivityOverviewResponse {
+  const value = overviewWithFocusedSession();
+  return {
+    ...value,
+    workstreams: value.workstreams.map((node) => ({
+      ...node,
+      session_id: 'session-current',
+      backing_session_ids: ['session-1'],
+      title: 'Rotated focused session',
+    })),
+  };
+}
+
 function deferred<T>(): {
   promise: Promise<T>;
   resolve: (value: T) => void;
@@ -118,6 +155,22 @@ describe('SharedInspectorTabs', () => {
 
     await waitFor(() => expect(mocks.activityOverview).toHaveBeenCalledOnce());
     expect(mocks.activityOverview.mock.calls[0]?.[1]).not.toMatchObject({ detail: 'full' });
+  });
+
+  it('resolves the focused session card from the same activity overview', async () => {
+    mocks.activityOverview.mockResolvedValue(overviewWithFocusedSession());
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1' });
+
+    expect(await screen.findByTestId('focused-session-card')).toHaveTextContent('Focused root session');
+    expect(screen.queryByTestId('focused-session-loading')).not.toBeInTheDocument();
+  });
+
+  it('resolves a rotated focused session through its backing session IDs', async () => {
+    mocks.activityOverview.mockResolvedValue(overviewWithRotatedFocusedSession());
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1' });
+
+    expect(await screen.findByTestId('focused-session-card')).toHaveTextContent('Rotated focused session');
+    expect(screen.queryByTestId('focused-session-loading')).not.toBeInTheDocument();
   });
 
   it('keeps Session content visible during a background Overview refresh', async () => {

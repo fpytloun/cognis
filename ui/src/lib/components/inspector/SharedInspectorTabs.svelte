@@ -13,6 +13,7 @@
   } from '$lib/activityOverviewCache';
   import type { Agent, ContextUsage } from '$lib/types/api';
   import { untrack } from 'svelte';
+  import { nodeMatchesFocus } from '$lib/activityTreeState';
 
   let {
     scope,
@@ -69,6 +70,9 @@
   let overviewGeneration = 0;
   let sessionGeneration = 0;
   let overviewAbortController: AbortController | null = null;
+  const focusedSession = $derived(
+    overview?.workstreams.find((node) => nodeMatchesFocus(node, sessionId)) ?? null,
+  );
 
   async function load(tab = activeTab): Promise<void> {
     if (headerOnly) return;
@@ -202,7 +206,7 @@
     {:else if activeTab === 'session' && sessionError && !session}
       <p class="text-xs text-rose-300" role="alert">{sessionError}</p>
     {:else if activeTab === 'overview' && overview}
-      <InspectorOverview {overview} {agents} focusedSessionId={sessionId} {contextUsage} {diagnosticsFreshness} onOpenWork={openWork} {onViewSession} narrow />
+      <InspectorOverview {overview} {agents} {focusedSession} focusedSessionId={sessionId} {contextUsage} {diagnosticsFreshness} onOpenWork={openWork} {onViewSession} narrow />
     {:else if activeTab === 'work'}
       <WorkView {scope} initialTab={workCategory === 'deliverables' ? 'results' : workCategory} forceInitialTab {onViewSession} />
     {:else if activeTab === 'session' && session}

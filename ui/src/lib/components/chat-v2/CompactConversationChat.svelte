@@ -17,9 +17,10 @@
   import { createIndexedDbChatV2Outbox, MemoryChatV2Outbox } from '$lib/chat-v2/outbox';
   import { conversationTimelineScope, type CommandV2Response, type QueueMessage, type QueueMutationResponse, type TimelineScope, type WorkstreamRef } from '$lib/chat-v2/types';
   import { handleClipboardFilePaste } from '$lib/clipboard';
-  import type { Agent, AttachmentRef } from '$lib/types/api';
+  import type { Agent, AttachmentRef, BackgroundWorkItem } from '$lib/types/api';
   import type { SendMessageV2Response } from '$lib/chat-v2/types';
   import type { TodoSnapshotItem } from '$lib/todos';
+  import { directChildBackgroundWork, mergeCurrentCycleDelegations } from '$lib/ongoing-work';
 
   /**
    * Small reusable native chat for a plain conversation, used by the Control
@@ -63,6 +64,7 @@
     onRuntimeActiveChange,
     onInitialLoaded,
     timelineScope,
+    controllerSessionIds = [],
     onViewSession,
   } = $props<{
     conversationId: string;
@@ -75,6 +77,7 @@
     onRuntimeActiveChange?: (active: boolean) => void;
     onInitialLoaded?: () => void | Promise<void>;
     timelineScope?: TimelineScope;
+    controllerSessionIds?: string[];
     onViewSession?: (sessionId: string, node?: WorkstreamRef) => void;
   }>();
 
@@ -92,6 +95,10 @@
   let queuedMessages = $state<QueueMessage[]>([]);
   let commandResult = $state<CommandV2Response | null>(null);
   let todos = $state<TodoSnapshotItem[]>([]);
+  let currentCycleWork = $state<BackgroundWorkItem[]>([]);
+  let projectedWork = $state<BackgroundWorkItem[]>([]);
+  let workTruncated = $state(false);
+  let workGeneration = 0;
   let ongoingWorkOpen = $state(false);
   let composerElement = $state<HTMLElement | null>(null);
   let composerHeight = $state(0);
@@ -103,6 +110,9 @@
   const outbox = typeof indexedDB === 'undefined' ? new MemoryChatV2Outbox() : createIndexedDbChatV2Outbox();
   const scope = $derived(timelineScope ?? conversationTimelineScope(conversationId));
   const editableScope = $derived(scope.kind === 'conversation');
+  const ongoingWork = $derived(
+    mergeCurrentCycleDelegations(projectedWork, currentCycleWork),
+  );
   const draftKey = $derived(`cognis:chat-v2-draft:${conversationId}`);
 
   $effect(() => {
@@ -121,6 +131,41 @@
     sending = false;
     error = '';
     if (initialAutoTail) userScrolledUp = false;
+  });
+
+  async function loadProjectedWork(
+    currentId = conversationId,
+    sessionIds = controllerSessionIds,
+  ): Promise<void> {
+    const generation = ++workGeneration;
+    try {
+      const projection = await api.conversations.sidebar();
+      if (generation !== workGeneration || currentId !== conversationId) return;
+      projectedWork = directChildBackgroundWork(
+        (projection.background_work?.items ?? []).filter(
+          (item) => item.controller_conversation_id === currentId,
+        ),
+        new Set(sessionIds),
+      );
+      workTruncated = projection.background_work?.truncated ?? false;
+    } catch {
+      // Current-cycle timeline data remains available when sidebar projection fails.
+    }
+  }
+
+  $effect(() => {
+    const currentId = conversationId;
+    const sessionIds = controllerSessionIds;
+    projectedWork = [];
+    workTruncated = false;
+    void loadProjectedWork(currentId, sessionIds);
+  });
+
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    const refresh = () => { void loadProjectedWork(); };
+    window.addEventListener('cognis:work-invalidated', refresh);
+    return () => window.removeEventListener('cognis:work-invalidated', refresh);
   });
 
   $effect(() => {
@@ -338,18 +383,20 @@
     compact
     hasEditableComposer={editableScope}
     showQueuedMessages={false}
+    showTodoDrawer={false}
     emptyLabel={emptyLabel}
     onRuntimeActiveChange={setRuntimeActive}
     {onInitialLoaded}
     {onViewSession}
     onTodosChange={(next) => { todos = next; }}
+    onOngoingWorkChange={(next) => { currentCycleWork = next; }}
     onQueueChange={(queue) => {
       queuedMessages = queue;
     }}
   />
-  {#if todos.length}
-    <div class="shrink-0 px-3 pt-3" data-testid="compact-chat-ongoing-work">
-      <TimelineOngoingWorkDrawer {todos} work={[]} bind:open={ongoingWorkOpen} {onViewSession} />
+  {#if todos.length || ongoingWork.length}
+    <div class="shrink-0 border-t border-slate-800/80 px-4 py-3" data-testid="compact-chat-ongoing-work">
+      <TimelineOngoingWorkDrawer {todos} work={ongoingWork} truncated={workTruncated} bind:open={ongoingWorkOpen} {onViewSession} />
     </div>
   {/if}
   {#if editableScope}

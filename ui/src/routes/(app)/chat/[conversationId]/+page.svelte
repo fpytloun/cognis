@@ -10549,10 +10549,7 @@ import X from 'lucide-svelte/icons/x';
                     : 'Loading focused activity…'}
                 </p>
                {:else if renderedActivityOverview && overviewReadPresentation.ready}
-                 {#if overviewReadPresentation.refreshing}
-                   <p class="mb-2 text-xs text-slate-500">Refreshing activity overview…</p>
-                 {/if}
-                 <InspectorOverview
+                  <InspectorOverview
                   overview={renderedActivityOverview}
                   {agents}
                   focusedSession={focusedWorkstream}

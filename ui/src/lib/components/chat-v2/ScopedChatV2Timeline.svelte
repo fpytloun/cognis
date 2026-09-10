@@ -10,7 +10,7 @@
   import { selectLatestTodoState } from '$lib/chat-v2/selectors';
   import { ChatV2Store } from '$lib/chat-v2/store.svelte';
   import type { QueueMessage, QueueMutationResponse, TimelineScope, TurnCycleState } from '$lib/chat-v2/types';
-  import type { Agent, CognisWebSocketEvent, StepRun, UserPreferences } from '$lib/types/api';
+  import type { Agent, BackgroundWorkItem, CognisWebSocketEvent, StepRun, UserPreferences } from '$lib/types/api';
   import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
   import { userPreferences } from '$lib/stores/userPreferences';
   import { wsClient } from '$lib/ws/client';
@@ -22,6 +22,7 @@
   } from '$lib/chat-v2/types';
   import type { AttachmentRef } from '$lib/types/api';
   import type { TodoSnapshotItem } from '$lib/todos';
+  import { currentCycleDelegations } from '$lib/ongoing-work';
 
   export interface ScopedChatV2Realtime {
     subscribe: (listener: (event: any) => void) => () => void;
@@ -39,12 +40,14 @@
     onViewSession,
     emptyLabel = 'No events recorded yet.',
     onTodosChange,
+    onOngoingWorkChange,
     onMissingStream,
     activityStatus = '',
     stepRun = null,
     onRuntimeActiveChange,
     hasEditableComposer = false,
     showQueuedMessages = true,
+    showTodoDrawer = true,
     onQueueChange,
     onInitialLoaded,
     autoBackfill = undefined,
@@ -59,12 +62,14 @@
     onViewSession?: (sessionId: string) => void | Promise<void>;
     emptyLabel?: string;
     onTodosChange?: (todos: TodoSnapshotItem[]) => void;
+    onOngoingWorkChange?: (work: BackgroundWorkItem[]) => void;
     onMissingStream?: (() => void) | undefined;
     activityStatus?: string;
     stepRun?: StepRun | null;
     onRuntimeActiveChange?: ((active: boolean) => void) | undefined;
     hasEditableComposer?: boolean;
     showQueuedMessages?: boolean;
+    showTodoDrawer?: boolean;
     onQueueChange?: ((queue: QueueMessage[]) => void) | undefined;
     onInitialLoaded?: (() => void | Promise<void>) | undefined;
     autoBackfill?: boolean | undefined;
@@ -117,11 +122,21 @@
   const effectivePreferences = $derived(preferences ?? $userPreferences ?? DEFAULT_USER_PREFERENCES);
   const cycleStates = $derived<TurnCycleState[]>(store.cycleStates);
   const todos = $derived(selectLatestTodoState(items));
+  const currentCycleWork = $derived(currentCycleDelegations(
+    items,
+    cycleStates,
+    store.snapshot.runtime?.active_turn?.turn_id,
+    scope.conversation_id ?? '',
+  ));
   const queue = $derived(store.visibleQueue.messages);
   const effectiveAutoBackfill = $derived(autoBackfill ?? !hasEditableComposer);
   $effect(() => {
     const nextTodos = todos;
     untrack(() => onTodosChange?.(nextTodos));
+  });
+  $effect(() => {
+    const nextWork = currentCycleWork;
+    untrack(() => onOngoingWorkChange?.(nextWork));
   });
   $effect(() => {
     const nextQueue = queue;
@@ -742,7 +757,7 @@
       <TaskStepOutcomeEpilogue {stepRun} />
     {/if}
   </TimelineViewport>
-  {#if todos.length > 0}
+  {#if showTodoDrawer && todos.length > 0}
     <div class="shrink-0 border-t border-slate-800/80 px-4 py-3">
       <TimelineTodoDrawer {todos} bind:open={todoDrawerOpen} />
     </div>

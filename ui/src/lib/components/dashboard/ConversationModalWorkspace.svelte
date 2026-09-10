@@ -75,6 +75,10 @@
     ? sessionTimelineScope(selectedSession.sessionId, selectedSession.conversationId)
     : conversationTimelineScope(effectiveConversationId));
   const displayedSessionId = $derived(selectedSession?.sessionId ?? effectiveSessionId);
+  const controllerSessionIds = $derived([
+    displayedSessionId,
+    ...(selectedSession?.node?.backing_session_ids ?? []),
+  ].filter(Boolean));
   const diagnosticsScope = $derived(displayedSessionId
     ? sessionTimelineScope(
         displayedSessionId,
@@ -327,6 +331,7 @@
       <CompactConversationChat
         conversationId={effectiveConversationId}
         timelineScope={scope}
+        {controllerSessionIds}
         {agent}
         embedded
         initialAutoTail

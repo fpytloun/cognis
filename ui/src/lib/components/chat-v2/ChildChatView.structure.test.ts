@@ -263,13 +263,13 @@ describe('ChildChatView shell ownership', () => {
     expect(focus).not.toContain('intarisDetail');
   });
 
-  it('renders pending and actual-error states from the scoped read owner', () => {
+  it('renders pending and actual-error states without a layout-shifting refresh label', () => {
     const overviewPanel = pageSource.slice(
       pageSource.indexOf("{#if headerInfoMode === 'overview' || headerInfoMode === 'context'}"),
       pageSource.indexOf("{:else if headerInfoMode === 'work'}"),
     );
     expect(overviewPanel).toContain('overviewReadPresentation.loading');
-    expect(overviewPanel).toContain('overviewReadPresentation.refreshing');
+    expect(overviewPanel).not.toContain('Refreshing activity overview');
     expect(overviewPanel).toContain('overviewReadPresentation.error');
     expect(overviewPanel).not.toContain("?? 'Unable to load activity overview.'");
   });
