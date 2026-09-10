@@ -4,10 +4,19 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to publish
+        required: true
+        type: string
 
 permissions:
   contents: read
   packages: write
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+  RELEASE_CREATED: ${{ github.event.release.published_at || github.event.repository.updated_at }}
 
 jobs:
   controller-publish:
@@ -15,6 +24,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tagged revision
+        run: |
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${RELEASE_TAG}^{commit}")"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -35,15 +48,15 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.event.release.tag_name }}
+            ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
             ghcr.io/${{ github.repository }}:latest
           labels: |
             org.opencontainers.image.title=cognis-controller
             org.opencontainers.image.description=Cognis controller image
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.event.release.tag_name }}
-            org.opencontainers.image.created=${{ github.event.release.published_at }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.RELEASE_CREATED }}
           cache-from: type=gha,scope=controller
           cache-to: type=gha,mode=max,scope=controller
 
@@ -52,7 +65,7 @@ jobs:
           mkdir -p docker-image-artifacts
           {
             printf 'image=ghcr.io/%s\n' '${{ github.repository }}'
-            printf 'release_tag=%s\n' '${{ github.event.release.tag_name }}'
+            printf 'release_tag=%s\n' '${{ env.RELEASE_TAG }}'
             printf 'digest=%s\n' '${{ steps.build.outputs.digest }}'
           } > docker-image-artifacts/controller.txt
 
@@ -67,6 +80,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - name: Verify tagged revision
+        run: |
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "${RELEASE_TAG}^{commit}")"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -91,14 +108,14 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-executor:minimal
-            ghcr.io/${{ github.repository }}-executor:${{ github.event.release.tag_name }}-minimal
+            ghcr.io/${{ github.repository }}-executor:${{ env.RELEASE_TAG }}-minimal
           labels: |
             org.opencontainers.image.title=cognis-executor-minimal
             org.opencontainers.image.description=Minimal Cognis remote executor
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.event.release.tag_name }}-minimal
-            org.opencontainers.image.created=${{ github.event.release.published_at }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}-minimal
+            org.opencontainers.image.created=${{ env.RELEASE_CREATED }}
           cache-from: type=gha,scope=executor
 
       - name: Build and push general executor
@@ -113,15 +130,15 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-executor:latest
             ghcr.io/${{ github.repository }}-executor:general
-            ghcr.io/${{ github.repository }}-executor:${{ github.event.release.tag_name }}
-            ghcr.io/${{ github.repository }}-executor:${{ github.event.release.tag_name }}-general
+            ghcr.io/${{ github.repository }}-executor:${{ env.RELEASE_TAG }}
+            ghcr.io/${{ github.repository }}-executor:${{ env.RELEASE_TAG }}-general
           labels: |
             org.opencontainers.image.title=cognis-executor
             org.opencontainers.image.description=General-purpose Cognis remote executor
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.event.release.tag_name }}
-            org.opencontainers.image.created=${{ github.event.release.published_at }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}
+            org.opencontainers.image.created=${{ env.RELEASE_CREATED }}
           cache-from: type=gha,scope=executor
 
       - name: Build and push development executor
@@ -135,14 +152,14 @@ jobs:
           push: true
           tags: |
             ghcr.io/${{ github.repository }}-executor:development
-            ghcr.io/${{ github.repository }}-executor:${{ github.event.release.tag_name }}-development
+            ghcr.io/${{ github.repository }}-executor:${{ env.RELEASE_TAG }}-development
           labels: |
             org.opencontainers.image.title=cognis-executor-development
             org.opencontainers.image.description=Cognis remote executor with preinstalled language servers
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.event.release.tag_name }}-development
-            org.opencontainers.image.created=${{ github.event.release.published_at }}
+            org.opencontainers.image.version=${{ env.RELEASE_TAG }}-development
+            org.opencontainers.image.created=${{ env.RELEASE_CREATED }}
           cache-from: type=gha,scope=executor
           cache-to: type=gha,mode=max,scope=executor
 
@@ -151,7 +168,7 @@ jobs:
           mkdir -p docker-image-artifacts
           {
             printf 'image=ghcr.io/%s-executor\n' '${{ github.repository }}'
-            printf 'release_tag=%s\n' '${{ github.event.release.tag_name }}'
+            printf 'release_tag=%s\n' '${{ env.RELEASE_TAG }}'
             printf 'minimal_digest=%s\n' '${{ steps.build_minimal.outputs.digest }}'
             printf 'general_digest=%s\n' '${{ steps.build_general.outputs.digest }}'
             printf 'development_digest=%s\n' '${{ steps.build_development.outputs.digest }}'
