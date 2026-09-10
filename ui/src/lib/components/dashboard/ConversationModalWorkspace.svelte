@@ -82,13 +82,18 @@
     ? sessionTimelineScope(selectedSession.sessionId, selectedSession.conversationId)
     : conversationTimelineScope(effectiveConversationId));
   const displayedSessionId = $derived(selectedSession?.sessionId ?? effectiveSessionId);
+  const activeRootSessionIds = $derived(
+    rootSessionsConversationId === effectiveConversationId
+      ? activeRootSessionLineageIds(rootSessions, effectiveSessionId)
+      : new Set<string>(),
+  );
   const controllerSessionIds = $derived(selectedSession
     ? [
         displayedSessionId,
         ...(selectedSession.node?.backing_session_ids ?? []),
       ].filter(Boolean)
-    : rootSessionsConversationId === effectiveConversationId
-      ? [...activeRootSessionLineageIds(rootSessions, effectiveSessionId)]
+    : activeRootSessionIds.size > 0
+      ? [...activeRootSessionIds]
       : [effectiveSessionId].filter(Boolean));
   const diagnosticsScope = $derived(displayedSessionId
     ? sessionTimelineScope(
@@ -115,6 +120,7 @@
 
   $effect(() => {
     const currentConversationId = effectiveConversationId;
+    const currentSessionId = effectiveSessionId;
     if (!currentConversationId) return;
     const request = ++rootSessionsRequest;
     void api.conversations.sessions(currentConversationId, {
@@ -122,11 +128,19 @@
       limit: 200,
       order: 'desc',
     }).then((sessions) => {
-      if (request !== rootSessionsRequest || currentConversationId !== effectiveConversationId) return;
+      if (
+        request !== rootSessionsRequest
+        || currentConversationId !== effectiveConversationId
+        || currentSessionId !== effectiveSessionId
+      ) return;
       rootSessions = sessions;
       rootSessionsConversationId = currentConversationId;
     }).catch(() => {
-      if (request !== rootSessionsRequest || currentConversationId !== effectiveConversationId) return;
+      if (
+        request !== rootSessionsRequest
+        || currentConversationId !== effectiveConversationId
+        || currentSessionId !== effectiveSessionId
+      ) return;
       rootSessions = [];
       rootSessionsConversationId = '';
     });

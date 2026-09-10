@@ -178,6 +178,11 @@ describe('ConversationModalWorkspace inspector', () => {
       expect(screen.getByTestId('compact-chat-controller-sessions'))
         .toHaveTextContent('session-root,session-predecessor');
     });
+    await fireEvent.click(screen.getByRole('button', { name: 'Rotate session' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('compact-chat-controller-sessions'))
+        .toHaveTextContent('session-rotated');
+    });
     await fireEvent.click(screen.getByRole('button', { name: 'View child session' }));
 
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('session:session-child');

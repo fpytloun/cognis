@@ -1,8 +1,15 @@
 <script lang="ts">
-  let { conversationId, timelineScope, controllerSessionIds = [], onViewSession }: {
+  let {
+    conversationId,
+    timelineScope,
+    controllerSessionIds = [],
+    onCommandResponse,
+    onViewSession,
+  }: {
     conversationId: string;
     timelineScope?: { key: string };
     controllerSessionIds?: string[];
+    onCommandResponse?: (response: { data?: Record<string, unknown> }) => void;
     onViewSession?: (sessionId: string, node?: Record<string, unknown>) => void;
   } = $props();
   let draft = $state('');
@@ -11,6 +18,12 @@
 <input data-testid={`compact-chat-draft-${conversationId}`} bind:value={draft} />
 <span data-testid="compact-chat-scope">{timelineScope?.key}</span>
 <span data-testid="compact-chat-controller-sessions">{controllerSessionIds.join(',')}</span>
+<button
+  type="button"
+  onclick={() => onCommandResponse?.({
+    data: { conversation_id: conversationId, session_id: 'session-rotated' },
+  })}
+>Rotate session</button>
 <button
   type="button"
   onclick={() => onViewSession?.('session-child', {
