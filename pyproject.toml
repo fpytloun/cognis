@@ -95,6 +95,7 @@ cognis-controller = "cognis.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cognis"]
+artifacts = ["cognis/ui_dist/**"]
 
 [tool.uv.workspace]
 members = ["packages/common", "packages/executor"]
