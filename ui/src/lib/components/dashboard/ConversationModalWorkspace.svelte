@@ -11,16 +11,20 @@
     type WorkstreamRef,
   } from '$lib/chat-v2/types';
   import {
+    activeRootSessionLineageIds,
+  } from '$lib/ongoing-work';
+  import {
     FocusedSessionDiagnosticsController,
     type FocusedSessionDiagnosticsState,
   } from '$lib/focusedSessionDiagnostics';
   import { chatV2Api } from '$lib/chat-v2/api';
+  import { api } from '$lib/api/client';
   import { wsClient } from '$lib/ws/client';
   import {
     INSPECTOR_MAX_WIDTH,
     INSPECTOR_MIN_WIDTH,
   } from '$lib/stores/conversationInfo.svelte';
-  import type { Agent } from '$lib/types/api';
+  import type { Agent, Session } from '$lib/types/api';
 
   let {
     conversationId,
@@ -64,6 +68,9 @@
   let effectiveConversationId = $state('');
   let effectiveSessionId = $state('');
   let selectedSession = $state<SelectedSession | null>(null);
+  let rootSessions = $state<Session[]>([]);
+  let rootSessionsConversationId = $state('');
+  let rootSessionsRequest = 0;
   let focusedDiagnostics = $state<FocusedSessionDiagnosticsState>({
     sessionId: null,
     contextUsage: null,
@@ -75,10 +82,14 @@
     ? sessionTimelineScope(selectedSession.sessionId, selectedSession.conversationId)
     : conversationTimelineScope(effectiveConversationId));
   const displayedSessionId = $derived(selectedSession?.sessionId ?? effectiveSessionId);
-  const controllerSessionIds = $derived([
-    displayedSessionId,
-    ...(selectedSession?.node?.backing_session_ids ?? []),
-  ].filter(Boolean));
+  const controllerSessionIds = $derived(selectedSession
+    ? [
+        displayedSessionId,
+        ...(selectedSession.node?.backing_session_ids ?? []),
+      ].filter(Boolean)
+    : rootSessionsConversationId === effectiveConversationId
+      ? [...activeRootSessionLineageIds(rootSessions, effectiveSessionId)]
+      : [effectiveSessionId].filter(Boolean));
   const diagnosticsScope = $derived(displayedSessionId
     ? sessionTimelineScope(
         displayedSessionId,
@@ -100,6 +111,25 @@
     effectiveConversationId = conversationId;
     effectiveSessionId = sessionId;
     selectedSession = null;
+  });
+
+  $effect(() => {
+    const currentConversationId = effectiveConversationId;
+    if (!currentConversationId) return;
+    const request = ++rootSessionsRequest;
+    void api.conversations.sessions(currentConversationId, {
+      rootOnly: true,
+      limit: 200,
+      order: 'desc',
+    }).then((sessions) => {
+      if (request !== rootSessionsRequest || currentConversationId !== effectiveConversationId) return;
+      rootSessions = sessions;
+      rootSessionsConversationId = currentConversationId;
+    }).catch(() => {
+      if (request !== rootSessionsRequest || currentConversationId !== effectiveConversationId) return;
+      rootSessions = [];
+      rootSessionsConversationId = '';
+    });
   });
 
   $effect(() => {

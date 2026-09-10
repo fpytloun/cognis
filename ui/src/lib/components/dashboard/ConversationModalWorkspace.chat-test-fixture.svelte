@@ -1,7 +1,8 @@
 <script lang="ts">
-  let { conversationId, timelineScope, onViewSession }: {
+  let { conversationId, timelineScope, controllerSessionIds = [], onViewSession }: {
     conversationId: string;
     timelineScope?: { key: string };
+    controllerSessionIds?: string[];
     onViewSession?: (sessionId: string, node?: Record<string, unknown>) => void;
   } = $props();
   let draft = $state('');
@@ -9,6 +10,7 @@
 
 <input data-testid={`compact-chat-draft-${conversationId}`} bind:value={draft} />
 <span data-testid="compact-chat-scope">{timelineScope?.key}</span>
+<span data-testid="compact-chat-controller-sessions">{controllerSessionIds.join(',')}</span>
 <button
   type="button"
   onclick={() => onViewSession?.('session-child', {

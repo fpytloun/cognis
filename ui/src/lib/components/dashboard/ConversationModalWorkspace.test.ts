@@ -3,6 +3,28 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import ConversationModalWorkspace from './ConversationModalWorkspace.svelte';
 
+vi.mock('$lib/api/client', () => ({
+  api: {
+    conversations: {
+      sessions: vi.fn(async () => [
+        {
+          session_id: 'session-root',
+          conversation_id: 'conversation-one',
+          parent_session_id: null,
+          previous_session_id: 'session-predecessor',
+          activity_scope_id: 'scope-one',
+        },
+        {
+          session_id: 'session-predecessor',
+          conversation_id: 'conversation-one',
+          parent_session_id: null,
+          previous_session_id: null,
+          activity_scope_id: 'scope-one',
+        },
+      ]),
+    },
+  },
+}));
 vi.mock('$lib/components/chat-v2/CompactConversationChat.svelte', async () => (
   import('./ConversationModalWorkspace.chat-test-fixture.svelte')
 ));
@@ -152,6 +174,10 @@ describe('ConversationModalWorkspace inspector', () => {
     });
 
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-one');
+    await waitFor(() => {
+      expect(screen.getByTestId('compact-chat-controller-sessions'))
+        .toHaveTextContent('session-root,session-predecessor');
+    });
     await fireEvent.click(screen.getByRole('button', { name: 'View child session' }));
 
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('session:session-child');
