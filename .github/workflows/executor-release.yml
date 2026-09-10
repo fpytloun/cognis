@@ -43,7 +43,7 @@ jobs:
           - architecture: arm64
             runner: macos-14
           - architecture: x86_64
-            runner: macos-13
+            runner: macos-15-intel
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
