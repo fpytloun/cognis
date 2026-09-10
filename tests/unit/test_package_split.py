@@ -133,10 +133,15 @@ def test_missing_optional_components_do_not_import_or_register() -> None:
     assert "document_generate" not in handlers
 
 
-def test_editable_workspace_exposes_both_trees_and_one_version() -> None:
+def test_editable_workspace_exposes_both_trees_and_one_version(tmp_path: Path) -> None:
+    environment = {
+        **os.environ,
+        "UV_PROJECT_ENVIRONMENT": str(tmp_path / ".venv"),
+    }
     subprocess.run(
         ["uv", "sync", "--all-packages", "--all-extras"],
         cwd=REPOSITORY_ROOT,
+        env=environment,
         check=True,
         capture_output=True,
         text=True,
@@ -155,6 +160,7 @@ def test_editable_workspace_exposes_both_trees_and_one_version() -> None:
             ),
         ],
         cwd=REPOSITORY_ROOT,
+        env=environment,
         check=True,
         capture_output=True,
         text=True,

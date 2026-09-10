@@ -1006,8 +1006,8 @@ async def test_deliver_outbox_persists_signal_uncertainty_without_resend(
         '"kind": "signal_delivery_failure", "next_step": "Do not resend automatically. '
         'Reconcile Signal delivery externally before any manual resend.", '
         '"provider": "signal-cli", "provider_code": -5, '
-        '"retry_after_seconds": 7.0, "retry_scheduled": false, '
-        '"side_effect_certainty": "uncertain"}'
+        '"result_count": 0, "retry_after_seconds": 7.0, "retry_scheduled": false, '
+        '"side_effect_certainty": "uncertain", "success_count": 0}'
     )
 
     row.status = "pending"

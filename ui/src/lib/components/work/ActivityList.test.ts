@@ -47,7 +47,7 @@ function activity(overrides: Partial<WorkActivityItem> = {}): WorkActivityItem {
     },
     project: { project_id: 'project-server-owned', name: 'Cognis' },
     status: 'running',
-    last_activity_at: '2026-08-11T20:00:00Z',
+    last_activity_at: new Date(Date.now() - 60_000).toISOString(),
     summary: {
       mutations: 2,
       commands: 3,

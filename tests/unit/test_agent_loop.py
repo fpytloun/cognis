@@ -6093,6 +6093,7 @@ async def test_agent_conversation_recover_channel_returns_auditable_safe_result(
         actor_conversation_id="conv-controller",
         actor_session_id="controller-session",
         reason="The reconciliation boundary passed.",
+        reconciliation_evidence=None,
     )
 
 
