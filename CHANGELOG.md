@@ -14,6 +14,7 @@ All notable changes to this project will be documented in this file.
 - Improved managed channel lifecycle controls, delivery recovery, and route occupancy diagnostics.
 - Improved compact dashboard chat windows, conversation inspector state, and rich deliverable navigation across responsive layouts.
 - Improved Work projection seeding, materialization recovery, and browser release coverage.
+- Improved direct web search with bounded DDGS engine selection, diagnostics, and deadlines.
 
 ### Fixed
 
