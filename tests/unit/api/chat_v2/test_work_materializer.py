@@ -4894,8 +4894,8 @@ async def test_urgent_lane_rotates_stale_siblings_while_root_keeps_appending(
         siblings_caught_up.set()
         if appender is not None:
             await appender
-        store.release.set()
         await materializer.stop()
+        store.release.set()
         await engine.dispose()
 
 
