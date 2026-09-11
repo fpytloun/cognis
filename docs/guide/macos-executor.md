@@ -99,16 +99,16 @@ hardware for each architecture. Generate a development formula with explicit
 
 ```bash
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture arm64 --output "$PWD/cognis-executor-0.14.1-macos-arm64.tar.gz"
+  --architecture arm64 --output "$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz"
 python3 packaging/homebrew/build_executor_asset.py \
-  --architecture x86_64 --output "$PWD/cognis-executor-0.14.1-macos-x86_64.tar.gz"
-arm_sha="$(shasum -a 256 cognis-executor-0.14.1-macos-arm64.tar.gz | awk '{print $1}')"
-intel_sha="$(shasum -a 256 cognis-executor-0.14.1-macos-x86_64.tar.gz | awk '{print $1}')"
+  --architecture x86_64 --output "$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz"
+arm_sha="$(shasum -a 256 cognis-executor-0.14.2-macos-arm64.tar.gz | awk '{print $1}')"
+intel_sha="$(shasum -a 256 cognis-executor-0.14.2-macos-x86_64.tar.gz | awk '{print $1}')"
 python3 packaging/homebrew/generate_formula.py --development \
-  --version 0.14.1 \
-  --arm64-url "file://$PWD/cognis-executor-0.14.1-macos-arm64.tar.gz" \
+  --version 0.14.2 \
+  --arm64-url "file://$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-url "file://$PWD/cognis-executor-0.14.1-macos-x86_64.tar.gz" \
+  --x86-64-url "file://$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source ./CognisExecutor.rb
@@ -120,10 +120,10 @@ add the private repository URL:
 ```bash
 python3 packaging/homebrew/generate_formula.py --development \
   --head-url ssh://git.fpy.cz:2222/filip/cognis.git \
-  --version 0.14.1 \
-  --arm64-asset "$PWD/cognis-executor-0.14.1-macos-arm64.tar.gz" \
+  --version 0.14.2 \
+  --arm64-asset "$PWD/cognis-executor-0.14.2-macos-arm64.tar.gz" \
   --arm64-sha256 "$arm_sha" \
-  --x86-64-asset "$PWD/cognis-executor-0.14.1-macos-x86_64.tar.gz" \
+  --x86-64-asset "$PWD/cognis-executor-0.14.2-macos-x86_64.tar.gz" \
   --x86-64-sha256 "$intel_sha" \
   --output CognisExecutor.rb
 brew install --build-from-source --HEAD ./CognisExecutor.rb

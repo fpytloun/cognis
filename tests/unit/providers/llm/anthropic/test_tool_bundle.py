@@ -7,16 +7,18 @@ import httpx
 import pytest
 from jsonschema import Draft7Validator
 
+from cognis.api.runtime_support import static_tool_definitions
 from cognis.core.tool_exposure import (
     _normalize_anthropic_tool_schema_arguments,
     reverse_tool_argument_aliases,
 )
-from cognis.models.tool import tool_input_schema
+from cognis.models.tool import stable_tool_id, tool_input_schema, tool_provider_exposure_schema
 from cognis.providers.llm.anthropic import (
     CompiledAnthropicToolBundle,
     compile_anthropic_tool_bundle,
 )
 from cognis.providers.llm.anthropic.contracts import materialize_json
+from cognis.tools.builtin.orchestration import AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL
 from cognis.tools.builtin.workflow import WRITE_DELIVERABLE_TOOL
 
 
@@ -477,6 +479,66 @@ def test_explicit_object_root_lowers_composition_keywords() -> None:
     }
     assert "strict" not in bundle.wire_tools[0]
     assert "top-level oneOf lowered" in bundle.strict_diagnostics[0]
+
+
+@pytest.mark.parametrize("keyword", ["oneOf", "anyOf"])
+def test_explicit_object_root_lowers_cross_field_union_constraints(keyword: str) -> None:
+    schema = deepcopy(tool_input_schema(AGENT_CONVERSATION_RECOVER_CHANNEL_TOOL))
+    if keyword != "oneOf":
+        schema[keyword] = schema.pop("oneOf")
+
+    bundle = compile_anthropic_tool_bundle(
+        [
+            _tool(
+                "agent_conversation_recover_channel",
+                "builtin:agent_conversation_recover_channel",
+                schema,
+            )
+        ]
+    )
+
+    lowered = _plain(bundle.wire_tools[0]["input_schema"])
+    assert isinstance(lowered, dict)
+    assert lowered["type"] == "object"
+    assert keyword not in lowered
+    assert lowered["required"] == ["reason"]
+    assert set(lowered["properties"]) == {
+        "conversation_id",
+        "delivery_id",
+        "expected_owner_epoch",
+        "reason",
+        "reconciliation_evidence",
+    }
+    Draft7Validator(lowered).validate(
+        {
+            "conversation_id": "conv_target",
+            "expected_owner_epoch": 2,
+            "reason": "Externally reconciled.",
+        }
+    )
+    Draft7Validator(lowered).validate(
+        {
+            "delivery_id": "cdel_target",
+            "reason": "Externally reconciled.",
+        }
+    )
+
+
+def test_all_static_tools_compile_to_anthropic_object_roots() -> None:
+    for tool in static_tool_definitions(knowledgebase_enabled=True):
+        bundle = compile_anthropic_tool_bundle(
+            [
+                _tool(
+                    tool.name,
+                    stable_tool_id(tool),
+                    tool_provider_exposure_schema(tool),
+                )
+            ]
+        )
+
+        schema = bundle.wire_tools[0]["input_schema"]
+        assert schema["type"] == "object", tool.name
+        assert not ({"allOf", "anyOf", "oneOf"} & schema.keys()), tool.name
 
 
 def test_all_of_object_root_is_lowered_with_required_union() -> None:

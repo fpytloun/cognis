@@ -40,7 +40,7 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cognis.api.chat_v2.schemas import RuntimeAuthority
+from cognis.api.chat_v2.schemas import RuntimeAuthority, RuntimeLifecycle
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.agent_direct import is_agent_direct_context
@@ -5461,6 +5461,7 @@ class TurnScheduler:
     def _runtime_authority_from_row(row: DirectTurnRequestRow) -> RuntimeAuthority | None:
         if row.fencing_token is None or not row.turn_id:
             return None
+        lifecycle: RuntimeLifecycle
         if row.status in {status.value for status in ACTIVE_STATUSES}:
             lifecycle = "active"
         elif row.status == DirectTurnStatus.RECOVERABLE.value:

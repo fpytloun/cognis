@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-common"
-version = "0.14.1"
+version = "0.14.2"
 description = "Shared contracts and portable runtimes for Cognis"
 readme = "README.md"
 license = { text = "TBD" }

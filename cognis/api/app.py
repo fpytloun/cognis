@@ -1741,7 +1741,7 @@ def create_app(
         await engine.dispose()
         controller_runtime.mark_stopped()
 
-    app = FastAPI(title="Cognis", version="0.14.1", lifespan=lifespan)
+    app = FastAPI(title="Cognis", version="0.14.2", lifespan=lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths

@@ -387,7 +387,10 @@ def _lower_object_composition(
     tool_name: str,
 ) -> dict[str, Any]:
     branches = schema.get(keyword)
-    if not _all_composition_branches_are_objects(branches):
+    if not _all_composition_branches_are_objects(
+        branches,
+        object_root_is_explicit=schema.get("type") == "object",
+    ):
         raise ValueError(
             f"Anthropic tool {tool_name!r} input_schema has an ambiguous root ({keyword})"
         )
@@ -502,12 +505,21 @@ def _json_identity(value: Any) -> str:
     )
 
 
-def _all_composition_branches_are_objects(branches: Any) -> bool:
+def _all_composition_branches_are_objects(
+    branches: Any,
+    *,
+    object_root_is_explicit: bool,
+) -> bool:
     if not isinstance(branches, list) or not branches:
         return False
     for branch in branches:
         if not isinstance(branch, Mapping):
             return False
+        if object_root_is_explicit:
+            # The parent schema already constrains every branch to an object.
+            # Branches can therefore contain only cross-field constraints such
+            # as ``required`` plus ``not`` without repeating ``type=object``.
+            continue
         if set(branch) & {"$dynamicRef", "$recursiveRef", "$ref"}:
             return False
         branch_type = branch.get("type")

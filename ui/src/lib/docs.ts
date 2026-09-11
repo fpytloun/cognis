@@ -31,7 +31,7 @@ const overviewModules = import.meta.glob('../../../docs/README.md', {
   import: 'default'
 }) as Record<string, RawMarkdownLoader>;
 
-const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg}', {
+const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg,webp}', {
   query: '?url',
   import: 'default',
   eager: true

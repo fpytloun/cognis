@@ -155,7 +155,7 @@ def test_editable_workspace_exposes_both_trees_and_one_version(tmp_path: Path) -
             "-c",
             (
                 "import cognis; import cognis.main; import cognis.executor.runner; "
-                "assert cognis.__version__ == '0.14.1'; "
+                "assert cognis.__version__ == '0.14.2'; "
                 "assert len(cognis.__path__) == 3"
             ),
         ],
@@ -187,7 +187,7 @@ def test_workspace_console_scripts_start(command: str) -> None:
         (
             ("common",),
             (
-                "import importlib.util, cognis; assert cognis.__version__ == '0.14.1'; "
+                "import importlib.util, cognis; assert cognis.__version__ == '0.14.2'; "
                 "import cognis.core.tool_arguments; import cognis.tools.introspection; "
                 "import cognis.mcp_runtime; "
                 "from cognis.channels.factory import create_adapter; "
@@ -287,7 +287,7 @@ def test_isolated_minimal_full_and_uninstall_acceptance(
             "-c",
             (
                 "import sys; from pathlib import Path; import cognis; "
-                "import cognis.executor.runner; assert cognis.__version__ == '0.14.1'; "
+                "import cognis.executor.runner; assert cognis.__version__ == '0.14.2'; "
                 "assert Path(cognis.__file__).resolve().is_relative_to("
                 "Path(sys.prefix).resolve())"
             ),

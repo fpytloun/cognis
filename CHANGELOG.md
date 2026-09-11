@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.2] - 2026-09-11
+
+### Fixed
+
+- Fixed runtime authority lifecycle typing in the Chat v2 relay and scheduler.
+- Fixed embedded documentation so bundled WebP screenshots resolve correctly.
+- Fixed Anthropic tool schema compilation for explicit object roots with cross-field `oneOf` and `anyOf` constraints.
+
 ## [0.14.1] - 2026-09-11
 
 ### Changed

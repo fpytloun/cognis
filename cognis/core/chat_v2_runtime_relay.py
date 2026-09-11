@@ -26,6 +26,7 @@ from cognis.api.chat_v2.schemas import (
     BoundaryReceipt,
     RuntimeActiveTurn,
     RuntimeAuthority,
+    RuntimeLifecycle,
     StrictModel,
     TimelineItem,
 )
@@ -369,7 +370,7 @@ class RelayGenerationContext:
     owner_controller_id: str
     owner_incarnation_id: str
     fencing_token: int
-    lifecycle: str = "active"
+    lifecycle: RuntimeLifecycle = "active"
 
     def __post_init__(self) -> None:
         for value in (
@@ -757,7 +758,7 @@ class ChatV2RuntimeRedisRelay:
         last_generation: GenerationPerformanceSnapshot | None = None,
         boundary_receipts: list[BoundaryReceipt] | None = None,
         volatile_items_complete: bool = False,
-        lifecycle: str | None = None,
+        lifecycle: RuntimeLifecycle | None = None,
         event_id: str | None = None,
     ) -> ChatV2RuntimeRelayEnvelope:
         relay_context_usage = dict(context_usage or {})

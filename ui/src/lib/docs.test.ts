@@ -69,6 +69,9 @@ describe('embedded docs registry', () => {
     const docsOverview = await loadDocsOverviewContent();
     expect(docsOverview.content).toContain('/blob/main/docs/specs/README.md');
     expect(docsOverview.content).not.toContain('](specs/README.md)');
+
+    const usingChat = await getEmbeddedDoc('using-chat');
+    expect(usingChat?.content).not.toContain('](../assets/screenshots/chat-desktop.webp)');
   });
 
   it('builds internal onboarding doc links only', async () => {
