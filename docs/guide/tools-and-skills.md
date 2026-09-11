@@ -2,7 +2,7 @@
 
 The `Tools` workspace helps you understand what Cognis can execute and how those capabilities are exposed to agents.
 
-![Tools and skills registry](../assets/screenshots/tools-skills.png)
+![Tools and skills registry](../assets/screenshots/tools-skills.webp)
 
 ## Tool registry
 

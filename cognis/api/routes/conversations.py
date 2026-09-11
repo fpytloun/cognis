@@ -83,6 +83,7 @@ from cognis.store.queries import (
     get_task_by_control_conversation_id,
     get_user_ui_state_value,
     list_active_delegation_sessions,
+    list_active_tasks_by_source_conversation,
     list_agent_direct_chat_rows,
     list_conversation_context_types,
     list_conversation_sessions,
@@ -147,6 +148,11 @@ async def _background_work_projection(
         user_email=user_email,
         limit=_BACKGROUND_WORK_LIMIT + 1,
     )
+    active_tasks = await list_active_tasks_by_source_conversation(
+        session,
+        created_by=user_email,
+        limit=_BACKGROUND_WORK_LIMIT + 1,
+    )
     candidates: list[tuple[datetime, str, Any]] = [
         (link.updated_at or link.created_at, "managed_conversation", link) for link in managed_links
     ]
@@ -154,6 +160,7 @@ async def _background_work_projection(
         (child.updated_at or child.started_at, "delegated_session", child)
         for child in delegated_sessions
     )
+    candidates.extend((task.updated_at or task.created_at, "task", task) for task in active_tasks)
     conversation_assignments: dict[tuple[str, str], bool] = {}
     for shell in background_shells or []:
         conversation_id = str(shell.get("conversation_id") or "")
@@ -250,6 +257,23 @@ async def _background_work_projection(
                 )
             )
             continue
+        if kind == "task":
+            items.append(
+                BackgroundWorkItemResponse(
+                    kind="task",
+                    work_id=item.task_id,
+                    controller_conversation_id=item.source_ref,
+                    controller_session_id=item.source_session_id,
+                    task_id=item.task_id,
+                    title=item.title,
+                    agent_id=item.agent_id,
+                    agent_profile_id=item.agent_profile_id,
+                    status=item.status,
+                    started_at=item.started_at or item.created_at,
+                    updated_at=item.updated_at,
+                )
+            )
+            continue
         items.append(
             BackgroundWorkItemResponse(
                 kind="delegated_session",
@@ -269,7 +293,7 @@ async def _background_work_projection(
     return BackgroundWorkProjectionResponse(
         items=items,
         active_count=sum(
-            item.kind in {"delegated_session", "background_command"}
+            item.kind in {"task", "delegated_session", "background_command"}
             or item.status in {"queued", "running"}
             for item in items
         ),

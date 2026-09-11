@@ -478,6 +478,28 @@ class RuntimeActiveTurn(StrictModel):
     updated_at: str | None = None
 
 
+RuntimeLifecycle = Literal[
+    "active",
+    "inactive",
+    "recoverable",
+    "terminal",
+    "relinquished",
+    "legacy",
+]
+
+
+class RuntimeAuthority(StrictModel):
+    """Durable lifecycle identity used to order runtime overlays."""
+
+    protocol: Literal["runtime_authority_v1"] = "runtime_authority_v1"
+    direct_request_id: str
+    turn_id: str
+    fencing_token: int = Field(ge=0)
+    lifecycle: RuntimeLifecycle
+    source_epoch: str | None = None
+    source_revision: int | None = Field(default=None, ge=0)
+
+
 class BoundaryReceipt(StrictModel):
     session_id: str
     seq: int = Field(ge=1)
@@ -491,7 +513,9 @@ class RuntimeOverlaySnapshot(StrictModel):
     generated_at: str
     has_active_turn: bool
     active_turn: RuntimeActiveTurn | None = None
+    authority: RuntimeAuthority | None = None
     volatile_items: list[TimelineItem] = Field(default_factory=list)
+    volatile_items_complete: bool = False
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
     context_usage: dict[str, Any] | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
@@ -501,6 +525,12 @@ class RuntimeOverlaySnapshot(StrictModel):
     def _validate_active_turn_consistency(self) -> RuntimeOverlaySnapshot:
         if not self.has_active_turn and self.active_turn is not None:
             raise ValueError("active_turn must be null when has_active_turn is false")
+        if (
+            self.authority is not None
+            and self.authority.lifecycle == "active"
+            and not self.has_active_turn
+        ):
+            raise ValueError("active runtime authority requires an active turn")
         for item in self.volatile_items:
             if item.stable:
                 raise ValueError("runtime volatile_items must have stable=false")

@@ -33,6 +33,7 @@ from cognis.api.chat_v2.realtime import (
 )
 from cognis.api.chat_v2.schemas import (
     MessageTimelineItem,
+    RuntimeAuthority,
     TimelineItem,
     TimelineScope,
     ToolCallTimelineItem,
@@ -277,7 +278,7 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
         relay_generation_context=Mock(return_value=context),
         running_turn_state=Mock(return_value={"status": "running"}),
     )
-    envelope = object()
+    envelope = SimpleNamespace(authority=None, volatile_items_complete=True)
     relay = SimpleNamespace(
         make_envelope=Mock(return_value=envelope),
         enqueue=Mock(return_value=True),
@@ -307,6 +308,7 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
     )
 
     relay.enqueue.assert_called_once_with(envelope, cumulative_boundary=False)
+    assert relay.make_envelope.call_args.kwargs["volatile_items_complete"] is True
 
 
 @pytest.mark.asyncio
@@ -327,7 +329,9 @@ async def test_terminal_runtime_relay_logs_enqueue_rejection(
         running_turn_state=Mock(return_value=None),
     )
     relay = SimpleNamespace(
-        make_envelope=Mock(return_value=object()),
+        make_envelope=Mock(
+            return_value=SimpleNamespace(authority=None, volatile_items_complete=True)
+        ),
         enqueue=Mock(return_value=False),
     )
     manager = WebSocketConnectionManager(
@@ -1308,6 +1312,7 @@ class _RecordingManager:
         self.chat_v2_runtime_payloads: list[tuple[str, bool, int]] = []
         self.chat_v2_runtime_items: list[list[TimelineItem]] = []
         self.chat_v2_last_generations: list[dict[str, Any] | None] = []
+        self.chat_v2_runtime_lifecycles: list[str | None] = []
         self.app: Any = SimpleNamespace(state=SimpleNamespace())
 
     async def send_error(self, _: object, **kwargs: object) -> None:
@@ -1341,6 +1346,7 @@ class _RecordingManager:
         active_session_id: str | None = None,
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
+        lifecycle: str | None = None,
     ) -> None:
         del active_session_id, context_usage
         self.chat_v2_runtime_payloads.append(
@@ -1348,6 +1354,7 @@ class _RecordingManager:
         )
         self.chat_v2_runtime_items.append(volatile_items)
         self.chat_v2_last_generations.append(last_generation)
+        self.chat_v2_runtime_lifecycles.append(lifecycle)
         self.snapshots.append(f"chat_v2:{conversation_id}:{len(volatile_items)}")
 
     def has_tts_enabled_subscribers(self, _conversation_id: str) -> bool:
@@ -1635,6 +1642,8 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
             last_generation: dict[str, Any] | None,
             active_turn: dict[str, Any] | None = None,
             boundary_receipts: list[Any] | None = None,
+            authority: RuntimeAuthority | None = None,
+            volatile_items_complete: bool = False,
         ) -> None:
             del (
                 conversation_id,
@@ -1644,6 +1653,8 @@ async def test_local_runtime_accumulates_system_notice_without_redis_relay() -> 
                 last_generation,
                 active_turn,
                 boundary_receipts,
+                authority,
+                volatile_items_complete,
             )
             runtime_frames.append(volatile_items)
 
@@ -1715,6 +1726,8 @@ async def test_local_runtime_settlement_removes_only_transient_recovery_notices(
             last_generation: dict[str, Any] | None,
             active_turn: dict[str, Any] | None = None,
             boundary_receipts: list[Any] | None = None,
+            authority: RuntimeAuthority | None = None,
+            volatile_items_complete: bool = False,
         ) -> None:
             del (
                 conversation_id,
@@ -1724,6 +1737,8 @@ async def test_local_runtime_settlement_removes_only_transient_recovery_notices(
                 last_generation,
                 active_turn,
                 boundary_receipts,
+                authority,
+                volatile_items_complete,
             )
             runtime_frames.append(volatile_items)
 
@@ -4556,6 +4571,21 @@ async def test_turn_observer_clears_chat_v2_runtime_after_error() -> None:
     )
 
     assert ("conv-1", False, 0) in manager.chat_v2_runtime_payloads
+    assert manager.chat_v2_runtime_lifecycles[-1] == "terminal"
+
+
+@pytest.mark.asyncio
+async def test_turn_observer_relinquishes_runtime_after_recoverable_error() -> None:
+    manager = _RecordingManager()
+    observer = WebSocketTurnObserver(cast(Any, manager))
+
+    await observer.on_turn_error(
+        "conv-1",
+        TurnError("temporarily_unavailable", "Retry later", recoverable=True),
+    )
+
+    assert ("conv-1", False, 0) in manager.chat_v2_runtime_payloads
+    assert manager.chat_v2_runtime_lifecycles[-1] == "recoverable"
 
 
 @pytest.mark.asyncio

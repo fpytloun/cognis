@@ -13,6 +13,7 @@ The public guides explain how to run and use Cognis. The [specifications](specs/
 | [Architecture](guide/architecture.md) | Understand the cloud-native controller/executor split and companion services |
 | [Configuring Providers](guide/configuring-providers.md) | Add LLM providers, test them, and set model routing |
 | [Creating Agents](guide/creating-agents.md) | Define identity, tools, skills, executor placement, and workflow behavior |
+| [How to Customize Your Harness](guide/customizing-your-harness.md) | Customize agent roles, profiles, coding guidance, and coordination conventions |
 | [Security and Privacy](guide/security-and-privacy.md) | Understand secrets, value refs, inference-provider privacy, guardrails, and executor boundaries |
 
 ## Workspace
@@ -54,6 +55,7 @@ When Cognis serves the bundled UI, these guides are also available directly insi
 - `/docs/architecture`
 - `/docs/configuring-providers`
 - `/docs/creating-agents`
+- `/docs/customizing-your-harness`
 - `/docs/security-and-privacy`
 - `/docs/using-chat`
 - `/docs/projects`

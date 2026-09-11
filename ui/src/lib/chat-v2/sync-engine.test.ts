@@ -101,6 +101,229 @@ function syncResponse(overrides: Partial<ChatSyncResponse> = {}): ChatSyncRespon
   };
 }
 
+function authority(
+  overrides: Partial<NonNullable<RuntimeOverlaySnapshot['authority']>> = {}
+): NonNullable<RuntimeOverlaySnapshot['authority']> {
+  return {
+    protocol: 'runtime_authority_v1',
+    direct_request_id: 'request-1',
+    turn_id: 'turn-1',
+    fencing_token: 7,
+    lifecycle: 'active',
+    source_epoch: 'source-a',
+    source_revision: 1,
+    ...overrides
+  };
+}
+
+describe('authoritative runtime overlay ordering', () => {
+  it('orders by fencing token before source revision', () => {
+    const current = runtime(8, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ fencing_token: 7, source_revision: 9 })
+    });
+    const incoming = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-2', session_id: 'sess-1', status: 'running' },
+      authority: authority({
+        turn_id: 'turn-2',
+        fencing_token: 8,
+        source_revision: 1
+      })
+    });
+    expect(maybeApplyRuntime(current, incoming)).toBe(incoming);
+  });
+
+  it('does not let a same-fence different identity clear versioned state', () => {
+    const current = runtime(3, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority()
+    });
+    const stale = runtime(99, {
+      authority: authority({ turn_id: 'turn-old', lifecycle: 'terminal' }),
+      volatile_items_complete: true
+    });
+    expect(maybeApplyRuntime(current, stale)).toBe(current);
+  });
+
+  it('accepts an exact inactive authority and clears volatile state', () => {
+    const current = runtime(3, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority()
+    });
+    const inactive = runtime(1, {
+      authority: authority({ lifecycle: 'terminal', source_revision: 2 }),
+      volatile_items_complete: true
+    });
+    expect(maybeApplyRuntime(current, inactive)).toBe(inactive);
+  });
+
+  it('keeps partial continuity but lets a complete same-source snapshot replace it', () => {
+    const current = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_revision: 2 }),
+      volatile_items: [message({ id: 'message:partial', stable: false })]
+    });
+    const partial = runtime(2, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_revision: 3 }),
+      volatile_items: [message({ id: 'message:next', stable: false })]
+    });
+    const merged = maybeApplyRuntime(current, partial);
+    expect(merged?.volatile_items.map((item) => item.id)).toEqual([
+      'message:next',
+      'message:partial'
+    ]);
+    const complete = runtime(3, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_revision: 3 }),
+      volatile_items_complete: true,
+      volatile_items: [message({ id: 'message:full', stable: false })]
+    });
+    expect(maybeApplyRuntime(merged, complete)?.volatile_items.map((item) => item.id)).toEqual([
+      'message:full'
+    ]);
+  });
+
+  it('keeps one apply_patch preparation row across full WS, partial REST, and full WS', () => {
+    const preparingPatch = {
+      id: 'tool:patch-input',
+      kind: 'tool_call',
+      sort_key: '9998:999999999999999:000000:03:000000000',
+      source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'tool_call' }],
+      stable: false,
+      status: 'running',
+      call_id: 'patch-input',
+      tool_name: 'apply_patch',
+      arguments: null,
+      arguments_preview: null,
+      progress_phase: 'preparing_input',
+      progress_input_chars: 120,
+      progress_input_lines: 4,
+      progress_complete: false,
+      attachments: [],
+      file_diffs: [],
+      is_error: false,
+      truncated: false,
+      has_full_output: false
+    } as TimelineItem;
+    const full = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false, before_cursor: null },
+      runtime: runtime(1, {
+        runtime_epoch: 'receiver-a',
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        authority: authority({ source_revision: 1 }),
+        volatile_items_complete: true,
+        volatile_items: [preparingPatch]
+      })
+    }));
+    const partial = applySnapshot(snapshot({
+      timeline: { items: [], has_more_before: false, before_cursor: null },
+      runtime: runtime(0, {
+        runtime_epoch: 'receiver-b',
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        authority: authority({ source_epoch: null, source_revision: null }),
+        volatile_items_complete: false,
+        volatile_items: []
+      })
+    }), full);
+
+    expect(visibleTimelineItems(partial).map((item) => item.id)).toEqual(['tool:patch-input']);
+    expect(partial.localItems).toEqual([]);
+
+    const frame: ChatRealtimeFrame = {
+      type: 'chat_v2_frame',
+      schema_version: 2,
+      projection_version: 'chat-v2-test',
+      scope: { key: 'conversation:conv-1', kind: 'conversation', conversation_id: 'conv-1' },
+      conversation_id: 'conv-1',
+      cursor_before: 'cursor-1',
+      cursor_after: 'cursor-1',
+      ops: [],
+      cycle_states: [],
+      runtime: runtime(2, {
+        runtime_epoch: 'receiver-c',
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        authority: authority({ source_revision: 2 }),
+        volatile_items_complete: true,
+        volatile_items: [{ ...preparingPatch, progress_input_chars: 240 } as TimelineItem]
+      }),
+      server_time: '2026-01-01T00:00:03Z'
+    };
+    const resumed = applyRealtimeFrame(partial, frame);
+
+    expect(resumed.outcome).toBe('applied');
+    expect(visibleTimelineItems(resumed.state).map((item) => item.id)).toEqual(['tool:patch-input']);
+    expect(visibleTimelineItems(resumed.state)[0]).toMatchObject({ progress_input_chars: 240 });
+  });
+
+  it('does not let legacy inactive state clear versioned state', () => {
+    const current = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority()
+    });
+    const legacy = runtime(100, { has_active_turn: false, active_turn: null });
+    expect(maybeApplyRuntime(current, legacy)).toBe(current);
+  });
+
+  it('does not enable authoritative ordering for an authority shape without the capability', () => {
+    const current = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority()
+    });
+    const { protocol: _protocol, ...legacyAuthority } = authority({
+      lifecycle: 'terminal',
+      source_revision: 2
+    });
+    const mixedVersion = runtime(2, {
+      authority: legacyAuthority,
+      volatile_items_complete: true
+    });
+
+    expect(maybeApplyRuntime(current, mixedVersion)).toBe(current);
+  });
+
+  it('rejects an equal-fence source-epoch conflict', () => {
+    const current = runtime(99, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_epoch: 'source-old', source_revision: 99 })
+    });
+    const reset = runtime(1, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_epoch: 'source-new', source_revision: 1 })
+    });
+    expect(maybeApplyRuntime(current, reset)).toBe(current);
+  });
+
+  it('keeps an exact inactive authority absorbing regardless of source revision', () => {
+    const current = runtime(3, {
+      has_active_turn: true,
+      active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+      authority: authority({ source_revision: 9 })
+    });
+    const inactive = runtime(1, {
+      authority: authority({ lifecycle: 'terminal', source_revision: 1 }),
+      volatile_items_complete: true
+    });
+    const settled = maybeApplyRuntime(current, inactive);
+    expect(settled).toBe(inactive);
+    expect(maybeApplyRuntime(settled, current)).toBe(inactive);
+  });
+});
+
 describe('Chat v2 sync engine', () => {
   it('loads a snapshot into ready state', () => {
     const state = applySnapshot(snapshot());
@@ -1675,6 +1898,39 @@ describe('Chat v2 sync engine', () => {
     expect(next.timelineItems.map((item) => item.id)).toEqual(['message:1']);
   });
 
+  it('does not render an identical assistant message from canonical and runtime phases twice', () => {
+    const canonical = message({
+      id: 'message:msg-1:phase:1',
+      message_id: 'msg-1',
+      content: 'Finished answer'
+    });
+    const staleRuntime = message({
+      id: 'message:msg-1:phase:0',
+      stable: false,
+      message_id: 'msg-1',
+      content: 'Finished answer'
+    });
+    const nextPhase = message({
+      id: 'message:msg-1:phase:2',
+      stable: false,
+      message_id: 'msg-1',
+      content: 'New activity'
+    });
+    const state = applySnapshot(snapshot({
+      timeline: { items: [canonical], has_more_before: false, before_cursor: null },
+      runtime: runtime(2, {
+        has_active_turn: true,
+        active_turn: { turn_id: 'turn-1', session_id: 'sess-1', status: 'running' },
+        volatile_items: [staleRuntime, nextPhase]
+      })
+    }));
+
+    expect(visibleTimelineItems(state).map((item) => item.id)).toEqual([
+      'message:msg-1:phase:1',
+      'message:msg-1:phase:2'
+    ]);
+  });
+
   it('merges per-block thinking runtime and canonical items 1:1 without duplication', () => {
     // Runtime overlay now emits one item PER block, keyed identically to the
     // canonical projector. During the live turn the overlay carries the blocks;
@@ -1838,9 +2094,7 @@ describe('Chat v2 sync engine', () => {
     });
   });
 
-  it('preserves apply_patch progress across a progress-less canonical merge', () => {
-    // The runtime overlay carries live apply_patch progress; a later
-    // progress-less canonical/settle merge must not null it out (Bug B).
+  it('lets a canonical tool suppress an incomplete apply_patch preparation placeholder', () => {
     const runtimeTool = {
       id: 'tool:call-1',
       kind: 'tool_call',
@@ -1877,12 +2131,7 @@ describe('Chat v2 sync engine', () => {
       runtime: runtime(2, { has_active_turn: true, volatile_items: [runtimeTool] })
     };
 
-    expect(visibleTimelineItems(state)[0]).toMatchObject({
-      kind: 'tool_call',
-      progress_phase: 'preparing_input',
-      progress_input_chars: 1234,
-      progress_input_lines: 42
-    });
+    expect(visibleTimelineItems(state)).toEqual([canonicalTool]);
   });
 
   it('keeps multi-phase assistant segments as distinct items (no collapse)', () => {

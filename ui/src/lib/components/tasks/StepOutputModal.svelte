@@ -49,6 +49,18 @@
     return stepDeliverables(stepRun)[0] ?? null;
   }
 
+  function hasRenderableRichPayload(deliverable: Deliverable | null): boolean {
+    const payload = deliverable?.rich_payload;
+    return Boolean(
+      deliverable?.format === 'rich'
+      && payload
+      && typeof payload === 'object'
+      && !Array.isArray(payload)
+      && Array.isArray(payload.blocks)
+      && payload.blocks.length > 0
+    );
+  }
+
   function renderDeliverableContent(deliverable: Deliverable | null): string {
     if (!deliverable?.content) return '';
     return deliverable.format === 'html'
@@ -179,6 +191,9 @@
         .getForStepRun(stepRun.step_run_id, projectedDeliverable.deliverable_id)
         .then((deliverable: Deliverable) => {
           if (!mounted) return;
+          if (deliverable.format === 'rich' && !hasRenderableRichPayload(deliverable)) {
+            throw new Error('The full rich deliverable payload is unavailable or corrupt.');
+          }
           hydratedDeliverable = deliverable;
           deliverableLoadError = '';
         })
@@ -274,14 +289,14 @@
           {:else if deliverableLoadError}
             <p class="mt-4 text-sm text-amber-200">{deliverableLoadError}</p>
           {/if}
-          {#if latestDeliverableVersion?.format === 'rich'}
+          {#if hasRenderableRichPayload(hydratedDeliverable)}
             <div class="mt-4">
               <RichDeliverable
-                payload={latestDeliverableVersion.rich_payload}
-                content={latestDeliverableVersion.content}
-                 title={latestDeliverableVersion.title ?? 'Deliverable'}
-                 instanceId={latestDeliverableVersion.deliverable_id}
-                 surface="standalone"
+                payload={hydratedDeliverable?.rich_payload}
+                content={hydratedDeliverable?.content}
+                title={hydratedDeliverable?.title ?? 'Deliverable'}
+                instanceId={hydratedDeliverable?.deliverable_id}
+                surface="standalone"
               />
             </div>
           {:else if deliverableHtml}

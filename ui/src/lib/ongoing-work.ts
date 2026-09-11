@@ -17,6 +17,9 @@ const inactiveBackgroundStatuses = new Set([
 ]);
 
 export function backgroundWorkItemIsRunning(item: BackgroundWorkItem): boolean {
+  if (item.kind === 'task') {
+    return ['queued', 'ready', 'running'].includes(item.status);
+  }
   if (item.kind === 'managed_conversation') {
     return item.status === 'running' || item.status === 'queued';
   }

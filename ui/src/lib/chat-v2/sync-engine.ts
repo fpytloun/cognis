@@ -1024,6 +1024,15 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
     derived.visibleItems = baseItems;
     return baseItems;
   }
+  const canonicalAssistantContents = runtimeItems.length > 0
+    ? new Set(
+        state.timelineItems.flatMap((item) =>
+          item.kind === 'message' && item.role === 'assistant' && item.message_id
+            ? [`${item.message_id}\u0000${item.content}`]
+            : []
+        )
+      )
+    : null;
 
   const visible = [...baseItems];
   const visibleById = baseItems === state.timelineItems
@@ -1047,6 +1056,15 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
     upsertVisibleTimelineItem(visible, visibleById, item);
   }
   for (const item of runtimeItems) {
+    if (
+      item.kind === 'message'
+      && item.role === 'assistant'
+      && item.message_id
+      && canonicalAssistantContents?.has(`${item.message_id}\u0000${item.content}`)
+    ) {
+      continue;
+    }
+    if (visibleById.has(item.id) && isIncompleteApplyPatchPreparation(item)) continue;
     upsertVisibleTimelineItem(visible, visibleById, item);
   }
   derived.visibleItems = visible;
@@ -1312,6 +1330,9 @@ export function maybeApplyRuntime(
       incoming = { ...incoming, volatile_items: volatileItems };
     }
   }
+  if (runtimeAuthorityV1(incoming) || runtimeAuthorityV1(current)) {
+    return applyAuthoritativeRuntime(current, incoming);
+  }
   if (!current) return incoming;
   // A new epoch (process restart / different replica / reset) is authoritative
   // and replaces the overlay wholesale, regardless of revision numbers.
@@ -1342,6 +1363,52 @@ export function maybeApplyRuntime(
   // out-of-order duplicate frames.
   if (incoming.runtime_revision > current.runtime_revision) return mergeRuntimeOverlay(current, incoming);
   return current;
+}
+
+function applyAuthoritativeRuntime(
+  current: RuntimeOverlaySnapshot | null,
+  incoming: RuntimeOverlaySnapshot
+): RuntimeOverlaySnapshot | null {
+  const incomingAuthority = runtimeAuthorityV1(incoming);
+  if (!incomingAuthority) return current;
+  const currentAuthority = runtimeAuthorityV1(current);
+  if (!current || !currentAuthority) return incoming;
+  if (incomingAuthority.fencing_token !== currentAuthority.fencing_token) {
+    return incomingAuthority.fencing_token > currentAuthority.fencing_token ? incoming : current;
+  }
+  if (
+    incomingAuthority.direct_request_id !== currentAuthority.direct_request_id
+    || incomingAuthority.turn_id !== currentAuthority.turn_id
+  ) {
+    return current;
+  }
+  if (!current.has_active_turn && incoming.has_active_turn) return current;
+  if (current.has_active_turn && !incoming.has_active_turn) return incoming;
+  if (
+    incomingAuthority.source_epoch
+    && currentAuthority.source_epoch
+    && incomingAuthority.source_epoch !== currentAuthority.source_epoch
+  ) {
+    return current;
+  }
+  const incomingRevision = incomingAuthority.source_revision;
+  const currentRevision = currentAuthority.source_revision;
+  if (incomingRevision !== null && incomingRevision !== undefined
+    && currentRevision !== null && currentRevision !== undefined) {
+    if (incomingRevision < currentRevision) return current;
+    if (incomingRevision > currentRevision) {
+      return incoming.volatile_items_complete ? incoming : mergeRuntimeOverlay(current, incoming);
+    }
+  }
+  if (incoming.volatile_items_complete && !current.volatile_items_complete) return incoming;
+  if (!incoming.volatile_items_complete && current.volatile_items_complete) return current;
+  return mergeRuntimeOverlay(current, incoming);
+}
+
+function runtimeAuthorityV1(
+  runtime: RuntimeOverlaySnapshot | null
+): NonNullable<RuntimeOverlaySnapshot['authority']> | null {
+  return runtime?.authority?.protocol === 'runtime_authority_v1' ? runtime.authority : null;
 }
 
 /**
@@ -1535,13 +1602,19 @@ function carrySettledRuntimeItems(
   // queued messages: turn N+1 can start streaming before turn N's items are
   // canonically confirmed — dropping them made the just-finished reply blink
   // out until the next canonical sync.
-  const replacesCurrentTurn =
-    currentRuntime.has_active_turn
-    && (
-      !incomingRuntime.has_active_turn
-      || incomingRuntime.runtime_epoch !== currentRuntime.runtime_epoch
-      || incomingRuntime.active_turn?.turn_id !== currentRuntime.active_turn?.turn_id
-    );
+  const currentAuthority = currentRuntime.authority;
+  const incomingAuthority = incomingRuntime.authority;
+  const replacesCurrentTurn = currentRuntime.has_active_turn && (
+    !incomingRuntime.has_active_turn
+    || (
+      currentAuthority && incomingAuthority
+        ? currentAuthority.fencing_token !== incomingAuthority.fencing_token
+          || currentAuthority.direct_request_id !== incomingAuthority.direct_request_id
+          || currentAuthority.turn_id !== incomingAuthority.turn_id
+        : incomingRuntime.runtime_epoch !== currentRuntime.runtime_epoch
+          || incomingRuntime.active_turn?.turn_id !== currentRuntime.active_turn?.turn_id
+    )
+  );
   const incomingIds = new Set(incomingRuntime.volatile_items.map((item) => item.id));
   const hasDroppedCompaction = currentRuntime.volatile_items.some(
     (item) => item.kind === 'compaction' && !incomingIds.has(item.id)
@@ -1571,23 +1644,25 @@ function carrySettledRuntimeItems(
     // Native apply_patch input creates a progress-only runtime card before the
     // provider emits a complete tool call. If the turn stops during that input,
     // no canonical event can reconcile this empty placeholder.
-    if (
-      item.kind === 'tool_call'
-      && item.tool_name === 'apply_patch'
-      && item.progress_phase === 'preparing_input'
-      && !item.progress_complete
-      && !item.arguments
-      && !item.arguments_preview
-      && !item.result_preview
-      && !item.streamed_output
-      && item.file_diffs.length === 0
-    ) {
+    if (isIncompleteApplyPatchPreparation(item)) {
       continue;
     }
     const settled = terminalizeSettledItem(item);
     byId.set(item.id, { ...settled, sort_key: carriedSortKey(settled.sort_key) });
   }
   return sortTimelineItems([...byId.values()]);
+}
+
+function isIncompleteApplyPatchPreparation(item: TimelineItem): boolean {
+  return item.kind === 'tool_call'
+    && item.tool_name === 'apply_patch'
+    && item.progress_phase === 'preparing_input'
+    && !item.progress_complete
+    && !item.arguments
+    && !item.arguments_preview
+    && !item.result_preview
+    && !item.streamed_output
+    && item.file_diffs.length === 0;
 }
 
 function nextLocalSortKey(state: ChatV2ClientState): string {

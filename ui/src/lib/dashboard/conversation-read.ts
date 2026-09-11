@@ -7,7 +7,68 @@ export interface DashboardConversationReadDependencies {
   isRetryable(error: unknown): boolean;
 }
 
+export interface ObservedConversationReadDependencies {
+  markRead(conversationId: string): Promise<unknown>;
+  optimisticRead(conversationId: string, readThrough: string | null): void;
+  isObserved(conversationId: string): boolean;
+  reconcile(): void;
+}
+
+export interface ObservedConversationVersion {
+  conversationId: string;
+  version: string;
+  readThrough: string | null;
+}
+
 const MAX_MARK_READ_ATTEMPTS = 2;
+
+export class ObservedConversationReadTracker {
+  private attemptedVersions = new Map<string, string>();
+  private inFlight = new Map<string, Promise<void>>();
+  private pending = new Map<string, ObservedConversationVersion>();
+
+  constructor(private readonly dependencies: ObservedConversationReadDependencies) {}
+
+  observe(observation: ObservedConversationVersion): Promise<void> | null {
+    if (!this.dependencies.isObserved(observation.conversationId)) return null;
+    if (this.attemptedVersions.get(observation.conversationId) === observation.version) return null;
+
+    const existing = this.inFlight.get(observation.conversationId);
+    if (existing) {
+      this.pending.set(observation.conversationId, observation);
+      return existing;
+    }
+
+    this.attemptedVersions.set(observation.conversationId, observation.version);
+    this.dependencies.optimisticRead(observation.conversationId, observation.readThrough);
+    const operation = this.dependencies.markRead(observation.conversationId)
+      .then(
+        () => undefined,
+        () => {
+          if (this.attemptedVersions.get(observation.conversationId) === observation.version) {
+            this.attemptedVersions.delete(observation.conversationId);
+          }
+          this.dependencies.reconcile();
+        },
+      )
+      .finally(() => {
+        if (this.inFlight.get(observation.conversationId) === operation) {
+          this.inFlight.delete(observation.conversationId);
+        }
+        const pending = this.pending.get(observation.conversationId);
+        this.pending.delete(observation.conversationId);
+        if (
+          pending
+          && this.dependencies.isObserved(pending.conversationId)
+          && this.attemptedVersions.get(pending.conversationId) !== pending.version
+        ) {
+          void this.observe(pending);
+        }
+      });
+    this.inFlight.set(observation.conversationId, operation);
+    return operation;
+  }
+}
 
 export class DashboardConversationProjectionGate {
   private generation = 0;

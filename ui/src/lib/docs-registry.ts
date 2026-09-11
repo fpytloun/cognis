@@ -73,7 +73,15 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Define identity, personality, tools, executors, and workflow options.',
     category: 'workspace',
     sourcePath: 'docs/guide/creating-agents.md',
-    relatedSlugs: ['configuring-providers', 'using-chat', 'executors', 'tools-and-skills']
+    relatedSlugs: ['customizing-your-harness', 'configuring-providers', 'using-chat', 'tools-and-skills']
+  },
+  {
+    slug: 'customizing-your-harness',
+    title: 'How to Customize Your Harness',
+    description: 'Customize agent roles, profiles, coding guidance, and coordination conventions.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/customizing-your-harness.md',
+    relatedSlugs: ['creating-agents', 'tools-and-skills', 'using-chat']
   },
   {
     slug: 'security-and-privacy',
@@ -137,7 +145,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Inspect the tool registry, MCP-backed capabilities, and reusable skills.',
     category: 'workspace',
     sourcePath: 'docs/guide/tools-and-skills.md',
-    relatedSlugs: ['settings', 'creating-agents', 'executors']
+    relatedSlugs: ['settings', 'creating-agents', 'customizing-your-harness', 'executors']
   },
   {
     slug: 'content-and-sharing',
@@ -243,6 +251,7 @@ export const ONBOARDING_DOC_SLUGS = [
   'architecture',
   'configuring-providers',
   'creating-agents',
+  'customizing-your-harness',
   'security-and-privacy',
   'settings',
   'using-chat',

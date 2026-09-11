@@ -362,6 +362,20 @@ describe('backgroundWorkItemIsRunning', () => {
       executor_id: 'executor-1',
     })).toBe(true);
   });
+
+  it('only counts queued, ready, or running tasks as running', () => {
+    const task = (status: string): BackgroundWorkItem => ({
+      ...managed(status),
+      kind: 'task',
+      work_id: 'task_1',
+      task_id: 'task_1',
+    });
+    expect(backgroundWorkItemIsRunning(task('queued'))).toBe(true);
+    expect(backgroundWorkItemIsRunning(task('ready'))).toBe(true);
+    expect(backgroundWorkItemIsRunning(task('running'))).toBe(true);
+    expect(backgroundWorkItemIsRunning(task('draft'))).toBe(false);
+    expect(backgroundWorkItemIsRunning(task('paused'))).toBe(false);
+  });
 });
 
 describe('sortBackgroundWorkByActivity', () => {

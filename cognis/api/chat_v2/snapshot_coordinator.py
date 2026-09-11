@@ -106,6 +106,14 @@ async def load_conversation_snapshot_context(
         label=conversation.title,
         status=conversation.status,
     )
+    runtime_input = await runtime_input_from_scheduler(
+        conversation_id=conversation_id,
+        scope_key=scope.key,
+        active_session_id=conversation.active_session_id,
+        turn_scheduler=turn_scheduler,
+        session_cache=getattr(app.state, "session_cache", None),
+    )
+    runtime_input = await _hydrate_runtime_input(app, conversation_id, runtime_input)
     return ConversationSnapshotContext(
         scope=scope,
         conversation=conversation,
@@ -114,13 +122,7 @@ async def load_conversation_snapshot_context(
         cursor_secret=_cursor_secret(app),
         queue=queue_state_from_messages(queued_messages),
         state=state_view_from_snapshot(state_snapshot),
-        runtime_input=await runtime_input_from_scheduler(
-            conversation_id=conversation_id,
-            scope_key=scope.key,
-            active_session_id=conversation.active_session_id,
-            turn_scheduler=turn_scheduler,
-            session_cache=getattr(app.state, "session_cache", None),
-        ),
+        runtime_input=runtime_input,
         session_cache=getattr(app.state, "session_cache", None),
         event_post_processor=event_attachment_post_processor(
             app,
@@ -129,6 +131,35 @@ async def load_conversation_snapshot_context(
         ),
         owner_email=user_email,
         conversation_id=conversation_id,
+    )
+
+
+async def _hydrate_runtime_input(
+    app: Any,
+    conversation_id: str,
+    runtime_input: RuntimeOverlayInput,
+) -> RuntimeOverlayInput:
+    """Hydrate one matching relay envelope without making runtime authoritative."""
+
+    authority = runtime_input.authority
+    relay = getattr(app.state, "chat_v2_runtime_relay", None)
+    hydrate = getattr(relay, "hydrate_latest_authority", None) if relay is not None else None
+    if authority is None or not callable(hydrate):
+        return runtime_input
+    envelope = await hydrate(conversation_id, authority)
+    if envelope is None:
+        return runtime_input
+    return runtime_input.model_copy(
+        update={
+            "authority": envelope.authority or authority,
+            "active_turn": (
+                envelope.active_turn.model_dump(mode="json")
+                if envelope.active_turn is not None
+                else None
+            ),
+            "volatile_items": list(envelope.volatile_items),
+            "volatile_items_complete": envelope.volatile_items_complete,
+        }
     )
 
 

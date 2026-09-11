@@ -1055,7 +1055,7 @@ async def test_stale_cancelled_turn_is_terminalized_without_execution(
             await asyncio.sleep(0.01)
         assert row.owner_controller_id is None
         assert row.owner_incarnation_id is None
-        assert row.fencing_token is None
+        assert row.fencing_token == stale_lease.fencing_token
         assert row.terminal_at is not None
         assert row.outcome == {
             "phase": "cancelled",

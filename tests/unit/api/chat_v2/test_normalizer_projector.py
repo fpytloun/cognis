@@ -1891,8 +1891,7 @@ def test_delegation_completion_without_call_id_folds_via_child_session() -> None
     assert item.delegation["duration_ms"] == 1234
 
 
-def test_task_mode_delegation_keeps_standalone_card() -> None:
-    # Async task delegations carry a call_id but must NOT fold onto a tool call.
+def test_task_mode_delegation_is_hidden_from_conversation_timeline() -> None:
     raw_events = [
         RawSessionEvent(
             store_id="intaris",
@@ -1909,7 +1908,7 @@ def test_task_mode_delegation_keeps_standalone_card() -> None:
         )
     ]
     projection = project_timeline(normalize_session_events(raw_events).events)
-    assert [item.kind for item in projection.timeline.items] == ["delegation"]
+    assert projection.timeline.items == []
 
 
 def test_delegation_without_matching_tool_call_emits_standalone_card() -> None:

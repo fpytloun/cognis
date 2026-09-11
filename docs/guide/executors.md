@@ -4,7 +4,7 @@ Executors are the part of Cognis that perform tool execution. The controller dec
 
 ![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)
 
-![Executor browser automation and tool configuration](../assets/screenshots/executor-browser-tools.png)
+![Executor browser automation and tool configuration](../assets/screenshots/executor-browser-tools.webp)
 
 ## Why executors exist
 
@@ -20,7 +20,7 @@ This separation lets Cognis:
 The normal installation includes all built-in executor components:
 
 ```bash
-pip install "cognis-executor[full]==0.14.0"
+pip install "cognis-executor[full]==0.14.1"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 

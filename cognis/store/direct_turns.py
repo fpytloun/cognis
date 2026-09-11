@@ -502,6 +502,44 @@ class DirectTurnStore:
         )
         return result.scalar_one_or_none()
 
+    async def get_conversation_runtime_authority_row(
+        self,
+        conversation_id: str,
+        *,
+        session: AsyncSession | None = None,
+    ) -> DirectTurnRequestRow | None:
+        """Return active state, or the latest formerly-active lifecycle row, in one query."""
+
+        if session is None:
+            async with self._session_factory() as owned_session:
+                return await self.get_conversation_runtime_authority_row(
+                    conversation_id,
+                    session=owned_session,
+                )
+        active_values = [status.value for status in ACTIVE_STATUSES]
+        historical_values = [
+            status.value
+            for status in (
+                ACTIVE_STATUSES | {DirectTurnStatus.RECOVERABLE} | set(TERMINAL_STATUSES)
+            )
+        ]
+        result = await session.execute(
+            select(DirectTurnRequestRow)
+            .where(
+                DirectTurnRequestRow.conversation_id == conversation_id,
+                DirectTurnRequestRow.status.in_(historical_values),
+            )
+            .order_by(
+                case(
+                    (DirectTurnRequestRow.status.in_(active_values), 0),
+                    else_=1,
+                ),
+                DirectTurnRequestRow.admission_order.desc(),
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     async def list_conversations_active(
         self,
         conversation_ids: list[str],
@@ -1616,7 +1654,7 @@ class DirectTurnStore:
                         status=DirectTurnStatus.RECOVERABLE.value,
                         owner_controller_id=None,
                         owner_incarnation_id=None,
-                        fencing_token=None,
+                        fencing_token=DirectTurnRequestRow.fencing_token,
                         outcome=outcome,
                         updated_at=now,
                     )
@@ -1812,7 +1850,7 @@ class DirectTurnStore:
                         status=DirectTurnStatus.CANCELLED.value,
                         owner_controller_id=None,
                         owner_incarnation_id=None,
-                        fencing_token=None,
+                        fencing_token=DirectTurnRequestRow.fencing_token,
                         outcome={
                             "phase": "cancelled",
                             "reason": "stale owner cancellation recovered",
@@ -1864,7 +1902,7 @@ class DirectTurnStore:
                         status=DirectTurnStatus.RECOVERABLE.value,
                         owner_controller_id=None,
                         owner_incarnation_id=None,
-                        fencing_token=None,
+                        fencing_token=DirectTurnRequestRow.fencing_token,
                         absorbed_by_turn_id=None,
                         outcome={"phase": "recovered_uncommitted_absorb"},
                         updated_at=now,
@@ -1914,7 +1952,7 @@ class DirectTurnStore:
                         status=DirectTurnStatus.RECOVERABLE.value,
                         owner_controller_id=None,
                         owner_incarnation_id=None,
-                        fencing_token=None,
+                        fencing_token=DirectTurnRequestRow.fencing_token,
                         outcome=outcome,
                         updated_at=now,
                     )
@@ -2010,7 +2048,7 @@ class DirectTurnStore:
                     "status": DirectTurnStatus.RECOVERABLE.value,
                     "owner_controller_id": None,
                     "owner_incarnation_id": None,
-                    "fencing_token": None,
+                    "fencing_token": DirectTurnRequestRow.fencing_token,
                     "outcome": outcome,
                     "updated_at": now,
                 },
@@ -2043,7 +2081,7 @@ class DirectTurnStore:
                     "status": DirectTurnStatus.RECOVERABLE.value,
                     "owner_controller_id": None,
                     "owner_incarnation_id": None,
-                    "fencing_token": None,
+                    "fencing_token": DirectTurnRequestRow.fencing_token,
                     "outcome": outcome,
                     "next_attempt_at": next_attempt_at,
                     "terminal_at": None,

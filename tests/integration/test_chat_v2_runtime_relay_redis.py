@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 import pytest
 
-from cognis.api.chat_v2.schemas import MessageTimelineItem, RuntimeActiveTurn
+from cognis.api.chat_v2.schemas import MessageTimelineItem, RuntimeActiveTurn, RuntimeAuthority
 from cognis.core.chat_v2_runtime_relay import (
     ADMIT_AND_PUBLISH_LUA,
     MAX_PAYLOAD_BYTES,
@@ -79,6 +79,9 @@ def _envelope(
     kind: RelayKind = RelayKind.RUNTIME,
     fence: int = 7,
     large: bool = False,
+    source_epoch: str = "epoch-a",
+    complete: bool = False,
+    authoritative: bool = False,
 ) -> ChatV2RuntimeRelayEnvelope:
     return ChatV2RuntimeRelayEnvelope(
         kind=kind,
@@ -87,7 +90,7 @@ def _envelope(
         origin=RelayOrigin(
             controller_id="controller-a",
             incarnation_id="incarnation-a",
-            runtime_epoch="epoch-a",
+            runtime_epoch=source_epoch,
         ),
         conversation_id="conversation-a",
         session_id="session-a",
@@ -99,6 +102,24 @@ def _envelope(
         ),
         fencing_token=fence,
         source_revision=revision,
+        authority=(
+            RuntimeAuthority(
+                direct_request_id="request-a",
+                turn_id="turn-a",
+                fencing_token=fence,
+                lifecycle=(
+                    "active"
+                    if kind == RelayKind.RUNTIME
+                    else "relinquished"
+                    if kind == RelayKind.RELINQUISHED
+                    else "terminal"
+                ),
+                source_epoch=source_epoch,
+                source_revision=revision,
+            )
+            if authoritative
+            else None
+        ),
         has_active_turn=kind == RelayKind.RUNTIME,
         active_turn=(
             RuntimeActiveTurn(turn_id="turn-a", session_id="session-a", status="running")
@@ -120,6 +141,7 @@ def _envelope(
             if large
             else []
         ),
+        volatile_items_complete=complete,
     )
 
 
@@ -179,4 +201,57 @@ async def test_real_redis_lua_orders_legacy_and_compressed_frames_atomically() -
     finally:
         await redis.command("DEL", key)
         await subscriber.close()
+        await redis.close()
+
+
+@pytest.mark.asyncio
+async def test_real_redis_lua_matches_authority_lifecycle_ordering() -> None:
+    redis_url = os.environ.get("COGNIS_TEST_REDIS_URL")
+    if not redis_url:
+        pytest.skip("COGNIS_TEST_REDIS_URL is not configured")
+    redis = await _RespConnection.connect(redis_url)
+    suffix = secrets.token_hex(8)
+    key = f"test:chat-v2-runtime-relay:{suffix}:latest"
+    channel = f"test:chat-v2-runtime-relay:{suffix}:channel"
+    try:
+        active = _envelope(10, complete=True, authoritative=True).encoded()
+        source_conflict = _envelope(
+            1,
+            source_epoch="epoch-b",
+            complete=True,
+            authoritative=True,
+        ).encoded()
+        relinquished = _envelope(
+            1,
+            kind=RelayKind.RELINQUISHED,
+            source_epoch="epoch-b",
+            complete=True,
+            authoritative=True,
+        ).encoded()
+        late_active = _envelope(11, complete=True, authoritative=True).encoded()
+
+        assert await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, active, 60, channel) == 1
+        assert (
+            await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, source_conflict, 60, channel)
+            == -1
+        )
+        assert (
+            await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, relinquished, 60, channel)
+            == 1
+        )
+        assert (
+            await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, late_active, 60, channel)
+            == -1
+        )
+
+        await redis.command("DEL", key)
+        partial = _envelope(4, complete=False, authoritative=True).encoded()
+        complete = _envelope(4, complete=True, authoritative=True).encoded()
+        assert await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, partial, 60, channel) == 1
+        assert (
+            await redis.command("EVAL", ADMIT_AND_PUBLISH_LUA, 1, key, complete, 60, channel) == 1
+        )
+        assert await redis.command("GET", key) == complete
+    finally:
+        await redis.command("DEL", key)
         await redis.close()

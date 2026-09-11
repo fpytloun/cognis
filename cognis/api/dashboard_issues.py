@@ -29,6 +29,7 @@ from cognis.store.queries import mcp_oauth_resource_key
 ISSUE_LIMIT = 50
 CANDIDATE_LIMIT = 500
 TOOL_OBSERVATION_STALE_AFTER = timedelta(minutes=10)
+EXECUTOR_OFFLINE_GRACE = timedelta(seconds=30)
 _SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
 _UNHEALTHY_RUNTIME_STATES = {"offline", "stale", "blocked", "error", "unavailable"}
 
@@ -180,7 +181,16 @@ def _executor_issues(
     action_url = "/settings?tab=executors"
     issues: list[DashboardIssue] = []
     runtime_state = str(row.runtime_state or "offline")
-    if row.executor_type == "websocket" and runtime_state in _UNHEALTHY_RUNTIME_STATES:
+    offline_in_grace = (
+        runtime_state == "offline"
+        and observed_at is not None
+        and now - observed_at < EXECUTOR_OFFLINE_GRACE
+    )
+    if (
+        row.executor_type == "websocket"
+        and runtime_state in _UNHEALTHY_RUNTIME_STATES
+        and not offline_in_grace
+    ):
         issues.append(
             _issue(
                 kind="executor_unavailable",

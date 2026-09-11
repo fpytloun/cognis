@@ -87,7 +87,10 @@ from cognis.models.session import ConversationContext, ConversationLineage, Sess
 from cognis.models.task import TaskDelivery, TaskModel
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
 from cognis.runtime_context import RuntimeAccessContext, scoped_runtime_context
-from cognis.store.deliverable_storage import hydrate_deliverable_payload
+from cognis.store.deliverable_storage import (
+    DeliverablePayloadIntegrityError,
+    hydrate_deliverable_payload,
+)
 from cognis.store.models import (
     DeliverableRow,
     StepRun,
@@ -2439,7 +2442,33 @@ async def step_run_deliverable_detail(
         row = await get_deliverable(session, deliverable_id)
         if row is None or row.step_run_id != step_run_id:
             raise api_exception(404, "not_found", "Deliverable not found")
-        await hydrate_deliverable_payload(row, request.app.state.artifact_store)
+        try:
+            await hydrate_deliverable_payload(row, request.app.state.artifact_store)
+        except (
+            DeliverablePayloadIntegrityError,
+            FileNotFoundError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise api_exception(
+                409,
+                "deliverable_payload_unavailable",
+                "The full deliverable payload is unavailable or corrupt",
+            ) from exc
+        if (
+            row.format == "rich"
+            and int((row.render_metadata or {}).get("block_count") or 0) > 0
+            and (
+                not isinstance(row.rich_payload, dict)
+                or not isinstance(row.rich_payload.get("blocks"), list)
+                or not row.rich_payload["blocks"]
+            )
+        ):
+            raise api_exception(
+                409,
+                "deliverable_payload_unavailable",
+                "The full deliverable payload is unavailable or corrupt",
+            )
     return deliverable_to_response(row)
 
 

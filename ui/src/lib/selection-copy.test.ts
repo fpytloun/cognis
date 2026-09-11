@@ -37,6 +37,28 @@ function clipboardEvent(
 }
 
 describe('selection copy serialization', () => {
+  it('copies visible text without Markdown decoration, escaping, or link destinations', () => {
+    const payload = payloadFor(
+      '<h2>Title</h2><p><strong>Bold</strong> <a href="https://example.com">label</a> <code>file_name*</code></p><blockquote>Quote</blockquote>',
+    );
+    expect(payload.plainText).toBe('Title\n\nBold label file_name*\n\nQuote');
+  });
+
+  it('preserves plain code whitespace and textual list numbering', () => {
+    expect(payloadFor('<pre>  file_name*\n\n\nnext  </pre>').plainText).toBe('  file_name*\n\n\nnext  ');
+    expect(payloadFor('<ol start="3"><li>First</li><li>Second</li></ol>').plainText).toBe('3. First\n4. Second');
+    expect(payloadFor('<ul><li>First<ul><li>Nested</li></ul></li></ul>').plainText).toBe('- First\n  - Nested');
+  });
+
+  it('does not add list markers or escape characters to selected words', () => {
+    document.body.innerHTML = '<ul><li>file_name*</li></ul>';
+    const text = document.querySelector('li')!.firstChild!;
+    const range = document.createRange();
+    range.setStart(text, 0);
+    range.setEnd(text, 10);
+    expect(serializeSelectionRange(range).plainText).toBe('file_name*');
+  });
+
   it('removes visual styling and UI chrome while preserving semantic HTML', () => {
     const payload = payloadFor(`
       <section class="bg-slate-950" style="background:red;color:white">
@@ -195,12 +217,12 @@ fourth \`\`\`\`
     range.setStart(text, 7);
     range.setEnd(text, 15);
 
-    expect(serializeSelectionRange(range)).toEqual({ html: 'selected', markdown: 'selected' });
+    expect(serializeSelectionRange(range)).toEqual({ html: 'selected', plainText: 'selected', markdown: 'selected' });
   });
 });
 
 describe('selection copy event handling', () => {
-  it('writes all supported payloads and tolerates unsupported text/markdown', () => {
+  it('writes semantic HTML and plain text without a Markdown clipboard representation', () => {
     document.body.innerHTML = '<p id="source">Selected <strong>text</strong></p>';
     const source = document.querySelector('#source')!;
     const selection = document.getSelection()!;
@@ -211,7 +233,8 @@ describe('selection copy event handling', () => {
     expect(handleSelectionCopy(event, selection)).toBe(true);
     expect(event.preventDefault).toHaveBeenCalledOnce();
     expect(data.get('text/html')).toContain('<strong>text</strong>');
-    expect(data.get('text/plain')).toBe('Selected **text**');
+    expect(data.get('text/plain')).toBe('Selected text');
+    expect(data.has('text/markdown')).toBe(false);
   });
 
   it.each(['input', 'textarea', 'select', 'contenteditable'])('bypasses %s editors', (kind) => {

@@ -217,15 +217,6 @@
         "source_ref_count": 1,
         "level": "warning",
         "title": "History incomplete"
-      },
-      {
-        "id": "task:task_1",
-        "kind": "task",
-        "sort_key": "0000:000000000000012:000000:05:000000011",
-        "source_ref_count": 1,
-        "status": "complete",
-        "task_id": "task_1",
-        "result_summary": "Completed"
       }
     ]
   }

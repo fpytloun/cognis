@@ -2,7 +2,7 @@
 
 Projects group related work so agents can understand which repository, source, workflow, task, or conversation they are operating inside.
 
-![Cognis iOS PWA conversation drawer](../assets/screenshots/pwa-conversations.png)
+![Cognis iOS PWA conversation drawer](../assets/screenshots/pwa-conversations.webp)
 
 Use projects when work has a durable context: a codebase, customer environment, research area, operations domain, or recurring workflow family.
 

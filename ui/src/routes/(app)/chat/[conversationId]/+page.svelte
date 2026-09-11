@@ -54,6 +54,7 @@ import X from 'lucide-svelte/icons/x';
   import Popover from '$lib/components/ui/Popover.svelte';
   import PullToRefresh from '$lib/components/ui/PullToRefresh.svelte';
   import { api, asApiError } from '$lib/api/client';
+  import { ObservedConversationReadTracker } from '$lib/dashboard/conversation-read';
   import {
     activityOverviewIsVisible,
     getActivityOverview,
@@ -847,6 +848,19 @@ import X from 'lucide-svelte/icons/x';
   let timelineContentEl = $state<HTMLDivElement | null>(null);
   let userScrolledUp = $state(false);
   let tailPinned = $state(false);
+  const observedConversationReads = new ObservedConversationReadTracker({
+    markRead: (conversationId) => api.conversations.markRead(conversationId),
+    optimisticRead: (conversationId, readThrough) => {
+      markConversationObservedByServiceWorker(conversationId, readThrough);
+      markConversationReadLocally(conversationId, readThrough);
+    },
+    isObserved: (conversationId) => (
+      typeof document !== 'undefined'
+      && !document.hidden
+      && conversationIdFromRoute() === conversationId
+    ),
+    reconcile: () => scheduleSidebarReconciliation('observed-read-failed'),
+  });
   let loadingOlderMessages = $state(false);
   let programmaticScroll = false;
   // The scrollTop value written by the most recent programmatic scroll. Used
@@ -1012,6 +1026,7 @@ import X from 'lucide-svelte/icons/x';
 
   async function applyChatV2Frame(frame: ChatRealtimeFrame): Promise<void> {
     const previousStatus = chatV2Store.snapshot.syncStatus;
+    const previouslyActive = chatV2Store.snapshot.runtime?.has_active_turn === true;
     const result = chatV2Store.applyRealtime(frame);
     if (result.outcome === 'cursor_mismatch' || result.outcome === 'reset_required') {
       await recoverChatV2Canonical(frame.conversation_id);
@@ -1043,6 +1058,17 @@ import X from 'lucide-svelte/icons/x';
     }
     if (chatV2Store.snapshot.conversationId === frame.conversation_id && chatV2Store.snapshot.cursor) {
       wsClient.updateChatV2Cursor(frame.conversation_id, chatV2Store.snapshot.cursor);
+    }
+    if (
+      result.outcome === 'applied'
+      && previouslyActive
+      && chatV2Store.snapshot.runtime?.has_active_turn !== true
+    ) {
+      void observedConversationReads.observe({
+        conversationId: frame.conversation_id,
+        version: frame.cursor_after,
+        readThrough: frame.server_time,
+      });
     }
   }
 
@@ -3840,6 +3866,13 @@ import X from 'lucide-svelte/icons/x';
     } else {
       removeConversationFromSidebar(conversationId);
     }
+    if (conversation.has_unread) {
+      void observedConversationReads.observe({
+        conversationId,
+        version: conversation.last_message_at ?? conversation.updated_at ?? revision ?? 'initial',
+        readThrough: conversation.last_message_at ?? null,
+      });
+    }
   }
 
   function syncConversationActiveSession(activeSessionId: string | null | undefined): void {
@@ -5957,10 +5990,18 @@ import X from 'lucide-svelte/icons/x';
   }
 
   function handleTimelineWheel(event: WheelEvent): void {
-    if (event.deltaY < -CHAT_USER_SCROLL_DELTA_THRESHOLD_PX) {
+    if (event.deltaY < 0) {
       markUserScrollIntentUp();
       clearUserScrollIntentSoon();
     }
+  }
+
+  function handleTimelinePointerDown(event: PointerEvent): void {
+    if (event.target === event.currentTarget) {
+      userScrollIntentUp = true;
+      clearUserScrollIntentSoon();
+    }
+    if (inspectorPresentation === 'overlay') closeHeaderInfo(false);
   }
 
   function handleTimelineTouchStart(event: TouchEvent): void {
@@ -11069,15 +11110,13 @@ import X from 'lucide-svelte/icons/x';
           bind:userScrolledUp
           class="relative min-h-0 flex-1 overflow-y-auto overscroll-contain [overflow-anchor:auto] px-2.5 py-1.5 sm:p-4"
           contentClass="space-y-3 [overflow-anchor:auto]"
-          onScroll={handleTimelineScroll}
+           onScroll={handleTimelineScroll}
+           onPointerDown={handleTimelinePointerDown}
           onWheel={handleTimelineWheel}
           onTouchStart={handleTimelineTouchStart}
           onTouchMove={handleTimelineTouchMove}
           onTouchEnd={handleTimelineTouchEnd}
           onKeydown={handleTimelineKeydown}
-          onPointerDown={() => {
-            if (inspectorPresentation === 'overlay') closeHeaderInfo(false);
-          }}
            onViewSession={handleViewSession}
            onJumpToBottom={jumpToBottom}
           onJumpToActiveStart={jumpToActiveTimelineStart}

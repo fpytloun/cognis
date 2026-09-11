@@ -1646,7 +1646,7 @@ async def _single_session_context(
         and runtime_input.active_turn.get("session_id") != current_session_row.session_id
     ):
         runtime_input = runtime_input.model_copy(
-            update={"runtime_revision": 0, "active_turn": None}
+            update={"runtime_revision": 0, "active_turn": None, "authority": None}
         )
     return {
         "scope": scope,

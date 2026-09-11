@@ -25,6 +25,7 @@ from pydantic import Field, ValidationError, model_validator
 from cognis.api.chat_v2.schemas import (
     BoundaryReceipt,
     RuntimeActiveTurn,
+    RuntimeAuthority,
     StrictModel,
     TimelineItem,
 )
@@ -213,6 +214,7 @@ CODEC_OUTCOMES = frozenset(
 class RelayKind(StrEnum):
     RUNTIME = "runtime"
     TERMINAL = "terminal"
+    RELINQUISHED = "relinquished"
 
 
 class RelayOrigin(StrictModel):
@@ -241,9 +243,11 @@ class ChatV2RuntimeRelayEnvelope(StrictModel):
     owner: RelayOwner
     fencing_token: int = Field(ge=0, le=MAX_REDIS_SAFE_INTEGER)
     source_revision: int = Field(ge=0, le=MAX_REDIS_SAFE_INTEGER)
+    authority: RuntimeAuthority | None = None
     has_active_turn: bool
     active_turn: RuntimeActiveTurn | None = None
     volatile_items: list[TimelineItem] = Field(default_factory=list)
+    volatile_items_complete: bool = False
     context_usage: dict[str, Any] | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
 
@@ -258,8 +262,17 @@ class ChatV2RuntimeRelayEnvelope(StrictModel):
                 raise ValueError("active_turn.turn_id must match turn_id")
             if self.active_turn.session_id != self.session_id:
                 raise ValueError("active_turn.session_id must match session_id")
-        if self.kind == RelayKind.TERMINAL and self.has_active_turn:
-            raise ValueError("terminal envelopes cannot contain an active turn")
+        if self.kind in {RelayKind.TERMINAL, RelayKind.RELINQUISHED} and self.has_active_turn:
+            raise ValueError("inactive envelopes cannot contain an active turn")
+        if self.authority is not None:
+            if self.authority.direct_request_id != self.direct_request_id:
+                raise ValueError("authority request identity must match envelope")
+            if self.authority.turn_id != self.turn_id:
+                raise ValueError("authority turn identity must match envelope")
+            if self.authority.fencing_token != self.fencing_token:
+                raise ValueError("authority fence must match envelope")
+            if self.authority.lifecycle == "active" and not self.has_active_turn:
+                raise ValueError("active authority requires an active envelope")
         for item in self.volatile_items:
             if item.stable:
                 raise ValueError("volatile_items must have stable=false")
@@ -300,6 +313,8 @@ class _CompressedRelayWireFrame(StrictModel):
     origin: RelayOrigin
     fencing_token: int = Field(ge=0, le=MAX_REDIS_SAFE_INTEGER)
     source_revision: int = Field(ge=0, le=MAX_REDIS_SAFE_INTEGER)
+    authority: RuntimeAuthority | None = None
+    volatile_items_complete: bool = False
 
     @classmethod
     def from_envelope(
@@ -320,6 +335,8 @@ class _CompressedRelayWireFrame(StrictModel):
             origin=envelope.origin,
             fencing_token=envelope.fencing_token,
             source_revision=envelope.source_revision,
+            authority=envelope.authority,
+            volatile_items_complete=envelope.volatile_items_complete,
         )
 
     def matches(self, envelope: ChatV2RuntimeRelayEnvelope) -> bool:
@@ -331,6 +348,8 @@ class _CompressedRelayWireFrame(StrictModel):
             and self.origin == envelope.origin
             and self.fencing_token == envelope.fencing_token
             and self.source_revision == envelope.source_revision
+            and self.authority == envelope.authority
+            and self.volatile_items_complete == envelope.volatile_items_complete
         )
 
 
@@ -350,6 +369,7 @@ class RelayGenerationContext:
     owner_controller_id: str
     owner_incarnation_id: str
     fencing_token: int
+    lifecycle: str = "active"
 
     def __post_init__(self) -> None:
         for value in (
@@ -392,13 +412,44 @@ def compare_admission(
     )
     if not same_generation:
         return AdmissionDecision.WRONG_TURN
-    if candidate.origin.runtime_epoch != current.origin.runtime_epoch:
+    candidate_authority = candidate.authority
+    current_authority = current.authority
+    if candidate_authority is not None and current_authority is not None:
+        if (
+            candidate_authority.source_epoch is not None
+            and current_authority.source_epoch is not None
+            and candidate_authority.source_epoch != current_authority.source_epoch
+        ):
+            return (
+                AdmissionDecision.ACCEPT
+                if candidate.kind != RelayKind.RUNTIME or current.kind != RelayKind.RUNTIME
+                else AdmissionDecision.STALE
+            )
+    elif candidate.origin.runtime_epoch != current.origin.runtime_epoch:
         return AdmissionDecision.STALE
-    if current.kind == RelayKind.TERMINAL and candidate.kind == RelayKind.RUNTIME:
+    if (
+        current.kind in {RelayKind.TERMINAL, RelayKind.RELINQUISHED}
+        and candidate.kind == RelayKind.RUNTIME
+    ):
         return AdmissionDecision.STALE
-    if current.kind == RelayKind.RUNTIME and candidate.kind == RelayKind.TERMINAL:
+    if current.kind == RelayKind.RUNTIME and candidate.kind in {
+        RelayKind.TERMINAL,
+        RelayKind.RELINQUISHED,
+    }:
         return AdmissionDecision.ACCEPT
-    if candidate.source_revision <= current.source_revision:
+    if candidate.source_revision < current.source_revision:
+        return AdmissionDecision.STALE
+    if (
+        candidate.authority is None
+        and current.authority is None
+        and candidate.source_revision == current.source_revision
+    ):
+        return AdmissionDecision.STALE
+    if (
+        candidate.source_revision == current.source_revision
+        and not candidate.volatile_items_complete
+        and current.volatile_items_complete
+    ):
         return AdmissionDecision.STALE
     return AdmissionDecision.ACCEPT
 
@@ -416,14 +467,34 @@ if raw then
        or candidate.owner.incarnation_id ~= current.owner.incarnation_id then
       return -2
     end
-    if candidate.origin.runtime_epoch ~= current.origin.runtime_epoch then return -1 end
-    if current.kind == 'terminal' and candidate.kind == 'runtime' then return -1 end
-    if current.kind == 'runtime' and candidate.kind == 'terminal' then
+    local candidate_authority = type(candidate.authority) == 'table'
+    local current_authority = type(current.authority) == 'table'
+    if candidate_authority and current_authority then
+      local candidate_epoch = candidate.authority.source_epoch
+      local current_epoch = current.authority.source_epoch
+      if candidate_epoch and current_epoch and candidate_epoch ~= current_epoch
+         and candidate.kind == 'runtime' and current.kind == 'runtime' then
+        return -1
+      end
+    elseif candidate.origin.runtime_epoch ~= current.origin.runtime_epoch then
+      return -1
+    end
+    local current_inactive = current.kind == 'terminal' or current.kind == 'relinquished'
+    local candidate_inactive = candidate.kind == 'terminal' or candidate.kind == 'relinquished'
+    if current_inactive and candidate.kind == 'runtime' then return -1 end
+    if current.kind == 'runtime' and candidate_inactive then
       redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
       redis.call('PUBLISH', ARGV[3], ARGV[1])
       return 1
     end
-    if candidate.source_revision <= current.source_revision then return -1 end
+    if candidate.source_revision < current.source_revision then return -1 end
+    if candidate.source_revision == current.source_revision then
+      if not candidate_authority and not current_authority then return -1 end
+      if candidate.volatile_items_complete == false
+         and current.volatile_items_complete == true then
+        return -1
+      end
+    end
   end
 end
 redis.call('SET', KEYS[1], ARGV[1], 'EX', tonumber(ARGV[2]))
@@ -444,7 +515,7 @@ class _QueuedEnvelope:
 
     @property
     def is_terminal(self) -> bool:
-        return self.envelope.kind == RelayKind.TERMINAL
+        return self.envelope.kind in {RelayKind.TERMINAL, RelayKind.RELINQUISHED}
 
 
 class _BoundedRelayQueue:
@@ -685,6 +756,8 @@ class ChatV2RuntimeRedisRelay:
         context_usage: Mapping[str, Any] | None = None,
         last_generation: GenerationPerformanceSnapshot | None = None,
         boundary_receipts: list[BoundaryReceipt] | None = None,
+        volatile_items_complete: bool = False,
+        lifecycle: str | None = None,
         event_id: str | None = None,
     ) -> ChatV2RuntimeRelayEnvelope:
         relay_context_usage = dict(context_usage or {})
@@ -692,6 +765,7 @@ class ChatV2RuntimeRedisRelay:
             relay_context_usage["__boundary_receipts"] = [
                 item.model_dump(mode="json") for item in boundary_receipts
             ]
+        source_revision = self.next_revision(context)
         return ChatV2RuntimeRelayEnvelope(
             kind=kind,
             event_id=event_id or secrets.token_urlsafe(18),
@@ -706,10 +780,19 @@ class ChatV2RuntimeRedisRelay:
                 incarnation_id=context.owner_incarnation_id,
             ),
             fencing_token=context.fencing_token,
-            source_revision=self.next_revision(context),
+            source_revision=source_revision,
+            authority=RuntimeAuthority(
+                direct_request_id=context.direct_request_id,
+                turn_id=context.turn_id,
+                fencing_token=context.fencing_token,
+                lifecycle=(lifecycle or (context.lifecycle if has_active_turn else "terminal")),
+                source_epoch=self.origin.runtime_epoch,
+                source_revision=source_revision,
+            ),
             has_active_turn=has_active_turn,
             active_turn=active_turn,
             volatile_items=volatile_items or [],
+            volatile_items_complete=volatile_items_complete,
             context_usage=relay_context_usage or None,
             last_generation=last_generation,
         )
@@ -731,7 +814,8 @@ class ChatV2RuntimeRedisRelay:
             _QueuedEnvelope(
                 envelope=envelope,
                 payload=payload,
-                cumulative_boundary=cumulative_boundary or envelope.kind == RelayKind.TERMINAL,
+                cumulative_boundary=cumulative_boundary
+                or envelope.kind in {RelayKind.TERMINAL, RelayKind.RELINQUISHED},
             )
         )
         if accepted:
@@ -1021,7 +1105,39 @@ class ChatV2RuntimeRedisRelay:
             reason = str(verdict)
             _drop(reason if reason in DROP_REASONS else "invalid")
             return None
-        self._remember(envelope)
+        return envelope
+
+    async def hydrate_latest_authority(
+        self,
+        conversation_id: str,
+        authority: RuntimeAuthority,
+    ) -> ChatV2RuntimeRelayEnvelope | None:
+        """Hydrate one latest envelope only when its durable authority is exact."""
+
+        try:
+            payload = await self.redis_service.get(self.latest_key(conversation_id))
+        except Exception:
+            return None
+        if payload is None:
+            return None
+        envelope = await self._decode_payload(payload)
+        if envelope is None or envelope.authority is None:
+            return None
+        envelope_authority = envelope.authority
+        if (
+            envelope_authority.direct_request_id != authority.direct_request_id
+            or envelope_authority.turn_id != authority.turn_id
+            or envelope_authority.fencing_token != authority.fencing_token
+            or envelope_authority.lifecycle != authority.lifecycle
+        ):
+            return None
+        if (
+            envelope.conversation_id != conversation_id
+            or envelope.direct_request_id != authority.direct_request_id
+            or envelope.turn_id != authority.turn_id
+            or envelope.fencing_token != authority.fencing_token
+        ):
+            return None
         return envelope
 
     async def _decode_payload(self, payload: bytes) -> ChatV2RuntimeRelayEnvelope | None:

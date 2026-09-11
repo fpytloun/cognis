@@ -8,7 +8,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event
 
 from cognis.api.app import create_app
-from cognis.api.dashboard_issues import ISSUE_LIMIT, schedule_incident_token
+from cognis.api.dashboard_issues import (
+    EXECUTOR_OFFLINE_GRACE,
+    ISSUE_LIMIT,
+    schedule_incident_token,
+)
 from cognis.store.models import MCPOAuthTokenRow, Schedule
 from cognis.store.queries import (
     create_agent,
@@ -424,6 +428,56 @@ def test_dashboard_issues_have_a_fixed_result_cap(
         assert len(payload["issues"]) == ISSUE_LIMIT
         assert payload["summary"]["total"] == ISSUE_LIMIT + 5
         assert payload["summary"]["truncated"] is True
+
+
+def test_dashboard_issues_suppress_recent_transient_executor_disconnect(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    with _client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                )
+                recent = await create_executor(
+                    session,
+                    executor_id="exec-recent",
+                    name="Recent disconnect",
+                    executor_type="websocket",
+                    owner_email="owner@example.com",
+                )
+                recent.status = "active"
+                recent.runtime_state = "offline"
+                recent.last_observed_at = now - EXECUTOR_OFFLINE_GRACE / 2
+                expired = await create_executor(
+                    session,
+                    executor_id="exec-expired",
+                    name="Expired disconnect",
+                    executor_type="websocket",
+                    owner_email="owner@example.com",
+                )
+                expired.status = "active"
+                expired.runtime_state = "offline"
+                expired.last_observed_at = now - EXECUTOR_OFFLINE_GRACE
+                await session.commit()
+
+        asyncio.run(_seed())
+        payload = client.get(
+            "/api/v1/dashboard/issues",
+            headers=_headers(client.app, "owner@example.com"),
+        ).json()
+        unavailable_ids = {
+            issue["resource"]["id"]
+            for issue in payload["issues"]
+            if issue["kind"] == "executor_unavailable"
+        }
+        assert unavailable_ids == {"exec-expired"}
 
 
 def test_schedule_issue_dismissal_is_incident_scoped_and_survives_reconciliation(

@@ -691,13 +691,25 @@ export interface BoundaryReceipt {
   client_message_id: string;
 }
 
+export interface RuntimeAuthority {
+  protocol?: 'runtime_authority_v1';
+  direct_request_id: string;
+  turn_id: string;
+  fencing_token: number;
+  lifecycle: 'active' | 'inactive' | 'recoverable' | 'terminal' | 'relinquished' | 'legacy';
+  source_epoch?: string | null;
+  source_revision?: number | null;
+}
+
 export interface RuntimeOverlaySnapshot {
   runtime_epoch: string;
   runtime_revision: number;
   generated_at: string;
   has_active_turn: boolean;
   active_turn?: RuntimeActiveTurn | null;
+  authority?: RuntimeAuthority | null;
   volatile_items: TimelineItem[];
+  volatile_items_complete?: boolean;
   cycle_states?: TurnCycleState[];
   context_usage?: ContextUsage | null;
   last_generation?: GenerationPerformanceSnapshot | null;

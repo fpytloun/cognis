@@ -1303,7 +1303,19 @@ RuntimeOverlaySnapshot {
   generated_at: string
   has_active_turn: boolean
   active_turn?: RuntimeActiveTurn | null
+  authority?: RuntimeAuthority | null
   volatile_items: TimelineItem[]
+  volatile_items_complete: boolean
+}
+
+RuntimeAuthority {
+  protocol: "runtime_authority_v1"
+  direct_request_id: string
+  turn_id: string
+  fencing_token: number
+  lifecycle: "active" | "inactive" | "recoverable" | "terminal" | "relinquished"
+  source_epoch?: string | null
+  source_revision?: number | null
 }
 
 RuntimeActiveTurn {
@@ -1319,29 +1331,36 @@ RuntimeActiveTurn {
 
 Runtime rules:
 
-- Runtime identity is `(runtime_epoch, runtime_revision)`.
+- Versioned runtime lifecycle identity is
+  `(fencing_token, direct_request_id, turn_id)`.
+- The per-conversation PostgreSQL lease owns `fencing_token`. A higher fence
+  always supersedes a lower fence.
+- For one exact authority, inactive lifecycle state absorbs delayed active
+  state. A retry, takeover, or new turn acquires a higher fence.
+- `source_epoch` and `source_revision` order complete progress snapshots only
+  within one exact authority.
+- `volatile_items_complete=false` marks a partial durable snapshot. Missing
+  items in a partial snapshot do not remove same-authority volatile items.
+- A complete snapshot replaces same-authority volatile items.
+- A canonical same-ID item suppresses an incomplete runtime preparation item.
+- `runtime_epoch`, `runtime_revision`, and `generated_at` remain legacy
+  compatibility fields. They do not order versioned authority.
 - `runtime_epoch` changes on controller/scheduler process restart or when a
   cluster-wide runtime state authority changes epoch.
 - `runtime_revision` is monotonic per conversation within one epoch.
-- Client applies runtime when:
-  - local runtime is absent, or
-  - `runtime_epoch` differs, or
-  - `runtime_epoch` matches and `runtime_revision > local.runtime_revision`.
-- If epoch changes, the server reconstructs `claimed`, `running`, and
-  `absorbing` direct turns from `direct_turn_requests` before emitting runtime.
-  This prevents a non-owner controller from clearing the spinner for an active
-  turn owned by another replica.
-- Applying runtime replaces previous volatile overlay completely.
+- Legacy clients use epoch and revision ordering only when no
+  `runtime_authority_v1` capability is present.
+- The server reconstructs active, recoverable, and terminal authority from
+  `direct_turn_requests`. Redis hydration can add complete volatile detail.
 - Runtime items must have `stable=false`.
 - Canonical snapshot/sync items must have `stable=true`.
 - Runtime overlay never advances canonical cursor.
 
-Direct-turn transitions publish bounded `CHAT_SCOPE_CHANGED` invalidations and
-conversation watermarks include durable-turn updates, so dropped notifications
-are repaired by periodic reconciliation. Live token, thinking, and tool-output
-frames remain owner-local volatile detail; they are not sent through PostgreSQL
-notifications. A future shared runtime transport may add cross-controller live
-frame replay without changing durable active-turn authority.
+Direct-turn transitions publish bounded `CHAT_SCOPE_CHANGED` invalidations.
+Conversation watermarks include durable-turn updates, so periodic
+reconciliation repairs dropped notifications. Redis relays complete volatile
+runtime snapshots between controllers. PostgreSQL remains the durable
+lifecycle authority and reconstructs safe partial state after Redis loss.
 
 ---
 

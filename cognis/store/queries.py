@@ -6957,6 +6957,29 @@ async def list_tasks_for_agent(
     return list(result.scalars().all())
 
 
+async def list_active_tasks_by_source_conversation(
+    session: AsyncSession,
+    *,
+    created_by: str,
+    limit: int = 100,
+) -> list[Task]:
+    """List non-terminal tasks that originated from a conversation."""
+
+    result = await session.execute(
+        select(Task)
+        .where(
+            Task.created_by == created_by,
+            Task.source_type.in_(["agent", "chat"]),
+            Task.source_ref.is_not(None),
+            Task.source_session_id.is_not(None),
+            Task.status.in_(["draft", "queued", "ready", "running", "paused"]),
+        )
+        .order_by(Task.updated_at.desc(), Task.created_at.desc(), Task.task_id.desc())
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
 async def list_tasks_by_status(
     session: AsyncSession,
     statuses: list[str],

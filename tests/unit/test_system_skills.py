@@ -96,16 +96,16 @@ def test_coding_skill_assigns_conditional_review_and_evidence_ownership() -> Non
     assert "coordinator or integration changes include uncovered code" in instructions
     assert "explicit workflow gate" in instructions
     assert "After the first blocking review, make one evidence-based correction" in instructions
-    assert "In an architect-owned child, stop and return control to the architect" in instructions
-    assert "Do not start another implementation or review loop" in instructions
-    assert "Otherwise, replan in the same conversation" in instructions
+    assert "stop the fix loop" in instructions
+    assert "required decision to the assignment owner" in instructions
+    assert "replan in the same conversation" in instructions
     assert "Do not escalate for a new unrelated nit" in instructions
     assert "reviewer's role and criteria" in instructions
     assert "prior findings and dispositions" in instructions
     assert "materially useful" in instructions
     assert "implementation reasoning transcript" in instructions
-    assert "architect in coordinate mode" in instructions
-    assert "downgrade the architect" in instructions
+    assert "architect-owned" not in instructions.lower()
+    assert "architect in coordinate mode" not in instructions.lower()
 
 
 def test_coding_skill_defines_bounded_delivery_contract() -> None:
@@ -126,14 +126,14 @@ def test_coding_skill_defines_bounded_delivery_contract() -> None:
         "builtin:bash",
     } <= set(skill["linked_tool_ids"])
     instructions = _normalized_instructions(skill)
-    assert "Architect Todos track those durable workstreams or milestones" in instructions
-    assert "developer Todos track granular implementation" in instructions
-    assert "coordinator retains end-to-end ownership" in instructions
-    assert "one bounded scope" in instructions
-    assert "Do not delegate that same implementation scope" in instructions
-    assert "delegate implementation further" in instructions
+    assert "Direct delivery is the default" in instructions
+    assert "Do not redelegate that core scope" in instructions
+    assert "Coordinated delivery can use a team" in instructions
+    assert "do not redelegate implementation" in instructions
+    assert "instead of replacing itself with another coordinator" in instructions
+    assert "Advisory assistance returns analysis, plans, or review" in instructions
     assert "one evidence-based correction" in instructions
-    assert "Otherwise, replan in the same conversation" in instructions
+    assert "replan in the same conversation" in instructions
     assert "acceptance evidence beyond tests written by the same" in instructions
     assert "Keep reviews scope-locked" in instructions
     assert "Reuse context generically, not only for review" in instructions
@@ -239,7 +239,7 @@ def test_orchestrator_skill_routes_all_bounded_execution_shapes() -> None:
     assert "Use a workflow only when an explicit durable step" in instructions
     assert "Reuse a relevant managed conversation" in instructions
     assert "`agent_conversation_fork`" in instructions
-    assert "Architect Todos track durable workstreams or milestones" in instructions
+    assert "Architect" not in instructions
     assert "update it when each child result changes" in instructions
     assert "Select each worker's profile explicitly" in instructions
     assert "agent_conversation_set_profile" in instructions

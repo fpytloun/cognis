@@ -223,8 +223,8 @@ def _project_event(
     if event.kind == "delegation":
         # Fold synchronous delegate/fork delegations onto their originating
         # tool call so they render as a single rich, auto-expanding tool call.
-        # Asynchronous task/workflow delegations (and any delegation without a
-        # correlated delegate tool call) keep their standalone card.
+        # Task lifecycle belongs in the ongoing-work projection, not the
+        # conversation timeline.
         folded = _record_tool_delegation(event, items_by_id, delegation_folds)
         if folded:
             return HIDDEN_EVENT
@@ -232,7 +232,7 @@ def _project_event(
     if event.kind == "managed_conversation":
         return _managed_conversation_item(event)
     if event.kind == "task":
-        return _task_item(event)
+        return HIDDEN_EVENT
     if event.kind == "question_set":
         return _question_set_item(event)
     if event.kind == "auth_challenge":
@@ -542,11 +542,12 @@ def _record_tool_delegation(
     """
     data = event.data
     mode = _str_or_none(data.get("mode"))
+    child_session_id = _str_or_none(data.get("child_session_id") or data.get("session_id"))
+    if child_session_id and child_session_id.startswith("task_"):
+        return True
     # Only synchronous sub-session delegations render as folded tool calls.
-    # Async task/workflow delegations keep their standalone task card.
     if mode is not None and mode not in {"delegate", "fork"}:
         return False
-    child_session_id = _str_or_none(data.get("child_session_id") or data.get("session_id"))
     call_id = delegation_folds.resolve_call_id(
         call_id=_str_or_none(data.get("call_id")), child_session_id=child_session_id
     )

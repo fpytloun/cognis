@@ -69,11 +69,8 @@ shape for work in Cognis.
   `agent_conversation_get` and `agent_conversation_send` instead of creating a
   duplicate; use `agent_conversation_fork` only for an independent branch that
   requires inherited context.
-- Every new managed-conversation contract must state `Working mode: execute` or
-  `Working mode: coordinate`. Execute means the target completes the assigned
-  core work itself and does not split or delegate it; bounded exploration,
-  research, consultation, or independent review remains allowed. Coordinate
-  permits independent workstreams while retaining integration and acceptance.
+- Give each new managed conversation a compact contract with the objective,
+  context, scope, acceptance criteria, and required return evidence.
 - Use a task when work needs durable background ownership, status, pause/resume,
   or later retrieval but not a custom workflow definition.
 - Use a workflow only when an explicit durable step, deliverable, evaluation, or
@@ -84,9 +81,6 @@ shape for work in Cognis.
 
 # Bounded Coordination
 
-- The architect in coordinate mode retains end-to-end ownership from
-  decomposition through integration, acceptance evidence, and final delivery.
-  Do not downgrade the architect into a worker by default.
 - Decompose large scope into proportional observable workstreams when that
   materially improves safety or elapsed time. Give each implementation worker
   one bounded scope with stable inputs and acceptance criteria; workers do not
@@ -94,9 +88,9 @@ shape for work in Cognis.
 - Require compact child returns with status, results/findings, changed
   references, verification, risks, and questions. Keep detailed logs
   inspectable outside the parent's active context.
-- Architect Todos track durable workstreams or milestones. Keep the parent Todo
-  current across turns, and update it when each child result changes the state
-  of the parent workstream. Plain proportional names are sufficient.
+- Keep the parent Todo current across turns, and update it when each child
+  result changes the state of the parent workstream. Plain proportional names
+  are sufficient.
 - Select each worker's profile explicitly from discovered eligible profiles
   when profile choice matters. Do not guess profile IDs.
 
@@ -224,35 +218,38 @@ Workflow step objectives and controller completion contracts override this skill
 # Execution Contract
 
 - Follow the current role, user request, and workflow contract.
-- A coordinator retains end-to-end ownership for decomposition, integration,
-  acceptance evidence, correction decisions, and final delivery. The architect
-  in coordinate mode owns that work from decomposition through integration and
-  acceptance; do not downgrade the architect into a worker by default.
-- If explicitly assigned as a coordinator, plan, split genuinely independent work, and integrate the results while retaining that ownership.
-- Decompose large scope into proportional observable workstreams when useful.
-  Architect Todos track those durable workstreams or milestones; developer
-  Todos track granular implementation, test, and acceptance steps.
-- If directly assigned as the implementer, own one bounded scope and inspect, implement, and test it yourself. Do not delegate that same implementation scope, delegate implementation further, or redelegate the same scope.
+- Direct delivery is the default. Complete implementation in one conversation
+  when one agent can safely inspect, edit, test, correct, and report the work.
+- A direct implementer owns the assigned implementation, tests, and corrections.
+  Do not redelegate that core scope. Bounded exploration, research, advice, and
+  independent review remain available when they reduce uncertainty.
+- Coordinated delivery can use a team for genuinely independent implementation
+  workstreams. Give workers stable interfaces, separate ownership or workspaces,
+  bounded acceptance criteria, and one integration and acceptance owner.
+- Implementation workers complete their assigned slice and do not redelegate
+  implementation. The coordinator retains decomposition, integration,
+  acceptance, and final delivery instead of replacing itself with another
+  coordinator.
+- Advisory assistance returns analysis, plans, or review. It does not assume
+  implementation ownership unless the assignment changes explicitly.
+- These are prompt conventions, not required runtime modes or an enum. Custom
+  assignments and skills can use other conventions when they obey safety,
+  authorization, capability, and workflow contracts.
+- Do not require a team because work is large, difficult, or assigned to a
+  particular runtime profile. Respect an explicit coordinator assignment.
+- Decompose large scope into proportional observable workstreams only when useful.
 - Workers return compact evidence: status, results/findings, changed references,
   verification, risks, and questions. Keep detailed logs inspectable outside the
   parent's active context.
-- When assigning a primary-agent workstream, state `Working mode: execute` or
-  `Working mode: coordinate`. In execute mode, the target completes the core
-  work itself and does not split or delegate it. Use coordinate mode only when
-  the target is expected to decompose independent workstreams and retain
-  integration and acceptance.
 - Prefer delegation for bounded independent exploration or review. Parallel implementation is appropriate only when the plan and integration contracts are stable, workstreams have separate ownership, dependencies are not sequential, each worker has clear acceptance criteria and an isolated workspace, and one coordinator owns final integration and review.
 - Keep work direct when workers would touch the same hotspots, interfaces are still evolving, one slice depends on decisions from another, or coordination costs more than the implementation.
 - After the first blocking review, make one evidence-based correction when the
   cause and fix are clear.
 - If the same material problem remains, or the correction reveals unclear
-  ownership, wiring, or invariants:
-  - In an architect-owned child, stop and return control to the architect with
-    the finding, attempted correction, remaining uncertainty, and recommended
-    next decision. Do not start another implementation or review loop.
-  - Otherwise, replan in the same conversation and switch to the next suitable
-    profile when available. If escalation is unavailable, stop and return the
-    blocker to the caller.
+  ownership, wiring, or invariants, stop the fix loop. Return the finding,
+  attempted correction, evidence, remaining uncertainty, and required decision
+  to the assignment owner. If you own the assignment, replan in the same
+  conversation and use a suitable available profile or report the blocker.
 - Do not escalate for a new unrelated nit, a test-only portability correction,
   or an infrastructure failure.
 - Reuse context generically, not only for review. Before any fresh delegation,

@@ -1179,7 +1179,7 @@ async def test_latest_hydration_validates_generation_tombstone_and_failures() ->
 
 
 @pytest.mark.asyncio
-async def test_latest_hydration_records_envelope_before_delayed_pubsub_delivery() -> None:
+async def test_latest_hydration_does_not_suppress_delayed_pubsub_delivery() -> None:
     redis = _FakeRedis()
     applied: list[str] = []
 
@@ -1194,8 +1194,8 @@ async def test_latest_hydration_records_envelope_before_delayed_pubsub_delivery(
 
     assert hydrated is not None
     assert hydrated.event_id == "hydrated"
-    assert not await relay.receive(payload)
-    assert applied == []
+    assert await relay.receive(payload)
+    assert applied == ["hydrated"]
 
 
 def test_invalidation_clears_bounded_generation_state() -> None:

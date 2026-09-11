@@ -40,6 +40,7 @@ from prometheus_client import Counter, Histogram
 from sqlalchemy import and_, case, delete, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from cognis.api.chat_v2.schemas import RuntimeAuthority
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.agent_direct import is_agent_direct_context
@@ -169,10 +170,12 @@ from cognis.runtime_context import (
 from cognis.store import queries
 from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now
 from cognis.store.direct_turns import (
+    ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     AdmissionResult,
     DirectTurnAdmissionGuard,
     DirectTurnAdmissionRejected,
+    DirectTurnConflictError,
     DirectTurnStatus,
     DirectTurnStore,
     MaterializedDirectTurnPayload,
@@ -5455,6 +5458,56 @@ class TurnScheduler:
         return self._durable_runtime_state_from_row(row, self.running_turn_state(conversation_id))
 
     @staticmethod
+    def _runtime_authority_from_row(row: DirectTurnRequestRow) -> RuntimeAuthority | None:
+        if row.fencing_token is None or not row.turn_id:
+            return None
+        if row.status in {status.value for status in ACTIVE_STATUSES}:
+            lifecycle = "active"
+        elif row.status == DirectTurnStatus.RECOVERABLE.value:
+            lifecycle = "recoverable"
+        elif row.status in {status.value for status in TERMINAL_STATUSES}:
+            lifecycle = "terminal"
+        else:
+            lifecycle = "inactive"
+        return RuntimeAuthority(
+            direct_request_id=row.request_id,
+            turn_id=row.turn_id,
+            fencing_token=row.fencing_token,
+            lifecycle=lifecycle,
+        )
+
+    async def durable_runtime_context(
+        self,
+        conversation_id: str,
+        *,
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        """Read active state and lifecycle authority from one bounded DB query."""
+
+        if self._direct_turn_store is None:
+            return {
+                "running": self.running_turn_state(conversation_id),
+                "authority": None,
+            }
+        row = await self._direct_turn_store.get_conversation_runtime_authority_row(
+            conversation_id,
+            session=session,
+        )
+        if row is None:
+            return {"running": None, "authority": None}
+        return {
+            "running": (
+                self._durable_runtime_state_from_row(
+                    row,
+                    self.running_turn_state(conversation_id),
+                )
+                if row.status in {status.value for status in ACTIVE_STATUSES}
+                else None
+            ),
+            "authority": self._runtime_authority_from_row(row),
+        }
+
+    @staticmethod
     def _durable_runtime_state_from_row(
         row: DirectTurnRequestRow, local: dict[str, Any] | None
     ) -> dict[str, Any]:
@@ -7123,26 +7176,50 @@ class TurnScheduler:
         ):
             return
 
-        error = await self.submit_turn(
-            conversation_id,
-            "",
-            user_email=row.user_email,
-            attachments=event.data.get("attachments")
-            if isinstance(event.data.get("attachments"), list)
-            else None,
-            outbound_attachments=event.data.get("attachments")
-            if isinstance(event.data.get("attachments"), list)
-            else None,
-            system_initiated=True,
-            follow_up=follow_up,
-            channel_deliverable=channel_deliverable,
-            delivery_id=delivery_id,
-            delivery_fallback_text=delivery_fallback_text,
-            client_message_id=f"follow-up:{follow_up.follow_up_id}",
-            one_shot_chat_mode=event.data.get("one_shot_chat_mode")
-            if event.data.get("one_shot_chat_mode") in {"default", "plan", "build"}
-            else None,
-        )
+        try:
+            error = await self.submit_turn(
+                conversation_id,
+                "",
+                user_email=row.user_email,
+                attachments=event.data.get("attachments")
+                if isinstance(event.data.get("attachments"), list)
+                else None,
+                outbound_attachments=event.data.get("attachments")
+                if isinstance(event.data.get("attachments"), list)
+                else None,
+                system_initiated=True,
+                follow_up=follow_up,
+                channel_deliverable=channel_deliverable,
+                delivery_id=delivery_id,
+                delivery_fallback_text=delivery_fallback_text,
+                client_message_id=f"follow-up:{follow_up.follow_up_id}",
+                one_shot_chat_mode=event.data.get("one_shot_chat_mode")
+                if event.data.get("one_shot_chat_mode") in {"default", "plan", "build"}
+                else None,
+            )
+        except DirectTurnConflictError:
+            if await self._reconcile_conflicting_follow_up_admission(
+                conversation_id=conversation_id,
+                user_email=row.user_email,
+                follow_up_id=follow_up.follow_up_id,
+            ):
+                return
+            logger.error(
+                "turn_scheduler: follow-up direct-turn admission conflict",
+                extra={
+                    "extra_data": {
+                        "conversation_id": conversation_id,
+                        "follow_up_id": follow_up.follow_up_id,
+                    }
+                },
+            )
+            await self._mark_follow_up_intent(
+                conversation_id,
+                follow_up.follow_up_id,
+                status="failed",
+                error="Follow-up admission conflicted with another durable request.",
+            )
+            return
         if error is not None:
             if not error.transient:
                 await self._publish_turn_error(
@@ -7160,6 +7237,101 @@ class TurnScheduler:
                 status="pending" if error.transient else "failed",
                 error=error.message,
             )
+
+    async def _reconcile_conflicting_follow_up_admission(
+        self,
+        *,
+        conversation_id: str,
+        user_email: str,
+        follow_up_id: str,
+    ) -> bool:
+        """Finalize recovery when the matching direct turn already owns the work."""
+
+        scope = f"direct:{conversation_id}:{user_email}:system"
+        stable_key = f"follow-up:{follow_up_id}"
+        dedupe_key = self._follow_up_dedupe_key(conversation_id, follow_up_id)
+        now = _utcnow()
+        async with self._session_factory() as db_session:
+            direct_turn = (
+                await db_session.execute(
+                    select(DirectTurnRequestRow).where(
+                        DirectTurnRequestRow.idempotency_scope == scope,
+                        DirectTurnRequestRow.idempotency_key == stable_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            metadata = (
+                direct_turn.payload.get("metadata")
+                if direct_turn is not None and isinstance(direct_turn.payload, dict)
+                else None
+            )
+            existing_follow_up = metadata.get("follow_up") if isinstance(metadata, dict) else None
+            if (
+                not isinstance(existing_follow_up, dict)
+                or existing_follow_up.get("follow_up_id") != follow_up_id
+            ):
+                return False
+            direct_turn_failed = direct_turn.status in {
+                DirectTurnStatus.FAILED.value,
+                DirectTurnStatus.CANCELLED.value,
+                DirectTurnStatus.AMBIGUOUS.value,
+            }
+            dedupe = await db_session.execute(
+                update(FollowUpDedupeRow)
+                .where(
+                    FollowUpDedupeRow.dedupe_key == dedupe_key,
+                    FollowUpDedupeRow.status.in_(("processing", "admitted")),
+                    FollowUpDedupeRow.lease_owner == self._follow_up_lease_owner,
+                )
+                .values(
+                    status="handled",
+                    expires_at=now + timedelta(seconds=FOLLOW_UP_DEDUPE_TTL_SECONDS),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+            )
+            intent = await db_session.execute(
+                update(FollowUpIntentRow)
+                .where(
+                    FollowUpIntentRow.conversation_id == conversation_id,
+                    FollowUpIntentRow.follow_up_id == follow_up_id,
+                    FollowUpIntentRow.status.in_(("processing", "admitted")),
+                    FollowUpIntentRow.lease_owner == self._follow_up_lease_owner,
+                )
+                .values(
+                    status="failed" if direct_turn_failed else "submitted",
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    last_error=(
+                        "The existing durable direct turn ended without successful completion."
+                        if direct_turn_failed
+                        else None
+                    ),
+                    updated_at=now,
+                )
+            )
+            if not dedupe.rowcount or not intent.rowcount:
+                await db_session.rollback()
+                return False
+            await db_session.commit()
+        key = (conversation_id, follow_up_id)
+        self._pending_follow_ups.discard(key)
+        self._handled_follow_ups[key] = monotonic()
+        logger.info(
+            "turn_scheduler: reconciled follow-up with existing direct turn",
+            extra={
+                "extra_data": {
+                    "conversation_id": conversation_id,
+                    "follow_up_id": follow_up_id,
+                    "request_id": direct_turn.request_id,
+                    "turn_id": direct_turn.turn_id,
+                    "direct_turn_status": direct_turn.status,
+                    "intent_status": "failed" if direct_turn_failed else "submitted",
+                }
+            },
+        )
+        return True
 
     async def _durably_admit_follow_up(
         self,

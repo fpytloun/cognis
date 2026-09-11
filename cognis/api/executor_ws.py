@@ -451,6 +451,7 @@ async def handle_executor_websocket(
                     session,
                     connection_owner,
                     runtime_state=next_state,
+                    last_observed_at=datetime.now(UTC),
                 )
                 await session.commit()
             await ownership.release(connection_owner)

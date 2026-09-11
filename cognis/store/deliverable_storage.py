@@ -43,6 +43,10 @@ class StoredDeliverablePayload:
     outputs: StoredDeliverableFile
 
 
+class DeliverablePayloadIntegrityError(ValueError):
+    """Raised when stored deliverable bytes do not match their database metadata."""
+
+
 def _json_bytes(value: Any) -> bytes:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
         "utf-8"
@@ -58,6 +62,15 @@ def _file_meta(key: str | None, mime: str | None, content: bytes | None) -> Stor
         size=len(content),
         hash=hashlib.sha256(content).hexdigest(),
     )
+
+
+def _verify_stored_file(row: Any, field: str, content: bytes) -> None:
+    expected_size = getattr(row, f"{field}_size", None)
+    expected_hash = getattr(row, f"{field}_hash", None)
+    if expected_size is not None and len(content) != expected_size:
+        raise DeliverablePayloadIntegrityError(f"{field} payload size mismatch")
+    if expected_hash is not None and hashlib.sha256(content).hexdigest() != expected_hash:
+        raise DeliverablePayloadIntegrityError(f"{field} payload hash mismatch")
 
 
 async def store_deliverable_payload(
@@ -173,12 +186,14 @@ async def hydrate_deliverable_payload(row: Any, artifact_store: Any) -> Any:
     content_bytes, _content_type = await artifact_store.async_load(
         namespace, object_id, content_key
     )
+    _verify_stored_file(row, "content", content_bytes)
     content = content_bytes.decode("utf-8")
 
     rich_payload: dict[str, Any] | None = None
     rich_key = getattr(row, "rich_key", None)
     if isinstance(rich_key, str) and rich_key:
         rich_bytes, _rich_type = await artifact_store.async_load(namespace, object_id, rich_key)
+        _verify_stored_file(row, "rich", rich_bytes)
         raw_rich = json.loads(rich_bytes.decode("utf-8"))
         rich_payload = raw_rich if isinstance(raw_rich, dict) else None
         if (
@@ -194,6 +209,7 @@ async def hydrate_deliverable_payload(row: Any, artifact_store: Any) -> Any:
         outputs_bytes, _outputs_type = await artifact_store.async_load(
             namespace, object_id, outputs_key
         )
+        _verify_stored_file(row, "outputs", outputs_bytes)
         raw_outputs = json.loads(outputs_bytes.decode("utf-8"))
         outputs = raw_outputs if isinstance(raw_outputs, dict) else {}
 

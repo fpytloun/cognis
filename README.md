@@ -4,7 +4,7 @@
 
 # cognis
 
-**Cloud-native Agent OS for self-hosted AI agents.** Cognis gives agents identity, memory, workflows, tools, browser use, channels, and safety guardrails without turning everything into one fragile monolith.
+**Cloud-native Agent OS for self-hosted AI agents.** Cognis is not only a place to chat with agents. It is a workspace where agents perform, coordinate, and expose real work. Use it at your desk, at home, or from your phone.
 
 Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
@@ -35,30 +35,40 @@ Cognis works with companion services for memory and guardrails:
 
 ## Screenshots
 
-Desktop workspace:
+### One workspace for real work
+
+Open several conversations and tasks from the dashboard. Keep active work in
+separate windows, switch between them, and inspect rich deliverables without
+losing your place.
 
 <p align="center">
-  <img src="docs/assets/screenshots/chat-desktop.png" alt="Cognis chat workspace with web research tools and todo tracking" />
+  <img src="docs/assets/screenshots/desktop-window-deliverable.webp" alt="Cognis dashboard with several managed windows and a rich daily brief deliverable" />
 </p>
 
-Realtime tool call rendering:
+### See what agents are doing
+
+The activity sidebar shows the files, commands, mutations, artifacts, and
+deliverables for the current work graph. Open command output or inspect a diff
+while the agent continues its work.
 
 <p align="center">
-  <img src="docs/assets/screenshots/realtime-tool-rendering.png" alt="Cognis chat showing realtime bash tool output rendering with validation results and todos" />
+  <img src="docs/assets/screenshots/desktop-work-commands.webp" alt="Cognis desktop workspace with command history, validation output, and execution details beside the conversation" width="49%" />
+  <img src="docs/assets/screenshots/desktop-work-diff.webp" alt="Cognis desktop workspace with a source diff beside the active conversation" width="49%" />
 </p>
+
+### Keep working from mobile
+
+Monitor ongoing sessions, inspect the activity overview, and review changed
+files from the installable mobile app.
 
 <p align="center">
-  <img src="docs/assets/screenshots/executor-browser-tools.png" alt="Executor configuration with browser automation tools" width="49%" />
-  <img src="docs/assets/screenshots/tools-skills.png" alt="Tools and skills registry" width="49%" />
+  <img src="docs/assets/screenshots/mobile-conversations.webp" alt="Cognis mobile conversation list with active work indicators" width="31%" />
+  <img src="docs/assets/screenshots/mobile-ongoing-work.webp" alt="Cognis mobile conversation with three ongoing execution sessions" width="31%" />
+  <img src="docs/assets/screenshots/mobile-activity-overview.webp" alt="Cognis mobile activity overview with context use, changed files, commands, and recent activity" width="31%" />
 </p>
 
-iOS PWA:
-
-<p align="center">
-  <img src="docs/assets/screenshots/pwa-conversations.png" alt="Cognis iOS PWA conversation drawer" width="31%" />
-  <img src="docs/assets/screenshots/pwa-chat.png" alt="Cognis iOS PWA chat with tool activity" width="31%" />
-  <img src="docs/assets/screenshots/pwa-task.png" alt="Cognis iOS PWA task workflow detail" width="31%" />
-</p>
+[See the complete product showcase](docs/guide/showcase.md), including window
+management, desktop activity inspection, mobile diffs, and command output.
 
 ## Features
 
@@ -281,7 +291,7 @@ cognis-executor
 Install a normal remote executor with the complete component set:
 
 ```bash
-pip install "cognis-executor[full]==0.14.0"
+pip install "cognis-executor[full]==0.14.1"
 uvx --from 'cognis-executor[full]' cognis-executor
 ```
 

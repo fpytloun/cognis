@@ -53,6 +53,18 @@ describe('embedded docs registry', () => {
     expect(await validateEmbeddedDocsContent()).toEqual([]);
   });
 
+  it('embeds the harness customization guide', async () => {
+    const guide = await getEmbeddedDoc('customizing-your-harness');
+
+    expect(guide?.title).toBe('How to Customize Your Harness');
+    expect(guide?.content).toContain('### 4. Project instructions');
+    expect(guide?.content).toContain('A Cognis project has an `instructions` field');
+    expect(guide?.content).toContain('PATCH /api/v1/projects/{project_id}');
+    expect(guide?.content).toContain('#### Repository instruction files');
+    expect(guide?.content).toContain('combines these files from root to leaf');
+    expect(guide?.content).toContain('Runtime capabilities, permissions, safety gates');
+  });
+
   it('rewrites internal relative doc links to supported embedded or repo targets', async () => {
     const docsOverview = await loadDocsOverviewContent();
     expect(docsOverview.content).toContain('/blob/main/docs/specs/README.md');

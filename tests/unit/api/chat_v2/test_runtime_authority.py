@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from cognis.api.chat_v2.schemas import RuntimeAuthority
 from cognis.api.chat_v2.sync import runtime_input_from_scheduler
 
 
@@ -25,6 +26,17 @@ class _RemoteOwnerScheduler:
             "updated_at": "2026-07-28T08:00:01+00:00",
         }
 
+    async def durable_runtime_context(self, _conversation_id: str):
+        return {
+            "running": await self.durable_running_turn_state(_conversation_id),
+            "authority": RuntimeAuthority(
+                direct_request_id="request-remote",
+                turn_id="turn-remote",
+                fencing_token=11,
+                lifecycle="active",
+            ),
+        }
+
 
 @pytest.mark.anyio
 async def test_runtime_overlay_keeps_remote_durable_turn_active() -> None:
@@ -43,3 +55,5 @@ async def test_runtime_overlay_keeps_remote_durable_turn_active() -> None:
         "started_at": "2026-07-28T08:00:00+00:00",
         "updated_at": "2026-07-28T08:00:01+00:00",
     }
+    assert runtime.authority is not None
+    assert runtime.authority.fencing_token == 11

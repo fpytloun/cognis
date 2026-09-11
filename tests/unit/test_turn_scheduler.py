@@ -72,6 +72,7 @@ from cognis.models.session import (
 from cognis.store import queries
 from cognis.store.direct_turns import (
     DirectTurnAdmissionRejected,
+    DirectTurnConflictError,
     DirectTurnStatus,
     DirectTurnStore,
 )
@@ -6871,6 +6872,118 @@ async def test_startup_recovery_reclaims_intent_and_dedupe_together(
     monkeypatch.setattr(queries, "get_conversation", _get_conversation)
     assert await scheduler.recover_follow_up_intents(reclaim_processing=True) == 1
     scheduler.submit_turn.assert_awaited_once()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("direct_turn_status", "expected_intent_status"),
+    [
+        (DirectTurnStatus.QUEUED.value, "submitted"),
+        (DirectTurnStatus.RUNNING.value, "submitted"),
+        (DirectTurnStatus.COMPLETED.value, "submitted"),
+        (DirectTurnStatus.FAILED.value, "failed"),
+        (DirectTurnStatus.CANCELLED.value, "failed"),
+        (DirectTurnStatus.AMBIGUOUS.value, "failed"),
+    ],
+)
+async def test_startup_recovery_reconciles_existing_follow_up_direct_turn(
+    tmp_path: Path,
+    direct_turn_status: str,
+    expected_intent_status: str,
+) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'follow-up-conflict.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    scheduler = _follow_up_test_scheduler(session_factory)
+    scheduler.submit_turn = AsyncMock(  # type: ignore[method-assign]
+        side_effect=DirectTurnConflictError("idempotency key was reused with a different request")
+    )
+    follow_up = TaskResultFollowUp(
+        follow_up_id="fup_existing",
+        mode=FollowUpMode.NOTIFY,
+        origin_kind=FollowUpOriginKind.TASK_RESULT,
+        relevance_hint="unknown",
+        required_action=FollowUpRequiredAction.PRESENT_UPDATE,
+        topic_ref="task-1",
+        status=FollowUpStatus.COMPLETED,
+        task_id="task-1",
+        task_title="Background task",
+        source_type="api",
+        delivery_mode="latest_active_for_agent",
+        result_summary="Done",
+        description="",
+    )
+    async with session_factory() as session:
+        await create_user(
+            session,
+            email="user@example.com",
+            name="User",
+            password_hash="hash",
+        )
+        await create_agent(
+            session,
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            status="active",
+        )
+        conversation = await create_conversation(
+            session,
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+        )
+        await scheduler._persist_follow_up_intent(
+            session,
+            conversation_id=conversation.conversation_id,
+            follow_up=follow_up.model_dump(mode="json"),
+        )
+        await session.commit()
+    direct_turn_store = DirectTurnStore(session_factory)
+    admission = await direct_turn_store.admit(
+        conversation_id=conversation.conversation_id,
+        session_id=None,
+        agent_id="agent-1",
+        user_id="user@example.com",
+        idempotency_scope=f"direct:{conversation.conversation_id}:user@example.com:system",
+        idempotency_key="follow-up:fup_existing",
+        payload={
+            "schema_version": 1,
+            "content": "",
+            "attachments": [],
+            "metadata": {
+                "system_initiated": True,
+                "follow_up": follow_up.model_dump(mode="json"),
+            },
+            "channel_delivery": None,
+            "retry_reason": None,
+        },
+    )
+    async with session_factory() as session:
+        await session.execute(
+            update(DirectTurnRequestRow)
+            .where(DirectTurnRequestRow.request_id == admission.request.request_id)
+            .values(status=direct_turn_status)
+        )
+        await session.commit()
+
+    assert await scheduler.recover_follow_up_intents(reclaim_processing=True) == 1
+
+    async with session_factory() as session:
+        intent = (
+            await session.execute(
+                select(FollowUpIntentRow).where(FollowUpIntentRow.follow_up_id == "fup_existing")
+            )
+        ).scalar_one()
+        dedupe = (
+            await session.execute(
+                select(FollowUpDedupeRow).where(FollowUpDedupeRow.follow_up_id == "fup_existing")
+            )
+        ).scalar_one()
+        assert (intent.status, dedupe.status) == (expected_intent_status, "handled")
+    assert await scheduler.recover_follow_up_intents(reclaim_processing=True) == 0
     await engine.dispose()
 
 

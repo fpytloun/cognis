@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 
@@ -46,6 +46,17 @@ describe('CompactConversationChat auxiliary content', () => {
     mocks.sidebar.mockReset().mockResolvedValue({
       background_work: {
         items: [{
+          kind: 'task',
+          work_id: 'task-one',
+          task_id: 'task-one',
+          controller_conversation_id: 'conversation-one',
+          controller_session_id: 'session-root',
+          title: 'Investigate task activity',
+          agent_id: 'riker',
+          agent_profile_id: 'smart',
+          status: 'running',
+          todos: [],
+        }, {
           kind: 'managed_conversation',
           work_id: 'managed-one',
           controller_conversation_id: 'conversation-one',
@@ -92,7 +103,7 @@ describe('CompactConversationChat auxiliary content', () => {
           status: 'running',
           todos: [],
         }],
-        active_count: 5,
+        active_count: 6,
         truncated: false,
         generated_at: '2026-09-10T07:51:00Z',
       },
@@ -134,8 +145,15 @@ describe('CompactConversationChat auxiliary content', () => {
     expect(screen.getByTestId('compact-timeline-fixture')).toHaveClass('min-h-0', 'flex-1');
     expect(screen.getByTestId('compact-composer-fixture')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Ongoing work/ })).toBeInTheDocument();
-    expect(await screen.findByRole('button', { name: /Ongoing work · 3 running · 2 sessions · 1 command · 1 todo/ })).toBeInTheDocument();
+    const ongoing = await screen.findByRole('button', { name: /Ongoing work · 4 running · 1 task · 2 sessions · 1 command · 1 todo/ });
+    expect(ongoing).toBeInTheDocument();
     expect(screen.getAllByRole('button', { name: /Ongoing work/ })).toHaveLength(1);
+    await fireEvent.click(ongoing);
+    expect(screen.getByText('Investigate task activity')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open Investigate task activity' })).toHaveAttribute(
+      'href',
+      '/tasks/task-one',
+    );
   });
 
   it('does not expose parent conversation controls while viewing a child session', async () => {

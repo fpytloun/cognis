@@ -43,6 +43,7 @@ from cognis.api.chat_v2.schemas import (
     ReplaceQueueOp,
     ReplaceStateOp,
     RuntimeActiveTurn,
+    RuntimeAuthority,
     RuntimeOverlaySnapshot,
     StrictModel,
     TimelineBackfillResponse,
@@ -139,6 +140,9 @@ class RuntimeOverlayInput(StrictModel):
     runtime_epoch: str
     runtime_revision: int = Field(ge=0)
     active_turn: dict[str, Any] | None = None
+    authority: RuntimeAuthority | None = None
+    volatile_items: list[TimelineItem] = Field(default_factory=list)
+    volatile_items_complete: bool = False
     context_usage: dict[str, Any] | None = None
     last_generation: GenerationPerformanceSnapshot | None = None
 
@@ -591,12 +595,19 @@ async def runtime_input_from_scheduler(
             context_usage=context_usage,
             last_generation=last_generation,
         )
-    durable_running = getattr(turn_scheduler, "durable_running_turn_state", None)
-    running = (
-        await durable_running(conversation_id)
-        if callable(durable_running)
-        else turn_scheduler.running_turn_state(conversation_id)
-    )
+    durable_context = getattr(turn_scheduler, "durable_runtime_context", None)
+    if callable(durable_context):
+        context = await durable_context(conversation_id)
+        running = context.get("running")
+        authority = context.get("authority")
+    else:
+        durable_running = getattr(turn_scheduler, "durable_running_turn_state", None)
+        running = (
+            await durable_running(conversation_id)
+            if callable(durable_running)
+            else turn_scheduler.running_turn_state(conversation_id)
+        )
+        authority = None
     checkpoint = turn_scheduler.active_turn_checkpoint(conversation_id)
     active_turn: dict[str, Any] | None = None
     if running is not None:
@@ -618,6 +629,9 @@ async def runtime_input_from_scheduler(
         runtime_epoch=runtime_epoch_for(scope_key or f"conversation:{conversation_id}"),
         runtime_revision=1 if active_turn is not None else 0,
         active_turn=active_turn,
+        authority=authority,
+        volatile_items=[],
+        volatile_items_complete=False,
         context_usage=context_usage,
         last_generation=last_generation,
     )
@@ -643,7 +657,9 @@ def _runtime_overlay(
         generated_at=generated_at.isoformat(),
         has_active_turn=active_turn is not None,
         active_turn=active_turn,
-        volatile_items=[],
+        authority=runtime_input.authority,
+        volatile_items=runtime_input.volatile_items,
+        volatile_items_complete=runtime_input.volatile_items_complete,
         context_usage=runtime_input.context_usage,
         last_generation=runtime_input.last_generation,
     )

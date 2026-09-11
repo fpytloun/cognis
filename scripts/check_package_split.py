@@ -184,12 +184,12 @@ def assert_split(common: Path, controller: Path, executor: Path) -> None:
     common_metadata = metadata(common)
     controller_metadata = metadata(controller)
     executor_metadata = metadata(executor)
-    if "Version: 0.14.0" not in common_metadata:
-        raise AssertionError("common metadata does not report version 0.14.0")
-    if "Version: 0.14.0" not in controller_metadata:
-        raise AssertionError("controller metadata does not report version 0.14.0")
-    if "Version: 0.14.0" not in executor_metadata:
-        raise AssertionError("executor metadata does not report version 0.14.0")
+    if "Version: 0.14.1" not in common_metadata:
+        raise AssertionError("common metadata does not report version 0.14.1")
+    if "Version: 0.14.1" not in controller_metadata:
+        raise AssertionError("controller metadata does not report version 0.14.1")
+    if "Version: 0.14.1" not in executor_metadata:
+        raise AssertionError("executor metadata does not report version 0.14.1")
     if _requires(controller_metadata) != [
         item for item in _requires(controller_metadata) if item != "cognis-executor"
     ]:

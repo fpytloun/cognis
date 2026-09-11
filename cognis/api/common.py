@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any, cast
 
 from fastapi import HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
 from cognis.api.authentication import AuthenticatedUser
@@ -43,9 +44,12 @@ def error_response(
     """Create a structured JSON error response."""
     return JSONResponse(
         status_code=status_code,
-        content=ErrorResponse(
-            error=ErrorBody(code=code, message=message, details=details)
-        ).model_dump(),
+        content=jsonable_encoder(
+            ErrorResponse(
+                error=ErrorBody(code=code, message=message, details=details)
+            ).model_dump(),
+            custom_encoder={Exception: str},
+        ),
     )
 
 

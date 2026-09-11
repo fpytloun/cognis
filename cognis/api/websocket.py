@@ -49,7 +49,12 @@ from cognis.api.chat_v2.realtime import (
     tool_call_runtime_item,
     tool_result_runtime_item,
 )
-from cognis.api.chat_v2.schemas import BoundaryReceipt, TimelineItem, TimelineScope
+from cognis.api.chat_v2.schemas import (
+    BoundaryReceipt,
+    RuntimeAuthority,
+    TimelineItem,
+    TimelineScope,
+)
 from cognis.api.chat_v2.sync import current_projection_version
 from cognis.api.models import (
     WebSocketAuthenticated,
@@ -1315,6 +1320,7 @@ class WebSocketTurnObserver:
             conversation_id,
             volatile_items=[],
             has_active_turn=False,
+            lifecycle="recoverable" if error.recoverable else "terminal",
         )
 
     async def on_thinking(
@@ -2120,6 +2126,7 @@ class WebSocketConnectionManager:
         active_session_id: str | None = None,
         context_usage: dict[str, Any] | None = None,
         last_generation: dict[str, Any] | None = None,
+        lifecycle: str | None = None,
     ) -> None:
         """Fan out locally first, then enqueue the same generation for Redis relay."""
         relay = cast(Any, getattr(self.app.state, "chat_v2_runtime_relay", None))
@@ -2161,31 +2168,8 @@ class WebSocketConnectionManager:
             effective_items = [
                 item for item in effective_items if not _is_transient_runtime_notice(item)
             ]
-        await self._fanout_chat_v2_runtime(
-            conversation_id,
-            volatile_items=effective_items,
-            has_active_turn=has_active_turn,
-            active_session_id=active_session_id,
-            context_usage=context_usage,
-            last_generation=last_generation,
-            boundary_receipts=boundary_receipts,
-        )
-        if context is None or relay is None:
-            if (
-                context is not None
-                and boundary_receipts
-                and turn_scheduler is not None
-                and hasattr(turn_scheduler, "acknowledge_boundary_receipts")
-            ):
-                turn_scheduler.acknowledge_boundary_receipts(
-                    conversation_id,
-                    context.turn_id,
-                    [item.model_dump(mode="json") for item in boundary_receipts],
-                )
-            if not has_active_turn:
-                self._relay_runtime_items.pop(conversation_id, None)
-            return
-        try:
+        envelope: ChatV2RuntimeRelayEnvelope | None = None
+        if context is not None and relay is not None:
             running_state = (
                 turn_scheduler.running_turn_state(conversation_id)
                 if turn_scheduler is not None
@@ -2207,7 +2191,13 @@ class WebSocketConnectionManager:
 
             envelope = relay.make_envelope(
                 context,
-                kind=RelayKind.RUNTIME if has_active_turn else RelayKind.TERMINAL,
+                kind=(
+                    RelayKind.RUNTIME
+                    if has_active_turn
+                    else RelayKind.RELINQUISHED
+                    if lifecycle in {"recoverable", "relinquished"}
+                    else RelayKind.TERMINAL
+                ),
                 has_active_turn=has_active_turn,
                 active_turn=(
                     RuntimeActiveTurn.model_validate(active_turn_data)
@@ -2215,6 +2205,8 @@ class WebSocketConnectionManager:
                     else None
                 ),
                 volatile_items=effective_items,
+                volatile_items_complete=True,
+                lifecycle=lifecycle,
                 context_usage=context_usage,
                 last_generation=(
                     GenerationPerformanceSnapshot.model_validate(last_generation)
@@ -2223,6 +2215,36 @@ class WebSocketConnectionManager:
                 ),
                 boundary_receipts=boundary_receipts,
             )
+        await self._fanout_chat_v2_runtime(
+            conversation_id,
+            volatile_items=effective_items,
+            has_active_turn=has_active_turn,
+            active_session_id=active_session_id,
+            context_usage=context_usage,
+            last_generation=last_generation,
+            boundary_receipts=boundary_receipts,
+            authority=envelope.authority if envelope is not None else None,
+            volatile_items_complete=(
+                envelope.volatile_items_complete if envelope is not None else not has_active_turn
+            ),
+        )
+        if context is None or relay is None:
+            if (
+                context is not None
+                and boundary_receipts
+                and turn_scheduler is not None
+                and hasattr(turn_scheduler, "acknowledge_boundary_receipts")
+            ):
+                turn_scheduler.acknowledge_boundary_receipts(
+                    conversation_id,
+                    context.turn_id,
+                    [item.model_dump(mode="json") for item in boundary_receipts],
+                )
+            if not has_active_turn:
+                self._relay_runtime_items.pop(conversation_id, None)
+            return
+        try:
+            assert envelope is not None
             cumulative_boundary = _runtime_relay_cumulative_boundary(
                 effective_items,
                 has_active_turn=has_active_turn,
@@ -2276,6 +2298,8 @@ class WebSocketConnectionManager:
         last_generation: dict[str, Any] | None,
         active_turn: dict[str, Any] | None = None,
         boundary_receipts: list[BoundaryReceipt] | None = None,
+        authority: RuntimeAuthority | None = None,
+        volatile_items_complete: bool = False,
     ) -> None:
         """Apply a runtime overlay to authorized local scopes only."""
 
@@ -2312,6 +2336,8 @@ class WebSocketConnectionManager:
                         else None
                     ),
                     volatile_items=volatile_items,
+                    authority=authority,
+                    volatile_items_complete=volatile_items_complete,
                     context_usage=context_usage,
                     last_generation=last_generation,
                     boundary_receipts=[
@@ -2344,6 +2370,35 @@ class WebSocketConnectionManager:
     ) -> AdmissionDecision:
         """Validate Redis control data against the current PostgreSQL owner generation."""
         scheduler = getattr(self.app.state, "turn_scheduler", None)
+        if envelope.authority is not None and scheduler is not None:
+            durable_context = getattr(scheduler, "durable_runtime_context", None)
+            if callable(durable_context):
+                current = await durable_context(envelope.conversation_id)
+                current_authority = current.get("authority")
+                if current_authority is None:
+                    return AdmissionDecision.STALE
+                if envelope.fencing_token != current_authority.fencing_token:
+                    return AdmissionDecision.WRONG_FENCE
+                if (
+                    envelope.direct_request_id != current_authority.direct_request_id
+                    or envelope.turn_id != current_authority.turn_id
+                ):
+                    return AdmissionDecision.WRONG_TURN
+                if envelope.authority.lifecycle != current_authority.lifecycle:
+                    return AdmissionDecision.STALE
+                if current_authority.lifecycle == "active":
+                    context = await scheduler.durable_relay_generation_context(
+                        envelope.conversation_id
+                    )
+                    if context is None:
+                        return AdmissionDecision.STALE
+                    if (
+                        context.session_id != envelope.session_id
+                        or context.owner_controller_id != envelope.owner.controller_id
+                        or context.owner_incarnation_id != envelope.owner.incarnation_id
+                    ):
+                        return AdmissionDecision.STALE
+                return AdmissionDecision.ACCEPT
         context = (
             await scheduler.durable_relay_generation_context(envelope.conversation_id)
             if scheduler is not None and hasattr(scheduler, "durable_relay_generation_context")
@@ -2400,6 +2455,8 @@ class WebSocketConnectionManager:
                 BoundaryReceipt.model_validate(item)
                 for item in ((envelope.context_usage or {}).get("__boundary_receipts") or [])
             ],
+            authority=envelope.authority,
+            volatile_items_complete=envelope.volatile_items_complete,
         )
 
     def _chat_v2_active_turn_payload(

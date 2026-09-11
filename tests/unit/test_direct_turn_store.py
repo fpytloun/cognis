@@ -1663,6 +1663,66 @@ async def test_claimable_heads_preserve_fifo_per_conversation(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_runtime_authority_retains_terminal_fence_without_authorizing_work(
+    tmp_path: Path,
+) -> None:
+    harness = await _harness(tmp_path)
+    try:
+        admitted = await _admit(harness, key="authority-terminal", content="hello")
+        lease = await _lease(harness)
+        claimed = await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+            session_id="sess-1",
+        )
+        assert claimed is not None
+        terminal = await harness.store.mark_terminal(
+            admitted.request.request_id,
+            lease=lease,
+            status=DirectTurnStatus.COMPLETED,
+        )
+        assert terminal is not None
+        assert terminal.fencing_token == lease.fencing_token
+        assert terminal.owner_controller_id is not None
+        authority_row = await harness.store.get_conversation_runtime_authority_row("conv-a")
+        assert authority_row is not None
+        assert authority_row.fencing_token == lease.fencing_token
+        assert await harness.store.mark_running(admitted.request.request_id, lease=lease) is None
+    finally:
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_authority_lookup_uses_one_bounded_select(tmp_path: Path) -> None:
+    harness = await _harness(tmp_path)
+    statements: list[str] = []
+
+    def record_select(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            statements.append(statement)
+
+    event.listen(harness.engine.sync_engine, "before_cursor_execute", record_select)
+    try:
+        admitted = await _admit(harness, key="authority-query", content="hello")
+        lease = await _lease(harness)
+        assert await harness.store.claim(
+            admitted.request.request_id,
+            lease=lease,
+            controller_id="controller-a",
+            incarnation_id="boot-a",
+        )
+        statements.clear()
+        row = await harness.store.get_conversation_runtime_authority_row("conv-a")
+        assert row is not None
+        assert len(statements) == 1
+    finally:
+        event.remove(harness.engine.sync_engine, "before_cursor_execute", record_select)
+        await harness.engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_claimable_heads_wait_for_persisted_retry_deadline(tmp_path: Path) -> None:
     harness = await _harness(tmp_path)
     try:

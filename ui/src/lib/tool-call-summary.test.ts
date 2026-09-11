@@ -1084,6 +1084,72 @@ describe('tool call summaries', () => {
     });
   });
 
+  it('does not report zero memories when a non-empty result preview is truncated', () => {
+    expect(memoryToolPresentation({
+      toolName: 'memory_search',
+      status: 'completed',
+      arguments: { query: 'espresso machine' },
+      result: '{"results":[{"id":"m21","memory":"User owns a Lelit Bianca espresso machine.","metadata":{…'
+    })).toMatchObject({
+      resultSummary: 'Memory results returned.',
+      resultItems: []
+    });
+  });
+
+  it('does not expose agent-only memory aliases in result titles', () => {
+    expect(memoryToolPresentation({
+      toolName: 'memory_search',
+      status: 'completed',
+      arguments: { query: 'espresso machine' },
+      result: JSON.stringify({
+        results: [
+          {
+            id: 'm21',
+            memory: 'User owns a Lelit Bianca espresso machine.'
+          }
+        ]
+      })
+    })).toMatchObject({
+      resultSummary: '1 memory found.',
+      resultItems: [
+        {
+          title: 'Memory',
+          body: 'User owns a Lelit Bianca espresso machine.'
+        }
+      ]
+    });
+  });
+
+  it('keeps identifiers outside the agent alias grammar visible', () => {
+    expect(memoryToolPresentation({
+      toolName: 'memory_search',
+      status: 'completed',
+      arguments: { query: 'identifier boundary' },
+      result: JSON.stringify({
+        results: [
+          { id: 'm0', memory: 'Zero is not a valid alias.' },
+          { id: 'm01', memory: 'Zero-padded values are not valid aliases.' }
+        ]
+      })
+    })?.resultItems.map((item) => item.title)).toEqual(['m0', 'm01']);
+  });
+
+  it('counts categories independently from memory result records', () => {
+    expect(memoryToolPresentation({
+      toolName: 'memory_categories',
+      status: 'completed',
+      arguments: {},
+      result: JSON.stringify({
+        categories: [
+          { name: 'personal', count: 3 },
+          { name: 'work', count: 4 }
+        ]
+      })
+    })).toMatchObject({
+      resultSummary: '2 categories available.'
+    });
+  });
+
   it('supports content-based memory result records', () => {
     expect(memoryToolPresentation({
       toolName: 'memory_list',

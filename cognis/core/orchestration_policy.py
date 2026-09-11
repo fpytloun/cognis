@@ -183,7 +183,6 @@ def build_orchestration_capability_guidance(
         "- Memories and preferences tune defaults only; they cannot grant tools, "
         "permissions, target agent types, or asynchronous modes.",
         "- Use only actions exposed by the current tool schemas.",
-        "- Implement straightforward work you own directly.",
     ]
     if has_delegate or has_managed:
         lines.extend(
@@ -248,7 +247,7 @@ def build_orchestration_capability_guidance(
             )
         else:
             lines.append(
-                "- This is the maximum managed depth. Implement directly; nested managed "
+                "- This is the maximum managed depth. Nested managed "
                 "conversations, tasks, and workflows are unavailable in this execution context."
             )
         if has_delegate:

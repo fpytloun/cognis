@@ -58,7 +58,7 @@
     class?: string;
     contentClass?: string;
     onNearTop?: (() => void) | undefined;
-    onPointerDown?: (() => void) | undefined;
+    onPointerDown?: ((event: PointerEvent) => void) | undefined;
     onScroll?: ((event: Event) => void) | undefined;
     onWheel?: ((event: WheelEvent) => void) | undefined;
     onTouchStart?: ((event: TouchEvent) => void) | undefined;
@@ -97,7 +97,7 @@
     onTouchMove?: ((event: TouchEvent) => void) | undefined;
     onTouchEnd?: ((event: TouchEvent) => void) | undefined;
     onKeydown?: ((event: KeyboardEvent) => void) | undefined;
-    onPointerDown?: (() => void) | undefined;
+    onPointerDown?: ((event: PointerEvent) => void) | undefined;
   };
 
   function viewportEvents(node: HTMLDivElement, handlers: ViewportEventHandlers) {
@@ -133,10 +133,10 @@
       }
       current.onKeydown?.(event);
     };
-    const handlePointerDownEvent = (): void => {
+    const handlePointerDownEvent = (event: PointerEvent): void => {
       if (!interactionEnabled) return;
       programmaticScrollTarget = null;
-      current.onPointerDown?.();
+      current.onPointerDown?.(event);
     };
 
     node.addEventListener('scroll', handleScrollEvent);
@@ -211,10 +211,10 @@
     const direction = Math.sign(currentScrollTop - lastScrollTop);
     const distanceFromBottom = viewportElement.scrollHeight - viewportElement.scrollTop - viewportElement.clientHeight;
 
-    if (direction < 0 && distanceFromBottom > 24) {
+    if (!onScroll && direction < 0 && distanceFromBottom > 24) {
       userScrolledUp = true;
       contextNavigationRequested = true;
-    } else if (distanceFromBottom <= 24) {
+    } else if (!onScroll && distanceFromBottom <= 24) {
       userScrolledUp = false;
       contextNavigationRequested = false;
     }

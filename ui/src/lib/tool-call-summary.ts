@@ -1286,12 +1286,17 @@ function memoryItemMeta(record: Record<string, unknown>): StructuredToolEntry[] 
   return meta;
 }
 
+function displayMemoryId(value: unknown): string {
+  const id = stringField(value);
+  return /^m[1-9]\d*$/.test(id) ? '' : id;
+}
+
 function appendMemoryResultItem(items: MemoryResultItemPresentation[], record: Record<string, unknown>): void {
   const memory = stringField(record.memory) || stringField(record.content);
   const filename = stringField(record.filename);
   const name = stringField(record.name);
   const description = stringField(record.description);
-  const id = stringField(record.id);
+  const id = displayMemoryId(record.id);
   if (record.error === true || stringField(record.message)) {
     items.push({
       title: stringField(record.message) || 'Memory save failed',
@@ -1407,6 +1412,14 @@ function failedMemorySaveCount(resultItems: MemoryResultItemPresentation[]): num
   return resultItems.filter((item) => item.accent === 'generic').length;
 }
 
+function returnedMemoryCount(resultItems: MemoryResultItemPresentation[]): number {
+  return resultItems.filter((item) => item.accent === 'memory').length;
+}
+
+function returnedCategoryCount(resultItems: MemoryResultItemPresentation[]): number {
+  return resultItems.filter((item) => item.accent === 'category').length;
+}
+
 function memorySaveSummary(resultItems: MemoryResultItemPresentation[], fallback: string): string {
   const savedCount = savedMemoryCount(resultItems);
   const failedCount = failedMemorySaveCount(resultItems);
@@ -1446,23 +1459,30 @@ function memoryResultSummary(
   if (item.status === 'started') return 'Waiting for memory operation result.';
   const message = stringField(parsed?.message);
   if (item.isError || parsed?.error === true) return message || firstOutputLine(cleanToolResult(item.result)) || 'Memory operation failed.';
-  const count = resultItems.length;
+  const memoryCount = returnedMemoryCount(resultItems);
+  const itemCount = resultItems.length;
   if (name === 'memoryask') {
     const answer = stringField(parsed?.answer);
     return answer ? 'Answered from stored memories.' : 'No answer was returned.';
   }
   if (name === 'memorysearch' || name === 'memoryfind' || name === 'memorylist' || name === 'memoryrecent') {
-    return `${count} memor${count === 1 ? 'y' : 'ies'} found.`;
+    const rawResult = cleanToolResult(item.result).trim();
+    if (!parsed && /"results"\s*:\s*\[\s*\{/.test(rawResult)) return 'Memory results returned.';
+    if (!parsed && rawResult) return 'Memory result preview unavailable.';
+    return `${memoryCount} memor${memoryCount === 1 ? 'y' : 'ies'} found.`;
   }
   if (message) return message;
   if (name === 'memoryaddbatch' || name === 'memoryadd' || name === 'memoryupdate' || name === 'memorydelete') {
     return isMemorySaveTool(name)
       ? memorySaveSummary(resultItems, 'Memory operation completed.')
-      : count > 0 ? `${count} memor${count === 1 ? 'y' : 'ies'} changed.` : 'Memory operation completed.';
+      : memoryCount > 0 ? `${memoryCount} memor${memoryCount === 1 ? 'y' : 'ies'} changed.` : 'Memory operation completed.';
   }
-  if (name === 'memorycategories') return `${count} categor${count === 1 ? 'y' : 'ies'} available.`;
+  if (name === 'memorycategories') {
+    const categoryCount = returnedCategoryCount(resultItems);
+    return `${categoryCount} categor${categoryCount === 1 ? 'y' : 'ies'} available.`;
+  }
   const text = stringField(parsed?.text) || (name === 'memorygetartifact' ? stringField(parsed?.content) : '');
-  if (name.includes('artifact')) return count > 0 || text ? 'Artifact operation completed.' : 'Memory artifact operation completed.';
+  if (name.includes('artifact')) return itemCount > 0 || text ? 'Artifact operation completed.' : 'Memory artifact operation completed.';
   if (text) return 'Memory text returned.';
   return cleanToolResult(item.result).trim() ? 'Memory operation completed.' : 'No memory output was returned.';
 }

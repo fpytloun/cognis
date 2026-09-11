@@ -67,6 +67,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/architecture.md': '/docs/architecture',
   'docs/guide/configuring-providers.md': '/docs/configuring-providers',
   'docs/guide/creating-agents.md': '/docs/creating-agents',
+  'docs/guide/customizing-your-harness.md': '/docs/customizing-your-harness',
   'docs/guide/security-and-privacy.md': '/docs/security-and-privacy',
   'docs/guide/settings.md': '/docs/settings',
   'docs/guide/using-chat.md': '/docs/using-chat',

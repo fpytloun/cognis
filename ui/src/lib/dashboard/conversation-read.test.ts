@@ -4,6 +4,7 @@ import type { Conversation } from '$lib/types/api';
 import {
   DashboardConversationProjectionGate,
   DashboardConversationReadTracker,
+  ObservedConversationReadTracker,
 } from './conversation-read';
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
@@ -182,5 +183,133 @@ describe('DashboardConversationProjectionGate', () => {
 
     gate.invalidate();
     expect(gate.isCurrent(newerRealtimeLoad)).toBe(false);
+  });
+});
+
+describe('ObservedConversationReadTracker', () => {
+  it('marks a visible terminal version and ignores hidden or inactive conversations', async () => {
+    let activeConversationId = 'conversation-1';
+    let visible = true;
+    const markRead = vi.fn().mockResolvedValue({ ok: true });
+    const optimisticRead = vi.fn();
+    const subject = new ObservedConversationReadTracker({
+      markRead,
+      optimisticRead,
+      isObserved: (conversationId) => visible && conversationId === activeConversationId,
+      reconcile: vi.fn(),
+    });
+
+    await subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-2',
+      readThrough: '2026-08-24T12:01:00Z',
+    });
+    visible = false;
+    expect(subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-3',
+      readThrough: '2026-08-24T12:02:00Z',
+    })).toBeNull();
+    visible = true;
+    activeConversationId = 'conversation-2';
+    expect(subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-4',
+      readThrough: '2026-08-24T12:03:00Z',
+    })).toBeNull();
+
+    expect(markRead).toHaveBeenCalledOnce();
+    expect(optimisticRead).toHaveBeenCalledWith(
+      'conversation-1',
+      '2026-08-24T12:01:00Z',
+    );
+  });
+
+  it('re-marks a late newer sidebar version after an in-flight terminal read', async () => {
+    let resolveFirst!: () => void;
+    const markRead = vi.fn()
+      .mockReturnValueOnce(new Promise<void>((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce({ ok: true });
+    const optimisticRead = vi.fn();
+    const subject = new ObservedConversationReadTracker({
+      markRead,
+      optimisticRead,
+      isObserved: () => true,
+      reconcile: vi.fn(),
+    });
+
+    const first = subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-2',
+      readThrough: '2026-08-24T12:01:00Z',
+    });
+    subject.observe({
+      conversationId: 'conversation-1',
+      version: '2026-08-24T12:01:01Z',
+      readThrough: '2026-08-24T12:01:01Z',
+    });
+    resolveFirst();
+    await first;
+    await vi.waitFor(() => expect(markRead).toHaveBeenCalledTimes(2));
+
+    expect(optimisticRead).toHaveBeenLastCalledWith(
+      'conversation-1',
+      '2026-08-24T12:01:01Z',
+    );
+  });
+
+  it('does not drain a queued late version after the user leaves', async () => {
+    let observed = true;
+    let resolveFirst!: () => void;
+    const markRead = vi.fn()
+      .mockReturnValueOnce(new Promise<void>((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce({ ok: true });
+    const subject = new ObservedConversationReadTracker({
+      markRead,
+      optimisticRead: vi.fn(),
+      isObserved: () => observed,
+      reconcile: vi.fn(),
+    });
+
+    const first = subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-2',
+      readThrough: null,
+    });
+    subject.observe({
+      conversationId: 'conversation-1',
+      version: 'cursor-3',
+      readThrough: null,
+    });
+    observed = false;
+    resolveFirst();
+    await first;
+    await Promise.resolve();
+
+    expect(markRead).toHaveBeenCalledOnce();
+  });
+
+  it('reconciles a failed read and permits another attempt for the same version', async () => {
+    const markRead = vi.fn()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce({ ok: true });
+    const reconcile = vi.fn();
+    const subject = new ObservedConversationReadTracker({
+      markRead,
+      optimisticRead: vi.fn(),
+      isObserved: () => true,
+      reconcile,
+    });
+    const observation = {
+      conversationId: 'conversation-1',
+      version: 'cursor-2',
+      readThrough: null,
+    };
+
+    await subject.observe(observation);
+    await subject.observe(observation);
+
+    expect(markRead).toHaveBeenCalledTimes(2);
+    expect(reconcile).toHaveBeenCalledOnce();
   });
 });

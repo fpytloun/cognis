@@ -63,8 +63,8 @@ def test_prompt_requires_proportional_delegation_contract() -> None:
     assert "prior findings and dispositions" in instructions
     assert "compact evidence" in instructions
     assert "detailed child log inspectable" in instructions
-    assert "architect owns decomposition" in instructions
-    assert "downgrade the architect" in instructions
+    assert "Working mode:" not in instructions
+    assert "architect" not in instructions.lower()
 
 
 def test_delegation_contract_is_gated_to_chat_with_orchestration() -> None:
@@ -163,10 +163,13 @@ def test_todo_tool_contract_is_proportional_for_multistep_work() -> None:
 
 def test_chat_prompt_sets_pragmatic_coding_expectations() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
+    coding_skill = get_system_skill_default("cognis-coding")
     assert instructions is not None
-    assert "For software engineering work" in instructions
-    assert "smallest correct change" in instructions
-    assert "update docs only when directly affected" in instructions
+    assert coding_skill is not None
+    content = str(coding_skill["instructions"])
+    assert "For software engineering work" not in instructions
+    assert "smallest correct change" in content
+    assert "Update directly affected docs" in content
 
 
 def test_prompt_describes_artifact_value_refs() -> None:
@@ -218,9 +221,8 @@ def test_async_work_tool_descriptions_discourage_duplicate_parent_work() -> None
     assert "instead of creating a duplicate" in create_description
     assert 'chat_mode="plan"' in create_description
     assert 'chat_mode="build"' in create_description
-    assert "Working mode: execute" in create_description
-    assert "Working mode: coordinate" in create_description
-    assert "does not split or delegate it" in create_description
+    assert "Working mode:" not in create_description
+    assert "any assignment convention" in create_description
     assert "specialist role, tool/authority scope, and expected output" in delegate_description
     assert "they do not change specialist" in delegate_description
 
@@ -299,28 +301,30 @@ def test_immutable_prompt_families_contain_no_orchestration_menu() -> None:
             assert forbidden not in instructions
 
 
-def test_chat_prompt_prioritizes_dedicated_implementation_ownership() -> None:
+def test_coding_skill_prioritizes_direct_implementation_ownership() -> None:
     instructions = build_system_instructions(PromptContext.CHAT)
     coding_skill = get_system_skill_default("cognis-coding")
 
     assert instructions is not None
     assert coding_skill is not None
     content = str(coding_skill["instructions"])
-    assert "Implement straightforward work you own directly" in instructions
-    assert "directly assigned as the implementer" in content
-    assert "Do not delegate that same implementation scope" in content
+    assert "Direct delivery is the default" not in instructions
+    assert "Direct delivery is the default" in content
+    assert "Do not redelegate that core scope" in content
     assert "system:implement" not in content
 
 
-def test_coding_skill_has_generic_coordinator_contract_without_agent_special_case() -> None:
+def test_coding_skill_has_optional_generic_delivery_conventions() -> None:
     coding_skill = get_system_skill_default("cognis-coding")
     assert coding_skill is not None
     content = str(coding_skill["instructions"])
-    assert "explicitly assigned as a coordinator" in content
-    assert "plan, split genuinely independent work, and integrate the results" in content
-    assert "When assigning a primary-agent workstream" in content
-    assert "Working mode: execute" in content
-    assert "Working mode: coordinate" in content
+    assert "Coordinated delivery can use a team" in content
+    assert "coordinator retains decomposition, integration" in content
+    assert "Advisory assistance returns analysis, plans, or review" in content
+    assert "not required runtime modes or an enum" in content
+    assert "assignments and skills can use other conventions" in content
+    assert "Do not require a team because work is large, difficult" in content
+    assert "Working mode:" not in content
     assert "LaForge" not in content
     assert "LaForge managed conversation" not in content
 
@@ -369,9 +373,8 @@ def test_delegation_prompt_allows_only_explicit_nested_orchestration() -> None:
     instructions = build_system_instructions(PromptContext.DELEGATION)
 
     assert instructions is not None
-    assert "Complete the assigned scope directly by default" in instructions
-    assert "parent explicitly assigned you an orchestrator role" in instructions
-    assert "Never redelegate the same scope" in instructions
+    assert "Use further orchestration only when the assignment" in instructions
+    assert "current runtime capabilities authorize it" in instructions
 
 
 def test_chat_prompt_defaults_review_to_findings_first() -> None:
@@ -471,7 +474,7 @@ def test_delegation_prompt_mentions_todos_and_questions() -> None:
     assert instructions is not None
     assert "secondary (specialist) agent" in instructions
     assert "write a comprehensive final assistant message" in instructions
-    assert "Complete the assigned scope directly by default" in instructions
+    assert "Use further orchestration only when the assignment" in instructions
 
 
 def test_follow_up_integrate_prompt_marks_history_as_inactive() -> None:

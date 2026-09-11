@@ -1618,6 +1618,19 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
                     deliverable_id="projection-deliverable",
                     title="Projection deliverable",
                     content="heavy deliverable content",
+                    format="rich",
+                    rich={
+                        "blocks": [
+                            {
+                                "type": "section_header",
+                                "eyebrow": "Operations",
+                                "title": "Current state",
+                                "subtitle": "Verified signals",
+                            },
+                            {"type": "markdown", "content": "Persisted rich body"},
+                        ],
+                        "metadata": {},
+                    },
                     artifact_store=app.state.artifact_store,
                 )
                 await session.commit()
@@ -1671,7 +1684,137 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
             headers=headers,
         )
         assert hydrated.status_code == 200
-        assert hydrated.json()["content"] == "heavy deliverable content"
+        hydrated_body = hydrated.json()
+        assert hydrated_body["content"] == "heavy deliverable content"
+        assert hydrated_body["rich_payload"]["blocks"] == [
+            {
+                "type": "section_header",
+                "eyebrow": "Operations",
+                "title": "Current state",
+                "subtitle": "Verified signals",
+            },
+            {"type": "markdown", "content": "Persisted rich body"},
+        ]
+
+
+def test_failed_task_preserves_approved_rich_step_deliverable(
+    monkeypatch: object,
+    tmp_path: Path,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+        rich_blocks = [
+            {
+                "type": "section_header",
+                "eyebrow": "Operations",
+                "title": "Current state",
+                "subtitle": "Verified signals",
+            },
+            {"type": "markdown", "content": "Persisted rich body"},
+        ]
+
+        async def _seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="user@example.com",
+                    name="Agent 1",
+                    status="active",
+                )
+                task = await create_task(
+                    session,
+                    task_id="failed-rich-task",
+                    created_by="user@example.com",
+                    agent_id="agent-1",
+                    title="Failed rich task",
+                    status="running",
+                    workflow_id="system:general-task",
+                    workflow_state={"current_step_index": 1, "status": "failed"},
+                )
+                operate = await create_step_run(
+                    session,
+                    task_id=task.task_id,
+                    step_run_id="approved-operate",
+                    step_name="operate",
+                    step_type="run",
+                    agent_id="agent-1",
+                    attempt_number=1,
+                    status="approved",
+                    completed_at=datetime.now(UTC) - timedelta(minutes=1),
+                    deliverable_id="approved-rich-deliverable",
+                )
+                await create_deliverable(
+                    session,
+                    step_run_id=operate.step_run_id,
+                    deliverable_id="approved-rich-deliverable",
+                    title="Operations dashboard",
+                    content="Fallback content",
+                    format="rich",
+                    rich={"blocks": rich_blocks, "metadata": {}},
+                    artifact_store=app.state.artifact_store,
+                )
+                await session.commit()
+                await create_step_run(
+                    session,
+                    task_id=task.task_id,
+                    step_run_id="failed-coverage",
+                    step_name="coverage",
+                    step_type="condition",
+                    agent_id="agent-1",
+                    attempt_number=1,
+                    status="failed",
+                    completed_at=datetime.now(UTC),
+                )
+                task.status = "failed"
+                task.result_data = None
+                await session.commit()
+
+        asyncio.run(_seed())
+        response = client.get(
+            "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["rich_payload"]["blocks"] == rich_blocks
+
+        asyncio.run(
+            app.state.artifact_store.async_delete(
+                "deliverables",
+                "approved-rich-deliverable",
+                "rich.chart-v1.json",
+            )
+        )
+        unavailable = client.get(
+            "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert unavailable.status_code == 409
+        assert unavailable.json()["error"]["code"] == "deliverable_payload_unavailable"
+
+        asyncio.run(
+            app.state.artifact_store.async_save(
+                "deliverables",
+                "approved-rich-deliverable",
+                "rich.chart-v1.json",
+                b'{"blocks":[{}]}',
+                "application/json",
+            )
+        )
+        corrupt = client.get(
+            "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
+            headers=_auth_headers(app, email="user@example.com"),
+        )
+        assert corrupt.status_code == 409
+        assert corrupt.json()["error"]["code"] == "deliverable_payload_unavailable"
 
 
 def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_path: Path) -> None:

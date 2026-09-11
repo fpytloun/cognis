@@ -382,11 +382,12 @@ export interface BackgroundWorkTodo {
 }
 
 export interface BackgroundWorkItem {
-  kind: 'managed_conversation' | 'delegated_session' | 'background_command';
+  kind: 'task' | 'managed_conversation' | 'delegated_session' | 'background_command';
   work_id: string;
   controller_conversation_id: string;
   controller_session_id?: string | null;
   target_conversation_id?: string | null;
+  task_id?: string | null;
   session_id?: string | null;
   parent_session_id?: string | null;
   executor_id?: string | null;

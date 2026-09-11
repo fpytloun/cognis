@@ -1099,11 +1099,12 @@ class BackgroundWorkTodoResponse(BaseModel):
 
 
 class BackgroundWorkItemResponse(BaseModel):
-    kind: Literal["managed_conversation", "delegated_session", "background_command"]
+    kind: Literal["task", "managed_conversation", "delegated_session", "background_command"]
     work_id: str
     controller_conversation_id: str
     controller_session_id: str | None = None
     target_conversation_id: str | None = None
+    task_id: str | None = None
     session_id: str | None = None
     parent_session_id: str | None = None
     executor_id: str | None = None

@@ -3495,7 +3495,7 @@ describe('chat page helpers', () => {
     expect(isNearScrollBottom(CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX + 1)).toBe(false);
   });
 
-  it('pauses live-tail when the user intentionally scrolls upward', () => {
+  it('pauses live-tail only when upward movement has user intent', () => {
     expect(nextChatScrollState({
       currentScrollTop: 700,
       lastScrollTop: 760,
@@ -3510,7 +3510,7 @@ describe('chat page helpers', () => {
       distanceFromBottom: 100,
       userScrolledUp: false,
       userScrollIntentUp: false,
-    }).userScrolledUp).toBe(true);
+    }).userScrolledUp).toBe(false);
   });
 
   it('does not pause live-tail for layout expansion alone', () => {
@@ -3518,6 +3518,16 @@ describe('chat page helpers', () => {
       currentScrollTop: 760,
       lastScrollTop: 760,
       distanceFromBottom: 160,
+      userScrolledUp: false,
+      userScrollIntentUp: false,
+    }).userScrolledUp).toBe(false);
+  });
+
+  it('does not pause live-tail when layout clamps scrollTop upward', () => {
+    expect(nextChatScrollState({
+      currentScrollTop: 640,
+      lastScrollTop: 760,
+      distanceFromBottom: 120,
       userScrolledUp: false,
       userScrollIntentUp: false,
     }).userScrolledUp).toBe(false);

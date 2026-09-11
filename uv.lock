@@ -596,7 +596,7 @@ wheels = [
 
 [[package]]
 name = "cognis-common"
-version = "0.14.0"
+version = "0.14.1"
 source = { editable = "packages/common" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -625,7 +625,7 @@ requires-dist = [
 
 [[package]]
 name = "cognis-controller"
-version = "0.14.0"
+version = "0.14.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiolimiter" },
@@ -773,7 +773,7 @@ dev = [{ name = "pytest-xdist", specifier = ">=3.8.0" }]
 
 [[package]]
 name = "cognis-executor"
-version = "0.14.0"
+version = "0.14.1"
 source = { editable = "packages/executor" }
 dependencies = [
     { name = "cognis-common" },

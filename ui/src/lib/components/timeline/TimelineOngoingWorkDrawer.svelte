@@ -28,8 +28,11 @@
   const commandWork = $derived(sortBackgroundWorkByActivity(
     work.filter((item: BackgroundWorkItem) => item.kind === 'background_command'),
   ));
+  const taskWork = $derived(sortBackgroundWorkByActivity(
+    work.filter((item: BackgroundWorkItem) => item.kind === 'task'),
+  ));
   const sessionWork = $derived(sortBackgroundWorkByActivity(
-    work.filter((item: BackgroundWorkItem) => item.kind !== 'background_command'),
+    work.filter((item: BackgroundWorkItem) => item.kind !== 'background_command' && item.kind !== 'task'),
   ));
 
   function statusClass(status: string): string {
@@ -56,6 +59,7 @@
         <span class="font-medium text-slate-200">Ongoing work</span>
         <span class="text-slate-500">
           {#if runningWork.length > 0} · {runningWork.length} running{/if}
+          {#if taskWork.length > 0} · {taskWork.length} task{taskWork.length === 1 ? '' : 's'}{/if}
           {#if sessionWork.length > 0} · {sessionWork.length} session{sessionWork.length === 1 ? '' : 's'}{/if}
           {#if commandWork.length > 0} · {commandWork.length} command{commandWork.length === 1 ? '' : 's'}{/if}
           {#if activeTodos.length > 0} · {activeTodos.length} todo{activeTodos.length === 1 ? '' : 's'}{/if}
@@ -95,25 +99,31 @@
         <div class="min-h-0 min-w-0">
           <div class="mb-2 flex items-center justify-between gap-2">
             <p class="text-[10px] font-semibold uppercase tracking-[0.2em] text-slate-500">
-              {commandWork.length > 0 && sessionWork.length === 0 ? 'Commands' : 'Sessions and commands'}
+              {taskWork.length > 0 && sessionWork.length === 0 && commandWork.length === 0
+                ? 'Tasks'
+                : 'Tasks, sessions, and commands'}
             </p>
             {#if truncated}<span class="text-[10px] text-amber-300">Some global work is omitted</span>{/if}
           </div>
           <div class="min-w-0 space-y-1.5 overflow-x-hidden overflow-y-auto lg:max-h-60">
-            {#each [...sessionWork, ...commandWork] as item (item.work_id)}
+            {#each [...taskWork, ...sessionWork, ...commandWork] as item (item.work_id)}
               <article class="w-full max-w-full min-w-0 overflow-hidden rounded-lg border border-slate-800/60 bg-slate-950/35 px-3 py-2">
                 <p class="scrollbar-hidden-x w-full min-w-0 text-sm font-medium text-slate-100" title={item.title}>
                   {item.title}
                 </p>
                 <div class="mt-1 flex w-full max-w-full min-w-0 items-center gap-2">
-                  {#if item.kind !== 'background_command'}
+                  {#if item.kind !== 'background_command' && item.kind !== 'task'}
                     <TodoProgressPopover todos={item.todos} size="sm" class="shrink-0 text-emerald-300" label={`${item.title} todo progress`} />
                   {/if}
                   <p class="scrollbar-hidden-x min-w-0 flex-1 text-xs text-slate-500" title={`${item.agent_id}${item.agent_profile_id ? ` · ${item.agent_profile_id}` : ''}`}>
                     {item.agent_id}{#if item.agent_profile_id}<span> · {item.agent_profile_id}</span>{/if}
                   </p>
                   <span class={`shrink-0 text-[10px] font-semibold uppercase tracking-wide ${statusClass(item.status)}`}>{item.status}</span>
-                  {#if item.kind === 'managed_conversation' && item.target_conversation_id}
+                  {#if item.kind === 'task' && item.task_id}
+                    <a class="inline-flex shrink-0 items-center text-violet-200 hover:text-violet-100" aria-label={`Open ${item.title}`} href={`/tasks/${item.task_id}`}>
+                      <ExternalLink class="h-3.5 w-3.5" />
+                    </a>
+                  {:else if item.kind === 'managed_conversation' && item.target_conversation_id}
                     <a class="inline-flex shrink-0 items-center text-violet-200 hover:text-violet-100" aria-label={`Open ${item.title}`} href={`/chat/${item.target_conversation_id}`}>
                       <ExternalLink class="h-3.5 w-3.5" />
                     </a>

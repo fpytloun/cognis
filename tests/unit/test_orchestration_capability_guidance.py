@@ -282,8 +282,6 @@ def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routi
     fork = tools["agent_conversation_fork"].description
 
     for phrase in (
-        "Working mode: execute",
-        "Working mode: coordinate",
         "objective",
         "exact references",
         "scope and non-goals",
@@ -291,6 +289,7 @@ def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routi
         "return status and evidence",
     ):
         assert phrase in create
+    assert "Working mode:" not in create
     assert "initial independent review in a fresh conversation" in send
     assert "re-review only when" in send
     assert "Create a fresh isolated child when compatibility or useful context is absent" in send
@@ -467,8 +466,9 @@ def test_coding_skill_contains_only_model_neutral_execution_contract() -> None:
     content = str(skill["instructions"])
     for required in (
         "Follow the current role, user request, and workflow contract",
-        "directly assigned as the implementer",
-        "explicitly assigned as a coordinator",
+        "A direct implementer owns the assigned implementation",
+        "Coordinated delivery can use a team",
+        "Advisory assistance returns analysis, plans, or review",
         "bounded independent exploration or review",
         "visible in the current context",
     ):

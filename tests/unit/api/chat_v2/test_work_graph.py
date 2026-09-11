@@ -1242,7 +1242,7 @@ async def test_managed_conversation_active_pointer_must_match_its_own_session() 
 
 
 @pytest.mark.asyncio
-async def test_managed_child_task_uses_its_own_activity_scope_in_batched_and_sequential() -> None:
+async def test_conversation_graph_excludes_tasks_in_batched_and_sequential() -> None:
     root = _session("s-root", "root", activity_scope_id="scope-root")
     managed = _session("s-managed", "managed", activity_scope_id="scope-managed")
     managed_old = _session("s-managed-old", "managed", activity_scope_id="scope-old")
@@ -1564,7 +1564,7 @@ async def test_latest_session_root_includes_same_scope_predecessors_and_descenda
 
 
 @pytest.mark.asyncio
-async def test_resolves_delegate_managed_task_retry_graph_and_deduplicates_cycles() -> None:
+async def test_conversation_graph_resolves_delegate_and_managed_work_but_excludes_tasks() -> None:
     conversations = [
         _conversation("root", active_session_id="s-root"),
         _conversation("managed", active_session_id="s-managed"),
@@ -1658,14 +1658,12 @@ async def test_resolves_delegate_managed_task_retry_graph_and_deduplicates_cycle
         "s-child",
         "s-cycle",
         "s-managed",
-        "s-step",
-        "s-retry",
     }
     assert len({node.event_store_session_id for node in graph.nodes}) == len(graph.nodes)
     assert "s-managed-duplicate" not in {node.session_id for node in graph.nodes}
     assert any(node.edge_kind == "delegate" for node in graph.nodes)
     assert any(node.edge_kind == "managed" for node in graph.nodes)
-    assert any(node.step_run_id == "step-1" and node.superseded for node in graph.nodes)
+    assert not any(node.step_run_id for node in graph.nodes)
 
 
 @pytest.mark.asyncio
@@ -1702,7 +1700,7 @@ async def test_200_stream_graph_resolves_with_bounded_query_count() -> None:
         root.session_id,
         *(child.session_id for child in children),
     }
-    assert db.queries == 19
+    assert db.queries == 18
 
 
 @pytest.mark.asyncio
@@ -1793,7 +1791,7 @@ async def test_179_stream_mixed_topology_resolves_with_bounded_queries() -> None
 
     assert len(graph.nodes) == 178
     assert graph.truncated is False
-    assert db.queries == 30
+    assert db.queries == 28
     assert sum(node.edge_kind == "managed" for node in graph.nodes) == 88
     assert sum(node.edge_kind == "rotation" for node in graph.nodes) == 0
 
@@ -1975,6 +1973,138 @@ async def test_session_root_does_not_walk_back_to_parent_or_sibling() -> None:
         ),
     )
     assert {node.session_id for node in graph.nodes} == {"s-child", "s-grandchild"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope_kind", ["session", "task_step"])
+async def test_deep_delegate_root_excludes_same_scope_ancestors_and_siblings(
+    scope_kind: str,
+) -> None:
+    controller = _session("s-controller", "conversation", activity_scope_id="scope")
+    parent = _session(
+        "s-parent",
+        "conversation",
+        parent_session_id=controller.session_id,
+        activity_scope_id="scope",
+        delegation_mode="delegate",
+    )
+    requested_predecessor = _session(
+        "s-requested-predecessor",
+        "conversation",
+        parent_session_id=parent.session_id,
+        activity_scope_id="scope",
+        delegation_mode="delegate",
+    )
+    managed = _session("s-managed", "managed", activity_scope_id="managed-scope")
+    link = SimpleNamespace(
+        link_id="link-managed",
+        user_email="owner@example.com",
+        controller_conversation_id="conversation",
+        controller_session_id=requested_predecessor.session_id,
+        parent_link_id=None,
+        root_link_id=None,
+        target_conversation_id="managed",
+        target_agent_id="worker",
+        target_agent_profile_id=None,
+        title="Managed descendant",
+        conversation_state="open",
+    )
+    requested = _session(
+        "s-requested",
+        "conversation",
+        previous_session_id=requested_predecessor.session_id,
+        activity_scope_id="scope",
+    )
+    descendant = _session(
+        "s-descendant",
+        "conversation",
+        parent_session_id=requested.session_id,
+        activity_scope_id="scope",
+        delegation_mode="delegate",
+    )
+    sibling = _session(
+        "s-sibling",
+        "conversation",
+        parent_session_id=parent.session_id,
+        activity_scope_id="scope",
+        delegation_mode="delegate",
+    )
+    task = SimpleNamespace(
+        task_id="task-deep",
+        created_by="owner@example.com",
+        title="Deep task",
+        status="running",
+        agent_id="worker",
+        agent_profile_id=None,
+        source_ref="conversation",
+        source_session_id=requested.session_id,
+        control_conversation_id=None,
+        attempt_number=1,
+    )
+    step = SimpleNamespace(
+        step_run_id="step-deep",
+        task_id=task.task_id,
+        step_name="inspect",
+        status="running",
+        attempt=1,
+        attempt_number=1,
+        superseded_by_step_run_id=None,
+        agent_id="worker",
+        agent_profile_id=None,
+        conversation_id="conversation",
+        session_id=requested.session_id,
+    )
+    values = {
+        Conversation: [
+            _conversation("conversation", active_session_id=controller.session_id),
+            _conversation("managed", active_session_id=managed.session_id),
+        ],
+        Session: [
+            controller,
+            parent,
+            requested_predecessor,
+            requested,
+            descendant,
+            sibling,
+            managed,
+        ],
+        ManagedConversationLink: [link],
+        Task: [task],
+        StepRun: [step],
+    }
+    scope = (
+        TimelineScope(
+            key=f"session:{requested.session_id}",
+            kind="session",
+            session_id=requested.session_id,
+        )
+        if scope_kind == "session"
+        else TimelineScope(
+            key=f"task_step:{step.step_run_id}",
+            kind="task_step",
+            task_id=task.task_id,
+            step_run_id=step.step_run_id,
+        )
+    )
+
+    for resolver in (resolve_authorized_work_graph, _resolve_authorized_work_graph_sequential):
+        graph = await resolver(
+            _Db(values),  # type: ignore[arg-type]
+            user_email="owner@example.com",
+            scope=scope,
+        )
+
+        assert {node.session_id for node in graph.nodes} == {
+            requested.session_id,
+            descendant.session_id,
+            managed.session_id,
+        }
+        assert sum(node.parent_key is None for node in graph.nodes) == 1
+        assert graph.nodes[0].session_id == requested.session_id
+        assert graph.nodes[0].backing_session_ids == [
+            requested.session_id,
+            requested_predecessor.session_id,
+        ]
 
 
 @pytest.mark.asyncio

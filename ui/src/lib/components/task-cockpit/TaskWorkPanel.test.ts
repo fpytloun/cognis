@@ -29,6 +29,7 @@ beforeEach(() => {
 });
 
 const run = {
+  task_id: 'task-1',
   step_run_id: 'run-1',
   step_name: 'implement',
   conversation_id: 'conversation-1',
@@ -84,6 +85,31 @@ function activityOverview(changedFiles: number): ActivityOverviewResponse {
 }
 
 describe('TaskWorkPanel', () => {
+  it('includes the task identity in every task-step Work scope', async () => {
+    const loadWork = vi.fn().mockResolvedValue(projection(4));
+    const loadOverview = vi.fn().mockResolvedValue(activityOverview(4));
+
+    render(TaskWorkPanel, { stepRuns: [run], loadWork, loadOverview });
+
+    await waitFor(() => expect(loadWork).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: 'task_step:run-1',
+        kind: 'task_step',
+        task_id: 'task-1',
+        step_run_id: 'run-1',
+      }),
+    ));
+    await waitFor(() => expect(loadOverview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: 'task_step:run-1',
+        kind: 'task_step',
+        task_id: 'task-1',
+        step_run_id: 'run-1',
+      }),
+      expect.any(AbortSignal),
+    ));
+  });
+
   it('does not render false zero evidence when the initial projection fails', async () => {
     render(TaskWorkPanel, {
       stepRuns: [run],

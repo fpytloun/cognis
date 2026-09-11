@@ -85,6 +85,7 @@
   const selectedScope = $derived.by((): TimelineScope | null => selectedRun ? ({
     key: `task_step:${selectedRun.step_run_id}`,
     kind: 'task_step',
+    task_id: selectedRun.task_id,
     step_run_id: selectedRun.step_run_id,
     conversation_id: selectedRun.conversation_id,
     session_id: selectedRun.session_id
@@ -119,6 +120,7 @@
       projection: await loadWork({
         key: `task_step:${run.step_run_id}`,
         kind: 'task_step',
+        task_id: run.task_id,
         step_run_id: run.step_run_id,
         conversation_id: run.conversation_id,
         session_id: run.session_id
@@ -170,6 +172,7 @@
     return {
       key: `task_step:${run.step_run_id}`,
       kind: 'task_step',
+      task_id: run.task_id,
       step_run_id: run.step_run_id,
       conversation_id: run.conversation_id,
       session_id: run.session_id,

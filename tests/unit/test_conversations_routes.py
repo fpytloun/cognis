@@ -16,7 +16,7 @@ from cognis.api.routes.conversations import (
     _CHAT_LAST_OPENED_GLOBAL_STATE_KEY,
     _remember_chat_last_opened,
 )
-from cognis.store.models import DirectTurnRequestRow
+from cognis.store.models import DirectTurnRequestRow, Task
 from cognis.store.queries import (
     create_agent,
     create_conversation,
@@ -376,6 +376,30 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                         status="running",
                     )
                 )
+                session.add(
+                    Task(
+                        task_id="task_sidebar",
+                        title="Investigate task activity",
+                        status="running",
+                        created_by="user@example.com",
+                        agent_id="agent-chat",
+                        source_type="agent",
+                        source_ref=controller.conversation_id,
+                        source_session_id=parent.session_id,
+                    )
+                )
+                session.add(
+                    Task(
+                        task_id="task_unrelated_api",
+                        title="Unrelated API task",
+                        status="running",
+                        created_by="user@example.com",
+                        agent_id="agent-chat",
+                        source_type="api",
+                        source_ref=controller.conversation_id,
+                        source_session_id=parent.session_id,
+                    )
+                )
                 await session.commit()
                 return controller.conversation_id, target.conversation_id, link.link_id
 
@@ -407,7 +431,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         assert response.status_code == 200
         initial_body = response.json()
         background_work = initial_body["background_work"]
-        assert background_work["active_count"] == 2
+        assert background_work["active_count"] == 3
         assert background_work["truncated"] is False
         assert {
             (item["kind"], item["controller_conversation_id"], item["status"])
@@ -415,6 +439,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         } == {
             ("delegated_session", controller_id, "active"),
             ("managed_conversation", controller_id, "running"),
+            ("task", controller_id, "running"),
         }
         managed = next(
             item for item in background_work["items"] if item["kind"] == "managed_conversation"
@@ -422,11 +447,16 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         delegated = next(
             item for item in background_work["items"] if item["kind"] == "delegated_session"
         )
+        task = next(item for item in background_work["items"] if item["kind"] == "task")
         assert managed["target_conversation_id"] == target_id
         assert managed["controller_session_id"] == "sess_parent"
         assert managed["parent_session_id"] is None
         assert delegated["parent_session_id"] == "sess_parent"
         assert delegated["controller_session_id"] is None
+        assert task["task_id"] == "task_sidebar"
+        assert task["controller_session_id"] == "sess_parent"
+        assert task["title"] == "Investigate task activity"
+        assert all(item["work_id"] != "task_unrelated_api" for item in background_work["items"])
 
         unchanged_delta = client.get(
             "/api/v1/conversations/sidebar",
@@ -502,7 +532,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
         assert idle_response.status_code == 200
         assert idle_response.json()["background_work_changed"] is True
         idle_background_work = idle_response.json()["background_work"]
-        assert idle_background_work["active_count"] == 1
+        assert idle_background_work["active_count"] == 2
         idle_managed = next(
             item for item in idle_background_work["items"] if item["kind"] == "managed_conversation"
         )

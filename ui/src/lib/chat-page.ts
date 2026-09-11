@@ -1550,11 +1550,10 @@ export function nextChatScrollState(params: {
 }): ChatScrollState {
   const bottomThresholdPx = params.bottomThresholdPx ?? CHAT_LIVE_TAIL_BOTTOM_THRESHOLD_PX;
   const scrollDeltaThresholdPx = params.scrollDeltaThresholdPx ?? CHAT_USER_SCROLL_DELTA_THRESHOLD_PX;
-  const userMovedUp = params.currentScrollTop < params.lastScrollTop - scrollDeltaThresholdPx;
   // Positive delta means the user (or a programmatic scroll) moved downward.
   const userMovedDown = params.currentScrollTop > params.lastScrollTop + scrollDeltaThresholdPx;
 
-  if (params.userScrollIntentUp || (userMovedUp && params.distanceFromBottom > 0)) {
+  if (params.userScrollIntentUp) {
     return {
       distanceFromBottom: params.distanceFromBottom,
       userScrolledUp: true,

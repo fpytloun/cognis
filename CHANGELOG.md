@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.14.1] - 2026-09-11
+
+### Changed
+
+- Clarified project-specific harness instructions and orchestration guidance.
+- Improved task and conversation Work activity grouping and scope identity.
+
+### Fixed
+
+- Fixed Chat v2 runtime authority ordering, durable revisions, scoped overlay reconciliation, and read-tail behavior.
+- Fixed rich step deliverable hydration and truncated memory result previews.
+- Fixed plain-text selection copying so copied text does not include Markdown syntax.
+- Fixed executor rollout recovery and kept delegated Work graphs single-rooted.
+
 ## [0.14.0] - 2026-09-09
 
 ### Added

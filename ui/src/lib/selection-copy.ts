@@ -93,6 +93,7 @@ const PRESERVED_END = '\uE001';
 
 export interface SelectionCopyPayload {
   html: string;
+  plainText: string;
   markdown: string;
 }
 
@@ -294,21 +295,63 @@ function normalizeMarkdown(value: string): string {
     );
 }
 
+function childrenToPlainText(node: Node, depth = 0): string {
+  return Array.from(node.childNodes).map((child) => nodeToPlainText(child, depth)).join('');
+}
+
+function nodeToPlainText(node: Node, depth: number): string {
+  if (node.nodeType === Node.TEXT_NODE) return normalizeInline(node.textContent ?? '');
+  if (!(node instanceof Element)) return '';
+  const tag = node.tagName;
+  if (tag === 'BR' || tag === 'HR') return '\n';
+  if (tag === 'PRE' || tag === 'CODE') {
+    const text = `${PRESERVED_START}${node.textContent ?? ''}${PRESERVED_END}`;
+    return tag === 'PRE' ? `\n${text}\n\n` : text;
+  }
+  if (tag === 'UL' || tag === 'OL') {
+    const items = Array.from(node.children).filter((child) => child.tagName === 'LI');
+    const reversed = node.hasAttribute('reversed');
+    let number = node.hasAttribute('start') ? Number(node.getAttribute('start')) : reversed ? items.length : 1;
+    return '\n' + items.map((item) => {
+      if (item.hasAttribute('value')) number = Number(item.getAttribute('value'));
+      const marker = tag === 'OL' ? `${number}.` : '-';
+      number += reversed ? -1 : 1;
+      const body = Array.from(item.childNodes).map((child) =>
+        child instanceof Element && ['UL', 'OL'].includes(child.tagName)
+          ? nodeToPlainText(child, depth + 1)
+          : nodeToPlainText(child, depth),
+      ).join('').trim();
+      return `${'  '.repeat(depth)}${marker} ${body}\n`;
+    }).join('');
+  }
+  if (tag === 'TABLE') {
+    return '\n' + Array.from(node.querySelectorAll('tr')).map((row) =>
+      Array.from(row.children)
+        .filter((cell) => ['TH', 'TD'].includes(cell.tagName))
+        .map((cell) => childrenToPlainText(cell).trim().replace(/\s*\n\s*/g, ' '))
+        .join('\t'),
+    ).join('\n') + '\n\n';
+  }
+  const value = childrenToPlainText(node, depth);
+  return BLOCK_TAGS.has(tag) || tag === 'LI' ? `\n${value.trim()}\n\n` : value;
+}
+
 export function serializeSelectionRange(range: Range): SelectionCopyPayload {
   let fragment = range.cloneContents();
   const sourceContext = closestElement(range.commonAncestorContainer);
-  const preformattedContext = sourceContext?.closest('pre, [class*="whitespace-pre"]');
-  if (preformattedContext && !fragment.querySelector('pre, [class*="whitespace-pre"]')) {
-    const wrapper = document.createElement('pre');
-    if (preformattedContext.tagName !== 'PRE') wrapper.dataset.copyTextPreWrap = '';
+  const preformattedContext = sourceContext?.closest('pre, code, [class*="whitespace-pre"]');
+  if (preformattedContext && !fragment.querySelector('pre, code, [class*="whitespace-pre"]')) {
+    const wrapper = document.createElement(preformattedContext.tagName === 'CODE' ? 'code' : 'pre');
+    if (!['PRE', 'CODE'].includes(preformattedContext.tagName)) wrapper.dataset.copyTextPreWrap = '';
     wrapper.append(fragment);
     fragment = document.createDocumentFragment();
     fragment.append(wrapper);
   }
   prepareFragment(fragment);
   const markdown = normalizeMarkdown(childrenToMarkdown(fragment, 0));
+  const plainText = normalizeMarkdown(childrenToPlainText(fragment));
   const html = sanitizeFragment(fragment);
-  return { html, markdown };
+  return { html, plainText, markdown };
 }
 
 export function handleSelectionCopy(
@@ -325,14 +368,9 @@ export function handleSelectionCopy(
 
   try {
     const payload = serializeSelectionRange(selection.getRangeAt(0));
-    if (!payload.html && !payload.markdown) return false;
+    if (!payload.html && !payload.plainText) return false;
     event.clipboardData.setData('text/html', payload.html);
-    event.clipboardData.setData('text/plain', payload.markdown);
-    try {
-      event.clipboardData.setData('text/markdown', payload.markdown);
-    } catch {
-      // text/markdown is optional. The standard HTML and plain payloads remain valid.
-    }
+    event.clipboardData.setData('text/plain', payload.plainText);
     event.preventDefault();
     return true;
   } catch {

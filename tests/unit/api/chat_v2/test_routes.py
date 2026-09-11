@@ -50,12 +50,17 @@ from cognis.api.chat_v2.schemas import (
     ClientPerformanceRequest,
     ControlMutationV2Request,
     QueueUpdateV2Request,
+    RuntimeAuthority,
     SendMessageV2Request,
     TimelineScope,
 )
 from cognis.api.chat_v2.shared_snapshot_cache import SnapshotRequestTrace
 from cognis.api.chat_v2.snapshot_coordinator import ConversationSnapshotContext
-from cognis.api.chat_v2.sync import PROJECTION_VERSION, RuntimeOverlayInput
+from cognis.api.chat_v2.sync import (
+    PROJECTION_VERSION,
+    RuntimeOverlayInput,
+    runtime_overlay_from_input,
+)
 from cognis.api.common import AuthenticatedUser
 from cognis.core.turn_scheduler import TurnError
 from cognis.providers.guardrails.events import EventStoreAuthority
@@ -1637,6 +1642,53 @@ async def test_child_session_context_resolves_complete_lineage_from_successor(
     assert context["scope"].key == "session:child-successor"
     assert context["scope"].session_id == "child-successor"
     assert context["scope"].status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_child_session_context_clears_unrelated_active_runtime_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _scoped_request("alice@example.com")
+    child = _session(
+        "child-completed",
+        owner="alice@example.com",
+        conversation_id="conv-1",
+        parent_session_id="root-1",
+    )
+    child.status = "completed"
+    conversation_row = _conversation("conv-1", owner="alice@example.com")
+    _patch_scope_queries(
+        monkeypatch,
+        session_row=child,
+        conversation_row=conversation_row,
+    )
+
+    async def runtime_input(**_kwargs: Any) -> RuntimeOverlayInput:
+        return RuntimeOverlayInput(
+            runtime_epoch="session:child-completed",
+            runtime_revision=7,
+            active_turn={
+                "turn_id": "turn-current",
+                "session_id": "session-current",
+                "status": "running",
+            },
+            authority=RuntimeAuthority(
+                direct_request_id="request-current",
+                turn_id="turn-current",
+                fencing_token=3,
+                lifecycle="active",
+            ),
+        )
+
+    monkeypatch.setattr(chat_v2_routes, "runtime_input_from_scheduler", runtime_input)
+
+    context = await _load_session_context(request, child.session_id)
+    scoped_runtime = context["runtime_input"]
+
+    assert scoped_runtime.runtime_revision == 0
+    assert scoped_runtime.active_turn is None
+    assert scoped_runtime.authority is None
+    assert runtime_overlay_from_input(scoped_runtime).has_active_turn is False
 
 
 @pytest.mark.asyncio

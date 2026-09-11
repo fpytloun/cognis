@@ -910,6 +910,57 @@ async def _resolve_authorized_work_graph_sequential(
             None,
         )
 
+    async def seed_directed_root_session(root: Session) -> None:
+        nonlocal truncated
+        sessions[root.session_id] = root
+        merge_work_session_edge(
+            session_parent,
+            session_id=root.session_id,
+            parent_session_id=None,
+            edge_kind="root",
+        )
+        queue.append(_Frontier("session", root.session_id, None, "root"))
+        current = root
+        for _rotation_depth in range(WORK_GRAPH_MAX_DEPTH):
+            previous_id = current.previous_session_id
+            if not previous_id:
+                return
+            previous = await exact_session(previous_id)
+            if previous is None:
+                truncated = True
+                return
+            if (
+                previous.conversation_id != root.conversation_id
+                or previous.activity_scope_id != root.activity_scope_id
+            ):
+                return
+            sessions[previous.session_id] = previous
+            merge_work_session_edge(
+                session_parent,
+                session_id=current.session_id,
+                parent_session_id=None
+                if current.session_id == root.session_id
+                else previous.session_id,
+                edge_kind="root" if current.session_id == root.session_id else "rotation",
+            )
+            merge_work_session_edge(
+                session_parent,
+                session_id=previous.session_id,
+                parent_session_id=previous.previous_session_id,
+                edge_kind="rotation",
+            )
+            queue.append(
+                _Frontier(
+                    "session",
+                    previous.session_id,
+                    previous.previous_session_id,
+                    "rotation",
+                )
+            )
+            current = previous
+        if current.previous_session_id:
+            truncated = True
+
     if scope.kind == "conversation" and scope.conversation_id:
         root_conversation = await exact_conversation(scope.conversation_id)
         if root_conversation is None:
@@ -981,15 +1032,8 @@ async def _resolve_authorized_work_graph_sequential(
         root_session = await exact_session(scope.session_id)
         if root_session is None:
             raise ValueError("Authorized Work session root was not found")
-        sessions[root_session.session_id] = root_session
-        merge_work_session_edge(
-            session_parent,
-            session_id=root_session.session_id,
-            parent_session_id=None,
-            edge_kind="root",
-        )
         root_session_id = root_session.session_id
-        queue.append(_Frontier("session", root_session.session_id, None, "root"))
+        await seed_directed_root_session(root_session)
     elif scope.kind == "task_step" and scope.step_run_id:
         root_steps = await fetch(
             StepRun,
@@ -1013,6 +1057,12 @@ async def _resolve_authorized_work_graph_sequential(
             raise ValueError("Authorized Work task root was not found")
         steps[root_step.step_run_id] = root_step
         tasks[root_tasks[0].task_id] = root_tasks[0]
+        if root_step.session_id:
+            root_session = await exact_session(root_step.session_id)
+            if root_session is None:
+                raise ValueError("Authorized Work step session root was not found")
+            root_session_id = root_session.session_id
+            await seed_directed_root_session(root_session)
         queue.append(_Frontier("step", root_step.step_run_id, None, "root"))
     else:
         raise ValueError("Unsupported Work graph root scope")
@@ -1173,29 +1223,6 @@ async def _resolve_authorized_work_graph_sequential(
                         "managed",
                     )
                 )
-            for task in await fetch(
-                Task,
-                select(Task).where(
-                    Task.created_by == user_email,
-                    Task.source_ref == conversation_row.conversation_id,
-                ),
-                identity=task_id,
-            ):
-                if (
-                    task.created_by != user_email
-                    or task.source_ref != conversation_row.conversation_id
-                ):
-                    continue
-                source_id = task.source_session_id
-                source_session = await exact_session(source_id) if source_id else None
-                if (
-                    active_session is None
-                    or source_session is None
-                    or source_session.conversation_id != conversation_row.conversation_id
-                    or source_session.activity_scope_id != active_session.activity_scope_id
-                ):
-                    continue
-                queue.append(_Frontier("task", task.task_id, None, "task"))
         elif frontier.kind == "task":
             task_rows = await fetch(
                 Task,
@@ -1427,6 +1454,7 @@ async def resolve_authorized_work_graph(
     active_scope_id: str | None = None
     scope_by_conversation: dict[str, str] = {}
     loaded_scope_conversations: set[str] = set()
+    directed_root_conversation_id: str | None = None
     current_scope_session_ids: set[str] = set()
     frontier: list[_Frontier] = []
     seen: set[tuple[str, str]] = set()
@@ -1556,6 +1584,7 @@ async def resolve_authorized_work_graph(
             edge_kind="root",
         )
         root_session_id = root.session_id
+        directed_root_conversation_id = root.conversation_id
         active_scope_id = root.activity_scope_id
         scope_by_conversation[root.conversation_id] = root.activity_scope_id
         current_scope_session_ids.add(root.session_id)
@@ -1606,7 +1635,8 @@ async def resolve_authorized_work_graph(
             )
             current = previous
         else:
-            truncated = True
+            if current.previous_session_id:
+                truncated = True
     elif scope.kind == "task_step" and scope.step_run_id:
         root_steps = await fetch(
             StepRun,
@@ -1641,9 +1671,60 @@ async def resolve_authorized_work_graph(
             if root_session is None:
                 raise ValueError("Authorized Work step session root was not found")
             root_session_id = root_session.session_id
+            directed_root_conversation_id = root_session.conversation_id
             active_scope_id = root_session.activity_scope_id
             scope_by_conversation[root_session.conversation_id] = root_session.activity_scope_id
             current_scope_session_ids.add(root_session.session_id)
+            sessions[root_session.session_id] = root_session
+            merge_work_session_edge(
+                session_parent,
+                session_id=root_session.session_id,
+                parent_session_id=None,
+                edge_kind="root",
+            )
+            frontier.append(_Frontier("session", root_session.session_id, None, "root"))
+            current = root_session
+            for _rotation_depth in range(WORK_GRAPH_MAX_DEPTH):
+                previous_id = current.previous_session_id
+                if not previous_id:
+                    break
+                previous_rows = await fetch(
+                    Session,
+                    select(Session).where(
+                        Session.user_email == user_email,
+                        Session.session_id == previous_id,
+                    ),
+                    Session.session_id,
+                )
+                previous = previous_rows[0] if previous_rows else None
+                if previous is None:
+                    truncated = True
+                    break
+                if (
+                    previous.conversation_id != root_session.conversation_id
+                    or previous.activity_scope_id != root_session.activity_scope_id
+                ):
+                    break
+                sessions[previous.session_id] = previous
+                current_scope_session_ids.add(previous.session_id)
+                merge_work_session_edge(
+                    session_parent,
+                    session_id=previous.session_id,
+                    parent_session_id=previous.previous_session_id,
+                    edge_kind="rotation",
+                )
+                frontier.append(
+                    _Frontier(
+                        "session",
+                        previous.session_id,
+                        previous.previous_session_id,
+                        "rotation",
+                    )
+                )
+                current = previous
+            else:
+                if current.previous_session_id:
+                    truncated = True
         frontier.append(_Frontier("step", root_step.step_run_id, None, "root"))
     else:
         raise ValueError("Unsupported Work graph root scope")
@@ -1714,6 +1795,7 @@ async def resolve_authorized_work_graph(
                     row.session_id in session_ids
                     and row.activity_scope_id is not None
                     and row.conversation_id not in loaded_scope_conversations
+                    and row.conversation_id != directed_root_conversation_id
                 ):
                     canonical_scope_id = scope_by_conversation.setdefault(
                         row.conversation_id,
@@ -2041,27 +2123,6 @@ async def resolve_authorized_work_graph(
                         "managed",
                     )
                 )
-            authorized_source_sessions = {
-                row.session_id: row for row in [*sessions.values(), *scoped_sessions]
-            }
-            for task in await fetch_chunks(
-                Task,
-                conversation_ids,
-                Task.source_ref,
-                Task.task_id,
-                Task.created_by == user_email,
-            ):
-                source_session = authorized_source_sessions.get(task.source_session_id or "")
-                if (
-                    source_session is None
-                    or source_session.session_id not in current_scope_session_ids
-                    or source_session.conversation_id != task.source_ref
-                    or scope_by_conversation.get(task.source_ref)
-                    != source_session.activity_scope_id
-                ):
-                    continue
-                frontier.append(_Frontier("task", task.task_id, None, "task"))
-
         task_frontier = by_kind["task"]
         task_ids = {item.identifier for item in task_frontier}
         if task_ids:
