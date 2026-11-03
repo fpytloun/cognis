@@ -1,6 +1,7 @@
 <script lang="ts">
   import TimelineViewport from './TimelineViewport.svelte';
 
+  let { autoScrollOnResize = false } = $props<{ autoScrollOnResize?: boolean }>();
   let userScrolledUp = $state(false);
   let viewport = $state<{
     setProgrammaticScrollTop(scrollTop: number): void;
@@ -11,7 +12,7 @@
   bind:this={viewport}
   items={[]}
   bind:userScrolledUp
-  autoScrollOnResize={false}
+  {autoScrollOnResize}
   testId="timeline-intent-viewport"
 >
   {#snippet children()}

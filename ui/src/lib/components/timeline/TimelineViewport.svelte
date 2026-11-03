@@ -100,6 +100,12 @@
     onPointerDown?: ((event: PointerEvent) => void) | undefined;
   };
 
+  function cancelProgrammaticScroll(): void {
+    programmaticScrollGeneration += 1;
+    programmaticScroll = false;
+    programmaticScrollTarget = null;
+  }
+
   function viewportEvents(node: HTMLDivElement, handlers: ViewportEventHandlers) {
     let current = handlers;
     const handleScrollEvent = (event: Event): void => {
@@ -109,13 +115,13 @@
     };
     const handleWheelEvent = (event: WheelEvent): void => {
       if (!interactionEnabled) return;
-      programmaticScrollTarget = null;
+      cancelProgrammaticScroll();
       trustedScrollIntent = true;
       current.onWheel?.(event);
     };
     const handleTouchStartEvent = (event: TouchEvent): void => {
       if (!interactionEnabled) return;
-      programmaticScrollTarget = null;
+      cancelProgrammaticScroll();
       trustedScrollIntent = true;
       current.onTouchStart?.(event);
     };
@@ -128,14 +134,14 @@
     const handleKeydownEvent = (event: KeyboardEvent): void => {
       if (!interactionEnabled) return;
       if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
-        programmaticScrollTarget = null;
+        cancelProgrammaticScroll();
         trustedScrollIntent = true;
       }
       current.onKeydown?.(event);
     };
     const handlePointerDownEvent = (event: PointerEvent): void => {
       if (!interactionEnabled) return;
-      programmaticScrollTarget = null;
+      cancelProgrammaticScroll();
       current.onPointerDown?.(event);
     };
 
@@ -166,8 +172,11 @@
   function scrollToBottom(force = false): void {
     if (!viewportElement || (!force && userScrolledUp)) return;
     const viewport = viewportElement;
+    const generation = programmaticScrollGeneration;
     requestAnimationFrame(() => {
-      if (viewportElement === viewport) setProgrammaticScrollTop(viewport.scrollHeight);
+      // A newer scroll write or user input supersedes this queued pin.
+      if (viewportElement === viewport && generation === programmaticScrollGeneration
+        && (force || !userScrolledUp)) setProgrammaticScrollTop(viewport.scrollHeight);
     });
   }
 

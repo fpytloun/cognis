@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- Keep timeline reading positions stable when wheel, touch, or keyboard input interrupts pending automatic scrolling.
 - Keep dashboard provider cards compact when several quota windows and reset times are displayed, without hiding reset information or reducing refresh controls.
 - Keep knowledge search and document navigation responsive after opening a search result or a document deep link.
 - Keep full-chat drafts synchronized with pinned and dashboard views, and align tucked avatars at custom interface font sizes.

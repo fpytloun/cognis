@@ -111,6 +111,80 @@ describe('TimelineViewport user scroll intent', () => {
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 1; });
   });
 
+  it.each([
+    ['wheel', async (viewport: HTMLElement) => fireEvent.wheel(viewport, { deltaY: -120 })],
+    ['touch', async (viewport: HTMLElement) => fireEvent.touchStart(viewport)],
+    ['scrolling key', async (viewport: HTMLElement) => fireEvent.keyDown(viewport, { key: 'PageUp' })],
+  ])('accepts %s scrolling before a previous programmatic frame settles', async (_label, armIntent) => {
+    const previousFrame = globalThis.requestAnimationFrame;
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    try {
+      render(TimelineViewportFixture);
+      const viewport = screen.getByTestId('timeline-intent-viewport');
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1000 },
+        clientHeight: { configurable: true, value: 200 },
+      });
+      await fireEvent.click(screen.getByRole('button', { name: 'Programmatic bottom' }));
+      expect(viewport.scrollTop).toBe(800);
+      expect(frames.length).toBeGreaterThan(0);
+
+      await armIntent(viewport);
+      viewport.scrollTop = 400;
+      await fireEvent.scroll(viewport);
+      expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('paused');
+      while (frames.length) frames.splice(0).forEach(frame => frame(0));
+      expect(viewport.scrollTop).toBe(400);
+      expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('paused');
+    } finally {
+      vi.stubGlobal('requestAnimationFrame', previousFrame);
+    }
+  });
+
+  it('does not apply an already queued resize pin after the reader scrolls up', async () => {
+    const previousFrame = globalThis.requestAnimationFrame;
+    const previousObserver = globalThis.ResizeObserver;
+    const frames: FrameRequestCallback[] = [];
+    const resizes: Array<() => void> = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { resizes.push(callback); }
+      observe() {}
+      disconnect() {}
+    });
+    try {
+      render(TimelineViewportFixture, { autoScrollOnResize: true });
+      const viewport = screen.getByTestId('timeline-intent-viewport');
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1000 },
+        clientHeight: { configurable: true, value: 200 },
+      });
+      viewport.scrollTop = 800;
+      await fireEvent.scroll(viewport);
+      frames.splice(0).forEach(frame => frame(0));
+      resizes.forEach(resize => resize());
+      frames.splice(0).forEach(frame => frame(0));
+      expect(frames.length).toBeGreaterThan(0);
+
+      await fireEvent.wheel(viewport, { deltaY: -120 });
+      viewport.scrollTop = 400;
+      await fireEvent.scroll(viewport);
+      expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('paused');
+      while (frames.length) frames.splice(0).forEach(frame => frame(0));
+      expect(viewport.scrollTop).toBe(400);
+    } finally {
+      vi.stubGlobal('requestAnimationFrame', previousFrame);
+      vi.stubGlobal('ResizeObserver', previousObserver);
+    }
+  });
+
   it('keeps exported programmatic scrolling out of manual-scroll state', async () => {
     render(TimelineViewportFixture);
     const viewport = screen.getByTestId('timeline-intent-viewport');
