@@ -878,7 +878,12 @@ async def test_work_invalidation_coalescing_never_regresses_revision() -> None:
 
 
 @pytest.mark.asyncio
-async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscribers() -> None:
+@pytest.mark.parametrize("initial_session_id", ["session-1", None])
+async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscribers(
+    initial_session_id: str | None,
+) -> None:
+    from cognis.store.models import Conversation
+
     cache = SimpleNamespace(
         invalidate_session_token=AsyncMock(return_value=True),
         session_token=lambda store_id, session_id: f"{store_id}:{session_id}",
@@ -901,11 +906,15 @@ async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscrib
         async def __aexit__(self, *_: object) -> None:
             return None
 
-        async def execute(self, _: object) -> Result:
-            return results.pop(0)
+        async def execute(self, statement: Any) -> Result:
+            conversation_query = statement.column_descriptions[0]["entity"] is Conversation
+            for index, result in enumerate(results):
+                if isinstance(result.rows[0], tuple) == conversation_query:
+                    return results.pop(index)
+            raise AssertionError("No queued result for this routing query")
 
     results = [
-        Result([("conv-1", "session-2")]),
+        Result([("conv-1", "session-2"), ("conv-2", "session-3")]),
         Result(
             [
                 SimpleNamespace(session_id="session-2", intaris_session_id="intaris-2"),
@@ -925,20 +934,28 @@ async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscrib
         key="conversation:conv-1",
         kind="conversation",
         conversation_id="conv-1",
-        session_id="session-1",
+        session_id=initial_session_id,
     )
     foreign_scope = TimelineScope(
         key="session:session-3",
         kind="session",
-        conversation_id="conv-2",
+        conversation_id="conv-1",
         session_id="session-3",
+    )
+    foreign_conversation = TimelineScope(
+        key="conversation:conv-2",
+        kind="conversation",
+        conversation_id="conv-2",
     )
     owner = SimpleNamespace(
         chat_v2_scopes={owner_scope.key: owner_scope},
         send_scope_invalidation_nowait=Mock(return_value=True),
     )
     foreign = SimpleNamespace(
-        chat_v2_scopes={foreign_scope.key: foreign_scope},
+        chat_v2_scopes={
+            foreign_scope.key: foreign_scope,
+            foreign_conversation.key: foreign_conversation,
+        },
         send_scope_invalidation_nowait=Mock(return_value=True),
     )
     manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001

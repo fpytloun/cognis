@@ -137,7 +137,18 @@ def test_compiled_native_client_real_controller(
                         "(value)=>window.__nativeMessages.push(value)}}};"
                     )
                     requests: list[tuple[str, str]] = []
+                    responses: list[tuple[str, int]] = []
+                    request_failures: list[tuple[str, str | None]] = []
+                    page_errors: list[str] = []
+                    page.on("pageerror", lambda error: page_errors.append(error.stack))
                     page.on("request", lambda req: requests.append((req.method, req.url)))
+                    page.on(
+                        "response",
+                        lambda response: responses.append((response.url, response.status)),
+                    )
+                    page.on(
+                        "requestfailed", lambda req: request_failures.append((req.url, req.failure))
+                    )
                     page.goto(f"{origin}/login?returnTo=/companion")
                     page.get_by_label("Email", exact=True).fill(stack.admin_email)
                     page.get_by_label("Password", exact=True).fill(stack.admin_password)
@@ -235,6 +246,9 @@ def test_compiled_native_client_real_controller(
                                 "url": page.url,
                                 "body": page.locator("body").inner_text(),
                                 "requests": requests,
+                                "responses": responses,
+                                "requestFailures": request_failures,
+                                "pageErrors": page_errors,
                                 "buildEvidence": str(compiled_client),
                             },
                             indent=2,

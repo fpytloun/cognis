@@ -5,6 +5,7 @@ import { createReactiveAgentForm } from './agentFormTestState.svelte';
 import AgentForm from './AgentForm.svelte';
 import { api } from '$lib/api/client';
 import type { LLMProvider } from '$lib/types/api';
+import { defaultModelEntry } from '$lib/types/api';
 
 function setup(readonly = false, agents: any[] = [], providers: LLMProvider[] = []) {
   const form = createReactiveAgentForm();
@@ -76,6 +77,30 @@ describe('AgentForm sections', () => {
     form.agentProfiles[0].reasoningEffort = 'max';
     await screen.findByText('Thinking effort for profile "default" is unavailable. Select an available value.');
     expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();
+  });
+  it('renders direct models with partial metadata without inventing capabilities', async () => {
+    vi.spyOn(api.inferenceRoutes, 'list').mockResolvedValue({ routes: [] });
+    const form = createReactiveAgentForm();
+    form.name = 'Partial metadata';
+    form.providerId = 'partial';
+    form.model = 'model';
+    const model = defaultModelEntry('model');
+    Reflect.deleteProperty(model, 'reasoning_efforts');
+    Reflect.deleteProperty(model, 'supports_fast_mode');
+    render(AgentForm, {
+      mode: 'create', form, tools: [], workflows: [], agents: [], onSave: vi.fn(),
+      providers: [{
+        provider_id: 'partial', display_name: 'Partial metadata', location: 'controller',
+        backend: 'openai', config: {}, is_default: false, status: 'active',
+        created_at: null, updated_at: null, last_test: null, models: [model]
+      }]
+    });
+    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
+    const efforts = screen.getByRole('combobox', { name: /Thinking effort/ });
+    expect(within(efforts).getByRole('option', { name: 'Provider default' })).toHaveValue('default');
+    expect(within(efforts).queryByRole('option', { name: 'High' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('combobox', { name: /^Fast mode/ }))
+      .getByRole('option', { name: /^Enabled\b/ })).toBeDisabled();
   });
   it('groups memory and guardrails while keeping configured advanced controls and warnings visible', async () => {
     const { container, form, onSave } = setup();

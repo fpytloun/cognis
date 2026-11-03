@@ -131,6 +131,8 @@ def test_independent_recipient_reads_user_after_append_before_sender_ack(
         _subscribe_chat_v2(sender, stack, conversation_id)
         cursor = initial["cursor"]
         items = {item["id"]: item for item in initial["timeline"]["items"]}
+        assert initial["scope"]["session_id"] is None
+        lineage_reset_seen = False
         assert not any(
             item.get("client_message_id") == client_message_id for item in items.values()
         )
@@ -154,18 +156,32 @@ def test_independent_recipient_reads_user_after_append_before_sender_ack(
                     continue
                 post_append_seen |= event.get("reason") == "event_store_session_invalidated"
                 # Reads are driven exclusively by server invalidation, never a
-                # timer, sender ACK, or repeated forced snapshot.
+                # timer or sender ACK. A first-session lineage reset requires
+                # exactly one server-directed recovery snapshot.
                 response = stack.get(
                     f"/api/v1/chat/v2/conversations/{conversation_id}/sync",
                     params={"cursor": cursor},
                 )
                 assert response.status_code == 200, response.text
                 delta = response.json()
-                assert not delta["reset_required"], delta
-                for op in delta["ops"]:
-                    if op["op"] == "upsert_item":
-                        items[op["item"]["id"]] = op["item"]
-                cursor = delta["cursor_after"]
+                if delta["reset_required"]:
+                    assert delta["reset_reason"] == "lineage_changed", delta
+                    assert not lineage_reset_seen, delta
+                    lineage_reset_seen = True
+                    recovery = stack.get(
+                        f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot"
+                    )
+                    assert recovery.status_code == 200, recovery.text
+                    snapshot = recovery.json()
+                    assert snapshot["scope"]["session_id"] is not None
+                    assert snapshot["scope"]["session_id"] == delta["scope"]["session_id"]
+                    items = {item["id"]: item for item in snapshot["timeline"]["items"]}
+                    cursor = snapshot["cursor"]
+                else:
+                    for op in delta["ops"]:
+                        if op["op"] == "upsert_item":
+                            items[op["item"]["id"]] = op["item"]
+                    cursor = delta["cursor_after"]
                 found = [
                     item
                     for item in items.values()

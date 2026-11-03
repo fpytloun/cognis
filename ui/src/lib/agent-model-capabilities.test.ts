@@ -33,6 +33,25 @@ describe('agent model capabilities', () => {
     expect(agentModelCapabilities(providers.slice(0, 1), routes, 'cognis', 'cognis/chat')).toBeNull();
   });
   it('preserves direct-provider and default-model lookup', () => {
-    expect(agentModelCapabilities(providers, routes, 'first', '')).toBe(providers[0].models[0]);
+    expect(agentModelCapabilities(providers, routes, 'first', '')).toMatchObject({
+      reasoning_efforts: ['default', 'low', 'high', 'max'], supports_fast_mode: true
+    });
+  });
+  it('normalizes direct-provider metadata with no advertised capabilities', () => {
+    const partial = structuredClone(providers);
+    Reflect.deleteProperty(partial[0].models[0], 'reasoning_efforts');
+    Reflect.deleteProperty(partial[0].models[0], 'supports_fast_mode');
+    expect(agentModelCapabilities(partial, [], 'first', '')).toEqual({
+      reasoning_efforts: ['default'], supports_fast_mode: false
+    });
+    expect(agentModelCapabilities(partial, [], 'first', 'unknown')).toBeNull();
+  });
+  it('uses the same default efforts for partial routed metadata', () => {
+    const partial = structuredClone(providers);
+    Reflect.deleteProperty(partial[0].models[0], 'reasoning_efforts');
+    Reflect.deleteProperty(partial[0].models[0], 'supports_fast_mode');
+    expect(agentModelCapabilities(partial, routes, '', 'cognis/chat')).toEqual({
+      reasoning_efforts: ['default'], supports_fast_mode: false
+    });
   });
 });

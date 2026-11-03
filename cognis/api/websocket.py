@@ -3566,11 +3566,17 @@ class WebSocketConnectionManager:
     async def _resolve_event_session_routes(
         self, event_session_token: str, cached_event_store: Any
     ) -> set[str]:
+        # Authorized conversation subscriptions may precede their first session.
         subscribed_scopes = [
             (connection_id, scope)
             for connection_id, connection in self._connections.items()
             for scope in connection.chat_v2_scopes.values()
-            if isinstance(scope.session_id, str) and scope.session_id
+            if (isinstance(scope.session_id, str) and scope.session_id)
+            or (
+                scope.kind == "conversation"
+                and isinstance(scope.conversation_id, str)
+                and scope.conversation_id
+            )
         ]
         if not subscribed_scopes:
             self._event_route_membership = ()
@@ -3616,7 +3622,11 @@ class WebSocketConnectionManager:
                 )
                 for _, scope in subscribed_scopes
             }
-            subscribed_session_ids = set(session_id_by_scope_key.values())
+            subscribed_session_ids = {
+                session_id
+                for session_id in session_id_by_scope_key.values()
+                if isinstance(session_id, str) and session_id
+            }
             result = await session.execute(
                 select(Session).where(Session.session_id.in_(subscribed_session_ids))
             )
@@ -3639,7 +3649,12 @@ class WebSocketConnectionManager:
             (connection_id, scope.key, scope.session_id, scope.conversation_id)
             for connection_id, connection in self._connections.items()
             for scope in connection.chat_v2_scopes.values()
-            if isinstance(scope.session_id, str) and scope.session_id
+            if (isinstance(scope.session_id, str) and scope.session_id)
+            or (
+                scope.kind == "conversation"
+                and isinstance(scope.conversation_id, str)
+                and scope.conversation_id
+            )
         )
         if current_membership == membership:
             self._event_routes = routes
