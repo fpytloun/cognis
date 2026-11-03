@@ -31,8 +31,15 @@ from cognis.config import load_config
 E2E_AGENT_ID = "e2e-test-agent"
 E2E_PROVIDER_ID = "e2e-mock-llm"
 SCENARIOS_DIR = Path(__file__).parent / "scenarios"
-GOLDEN_DIR = Path(__file__).parent / "golden"
-CANONICAL_CAPTURE_DIR = Path(__file__).parents[2] / "ui" / "src" / "lib" / "chat-v2" / "captures"
+_CAPTURE_ROOT = os.environ.get("COGNIS_E2E_CAPTURE_ROOT")
+GOLDEN_DIR = (
+    Path(_CAPTURE_ROOT).resolve() / "golden" if _CAPTURE_ROOT else Path(__file__).parent / "golden"
+)
+CANONICAL_CAPTURE_DIR = (
+    Path(_CAPTURE_ROOT).resolve() / "canonical"
+    if _CAPTURE_ROOT
+    else Path(__file__).parents[2] / "ui" / "src" / "lib" / "chat-v2" / "captures"
+)
 PROJECTION_RESET_LOCK = Lock()
 
 

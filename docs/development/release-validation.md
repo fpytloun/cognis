@@ -36,6 +36,15 @@ Vite: `cd ui && npx playwright test e2e/changelog.spec.ts`. Set `COGNIS_E2E_URL`
 when the app is not at the default `http://localhost:8080`. Browser tests in
 `ui/e2e/` must not depend on development-only module endpoints.
 
+For frozen-source qualification, export `COGNIS_E2E_CAPTURE_ROOT` to an absolute
+directory outside the checkout before running `uv run pytest tests/e2e/`. Raw captures go
+to its `golden/` directory and promoted captures to `canonical/`, without
+overwriting tracked fixtures. Keep the same variable exported for
+`make e2e-events-replay`: replay checks both the committed corpus and the fresh
+private captures, and rejects a missing or empty configured live corpus.
+Ordinary runs without this variable retain the tracked output locations.
+Review generated captures before explicitly promoting them into public source.
+
 ## Failure triage
 
 Classify each failure before editing:

@@ -21,10 +21,16 @@ type CaptureRecord =
     };
 
 function capturePaths(): string[] {
-  return readdirSync(resolve(__dirname, 'captures'))
+  const readPaths = (directory: string): string[] => readdirSync(directory)
     .filter((name) => name.endsWith('.jsonl'))
     .sort()
-    .map((name) => resolve(__dirname, 'captures', name));
+    .map((name) => resolve(directory, name));
+  const committed = readPaths(resolve(__dirname, 'captures'));
+  const captureRoot = process.env.COGNIS_E2E_CAPTURE_ROOT;
+  if (!captureRoot) return committed;
+  const live = readPaths(resolve(captureRoot, 'canonical'));
+  expect(live.length, 'configured live capture directory must not be empty').toBeGreaterThan(0);
+  return [...committed, ...live];
 }
 
 function readCapture(path: string): CaptureRecord[] {
