@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [0.18.3] - 2026-11-02
+
+### Fixed
+
+- Allow controller package publication to retry an existing immutable project tag without rebuilding from a newer application revision, and recognize the build-only workspace manifest needed by locked dependency export while continuing to reject executor implementation in controller images.
 ## [0.18.2] - 2026-10-24
 
 ### Highlights

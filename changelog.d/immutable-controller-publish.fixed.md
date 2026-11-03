@@ -1,1 +1,0 @@
-Allow controller package publication to retry an existing immutable project tag without rebuilding from a newer application revision, and recognize the build-only workspace manifest needed by locked dependency export while continuing to reject executor implementation in controller images.
