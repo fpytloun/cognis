@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import cognis.core.remember_queue as remember_queue_module
 from cognis.core.events import EventBus, EventType
@@ -249,11 +249,33 @@ async def test_ambiguous_remember_outcome_is_terminal_and_not_reclaimed(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_durable_remember_lease_renews_during_slow_provider_call(tmp_path: Path) -> None:
+async def test_durable_remember_lease_renews_during_slow_provider_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    initial_clock = datetime(2024, 1, 1, tzinfo=UTC)
+    clock = initial_clock
+    renewed = asyncio.Event()
+
+    async def database_clock(session: AsyncSession) -> datetime:
+        assert isinstance(session, ObservedSession)
+        session.sampled_clock = clock
+        return clock
+
+    class ObservedSession(AsyncSession):
+        sampled_clock: datetime | None = None
+
+        async def commit(self) -> None:
+            sampled_clock = self.sampled_clock
+            await super().commit()
+            if sampled_clock is not None and sampled_clock > initial_clock:
+                renewed.set()
+
+    # SQLite's second-precision clock cannot establish subsecond lease boundaries.
+    monkeypatch.setattr(remember_queue_module, "database_now", database_clock)
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'remember-renew.db'}")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    session_factory = async_sessionmaker(engine, class_=ObservedSession, expire_on_commit=False)
     async with session_factory() as session:
         session.add(User(email="user@example.com", password_hash="x", role="user"))
         await session.commit()
@@ -282,13 +304,34 @@ async def test_durable_remember_lease_renews_during_slow_provider_call(tmp_path:
         }
     )
     claimed = await first._claim_due_durable_items(1)
+    assert len(claimed) == 1
+    initial_expiry = initial_clock + timedelta(seconds=first.lease_seconds)
     processing = asyncio.create_task(first._process(claimed[0], asyncio.Semaphore(1)))
-    await worker.started.wait()
-    await asyncio.sleep(0.15)
-    assert await second._claim_due_durable_items(1) == []
-    worker.release.set()
-    await processing
-    await engine.dispose()
+    try:
+        await asyncio.wait_for(worker.started.wait(), 2)
+        clock = initial_clock + timedelta(milliseconds=40)
+        await asyncio.wait_for(renewed.wait(), 2)
+        async with session_factory() as session:
+            row = await session.get(RememberQueueRow, claimed[0].item_id)
+            assert row is not None
+            assert row.lease_token == claimed[0].lease_token
+            renewed_expiry = row.lease_expires_at.replace(tzinfo=UTC)
+            assert renewed_expiry == clock + timedelta(seconds=first.lease_seconds)
+        clock = initial_clock + timedelta(milliseconds=80)
+        assert initial_expiry < clock < renewed_expiry
+        assert await second._claim_due_durable_items(1) == []
+        async with session_factory() as session:
+            row = await session.get(RememberQueueRow, claimed[0].item_id)
+            assert row is not None
+            assert row.status == "dispatching"
+            assert row.lease_token == claimed[0].lease_token
+            assert row.lease_expires_at.replace(tzinfo=UTC) > clock
+        worker.release.set()
+        await asyncio.wait_for(processing, 2)
+    finally:
+        worker.release.set()
+        await asyncio.gather(processing, return_exceptions=True)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
