@@ -1,4 +1,4 @@
-import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
 import { Buffer } from 'node:buffer';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
 import type { NativeConfiguration } from '../src/lib/native/host';
@@ -351,7 +351,7 @@ test('stack expands agents, tabs use native chat, drafts survive, click-away col
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher).toBeVisible();
   await expect(launcher.getByTestId('activity-avatar-orbit')).toBeVisible();
   const avatarButtons = page.locator('[data-pinned-agent]');
@@ -483,7 +483,6 @@ test('click-away consumes the first click without activating underlying backgrou
     });
     document.body.append(target);
   });
-  await expect(page.getByTestId('pinned-chat-launcher')).toHaveAttribute('data-pinned-agent', 'agent-second');
   await openButler(page);
   const panel = page.getByTestId('pinned-chat-panel');
   await expect(panel).toBeVisible();
@@ -499,8 +498,15 @@ test('click-away consumes the first click without activating underlying backgrou
   expect(state.errors).toEqual([]);
 });
 
-async function openButler(page: Page): Promise<void> {
-  await page.getByTestId('pinned-chat-launcher').click();
+async function settledStackLauncher(page: Page, expectedLauncherAgent = 'agent-second'): Promise<Locator> {
+  const launcher = page.getByTestId('pinned-chat-launcher');
+  await expect(launcher).toHaveAttribute('data-pinned-agent', expectedLauncherAgent);
+  return launcher;
+}
+
+async function openButler(page: Page, expectedLauncherAgent = 'agent-second'): Promise<void> {
+  const launcher = await settledStackLauncher(page, expectedLauncherAgent);
+  await launcher.click();
   await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
   await expect(page.getByTestId('pinned-chat-panel')).toBeVisible();
 }
@@ -625,7 +631,7 @@ for (const surface of ['dashboard', 'full chat'] as const) {
     const peerState = peer === page ? state : await fixture(peer, true, true, {}, 1);
     if (peer !== page) {
       await peer.goto('/chat/conv-task-chat');
-    } else await openButler(peer);
+    } else await openButler(peer, 'agent-stage39');
     const pinned = peer === page ? peer.getByTestId('pinned-chat-panel')
       : peer.locator('form').filter({ has: peer.getByRole('textbox', { name: 'Chat message', exact: true }) });
     if (peer === page) await pinned.getByRole('tab', { name: /Kitchen renovation/ }).click();
@@ -729,7 +735,7 @@ test('saved tuck temporarily reveals on hover and chat opening, and toggle works
   await page.reload();
   await expect(stack).toHaveAttribute('data-tucked', 'true');
   await page.keyboard.press('Tab');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await launcher.focus();
   await launcher.hover();
   await expect(stack).toHaveAttribute('data-tucked', 'true');
@@ -795,7 +801,7 @@ test('right-edge gutter stays an interactive, stable target and short swipes tuc
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher).toBeVisible();
   const before = (await launcher.boundingBox())!;
   await page.mouse.move(1438, before.y + before.height / 2);
@@ -1029,7 +1035,7 @@ test('rightward throw tucks the dock without opening it and tab strip scrolls in
   await page.setViewportSize({ width: 1024, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher).toBeVisible();
   const rect = (await launcher.boundingBox())!;
   await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2);
@@ -1125,7 +1131,7 @@ test('collapsed stack animates latest activity to the front and nudges for new a
   const state = await fixture(page);
   await page.goto('/notifications');
   await expect.poll(state.details).toBeGreaterThanOrEqual(5);
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
   state.settle();
   state.activity('conv-task-chat', '2026-10-15T08:00:00Z');
@@ -1147,7 +1153,7 @@ test('stack separates through transforms and animates back without a second laun
   const state = await fixture(page);
   await page.goto('/notifications');
   const avatars = page.locator('[data-pinned-agent]');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher.locator('img')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Open pinned chats with Butler' })).toHaveCount(0);
   const handles = await avatars.elementHandles();
@@ -1169,7 +1175,8 @@ test('expanded avatar image dragging moves the whole dock without opening a chat
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  await page.getByTestId('pinned-chat-launcher').click();
+  const launcher = await settledStackLauncher(page);
+  await launcher.click();
   const avatar = page.getByRole('button', { name: 'Open pinned chats with Butler' });
   await expect(avatar.locator('img')).toHaveAttribute('draggable', 'false');
   await expect.poll(() => avatar.evaluate((node) => node.getAnimations().length)).toBe(0);
@@ -1192,8 +1199,7 @@ test('reduced motion keeps expansion instant while preserving keyboard movement'
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = page.getByTestId('pinned-chat-launcher');
-  await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
+  const launcher = await settledStackLauncher(page);
   await launcher.click();
   expect(await page.locator('[data-pinned-agent]').evaluateAll((nodes) => nodes.every((node) => !node.getAnimations().length))).toBe(true);
   const before = (await launcher.boundingBox())!;
@@ -1210,7 +1216,7 @@ test('touch dragging on the avatar does not cancel or expand the collapsed dock'
   try {
     const state = await fixture(page);
     await page.goto('/notifications');
-    const launcher = page.getByTestId('pinned-chat-launcher');
+    const launcher = await settledStackLauncher(page);
     await expect(launcher.locator('img')).toBeVisible();
     await launcher.tap();
     await expect(page.getByTestId('pinned-agent-strip')).toBeVisible();
@@ -1273,7 +1279,7 @@ test('removing or cancelling the captured avatar does not block the next interac
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = page.getByTestId('pinned-chat-launcher');
+  const launcher = await settledStackLauncher(page);
   await expect(launcher.locator('img')).toBeVisible();
   const before = (await launcher.boundingBox())!;
   await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
@@ -1325,8 +1331,7 @@ for (const width of [768, 2560]) {
     await page.setViewportSize({ width, height: 900 });
     const state = await fixture(page);
     await page.goto('/notifications');
-    const launcher = page.getByTestId('pinned-chat-launcher');
-    await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
+    const launcher = await settledStackLauncher(page);
     await launcher.click();
     await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
     const panel = page.getByTestId('pinned-chat-panel');
@@ -1385,7 +1390,8 @@ test('global pins stay visible independently of project windows and share main d
   await expect(page.getByTestId('workspace-window-conversation:conv-task-chat-b')).toBeVisible();
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
   await page.goto('/notifications');
-  await page.getByTestId('pinned-chat-launcher').click();
+  const launcher = await settledStackLauncher(page);
+  await launcher.click();
   await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
   await page.getByRole('button', { name: 'Unpin Kitchen renovation' }).click();
   await page.goto('/projects/proj_home');
