@@ -85,6 +85,11 @@ async function mockChat(page: Page, toggle = false, many = false, overridden = f
     if (path === '/api/auth/me') body = { email: 'acceptance@cognis.local', name: 'Acceptance', role: 'admin' };
     else if (path === '/api/health') body = { status: 'ok', services: {}, llm_available: true };
     else if (path === '/api/bootstrap-status') body = { has_users: true, needs_bootstrap: false };
+    else if (path === '/api/v1/dashboard/navigation-summary') body = {
+      chat_groups: [], dashboard: { total: 0, critical: 0, warning: 0, info: 0, truncated: false },
+      schedules: 0, tasks: 0
+    };
+    else if (path === '/api/v1/inbox') body = { items: [], unread_count: 0, next_cursor: null };
     else if (path === '/api/v1/agents') body = [agent];
     else if (path === `/api/v1/agents/${agent.agent_id}`) body = agent;
     else if (path.endsWith('/sidebar')) body = {
@@ -122,7 +127,7 @@ async function mockChat(page: Page, toggle = false, many = false, overridden = f
           notice_id: 'command:profile:pending', runtime_selection: runtimeSelection() },
         server_time: conversation.updated_at
       };
-     } else if (path.includes('/sessions/')) body = {
+     } else if (path.startsWith('/api/v1/sessions/')) body = {
        session_id: conversation.active_session_id, intaris_session_id: conversation.active_session_id,
        status: 'active', events: [], transcript: [], total_calls: 0,
        runtime_selection: runtimeSelection()
@@ -131,7 +136,20 @@ async function mockChat(page: Page, toggle = false, many = false, overridden = f
     else if (path.endsWith('/state')) body = snapshot().state;
     else if (path.endsWith('/user-preferences')) body = {};
     else if (path.includes('/ui-state')) body = {};
-    else if (path.includes('/activity-overview')) body = { workstreams: [], has_more: false };
+    else if (path.endsWith('/activity-overview')) body = {
+      schema_version: 2, detail: 'lightweight', projection_version: 'quick-profile-acceptance-v1',
+      scope: { key: `conversation:${conversation.conversation_id}`,
+        kind: 'conversation', conversation_id: conversation.conversation_id },
+      summary: { mutations: 0, commands: 0, changed_files: 0, artifacts: 0, deliverables: 0,
+        additions: 0, deletions: 0, omitted_files: 0 },
+      materialization: { state: 'live', completed_streams: 0, total_streams: 0,
+        covered_events: 0, target_events: 0, failed_streams: 0, retry_after_ms: null },
+      workstreams: [], recent: {}, recent_work: {
+        commands: [], mutations: [], files: [], artifacts: [], deliverables: []
+      },
+      graph_fingerprint: 'quick-profile-empty', overview_revision: 'quick-profile-empty',
+      work_revision: 0, graph_revision: 0, graph_truncated: false, server_time: conversation.updated_at
+    };
     else if (path.includes('/llm/providers')) body = [{ provider_id: 'acceptance-provider', enabled: true }];
     else if (path.includes('/notifications')) body = [];
     await route.fulfill({ json: body });
