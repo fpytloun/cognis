@@ -291,5 +291,5 @@ def test_postgresql_old_writer_snapshot_and_downgrade_when_available() -> None:
             )
         assert trigger_count == 0
     finally:
+        # The isolated fixture must not roll back across the irreversible Work cutover.
         engine.dispose()
-        command.downgrade(config, "base")
