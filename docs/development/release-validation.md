@@ -69,6 +69,12 @@ inputs with only a different port, and is not a separate matrix execution.
 For interactive compose-only debugging, use `make e2e-browser-ui`; use an
 explicit owning config for fixture-page debugging.
 
+The native attachment IndexedDB harness uses a fresh on-disk browser profile
+under each test's output directory, matching the companion's persistent,
+profile-scoped WebKit data store. WebKit's ephemeral context can reject Blob
+records even when metadata-only transactions succeed. Both browser projects
+retain their original device options and byte, reload, lease and abort checks.
+
 ## Failure triage
 
 Classify each failure before editing:

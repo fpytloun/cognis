@@ -1,4 +1,19 @@
-import { expect, test } from '@playwright/test';
+import { expect, test as base } from '@playwright/test';
+
+const test = base.extend({
+  context: async ({ playwright, browserName, contextOptions, launchOptions, baseURL, headless }, use, testInfo) => {
+    // Match the companion's persistent, profile-scoped WKWebsiteDataStore.
+    const context = await playwright[browserName].launchPersistentContext(
+      testInfo.outputPath('native-storage-profile'),
+      { ...contextOptions, baseURL, headless, ...launchOptions },
+    );
+    try {
+      await use(context);
+    } finally {
+      await context.close();
+    }
+  },
+});
 
 test('native structured clone, callback abort, bytes and lease boundary', async ({ page }, testInfo) => {
   await page.route(url => url.pathname.startsWith('/api/'), route => route.abort());
