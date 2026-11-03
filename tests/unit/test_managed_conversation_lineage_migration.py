@@ -526,9 +526,15 @@ def test_artifact_source_identity_094_postgresql_when_available() -> None:
                 "postgresql://", "postgresql+asyncpg://", 1
             )
         async_engine = create_engine(async_database_url)
-        asyncio.run(run_schema_bootstrap(async_engine))
-        asyncio.run(run_schema_bootstrap(async_engine))
-        asyncio.run(async_engine.dispose())
+
+        async def bootstrap_twice() -> None:
+            try:
+                await run_schema_bootstrap(async_engine)
+                await run_schema_bootstrap(async_engine)
+            finally:
+                await async_engine.dispose()
+
+        asyncio.run(bootstrap_twice())
         reflected = sa.Table("artifacts", sa.MetaData(), autoload_with=engine)
         with engine.connect() as connection:
             rows = {
