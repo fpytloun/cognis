@@ -377,6 +377,8 @@ def test_update_if_match_accepts_current_and_rejects_stale_malformed_and_conflic
         json={"content": f"updated revision contract {unique_label}"},
     )
     assert updated.status_code == 200
+    current_revision = _current_revision(http_client, mnemory_url, headers, memory_id)
+    assert current_revision > revision
 
     stale = http_client.put(
         f"{mnemory_url}/api/memories/{memory_id}",
@@ -390,14 +392,27 @@ def test_update_if_match_accepts_current_and_rejects_stale_malformed_and_conflic
         headers={**headers, "If-Match": "not-an-integer"},
         json={"pinned": True},
     )
-    assert malformed.status_code == 422
+    assert malformed.status_code == 400
+    assert "positive integer revision" in malformed.json()["detail"]
+
+    multiple_revisions = http_client.put(
+        f"{mnemory_url}/api/memories/{memory_id}",
+        headers={**headers, "If-Match": f"{current_revision}, {current_revision + 1}"},
+        json={"pinned": True},
+    )
+    assert multiple_revisions.status_code == 400
+    assert "positive integer revision" in multiple_revisions.json()["detail"]
 
     conflicting = http_client.put(
         f"{mnemory_url}/api/memories/{memory_id}",
-        headers=[*headers.items(), ("If-Match", "1"), ("If-Match", "2")],
-        json={"pinned": True},
+        headers={**headers, "If-Match": str(current_revision)},
+        json={"pinned": True, "expected_revision": current_revision + 1},
     )
-    assert conflicting.status_code == 422
+    assert conflicting.status_code == 409
+    assert conflicting.json()["detail"] == (
+        "If-Match and expected_revision must identify the same revision"
+    )
+    assert _current_revision(http_client, mnemory_url, headers, memory_id) == current_revision
     _delete_current_memory(http_client, mnemory_url, headers, memory_id)
 
 
@@ -471,18 +486,36 @@ def test_artifact_delete_accepts_current_and_rejects_stale_if_match(
         },
     )
     assert created.status_code == 200
-    artifact_id = created.json().get("artifact_id") or created.json().get("id")
+    payload = created.json()
+    assert payload["status"] == "saved"
+    assert isinstance(payload["artifact"], dict)
+    artifact_id = payload["artifact"]["id"]
     assert isinstance(artifact_id, str) and artifact_id
+    assert payload["revision"] == revision
+    assert payload["artifact_revision"] >= 1
+
+    # Artifact metadata has its own revision; advance semantic content before
+    # asserting that the original semantic If-Match token is stale.
+    advanced = http_client.put(
+        f"{mnemory_url}/api/memories/{memory_id}",
+        headers={**headers, "If-Match": str(revision)},
+        json={"content": f"advanced artifact contract {unique_label}"},
+    )
+    assert advanced.status_code == 200
+    current_revision = _current_revision(http_client, mnemory_url, headers, memory_id)
+    assert current_revision > revision
 
     stale = http_client.delete(
         f"{mnemory_url}/api/memories/{memory_id}/artifacts/{artifact_id}",
         headers={**headers, "If-Match": str(revision)},
     )
     _assert_revision_conflict(stale)
-    current_revision = _current_revision(http_client, mnemory_url, headers, memory_id)
+    assert _current_revision(http_client, mnemory_url, headers, memory_id) == current_revision
     deleted = http_client.delete(
         f"{mnemory_url}/api/memories/{memory_id}/artifacts/{artifact_id}",
         headers={**headers, "If-Match": str(current_revision)},
     )
     assert deleted.is_success
+    assert deleted.json()["status"] == "deleted"
+    assert deleted.json()["artifact_id"] == artifact_id
     _delete_current_memory(http_client, mnemory_url, headers, memory_id)
