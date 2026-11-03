@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 - Deliver canonical event updates to conversation subscribers that connected before the first session existed, while preserving child-session isolation.
 - Keep agent configuration usable when persisted model metadata omits optional reasoning-effort or fast-mode capabilities.
 - Keep full-chat drafts synchronized with pinned and dashboard views, and align tucked avatars at custom interface font sizes.
+- Preserve known running activity during incomplete executor telemetry, including conversations without unread messages and activity reported across Waiting pages.
 ## [0.18.2] - 2026-10-24
 
 ### Highlights

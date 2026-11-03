@@ -15,6 +15,31 @@ const page = (items: Conversation[], cursor: string | null = null, active: strin
 });
 
 describe('complete Waiting projection', () => {
+  it('remembers reported work without unread candidates until telemetry confirms idle', async () => {
+    const activity = new WaitingActivity();
+    const running = conversation('running-without-unread');
+    await loadCompleteWaiting(async () => page([], null, [running.conversation_id]), activity, 'owner');
+    await loadCompleteWaiting(async () => ({
+      ...page([]), activity_complete: false,
+    }), activity, 'owner');
+    expect(await loadCompleteWaiting(async () => ({
+      ...page([running, conversation('new-unread')]), activity_complete: false,
+    }), activity, 'owner')).toEqual([conversation('new-unread')]);
+    expect(await loadCompleteWaiting(async () => page([running]), activity, 'owner')).toEqual([running]);
+  });
+
+  it('classifies earlier candidates using activity reported by later pages', async () => {
+    const running = conversation('later-reported-work');
+    const question = conversation('later-reported-question', {
+      pending_notification_types: ['step_question'],
+    });
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(page([running, question], 'next'))
+      .mockResolvedValueOnce(page([], null, [running.conversation_id, question.conversation_id]));
+    expect(await loadCompleteWaiting(fetch)).toEqual([question]);
+    expect(fetch.mock.calls).toEqual([[null], ['next']]);
+  });
+
   it('updates unread and actionable rows during missing telemetry without declaring known work idle', async () => {
     const activity = new WaitingActivity();
     const running = conversation('running-shell');

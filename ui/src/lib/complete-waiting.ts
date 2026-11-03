@@ -32,16 +32,12 @@ export async function loadCompleteWaiting(
   let cursor: string | null = null;
   do {
     const page = await fetchPage(cursor);
-    const activeIds = new Set(page.active_conversation_ids);
+    for (const id of page.active_conversation_ids) nextActiveIds.add(id);
+    if (page.activity_complete === false) {
+      for (const id of previous?.activeIds ?? []) nextActiveIds.add(id);
+    }
     for (const item of page.conversations.items) {
-      const active = activeIds.has(item.conversation_id)
-        || (page.activity_complete === false && previous?.activeIds.has(item.conversation_id));
-      if (active) nextActiveIds.add(item.conversation_id);
-      if (isSidebarConversationWaiting(item, Boolean(active))) {
-        items.set(item.conversation_id, item);
-      } else {
-        items.delete(item.conversation_id);
-      }
+      items.set(item.conversation_id, item);
     }
     if (!page.conversations.has_more) break;
     const next = page.conversations.cursor;
@@ -50,7 +46,8 @@ export async function loadCompleteWaiting(
     cursor = next;
   } while (true);
   if (previous) activity!.commit(scope, previous.generation, nextActiveIds);
-  return [...items.values()];
+  return [...items.values()].filter(item =>
+    isSidebarConversationWaiting(item, nextActiveIds.has(item.conversation_id)));
 }
 
 /** Waiting metadata overrides overlapping history; history cursors are untouched. */

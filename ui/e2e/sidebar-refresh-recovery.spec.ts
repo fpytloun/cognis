@@ -3,13 +3,57 @@ import { installTaskCockpitFixture, TASK_ID } from './task-cockpit-fixture';
 
 test.use({ serviceWorkers: 'block', viewport: { width: 1440, height: 1000 } });
 
-async function openApp(page: Page, path = '/chat/conv-task-chat') {
+async function openApp(page: Page, path = '/chat/conv-task-chat', initialWaitingStatus = 200) {
+  const initialWaiting = page.waitForResponse(response =>
+    new URL(response.url()).pathname === '/api/v1/conversations/waiting'
+      && response.status() === initialWaitingStatus);
   await page.goto(path);
-  // Only cold startup gets an extended budget. Drain initial HTTP/IndexedDB
-  // bootstrap work before installing a clock that can expire live deadlines.
+  // A quiet network can precede the leader-owned bootstrap read. Observe its
+  // expected response before changing fixtures or advancing live deadlines.
   await page.getByTestId(path === '/' ? 'control-center' : 'chat-header')
     .waitFor({ state: 'visible', timeout: 30_000 });
+  await (await initialWaiting).finished();
   await page.waitForLoadState('networkidle', { timeout: 30_000 });
+}
+
+async function openClockedApp(page: Page, path = '/chat/conv-task-chat', initialWaitingStatus = 200) {
+  // Clock.install must precede application timers, including document leases.
+  // https://playwright.dev/docs/clock#introduction
+  await page.clock.install();
+  await openApp(page, path, initialWaitingStatus);
+}
+
+async function settleAuthorityStorage(page: Page) {
+  // Virtual time must not expire real IndexedDB work's three-second watchdog.
+  // This readonly transaction waits behind admitted authority transactions.
+  await page.evaluate(() => new Promise<void>((resolve, reject) => {
+    const request = indexedDB.open('cognis-profile-intent-v1', 1);
+    request.onupgradeneeded = () => request.transaction?.abort();
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => reject(new Error('Authority storage is blocked'));
+    request.onsuccess = () => {
+      const db = request.result;
+      const tx = db.transaction('profiles', 'readonly');
+      tx.objectStore('profiles').getAllKeys();
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onabort = tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  }));
+}
+
+async function advanceClock(page: Page, duration: number, mode: 'runFor' | 'fastForward' = 'runFor') {
+  await settleAuthorityStorage(page);
+  if (mode === 'fastForward') {
+    await page.clock.fastForward(duration);
+    await settleAuthorityStorage(page);
+    return;
+  }
+  for (let remaining = duration; remaining > 0;) {
+    const step = Math.min(remaining, 500);
+    await page.clock.runFor(step);
+    await settleAuthorityStorage(page);
+    remaining -= step;
+  }
 }
 
 const row = (id: string, title: string, unread = false) => ({
@@ -58,22 +102,21 @@ test('executor and schedule bursts refresh metadata without rebuilding the activ
   page.on('request', request => {
     if (/\/chat\/v2\/conversations\/conv-task-chat\/(snapshot|sync)/.test(request.url())) timelineCalls++;
   });
-  await openApp(page);
+  await openClockedApp(page);
   // The header can render before the first canonical snapshot is requested.
   // Drain that bootstrap request before attributing traffic to invalidations.
   await expect.poll(() => timelineCalls).toBeGreaterThan(0);
   await page.waitForLoadState('networkidle');
-  await page.clock.install();
   const sidebarBefore = sidebarCalls;
   const timelineBefore = timelineCalls;
   for (let i = 0; i < 100; i++) {
     send({ type: 'scope_invalidated', reason: 'executor_state_changed' });
     send({ type: 'scope_invalidated', reason: 'schedule_action_changed' });
   }
-  await page.clock.runFor(200);
+  await advanceClock(page, 200);
   expect(timelineCalls).toBe(timelineBefore);
   expect(sidebarCalls).toBeLessThanOrEqual(sidebarBefore + 1);
-  await page.clock.runFor(4_100);
+  await advanceClock(page, 4_100);
   await expect.poll(() => sidebarCalls).toBeGreaterThan(sidebarBefore);
   expect(sidebarCalls).toBeLessThanOrEqual(sidebarBefore + 2);
 });
@@ -227,11 +270,10 @@ test('opening a stale conversation list repairs missed pushes without polling or
   page.on('request', request => {
     if (/\/chat\/v2\/conversations\/conv-task-chat\/(snapshot|sync)/.test(request.url())) timelineCalls++;
   });
-  await openApp(page);
-  await page.clock.install();
+  await openClockedApp(page);
   const before = calls;
   await page.getByRole('button', { name: 'Hide conversations', exact: true }).click();
-  await page.clock.runFor(31_000);
+  await advanceClock(page, 31_000);
   expect(calls).toBe(before);
   const timelineBefore = timelineCalls;
   updated = true; // No WebSocket event: the client missed the push while idle.
@@ -240,7 +282,7 @@ test('opening a stale conversation list repairs missed pushes without polling or
   expect(calls).toBe(before + 1);
   await page.getByRole('button', { name: 'Hide conversations', exact: true }).click();
   await page.getByRole('button', { name: 'Show conversations', exact: true }).click();
-  await page.clock.runFor(31_000);
+  await advanceClock(page, 31_000);
   expect(calls).toBe(before + 1);
   expect(timelineCalls).toBe(timelineBefore);
 });
@@ -299,7 +341,7 @@ test(`accepted live sidebar ${mutation} fences delayed device hydration`, async 
 });
 }
 
-test('timeline distinguishes readable history from an unfinished reconciliation', async ({ page }) => {
+test('timeline keeps readable history quiet during an unfinished reconciliation', async ({ page }) => {
   const send = await fixture(page);
   await page.goto(`/tasks/${TASK_ID}`);
   await page.getByTestId('task-agent-dock-launcher').click();
@@ -313,7 +355,8 @@ test('timeline distinguishes readable history from an unfinished reconciliation'
   });
   send({ type: 'turn_settled', conversation_id: 'conv-task-chat', turn_id: 'freshness-turn' });
   await expect(timeline).toHaveAttribute('data-freshness', 'reconciling');
-  await expect(timeline.getByRole('status')).toHaveText('Refreshing…');
+  await expect(timeline.getByRole('status')).toHaveCount(0);
+  await expect(timeline.getByText('What is blocking this release?', { exact: true })).toBeVisible();
   release();
   await expect(timeline).toHaveAttribute('data-freshness', 'current');
 });
@@ -329,11 +372,10 @@ test('foreground force refresh bypasses ordinary success spacing without a dupli
   page.on('request', request => {
     if (new URL(request.url()).pathname.endsWith('/conversations/context-types')) contextCalls++;
   });
-  await openApp(page);
-  await page.clock.install();
+  await openClockedApp(page);
   const before = calls;
   await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })));
-  await page.clock.runFor(100);
+  await advanceClock(page, 100);
   await expect.poll(() => calls).toBe(before + 1);
   expect(contextCalls).toBe(0);
 });
@@ -360,17 +402,16 @@ test('Waiting retains its snapshot and recovers while sidebar remains unavailabl
         active_conversation_ids: [],
       } });
   });
-  await openApp(page);
+  await openClockedApp(page);
   await expect(page.getByText('Retained Waiting snapshot', { exact: true }).first()).toBeVisible();
-  await page.clock.install();
   failing = waitingFailing = true;
   send({ type: 'work_invalidated', revision: '2' });
   for (let call = 2; call <= 4; call++) {
-    await page.clock.runFor(4_100);
+    await advanceClock(page, 4_100);
     await expect.poll(() => waitingCalls).toBe(call);
   }
   // Independent response completions can put the sidebar one cooldown behind.
-  await page.clock.runFor(4_100);
+  await advanceClock(page, 4_100);
   await expect.poll(() => sidebarCalls).toBe(4);
   await expect(page.getByTestId('waiting-refresh-stale')).toHaveCount(0);
   await expect(page.getByText(/Waiting could not refresh/)).toHaveCount(0);
@@ -380,7 +421,7 @@ test('Waiting retains its snapshot and recovers while sidebar remains unavailabl
     send({ type: 'work_invalidated', revision: String(i + 3) });
     send({ type: 'sidebar_conversation_upsert', conversation_id: `missing-${i}` });
   }
-  await page.clock.fastForward(60_000);
+  await advanceClock(page, 60_000, 'fastForward');
   await expect(page.getByTestId('waiting-refresh-stale')).toContainText('Waiting updates are delayed.');
   await expect(page.getByTestId('waiting-refresh-stale')).not.toHaveAttribute('role', 'alert');
   const sidebarBeforeRetry = sidebarCalls;
@@ -599,6 +640,7 @@ test('unread updates continue quietly during incomplete executor telemetry', asy
   let calls = 0;
   let incomplete = false;
   const running = row('known-shell', 'Known active shell', true);
+  const initialUnread = row('initial-unread', 'Unread before executor outage', true);
   const unread = row('new-unread-during-outage', 'Fresh unread during executor outage', true);
   await page.route('**/api/v1/conversations/sidebar?**', route => route.fulfill({ json: {
     ...projection([], '1'), background_work_changed: !incomplete,
@@ -606,19 +648,21 @@ test('unread updates continue quietly during incomplete executor telemetry', asy
   await page.route('**/api/v1/conversations/waiting?**', route => {
     calls++;
     return route.fulfill({ json: {
-      conversations: { items: incomplete ? [running, unread] : [running], cursor: null, has_more: false },
+      conversations: { items: incomplete ? [running, unread] : [running, initialUnread], cursor: null, has_more: false },
       active_conversation_ids: incomplete ? [] : ['known-shell'], activity_complete: !incomplete,
     } });
   });
-  await openApp(page);
+  await openClockedApp(page);
+  await expect(page.getByText(initialUnread.title, { exact: true })).toBeVisible();
+  await expect(page.getByText(running.title, { exact: true })).toHaveCount(0);
   await expect.poll(() => calls).toBe(1);
-  await page.clock.install();
   incomplete = true;
   send({ type: 'work_invalidated', revision: '2' });
-  await page.clock.runFor(4_100);
+  await advanceClock(page, 4_100);
   await expect(page.getByText('Fresh unread during executor outage', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText(initialUnread.title, { exact: true })).toHaveCount(0);
   await expect(page.getByText('Known active shell', { exact: true })).toHaveCount(0);
-  await page.clock.fastForward(5 * 60_000);
+  await advanceClock(page, 5 * 60_000, 'fastForward');
   await expect(page.getByTestId('waiting-refresh-stale')).toHaveCount(0);
   await expect(page.getByText(/Waiting could not refresh/)).toHaveCount(0);
 });
@@ -630,13 +674,12 @@ test('Dashboard also keeps transient Waiting failures quiet', async ({ page }) =
     failures++;
     return route.fulfill({ status: 503, json: { detail: 'Database temporarily unavailable' } });
   });
-  await openApp(page, '/');
+  await openClockedApp(page, '/', 503);
   await expect.poll(() => failures).toBeGreaterThan(0);
-  await page.clock.install();
   await expect(page.getByText(/Waiting could not refresh/)).toHaveCount(0);
   await expect(page.getByTestId('waiting-refresh-stale')).toHaveCount(0);
-  await page.clock.runFor(1_000);
-  await page.clock.fastForward(60_000);
+  await advanceClock(page, 1_000);
+  await advanceClock(page, 60_000, 'fastForward');
   await expect(page.getByTestId('waiting-refresh-stale')).toContainText('Waiting updates are delayed.');
   await expect(page.getByTestId('waiting-refresh-stale')).not.toHaveAttribute('role', 'alert');
 });
@@ -646,27 +689,27 @@ test('Dashboard Waiting completes and recovers independently of failed history',
   let waitingFails = false;
   let waitingCalls = 0;
   let title = 'Fresh Waiting despite failed history';
+  // Application errors stay resource-local; 503 belongs to global connectivity.
   await page.route('**/api/v1/conversations?**', route => route.fulfill({
-    status: 503, json: { detail: 'History unavailable' },
+    status: 500, json: { detail: 'History unavailable' },
   }));
   await page.route('**/api/v1/conversations/waiting?**', route => {
     waitingCalls++;
     return waitingFails
-      ? route.fulfill({ status: 503, json: { detail: 'Waiting unavailable' } })
+      ? route.fulfill({ status: 500, json: { detail: 'Waiting unavailable' } })
       : route.fulfill({ json: {
         conversations: { items: [row('independent-waiting', title, true)], cursor: null, has_more: false },
         active_conversation_ids: [],
       } });
   });
-  await openApp(page, '/');
+  await openClockedApp(page, '/');
   await expect(page.getByText(title, { exact: true }).first()).toBeVisible();
   await expect(page.getByTestId('dashboard-conversations-error')).toContainText('History unavailable');
-  await page.clock.install();
   waitingFails = true;
   await page.getByTestId('dashboard-conversations-error').getByRole('button', { name: 'Try again' }).click();
   await expect.poll(() => waitingCalls).toBeGreaterThan(1);
-  await page.clock.runFor(1_000);
-  await page.clock.fastForward(60_000);
+  await advanceClock(page, 1_000);
+  await advanceClock(page, 60_000, 'fastForward');
   await expect(page.getByTestId('waiting-refresh-stale')).toBeVisible();
   waitingFails = false;
   title = 'Recovered Waiting while history still fails';
@@ -695,16 +738,15 @@ test('a long cooldown cannot carry an old scope failure into a new scope', async
         active_conversation_ids: [],
       } });
   });
-  await openApp(page);
+  await openClockedApp(page);
   await expect(page.getByText('Initial Waiting snapshot', { exact: true }).first()).toBeVisible();
-  await page.clock.install();
   fails = true;
   send({ type: 'work_invalidated', revision: '2' });
-  await page.clock.runFor(4_100);
+  await advanceClock(page, 4_100);
   await expect.poll(() => waitingCalls).toBe(2);
   await page.getByRole('button', { name: 'Expand conversation filters', exact: true }).click();
   await page.getByRole('button', { name: 'Archived', exact: true }).click();
-  await page.clock.fastForward(61_000);
+  await advanceClock(page, 61_000, 'fastForward');
   await expect(page.getByTestId('waiting-refresh-stale')).toHaveCount(0);
   expect(waitingCalls).toBe(2);
 });
