@@ -31,10 +31,10 @@
   }
 </script>
 
-<div class={compact ? 'grid min-w-0 grid-cols-2 gap-x-3 gap-y-2' : 'space-y-3'} data-testid="provider-usage-bars">
+<div class={compact ? `grid min-w-0 ${windows.length >= 3 ? 'grid-cols-3' : 'grid-cols-2'} gap-x-0.5 gap-y-0.5` : 'space-y-3'} data-testid="provider-usage-bars">
   {#each windows as item (item.id)}
     <div class="min-w-0">
-      <div class="mb-1 flex min-w-0 items-baseline justify-between gap-2 text-xs">
+      <div class={`${compact ? 'mb-0.5 gap-0.5' : 'mb-1 gap-2'} flex min-w-0 items-baseline justify-between text-xs`}>
         <span class="truncate text-secondary" title={item.name}>{item.name}</span>
         <span class="shrink-0 tabular-nums text-foreground">{Math.round(percent(item.window.used_percent))}% used</span>
       </div>
@@ -52,7 +52,7 @@
     </div>
   {/each}
   {#if compact && resets.length}
-    <div class={`min-w-0 self-end text-[10px] leading-[14px] text-quiet ${windows.length % 2 === 0 ? 'col-span-2 flex flex-wrap gap-x-3 gap-y-0.5' : 'space-y-0.5'}`}
+    <div class={`min-w-0 self-end text-[10px] leading-[12px] text-quiet ${windows.length > 1 ? 'col-span-full flex flex-wrap gap-x-3 gap-y-0.5' : ''}`}
       aria-label="Limit reset times" data-testid="compact-limit-resets">
       {#each resets as item (item.id)}
         <p class="flex min-w-0 items-baseline gap-1" title={`${item.name} resets ${new Date(item.window.resets_at!).toLocaleString()}`}>

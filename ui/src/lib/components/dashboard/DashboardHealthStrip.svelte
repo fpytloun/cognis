@@ -144,7 +144,7 @@
             {#each cards as card (card.map((provider) => provider.provider_id).join(':'))}
               <div class="min-w-0 basis-full shrink-0 snap-start snap-always sm:min-w-56 sm:flex-1 sm:basis-56"
                 data-provider-card data-testid="provider-card">
-                <div class="flex flex-col gap-2">
+                <div class="flex flex-col gap-0.5">
                   {#each card as provider (provider.provider_id)}
                     <ProviderHealthLine providerId={provider.provider_id} />
                   {/each}

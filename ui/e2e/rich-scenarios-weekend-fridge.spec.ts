@@ -38,10 +38,12 @@ test('fridge comparison preserves product names next to their illustrations in d
 
   const fixture = page.getByTestId('rich-deliverable-fixture');
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.resolvedTheme)).toBe('dark');
-  const richText = await fixture.locator('.rich-block-list').first().evaluate((element) =>
-    getComputedStyle(element).getPropertyValue('--rich-text').trim(),
-  );
-  expect(richText).toBe('#eaf1f9');
+  const richText = await fixture.locator('.rich-block-list').first().evaluate((element) => {
+    const color = document.createElement('canvas').getContext('2d')!;
+    color.fillStyle = getComputedStyle(element).getPropertyValue('--rich-text').trim();
+    return color.fillStyle;
+  });
+  expect(richText).toBe('#e2e8f0');
 
   const nordhavenCard = fixture.getByRole('heading', { name: 'Nordhaven 430 Graphite' })
     .first()

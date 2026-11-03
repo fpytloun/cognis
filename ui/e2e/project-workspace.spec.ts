@@ -77,7 +77,7 @@ async function projectFixture(page: Page, windows = false, reader = false) {
   await page.route('**/api/health**', (route) => route.fulfill({ json: { status: 'ok', providers: {} } }));
   const project = {
     project_id: 'proj_home', name: 'Home', description: 'Household and reconstruction',
-    status: 'active', instructions: '', sources: [], workflow_ids: [],
+    status: 'active', instructions: '', sources: [], workflow_ids: [], metadata: {},
     agents: [{ agent_id: 'agent-stage39', project_id: 'proj_home', agent_name: 'Butler', enabled: true }],
     grants: [], caller_role: reader ? 'member' : 'owner', active_schedule_count: 1,
     is_readonly_for_caller: reader, is_shared_with_me: reader,
@@ -210,9 +210,11 @@ for (const width of [1440, 390]) {
     await expect(page.getByRole('link', { name: /Renovation plan/ })).toBeVisible();
     await page.screenshot({ path: test.info().outputPath(`project-resources-library-${width}.png`), fullPage: true });
     await page.getByRole('link', { name: /Renovation plan/ }).click();
+    if (width < 1024) await page.getByRole('button', { name: 'Show details', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Details', exact: true })).toBeVisible();
     await expect(page.locator('p').getByText('Keep the original oak floor.', { exact: true })).toBeVisible();
     await page.screenshot({ path: test.info().outputPath(`project-asset-${width}.png`) });
+    if (width < 1024) await page.getByRole('button', { name: 'Close details', exact: true }).click();
     await page.goBack();
     await page.getByRole('tab', { name: 'Files', exact: true }).click();
     await page.getByRole('link', { name: /floor-plan.png/ }).click();
@@ -302,8 +304,8 @@ for (const resource of ['conversations', 'tasks']) {
     }).toBe(true);
     await expect.poll(async () => {
       await list.evaluate((node) => { node.scrollTop = node.scrollHeight; });
-      const more = page.getByTestId(`dashboard-${resource}-load-more`);
-      if (await more.isVisible()) await more.click();
+      // The sentinel already requested the next page; its pending response can
+      // remove the manual footer while a click is waiting for actionability.
       return page.getByTestId(`dashboard-${prefix}-row-${prefix === 'task' ? 'task' : 'conv'}_page_59`).count();
     }).toBe(1);
     expect(await section.evaluate((node) => node.getBoundingClientRect().height)).toBeCloseTo(initialHeight, 0);

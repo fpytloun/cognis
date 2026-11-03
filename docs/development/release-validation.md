@@ -71,9 +71,12 @@ loopback; published Docker ports do not satisfy the mock's loopback-only control
 gate. Missing or stale container identity fails without fallback or retry.
 Host-started mock servers retain normal loopback HTTP control.
 
-The component-runtime fixture compiles the real branding and streaming
-components independently of the production application. It does not open
-development-only routes in production or replace application authentication.
+The component-runtime fixture compiles the real branding, streaming, scoped
+timeline and session-log drawer components independently of the production
+application. Scoped fixtures initialize fictional document-coordination
+metadata before mounting while retaining principal-scoped dispatch fences.
+This does not open development-only routes in production or replace application
+authentication. Drawer cases belong to this harness, not the Compose app routes.
 
 `playwright.pinned.config.ts` is the pinned-conversation owner; the older
 `playwright.compiled.config.ts` has identical tests, device, retry and preview

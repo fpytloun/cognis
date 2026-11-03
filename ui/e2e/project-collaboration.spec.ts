@@ -210,7 +210,7 @@ test('Home project: owner assigns agent, shares, and partner reads and continues
 
   await partner.goto(`/projects/${home.project_id}?tab=conversations`);
   await expect(partner.getByTestId('project-role')).toHaveText('Member');
-  const rows = partner.getByTestId('project-conversation-row');
+   const rows = partner.getByTestId(/^dashboard-conversation-row-/);
   await expect(rows.filter({ hasText: 'Kitchen reconstruction plan' })).toHaveCount(1);
   await expect(rows.filter({ hasText: 'Birthday surprise' })).toHaveCount(0);
   await shot(partner, '09-partner-project-conversations');

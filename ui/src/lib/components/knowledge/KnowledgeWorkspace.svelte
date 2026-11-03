@@ -1,7 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
@@ -180,7 +180,7 @@
       selectedDocumentFragment = null;
     }
     missingDocument = false;
-    selectionRequestId += 1;
+    selectionRequestId = untrack(() => selectionRequestId) + 1;
   });
 </script>
 

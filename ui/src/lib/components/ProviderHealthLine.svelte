@@ -40,7 +40,7 @@
 </script>
 
 <div class="min-w-0 text-xs" data-testid={`provider-health-${providerId}`}>
-  <div class="mb-1 flex min-w-0 items-center gap-2">
+  <div class={`${compact ? 'mb-0' : 'mb-1'} flex min-w-0 items-center gap-2`}>
     <span class={`h-1.5 w-1.5 shrink-0 rounded-full ${colors[status] ?? colors.unknown}`} role="img" aria-label={`Provider health: ${status}`} title={value?.health_detail ?? status}></span>
     <div class="min-w-0 flex-1">
       {#if heading}

@@ -1,18 +1,10 @@
 import { mount } from 'svelte';
 import '../../../src/app.css';
 import ScopedFixture from '../../../src/routes/scoped-chat-v2-fixture/+page.svelte';
-import { documentCoordination } from '../../../src/lib/document-coordination';
-import { offlineCache } from '../../../src/lib/offline/cache';
-import { startAppearance } from '../../../src/lib/theme/appearance';
+import { initializeFixtureDocumentContext } from './document-context';
 
 async function start(): Promise<void> {
-  const coordination = documentCoordination();
-  await coordination.initialize();
-  // Fictional coordination metadata; real principal-scoped dispatch fences stay active.
-  await coordination.verified('fixture@example.com');
-  await offlineCache.setOwner(coordination.storageName('offline-cache'));
-  const stopAppearance = startAppearance();
-  window.addEventListener('pagehide', stopAppearance, { once: true });
+  await initializeFixtureDocumentContext();
   mount(ScopedFixture, { target: document.getElementById('app')! });
 }
 

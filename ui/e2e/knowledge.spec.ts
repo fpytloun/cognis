@@ -347,6 +347,8 @@ async function mockKnowledgeApi(
 
 test.describe('Knowledge', () => {
   test('list -> create -> add folder -> browse -> search -> ask', async ({ page }) => {
+    const runtimeErrors: string[] = [];
+    page.on('pageerror', error => runtimeErrors.push(error.message));
     await login(page);
     await mockKnowledgeApi(page);
 
@@ -407,6 +409,7 @@ test.describe('Knowledge', () => {
     const citation = page.getByRole('button', { name: 'Citation 1: intro.md' });
     await citation.click();
     await expect(page.getByTestId('knowledge-raw-result')).toBeInViewport();
+    expect(runtimeErrors).toEqual([]);
   });
 
   test('owner grants direct access and shared detail remains read-only', async ({ page }) => {

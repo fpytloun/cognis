@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
 test.describe('Session logs drawer parity', () => {
   test.use({ serviceWorkers: 'block' });
@@ -9,7 +10,7 @@ test.describe('Session logs drawer parity', () => {
       contentType: 'application/json',
       body: '[]',
     }));
-    await page.goto('/session-logs-drawer-fixture');
+    await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/session-logs.html`);
   });
 
   test('locks the page, shows activity, contains boundary scrolling, and restores focus', async ({ page }) => {
@@ -52,7 +53,7 @@ test.describe('Session logs drawer parity', () => {
 
     await page.getByTestId('finish-session-step').evaluate((button) => (button as HTMLButtonElement).click());
 
-    await expect(drawer.getByTestId('session-activity-status')).toHaveText('completed');
+    await expect(drawer.getByTestId('session-activity-status')).toHaveText(/^\s*Attempt 1\s*·\s*completed\s*$/);
     await expect(drawer.getByTestId('session-activity-status').locator('[aria-label="Agent is working…"]')).toHaveCount(0);
     await expect(drawer).toHaveAttribute('data-mount-marker', 'preserved');
   });

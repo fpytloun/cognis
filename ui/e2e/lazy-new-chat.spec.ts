@@ -20,6 +20,8 @@ test('conversation opens the on-demand new-chat dialog with working bindings and
   await open.click();
   const dialog = page.getByRole('dialog', { name: 'New chat', exact: true });
   await expect(dialog.getByLabel('Primary agent')).toBeVisible();
+  await dialog.getByLabel('Primary agent').selectOption('agent-stage39');
+  await expect(dialog.getByLabel('Primary agent')).toHaveValue('agent-stage39');
   await expect(dialog.getByRole('button', { name: 'Create conversation', exact: true })).toBeEnabled();
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(dialog).toHaveCount(0);

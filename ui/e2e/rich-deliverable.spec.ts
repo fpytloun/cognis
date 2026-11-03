@@ -1,20 +1,10 @@
 import { expect, test } from '@playwright/test';
 
-/**
- * Force the explicit light-theme override rather than relying on
- * `emulateMedia({ colorScheme: 'light' })`: rich deliverables default to
- * dark regardless of OS preference (there is no per-deliverable theme
- * toggle, and silently following `prefers-color-scheme: light` left
- * standalone pages and embedded chat stuck light with no way back to
- * dark). The `data-resolved-theme="light"` selector is kept for a future
- * app-wide theme switch, so tests that need to exercise the light palette
- * set that attribute directly, the same way that future switch will.
- */
+/** Select the fixture's supported theme control before exercising viewer portals. */
 async function forceLightTheme(page: import('@playwright/test').Page) {
-  await page.evaluate(() => {
-    localStorage.setItem('theme', 'light');
-    document.documentElement.dataset.resolvedTheme = 'light';
-  });
+  await page.getByLabel('Preview theme', { exact: true }).selectOption('light');
+  await expect(page.getByTestId('rich-deliverable-fixture')).toHaveAttribute('data-theme', 'light');
+  await expect(page.locator('html')).toHaveAttribute('data-resolved-theme', 'light');
 }
 
 async function selectScenario(page: import('@playwright/test').Page, name: string | RegExp) {
@@ -272,9 +262,9 @@ test.describe('rich deliverable visual fixture', () => {
       subtitle: getComputedStyle(document.querySelector('.rich-toolbar p')!).color,
     }));
     // Light-theme --rich-text / --rich-text-secondary / --rich-accent-soft.
-    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(23, 32, 51)');
+    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(15, 23, 42)');
     expect(colors.subtitle, JSON.stringify(colors)).toBe('rgb(51, 65, 85)');
-    expect(colors.eyebrow, JSON.stringify(colors)).toBe('rgb(2, 132, 199)');
+    expect(colors.eyebrow, JSON.stringify(colors)).toBe('rgb(3, 111, 159)');
   });
 
   test('renders readable colors in the full-view modal, which is portaled outside .rich-deliverable', async ({ page }) => {
@@ -290,8 +280,8 @@ test.describe('rich deliverable visual fixture', () => {
     // `.rich-deliverable` and `.rich-full`.
     await page.goto('/rich-deliverable-fixture');
     await selectScenario(page, 'Weekly metrics dashboard');
-    await page.getByRole('button', { name: 'Open full view' }).click();
     await forceLightTheme(page);
+    await page.getByRole('button', { name: 'Open full view' }).click();
     const dialog = page.getByTestId('rich-deliverable-full-view');
     await expect(dialog).toBeVisible();
 
@@ -301,8 +291,8 @@ test.describe('rich deliverable visual fixture', () => {
       blockList: getComputedStyle(full.querySelector('.rich-block-list')!).color,
     }));
     expect(colors.richText, JSON.stringify(colors)).not.toBe('');
-    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(14, 22, 34)');
-    expect(colors.blockList, JSON.stringify(colors)).toBe('rgb(76, 92, 114)');
+    expect(colors.h1, JSON.stringify(colors)).toBe('rgb(15, 23, 42)');
+    expect(colors.blockList, JSON.stringify(colors)).toBe('rgb(51, 65, 85)');
   });
 
   test('gives every registered block type dedicated visual treatment (design-system polish pass)', async ({ page }) => {
@@ -664,12 +654,17 @@ test.describe('rich deliverable visual fixture', () => {
     await fullView.getByRole('button', { name: 'Evaluation' }).first().click();
     await expect(page.locator(`#${namespace}-evaluation`)).toBeFocused();
 
+    const evaluation = fullView.getByRole('heading', { name: 'Evaluation', exact: true });
+    await fullView.getByRole('heading', { level: 1 }).first().scrollIntoViewIfNeeded();
+    await expect(evaluation).not.toBeInViewport();
     await page.evaluate(() => {
       const root = document.querySelector<HTMLElement>('[data-rich-instance]');
       window.location.hash = `#${root?.dataset.richInstance}-rich-section-4`;
     });
     await expect(page.locator(`#${namespace}-rich-section-4`)).toBeAttached();
-    await expect(page.locator(`#${namespace}-rich-section-4`)).toBeInViewport();
+    // Legacy aliases have zero height; qualify the painted destination after
+    // moving away, not the alias point clipped underneath the reader header.
+    await expect(evaluation).toBeInViewport();
   });
 
   test('keeps adversarial generated namespaces unique and titled Markdown semantic', async ({ page }) => {

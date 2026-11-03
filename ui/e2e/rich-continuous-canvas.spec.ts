@@ -55,7 +55,7 @@ for (const width of [390, 1440]) {
         await expect(hero).toHaveCSS('border-top-width', '0px');
       }
       if (scenario === 'compact-alert-dashboard') {
-        await expect(viewer.locator('.rich-lede')).toContainText('Hourly pass after a fifth rollout');
+        await expect(viewer.locator('.rich-lede')).toContainText('Invented exercise after two simulator resets');
         await expect(viewer.locator('.rich-section-header h3').first()).toHaveCSS('text-transform', 'none');
         for (const metric of await viewer.locator('.rich-metric').all()) {
           expect((await metric.boundingBox())!.height).toBeLessThan(130);

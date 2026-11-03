@@ -79,8 +79,9 @@ test('deliverable revisions: chat shows the latest revision and browses history'
   await expect(revised).toContainText('Ship the beta to 20 design partners');
 
   // The activity inspector lists one deliverable: the latest revision.
-  const inspectorToggle = page.getByRole('button', { name: 'Open conversation inspector' });
-  if (await inspectorToggle.isVisible()) await inspectorToggle.click();
+  const inspectorToggle = page.getByRole('button', { name: 'Toggle session details', exact: true });
+  await expect(inspectorToggle).toBeVisible();
+  await inspectorToggle.click();
   const inspector = page.getByTestId('conversation-info-drawer');
   await expect(inspector).toBeVisible();
   const recent = inspector.getByTestId('recent-work-activity');

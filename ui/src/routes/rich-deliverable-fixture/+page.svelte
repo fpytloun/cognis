@@ -1,9 +1,12 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { page } from '$app/state';
+  import { onMount } from 'svelte';
   import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
   import { setViewerTheme } from '$lib/components/rich/viewer-theme';
   import { defaultRichScenarioId, getRichScenario, requireRichScenario, richGalleryScenarios } from '$lib/rich-scenarios/registry';
+  import { projectAppearance, resolveTheme, type AppearancePreference } from '$lib/theme/appearance';
+  import { DEFAULT_THEME_FAMILY, type ThemeFamily } from '$lib/theme/catalog';
 
   const widths = ['360', '390', '768', '1024', '1230', '1280', '1440'];
   const themes = ['light', 'dark', 'system'];
@@ -13,16 +16,19 @@
   let theme = $derived(themes.includes(page.url.searchParams.get('theme') ?? '') ? page.url.searchParams.get('theme')! : 'system');
   let surface = $derived((surfaces.includes(page.url.searchParams.get('surface') ?? '') ? page.url.searchParams.get('surface') : 'embedded') as 'embedded' | 'standalone');
   let capture = $derived(page.url.searchParams.get('capture') === 'viewer');
+  let mounted = $state(false);
+  onMount(() => { mounted = true; });
 
   $effect(() => {
+    if (!mounted) return;
     const queryTheme = page.url.searchParams.get('theme');
     if (queryTheme === 'light' || queryTheme === 'dark' || queryTheme === 'system') setViewerTheme(queryTheme);
-    const previous = document.documentElement.dataset.resolvedTheme;
-    if (theme === 'system') delete document.documentElement.dataset.resolvedTheme;
-    else document.documentElement.dataset.resolvedTheme = theme;
+    const root = document.documentElement;
+    const family = (root.dataset.themeFamily ?? DEFAULT_THEME_FAMILY) as ThemeFamily;
+    const previous = root.dataset.resolvedTheme === 'dark' ? 'dark' : 'light';
+    projectAppearance(family, resolveTheme(theme as AppearancePreference, matchMedia('(prefers-color-scheme: dark)').matches));
     return () => {
-      if (previous === undefined) delete document.documentElement.dataset.resolvedTheme;
-      else document.documentElement.dataset.resolvedTheme = previous;
+      projectAppearance(family, previous);
     };
   });
 

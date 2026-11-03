@@ -211,9 +211,11 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       await step('submit synthetic admission', async () => {
         await sender.locator('textarea').first().fill(text);
         // The textarea stays editable while uploads are pending; submit does not.
-        await expect(sender.getByRole('button', {
+        const submit = sender.getByRole('button', {
           name: mode === 'normal' ? 'Send' : 'Queue message', exact: true,
-        })).toBeVisible();
+        });
+        await expect(submit).toBeVisible();
+        await expect(submit).toBeEnabled();
         await sender.locator('textarea').first().press('Enter');
       });
       const request = await step('real admission response captured', () => admission);

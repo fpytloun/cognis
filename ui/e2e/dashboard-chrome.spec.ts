@@ -57,7 +57,7 @@ for (const width of [1440, 390]) {
       await expect.poll(() => logo.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
       await logo.hover();
       const hoverColor = await logo.evaluate(() =>
-        `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--color-inset').trim().split(/\s+/).join(', ')}, 0.6)`);
+        `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--color-raised').trim().split(/\s+/).join(', ')}, 0.6)`);
       await expect(logo).toHaveCSS('background-color', hoverColor);
       await logo.screenshot({ path: test.info().outputPath('sidebar-brand-hover.png') });
       await logo.focus();

@@ -13,6 +13,7 @@ export default defineConfig({
       brand: fileURLToPath(new URL('./e2e/fixtures/component-runtime/brand.html', import.meta.url)),
       streaming: fileURLToPath(new URL('./e2e/fixtures/component-runtime/streaming.html', import.meta.url)),
       scoped: fileURLToPath(new URL('./e2e/fixtures/component-runtime/scoped.html', import.meta.url)),
+      sessionLogs: fileURLToPath(new URL('./e2e/fixtures/component-runtime/session-logs.html', import.meta.url)),
     } },
   },
   resolve: {

@@ -21,7 +21,9 @@ test.describe('chat workspace inspector', () => {
         const dialog = page.getByRole('dialog', { name: 'Conversation information' });
         await expect(dialog).toBeVisible();
         const panel = dialog.locator('#conversation-info-drawer');
-        await expect(panel).toHaveCSS('background-color', 'rgb(2, 6, 23)');
+        const elevated = await panel.evaluate((node) =>
+          `rgb(${getComputedStyle(node).getPropertyValue('--color-elevated').trim().split(/\s+/).join(', ')})`);
+        await expect(panel).toHaveCSS('background-color', elevated);
       }
     });
   }

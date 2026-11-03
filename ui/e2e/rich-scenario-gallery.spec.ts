@@ -53,10 +53,39 @@ test('standalone query theme overrides saved preference on direct load and histo
 });
 
 test('restores the document theme after leaving the fixture', async ({ page }) => {
-  await page.goto('/rich-deliverable-fixture?theme=dark');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.goto('/rich-deliverable-fixture?theme=light');
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.resolvedTheme)).toBe('light');
+  await expect.poll(() => page.evaluate(() => document.documentElement.style.colorScheme)).toBe('light');
+  const appearance = () => page.evaluate(() => ({
+    family: document.documentElement.dataset.themeFamily,
+    theme: document.documentElement.dataset.resolvedTheme,
+    dark: document.documentElement.classList.contains('dark'),
+    colorScheme: document.documentElement.style.colorScheme,
+    chrome: document.querySelector('meta[name="theme-color"]')?.getAttribute('content'),
+  }));
+  const original = await appearance();
+  await page.evaluate(() => {
+    (window as Window & { fixtureNavigationDocument?: boolean }).fixtureNavigationDocument = true;
+  });
+  const navigate = async (url: string) => {
+    await page.evaluate(href => {
+      const link = document.createElement('a');
+      link.href = href;
+      link.textContent = 'Navigate fixture';
+      link.dataset.testid = 'fixture-navigation';
+      link.style.cssText = 'position:fixed;top:0;left:0;z-index:9999';
+      document.body.append(link);
+    }, url);
+    await page.getByTestId('fixture-navigation').click();
+    await page.getByTestId('fixture-navigation').evaluate(node => node.remove());
+  };
+  await navigate('/rich-deliverable-fixture?theme=dark');
   await expect.poll(() => page.evaluate(() => document.documentElement.dataset.resolvedTheme)).toBe('dark');
-  await page.goto('/rich-deliverable-block-fixture?block=hero');
-  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.resolvedTheme)).toBeUndefined();
+  await navigate('/rich-deliverable-block-fixture?block=hero');
+  await expect.poll(appearance).toEqual(original);
+  expect(await page.evaluate(() =>
+    (window as Window & { fixtureNavigationDocument?: boolean }).fixtureNavigationDocument)).toBe(true);
 });
 
 test('loads every gallery scenario without unsupported blocks', async ({ page }) => {
