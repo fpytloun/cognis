@@ -47,7 +47,8 @@ test('hook autocomplete shows disabled status and inserts stable ID', async ({ p
   await expect(composer).toHaveValue('/hook system:self-improvement');
   const card = page.getByRole('region', { name: 'Background hook' });
   await expect(card.getByText('Idle hook')).toBeVisible();
-  await expect(card.getByRole('button', { name: 'View session' })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: 'Open session' })).toBeVisible();
+  await expect(card.locator('.chat-markdown')).toHaveCount(0);
   for (const width of [1280, 390]) {
     await page.setViewportSize({ width, height: 900 });
     const bounds = await card.boundingBox();
@@ -56,9 +57,9 @@ test('hook autocomplete shows disabled status and inserts stable ID', async ({ p
     expect(await card.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
   }
   await card.getByRole('button', { name: 'Expand' }).click();
-  await expect(card.getByRole('button', { name: 'View session' })).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Open session' })).toBeVisible();
   await expect(card.locator('.chat-markdown')).toContainText('Full detailed outcome');
   await card.getByRole('button', { name: 'Collapse' }).click();
   await expect(card.locator('.chat-markdown')).toHaveCount(0);
-  await expect(card.getByRole('button', { name: 'View session' })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: 'Open session' })).toBeVisible();
 });

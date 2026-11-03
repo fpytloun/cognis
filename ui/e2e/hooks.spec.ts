@@ -96,8 +96,8 @@ for (const width of [390, 1280]) {
     await dialog.getByRole('combobox', { name: 'Trigger', exact: true }).selectOption('turn_completed');
     await dialog.getByRole('combobox', { name: 'Execution', exact: true }).selectOption('follow_up');
     await dialog.getByRole('button', { name: 'Save hook', exact: true }).click();
-    expect(state.hooks.find(hook => hook.hook_id === 'hook-created')?.mode).toBe('follow_up');
     await expect(page.getByRole('dialog', { name: 'My learning hook', exact: true })).toBeVisible();
+    expect(state.hooks.find(hook => hook.hook_id === 'hook-created')?.mode).toBe('follow_up');
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await page.getByLabel('Search hooks', { exact: true }).fill('My learning');

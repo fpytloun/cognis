@@ -290,7 +290,7 @@
                }}
              />
            {:else if workspaceWindow.kind === 'agent'}
-            {@const agent = agents.find((item: Agent) => item.agent_id === workspaceWindow.agentId)}
+             {@const agent = agents.find((item: Agent) => item.agent_id === workspaceWindow.entityId)}
             {#if agent}
               <AgentQuickChatModal
                 bind:this={entityRefs[workspaceWindow.key]}

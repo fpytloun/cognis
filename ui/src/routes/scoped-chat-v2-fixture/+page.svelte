@@ -10,6 +10,7 @@
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   let themePreview = $state(false);
+  let timeline = $state<{ refresh(): Promise<void> }>();
 
   const controller = new ScopedFixtureController();
   if (typeof location !== 'undefined') controller.layoutCases = new URLSearchParams(location.search).has('layout-cases');
@@ -142,6 +143,7 @@
       <button type="button" data-testid="hold-refresh-snapshot" onclick={() => controller.holdNextRefreshSnapshot()}>Hold next snapshot</button>
       <button type="button" data-testid="resolve-refresh-snapshot" onclick={() => controller.resolveHeldRefreshSnapshot()}>Resolve snapshot</button>
       <button type="button" data-testid="reset-cursor" onclick={resetCursor}>Reset cursor</button>
+      <button type="button" onclick={() => timeline?.refresh()}>Refresh timeline</button>
        <button type="button" data-testid="reconnect" onclick={reconnect}>Reconnect</button>
       <button type="button" data-testid="set-evaluating" onclick={setEvaluating}>Set evaluating</button>
       <button type="button" data-testid="set-approved" onclick={setApproved}>Set approved</button>
@@ -165,6 +167,7 @@
   {/if}
   <div class="flex h-[32rem] overflow-hidden rounded-xl border border-separator" data-testid="scoped-timeline-shell">
     <ScopedChatV2Timeline
+      bind:this={timeline}
       {scope}
       api={controller.api}
       realtime={controller.realtime}

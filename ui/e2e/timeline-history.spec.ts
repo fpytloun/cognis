@@ -78,11 +78,8 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
     rows.map(row => (row as HTMLElement).dataset.timelineRowKey));
   const retainedKeys = await keys();
   if (hidden) {
-    await full.locator('[aria-label="Background hook"]').evaluate(element => {
-      element.querySelector<HTMLButtonElement>('button')!.click();
-    });
     parentAnchor = await anchor(full);
-    await full.locator('[aria-label="Background hook"]').getByRole('button', { name: 'View session' })
+    await full.locator('[aria-label="Background hook"]').getByRole('button', { name: 'Open session', exact: true })
       .evaluate(element => (element as HTMLButtonElement).click());
     await expect(page.getByTestId('child-header')).toBeVisible();
   }
@@ -101,7 +98,7 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
         queued.clear();
       };
     });
-    await page.getByRole('button', { name: 'Back to parent conversation' }).evaluate(e => (e as HTMLButtonElement).click());
+    await page.getByRole('link', { name: 'Back to parent conversation', exact: true }).evaluate(e => (e as HTMLAnchorElement).click());
     await expect(page.getByTestId('child-header')).not.toBeAttached();
   }
   for (let pageIndex = 1; pageIndex <= 2; pageIndex++) {
@@ -146,7 +143,7 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
     await page.evaluate(() => window.releaseRestorationFrames());
     await expectAnchor(full, parentAnchor!);
   } else if (hidden) {
-    await page.getByRole('button', { name: 'Back to parent conversation' }).click();
+    await page.getByRole('link', { name: 'Back to parent conversation', exact: true }).click();
     await expect(page.getByTestId('child-header')).not.toBeAttached();
     await expectAnchor(full, parentAnchor!);
     await expect(full.getByText('Synthetic live update 2', { exact: true })).toBeAttached();

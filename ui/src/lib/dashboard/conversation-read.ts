@@ -107,6 +107,10 @@ export class DashboardConversationReadTracker {
     void this.initialLoaded(pending);
   }
 
+  suspend(conversationId: string): void {
+    this.openConversationIds.delete(conversationId);
+  }
+
   close(conversationId?: string): void {
     if (conversationId) {
       this.openConversationIds.delete(conversationId);
@@ -135,6 +139,7 @@ export class DashboardConversationReadTracker {
     if (!hostAllowsObservation()) return null;
     const unread = conversations.filter((conversation) => (
       this.openConversationIds.has(conversation.conversation_id)
+      && this.loadedScopes.has(`conversation:${conversation.conversation_id}`)
       && conversation.has_unread
       && this.attemptedUnreadVersions.get(conversation.conversation_id) !== this.unreadVersion(conversation)
     ));

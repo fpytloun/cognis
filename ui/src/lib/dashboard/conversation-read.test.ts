@@ -38,11 +38,13 @@ function tracker(markRead = vi.fn().mockResolvedValue({ ok: true })) {
 describe('DashboardConversationReadTracker', () => {
   it('does not mark on open and marks exactly once after the initial scope load', async () => {
     const subject = tracker();
-    const item = conversation();
+    const item = conversation({ has_unread: true });
 
     subject.value.open(item.conversation_id);
+    subject.value.observe([item]);
     expect(subject.markRead).not.toHaveBeenCalled();
     await subject.value.initialLoaded(item);
+    subject.value.observe([item]);
     expect(subject.markRead).toHaveBeenCalledOnce();
     expect(subject.optimisticRead).toHaveBeenCalledWith(
       item.conversation_id,
@@ -134,6 +136,46 @@ describe('DashboardConversationReadTracker', () => {
     expect(subject.markRead).toHaveBeenCalledOnce();
   });
 
+  it('retains loaded readiness while hidden but disposes it when closed', async () => {
+    const subject = tracker();
+    const initial = conversation({ has_unread: true });
+    const newer = conversation({
+      has_unread: true,
+      last_message_at: '2026-08-24T12:03:00Z',
+    });
+    subject.value.open(initial.conversation_id);
+    await subject.value.initialLoaded(initial);
+    subject.value.suspend(initial.conversation_id);
+    expect(subject.value.observe([newer])).toBeNull();
+    expect(subject.markRead).toHaveBeenCalledOnce();
+
+    subject.value.open(initial.conversation_id);
+    await subject.value.observe([newer]);
+    expect(subject.markRead).toHaveBeenCalledTimes(2);
+    expect(subject.value.observe([newer])).toBeNull();
+    expect(subject.optimisticRead).toHaveBeenLastCalledWith(initial.conversation_id, newer.last_message_at);
+
+    subject.value.close(initial.conversation_id);
+    subject.value.open(initial.conversation_id);
+    expect(subject.value.observe([newer])).toBeNull();
+    await subject.value.initialLoaded(newer);
+    expect(subject.markRead).toHaveBeenCalledTimes(3);
+  });
+
+  it('defers a hidden initial load until the retained window is visible again', async () => {
+    const subject = tracker();
+    const item = conversation({ has_unread: true });
+    subject.value.open(item.conversation_id);
+    subject.value.suspend(item.conversation_id);
+    expect(subject.value.initialLoaded(item)).toBeNull();
+    expect(subject.value.observe([item])).toBeNull();
+    expect(subject.markRead).not.toHaveBeenCalled();
+
+    subject.value.open(item.conversation_id);
+    await vi.waitFor(() => expect(subject.markRead).toHaveBeenCalledOnce());
+    expect(subject.value.observe([item])).toBeNull();
+  });
+
   it('tracks multiple open conversation windows independently', async () => {
     const subject = tracker();
     const second = conversation({
@@ -160,6 +202,7 @@ describe('DashboardConversationReadTracker', () => {
   it('keeps workspace reads tracked when one blocking conversation closes', async () => {
     const subject = tracker();
     subject.value.open('workspace-conversation');
+    await subject.value.initialLoaded(conversation({ conversation_id: 'workspace-conversation' }));
     subject.value.open('blocking-conversation');
     subject.value.close('blocking-conversation');
     const observed = subject.value.observe([conversation({
@@ -169,6 +212,7 @@ describe('DashboardConversationReadTracker', () => {
     expect(observed).not.toBeNull();
     await observed;
     expect(subject.markRead).toHaveBeenCalledWith('workspace-conversation');
+    expect(subject.markRead).toHaveBeenCalledTimes(2);
   });
 });
 

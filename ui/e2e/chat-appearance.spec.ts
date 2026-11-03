@@ -1,4 +1,5 @@
 import { expect, test, type Locator } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
 async function textContrast(locator: Locator): Promise<number> {
   return locator.evaluate((element) => {
@@ -27,7 +28,7 @@ for (const width of [1440, 390]) {
     test(`real chat controls and terminal contrast in ${theme} at ${width}px`, async ({ page }) => {
       await page.setViewportSize({ width, height: 1000 });
       await page.emulateMedia({ colorScheme: theme, reducedMotion: 'reduce' });
-      await page.goto('/scoped-chat-v2-fixture?theme-preview');
+      await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/scoped.html?theme-preview`);
       await expect(page.locator('html')).toHaveAttribute('data-resolved-theme', theme);
       const preview = page.getByTestId('chat-theme-preview');
       await expect(preview).toBeVisible();

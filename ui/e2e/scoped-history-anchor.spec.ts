@@ -1,9 +1,10 @@
 import { test, expect } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
 test.use({ serviceWorkers: 'block' });
 for (const move of [false, true]) {
   test(`held history preserves the row anchor with in-flight movement=${move}`, async ({ page }) => {
-    await page.goto('/scoped-chat-v2-fixture');
+    await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/scoped.html`);
     const viewport = page.getByTestId('scoped-timeline-shell').getByTestId('scoped-timeline-viewport');
     await expect(page.getByTestId('scoped-timeline-shell').getByRole('heading', { name: 'Parent conversation event 20' })).toBeVisible();
     await expect.poll(() => viewport.evaluate(e => e.scrollHeight-e.scrollTop-e.clientHeight)).toBeLessThanOrEqual(2);

@@ -55,13 +55,25 @@ retain both Chromium and iPad coverage and use `COGNIS_E2E_URL`.
 
 The runner independently lists the complete test directory, verifies exactly
 one logical owner and all required device executions, then runs each harness
-sequentially under one unchanged 3600-second budget. Assertions, retry counts
-and per-config timeouts remain owned by the existing configurations. Missing
+sequentially under one unchanged 3600-second budget with one worker and zero
+retries, regardless of interactive configuration defaults. Assertions and
+per-config timeouts remain owned by the existing configurations. Missing
 cases, devices, execution results, `.only`, empty groups or failed commands
 fail the gate. Skips and flaky attempts remain explicit in each group's report.
 Reports and artifacts are retained separately per group. Set `--output-root`
 when invoking `uv run python scripts/run_browser_matrix.py` to retain a new run.
 `--inventory-only` checks routing but is not execution or release qualification.
+
+`make e2e-browser` binds the mock container through the same Compose project and
+files used to start the stack. Only the Compose harness receives that identity.
+Its barrier controls execute a fixed, deadline-bounded request on container
+loopback; published Docker ports do not satisfy the mock's loopback-only control
+gate. Missing or stale container identity fails without fallback or retry.
+Host-started mock servers retain normal loopback HTTP control.
+
+The component-runtime fixture compiles the real branding and streaming
+components independently of the production application. It does not open
+development-only routes in production or replace application authentication.
 
 `playwright.pinned.config.ts` is the pinned-conversation owner; the older
 `playwright.compiled.config.ts` has identical tests, device, retry and preview

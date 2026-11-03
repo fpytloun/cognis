@@ -33,9 +33,10 @@ concurrent requests do not execute it twice. Other hooks retain their timers.
 An already executed occurrence reports its existing status rather than rerunning.
 Results appear in a compact, two-row card in the source chat: name, trigger type,
 status, and a one-line output preview. Expand the card to read the full output
-and use **View session**, available for running and completed executions with a
-recorded child-session reference. Older events without that reference cannot
-offer session inspection. Collapse hides both the output and session action.
+or use **Open session**, available without expanding running and completed
+executions with a recorded child-session reference. Older events without that
+reference cannot offer session inspection. Collapse hides the full output but
+keeps the session action available.
 
 ## Ready-to-use hooks
 

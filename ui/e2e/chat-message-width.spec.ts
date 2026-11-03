@@ -1,9 +1,10 @@
 import { expect, test, type Page } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
 // Real ChatMessage/notice rendering inside the scoped Chat v2 timeline.
 async function open(page: Page, family: string, width: number) {
   await page.setViewportSize({ width, height: 1000 });
-  await page.goto('/scoped-chat-v2-fixture?layout-cases');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/scoped.html?layout-cases`);
   const shell = page.getByTestId('scoped-timeline-shell');
   const assistant = shell.locator('article.chat-message-assistant').filter({ hasText: 'reading measure' });
   await expect(assistant).toBeVisible();

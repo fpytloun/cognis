@@ -60,7 +60,9 @@ test('Classic native and web helpers retain original low-alpha paints', async ({
   await expect(web.locator('.bg-violet-5')).toHaveCSS('border-color', 'rgba(139, 92, 246, 0.25)');
   // A local opposite palette must not inherit the Classic alpha channels.
   await native.evaluate((node) => { node.dataset.themeFamily = 'paper'; node.dataset.resolvedTheme = 'light'; });
-  await expect(native.locator('.bg-native-5')).toHaveCSS('background-color', 'rgb(239, 238, 236)');
+  const paperPaint = await native.evaluate(node =>
+    getComputedStyle(node).getPropertyValue('--color-blue-subtle').trim().replace(/\s+/g, ', '));
+  await expect(native.locator('.bg-native-5')).toHaveCSS('background-color', `rgb(${paperPaint})`);
 });
 test('Classic failed compaction and web result use distinct original failure paints', async ({ page }) => {
   await page.goto(`${url}?family=classic&mode=dark&restoration`);

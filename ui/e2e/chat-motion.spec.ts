@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 import type { MessageTimelineItem, ToolCallTimelineItem, TimelineItem, RuntimeOverlaySnapshot } from '../src/lib/chat-v2/types';
 
 const assistant: MessageTimelineItem = {
@@ -30,7 +31,7 @@ async function update(page: Page, items: TimelineItem[]) {
 }
 
 test.beforeEach(async ({ page }) => {
-  await page.goto('/streaming-fixture');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/streaming.html`);
   await page.waitForFunction(() => 'streamingFixture' in window);
 });
 
@@ -61,9 +62,11 @@ test('group sweep, disclosure and real status handoff use the selected timings',
   expect(await label.evaluate(node => getComputedStyle(node).animationDuration)).toBe('1.6s');
   expect(await header.evaluate(node => getComputedStyle(node).transitionDuration)).toBe('0.24s, 0.24s, 0.24s');
   await header.click();
+  await expect.poll(() => page.evaluate(() =>
+    document.getAnimations().some(a => a.effect?.getTiming().duration === 180)
+  )).toBe(true);
   await expect(header).toHaveAttribute('aria-expanded', 'true');
   await expect(page.locator('[data-kind="tool_call"]')).toBeVisible();
-  expect(await page.evaluate(() => document.getAnimations().some(a => a.effect?.getTiming().duration === 220))).toBe(true);
   await page.waitForTimeout(250);
   await header.click();
   await expect(header).toHaveAttribute('aria-expanded', 'false');
@@ -123,7 +126,7 @@ test('reduced motion keeps content immediate and disables decorative movement', 
   expect(await header.locator('.running-label').evaluate(node => getComputedStyle(node).animationName)).toBe('none');
   await header.click();
   await expect(page.locator('[data-kind="tool_call"]')).toBeVisible();
-  expect(await page.evaluate(() => document.getAnimations().some(a => a.effect?.getTiming().duration === 220))).toBe(false);
+  expect(await page.evaluate(() => document.getAnimations().some(a => a.effect?.getTiming().duration === 180))).toBe(false);
 });
 
 test('historical partial replies never enter again when paginated or restored', async ({ page }) => {

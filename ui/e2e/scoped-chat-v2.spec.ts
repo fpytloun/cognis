@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 import type { ScopedFixtureController } from '../src/lib/chat-v2/scoped-fixture';
 import type { ChatRealtimeFrame, MessageTimelineItem } from '../src/lib/chat-v2/types';
 
@@ -6,8 +7,9 @@ test.describe('ScopedChatV2Timeline', () => {
   test.use({ serviceWorkers: 'block' });
 
   test.beforeEach(async ({ page }) => {
-    await page.goto('/scoped-chat-v2-fixture');
+    await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/scoped.html`);
     await expect(page.getByTestId('scoped-timeline-shell')).toBeVisible();
+    await expect(page.getByTestId('scoped-timeline-shell').locator('[data-cursor]')).toHaveAttribute('data-cursor', /.+/);
   });
 
   test('does not blink from recent history to an old tail when runtime hydration arrives later', async ({ page }) => {
@@ -90,12 +92,18 @@ test.describe('ScopedChatV2Timeline', () => {
         className: row.className,
       }))
     );
+    await page.getByTestId('reconnect').click();
+    await expect(shell.getByText('Parent conversation event 999', { exact: true })).toBeVisible();
     const parent = await signature();
     await page.getByTestId('scope-child').click();
     await expect(shell.getByText('Child delegated session event 20', { exact: true })).toBeVisible();
+    await expect(shell.getByText('Child delegated session event 999', { exact: true })).toBeVisible();
     const child = await signature();
     await page.getByTestId('scope-task-step').click();
     await expect(shell.getByText('Task step event 20', { exact: true })).toBeVisible();
+    await expect(shell.locator('[data-cursor]')).toHaveAttribute('data-cursor', /.+/);
+    await page.getByTestId('reconnect').click();
+    await expect(shell.getByText('Task step event 999', { exact: true })).toBeVisible();
     const taskStep = await signature();
 
     expect(child.map((row) => row.kind)).toEqual(parent.map((row) => row.kind));
@@ -230,7 +238,7 @@ test.describe('ScopedChatV2Timeline', () => {
     const viewport = shell.getByTestId('scoped-timeline-viewport');
     await expect(scopeNode).toHaveAttribute('data-cursor', /cursor/);
     await page.getByTestId('emit-active-frame').click();
-    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toBeVisible();
+    await expect(shell.getByRole('status', { name: 'Turn running' })).toBeVisible();
     const cursor = await scopeNode.getAttribute('data-cursor');
     await viewport.hover();
     await page.mouse.wheel(0, -500);
@@ -240,16 +248,17 @@ test.describe('ScopedChatV2Timeline', () => {
     await page.getByTestId('set-failed').click();
 
     await expect(shell.getByTestId('task-step-outcome')).toContainText('failed');
-    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toHaveCount(0);
     await expect(scopeNode).toHaveAttribute('data-cursor', cursor ?? '');
     expect(await viewport.evaluate((node) => (node as HTMLElement).scrollTop)).toBe(scrollTop);
+    await shell.getByRole('button', { name: 'Resume live follow' }).click();
+    await expect(shell.getByRole('status', { name: 'Turn running' })).toHaveCount(0);
   });
 
   test('generic session scope still uses runtime-only activity', async ({ page }) => {
     await page.getByTestId('scope-child').click();
     const shell = page.getByTestId('scoped-timeline-shell');
     await page.getByTestId('emit-active-frame').click();
-    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toBeVisible();
+    await expect(shell.getByRole('status', { name: 'Turn running' })).toBeVisible();
   });
 
   test('loads full tool output through the exact task-step scope endpoint', async ({ page }) => {
@@ -342,8 +351,10 @@ test.describe('ScopedChatV2Timeline', () => {
     const timeline = page.getByTestId('scoped-timeline-shell');
     const before = timeline.locator('[data-cursor]');
     await expect(before).toHaveAttribute('data-cursor', /fixture-conversation/);
+    const priorCursor = await before.getAttribute('data-cursor');
     await page.getByTestId('reset-cursor').click();
-    await expect(before).toHaveAttribute('data-cursor', /-1$/);
+    await expect(before).toHaveAttribute('data-cursor', /.+/);
+    await expect(before).not.toHaveAttribute('data-cursor', priorCursor ?? '');
     await expect(timeline.getByText('Parent conversation event 20')).toBeVisible();
   });
 
@@ -403,7 +414,7 @@ test.describe('ScopedChatV2Timeline', () => {
 
   test('accepts a valid frame after the production refresh button and rejects stale or cross-scope frames', async ({ page }) => {
     const timeline = page.getByTestId('scoped-chat-v2-fixture').getByTestId('scoped-timeline-shell');
-    await timeline.getByRole('button', { name: 'Refresh timeline' }).click();
+    await page.getByRole('toolbar', { name: 'Scope controls' }).getByRole('button', { name: 'Refresh timeline' }).click();
     await expect(timeline.locator('[data-cursor]')).toHaveAttribute('data-cursor', /fixture-conversation/);
     await page.getByTestId('emit-active-frame').click();
     await expect(timeline.getByText('Parent conversation live frame')).toBeVisible();
@@ -417,7 +428,7 @@ test.describe('ScopedChatV2Timeline', () => {
     const timeline = page.getByTestId('scoped-chat-v2-fixture').getByTestId('scoped-timeline-shell');
     await expect(timeline.locator('[data-cursor]')).toHaveAttribute('data-cursor', /fixture-conversation/);
     await page.getByTestId('hold-refresh-snapshot').click();
-    await timeline.getByRole('button', { name: 'Refresh timeline' }).click();
+    await page.getByRole('toolbar', { name: 'Scope controls' }).getByRole('button', { name: 'Refresh timeline' }).click();
     await page.getByTestId('emit-active-frame').click();
     await expect(timeline.getByText('Parent conversation live frame')).toBeVisible();
     const liveCursor = await timeline.locator('[data-cursor]').getAttribute('data-cursor');

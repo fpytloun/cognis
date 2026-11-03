@@ -1,5 +1,6 @@
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
+import { expectAttentionTone } from './attention-tone';
 
 for (const width of [1440, 390]) {
   test(`navigation attention counts and dots at ${width}px`, async ({ page }) => {
@@ -39,7 +40,7 @@ for (const width of [1440, 390]) {
     }
     const nav = page.locator('nav').filter({ has: page.locator('a[href="/schedules"]') }).filter({ visible: true });
     await expect(nav.locator('a[href="/chat"] [data-testid="navigation-attention-count"]')).toHaveText('5');
-    await expect(nav.locator('a[href="/chat"] [data-testid="navigation-attention-count"]')).toHaveClass(/text-rose-300/);
+    await expectAttentionTone(nav.locator('a[href="/chat"] [data-testid="navigation-attention-count"]'), 'danger');
     await expect(nav.locator('a[href="/"] [data-testid="navigation-attention-count"]')).toHaveText('5');
     await expect(nav.locator('a[href="/schedules"] [data-testid="navigation-attention-count"]')).toHaveText('2');
     await expect(nav.locator('a[href="/tasks"] [data-testid="navigation-attention-count"]')).toHaveText('6');
@@ -53,7 +54,7 @@ for (const width of [1440, 390]) {
     await expect(nav.locator('a[href="/tasks"] [data-testid="navigation-attention-count"]')).toHaveText('7');
     if (width >= 1024) {
       await page.getByRole('button', { name: 'Collapse sidebar' }).click();
-      await expect(nav.locator('a[href="/chat"] [data-testid="navigation-attention-dot"]')).toHaveClass(/bg-rose-400/);
+      await expectAttentionTone(nav.locator('a[href="/chat"] [data-testid="navigation-attention-dot"]'), 'danger', 'dot');
       await expect(nav.getByTestId('navigation-attention-count')).toHaveCount(0);
       tasks = 0;
       await page.evaluate(() => window.dispatchEvent(new Event('focus')));

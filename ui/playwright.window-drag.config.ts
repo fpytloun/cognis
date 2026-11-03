@@ -16,7 +16,7 @@ export default defineConfig({
   },
   projects: [{ name: 'chromium', use: { browserName: 'chromium' } }],
   webServer: {
-    command: './node_modules/.bin/vite preview --config vite.window-drag.config.ts --host 127.0.0.1 --port 4178 --strictPort',
+    command: './node_modules/.bin/vite build --config vite.window-drag.config.ts && ./node_modules/.bin/vite preview --config vite.window-drag.config.ts --host 127.0.0.1 --port 4178 --strictPort',
     url: 'http://127.0.0.1:4178',
     reuseExistingServer: false,
   },

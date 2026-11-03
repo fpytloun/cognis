@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { selectViewerTheme } from './viewer-theme';
 
 test('embedded defaults follow app, while explicit system and standalone follow OS', async ({ page }) => {
   await page.emulateMedia({ colorScheme: 'dark' });
@@ -24,14 +25,28 @@ test('embedded defaults follow app, while explicit system and standalone follow 
   await expect(full).toHaveAttribute('data-viewer-theme', 'light');
   await expect(drawer).toHaveAttribute('data-viewer-theme', 'light');
   await page.keyboard.press('Escape');
-  await full.getByRole('button', { name: 'Theme: app.', exact: false }).click();
+  await expect(full.locator('.theme-control')).toHaveCount(0);
   await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
-  await full.getByRole('button', { name: 'Theme: light.', exact: false }).click();
-  await full.getByRole('button', { name: 'Theme: dark.', exact: false }).click();
-  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'dark'));
   await expect(full).toHaveAttribute('data-viewer-theme', 'dark');
-  await page.emulateMedia({ colorScheme: 'light' });
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
   await expect(full).toHaveAttribute('data-viewer-theme', 'light');
+  await page.keyboard.press('Escape');
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&surface=standalone&capture=viewer');
+  await selectViewerTheme(viewer, 'light');
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
+  await selectViewerTheme(viewer, 'dark');
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
+  await selectViewerTheme(viewer, 'system');
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
+  await page.goto('/rich-deliverable-fixture?scenario=claude-viewer-parity&surface=embedded&capture=viewer');
+  await expect(viewer).toBeVisible();
+  await page.evaluate(() => document.documentElement.setAttribute('data-resolved-theme', 'light'));
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
 });
 
 test('saved app mode falls back to OS in standalone without rewriting storage', async ({ page }) => {

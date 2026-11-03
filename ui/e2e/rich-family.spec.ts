@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test';
 
 for (const family of ['porcelain', 'classic', 'gruvbox', 'paper']) {
-  for (const mode of ['light', 'dark']) {
+  for (const mode of ['light', 'dark'] as const) {
     test(`${family} ${mode} uses production scoped roles with opposite app mode`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: mode });
       await page.addInitScript(mode => localStorage.setItem('cognis-rich-viewer-theme', mode), mode);
       await page.goto('/rich-deliverable-fixture?scenario=design-document-legacy&surface=embedded&capture=viewer');
       const viewer = page.getByTestId('rich-deliverable');
@@ -12,7 +13,7 @@ for (const family of ['porcelain', 'classic', 'gruvbox', 'paper']) {
         document.documentElement.dataset.resolvedTheme = mode === 'light' ? 'dark' : 'light';
       }, { family, mode });
       await expect(viewer).toHaveAttribute('data-theme-family', family);
-      await expect(viewer).toHaveAttribute('data-resolved-theme', mode);
+      await expect(viewer).toHaveAttribute('data-resolved-theme', mode === 'light' ? 'dark' : 'light');
       const code = viewer.locator('.rich-markdown pre code').first();
       await code.scrollIntoViewIfNeeded();
       await expect(code.locator('[class*="hljs-"]').first()).toBeAttached({ timeout: 30_000 });
@@ -59,6 +60,7 @@ for (const family of ['porcelain', 'classic', 'gruvbox', 'paper']) {
 }
 
 test('embedded projects family into opposite-mode reader and portals; standalone stays independent', async ({ page }) => {
+  await page.emulateMedia({ colorScheme: 'light' });
   await page.addInitScript(() => localStorage.setItem('cognis-rich-viewer-theme', 'light'));
   await page.goto('/rich-deliverable-fixture?scenario=every-block-reference&surface=embedded&capture=viewer');
   const viewer = page.getByTestId('rich-deliverable');
@@ -69,7 +71,7 @@ test('embedded projects family into opposite-mode reader and portals; standalone
     document.documentElement.dataset.themeFamily = 'gruvbox';
   });
   await expect(viewer).toHaveAttribute('data-theme-family', 'gruvbox');
-  await expect(viewer).toHaveAttribute('data-resolved-theme', 'light');
+  await expect(viewer).toHaveAttribute('data-resolved-theme', 'dark');
   const surface = () => viewer.evaluate(node => getComputedStyle(node).getPropertyValue('--rich-surface').trim());
   const gruvboxSurface = await surface();
   expect(gruvboxSurface).not.toBe('#f6f8fb');
@@ -89,7 +91,7 @@ test('embedded projects family into opposite-mode reader and portals; standalone
   await viewer.getByRole('button', { name: 'Open full view' }).click();
   const full = page.getByTestId('rich-deliverable-full-view');
   await expect(full).toHaveAttribute('data-theme-family', 'paper');
-  await expect(full).toHaveAttribute('data-resolved-theme', 'light');
+  await expect(full).toHaveAttribute('data-resolved-theme', 'dark');
   expect(await full.evaluate(node => getComputedStyle(node).getPropertyValue('--rich-surface').trim())).toBe(await surface());
   await page.setViewportSize({ width: 390, height: 844 });
   await full.getByRole('button', { name: 'Open table of contents' }).click();
@@ -99,7 +101,7 @@ test('embedded projects family into opposite-mode reader and portals; standalone
   await full.locator('button[aria-label^="Enlarge image:"]').first().click();
   const image = page.locator('dialog.image-viewer');
   await expect(image).toHaveAttribute('data-theme-family', 'paper');
-  await expect(image).toHaveAttribute('data-resolved-theme', 'light');
+  await expect(image).toHaveAttribute('data-resolved-theme', 'dark');
   expect(await image.evaluate(node => getComputedStyle(node).getPropertyValue('--color-foreground').trim()))
     .toBe(await full.evaluate(node => getComputedStyle(node).getPropertyValue('--color-foreground').trim()));
   expect(await image.locator('img').evaluate(node => getComputedStyle(node).filter)).toBe('none');
@@ -107,4 +109,5 @@ test('embedded projects family into opposite-mode reader and portals; standalone
   await page.goto('/rich-deliverable-fixture?scenario=every-block-reference&surface=standalone&capture=viewer');
   await expect(viewer).not.toHaveClass(/theme-palette/);
   await expect(viewer).not.toHaveAttribute('data-theme-family');
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'light');
 });

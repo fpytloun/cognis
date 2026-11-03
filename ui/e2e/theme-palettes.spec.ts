@@ -86,7 +86,7 @@ test('all eight palettes are local, preserve node identity, and keep chat text/c
     });
     expect(reader).toEqual(readerMode === 'dark'
       ? ['2 6 23', 'rgb(2 6 23)', '125 211 252']
-      : ['224 231 239', 'rgb(224 231 239)', '109 40 217']);
+      : ['248 250 252', 'rgb(248 250 252)', '109 40 217']);
     await page.screenshot({ path: test.info().outputPath(`${family}-${mode}.png`) });
   }
   for (const [family, mode, canvas, chrome] of pairs) {
@@ -108,7 +108,7 @@ test('CSS boot defaults follow OS and native rail stays transparent', async ({ p
     await page.emulateMedia({ colorScheme: mode });
     await page.goto(url);
     await expect(page.locator('[data-message-role="assistant"]')).toBeVisible();
-    const expected = mode === 'light' ? '228 229 230' : '17 18 19';
+    const expected = mode === 'light' ? '248 250 252' : '2 6 23';
     expect(await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--color-canvas').trim())).toBe(expected);
     await page.evaluate(() => { document.documentElement.dataset.nativeSurface = 'rail'; });
     await expect(page.locator('html')).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');

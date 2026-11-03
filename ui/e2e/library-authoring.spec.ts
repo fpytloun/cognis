@@ -7,6 +7,10 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
   let current: LibraryItem = { ...libraryCatalog[7], id: 'art_authoring_config', title: mime === 'text/html' ? 'page.html' : mime === 'text/markdown' ? 'report.md' : 'config.json', format: mime, revision: 1 };
   if (filename) current.title = filename;
   let content = source ?? (mime === 'text/html' ? '<h1>Page preview</h1>' : '{"ready":true}');
+  const htmlPreviewPath = '/api/v1/artifacts/view/art_authoring_config/authoring/page.html';
+  const previewUrl = mime === 'text/html'
+    ? `${htmlPreviewPath}?exp=4102444800&sig=${'a'.repeat(64)}`
+    : '/authoring-preview';
   let explicit = false;
   await page.route('**/api/v1/library/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -42,7 +46,7 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
   });
   await page.route('**/api/v1/artifacts/**', (route) => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith('/signed-url')) return route.fulfill({ json: { url: '/authoring-preview', mode: 'view' } });
+    if (path.endsWith('/signed-url')) return route.fulfill({ json: { url: previewUrl, mode: 'view' } });
     if (path.endsWith('/text-preview')) {
       if (mime === 'text/html') return route.fulfill({ status: 415, json: { error: { message: 'HTML cannot be previewed as text' } } });
       return route.fulfill({ json: { content, truncated: false, rich_payload: richPayload } });
@@ -51,6 +55,8 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
     return route.fallback();
   });
   await page.route('**/authoring-preview', (route) => route.fulfill({ contentType: mime, body: content }));
+  await page.route((url) => url.pathname === htmlPreviewPath, (route) =>
+    route.fulfill({ contentType: mime, body: content }));
 }
 
 test('Markdown renders on open, after cancel and after saving without entering preview mode', async ({ page }) => {

@@ -5,6 +5,8 @@ import { bounded, cleanupIndependently } from './diagnostic-boundary';
 import { OwnedAsyncWork } from './owned-async-work';
 import { canonicalMetadata, durableMatch, type CanonicalMetadata } from './canonical-response-evidence';
 import { clearScenario, injectScenario, login, openOrCreateConversation, MOCK_LLM_URL, sendMessage } from './helpers';
+import { requestMockBarrier } from '../src/lib/testing/mock-llm-control';
+import type { UserPreferences } from '../src/lib/types/api';
 
 test.beforeEach(async ({}, info) => {
   test.skip(process.env.COGNIS_E2E_SCOPED_WITNESS_DIAGNOSTIC === '1'
@@ -78,6 +80,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
     let resolveDurable: ((item: any) => void) | undefined;
     let expectedClientId: string | undefined;
     let recipientConversationId: string | undefined;
+    let previousPreferences: UserPreferences | undefined;
     const canonicalRequests = new WeakMap<Request, number>();
     let nextRequestId = 0;
     const checkDurable = () => {
@@ -145,17 +148,27 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       // live-view reads. The recipient still subscribes before the tested admission.
       if (mode !== 'normal') {
         await injectScenario('single-phase-stream');
-        const armed = await fetch(`${MOCK_LLM_URL}/__mock/barrier`, {
+         const armed = await requestMockBarrier(MOCK_LLM_URL, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ scenario_id: 'single-phase-stream', turn_index: 0 }),
         });
         expect(armed.status).toBe(201);
         await sendMessage(sender, 'Synthetic active leader');
         await expect(userRow(sender, 'Synthetic active leader')).toBeVisible();
-        const entered = await step('leader entered LLM barrier', () => fetch(`${MOCK_LLM_URL}/__mock/barrier`, { signal: AbortSignal.timeout(10_000) }));
+         const entered = await step('leader entered LLM barrier', () => requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
         expect(entered.status).toBe(204);
       }
       await step('recipient login', () => login(recipient));
+      if (recipientSurface === 'scoped') {
+        const existing = await recipient.request.get('/api/v1/user-preferences');
+        expect(existing.status()).toBe(200);
+        const preferences: UserPreferences = await existing.json();
+        previousPreferences = preferences;
+        const updated = await recipient.request.put('/api/v1/user-preferences', {
+          data: { ...preferences, display: { ...preferences.display, dashboard_workspace_windows: true } },
+        });
+        expect(updated.status()).toBe(200);
+      }
       const heldSnapshot = new Promise<void>(resolve => { releaseSnapshot = resolve; });
       let snapshotCaptured!: () => void;
       const capturedSnapshot = new Promise<void>(resolve => { snapshotCaptured = resolve; });
@@ -197,6 +210,10 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       await step('pre-send composer enabled', () => expect(sender.locator('textarea').first()).toBeEnabled());
       await step('submit synthetic admission', async () => {
         await sender.locator('textarea').first().fill(text);
+        // The textarea stays editable while uploads are pending; submit does not.
+        await expect(sender.getByRole('button', {
+          name: mode === 'normal' ? 'Send' : 'Queue message', exact: true,
+        })).toBeVisible();
         await sender.locator('textarea').first().press('Enter');
       });
       const request = await step('real admission response captured', () => admission);
@@ -211,11 +228,11 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       releaseSnapshot();
       if (mode !== 'normal') {
         const held = await step('leader remains held through tested admission', () =>
-          fetch(`${MOCK_LLM_URL}/__mock/barrier`, { signal: AbortSignal.timeout(10_000) }));
+           requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
         expect(held.status).toBe(204);
       }
       if (mode === 'absorbed') {
-        expect((await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'PUT' })).status).toBe(204);
+         expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'PUT' })).status).toBe(204);
       } else if (mode === 'queued_after_ui_stop') {
         const status = await recipient.evaluate(async id => {
           const response = await fetch(`/api/v1/chat/v2/conversations/${id}/cancel`, {
@@ -225,7 +242,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
           return response.status;
         }, conversationId);
         expect(status).toBe(200);
-        expect((await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'DELETE' })).status).toBe(204);
+         expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' })).status).toBe(204);
       }
       // No recipient fetch/reload is used to make the message appear.
       const recipientRow = userRow(recipient, text);
@@ -297,7 +314,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
         return !navigator.onLine && state.__acceptanceClosedSocket?.readyState === WebSocket.CLOSED;
       })).toBe(true);
       if (mode !== 'normal') {
-        await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'DELETE' });
+         await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' });
       }
       const witnessText = `Disconnected recovery witness ${crypto.randomUUID()}`;
       witnessIdentity = { clientId: crypto.randomUUID(), transactionId: crypto.randomUUID() };
@@ -435,13 +452,19 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
         async () => { await recipient.removeAllListeners('response', { behavior: 'wait' }); },
         async () => { await sender.removeAllListeners('response', { behavior: 'wait' }); },
         async () => { await owned.drainCallbacks(); },
+        async () => {
+          if (previousPreferences) {
+            const restored = await recipient.request.put('/api/v1/user-preferences', { data: previousPreferences });
+            expect(restored.status()).toBe(200);
+          }
+        },
         async () => { await senderContext.close(); },
         async () => { await recipientContext.close(); },
         // Closing contexts rejects any remaining public event waiters. Their
         // rejections are owned and retained, never unhandled or ignored.
         async () => { await owned.drain(); },
         async () => {
-          if (mode !== 'normal') await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'DELETE', signal: AbortSignal.timeout(5_000) });
+           if (mode !== 'normal') await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE', signal: AbortSignal.timeout(5_000) }, 4500);
         },
         async () => { await clearScenario(); },
       ]);

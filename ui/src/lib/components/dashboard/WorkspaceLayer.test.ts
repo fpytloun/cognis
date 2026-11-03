@@ -2,11 +2,15 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { WorkspaceManager } from '$lib/dashboard/workspace';
+import type { Agent } from '$lib/types/api';
 
 vi.mock('./WorkspaceWindow.svelte', async () => (
   import('./WorkspaceLayer.window-test-fixture.svelte')
 ));
 vi.mock('./DashboardEntityModal.svelte', async () => (
+  import('./WorkspaceLayer.entity-test-fixture.svelte')
+));
+vi.mock('./AgentQuickChatModal.svelte', async () => (
   import('./WorkspaceLayer.entity-test-fixture.svelte')
 ));
 vi.mock('./WorkspaceDock.svelte', async () => (
@@ -118,6 +122,38 @@ describe('WorkspaceLayer stable window identity', () => {
     render(WorkspaceLayer, { manager, deviceClass: 'desktop' });
     expect(screen.queryByTestId('workspace-dismiss-backdrop')).not.toBeInTheDocument();
   });
+
+  it.each([undefined, 'agent-stale-metadata'])(
+    'renders the canonical agent entity with optional agent metadata %s',
+    async (agentId) => {
+      const agent: Agent = {
+        agent_id: 'agent-canonical', owner_email: 'owner@example.test',
+        name: 'Canonical agent', display_name: null, description: null,
+        system_prompt: null, personality: null, skills: null, tools: null,
+        permissions: null, llm_config: null, execution: null,
+        personality_synced: false, personality_sync_error: null,
+        personality_sync_checked_at: null, avatar_url: null, avatar_image_id: null,
+        agent_type: 'primary', is_system: false, hidden: false,
+        editable_fields: [], has_overrides: false, disabled: false, disableable: true,
+        sync_metadata: null, is_shared_with_me: false, shared_by_email: null,
+        granted_permission: null, executor_scope: null, is_readonly_for_caller: false,
+        status: 'idle', created_at: null, updated_at: null,
+      };
+      const manager = new WorkspaceManager('desktop', safe);
+      manager.open({
+        kind: 'agent', entityId: agent.agent_id, title: agent.name,
+        canonicalHref: `/chat/new?agent=${agent.agent_id}`,
+        ...(agentId ? { agentId } : {}),
+      });
+      render(WorkspaceLayer, { manager, deviceClass: 'desktop', agents: [agent] });
+      const draft = await screen.findByTestId('workspace-chat-draft-agent-canonical');
+      await fireEvent.input(draft, { target: { value: 'retained agent draft' } });
+      manager.minimize('agent:agent-canonical');
+      manager.restore('agent:agent-canonical');
+      await waitFor(() => expect(draft).toHaveValue('retained agent draft'));
+      expect(screen.getByTestId('workspace-chat-draft-agent-canonical')).toBe(draft);
+    },
+  );
 
   it('retains mounted identity through minimize, dashboard restore, and removes it on close', async () => {
     const manager = new WorkspaceManager('desktop', safe);

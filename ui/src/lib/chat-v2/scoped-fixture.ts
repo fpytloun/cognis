@@ -236,8 +236,8 @@ export class ScopedFixtureController {
   };
 
   readonly realtime = {
-    subscribe: (listener: (frame: ChatRealtimeFrame) => void): (() => void) => this.client.subscribe((event) => {
-      if (event.type === 'chat_v2_frame') listener(event);
+    subscribe: (listener: Parameters<CognisWebSocketClient['subscribe']>[0]): (() => void) => this.client.subscribe((event) => {
+      if (event.type === 'chat_v2_frame' || event.type === 'reconnected') listener(event);
     }),
       acquireChatV2: (scope: TimelineScope, cursor: string): void => {
         this.client.acquireChatV2(scope, cursor);
@@ -345,12 +345,15 @@ export class ScopedFixtureController {
     ];
     const cursor = `fixture-${scope.key}-cursor-${this.snapshotRevision}`;
     this.serverCursorByScope.set(scope.key, cursor);
+    const beforeCursor = missing ? null : `${cursor}:page:1`;
+    if (beforeCursor) this.pageByScope.set(scope.key, { page: 1, before: beforeCursor });
+    else this.pageByScope.delete(scope.key);
     const response: ChatSnapshot = {
       schema_version: 2,
       projection_version: 'fixture-projection-v1',
       scope,
       conversation: { conversation_id: 'fixture-conversation', agent_id: 'fixture-agent', title: scope.label, status: 'active' },
-      timeline: { items, has_more_before: !missing, before_cursor: missing ? null : `${cursor}:page:1` },
+      timeline: { items, has_more_before: !missing, before_cursor: beforeCursor },
       state: { state_version: 1, snapshot_generated_at: NOW, capabilities: [], active_turn: {}, pending: {}, active_session: {} },
       queue: { messages: [], queued_count: 0 },
       runtime: { runtime_epoch: 'fixture-epoch', runtime_revision: this.snapshotRevision, generated_at: NOW, has_active_turn: false, volatile_items: [] },
@@ -378,9 +381,11 @@ export class ScopedFixtureController {
         has_more: false, server_time: NOW,
       };
     }
+    const nextCursor = `${cursor}-synced`;
+    this.serverCursorByScope.set(scope.key, nextCursor);
     return {
       schema_version: 2, projection_version: 'fixture-projection-v1', scope, conversation_id: 'fixture-conversation',
-      cursor_before: cursor, cursor_after: `${cursor}-synced`, ops: [{ op: 'upsert_item', item: scopeItem(scope, 999) }],
+      cursor_before: cursor, cursor_after: nextCursor, ops: [{ op: 'upsert_item', item: scopeItem(scope, 999) }],
       reset_required: false, has_more: false, server_time: NOW,
     };
   }
@@ -410,12 +415,11 @@ export class ScopedFixtureController {
 
   private timeline(scope: TimelineScope, before: string | null): TimelineBackfillResponse {
     const current = this.pageByScope.get(scope.key);
-    const expectedBefore = current?.before ?? `${this.serverCursorByScope.get(scope.key) ?? `fixture-${scope.key}-cursor-${this.snapshotRevision}`}:page:1`;
-    if (before !== expectedBefore) throw new Error(`cross-scope or stale backfill cursor for ${scope.key}`);
-    const page = (current?.page ?? 1) + 1;
+    if (!current || before !== current.before) throw new Error(`cross-scope or stale backfill cursor for ${scope.key}`);
+    const page = current.page + 1;
     const hasMore = page < 3;
     const nextBefore = hasMore ? `opaque:${scope.key}:history:${page + 1}` : null;
-    this.pageByScope.set(scope.key, { page, before: nextBefore ?? expectedBefore });
+    this.pageByScope.set(scope.key, { page, before: nextBefore ?? current.before });
     return {
       schema_version: 2, projection_version: 'fixture-projection-v1', scope, conversation_id: 'fixture-conversation',
        items: Array.from({ length: 8 }, (_, index) => scopeItem(scope, Math.max(0, 20 - page * 8 + index))),

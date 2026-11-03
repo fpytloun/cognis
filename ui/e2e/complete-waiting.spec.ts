@@ -1,5 +1,6 @@
 import { expect, test, type WebSocketRoute } from '@playwright/test';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
+import { expectAttentionTone } from './attention-tone';
 
 test.use({ serviceWorkers: 'block' });
 
@@ -69,7 +70,7 @@ for (const width of [1440, 390]) {
     }
     const badge = page.locator('a[href="/chat"] [data-testid="navigation-attention-count"]').filter({ visible: true });
     await expect(badge).toHaveText('21');
-    await expect(badge).toHaveClass(/text-sky-300/);
+    await expectAttentionTone(badge, 'accent');
     if (width < 1024) await page.getByRole('button', { name: 'Close navigation', exact: true }).click();
     waiting = waiting.filter((item) => item.conversation_id !== 'old-0');
     socket!.send(JSON.stringify({ type: 'conversation_updated', conversation_id: 'old-0', has_unread: false, last_read_at: '2026-10-14T20:01:00Z' }));

@@ -1,4 +1,16 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Locator } from '@playwright/test';
+import { selectViewerTheme } from './viewer-theme';
+
+async function expectAppTextRole(locator: Locator): Promise<void> {
+  const roles = await locator.evaluate(element => {
+    const style = getComputedStyle(element);
+    return {
+      text: style.getPropertyValue('--rich-text').trim(),
+      foreground: style.getPropertyValue('--color-foreground').trim(),
+    };
+  });
+  expect(roles.text).toBe(`rgb(${roles.foreground})`);
+}
 
 for (const colorScheme of ['light', 'dark'] as const) {
   test(`renders the production-shaped rich deliverable prototype in ${colorScheme} mode`, async ({ page }) => {
@@ -13,6 +25,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
 
     const fixture = page.getByTestId('rich-deliverable-prototype-fixture');
     await expect(fixture).toBeVisible();
+    await expect(fixture.getByTestId('rich-deliverable')).toHaveAttribute('data-viewer-theme', colorScheme);
     await expect(fixture.locator('h1')).toHaveCount(1);
     await expect(fixture.locator('.rich-actions button')).toHaveCount(2);
     await expect(fixture.locator('.rich-card-visual.has-media')).toBeVisible();
@@ -23,9 +36,7 @@ for (const colorScheme of ['light', 'dark'] as const) {
     await expect(fixture.locator('[data-rich-block-type="accordion"] details')).toHaveCount(3);
     await expect(fixture.locator('.rich-chart-card')).toBeVisible();
     await expect(fixture.locator('[data-rich-block-type="source_list"]')).toBeVisible();
-    await expect(fixture.locator('.rich-block-list').first().evaluate((element) =>
-      getComputedStyle(element).getPropertyValue('--rich-text').trim()
-    )).resolves.toBe(colorScheme === 'light' ? '#172033' : '#eaf1f9');
+    await expectAppTextRole(fixture.locator('.rich-block-list').first());
 
     const disclosure = fixture.locator('[data-rich-block-type="accordion"] details').first();
     await disclosure.locator('summary').focus();
@@ -50,15 +61,18 @@ test('keeps the prototype single-column at the 390px review width', async ({ pag
   await expect(visualCard).toHaveClass(/has-media/);
   await expect(visualCard.locator('img')).toHaveJSProperty('complete', true);
   await expect(visualCard.evaluate((element) => element.scrollWidth <= document.documentElement.clientWidth)).resolves.toBe(true);
-  await expect(visualCard.getByText('Nejcennější okno končí v 09:00')).toBeVisible();
+  await expect(visualCard.getByText('Ukázkový katalog čeká kontrola')).toBeVisible();
 });
 
 test('uses the resolved standalone theme instead of the OS preference', async ({ page }) => {
   await page.emulateMedia({ colorScheme: 'light' });
-  await page.goto('/rich-deliverable-prototype-fixture');
+  await page.goto('/rich-deliverable-fixture?scenario=daily-pulse-v2&surface=standalone&capture=viewer');
+  const viewer = page.getByTestId('rich-deliverable');
+  await selectViewerTheme(viewer, 'dark');
   await page.evaluate(() => {
-    document.documentElement.dataset.resolvedTheme = 'dark';
+    document.documentElement.dataset.resolvedTheme = 'light';
   });
+  await expect(viewer).toHaveAttribute('data-viewer-theme', 'dark');
 
   await expect(page.locator('.rich-block-list').first().evaluate((element) =>
     getComputedStyle(element).getPropertyValue('--rich-text').trim()

@@ -1,7 +1,7 @@
 import { expect, test } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
-// Local-only: run against Vite with COGNIS_E2E_URL=http://127.0.0.1:5197.
-// No credentials or backend required.
+// The app owns login/recovery; an isolated compiled fixture owns the gallery.
 test('static loading and recovery remain usable without application startup', async ({ browser, baseURL }) => {
   const context = await browser.newContext({ javaScriptEnabled: false, reducedMotion: 'reduce' });
   const page = await context.newPage();
@@ -26,36 +26,18 @@ test('normal login, real component variants, sizing, and recovery', async ({ pag
   expect(await logo.boundingBox()).toMatchObject({ width: 4 * rem, height: 4 * rem });
   await page.screenshot({ path: test.info().outputPath('login.png') });
 
-  // Mount the actual component through Vite, not a reimplementation of its SVG.
-  await page.evaluate(async () => {
-    const runtimeUrl = '/node_modules/svelte/src/index-client.js';
-    const componentUrl = '/src/lib/components/CognisLogo.svelte';
-    const { mount } = await import(runtimeUrl);
-    const { default: CognisLogo } = await import(componentUrl);
-    const gallery = document.createElement('section');
-    gallery.id = 'brand-gallery';
-    gallery.style.cssText = 'position:fixed;inset:0;z-index:10000;overflow:auto;padding:24px;background:#64748b;';
-    document.body.append(gallery);
-    for (const [background, foreground] of [['#ffffff', '#0f172a'], ['#0b1420', '#f8fafc']]) {
-      const row = document.createElement('div');
-      row.style.cssText = `background:${background};color:${foreground};padding:32px;display:flex;align-items:center;gap:32px;min-height:220px`;
-      gallery.append(row);
-      for (const variant of ['color', 'mono']) {
-        for (const size of [16, 18, 22, 32, 48, 96]) {
-          const target = document.createElement('span');
-          target.style.fontSize = `${size}px`;
-          row.append(target);
-          mount(CognisLogo, { target, props: { variant, label: `${variant} ${size}` } });
-        }
-      }
+  const gallery = await page.context().newPage();
+  try {
+    await gallery.goto(`${COMPONENT_RUNTIME_ORIGIN}/brand.html`);
+    for (const size of [16, 18, 22, 32, 48, 96]) {
+      const mark = gallery.getByRole('img', { name: `mono ${size}`, exact: true }).first();
+      await expect(mark).toBeVisible();
+      expect(await mark.boundingBox()).toMatchObject({ width: size, height: size });
     }
-  });
-  for (const size of [16, 18, 22, 32, 48, 96]) {
-    const mark = page.getByRole('img', { name: `mono ${size}`, exact: true }).first();
-    expect(await mark.boundingBox()).toMatchObject({ width: size, height: size });
+    await gallery.screenshot({ path: test.info().outputPath('light-dark-variants.png') });
+  } finally {
+    await gallery.close();
   }
-  await page.screenshot({ path: test.info().outputPath('light-dark-variants.png') });
-  await page.locator('#brand-gallery').evaluate((node) => node.remove());
   await page.evaluate(() => window.dispatchEvent(new Event('vite:preloadError', { cancelable: true })));
   await expect(page.getByRole('heading', { name: 'Reload Cognis' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Reload app' })).toBeEnabled();

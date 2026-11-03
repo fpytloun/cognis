@@ -110,6 +110,13 @@ e2e-events-replay:
 
 .PHONY: e2e-browser
 e2e-browser:
+	@MOCK_CONTAINER=$$($(COMPOSE_E2E) ps -q mock-llm) || exit 1; \
+	if [ "$${#MOCK_CONTAINER}" -ne 64 ]; then \
+		printf '%s\n' "Expected exactly one running mock-llm container in this Compose project" >&2; \
+		exit 1; \
+	fi; \
+	COGNIS_E2E_MOCK_LLM_CONTROL=container \
+	COGNIS_E2E_MOCK_LLM_CONTAINER_ID="$$MOCK_CONTAINER" \
 	uv run python scripts/run_browser_matrix.py
 
 .PHONY: e2e-browser-ui

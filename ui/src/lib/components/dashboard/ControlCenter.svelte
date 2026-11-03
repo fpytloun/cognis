@@ -231,7 +231,7 @@
         : window.resolvedConversationId;
       if (!conversationId) return;
       if (visible && effectiveWorkspaceDevice() !== 'phone') readTracker.open(conversationId);
-      else readTracker.close(conversationId);
+      else readTracker.suspend(conversationId);
     },
   );
   const openWorkspaceConversationIds = $derived(
@@ -868,7 +868,6 @@
     });
     if (input.kind === 'conversation') {
       if (result.status === 'opened' || result.status === 'focused') readTracker.open(input.id);
-      else readTracker.close(input.id);
     }
     reportWorkspaceOpen(result);
   }
@@ -913,7 +912,6 @@
       if (result.status === 'opened' || result.status === 'focused') {
         readTracker.open(conversationId);
       } else {
-        readTracker.close(conversationId);
         reportWorkspaceOpen(result);
       }
       return;
@@ -1149,13 +1147,14 @@
       workspaceManager.setDevice(workspaceDevice);
       if (previousDevice !== nextDevice && (previousDevice === 'phone' || nextDevice === 'phone')) {
         for (const workspaceWindow of workspaceManager.snapshot()) {
-          if (workspaceWindow.minimized) continue;
           const conversationId = workspaceWindow.kind === 'conversation'
             ? workspaceWindow.entityId
             : workspaceWindow.resolvedConversationId;
           if (!conversationId) continue;
-          if (nextDevice === 'phone') readTracker.close(conversationId);
-          else readTracker.open(conversationId);
+          if (nextDevice === 'phone') {
+            readTracker.close(conversationId);
+            pendingConversationInitialLoads.delete(conversationId);
+          } else if (!workspaceWindow.minimized) readTracker.open(conversationId);
         }
       }
     };

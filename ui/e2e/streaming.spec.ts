@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 import type { ChatSnapshot, ChatRealtimeFrame, RuntimeOverlaySnapshot, TimelineItem, MessageTimelineItem } from '../src/lib/chat-v2/types';
 
 test.use({ serviceWorkers: 'block', viewport: { width: 390, height: 844 } });
@@ -15,7 +16,7 @@ const runtime: RuntimeOverlaySnapshot = {
 };
 
 test('streams Markdown and fades only new text; keeps group progress through thinking', async ({ page }) => {
-  await page.goto('/streaming-fixture');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/streaming.html`);
   await page.waitForFunction(() => 'streamingFixture' in window);
   const update = (items: TimelineItem[], overlay: RuntimeOverlaySnapshot | null = runtime) =>
     page.evaluate(({ items, overlay }) => {
@@ -60,7 +61,7 @@ test('streams Markdown and fades only new text; keeps group progress through thi
 });
 
 test('shows every incoming prefix, hides delimiters, and pauses only the typing indicator', async ({ page }) => {
-  await page.goto('/streaming-fixture');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/streaming.html`);
   await page.waitForFunction(() => 'streamingFixture' in window);
   const update = (item: MessageTimelineItem) => page.evaluate(({ item, runtime }) => {
     (window as typeof window & {
@@ -90,7 +91,7 @@ test('shows every incoming prefix, hides delimiters, and pauses only the typing 
 });
 
 test('renders cumulative realtime frames before canonical completion on mobile', async ({ page }) => {
-  await page.goto('/streaming-fixture');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/streaming.html`);
   await page.waitForFunction(() => 'streamingSnapshot' in window);
   const snapshot: ChatSnapshot = {
     schema_version: 2, projection_version: 'streaming-test-v1', cursor: 'streaming-cursor',

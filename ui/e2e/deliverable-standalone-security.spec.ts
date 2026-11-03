@@ -204,6 +204,7 @@ sys.stdout.write(render_standalone_shell(
 ))
 `;
 
+const viewerContextPath = '/api/v1/deliverables/dlv_standalone_security/viewer-context';
 let server: Server;
 let origin = '';
 let shell = '';
@@ -224,6 +225,11 @@ test.beforeAll(async () => {
   server = createServer((request, response) => {
     const requestPath = new URL(request.url ?? '/', 'http://standalone.test').pathname;
     observedRequests.push(requestPath);
+    if (requestPath === viewerContextPath) {
+      response.writeHead(401, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ detail: 'Not authenticated' }));
+      return;
+    }
     if (requestPath === '/view') {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -309,8 +315,8 @@ test('keeps adversarial values inert in the generated production shell', async (
 });
 
 test('runs the production module without payload execution or DOM/network breakout', async ({ page }) => {
-  const browserRequests: string[] = [];
-  page.on('request', (request) => browserRequests.push(request.url()));
+  const browserRequests: { url: string; method: string }[] = [];
+  page.on('request', (request) => browserRequests.push({ url: request.url(), method: request.method() }));
 
   await page.goto(`${origin}/view`, { waitUntil: 'networkidle' });
 
@@ -358,22 +364,17 @@ test('runs the production module without payload execution or DOM/network breako
     return false;
   }), JSON.stringify(renderedUrls, null, 2)).toBe(true);
 
-  const unexpectedBrowserRequests = browserRequests.filter((url) => {
+  const isExpectedPath = (pathname: string) => pathname === '/view'
+    || pathname.startsWith(ASSET_PREFIX)
+    || pathname === authorizedMediaPath
+    || pathname === viewerContextPath;
+  const unexpectedBrowserRequests = browserRequests.filter(({ url, method }) => {
     const parsed = new URL(url);
-    return parsed.origin !== origin
-      || (
-        parsed.pathname !== '/view'
-        && !parsed.pathname.startsWith(ASSET_PREFIX)
-        && parsed.pathname !== authorizedMediaPath
-      );
+    return method !== 'GET' || parsed.origin !== origin || !isExpectedPath(parsed.pathname);
   });
   expect(unexpectedBrowserRequests).toEqual([]);
-  expect(observedRequests.every(
-    (requestPath) =>
-      requestPath === '/view'
-      || requestPath.startsWith(ASSET_PREFIX)
-      || requestPath === authorizedMediaPath,
-  )).toBe(true);
+  expect(browserRequests.filter(({ url }) => new URL(url).pathname === viewerContextPath)).toHaveLength(1);
+  expect(observedRequests.every(isExpectedPath)).toBe(true);
 });
 
 test('renders authorized accordion item media once inside the standalone disclosure body', async ({ page }) => {

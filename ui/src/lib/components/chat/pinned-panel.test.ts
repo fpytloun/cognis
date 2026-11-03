@@ -19,6 +19,62 @@ const conversation = (id: string) => ({
 } as Conversation);
 
 describe('shared pinned panel state ownership', () => {
+  it('retains readiness through hiding and same-tab selection, but waits for a fresh picker transcript', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    const markRead = vi.spyOn(api.conversations, 'markRead').mockResolvedValue({ ok: true });
+    conversationWorkspace.setOwner('panel-owner@cognis.test', null);
+    const item = {
+      ...conversation('observed-pin'),
+      has_unread: true,
+      last_message_at: '2026-08-24T12:00:00Z',
+    };
+    await conversationWorkspace.pin(item);
+    pinnedConversations.set({ [item.conversation_id]: item });
+    let visible = true;
+    const { panel, destroy } = pinnedPanelTestState(vi.fn(), () => visible);
+    cleanup.push(destroy);
+    flushSync();
+    const entry = panel.groups[0].entries.find(entry => entry.window.entityId === item.conversation_id)!;
+    await panel.select(entry);
+    flushSync();
+    expect(markRead).not.toHaveBeenCalled();
+    panel.loaded();
+    await waitFor(() => expect(markRead).toHaveBeenCalledTimes(1));
+
+    visible = false;
+    panel.observe();
+    pinnedConversations.update(state => ({
+      ...state,
+      [item.conversation_id]: { ...item, last_message_at: '2026-08-24T12:01:00Z' },
+    }));
+    flushSync();
+    expect(markRead).toHaveBeenCalledTimes(1);
+    visible = true;
+    panel.observe();
+    await waitFor(() => expect(markRead).toHaveBeenCalledTimes(2));
+    await panel.select(entry);
+    flushSync();
+    panel.observe();
+    expect(markRead).toHaveBeenCalledTimes(2);
+
+    panel.picker = true;
+    flushSync();
+    pinnedConversations.update(state => ({
+      ...state,
+      [item.conversation_id]: { ...item, last_message_at: '2026-08-24T12:02:00Z' },
+    }));
+    panel.loaded();
+    panel.picker = false;
+    flushSync();
+    panel.observe();
+    expect(markRead).toHaveBeenCalledTimes(2);
+    panel.loaded();
+    await waitFor(() => expect(markRead).toHaveBeenCalledTimes(3));
+    panel.loaded();
+    panel.observe();
+    expect(markRead).toHaveBeenCalledTimes(3);
+  });
+
   it('retains selection across updates; silently resets on owner change and handles the next owner', async () => {
     conversationWorkspace.setOwner('panel-owner@cognis.test', null);
     const first = conversation('retained-one'), second = conversation('retained-two');

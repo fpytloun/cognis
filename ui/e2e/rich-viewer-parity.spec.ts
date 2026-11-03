@@ -14,7 +14,8 @@ for (const theme of ['dark', 'light'] as const) {
     await page.evaluate(() => document.fonts.ready);
     await expect(viewer.locator('aside.rich-toc')).toBeVisible();
     const icons = await viewer.locator('[aria-label="Viewer controls"] [data-viewer-icon]').evaluateAll(nodes => nodes.map(n => n.getAttribute('data-viewer-icon')));
-    expect(icons).toEqual([theme === 'dark' ? 'system' : 'light', 'download', 'copy']);
+    expect(icons).toEqual([theme === 'dark' ? 'system' : 'light', 'copy']);
+    await expect(viewer.locator('.download-menu')).toHaveCount(0);
     const geometry = await viewer.evaluate(el => {
       const rect = (selector: string) => {
         const node = el.querySelector(selector)!;
@@ -49,7 +50,9 @@ test('full view keeps focus inside after collapsing default sidebar', async ({ p
   await page.screenshot({ path: '/tmp/rich-parity-embedded.png' });
   await viewer.getByRole('button', { name: 'Open full view' }).click();
   const full = page.getByTestId('rich-deliverable-full-view');
-  await selectViewerTheme(full, 'dark');
+  await page.evaluate(() => { document.documentElement.dataset.resolvedTheme = 'dark'; });
+  await expect(full).toHaveAttribute('data-viewer-theme', 'dark');
+  await expect(full.locator('.theme-control')).toHaveCount(0);
   await expect(full.locator('aside.rich-toc')).toBeVisible();
   await page.screenshot({ path: '/tmp/rich-parity-full.png' });
   await full.getByRole('button', { name: 'Close table of contents' }).click();

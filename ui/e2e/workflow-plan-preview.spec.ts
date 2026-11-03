@@ -13,18 +13,18 @@ for (const width of [1440, 390]) {
     await page.route('**/api/health/providers', (route) => route.fulfill({ json: {} }));
     const workflow = syncHealthWorkflow();
     // Exercise expansion and wrapping, not only short demo strings.
-    workflow.steps[2].complete!.content += `\n${'Verify synchronization before attempting recovery. '.repeat(35)}`;
+    workflow.steps[2].complete!.content += `\n${'Verify synthetic catalog health before attempting recovery. '.repeat(35)}`;
     workflow.steps[1].condition!.if = `{{ steps.probe.outputs.${'health_result_'.repeat(12)} == true }}`;
     const schedule = {
       schedule_id: 'schedule-sync-health',
-      name: 'Obsidian sync health',
-      description: 'Check Obsidian synchronization.',
+      name: 'Sample catalog health',
+      description: 'Check the synthetic catalog health.',
       schedule_type: 'interval',
       interval_seconds: 300,
       timezone: 'UTC',
       agent_id: 'agent-stage39',
       workflow_id: workflow.workflow_id,
-      task_template: { title: 'Obsidian sync health', description: 'Check Obsidian synchronization.' },
+      task_template: { title: 'Sample catalog health', description: 'Check the synthetic catalog health.' },
       enabled: true,
       next_fire_at: '2099-01-01T08:00:00Z',
       consecutive_errors: 0,
@@ -41,7 +41,8 @@ for (const width of [1440, 390]) {
     await page.getByTestId('dashboard-schedule-modal-tab-steps').click();
     const plan = page.getByTestId('dashboard-schedule-planned-steps');
     await expect(plan).toContainText('Notify only when unhealthy');
-    await expect(plan).toContainText('Read-only Obsidian sync health check');
+    await expect(plan).toContainText('Synthetic catalog health probe');
+    await expect(plan).toContainText('Side effects are permitted; this is not a read-only guarantee.');
     await expect(plan).toContainText('not every step runs');
     await expect(page.getByTestId('planned-step-route')).toContainText('If true: healthy');
     await expect(page.getByTestId('planned-step-route')).toContainText('If false: unhealthy');
@@ -52,7 +53,7 @@ for (const width of [1440, 390]) {
     await summary.focus();
     await page.keyboard.press('Enter');
     await expect(unhealthy.locator('details')).toHaveAttribute('open', '');
-    await expect(unhealthy.getByText(/Synchronizace není zdravá/)).toBeVisible();
+    await expect(unhealthy.getByText(/Ukázkový katalog vyžaduje kontrolu/)).toBeVisible();
     await expect.poll(() => plan.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
     await page.getByTestId('planned-step-probe').scrollIntoViewIfNeeded();
     await page.screenshot({ path: test.info().outputPath(`workflow-plan-${width}.png`) });

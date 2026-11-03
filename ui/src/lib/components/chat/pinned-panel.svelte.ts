@@ -37,6 +37,7 @@ export function createPinnedPanel(options: {
   const owner = $derived(workspace.current.owner);
   let selectedKey = $state<string | null>(null);
   let loadedId = $state<string | null>(null);
+  let initialLoadPending = false;
   let picker = $state(false);
   let resolving = $state(false);
   let error = $state('');
@@ -93,19 +94,23 @@ export function createPinnedPanel(options: {
     const id = options.visible() && hostAllowsObservation() && !picker && selectedId === loadedId
       && !overlay.current && document.visibilityState === 'visible' ? selectedId : null;
     if (observed !== id) {
-      if (observed) tracker.close(observed);
+      if (observed) tracker.suspend(observed);
       observed = id;
       if (id) tracker.open(id);
     }
     if (id && conversation) {
-      void tracker.initialLoaded(conversation);
+      if (initialLoadPending) {
+        initialLoadPending = false;
+        void tracker.initialLoaded(conversation);
+      }
       void tracker.observe([conversation]);
     }
   }
   /** Owner replacement/disposal is silent; only a logical close notifies placement. */
   function reset() {
     generation++; selectedKey = null; loadedId = null; picker = false; resolving = false; creationRequest = null; error = '';
-    if (observed) tracker.close(observed);
+    initialLoadPending = false;
+    tracker.close();
     observed = null;
   }
   function close() {
@@ -121,7 +126,13 @@ export function createPinnedPanel(options: {
       if (!result.ok || request !== generation || owner !== workspace.current.owner) return;
       if (!entry.window.key.startsWith('home:') && !workspace.current.entries.some((item) => item.window.key === entry.window.key)) return;
     }
-    selectedKey = entry.window.key; loadedId = null; picker = false; error = ''; resolving = false;
+    if (retainedConversationId(entry.window) !== selectedId || picker || error || resolving) {
+      tracker.close();
+      observed = null;
+      loadedId = null;
+      initialLoadPending = false;
+    }
+    selectedKey = entry.window.key; picker = false; error = ''; resolving = false;
     const agentId = entry.window.agentId ?? entry.window.entityId;
     const request = ++generation, owner = workspace.current.owner;
     if (retainedConversationId(entry.window)) return;
@@ -196,10 +207,23 @@ export function createPinnedPanel(options: {
   return {
     get groups() { return groups; }, get selectedKey() { return selectedKey; }, get selected() { return selected; },
     get selectedId() { return selectedId; }, get group() { return group; }, get conversation() { return conversation; },
-    get picker() { return picker; }, set picker(value) { picker = value; },
+    get picker() { return picker; }, set picker(value) {
+      if (value && !picker) {
+        tracker.close();
+        observed = null;
+        loadedId = null;
+        initialLoadPending = false;
+      }
+      picker = value;
+    },
     get resolving() { return resolving; }, get error() { return error; }, get creating() { return creating; },
     activity, refresh, observe, close, select, openAgent, openConversation, unpin, newConversation, command,
-    loaded() { loadedId = selectedId; observe(); },
+    loaded() {
+      if (!selectedId || picker || loadedId === selectedId) return;
+      loadedId = selectedId;
+      initialLoadPending = true;
+      observe();
+    },
     async unpinAgent() {
       const request = generation, owner = workspace.current.owner;
       if (group && (await conversationWorkspace.execute({ type: 'agent', agentId: group.id, pinned: false })).ok

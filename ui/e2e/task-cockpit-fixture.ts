@@ -1,5 +1,7 @@
 import type { Page, Request } from '@playwright/test';
 import type { ActivityOverviewResponse } from '../src/lib/chat-v2/types';
+import type { DashboardIssuesResponse, InboxPage, NavigationSummary, ProviderMonitor } from '../src/lib/types/api';
+import type { LibraryItem } from '../src/lib/library';
 
 export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed';
 
@@ -147,6 +149,8 @@ function detailedRun(run: Record<string, unknown>): Record<string, unknown> {
   };
 }
 
+const TASK_TITLE = 'Release safety review';
+
 function task(status: CockpitStatus): Record<string, unknown> {
   const draft = status === 'draft';
   const paused = status === 'paused';
@@ -156,7 +160,7 @@ function task(status: CockpitStatus): Record<string, unknown> {
   const steps = projectionSteps(status);
   return {
     task_id: TASK_ID,
-    title: 'Release safety review',
+    title: TASK_TITLE,
     description: 'Verify the deterministic release workflow and approve the production handoff.',
     expected_output: 'An evidence-backed go/no-go decision with complete audit context.',
     status,
@@ -682,10 +686,41 @@ export async function installTaskCockpitFixture(
     if (path === '/api/v1/chat/v2/client-performance' && method === 'POST') {
       return json({ accepted: true });
     }
-    if (path === '/api/v1/dashboard/issues') {
-      return json({ items: [], next_cursor: null, has_more: false });
+    const dashboardSummary = { total: 0, critical: 0, warning: 0, info: 0, truncated: false };
+    if (path === '/api/v1/inbox' && method === 'GET') {
+      return json({ items: [], unread_count: 0, next_cursor: null } satisfies InboxPage);
+    }
+    if (path === '/api/v1/schedules' && method === 'GET') return json([]);
+    if (path === '/api/v1/dashboard/navigation-summary' && method === 'GET') {
+      return json({
+        chat_groups: [], dashboard: dashboardSummary, schedules: 0, tasks: 1,
+      } satisfies NavigationSummary);
+    }
+    if (path === '/api/v1/dashboard/issues' && method === 'GET') {
+      return json({ generated_at: NOW, issues: [], summary: dashboardSummary } satisfies DashboardIssuesResponse);
     }
     if (path === `/api/v1/tasks/${TASK_ID}/summary`) return json(task(status));
+    if (method === 'GET' && (
+      path === '/api/v1/library/items/deliverable/dlv-stage39-final' ||
+      path === '/api/v1/library/items/deliverable/dlv-child-supporting'
+    )) {
+      const final = path.endsWith('/dlv-stage39-final');
+      return json({
+        id: final ? 'dlv-stage39-final' : 'dlv-child-supporting',
+        kind: 'deliverable', format: 'markdown',
+        title: final ? 'Release decision' : 'Implementation evidence',
+        owner_email: taskChatConversation.user_email, agent_id: 'agent-stage39', agent_name: null,
+        project_id: null, project_name: null,
+        conversation_id: final ? 'conv-fetch' : 'conv-task-chat', conversation_title: null,
+        task_id: TASK_ID, task_title: TASK_TITLE,
+        lineage_id: final ? 'dlv-stage39-final' : 'dlv-child-supporting',
+        revision: 1, created_at: NOW, updated_at: NOW,
+        size_bytes: Buffer.byteLength(final
+          ? '# Release approved\n\nAll deterministic checks passed. The release is approved.'
+          : '# Supporting implementation\n\nChild checks passed.'),
+        status: 'approved', origin: 'agent', is_readonly: false,
+      } satisfies LibraryItem);
+    }
     if (
       path === '/api/v1/deliverables/dlv-stage39-final' ||
       path === `/api/v1/step-runs/${HEAVY_STEP_RUN_ID}/deliverables/dlv-stage39-final`
@@ -752,6 +787,15 @@ export async function installTaskCockpitFixture(
         primary: null, secondary: null, credits: null, rate_limit_reached_type: null,
         allowed: null, limit_reached: null, additional_rate_limits: [],
       });
+    }
+    if (path === '/api/v1/provider-monitor/stage39-provider' && method === 'GET') {
+      return json({
+        provider_id: 'stage39-provider', display_name: 'Fixture provider',
+        monitoring: { enabled: false, interval_minutes: 15, warning_percent: 20, critical_percent: 0 },
+        health_status: 'unknown', health_detail: 'Monitoring is disabled for this fixture.',
+        health_checked_at: null, checked_at: null, next_refresh_at: null,
+        usage: null, error: null, alert_severity: null, stale: false,
+      } satisfies ProviderMonitor);
     }
     const isFetchSessionSnapshot = path === '/api/v1/chat/v2/sessions/sess-fetch/snapshot';
     if (isFetchSessionSnapshot || path.match(/^\/api\/v1\/chat\/v2\/task-steps\/[^/]+\/snapshot$/)) {

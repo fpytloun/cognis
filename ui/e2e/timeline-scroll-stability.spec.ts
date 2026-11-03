@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
 // Regression: scrolling up through chat history must move the content being
 // read by exactly the scroll distance. Rows rendered with placeholder heights
@@ -8,7 +9,7 @@ test.use({ serviceWorkers: 'block' });
 
 test('scrolling up moves the visible row exactly by the scroll distance', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 700 });
-  await page.goto('/scoped-chat-v2-fixture');
+  await page.goto(`${COMPONENT_RUNTIME_ORIGIN}/scoped.html`);
   const shell = page.getByTestId('scoped-timeline-shell');
   const viewport = shell.getByTestId('scoped-timeline-viewport');
   await expect(shell.getByRole('heading', { name: 'Parent conversation event 20' })).toBeVisible();

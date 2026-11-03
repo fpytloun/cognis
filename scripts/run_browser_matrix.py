@@ -230,6 +230,9 @@ def main() -> None:
             "PLAYWRIGHT_JSON_OUTPUT_FILE": str(report),
             "PLAYWRIGHT_HTML_REPORT": str(directory / "html"),
         }
+        if name != "compose":
+            env.pop("COGNIS_E2E_MOCK_LLM_CONTROL", None)
+            env.pop("COGNIS_E2E_MOCK_LLM_CONTAINER_ID", None)
         print(f"START browser harness {name}", flush=True)
         run_command(
             [
@@ -238,6 +241,7 @@ def main() -> None:
                 "--config",
                 str(UI / group["config"]),
                 "--workers=1",
+                "--retries=0",
                 "--forbid-only",
                 "--reporter=list,json,html",
                 "--output",

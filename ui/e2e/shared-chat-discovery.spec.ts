@@ -85,11 +85,11 @@ for (const canContinue of [false, true]) {
     await expect.poll(() => projectFilter).toBe('proj_cognis');
     await expect(badge).toHaveAttribute('aria-pressed', 'true');
     await expect(badge).not.toHaveClass(/ring-1|ring-sky-400/);
-    await expect(page.getByTestId('sidebar-conversation-row-conv-home')).toHaveCount(0);
+    await expect(page.getByTestId('sidebar-conversation-row-conv-gallery')).toHaveCount(0);
     expect(new URL(page.url()).pathname).toBe('/chat/conv-task-chat');
     await badge.click();
     await expect.poll(() => projectFilter).toBeNull();
-    await expect(page.getByTestId('sidebar-conversation-row-conv-home')).toBeVisible();
+    await expect(page.getByTestId('sidebar-conversation-row-conv-gallery')).toBeVisible();
     await page.getByRole('button', { name: 'Expand conversation filters' }).click();
     await page.getByLabel('Shared with me', { exact: true }).uncheck();
     await expect.poll(() => includeShared).toBe(false);
