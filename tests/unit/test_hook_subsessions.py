@@ -86,7 +86,7 @@ async def queue(service, factory, occurrence, **evidence):
         )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["fork", "fresh"])
 async def test_detached_hook_is_internal_child_not_a_conversation(factory, mode):
     service = await setup_runtime(factory, mode)
@@ -128,7 +128,7 @@ async def test_detached_hook_is_internal_child_not_a_conversation(factory, mode)
     assert "<agent_hook" not in intention
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["fork", "fresh"])
 async def test_interpolated_evidence_cannot_become_hook_guardrail_assignment(factory, mode):
     service = await setup_runtime(
@@ -146,7 +146,7 @@ async def test_interpolated_evidence_cannot_become_hook_guardrail_assignment(fac
     assert injected not in intention
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_child_reservation_survives_remote_provisioning_failure(factory):
     from cognis.core.session import SessionManager
 
@@ -180,7 +180,7 @@ async def test_child_reservation_survives_remote_provisioning_failure(factory):
     assert service.providers.guardrails.create_session.await_count == 2
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_second_internal_fork_receives_prior_result_without_new_chat(factory):
     service = await setup_runtime(factory)
     first = await queue(service, factory, "completed:one")
@@ -193,7 +193,7 @@ async def test_second_internal_fork_receives_prior_result_without_new_chat(facto
     assert first.run_id in prompt
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_interrupted_execution_follows_up_same_child_after_restart(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:crash")
@@ -230,7 +230,7 @@ async def test_interrupted_execution_follows_up_same_child_after_restart(factory
         assert saved.handoff["successful_boundary"] is not None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_legacy_hook_conversations_hidden_by_provenance_not_title(factory):
     await assign(factory)
     async with factory() as db:
@@ -272,7 +272,7 @@ async def test_legacy_hook_conversations_hidden_by_provenance_not_title(factory)
         assert await db.get(Conversation, "old-hook-chat") is not None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_preparation_failure_releases_scope_without_creating_chat(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "preparation:failed")
@@ -287,7 +287,7 @@ async def test_preparation_failure_releases_scope_without_creating_chat(factory)
     service.scheduler.submit_turn.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_internal_recovery_schedules_instead_of_waiting_inside_scan(factory, monkeypatch):
     import asyncio
     from unittest.mock import Mock
@@ -315,7 +315,7 @@ async def test_internal_recovery_schedules_instead_of_waiting_inside_scan(factor
     service._started = False
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("with_tools", [False, True])
 @pytest.mark.parametrize("recovery", [None, "transient", "stream", "step_timeout"])
 async def test_internal_real_agent_loop_uses_hook_fence_and_suppresses_delivery(
@@ -404,7 +404,7 @@ async def test_internal_real_agent_loop_uses_hook_fence_and_suppresses_delivery(
         assert dispatched
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_lost_lease_cancels_execution_then_recovery_follows_up(factory, monkeypatch):
     import asyncio
 
@@ -443,7 +443,7 @@ async def test_lost_lease_cancels_execution_then_recovery_follows_up(factory, mo
     assert service.agent_loop.run_internal_child_session.await_count == 2
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_missing_source_does_not_strand_admission(factory, monkeypatch):
     from cognis.store.queries import get_session_row
 
@@ -468,7 +468,7 @@ async def test_missing_source_does_not_strand_admission(factory, monkeypatch):
     service.agent_loop.run_internal_child_session.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_previous_outcome_is_context_not_intaris_authorization(factory):
     service = await setup_runtime(factory)
     first = await queue(service, factory, "intention:first")
@@ -483,7 +483,7 @@ async def test_previous_outcome_is_context_not_intaris_authorization(factory):
     assert creation["task_description"] == "Background hook: Debrief"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_failed_internal_run_keeps_pointed_partial_response(factory):
     from cognis.models.session import SessionEvent
 

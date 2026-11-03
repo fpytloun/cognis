@@ -10,13 +10,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from pydantic import ValidationError
 from sqlalchemy import delete, inspect, select, text, update
 from sqlalchemy import event as sql_event
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
 
 from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.normalizer import normalize_session_events
@@ -41,6 +40,7 @@ from cognis.models.session import (
     SessionEvent,
     SessionModel,
 )
+from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import (
     Agent,
     AgentHookAssignmentRow,
@@ -55,7 +55,7 @@ from cognis.store.models import (
 from cognis.tools.builtin.agent_management import MANAGE_AGENTS_TOOL
 
 
-@pytest.fixture(
+@pytest_asyncio.fixture(
     params=["sqlite", *(["postgresql"] if os.getenv("COGNIS_HOOKS_TEST_POSTGRES_URL") else [])]
 )
 async def factory(request, tmp_path):
@@ -64,15 +64,19 @@ async def factory(request, tmp_path):
         if request.param == "postgresql"
         else f"sqlite+aiosqlite:///{tmp_path / 'hooks.db'}"
     )
-    engine = create_async_engine(
-        url, **({"poolclass": NullPool} if request.param == "postgresql" else {})
-    )
+    engine = create_engine(url)
+    owner_loop = asyncio.get_running_loop()
+
+    @sql_event.listens_for(engine.sync_engine, "checkout")
+    def check_loop(_connection, _record, _proxy):
+        assert asyncio.get_running_loop() is owner_loop
+
     async with engine.begin() as connection:
         if request.param == "postgresql":
             await connection.run_sync(Base.metadata.drop_all)
         await connection.run_sync(Base.metadata.create_all)
         await connection.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
+    factory = create_session_factory(engine)
     async with factory() as db:
         db.add_all([User(email="owner@hooks.test"), User(email="other@hooks.test")])
         await db.flush()
@@ -176,12 +180,31 @@ def runtime(factory, *, legacy_detached=True):
         user_email="owner@hooks.test",
         context=ConversationContext(type="web", platform_data={"hook_run_id": "child-run"}),
     )
+
+    async def create_child(*args, **kwargs):
+        async with factory() as db:
+            if await db.get(Conversation, child.conversation_id) is None:
+                db.add(
+                    Conversation(
+                        conversation_id=child.conversation_id,
+                        user_email=child.user_email,
+                        agent_id=child.agent_id,
+                        context_type=child.context.type,
+                    )
+                )
+                await db.commit()
+        return child, session()
+
+    async def fork_child(*args, **kwargs):
+        conversation, root_session = await create_child(*args, **kwargs)
+        return conversation, root_session, {}
+
     service = HookRuntime(
         session_factory=factory,
         providers=SimpleNamespace(guardrails=guardrails),
         session_manager=SimpleNamespace(
-            fork_into_new_conversation=AsyncMock(return_value=(child, session(), {})),
-            create_conversation_with_root_session=AsyncMock(return_value=(child, session())),
+            fork_into_new_conversation=AsyncMock(side_effect=fork_child),
+            create_conversation_with_root_session=AsyncMock(side_effect=create_child),
         ),
         session_cache=SimpleNamespace(append_recorded_events=AsyncMock()),
         event_bus=bus,
@@ -294,7 +317,7 @@ async def assign(factory, definition=None, hook_id=None, *, prospective=False):
     return hook_id
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_crud_ownership_revisions_and_assignment_delete_guard(factory):
     hook_id = await assign(factory)
     async with factory() as db:
@@ -334,7 +357,7 @@ async def test_crud_ownership_revisions_and_assignment_delete_guard(factory):
         await db.commit()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_no_shared_or_foreign_agent_assignment(factory):
     async with factory() as db:
         with pytest.raises(HookError, match="Owned agent"):
@@ -367,7 +390,7 @@ def test_bundled_hooks_have_native_actions_and_valid_templates():
         assert "todoist" not in definition.prompt.lower()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_matching_renders_parameters_and_deduplicates(factory):
     await assign(factory)
     service = runtime(factory)
@@ -390,7 +413,7 @@ async def test_matching_renders_parameters_and_deduplicates(factory):
     assert rows[0].status == "completed"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_cycle_condition_and_first_message_are_distinct(factory):
     await assign(factory, hook_id="system:working-reminder")
     await assign(factory, {"name": "First", "trigger": "first_user_message", "prompt": "Welcome"})
@@ -414,7 +437,7 @@ async def test_cycle_condition_and_first_message_are_distinct(factory):
     assert await service.before_cycle(ctx, 10) == []
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_fork_runs_once_and_returning_user_does_not_cancel(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     service = runtime(factory)
@@ -460,7 +483,7 @@ async def test_idle_fork_runs_once_and_returning_user_does_not_cancel(factory):
     assert "prompt" not in events[0].data
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_busy_and_thresholds(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     await assign(
@@ -482,7 +505,7 @@ async def test_idle_busy_and_thresholds(factory):
     service.scheduler.submit_turn.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_tool_hook_uses_deterministic_workflow_and_normal_queue(factory):
     await assign(
         factory,
@@ -513,7 +536,7 @@ async def test_tool_hook_uses_deterministic_workflow_and_normal_queue(factory):
     service.scheduler.submit_turn.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_legacy_child_reservation_before_admission_recovers_with_stable_idempotency(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     service = runtime(factory)
@@ -599,7 +622,7 @@ def test_management_tool_exposes_hook_crud():
     } <= actions
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bootstrap_and_migration_agree(factory):
     migration = importlib.import_module("cognis.store.migrations.versions.162_agent_hooks")
     engine = factory.kw["bind"]
@@ -628,7 +651,7 @@ async def test_bootstrap_and_migration_agree(factory):
         await connection.run_sync(check)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_terminal_lifecycle_delivery_retries_without_reexecuting(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     service = runtime(factory)
@@ -676,7 +699,7 @@ async def test_terminal_lifecycle_delivery_retries_without_reexecuting(factory):
         assert run.status == "completed" and not run.lifecycle_pending
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error", [asyncio.CancelledError, RuntimeError])
 async def test_crash_after_task_admission_recovers_without_repeating_task(factory, error):
     await assign(
@@ -728,7 +751,7 @@ async def test_crash_after_task_admission_recovers_without_repeating_task(factor
         assert run.status == "completed" and run.task_id
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_fork_boundary_is_frozen_before_later_source_messages(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     service = runtime(factory)
@@ -745,7 +768,7 @@ async def test_fork_boundary_is_frozen_before_later_source_messages(factory):
     )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_hook_definition_indirect_self_mutation_requires_approval(factory):
     from cognis.core.agent_management import AgentManagementError, handle_agent_management_action
 
@@ -764,7 +787,7 @@ async def test_hook_definition_indirect_self_mutation_requires_approval(factory)
         )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_invalid_runtime_condition_does_not_break_foreground(factory):
     await assign(
         factory,
@@ -790,7 +813,7 @@ async def test_invalid_runtime_condition_does_not_break_foreground(factory):
         assert (await db.scalar(select(AgentHookRunRow))).status == "invalid_condition"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("wrapped", [True, False])
 async def test_follow_up_uses_exact_turn_evidence_and_is_not_user_request(factory, wrapped):
     await assign(
@@ -877,7 +900,7 @@ async def test_follow_up_uses_exact_turn_evidence_and_is_not_user_request(factor
         assert (await db.scalar(select(AgentHookRunRow))).status == "running"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_deliverable_match_starts_a_pinned_fork(factory):
     await assign(
         factory,
@@ -919,7 +942,7 @@ async def test_deliverable_match_starts_a_pinned_fork(factory):
     assert "not a new user request" in service.scheduler.submit_turn.await_args.args[1]
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_follow_up_timeout_targets_request_not_parent_turn(factory):
     service = runtime(factory)
     async with factory() as db:
@@ -1003,7 +1026,7 @@ async def test_follow_up_timeout_targets_request_not_parent_turn(factory):
     assert signal.direct_request_id == "request-hook-timeout"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_follow_up_does_not_rearm_from_its_own_completion(factory):
     await assign(
         factory,
@@ -1070,7 +1093,7 @@ async def test_idle_follow_up_does_not_rearm_from_its_own_completion(factory):
         assert len((await db.scalars(select(AgentHookRunRow))).all()) == 1
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_literal_template_metadata_does_not_break_foreground(factory):
     await assign(
         factory,
@@ -1099,7 +1122,7 @@ async def test_literal_template_metadata_does_not_break_foreground(factory):
     service.providers.guardrails.read_events.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_real_session_manager_fork_preserves_prefix_and_owner_scope(factory):
     from cognis.core.session import SessionManager
     from cognis.core.session_cache import SessionCache
@@ -1159,7 +1182,7 @@ async def drain_jobs(service):
             await asyncio.gather(*list(service._jobs.values()))
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_match_dispatches_without_recovery_scan(factory, live):
     await assign(
         factory,
@@ -1183,7 +1206,7 @@ async def test_match_dispatches_without_recovery_scan(factory, live):
     assert any(key.startswith("hook-timeout:") for key in live._deadlines)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_fast_task_completion_during_admission_is_not_lost(factory, live):
     await assign(
         factory,
@@ -1233,7 +1256,7 @@ async def test_fast_task_completion_during_admission_is_not_lost(factory, live):
     live.scan.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_sleeping_idle_deadline_has_no_database_work(factory, live):
     await assign(factory, hook_id="system:memory-consolidation")
     async with factory() as db:
@@ -1279,7 +1302,7 @@ async def test_sleeping_idle_deadline_has_no_database_work(factory, live):
     live.scheduler.cancel_turn.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_expired_unadmitted_dispatch_does_not_spin_on_lifecycle_outage(factory, live):
     await assign(
         factory,
@@ -1316,7 +1339,7 @@ async def test_expired_unadmitted_dispatch_does_not_spin_on_lifecycle_outage(fac
         assert run.lifecycle_pending
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_dispatch_crossing_timeout_is_cancelled_immediately(factory, live):
     await assign(
         factory,
@@ -1354,7 +1377,7 @@ async def test_dispatch_crossing_timeout_is_cancelled_immediately(factory, live)
         assert "hook-timeout:" + run.run_id not in live._deadlines
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_recovery_interval_claim_skips_other_controllers(factory):
     from cognis.store.coordination import DatabaseLeaseStore
 
@@ -1368,7 +1391,7 @@ async def test_recovery_interval_claim_skips_other_controllers(factory):
     second.scan.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_timer_fires_once_without_polling(factory, live):
     await assign(factory, hook_id="system:memory-consolidation")
     async with factory() as db:
@@ -1393,7 +1416,7 @@ async def test_idle_timer_fires_once_without_polling(factory, live):
     live.scan.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_configuration_event_refreshes_and_removes_local_idle_deadline(factory, live):
     await assign(factory, hook_id="system:memory-consolidation")
     async with factory() as db:
@@ -1417,7 +1440,7 @@ async def test_configuration_event_refreshes_and_removes_local_idle_deadline(fac
     assert "hook-idle:conv-hooks" not in live._deadlines
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_recovery_rearms_future_deadline(factory, live):
     await assign(factory, hook_id="system:memory-consolidation")
     async with factory() as db:
@@ -1429,7 +1452,7 @@ async def test_recovery_rearms_future_deadline(factory, live):
     live.scheduler.submit_turn.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_no_idle_queries_for_agents_with_injection_hooks(factory):
     await assign(factory, hook_id="system:recall-reminder")
     service = runtime(factory)
@@ -1437,7 +1460,7 @@ async def test_no_idle_queries_for_agents_with_injection_hooks(factory):
     service.scheduler.durable_running_turn_state.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_lease_is_released_after_work_not_held_during_sleep(factory):
     service = runtime(factory)
     service.lease_store = SimpleNamespace(
@@ -1453,7 +1476,7 @@ async def test_lease_is_released_after_work_not_held_during_sleep(factory):
     service.lease_store.renew.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("evidence", ["read", "edit", "deliverable"])
 async def test_self_improvement_is_ready_to_enable_and_executes_fork(factory, evidence):
     await assign(factory, hook_id="system:self-improvement")
@@ -1483,7 +1506,7 @@ async def test_self_improvement_is_ready_to_enable_and_executes_fork(factory, ev
         assert run.status == "running"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tools",
     [
@@ -1501,7 +1524,7 @@ async def test_learning_requires_canonical_skill_tool_permissions(factory, tools
         await assign(factory, hook_id="system:self-improvement")
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_learning_rechecks_revoked_tools_at_dispatch(factory):
     await assign(factory, hook_id="system:self-improvement")
     await make_learning_due(factory)
@@ -1561,7 +1584,7 @@ def learning_events(evidence):
     return events
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("evidence", ["chat", "failed", "older_work"])
 async def test_learning_gate_preserves_earlier_work_but_skips_empty_windows(factory, evidence):
     await assign(factory, hook_id="system:self-improvement")
@@ -1589,7 +1612,7 @@ async def test_learning_gate_preserves_earlier_work_but_skips_empty_windows(fact
     assert BUNDLED_HOOKS["system:memory-consolidation"].condition is None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_learning_waits_twenty_five_minutes_but_memory_keeps_fifteen(factory):
     assert BUNDLED_HOOKS["system:self-improvement"].idle_seconds == 1500
     assert BUNDLED_HOOKS["system:memory-consolidation"].idle_seconds == 900
@@ -1610,7 +1633,7 @@ async def test_learning_waits_twenty_five_minutes_but_memory_keeps_fifteen(facto
     service.scheduler.submit_turn.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_configuration_refresh_bounds_pre_run_evidence(factory, live):
     await assign(factory, hook_id="system:self-improvement")
     await make_learning_due(factory)
@@ -1688,7 +1711,7 @@ async def test_idle_configuration_refresh_bounds_pre_run_evidence(factory, live)
     live.scheduler.submit_turn.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("already_matched", [False, True])
 async def test_idle_match_checks_eligibility_before_evidence(factory, already_matched):
     await assign(factory, hook_id="system:self-improvement")
@@ -1712,7 +1735,7 @@ async def test_idle_match_checks_eligibility_before_evidence(factory, already_ma
     service.providers.guardrails.read_events.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_recovery_reuses_evidence_until_foreground_occurrence_changes(factory):
     await assign(factory, hook_id="system:self-improvement")
     await make_learning_due(factory)
@@ -1733,7 +1756,7 @@ async def test_idle_recovery_reuses_evidence_until_foreground_occurrence_changes
     service.scheduler.submit_turn.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
 async def test_idle_evidence_failure_is_not_cached_and_releases_capacity(factory, failure):
     await assign(factory, hook_id="system:self-improvement")
@@ -1756,7 +1779,7 @@ async def test_idle_evidence_failure_is_not_cached_and_releases_capacity(factory
     assert len(service._idle_evidence) == 1
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_evidence_cache_is_bounded(factory, monkeypatch):
     monkeypatch.setattr("cognis.core.hook_runtime.MAX_IDLE_EVIDENCE", 1)
     await assign(factory, hook_id="system:self-improvement")
@@ -1774,7 +1797,7 @@ async def test_idle_evidence_cache_is_bounded(factory, monkeypatch):
     assert service.providers.guardrails.read_events.await_count == 3
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "waiting"], ids=["active", "recoverable"])
 async def test_idle_evidence_waits_for_settlement_and_includes_late_result(factory, status):
     await assign(factory, hook_id="system:self-improvement")
@@ -1807,7 +1830,7 @@ async def test_idle_evidence_waits_for_settlement_and_includes_late_result(facto
         assert (await db.scalar(select(AgentHookRunRow))).status == "pending"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
     [
@@ -1859,7 +1882,7 @@ async def test_existing_hook_status_suppresses_evidence_after_restart(factory, s
         assert runs[0].status == status
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("hook_id", ["system:memory-consolidation", "system:self-improvement"])
 async def test_real_manage_enable_does_not_spawn_historical_conversation_jobs(
     factory, live, hook_id
@@ -1935,7 +1958,7 @@ async def test_real_manage_enable_does_not_spawn_historical_conversation_jobs(
         assert await db.scalar(select(AgentHookRunRow)) is None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_activation_changes_only_on_enable_transition(factory):
     hook_id = await assign(factory, hook_id="system:memory-consolidation", prospective=True)
     async with factory() as db:
@@ -1963,7 +1986,7 @@ async def test_activation_changes_only_on_enable_transition(factory):
     restarted.providers.guardrails.record_events.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_old_turn_or_legacy_last_message_cannot_cross_activation(factory, legacy):
     await assign(factory, hook_id="system:memory-consolidation", prospective=True)
@@ -1984,7 +2007,7 @@ async def test_old_turn_or_legacy_last_message_cannot_cross_activation(factory, 
     service.scheduler.durable_running_turn_state.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("new_conversation", [False, True])
 async def test_new_foreground_after_enable_arms_and_recovers_idle_timer(
     factory, live, new_conversation
@@ -2049,7 +2072,7 @@ async def test_new_foreground_after_enable_arms_and_recovers_idle_timer(
         assert (await db.scalar(select(AgentHookRunRow))).occurrence == "idle:post-enable-turn"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["preparing", "pending", "dispatching"])
 async def test_reenable_fences_unadmitted_idle_runs_before_snapshot_reads(factory, status):
     hook_id = await assign(factory, hook_id="system:memory-consolidation")
@@ -2070,7 +2093,7 @@ async def test_reenable_fences_unadmitted_idle_runs_before_snapshot_reads(factor
         assert (await db.scalar(select(AgentHookRunRow))).status == "skipped"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("upgrade_path", ["bootstrap", "alembic"])
 async def test_activation_schema_upgrade_fences_legacy_assignments_once(factory, upgrade_path):
     from cognis.bootstrap import run_schema_bootstrap
@@ -2131,7 +2154,7 @@ async def test_activation_schema_upgrade_fences_legacy_assignments_once(factory,
     service.providers.guardrails.record_events.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["automation", "absorbed", "equal", "missing-boundary"])
 async def test_only_strictly_new_foreground_admissions_qualify(factory, kind):
     hook_id = await assign(factory, hook_id="system:memory-consolidation", prospective=True)
@@ -2153,7 +2176,7 @@ async def test_only_strictly_new_foreground_admissions_qualify(factory, kind):
     service.providers.guardrails.record_events.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_each_idle_assignment_has_its_own_boundary(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     await assign(factory, hook_id="system:self-improvement", prospective=True)
@@ -2167,7 +2190,7 @@ async def test_each_idle_assignment_has_its_own_boundary(factory):
         assert [run.hook_id for run in runs] == ["system:memory-consolidation"]
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_non_idle_and_definition_edits_preserve_activation_contract(factory):
     hook_id = await assign(factory, prospective=True)
     async with factory() as db:
@@ -2195,7 +2218,7 @@ async def test_non_idle_and_definition_edits_preserve_activation_contract(factor
     assert len(messages) == 1
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("winner", ["reenable", "claim"])
 async def test_activation_and_dispatch_claim_are_transactionally_ordered(factory, winner):
     hook_id = await assign(factory, hook_id="system:memory-consolidation")
@@ -2259,7 +2282,7 @@ async def test_activation_and_dispatch_claim_are_transactionally_ordered(factory
         service.scheduler.submit_turn.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["running", "completed", "ambiguous"])
 async def test_reenable_reconciles_admitted_or_uncertain_dispatch_without_resubmit(factory, status):
     hook_id = await assign(factory, hook_id="system:memory-consolidation")
@@ -2312,7 +2335,7 @@ async def test_reenable_reconciles_admitted_or_uncertain_dispatch_without_resubm
         assert persisted.child_conversation_id == "conv-hooks"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_static_true_configuration_refresh_has_global_bound_and_no_handled_backlog(
     factory, live
 ):
@@ -2416,7 +2439,7 @@ async def test_static_true_configuration_refresh_has_global_bound_and_no_handled
     assert peak <= MAX_HOOK_JOBS
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_candidate_query_only_returns_latest_unhandled_foreground_occurrence(factory):
     await assign(factory, hook_id="system:memory-consolidation")
     service = runtime(factory)
@@ -2450,7 +2473,7 @@ async def test_candidate_query_only_returns_latest_unhandled_foreground_occurren
         }
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_mixed_version_insert_defaults_and_null_repair_preserve_valid_boundaries(factory):
     from cognis.bootstrap import run_schema_bootstrap
 
@@ -2505,7 +2528,7 @@ async def test_mixed_version_insert_defaults_and_null_repair_preserve_valid_boun
         )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_enabled_put_repairs_missing_activation_once(factory):
     hook_id = await assign(factory, hook_id="system:memory-consolidation")
     async with factory() as db:
@@ -2523,7 +2546,7 @@ async def test_enabled_put_repairs_missing_activation_once(factory):
         ).activated_at == first
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("page_size", [1, 100])
 async def test_idle_recovery_resumes_after_timeout_without_starving_later_candidates(
     factory, monkeypatch, page_size
@@ -2654,7 +2677,7 @@ async def test_idle_recovery_resumes_after_timeout_without_starving_later_candid
     assert runtime(factory)._idle_recovery_cursor == ""
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("intaris_session_id", [None, "canonical-intaris-source"])
 @pytest.mark.parametrize("phase", ["snapshot", "lifecycle"])
 async def test_hook_event_append_keys_are_target_scoped_and_stable_on_retry(

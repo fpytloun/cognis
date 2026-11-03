@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from types import TracebackType
 from typing import Any, cast
 
 from prometheus_client import Counter, Gauge
@@ -125,11 +127,36 @@ def create_engine(database_url: str) -> AsyncEngine:
     return engine
 
 
+class _OwnedAsyncSession(AsyncSession):
+    """Keep transaction cleanup owned until it finishes, including on cancellation.
+
+    Cleanup completion is driver-dependent; bounded drains retain unfinished work.
+    """
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        cleanup = asyncio.create_task(self.close())
+        cancelled: asyncio.CancelledError | None = None
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError as exc:
+                if cancelled is None:
+                    cancelled = exc
+        cleanup.result()
+        if cancelled is not None:
+            raise cancelled
+
+
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
     """Create an async session factory bound to the engine."""
     return async_sessionmaker(
         engine,
-        class_=AsyncSession,
+        class_=_OwnedAsyncSession,
         expire_on_commit=False,
     )
 

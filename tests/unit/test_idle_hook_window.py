@@ -67,7 +67,7 @@ async def match(service, occurrence):
     )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_window_is_per_hook_and_failed_runs_do_not_consume_work(factory):
     definition = {
         "name": "Learn",
@@ -102,7 +102,7 @@ async def test_window_is_per_hook_and_failed_runs_do_not_consume_work(factory):
         assert [row.hook_id for row in rows] == [second]
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_injected_revision_without_snapshot_does_not_block_idle_revision(factory):
     hook_id = await assign(
         factory,
@@ -143,7 +143,7 @@ async def test_injected_revision_without_snapshot_does_not_block_idle_revision(f
         )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_snapshot_not_completion_time_and_same_occurrence_cache_invalidation(factory):
     hook_id = await assign(
         factory,
@@ -215,7 +215,7 @@ async def test_snapshot_not_completion_time_and_same_occurrence_cache_invalidati
     )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_rollover_reads_old_root_work_not_child_execution(factory):
     await assign(
         factory,

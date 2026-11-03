@@ -147,7 +147,7 @@ async def finish(service, factory, run, text, status="completed"):
         return await db.get(AgentHookRunRow, run.run_id)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_previous_outcome_on_card_then_second_fork_and_noop_retention(factory):
     service, _ = await prepare(factory)
     first = await match(service, factory, "first")
@@ -191,7 +191,7 @@ async def test_previous_outcome_on_card_then_second_fork_and_noop_retention(fact
     assert all(call.kwargs.get("seqs") or call.kwargs.get("last_n") == 1 for call in reads)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_failure_retains_success_boundary_and_partial_outcome(factory):
     service, _ = await prepare(factory)
     first = await match(service, factory, "first")
@@ -214,7 +214,7 @@ async def test_failure_retains_success_boundary_and_partial_outcome(factory):
     assert '"previous_status": "failed"' in prompt
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_overlap_and_cancel_wait_for_durable_settlement(factory):
     service, _ = await prepare(factory)
     first = await match(service, factory, "first")
@@ -235,7 +235,7 @@ async def test_overlap_and_cancel_wait_for_durable_settlement(factory):
     assert service.scheduler.submit_turn.await_count == 2
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_scope_isolation_and_optional_missing_outcome(factory):
     service, _ = await prepare(factory)
     first = await match(service, factory, "first")
@@ -279,7 +279,7 @@ def test_outcome_uses_delegate_projection_without_small_hook_specific_limit():
     assert result == text and not truncated and anchors
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_full_response_preserved_and_shared_projection_in_card_and_next_run(factory):
     from cognis.core.hook_handoff import capture_fork_response
     from cognis.runtime_context import scoped_runtime_context
@@ -341,7 +341,7 @@ async def test_full_response_preserved_and_shared_projection_in_card_and_next_ru
     assert first.child_conversation_id in prompt
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_continuation_admission_before_capture_keeps_slot(factory):
     from cognis.core.hook_handoff import capture_fork_response
 
@@ -415,7 +415,7 @@ async def test_continuation_admission_before_capture_keeps_slot(factory):
     assert captured["text"] == result.final_content
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("capture_first", [True, False])
 async def test_capture_and_cancellation_preserve_both_metadata_updates(factory, capture_first):
     import asyncio
@@ -453,7 +453,7 @@ async def test_capture_and_cancellation_preserve_both_metadata_updates(factory, 
     assert saved.fork_slot
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_snapshot_append_before_metadata_commit_recovers_boundary(factory):
     import asyncio
 
@@ -471,7 +471,7 @@ async def test_snapshot_append_before_metadata_commit_recovers_boundary(factory)
     assert recovered.handoff["snapshot"] == expected["snapshot"]
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_source_session_rollover_and_runtime_restart(factory):
     service, _ = await prepare(factory)
     first = await match(service, factory, "completed:first-session")
@@ -508,7 +508,7 @@ async def test_source_session_rollover_and_runtime_restart(factory):
     assert saved.handoff["boundary"]["session_id"] == rotated.session_id
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_concurrent_dispatch_and_replayed_publication_are_idempotent(factory):
     import asyncio
 

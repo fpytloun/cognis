@@ -9,7 +9,6 @@ import os
 import signal
 import sys
 import tarfile
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -31,15 +30,17 @@ def _load_script(name: str, path: Path) -> object:
 _HOME_BREW_DIR = Path(__file__).parents[2] / "packaging" / "homebrew"
 
 
-def test_chart_defaults_to_published_controller_image_tag() -> None:
+def test_chart_defaults_to_explicit_controller_image_tag() -> None:
     root = Path(__file__).parents[2]
-    with (root / "pyproject.toml").open("rb") as stream:
-        version = tomllib.load(stream)["project"]["version"]
     chart = yaml.safe_load((root / "deploy/helm/cognis/Chart.yaml").read_text(encoding="utf-8"))
     values = yaml.safe_load((root / "deploy/helm/cognis/values.yaml").read_text(encoding="utf-8"))
-    assert chart["appVersion"] == f"v{version}"
+    # A Mac-only version advance does not publish a new controller image.
+    assert chart["appVersion"] == f"v{Version(chart['appVersion'].removeprefix('v'))}"
     assert values["image"]["repository"] == "ghcr.io/fpytloun/cognis"
     assert values["image"]["tag"] == ""
+    helpers = (root / "deploy/helm/cognis/templates/_helpers.tpl").read_text(encoding="utf-8")
+    image_helper = helpers.split('{{- define "cognis.image" -}}', 1)[1].split("{{- end }}", 1)[0]
+    assert "(default .Chart.AppVersion .Values.image.tag)" in image_helper
 
 
 def test_tag_workflow_requires_reviewed_draft_before_upload() -> None:

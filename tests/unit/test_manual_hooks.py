@@ -37,7 +37,7 @@ async def idle_hook(factory, *, enabled=True):
     return hook_id
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
 async def test_manual_bypasses_condition_timer_and_consumes_idle(factory, enabled):
     service = await setup_runtime(factory)
@@ -62,7 +62,7 @@ async def test_manual_bypasses_condition_timer_and_consumes_idle(factory, enable
     assert "hook-idle:conv-hooks" not in service._deadlines
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_keeps_other_idle_timer(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -91,7 +91,7 @@ async def test_manual_keeps_other_idle_timer(factory):
         await service.stop()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_filters_ownership_trigger_and_assignment(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory, enabled=False)
@@ -109,7 +109,7 @@ async def test_manual_filters_ownership_trigger_and_assignment(factory):
     service.agent_loop.run_internal_child_session.assert_not_awaited()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", [None, SimpleNamespace(active_session_id=None)])
 async def test_manual_fails_closed_when_foreground_disappears(factory, monkeypatch, source):
     service = await setup_runtime(factory)
@@ -124,7 +124,7 @@ async def test_manual_fails_closed_when_foreground_disappears(factory, monkeypat
         assert await db.scalar(select(func.count()).select_from(AgentHookRunRow)) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_command_listing_suggestions_and_execution(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory, enabled=False)
@@ -158,7 +158,7 @@ async def test_manual_command_listing_suggestions_and_execution(factory):
     assert result.data["hook_run_id"]
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_timer_race_uses_one_durable_occurrence(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -172,7 +172,7 @@ async def test_manual_timer_race_uses_one_durable_occurrence(factory):
     service.agent_loop.run_internal_child_session.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_rejects_channel_origin(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -184,7 +184,7 @@ async def test_manual_rejects_channel_origin(factory):
         await service.run_manual(conversation(), session(), "owner@hooks.test", hook_id)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_recovers_disabled_preparation(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory, enabled=False)
@@ -200,7 +200,7 @@ async def test_manual_recovers_disabled_preparation(factory):
         assert (await db.get(AgentHookRunRow, run.run_id)).status == "completed"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_overrides_automatic_invalid_condition(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -223,7 +223,7 @@ async def test_manual_overrides_automatic_invalid_condition(factory):
         assert (await db.get(AgentHookRunRow, run.run_id)).status == "completed"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_idle_countdown_starts_after_attached_work_settles(factory, monkeypatch):
     service = await setup_runtime(factory)
     await idle_hook(factory)
@@ -251,7 +251,7 @@ async def test_idle_countdown_starts_after_attached_work_settles(factory, monkey
         await service.stop()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_manual_completed_hook_allowed_but_pre_triggers_excluded(factory):
     service = await setup_runtime(factory)
     hook_id = await assign(
@@ -270,7 +270,7 @@ async def test_manual_completed_hook_allowed_but_pre_triggers_excluded(factory):
     service.agent_loop.run_internal_child_session.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_stale_dispatch_reads_manual_upgrade_under_claim_lock(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory, enabled=False)
@@ -283,7 +283,7 @@ async def test_stale_dispatch_reads_manual_upgrade_under_claim_lock(factory):
     service.agent_loop.run_internal_child_session.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_prepared_automatic_hook_waits_for_restarted_countdown(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -330,7 +330,7 @@ async def test_prepared_automatic_hook_waits_for_restarted_countdown(factory):
     service.agent_loop.run_internal_child_session.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_actual_timer_manual_race(factory):
     service = await setup_runtime(factory)
     hook_id = await idle_hook(factory)
@@ -348,7 +348,7 @@ async def test_actual_timer_manual_race(factory):
     service.agent_loop.run_internal_child_session.assert_awaited_once()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_deferred_follow_up_timeout_starts_at_execution(factory):
     service = await setup_runtime(factory)
     hook_id = await assign(
