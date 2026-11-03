@@ -57,6 +57,15 @@ queue-only negative selector fixture is collected alongside the lifecycle cases.
 ACK checks await request completion and stable canonical sender identity.
 Reconnect waits for subscription hydration plus a completed canonical read
 before requiring the same single rendered identity and attachment.
+Active-leader modes establish the real inference-barrier precondition before
+loading the recipient's live view, then subscribe the recipient before the
+tested admission. This separates fixture precondition acquisition from concurrent
+recipient metadata reads without injecting or refreshing recipient content.
+The ten-second gate, case and outer subprocess budgets are unchanged. Normal-mode
+cases and the separate first-session lineage test retain empty-session coverage.
+The leader barrier must still be held after the tested admission. Terminal
+barriers return a failing control status, and queued-after-stop cancellation
+must confirm the barrier had not expired; a historical entry event is not enough.
 The reconnect phase explicitly closes the original socket, creates a separate
 post-ACK witness through sender admission while the recipient is offline, and
 tracks request objects first initiated in the new online epoch. An older held

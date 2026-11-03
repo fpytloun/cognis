@@ -10,6 +10,12 @@ class RequestBarrier:
         self.released = asyncio.Event()
         self.cancelled = False
         self.claimed = False
+        self.timed_out = False
+
+    @property
+    def held(self) -> bool:
+        """Whether the claimed request is still blocked by this barrier."""
+        return self.claimed and not self.cancelled and not self.released.is_set()
 
     async def hold(self) -> None:
         if self.claimed:
@@ -19,6 +25,10 @@ class RequestBarrier:
         try:
             async with asyncio.timeout(self.timeout):
                 await self.released.wait()
+        except TimeoutError:
+            self.timed_out = True
+            self.cancel()
+            raise
         except BaseException:
             self.cancel()
             raise

@@ -136,6 +136,50 @@ async def test_mock_llm_barrier_control_is_loopback_only_and_cancelled_on_shutdo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["expired", "cancelled", "released"])
+async def test_mock_llm_barrier_never_reports_terminal_gate_as_held(tmp_path, terminal):
+    from cognis.testing.mock_llm.server import create_app
+
+    app = create_app(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("127.0.0.1", 1234)),
+            base_url="http://fixture",
+        ) as client,
+    ):
+        assert (
+            await client.post(
+                "/__mock/barrier", json={"scenario_id": "fixture-scenario", "turn_index": 0}
+            )
+        ).status_code == 201
+        gate = app.state.release_barrier[2]
+        if terminal == "expired":
+            gate.timeout = 0.001
+        task = asyncio.create_task(gate.hold())
+        await gate.entered.wait()
+        if terminal == "expired":
+            with pytest.raises(TimeoutError):
+                await task
+        elif terminal == "cancelled":
+            gate.cancel()
+            with pytest.raises(RuntimeError, match="cancelled"):
+                await task
+        else:
+            gate.release()
+            await task
+        assert (await client.get("/__mock/barrier")).status_code == 410
+        cancelled = await client.delete("/__mock/barrier")
+        assert cancelled.status_code == (410 if terminal == "expired" else 204)
+        assert app.state.release_barrier is None
+        assert (
+            await client.post(
+                "/__mock/barrier", json={"scenario_id": "fixture-scenario", "turn_index": 0}
+            )
+        ).status_code == 201
+
+
+@pytest.mark.asyncio
 async def test_barrier_timeout_and_cancel_never_release_successfully():
     gate = RequestBarrier(timeout=0.001)
     with pytest.raises(TimeoutError):

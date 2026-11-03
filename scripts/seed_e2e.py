@@ -28,6 +28,7 @@ from cognis.models.session import SessionEvent
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.auth.jwt import JWTAuthProvider
 from cognis.providers.guardrails.intaris import IntarisProvider
+from cognis.providers.llm.routing import COMPANION_DEFAULTS, EMBEDDING_ROUTES
 from cognis.security import create_password_hasher
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.queries import (
@@ -58,7 +59,17 @@ E2E_SESSION_ID = "sess_e2e_refresh_scenario"
 HA_EXECUTOR_IDS = ("ha-e2e-executor-1", "ha-e2e-executor-2")
 HA_EXECUTOR_LABELS = {"deployment": "ha-e2e", "role": "primary"}
 
-TEXT_ROUTE_TYPES = ("default", "classifier", "compaction", "evaluator")
+TEXT_ROUTE_TYPES = (
+    "default",
+    "classifier",
+    "compaction",
+    "evaluator",
+    *(route for route in COMPANION_DEFAULTS if route not in EMBEDDING_ROUTES),
+)
+EMBEDDING_ROUTE_TYPES = (
+    "embedding",
+    *(route for route in COMPANION_DEFAULTS if route in EMBEDDING_ROUTES),
+)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -104,6 +115,8 @@ async def _seed_provider(session: AsyncSession) -> None:
             {
                 "model_id": "mock-embedding",
                 "display_name": "Mock Embedding (e2e)",
+                "model_mode": "embedding",
+                "supports_embedding": True,
                 "supports_tools": False,
                 "supports_streaming": False,
                 "supports_reasoning": False,
@@ -154,15 +167,16 @@ async def _seed_model_routing(session: AsyncSession) -> None:
             owner_email=SYSTEM_USER_EMAIL,
             config=None,
         )
-    await upsert_model_routing(
-        session,
-        task_type="embedding",
-        provider_id=E2E_PROVIDER_ID,
-        model="mock-embedding",
-        owner_email=SYSTEM_USER_EMAIL,
-        config=None,
-    )
-    print(f"Seeded e2e model routing for: {', '.join((*TEXT_ROUTE_TYPES, 'embedding'))}")
+    for task_type in EMBEDDING_ROUTE_TYPES:
+        await upsert_model_routing(
+            session,
+            task_type=task_type,
+            provider_id=E2E_PROVIDER_ID,
+            model="mock-embedding",
+            owner_email=SYSTEM_USER_EMAIL,
+            config=None,
+        )
+    print(f"Seeded e2e model routing for: {', '.join((*TEXT_ROUTE_TYPES, *EMBEDDING_ROUTE_TYPES))}")
 
 
 async def _seed_agent(session: AsyncSession) -> None:

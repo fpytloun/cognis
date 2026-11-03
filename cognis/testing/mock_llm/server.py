@@ -378,12 +378,17 @@ async def mock_barrier(request: Request) -> Response:
         # Long-poll the entered event, not a timer-based readiness guess.
         async with asyncio.timeout(30):
             await gate[2].entered.wait()
+        if not gate[2].held:
+            return Response(status_code=410)
         return Response(status_code=204)
     if request.method == "PUT":
         gate[2].release()
     else:
+        expired = gate[2].timed_out
         gate[2].cancel()
         request.app.state.release_barrier = None
+        if expired:
+            return Response(status_code=410)
     return Response(status_code=204)
 
 

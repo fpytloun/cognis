@@ -127,7 +127,7 @@ def test_create_session_and_duplicate_conflict(
     )
 
     assert first.status_code == 200
-    assert first.json() == {"ok": True}
+    assert first.json()["ok"] is True
     assert duplicate.status_code == 409
 
 

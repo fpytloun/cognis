@@ -141,6 +141,20 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
           if (canonicalEvidence.length > 64) canonicalEvidence.shift();
           checkDurable();
       }));
+      // Establish the active-leader precondition before adding the recipient's
+      // live-view reads. The recipient still subscribes before the tested admission.
+      if (mode !== 'normal') {
+        await injectScenario('single-phase-stream');
+        const armed = await fetch(`${MOCK_LLM_URL}/__mock/barrier`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ scenario_id: 'single-phase-stream', turn_index: 0 }),
+        });
+        expect(armed.status).toBe(201);
+        await sendMessage(sender, 'Synthetic active leader');
+        await expect(userRow(sender, 'Synthetic active leader')).toBeVisible();
+        const entered = await step('leader entered LLM barrier', () => fetch(`${MOCK_LLM_URL}/__mock/barrier`, { signal: AbortSignal.timeout(10_000) }));
+        expect(entered.status).toBe(204);
+      }
       await step('recipient login', () => login(recipient));
       const heldSnapshot = new Promise<void>(resolve => { releaseSnapshot = resolve; });
       let snapshotCaptured!: () => void;
@@ -163,17 +177,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
         if (mode !== 'normal') await expect(recipient.getByTestId('scoped-timeline-viewport')).toBeVisible();
       }
       if (mode === 'normal') await step('initial snapshot captured', () => capturedSnapshot);
-      await injectScenario('single-phase-stream');
-      if (mode !== 'normal') {
-        const armed = await fetch(`${MOCK_LLM_URL}/__mock/barrier`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ scenario_id: 'single-phase-stream', turn_index: 0 }),
-        });
-        expect(armed.status).toBe(201);
-        await sendMessage(sender, 'Synthetic active leader');
-        const entered = await step('leader entered LLM barrier', () => fetch(`${MOCK_LLM_URL}/__mock/barrier`, { signal: AbortSignal.timeout(10_000) }));
-        expect(entered.status).toBe(204);
-      }
+      if (mode === 'normal') await injectScenario('single-phase-stream');
       const text = `Independent admission ${crypto.randomUUID()}`;
       await step('upload synthetic attachment', () => sender.locator('input[type=file]').first().setInputFiles({
         name: 'cross-client-fixture.txt', mimeType: 'text/plain',
@@ -205,6 +209,11 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       expect(request.attachments.length).toBe(1);
       expect(request.attachments[0].artifact_id).toBeTruthy();
       releaseSnapshot();
+      if (mode !== 'normal') {
+        const held = await step('leader remains held through tested admission', () =>
+          fetch(`${MOCK_LLM_URL}/__mock/barrier`, { signal: AbortSignal.timeout(10_000) }));
+        expect(held.status).toBe(204);
+      }
       if (mode === 'absorbed') {
         expect((await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'PUT' })).status).toBe(204);
       } else if (mode === 'queued_after_ui_stop') {
@@ -216,7 +225,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
           return response.status;
         }, conversationId);
         expect(status).toBe(200);
-        await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'DELETE' });
+        expect((await fetch(`${MOCK_LLM_URL}/__mock/barrier`, { method: 'DELETE' })).status).toBe(204);
       }
       // No recipient fetch/reload is used to make the message appear.
       const recipientRow = userRow(recipient, text);
