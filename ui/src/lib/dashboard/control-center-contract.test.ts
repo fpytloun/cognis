@@ -13,7 +13,8 @@ describe('Control Center route contract', () => {
     expect(page).toContain('ControlCenter');
     expect(layout).toContain('href="/"');
     expect(layout).toContain('data-testid="sidebar-logo-link"');
-    expect(layout).toContain("{ href: '/', label: 'Dashboard'");
+    expect(layout).toContain('{#each navigationItems as item}');
+    expect(source('../navigation.ts')).toContain("{ href: '/', label: 'Dashboard'");
     expect(layout).toContain("href === '/' ? pathname === '/'");
     expect(source('../components/BottomTabBar.svelte')).toContain("{ href: '/', label: 'Dashboard'");
     expect(layout).not.toContain("href: '/work'");
@@ -30,16 +31,19 @@ describe('Control Center route contract', () => {
 
     expect(components).not.toContain('/api/v1/work/activities');
     expect(components).not.toContain('api.work.activities');
-    expect(source('../components/dashboard/ConversationModalWorkspace.svelte')).toContain('SharedInspectorTabs');
+    expect(source('../components/dashboard/ConversationModalWorkspace.svelte')).toContain('<ChatWorkspace');
+    expect(source('../components/chat-v2/ChatWorkspace.svelte')).toContain('SharedInspectorTabs');
     expect(components).toContain('TaskWorkPanel');
     expect(components).not.toContain("conversationTimelineScope(taskChat");
   });
 
   it('keeps task tabs and uses the canonical conversation inspector workspace', () => {
     const modal = source('../components/dashboard/DashboardEntityModal.svelte');
-    const workspace = source('../components/dashboard/ConversationModalWorkspace.svelte');
+    const wrapper = source('../components/dashboard/ConversationModalWorkspace.svelte');
+    const workspace = source('../components/chat-v2/ChatWorkspace.svelte');
 
     expect(modal).toContain('ConversationModalWorkspace');
+    expect(wrapper).toContain('<ChatWorkspace bind:this={workspace} {...props}');
     expect(workspace).toContain('SharedInspectorTabs');
     expect(workspace).toContain('SessionDetailsButton');
     expect(workspace).toContain('initialTab="overview"');

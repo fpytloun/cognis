@@ -1,11 +1,15 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import SessionDetailsButton from './components/session/SessionDetailsButton.svelte';
 
 const pageSource = readFileSync(
   resolve('src/routes/(app)/chat/[conversationId]/+page.svelte'),
   'utf8',
 );
+
+afterEach(cleanup);
 
 describe('mobile chat header contract', () => {
   it('keeps the canonical inspector action inside the single title header', () => {
@@ -16,11 +20,28 @@ describe('mobile chat header contract', () => {
     expect(headerStart).toBeGreaterThan(-1);
     expect(headerEnd).toBeGreaterThan(headerStart);
     expect(header).toContain('data-testid="chat-header-controls"');
-    expect(header).toContain('data-testid="chat-header-info"');
-    expect(header).toContain('aria-controls="conversation-info-drawer"');
-    expect(header).toContain('touch-target-compact');
+    expect(header).toContain('<SessionDetailsButton ');
+    expect(header).toContain('testId="chat-header-info"');
+    expect(header).toContain('ariaControls="conversation-info-drawer"');
+    expect(header).toContain('onclick={toggleHeaderInfo}');
     expect(header).not.toContain('conversation-mobile-inspector-control');
-    expect(header.match(/data-testid="chat-header-info"/g)).toHaveLength(1);
+    expect(header.match(/testId="chat-header-info"/g)).toHaveLength(1);
+  });
+
+  it('renders the shared inspector action with the drawer binding and toggle semantics', async () => {
+    const onclick = vi.fn();
+    const view = render(SessionDetailsButton, {
+      open: false, ariaControls: 'conversation-info-drawer', testId: 'chat-header-info', onclick,
+    });
+    const button = screen.getByRole('button', { name: 'Toggle session details' });
+    expect(screen.getAllByTestId('chat-header-info')).toHaveLength(1);
+    expect(button).toHaveAttribute('aria-controls', 'conversation-info-drawer');
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+    expect(button).toHaveClass('touch-target-compact');
+    await fireEvent.click(button);
+    expect(onclick).toHaveBeenCalledTimes(1);
+    await view.rerender({ open: true });
+    expect(button).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('keeps header spacing responsive and delegates status-area ownership to shared CSS', () => {

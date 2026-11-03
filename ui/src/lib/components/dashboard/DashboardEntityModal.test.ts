@@ -1,6 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import 'fake-indexeddb/auto';
 
+import { documentCoordination } from '$lib/document-coordination';
 import type { Conversation, TaskDetail } from '$lib/types/api';
 import DashboardEntityModal from './DashboardEntityModal.svelte';
 import {
@@ -18,6 +20,11 @@ const { taskDetail, controlChat, stepRunDetail, conversationDetail, gateResponse
 }));
 
 vi.mock('$app/navigation', () => ({ goto: vi.fn() }));
+vi.mock('$lib/chat-v2/api', async (original) => {
+  const module = await original<typeof import('$lib/chat-v2/api')>();
+  return { ...module, chatV2Api: { ...module.chatV2Api,
+    activityOverview: vi.fn().mockResolvedValue({ workstreams: [] }) } };
+});
 vi.mock('$lib/stores/auth', async () => {
   const { readable, get } = await import('svelte/store');
   const store = readable({
@@ -43,7 +50,7 @@ vi.mock('$lib/api/client', () => ({
       gateResponse,
       stepResponse: vi.fn()
     },
-    conversations: { detail: conversationDetail },
+    conversations: { detail: conversationDetail, sessions: vi.fn().mockResolvedValue([]) },
     deliverables: { getForStepRun: vi.fn(), get: getDeliverable },
     notifications: { list: vi.fn().mockResolvedValue([]), resolve: vi.fn() }
   },
@@ -58,7 +65,9 @@ beforeAll(() => {
 });
 
 afterEach(cleanup);
-beforeEach(() => {
+beforeEach(async () => {
+  await documentCoordination().beginLogin();
+  await documentCoordination().verified('user@example.com');
   taskDetail.mockReset();
   controlChat.mockReset();
   stepRunDetail.mockReset();
@@ -395,9 +404,11 @@ describe('DashboardEntityModal', () => {
     expect(await screen.findByTestId('session-logs-panel')).toBeVisible();
     expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow');
     await fireEvent.click(screen.getByRole('button', { name: 'View delegate session' }));
-    expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'session:session-delegate');
-    await fireEvent.click(screen.getByRole('button', { name: 'Back' }));
-    expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow');
+    await waitFor(() => expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'session:session-delegate'));
+    const parentLink = screen.getByRole('link', { name: 'Back to parent conversation' });
+    expect(parentLink).toHaveAttribute('href', '/chat/conversation-prepare');
+    await fireEvent.click(parentLink);
+    await waitFor(() => expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow'));
     await fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByTestId('session-logs-panel')).not.toBeInTheDocument());
     expect(screen.getByTestId('dashboard-task-modal-panel-steps')).toBeInTheDocument();

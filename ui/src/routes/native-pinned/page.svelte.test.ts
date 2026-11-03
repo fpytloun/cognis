@@ -1,21 +1,29 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
-import { writable } from 'svelte/store';
+import type { Writable } from 'svelte/store';
 import 'fake-indexeddb/auto';
 import type { Conversation } from '$lib/types/api';
 
 const mocks = vi.hoisted(() => ({ bridge: vi.fn(), resolve: vi.fn(), read: vi.fn(), detail: vi.fn() }));
-const route = writable({ url: new URL('https://fixture.invalid/native-pinned?agent=agent_a&conversation=conv_a') });
-const ready = writable(true);
-const session = writable({ status: 'authenticated', user: { email: 'native@fixture.invalid' } });
-const visible = writable({ visible: true, focused: true });
-vi.mock('$app/stores', () => ({ page: { subscribe: (...args: Parameters<typeof route.subscribe>) => route.subscribe(...args) } }));
-vi.mock('$lib/stores/auth', () => ({ auth: { subscribe: (...args: Parameters<typeof session.subscribe>) => session.subscribe(...args) } }));
-vi.mock('$lib/offline/session', () => ({ deviceDataReady: { subscribe: (...args: Parameters<typeof ready.subscribe>) => ready.subscribe(...args) } }));
-vi.mock('$lib/native/host', () => ({ isNativeHost: () => true, isWorkspaceReplica: () => false, nativeConfiguration: () => null,
-  hostAllowsObservation: () => true, postNative: mocks.bridge,
-  nativeVisibility: { subscribe: (...args: Parameters<typeof visible.subscribe>) => visible.subscribe(...args) } }));
+vi.mock('$app/stores', async () => {
+  const { writable } = await import('svelte/store');
+  return { page: writable({ url: new URL('https://fixture.invalid/native-pinned?agent=agent_a&conversation=conv_a') }) };
+});
+vi.mock('$lib/stores/auth', async () => {
+  const { writable } = await import('svelte/store');
+  return { auth: writable({ status: 'authenticated', user: { email: 'native@fixture.invalid' } }) };
+});
+vi.mock('$lib/offline/session', async () => {
+  const { writable } = await import('svelte/store');
+  return { deviceDataReady: writable(true) };
+});
+vi.mock('$lib/native/host', async () => {
+  const { writable } = await import('svelte/store');
+  return { isNativeHost: () => true, isWorkspaceReplica: () => false, nativeConfiguration: () => null,
+    hostAllowsObservation: () => true, postNative: mocks.bridge,
+    nativeVisibility: writable({ visible: true, focused: true }) };
+});
 vi.mock('$lib/api/client', async (original) => {
   const module = await original<typeof import('$lib/api/client')>();
   return { ...module, api: { ...module.api, agents: { ...module.api.agents,
@@ -30,6 +38,13 @@ import { conversationWorkspace } from '$lib/dashboard/conversation-workspace';
 import { pinnedConversations, pinnedAgents } from '$lib/dashboard/conversation-workspace-runtime';
 import { DocumentDrafts } from '$lib/offline/document-drafts';
 import { documentCoordination } from '$lib/document-coordination';
+import { page } from '$app/stores';
+import { auth } from '$lib/stores/auth';
+import { nativeVisibility } from '$lib/native/host';
+
+const route = page as unknown as Writable<{ url: URL }>;
+const session = auth as unknown as Writable<{ status: string; user: { email: string } }>;
+const visible = nativeVisibility as Writable<{ visible: boolean; focused: boolean }>;
 
 const conversation = (id: string, agent = 'agent_a') => ({
   conversation_id: id, agent_id: agent, title: id, status: 'completed', has_unread: true,
@@ -39,6 +54,11 @@ const go = async (query: string) => {
   route.set({ url: new URL(`https://fixture.invalid/native-pinned?${query}`) }); await tick();
 };
 beforeEach(async () => {
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
   vi.resetAllMocks(); localStorage.clear();
   session.set({ status: 'authenticated', user: { email: 'native@fixture.invalid' } });
   visible.set({ visible: true, focused: true });
@@ -58,6 +78,7 @@ beforeEach(async () => {
 });
 afterEach(() => {
   cleanup(); conversationWorkspace.setOwner(null, null); pinnedConversations.set({});
+  vi.unstubAllGlobals();
 });
 it('retires real pinned A before direct B, ignores A activity/unpin, and preserves drafts in both directions', async () => {
   const drafts = new DocumentDrafts();

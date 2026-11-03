@@ -24,6 +24,11 @@ vi.mock('$lib/stores/userPreferences', () => ({
 }));
 
 beforeEach(async () => {
+  vi.stubGlobal('ResizeObserver', class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
   bridge.mockClear();
   document.documentElement.style.fontSize = '16px';
   testPage.set({ url: new URL('https://rail.invalid/chat/first'), params: {} });
@@ -45,7 +50,7 @@ beforeEach(async () => {
   await conversationWorkspace.execute({ type: 'select', agentId: 'agent-first', key: 'conversation:first' });
   pinnedConversations.set({ first, second });
 });
-afterEach(() => { cleanup(); conversationWorkspace.setCommand(null); conversationWorkspace.setOwner(null, null); });
+afterEach(() => { cleanup(); conversationWorkspace.setCommand(null); conversationWorkspace.setOwner(null, null); vi.unstubAllGlobals(); });
 
 describe('canonical dock in native rail placement', () => {
   it('uses original image sources and shared activity markup without selecting activity', async () => {
