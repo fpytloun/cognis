@@ -563,7 +563,7 @@ import X from 'lucide-svelte/icons/x';
   // localStorage. This protects PWA users when the browser evicts or
   // reloads the web chat while a message is still being drafted.
   const DRAFT_PREFIX = 'cognis-chat-draft:';
-  let currentDraftKey: string | null = null;
+   let currentDraftKey = $state<string | null>(null);
   let draftSaveTimer: number | null = null;
 
   function readDraft(key: string): string {

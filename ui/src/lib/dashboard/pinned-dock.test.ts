@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { aggregatePinnedActivity, pinnedDockGeometry, pinnedAvatarPositions, pinnedThrow, pinnedEdgeGesture, pinnedBlockRows, pinnedMessageActivityAt, hasNewPinnedNotification, PINNED_AVATAR_GAP, isPinnedWorkspaceRoute } from './pinned-dock';
+import { aggregatePinnedActivity, pinnedDockGeometry, pinnedAvatarPositions, pinnedThrow, pinnedEdgeGesture, pinnedBlockRows, pinnedMessageActivityAt, hasNewPinnedNotification, PINNED_AVATAR_GAP, isPinnedWorkspaceRoute, pinnedAvatarTuckOffset } from './pinned-dock';
 import type { Conversation } from '$lib/types/api';
 import type { ActivityAvatarState } from '$lib/conversation-activity';
 const neutral: ActivityAvatarState = { active: false, background: false, attention: false,
   unread: false, error: false, tone: 'default', label: 'Idle' };
 
 describe('pinned dock', () => {
+  it.each([36, 42, 48, 60])('centers a tucked %ipx face on either viewport edge', (size) => {
+    const targetWidth = size * 4 / 3;
+    expect(-targetWidth + size / 2 + pinnedAvatarTuckOffset(size)).toBeCloseTo(0);
+    expect(size / 3 + size / 2 - pinnedAvatarTuckOffset(size)).toBeCloseTo(0);
+  });
+
   it('uses message time rather than open/read/session metadata for activity ordering', () => {
     const base = { last_message_at: '2026-10-15T08:00:00Z', pending_notification_types: [] } as unknown as Conversation;
     expect(pinnedMessageActivityAt({ ...base, updated_at: '2099-01-01', active_session_updated_at: '2099-01-01' }))

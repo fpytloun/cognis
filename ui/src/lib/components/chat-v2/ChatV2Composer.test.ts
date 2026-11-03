@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { api } from '$lib/api/client';
 import ChatV2Composer from './ChatV2Composer.svelte';
 import SettingsFixture from './ChatV2Composer.settings-test-fixture.svelte';
+import InputFixture from './ChatV2Composer.input-test-fixture.svelte';
 
 function props(overrides: Record<string, unknown> = {}) {
   return {
@@ -17,6 +18,15 @@ function props(overrides: Record<string, unknown> = {}) {
 }
 
 describe('ChatV2Composer', () => {
+  it('publishes the newly bound text before notifying the input owner', async () => {
+    render(InputFixture);
+    const input = screen.getByRole('textbox');
+    await fireEvent.input(input, { target: { value: 'first edit' } });
+    expect(screen.getByTestId('observed-input')).toHaveTextContent('["first edit"]');
+    await fireEvent.input(input, { target: { value: 'newer edit' } });
+    expect(screen.getByTestId('observed-input')).toHaveTextContent('["first edit","newer edit"]');
+  });
+
   it('hides settings during an active turn and restores them when idle', async () => {
     const { rerender } = render(SettingsFixture, { active: false });
     expect(screen.getByRole('button', { name: 'Chat settings' })).toBeVisible();

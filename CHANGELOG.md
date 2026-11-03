@@ -8,10 +8,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Deliver canonical event updates to conversation subscribers that connected before the first session existed, while preserving child-session isolation.
 - Allow controller package publication to retry an existing immutable project tag without rebuilding from a newer application revision, and recognize the build-only workspace manifest needed by locked dependency export while continuing to reject executor implementation in controller images.
 - Finish database-session rollback before a cancelled caller returns, including repeated cancellation during cleanup.
+- Deliver canonical event updates to conversation subscribers that connected before the first session existed, while preserving child-session isolation.
 - Keep agent configuration usable when persisted model metadata omits optional reasoning-effort or fast-mode capabilities.
+- Keep full-chat drafts synchronized with pinned and dashboard views, and align tucked avatars at custom interface font sizes.
 ## [0.18.2] - 2026-10-24
 
 ### Highlights

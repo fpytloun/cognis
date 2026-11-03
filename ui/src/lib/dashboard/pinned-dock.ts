@@ -3,6 +3,11 @@ import type { Conversation } from '$lib/types/api';
 
 export const PINNED_AVATAR_GAP = 6;
 
+/** Center a tucked 3rem face on the edge of its 4rem hit target at any font scale. */
+export function pinnedAvatarTuckOffset(avatarSize: number): number {
+  return avatarSize / 3 + avatarSize / 2;
+}
+
 /** Reading/opening metadata is not activity; message time is the durable baseline. */
 export function pinnedMessageActivityAt(conversation: Conversation | null | undefined): number {
   return conversation?.last_message_at ? Date.parse(conversation.last_message_at) || 0 : 0;

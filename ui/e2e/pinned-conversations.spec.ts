@@ -34,7 +34,7 @@ test.describe('dashboard retained-capacity restore', () => {
     ];
     await page.addInitScript(({ storageKey, retained }) => {
       localStorage.setItem(storageKey, JSON.stringify({
-        version: 1, position: 0.6, migrated: [],
+        version: 1, position: 0.6, migrated: [], tucked: false,
         agents: [{ agentId: 'agent-stage39' }],
         entries: retained.map((chat, i) => ({
           projectId: chat.project_id, layouts: {},
@@ -58,6 +58,8 @@ test.describe('dashboard retained-capacity restore', () => {
     await page.goto('/');
     await expect(page.getByTestId(`dashboard-conversation-row-${target.conversation_id}`).first()).toBeVisible({ timeout: 20_000 });
     await expect(page.locator('[data-workspace-window][data-minimized="false"], .workspace-window[data-minimized="false"]')).toHaveCount(4);
+    await page.getByTestId('workspace-dismiss-backdrop').click({ position: { x: 20, y: 15 } });
+    await expect(page.locator('[data-workspace-window][data-minimized="false"], .workspace-window[data-minimized="false"]')).toHaveCount(0);
     // Calibrate the independent recorder against an actual browser request.
     // Route fulfillment and fixture conversation membership must not hide reads.
     await page.evaluate(async (id) => {
@@ -72,8 +74,11 @@ test.describe('dashboard retained-capacity restore', () => {
     const { state, target } = await capacityFixture(page);
     const row = page.getByTestId(`dashboard-conversation-row-${target.conversation_id}`).first();
     await row.click({ position: { x: 20, y: 15 } });
-    await row.click({ position: { x: 20, y: 15 } });
     const panel = page.getByTestId(`workspace-window-conversation:${target.conversation_id}`);
+    await expect(panel).toHaveAttribute('data-minimized', 'false');
+    await page.getByTestId('workspace-dismiss-backdrop').click({ position: { x: 20, y: 15 } });
+    await expect(panel).toHaveAttribute('data-minimized', 'true');
+    await row.click({ position: { x: 20, y: 15 } });
     await expect(panel).toHaveAttribute('data-minimized', 'false');
     await expect(panel).toHaveAttribute('data-focused', 'true');
     await expect(page.getByText(/limit reached/i)).toHaveCount(0);
@@ -120,7 +125,8 @@ test.describe('dashboard retained-capacity restore', () => {
   });
 });
 
-async function fixture(page: Page, seed = true, windows = true, display: Record<string, boolean> = {}, chatCount = 3) {
+async function fixture(page: Page, seed = true, windows = true, display: Record<string, boolean> = {}, chatCount = 3,
+  workspaceOptions: { tucked?: boolean } = {}) {
   const errors: string[] = [];
   page.on('pageerror', (error) => { errors.push(error.message); console.error(error.message); });
   await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: windows });
@@ -205,10 +211,10 @@ async function fixture(page: Page, seed = true, windows = true, display: Record<
       : { project_id: 'proj_home', name: 'Home', description: '', status: 'active', instructions: '', sources: [], workflow_ids: [], agents: [], grants: [], caller_role: 'owner' };
     return route.fulfill({ json });
   });
-  if (seed) await page.addInitScript(({ storageKey, chats, homes }) => {
+  if (seed) await page.addInitScript(({ storageKey, chats, homes, tucked }) => {
     if (localStorage.getItem(storageKey)) return;
     localStorage.setItem(storageKey, JSON.stringify({
-      version: 1, position: 0.6, migrated: [],
+      version: 1, position: 0.6, migrated: [], tucked,
       agents: homes.map((home) => ({ agentId: home.agent_id, homeConversationId: home.conversation_id })),
       entries: chats.map((chat, index) => ({
         projectId: chat.project_id, layouts: {},
@@ -221,7 +227,7 @@ async function fixture(page: Page, seed = true, windows = true, display: Record<
         },
       })),
     }));
-  }, { storageKey, chats: chats.slice(0, chatCount), homes });
+  }, { storageKey, chats: chats.slice(0, chatCount), homes, tucked: workspaceOptions.tucked ?? false });
   return { errors, reads: () => readCalls, settle: () => { active = false; },
     readAll: () => { allRead = true; },
     opened: (id: string, time: string) => { openedTimes.set(id, time); },
@@ -322,6 +328,7 @@ test(`avatar selection persists through tabs and genuine dismissals (standalone=
   await page.goto('/notifications');
   const avatar = page.locator('[data-pinned-agent="agent-stage39"]');
   const panel = page.getByTestId('pinned-chat-panel');
+  await expect(avatar).toHaveAccessibleName('Open pinned chats with Butler');
   await avatar.click();
   await panel.getByRole('tab', { name: /Kitchen renovation/ }).click();
   await panel.locator('textarea').first().fill('Persistent avatar draft');
@@ -476,6 +483,7 @@ test('click-away consumes the first click without activating underlying backgrou
     });
     document.body.append(target);
   });
+  await expect(page.getByTestId('pinned-chat-launcher')).toHaveAttribute('data-pinned-agent', 'agent-second');
   await openButler(page);
   const panel = page.getByTestId('pinned-chat-panel');
   await expect(panel).toBeVisible();
@@ -686,7 +694,7 @@ for (const editDuringRequest of [false, true]) {
   });
 }
 
-test('saved tuck temporarily reveals on hover and chat opening, and toggle works both ways', async ({ page }) => {
+test('saved tuck temporarily reveals on hover and chat opening, and toggle works both ways', async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
@@ -695,10 +703,29 @@ test('saved tuck temporarily reveals on hover and chat opening, and toggle works
   await page.mouse.move(300, 100);
   const stack = page.getByTestId('pinned-agent-stack');
   await expect(stack).toHaveAttribute('data-tucked', 'true');
+  await testInfo.attach('tucked-avatar-geometry', {
+    contentType: 'application/json',
+    body: Buffer.from(JSON.stringify(await page.getByTestId('pinned-chat-launcher')
+      .getByTestId('pinned-avatar-face').evaluate(async (node) => {
+        const button = node.closest('button')!;
+        await Promise.all([...node.getAnimations(), ...button.getAnimations()]
+          .filter(animation => animation.effect?.getTiming().iterations !== Infinity)
+          .map(animation => animation.finished.catch(() => {})));
+        return {
+          viewportWidth: innerWidth, face: node.getBoundingClientRect().toJSON(),
+          button: button.getBoundingClientRect().toJSON(),
+          buttonBorder: getComputedStyle(button).borderLeftWidth,
+          faceTransform: getComputedStyle(node).transform,
+        };
+      }))),
+  });
   await expect.poll(async () => {
     const rect = (await page.getByTestId('pinned-chat-launcher').getByTestId('pinned-avatar-face').boundingBox())!;
     return Math.abs(rect.x + rect.width / 2 - 1440);
   }).toBeLessThan(2);
+  const tuckedPreview = testInfo.outputPath('tucked-avatars-synthetic-preview.png');
+  await page.screenshot({ path: tuckedPreview });
+  await testInfo.attach('tucked-avatars-synthetic-preview', { path: tuckedPreview });
   await page.reload();
   await expect(stack).toHaveAttribute('data-tucked', 'true');
   await page.keyboard.press('Tab');
@@ -843,7 +870,7 @@ for (const collapsed of [true, false]) {
 
 test('persistent block orders recent activity first, keeps tucked state and moves as a unit', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
-  const state = await fixture(page, true, true, { pinned_agents_collapsed: false });
+  const state = await fixture(page, true, true, { pinned_agents_collapsed: false }, 3, { tucked: true });
   state.settle();
   await page.goto('/notifications');
   const block = page.getByTestId('pinned-agent-block');
@@ -1166,6 +1193,7 @@ test('reduced motion keeps expansion instant while preserving keyboard movement'
   const state = await fixture(page);
   await page.goto('/notifications');
   const launcher = page.getByTestId('pinned-chat-launcher');
+  await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
   await launcher.click();
   expect(await page.locator('[data-pinned-agent]').evaluateAll((nodes) => nodes.every((node) => !node.getAnimations().length))).toBe(true);
   const before = (await launcher.boundingBox())!;
@@ -1281,9 +1309,11 @@ test('project windows do not create or remove global agent pins', async ({ page 
   await page.getByRole('tab', { name: /^Conversations/ }).click();
   await page.getByRole('button', { name: /Kitchen renovation/ }).first().click();
   await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toBeVisible();
+  await page.getByTestId('workspace-window-minimize-conversation:conv-task-chat').click();
   await page.getByRole('link', { name: 'Notifications', exact: true }).click();
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
   await page.goto('/projects/proj_home');
+  await page.getByTestId('workspace-dock-restore-conversation:conv-task-chat').click();
   await page.getByTestId('workspace-window-close-conversation:conv-task-chat').click();
   await page.goto('/notifications');
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
@@ -1296,12 +1326,13 @@ for (const width of [768, 2560]) {
     const state = await fixture(page);
     await page.goto('/notifications');
     const launcher = page.getByTestId('pinned-chat-launcher');
+    await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
     await launcher.click();
     await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
     const panel = page.getByTestId('pinned-chat-panel');
     await expect(panel).toBeVisible();
     const usableWidth = await page.evaluate(() => document.documentElement.clientWidth);
-    const edgeInset = await panel.evaluate((node) => parseFloat(getComputedStyle(node).right));
+    const edgeInset = await panel.evaluate((node) => parseFloat(getComputedStyle(node.parentElement!).right));
     await expect.poll(async () => {
       const rect = (await panel.boundingBox())!;
       return Math.abs(rect.x + rect.width - (usableWidth - edgeInset));

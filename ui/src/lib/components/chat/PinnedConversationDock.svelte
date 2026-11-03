@@ -9,7 +9,7 @@
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import WorkspaceVeil from '$lib/components/dashboard/WorkspaceVeil.svelte';
   import { conversationWorkspace } from '$lib/dashboard/conversation-workspace';
-  import { aggregatePinnedActivity, pinnedActivityRank, PINNED_AVATAR_GAP, pinnedDockGeometry, pinnedAvatarPositions, pinnedThrow, pinnedEdgeGesture, pinnedBlockRows, isPinnedWorkspaceRoute } from '$lib/dashboard/pinned-dock';
+  import { aggregatePinnedActivity, pinnedActivityRank, PINNED_AVATAR_GAP, pinnedDockGeometry, pinnedAvatarPositions, pinnedThrow, pinnedEdgeGesture, pinnedBlockRows, isPinnedWorkspaceRoute, pinnedAvatarTuckOffset } from '$lib/dashboard/pinned-dock';
   import { blockingOverlayActive } from '$lib/stores/overlays';
   import { loadUserPreferences, userPreferences } from '$lib/stores/userPreferences';
   import { createPinnedPanel } from './pinned-panel.svelte';
@@ -307,7 +307,7 @@
               else if (event.detail === 0 || lastPointerType !== 'touch') launch(group);
             }}>
             <span class="avatar-face absolute left-0 top-0 grid h-12 w-12 place-items-center rounded-full border border-control-border bg-surface shadow-card"
-              style:transform={visuallyTucked ? `translateX(${nativeRail && nativeLeft ? '-' : ''}${16 + avatarSize / 2}px)` : ''}
+               style:transform={visuallyTucked ? `translateX(${nativeRail && nativeLeft ? '-' : ''}${pinnedAvatarTuckOffset(avatarSize)}px)` : ''}
               style:transition={`transform ${dragging || reducedMotion ? 0 : 220}ms ease-out`} data-testid="pinned-avatar-face">
               {#key nudgeRevision}<span class="grid place-items-center" class:nudge={!reducedMotion && !dragging && nudgeAgent === group.id}>
                 <ActivityAvatar name={group.agent?.display_name ?? group.agent?.name ?? 'Agent'} avatarUrl={group.agent?.avatar_url} draggable={false}
