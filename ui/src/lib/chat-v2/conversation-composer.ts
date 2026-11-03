@@ -47,6 +47,9 @@ export class ConversationComposer {
     return snapshotPersistedMetadata(this.channel(id).hydration);
   }
   subscribe(id: string, listener: (input: CompositeInput) => void): () => void {
+    // Revocation already cleared these channels. A late view effect must not
+    // reattach an observer or throw while the existing recovery UI is mounting.
+    if (this.lease.signal.aborted) return () => {};
     this.lease.assertCurrent();
     // A failed hydration must remain fail-closed in its view, not retry from a
     // subscription effect and bypass the recovery UI's error boundary.

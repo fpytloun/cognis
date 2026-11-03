@@ -52,3 +52,24 @@ it('adopts clean external edits but preserves genuinely divergent local input', 
   expect(second.hydrate(id).input.text).toBe('local edit');
   await second.drafts.settled();
 });
+
+it('ignores observers of a revoked composer without restoring its mutation authority', async () => {
+  const owner = documentCoordination(), account = auth.getSnapshot().user!.email;
+  const stale = conversationComposer(), id = crypto.randomUUID();
+  const input = stale.hydrate(id).input;
+  let deliveries = 0;
+  const stop = stale.subscribe(id, () => { deliveries++; });
+  await owner.beginLogin();
+  expect(() => stale.subscribe(id, () => { deliveries++; })).not.toThrow();
+  await owner.verified(account);
+  const current = conversationComposer();
+  expect(current).not.toBe(stale);
+  current.hydrate(id);
+  current.update(id, { ...input, input_revision: crypto.randomUUID(), text: 'New verified input' });
+  expect(deliveries).toBe(1);
+  expect(() => stale.hydrate(id)).toThrow('The account or server changed');
+  expect(() => stale.update(id, input)).toThrow('The account or server changed');
+  expect(() => stale.consumed(id, input.input_revision)).toThrow('The account or server changed');
+  stop();
+  await current.drafts.settled();
+});
