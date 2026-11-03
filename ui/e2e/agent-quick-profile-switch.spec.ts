@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 
+test.use({ colorScheme: 'dark' });
+
 // Exercise the production chat route against a deterministic HTTP boundary.
 // No live agents, provider calls, or user configuration are modified.
 async function mockChat(page: Page, toggle = false, many = false, overridden = false) {

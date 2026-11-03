@@ -2,7 +2,7 @@ import { fileURLToPath, URL } from 'node:url';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vite';
 
-const shim = fileURLToPath(new URL('./e2e/window-drag/environment.ts', import.meta.url));
+const shim = fileURLToPath(new URL('./e2e/fixtures/environment.ts', import.meta.url));
 // Compile-time probes exist only in this opt-in fixture bundle. Never rewrite
 // application sources or silently instrument a normal performance measurement.
 const probe = (kind: string, scope: string, controller?: string) =>

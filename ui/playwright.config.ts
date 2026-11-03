@@ -1,4 +1,11 @@
 import { defineConfig, devices } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+
+const harnesses: { specs?: string[]; grep?: string }[] = JSON.parse(
+  readFileSync(new URL('./browser-harnesses.json', import.meta.url), 'utf8')
+);
+const routed = harnesses.filter((harness) => harness.specs);
+const escapePattern = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * Playwright configuration for L3 browser e2e tests.
@@ -7,11 +14,15 @@ import { defineConfig, devices } from '@playwright/test';
  *   make e2e-up && make e2e-seed
  *
  * Run:
- *   cd ui && npx playwright test e2e/
- *   cd ui && npx playwright test e2e/ --ui  (interactive)
+ *   make e2e-browser  (all owning harnesses and devices)
+ *   cd ui && npx playwright test --ui  (compose-owned cases only)
  */
 export default defineConfig({
   testDir: './e2e',
+  testIgnore: routed.filter((harness) => !harness.grep).flatMap((harness) =>
+    harness.specs!.map((spec) => `**/${spec}`)),
+  grepInvert: new RegExp(routed.filter((harness) => harness.grep).flatMap((harness) =>
+    harness.specs!.map((spec) => `${escapePattern(spec)}.*(?:${harness.grep})`)).join('|')),
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,  // Sequential — shared compose stack

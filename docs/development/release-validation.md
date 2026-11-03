@@ -45,6 +45,30 @@ private captures, and rejects a missing or empty configured live corpus.
 Ordinary runs without this variable retain the tracked output locations.
 Review generated captures before explicitly promoting them into public source.
 
+## Browser harness ownership
+
+Use `make e2e-browser` for the complete browser gate. The default Playwright
+configuration owns compose-app cases, not isolated fixture pages. The matrix
+in `ui/browser-harnesses.json` routes every other case through its existing
+fixture server, viewport and required browser projects. Selection-copy cases
+retain both Chromium and iPad coverage and use `COGNIS_E2E_URL`.
+
+The runner independently lists the complete test directory, verifies exactly
+one logical owner and all required device executions, then runs each harness
+sequentially under one unchanged 3600-second budget. Assertions, retry counts
+and per-config timeouts remain owned by the existing configurations. Missing
+cases, devices, execution results, `.only`, empty groups or failed commands
+fail the gate. Skips and flaky attempts remain explicit in each group's report.
+Reports and artifacts are retained separately per group. Set `--output-root`
+when invoking `uv run python scripts/run_browser_matrix.py` to retain a new run.
+`--inventory-only` checks routing but is not execution or release qualification.
+
+`playwright.pinned.config.ts` is the pinned-conversation owner; the older
+`playwright.compiled.config.ts` has identical tests, device, retry and preview
+inputs with only a different port, and is not a separate matrix execution.
+For interactive compose-only debugging, use `make e2e-browser-ui`; use an
+explicit owning config for fixture-page debugging.
+
 ## Failure triage
 
 Classify each failure before editing:

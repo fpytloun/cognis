@@ -110,7 +110,7 @@ e2e-events-replay:
 
 .PHONY: e2e-browser
 e2e-browser:
-	cd ui && npx playwright test e2e/ --workers=1
+	uv run python scripts/run_browser_matrix.py
 
 .PHONY: e2e-browser-ui
 e2e-browser-ui:

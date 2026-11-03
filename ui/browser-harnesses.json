@@ -1,0 +1,12 @@
+[
+  {"name":"compose","config":"playwright.config.ts","projects":["chromium"]},
+  {"name":"activity-drawer","config":"playwright.activity-drawer.config.ts","specs":["activity-drawer.spec.ts"],"projects":[""]},
+  {"name":"attachment-idb","config":"playwright.attachment-idb.config.ts","specs":["attachment-idb.spec.ts"],"projects":["chromium","webkit"]},
+  {"name":"chat-workspace","config":"playwright.chat-workspace.config.ts","specs":["unified-chat-workspace.spec.ts"],"projects":["chromium"]},
+  {"name":"pinned","config":"playwright.pinned.config.ts","specs":["pinned-conversations.spec.ts"],"projects":["chromium"]},
+  {"name":"composer","config":"playwright.composer.config.ts","specs":["queued-composer.spec.ts"],"projects":["chromium","webkit"]},
+  {"name":"sidebar-refresh","config":"playwright.sidebar-refresh.config.ts","specs":["sidebar-refresh-recovery.spec.ts"],"projects":["chromium"]},
+  {"name":"timeline","config":"playwright.timeline-client.config.ts","specs":["timeline-client-diagnostic.spec.ts","timeline-history.spec.ts","chat-loading-audit.spec.ts"],"projects":["chromium","webkit"]},
+  {"name":"window-drag","config":"playwright.window-drag.config.ts","specs":["dashboard-window-drag.spec.ts"],"projects":["chromium"]},
+  {"name":"selection-copy","config":"playwright.selection-copy.config.ts","specs":["canonical-deliverable-pwa.spec.ts"],"grep":"selection copy preserves","projects":["chromium","webkit-ipad"]}
+]

@@ -461,7 +461,7 @@ For ordering, identity, reconnect, or projection changes:
 ```bash
 uv run pytest tests/e2e/ -v
 make e2e-events-replay
-cd ui && npx playwright test e2e/
+uv run python scripts/run_browser_matrix.py
 ```
 
 Canonical client invariants live in
