@@ -8,14 +8,16 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- Finish database-session rollback before a cancelled caller returns, including repeated cancellation during cleanup.
-- Render dashboard agent chat windows from their canonical agent identity so newly opened or retained windows no longer appear empty when optional metadata is absent.
-- Mark conversations as read only after their displayed transcript is loaded, preserving read tracking across minimized windows and avoiding duplicate updates when pinned panels resume.
-- Preserve known running activity during incomplete executor telemetry, including conversations without unread messages and activity reported across Waiting pages.
-- Keep agent configuration usable when persisted model metadata omits optional reasoning-effort or fast-mode capabilities.
-- Deliver canonical event updates to conversation subscribers that connected before the first session existed, while preserving child-session isolation.
-- Allow controller package publication to retry an existing immutable project tag without rebuilding from a newer application revision, and recognize the build-only workspace manifest needed by locked dependency export while continuing to reject executor implementation in controller images.
+- Keep dashboard provider cards compact when several quota windows and reset times are displayed, without hiding reset information or reducing refresh controls.
+- Keep knowledge search and document navigation responsive after opening a search result or a document deep link.
 - Keep full-chat drafts synchronized with pinned and dashboard views, and align tucked avatars at custom interface font sizes.
+- Render dashboard agent chat windows from their canonical agent identity so newly opened or retained windows no longer appear empty when optional metadata is absent.
+- Deliver canonical event updates to conversation subscribers that connected before the first session existed, while preserving child-session isolation.
+- Keep agent configuration usable when persisted model metadata omits optional reasoning-effort or fast-mode capabilities.
+- Allow controller package publication to retry an existing immutable project tag without rebuilding from a newer application revision, and recognize the build-only workspace manifest needed by locked dependency export while continuing to reject executor implementation in controller images.
+- Preserve known running activity during incomplete executor telemetry, including conversations without unread messages and activity reported across Waiting pages.
+- Finish database-session rollback before a cancelled caller returns, including repeated cancellation during cleanup.
+- Mark conversations as read only after their displayed transcript is loaded, preserving read tracking across minimized windows and avoiding duplicate updates when pinned panels resume.
 ## [0.18.2] - 2026-10-24
 
 ### Highlights
