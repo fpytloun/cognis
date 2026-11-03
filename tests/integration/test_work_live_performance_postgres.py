@@ -5,6 +5,7 @@ import os
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -381,6 +382,16 @@ def _samples(
     started_queries: dict[int, float] = {}
     slowest: tuple[str, Any, float] = ("", (), 0.0)
     recent_queries: dict[str, tuple[str, Any]] = {}
+    request_queries = ContextVar("work_performance_request_queries", default=False)
+
+    def foreground_get() -> Any:
+        # TestClient propagates this context through authentication and request
+        # children; independently started lifespan workers retain the default.
+        token = request_queries.set(True)
+        try:
+            return client.get(path, headers=_headers(client))
+        finally:
+            request_queries.reset(token)
 
     def capture(
         _connection: object,
@@ -390,6 +401,8 @@ def _samples(
         _context: object,
         _executemany: object,
     ) -> None:
+        if not request_queries.get():
+            return
         statements.append(statement)
         started_queries[id(_context)] = time.perf_counter()
         if "recent_activity_ranked" in statement:
@@ -435,12 +448,12 @@ def _samples(
     sa.event.listen(client.app.state.engine.sync_engine, "after_cursor_execute", captured)
     try:
         for _ in range(2):
-            response = client.get(path, headers=_headers(client))
+            response = foreground_get()
             assert response.status_code == 200, response.text
         for _ in range(repeats):
             statements.clear()
             started = time.perf_counter()
-            response = client.get(path, headers=_headers(client))
+            response = foreground_get()
             timings.append((time.perf_counter() - started) * 1000)
             counts.append(len(statements))
             assert response.status_code == 200, response.text
