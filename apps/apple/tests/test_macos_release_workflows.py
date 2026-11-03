@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -133,11 +134,16 @@ class WorkflowTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/executor-release.yml").read_text()
         self.assertIn("workflow_dispatch:", workflow)
         source = textwrap.dedent(workflow.split("run: |\n", 1)[1].split("\n  build:", 1)[0])
+        version = tomllib.loads((ROOT / "packages/executor/pyproject.toml").read_text())["project"][
+            "version"
+        ]
+        major, minor, patch = map(int, version.split("."))
+        mismatched_tag = f"v{major}.{minor}.{patch + 1}"
         for ref_type, tag, valid in (
-            ("tag", "v0.18.2", True),
-            ("branch", "v0.18.2", False),
-            ("tag", "0.18.2", False),
-            ("tag", "v0.17.1", False),
+            ("tag", f"v{version}", True),
+            ("branch", f"v{version}", False),
+            ("tag", version, False),
+            ("tag", mismatched_tag, False),
         ):
             with self.subTest(ref_type=ref_type, tag=tag):
                 result = subprocess.run(

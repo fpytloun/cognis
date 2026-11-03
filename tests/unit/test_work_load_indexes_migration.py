@@ -18,6 +18,7 @@ from cognis.bootstrap import (
 )
 from cognis.store.database import create_engine as create_async_engine
 from cognis.store.models import DirectTurnRequestRow, Session, StepRun
+from cognis.store.palette_indexes import ensure_palette_indexes, ensure_palette_task_run_index
 
 EXPECTED_INDEXES = {
     "sessions": {
@@ -335,10 +336,20 @@ async def test_postgresql_bootstrap_uses_separate_autocommit_connection() -> Non
         call.args[0] for call in transactional_connection.run_sync.await_args_list
     }
     assert _ensure_work_load_indexes not in transactional_helpers
+    assert ensure_palette_indexes not in transactional_helpers
+    assert ensure_palette_task_run_index not in transactional_helpers
     concurrent_connection.execution_options.assert_awaited_once_with(isolation_level="AUTOCOMMIT")
     assert [call.args[0] for call in concurrent_connection.run_sync.await_args_list] == [
         _ensure_work_call_state_index,
         _ensure_work_load_indexes,
+        ensure_palette_indexes,
+        ensure_palette_task_run_index,
+    ]
+    assert [call.kwargs for call in concurrent_connection.run_sync.await_args_list] == [
+        {},
+        {},
+        {"concurrently": True},
+        {"concurrently": True},
     ]
 
 

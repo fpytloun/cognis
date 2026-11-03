@@ -242,6 +242,33 @@ def test_postgres_integration_schemas_never_fall_back_to_public() -> None:
     assert offenders == []
 
 
+@pytest.mark.parametrize("corruption", ["unknown-table", "ordinary-search-tables"])
+def test_schema_parity_rejects_noncanonical_native_tables(tmp_path: Path, corruption: str) -> None:
+    database_path = tmp_path / "native_parity.db"
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
+    config.config_file_name = None
+    command.upgrade(config, "head")
+    engine = create_engine(f"sqlite:///{database_path}")
+    try:
+        with engine.begin() as connection:
+            assert_schema_matches_metadata(connection)
+            if corruption == "unknown-table":
+                connection.execute(sa.text("CREATE TABLE unregistered_metadata (id INTEGER)"))
+                expected = "unregistered_metadata"
+            else:
+                connection.execute(sa.text("DROP TABLE palette_deliverables"))
+                for suffix in ("", "_data", "_idx", "_docsize", "_config"):
+                    connection.execute(
+                        sa.text(f"CREATE TABLE palette_deliverables{suffix} (id INTEGER)")
+                    )
+                expected = "deliverables"
+            with pytest.raises(AssertionError, match=expected):
+                assert_schema_matches_metadata(connection)
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.asyncio
 async def test_fresh_sqlite_upgrade_to_head_remains_supported(tmp_path: Path) -> None:
     database_path = tmp_path / "migration.db"

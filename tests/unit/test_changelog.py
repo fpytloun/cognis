@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,13 @@ def release_repo(tmp_path: Path) -> Path:
     (tmp_path / "changelog.d").mkdir()
     for path in ("pyproject.toml", "changelog.d/template.md.jinja"):
         shutil.copyfile(ROOT / path, tmp_path / path)
+    config_path = tmp_path / "pyproject.toml"
+    config_text = config_path.read_text(encoding="utf-8")
+    next_version = tomllib.loads(config_text)["tool"]["cognis"]["changelog"]["next_version"]
+    config_path.write_text(
+        config_text.replace(f'next_version = "{next_version}"', 'next_version = "0.18.0"'),
+        encoding="utf-8",
+    )
     (tmp_path / "CHANGELOG.md").write_text(
         "# Changelog\n\n<!-- towncrier release notes start -->\n\n"
         "## [0.17.1] - 2026-09-28\n\n### Fixed\n\n- Stable replay.\n",

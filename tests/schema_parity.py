@@ -6,6 +6,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
 from cognis.store.models import Base
+from cognis.store.palette_indexes import SOURCES
 
 CONTROL_TABLES = {"alembic_version"}
 LEGACY_EXTRA_COLUMNS = {("deliverables", "outputs")}
@@ -107,10 +108,40 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
     inspector = sa.inspect(connection)
     expected_tables = set(Base.metadata.tables)
     actual_tables = set(inspector.get_table_names()) - CONTROL_TABLES
-    assert actual_tables == expected_tables
+    # Native FTS tables and their exact shadow tables are not portable ORM tables.
+    search_tables = (
+        {
+            f"palette_{table}{suffix}"
+            for _, table, _, _ in SOURCES
+            for suffix in ("", "_data", "_idx", "_docsize", "_config")
+        }
+        if connection.dialect.name == "sqlite"
+        else set()
+    )
+    assert actual_tables == expected_tables | search_tables, (
+        (expected_tables | search_tables) - actual_tables,
+        actual_tables - (expected_tables | search_tables),
+    )
+    if connection.dialect.name == "sqlite":
+        for _, table, _, name in SOURCES:
+            sql = connection.execute(
+                sa.text("SELECT sql FROM sqlite_master WHERE type='table' AND name=:name"),
+                {"name": f"palette_{table}"},
+            ).scalar_one()
+            assert "using fts5(" in sql.lower(), table
+            assert f"content='{table}'" in sql, table
+            expected_columns = {name, "display_name"} if table == "agents" else {name}
+            assert {
+                column["name"] for column in inspector.get_columns(f"palette_{table}")
+            } == expected_columns, table
 
     observed_extra_columns: set[tuple[str, str]] = set()
     observed_extra_indexes: set[tuple[str, str]] = set()
+    palette_indexes = (
+        {(table, f"ix_{table}_palette_name") for _, table, _, _ in SOURCES}
+        if connection.dialect.name == "postgresql"
+        else set()
+    )
     for table_name in sorted(expected_tables):
         table = Base.metadata.tables[table_name]
         actual_columns = {column["name"]: column for column in inspector.get_columns(table_name)}
@@ -142,6 +173,14 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
         )
 
         expected_index_names = {index.name for index in table.indexes}
+        for index in inspector.get_indexes(table_name):
+            if (table_name, index["name"]) in palette_indexes:
+                assert index.get("dialect_options", {}).get("postgresql_using") == "gin"
+                assert any(
+                    "palette_name_vector(" in expression
+                    for expression in index.get("expressions", ())
+                    if expression is not None
+                )
         expected_unique_names = {
             constraint.name
             for constraint in table.constraints
@@ -196,7 +235,8 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
         ), (table_name, missing_foreign_keys)
 
     assert observed_extra_columns == LEGACY_EXTRA_COLUMNS
-    assert observed_extra_indexes == LEGACY_EXTRA_INDEXES, (
+    expected_extra_indexes = LEGACY_EXTRA_INDEXES | palette_indexes
+    assert observed_extra_indexes == expected_extra_indexes, (
         observed_extra_indexes,
-        LEGACY_EXTRA_INDEXES,
+        expected_extra_indexes,
     )

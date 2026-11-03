@@ -19,7 +19,7 @@ sign_bundle = __import__("sign_bundle")
 class IntegratedReleaseTests(unittest.TestCase):
     def test_canonical_workspace_versions_remain_aligned(self):
         version = json.loads((ROOT / "ui/package.json").read_text())["version"]
-        self.assertEqual(version, "0.18.0")
+        self.assertRegex(version, r"\A(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\Z")
         for relative in (
             "pyproject.toml",
             "packages/common/pyproject.toml",

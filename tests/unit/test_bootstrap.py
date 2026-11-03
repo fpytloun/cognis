@@ -1058,6 +1058,7 @@ async def test_run_schema_bootstrap_repairs_legacy_deliverable_constraints(
                 "deliverable_id TEXT PRIMARY KEY, "
                 "step_run_id TEXT NOT NULL, "
                 "version INTEGER NOT NULL DEFAULT 1, "
+                "title TEXT, "
                 "content TEXT NOT NULL, "
                 "format TEXT NOT NULL, "
                 "status TEXT NOT NULL"
@@ -1193,13 +1194,14 @@ async def test_run_schema_bootstrap_upgrades_legacy_chart_payload_twice(tmp_path
         await conn.execute(
             text(
                 "CREATE TABLE deliverables (deliverable_id VARCHAR PRIMARY KEY, "
-                "step_run_id TEXT, conversation_id TEXT, session_id TEXT, rich_payload JSON)"
+                "step_run_id TEXT, conversation_id TEXT, session_id TEXT, "
+                "title TEXT, status TEXT NOT NULL, rich_payload JSON)"
             )
         )
         await conn.execute(
             text(
-                "INSERT INTO deliverables (deliverable_id, rich_payload) "
-                "VALUES (:deliverable_id, :rich_payload)"
+                "INSERT INTO deliverables (deliverable_id, status, rich_payload) "
+                "VALUES (:deliverable_id, 'buffered', :rich_payload)"
             ).bindparams(sa.bindparam("rich_payload", type_=sa.JSON())),
             {"deliverable_id": "dlv_legacy_chart", "rich_payload": legacy_payload},
         )

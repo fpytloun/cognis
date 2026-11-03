@@ -25,6 +25,7 @@ import httpx
 import pytest
 
 from cognis.bootstrap import ensure_data_dir, ensure_jwt_keypair, ensure_secrets_key
+from cognis.providers.auth.jwt import JWTAuthProvider
 from tests.integration.conftest import (
     LiveStack,
     _bootstrap_config,
@@ -159,7 +160,8 @@ def recovery_provider(tmp_path):
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            endpoint = self.path
+            companion_request = self.path.startswith("/companion/")
+            endpoint = self.path.removeprefix("/companion")
             if endpoint not in ("/v1/chat/completions", "/v1/responses"):
                 record("unexpected-endpoint", endpoint=endpoint)
                 self.send_error(400)
@@ -168,7 +170,9 @@ def recovery_provider(tmp_path):
             users = [
                 item for item in inputs if isinstance(item, dict) and item.get("role") == "user"
             ]
-            is_turn = bool(users and "Hello, test recovery." in json.dumps(users[-1]))
+            is_turn = not companion_request and bool(
+                users and "Hello, test recovery." in json.dumps(users[-1])
+            )
             request_id = f"provider-{time.monotonic_ns()}"
             record("request", endpoint=endpoint, request_id=request_id, turn=is_turn)
             with lock:
@@ -388,19 +392,23 @@ def test_stale_session_recovery_on_restart(
     request.addfinalizer(lambda: _stop_service(mnemory_proc, "mnemory"))
     reservations[2].close()
     reservations[3].close()
+    intaris_env = {
+        "DATA_DIR": str(intaris_dir),
+        "INTARIS_HOST": "127.0.0.1",
+        "INTARIS_PORT": str(intaris_port),
+        "METRICS_HOST": "127.0.0.1",
+        "METRICS_PORT": str(metrics_port),
+        "INTARIS_JWT_PUBLIC_KEY": public_key_path,
+        "LLM_API_KEY": "test-api-key",
+        "OPENAI_API_KEY": "test-api-key",
+        # Companion inference must stay local without entering Cognis's barriers.
+        "LLM_BASE_URL": provider_url.removesuffix("/v1") + "/companion/v1",
+        "ANALYSIS_ENABLED": "false",
+        "LOG_LEVEL": "warning",
+    }
     intaris_proc = _start_service(
         [uvx_path, "intaris"],
-        {
-            "DATA_DIR": str(intaris_dir),
-            "INTARIS_HOST": "127.0.0.1",
-            "INTARIS_PORT": str(intaris_port),
-            "METRICS_HOST": "127.0.0.1",
-            "METRICS_PORT": str(metrics_port),
-            "INTARIS_JWT_PUBLIC_KEY": public_key_path,
-            "LLM_API_KEY": "test-api-key",
-            "OPENAI_API_KEY": "test-api-key",
-            "LOG_LEVEL": "warning",
-        },
+        intaris_env,
         label="intaris",
         clean_env=clean_env,
     )
@@ -519,6 +527,7 @@ def test_stale_session_recovery_on_restart(
             },
         )
         assert agent_resp.status_code == 200
+        agent_id = agent_resp.json()["agent_id"]
         http.post(f"{cognis_url}/api/v1/agents/recovery-agent/activate", headers=headers)
 
         conv_resp = http.post(
@@ -690,19 +699,73 @@ def test_stale_session_recovery_on_restart(
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
                 terminal = snapshot(cognis_dir / "cognis.db", "terminal")
-                if terminal["requests"][0]["status"] == "completed":
+                # The callback records its trace after the completion transaction
+                # commits. Observe both boundaries within the same existing budget.
+                terminal_trace = [
+                    json.loads(line)
+                    for line in (cognis_dir / "recovery-trace.jsonl")
+                    .read_text()
+                    .splitlines(keepends=True)
+                    if line.endswith("\n")
+                ]
+                if terminal["requests"][0]["status"] == "completed" and any(
+                    row["phase"] == "terminal-persisted" for row in terminal_trace
+                ):
                     break
                 threading.Event().wait(0.05)
             assert terminal["requests"][0]["status"] == "completed", terminal
             assert len(terminal["requests"]) == 1
-            terminal_trace = [
-                json.loads(line)
-                for line in (cognis_dir / "recovery-trace.jsonl").read_text().splitlines()
-            ]
             assert len([row for row in terminal_trace if row["phase"] == "terminal-persisted"]) == 1
             (base_dir / "crash-snapshots.json").write_text(
                 json.dumps([before, aged, recovered, resumed, terminal], indent=2)
             )
+
+            # Flush Cognis, then restart the durable owner before reading through
+            # its API. Intaris may compress its segments; filenames are not a
+            # cross-service contract, and an in-memory read would not prove restart.
+            _stop_service(cognis_proc, "cognis")
+            _stop_service(intaris_proc, "intaris")
+            intaris_proc = _start_service(
+                [uvx_path, "intaris"],
+                intaris_env,
+                label="intaris-restarted",
+                clean_env=clean_env,
+            )
+            _wait_healthy(intaris_url, timeout=120)
+            auth = JWTAuthProvider(
+                bootstrap_config.jwt_private_key_path,
+                bootstrap_config.jwt_public_key_path,
+            )
+            with httpx.Client(base_url=intaris_url, timeout=30, trust_env=False) as canonical:
+                response = canonical.get(
+                    f"/api/v1/session/{original_request['session_id']}/events",
+                    headers={
+                        "Authorization": (
+                            f"Bearer {auth.sign_service_jwt(admin_email, agent_id, ['intaris'])}"
+                        ),
+                        "X-Agent-Id": agent_id,
+                    },
+                    params={"after_seq": 0, "limit": 1000},
+                )
+                response.raise_for_status()
+                result = response.json()
+                assert result["has_more"] is False
+                assert result["history_gap"] is None
+                assert result["first_available_seq"] == 1
+                canonical_events = result["events"]
+            user_appends = [
+                event
+                for event in canonical_events
+                if event.get("type") == "user_message"
+                and event.get("data", {}).get("turn_id") == original_request["turn_id"]
+            ]
+            assert len(user_appends) == 1
+            assert not [
+                event
+                for event in canonical_events
+                if event.get("type") == "lifecycle"
+                and event.get("data", {}).get("event") == "turn_error"
+            ]
 
     finally:
         for reservation in reservations:
@@ -714,28 +777,6 @@ def test_stale_session_recovery_on_restart(
         _stop_service(cognis_proc, "cognis")
         _stop_service(mnemory_proc, "mnemory")
         _stop_service(intaris_proc, "intaris")
-
-    if contract == "durable-resume":
-        # Companion shutdown flushes canonical events. Inspect the actual sink,
-        # not the resumed request's checkpoint flag, to detect duplicate append.
-        canonical_events = [
-            json.loads(line)
-            for path in (intaris_dir / "events").rglob("*.ndjson")
-            for line in path.read_text().splitlines()
-        ]
-        user_appends = [
-            event
-            for event in canonical_events
-            if event.get("type") == "user_message"
-            and event.get("data", {}).get("turn_id") == original_request["turn_id"]
-        ]
-        assert len(user_appends) == 1
-        assert not [
-            event
-            for event in canonical_events
-            if event.get("type") == "lifecycle"
-            and event.get("data", {}).get("event") == "turn_error"
-        ]
 
 
 if __name__ == "__main__":
