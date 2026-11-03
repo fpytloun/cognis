@@ -1,7 +1,6 @@
 import { test, expect } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import postcss from 'postcss';
-import tailwind from 'tailwindcss';
+import { productionCss } from './helpers/production-css';
 
 const layout = readFileSync('src/routes/(app)/+layout.svelte', 'utf8');
 const chat = readFileSync('src/routes/(app)/chat/[conversationId]/+page.svelte', 'utf8');
@@ -11,10 +10,10 @@ const timeline = chat.match(/class="([^"]*px-2\.5 pb-1\.5 pt-0[^"]*)"/)![1];
 for (const height of [400, 800, 1100]) {
   for (const expanded of [false, true]) {
     test(`rail stays inside ${height}px viewport, expanded=${expanded}`, async ({ page }) => {
-      const css = await postcss([tailwind()]).process(readFileSync('src/app.css', 'utf8'), { from: 'src/app.css' });
+      const css = await productionCss();
       const classes = rail.replace(/\$\{sidebarExpanded[^}]+\}/, expanded ? 'w-64 p-4' : 'w-14 p-2');
       await page.setViewportSize({ width: 1200, height });
-      await page.setContent(`<style>${css.css}</style>
+      await page.setContent(`<style>${css}</style>
         <div class="app-viewport-frame fixed inset-x-0 overflow-hidden">
           <div class="flex h-full app-shell-safe-block">
             <aside class="${classes}">

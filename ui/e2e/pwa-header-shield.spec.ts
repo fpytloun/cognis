@@ -1,13 +1,9 @@
 import { expect, test } from '@playwright/test';
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
-
-const require = createRequire(import.meta.url);
-const postcss = require('postcss');
-const tailwind = require('tailwindcss');
-const source = readFileSync('src/app.css', 'utf8');
+import { DEFAULT_THEME_FAMILY } from '../src/lib/theme/catalog';
+import { productionCss } from './helpers/production-css';
 const chat = readFileSync('src/routes/(app)/chat/[conversationId]/+page.svelte', 'utf8');
-const child = readFileSync('src/lib/components/chat-v2/ChildChatView.svelte', 'utf8');
+const child = readFileSync('src/lib/components/chat-v2/SessionLogHeader.svelte', 'utf8');
 const layout = readFileSync('src/routes/(app)/+layout.svelte', 'utf8');
 const headerClasses = [chat, child, layout].map((text) => {
   const match = text.match(/class="([^"]*app-keyboard-stable-header[^"]*)"/);
@@ -20,9 +16,9 @@ for (const width of [390, 844, 1023]) {
   for (const [index, classes] of headerClasses.entries()) {
     test(`managed viewport ${width}px header ${index}`, async ({ page }) => {
       await page.setViewportSize({ width, height: 850 });
-      const result = await postcss([tailwind()]).process(source, { from: 'src/app.css' });
+      const css = await productionCss();
       await page.setContent(`
-        <style>${result.css}</style>
+        <style>${css}</style>
         <style>:root { --app-safe-area-top: 59px; }</style>
         <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden">
           <div class="app-chat-mobile-safe-top flex h-full flex-col overflow-hidden">
@@ -34,7 +30,11 @@ for (const width of [390, 844, 1023]) {
             </div>
           </div>
         </div>`);
-      await page.evaluate(() => { document.documentElement.dataset.standalonePwa = 'true'; });
+      await page.evaluate((family) => {
+        document.documentElement.dataset.themeFamily = family;
+        document.documentElement.dataset.resolvedTheme = 'dark';
+        document.documentElement.dataset.standalonePwa = 'true';
+      }, DEFAULT_THEME_FAMILY);
       const header = page.locator('#header');
       await expect(header).toHaveCSS('background-color', 'rgb(7, 17, 26)');
       await expect(page.locator('html')).toHaveCSS('background-color', 'rgb(7, 17, 26)');
