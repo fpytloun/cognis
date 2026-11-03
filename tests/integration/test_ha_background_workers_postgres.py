@@ -85,13 +85,32 @@ async def test_artifact_cleanup_and_attachment_serialize_at_database(attach_firs
             await db.run_sync(Base.metadata.create_all)
         now = datetime.now(UTC)
         async with factory() as db:
+            db.add(User(email="owner@example.com", name="Owner", role="user"))
+            await db.flush()
+            db.add(
+                Agent(
+                    agent_id="agent-owner",
+                    owner_email="owner@example.com",
+                    name="Owner",
+                )
+            )
+            await db.flush()
+            db.add(
+                Conversation(
+                    conversation_id="conversation-1",
+                    user_email="owner@example.com",
+                    agent_id="agent-owner",
+                    context_type="web",
+                )
+            )
+            await db.flush()
             candidate = await create_artifact_record(
                 db,
                 artifact_id="art-race",
                 namespace="uploads",
                 object_id="art-race",
                 filename="file.txt",
-                owner_email=None,
+                owner_email="owner@example.com",
                 purpose="attachment",
                 kind="file",
                 mime_type="text/plain",
@@ -104,6 +123,7 @@ async def test_artifact_cleanup_and_attachment_serialize_at_database(attach_firs
             return await mark_artifacts_attached(
                 db,
                 ["art-race"],
+                owner_email="owner@example.com",
                 conversation_id="conversation-1",
                 session_id=None,
             )
