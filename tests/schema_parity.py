@@ -108,7 +108,7 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
     inspector = sa.inspect(connection)
     expected_tables = set(Base.metadata.tables)
     actual_tables = set(inspector.get_table_names()) - CONTROL_TABLES
-    # Native FTS tables and their exact shadow tables are not portable ORM tables.
+    # SQLite FTS5 owns these exact search tables outside portable ORM metadata.
     search_tables = (
         {
             f"palette_{table}{suffix}"
@@ -137,6 +137,7 @@ def assert_schema_matches_metadata(connection: Connection) -> None:
 
     observed_extra_columns: set[tuple[str, str]] = set()
     observed_extra_indexes: set[tuple[str, str]] = set()
+    # PostgreSQL owns these expression indexes outside portable ORM metadata.
     palette_indexes = (
         {(table, f"ix_{table}_palette_name") for _, table, _, _ in SOURCES}
         if connection.dialect.name == "postgresql"

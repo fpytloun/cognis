@@ -126,7 +126,8 @@ async def run_cpu_bound[**P, T](
         state.admitted -= 1
         OFFLOAD_INFLIGHT.set(state.admitted)
         raise
-    OFFLOAD_WAIT_SECONDS.observe(time.perf_counter() - waited_from)
+    queue_seconds = time.perf_counter() - waited_from
+    OFFLOAD_WAIT_SECONDS.observe(queue_seconds)
 
     # asyncio.to_thread copies the caller's contextvars into the worker.
     call = functools.partial(fn, *args, **kwargs)
@@ -137,10 +138,24 @@ async def run_cpu_bound[**P, T](
         try:
             return await asyncio.to_thread(call)
         finally:
-            OFFLOAD_RUN_SECONDS.labels(task=task_label).observe(time.perf_counter() - started)
+            run_seconds = time.perf_counter() - started
+            OFFLOAD_RUN_SECONDS.labels(task=task_label).observe(run_seconds)
             state.workers.release()
             state.admitted -= 1
             OFFLOAD_INFLIGHT.set(state.admitted)
+            from cognis.core.turn_timing import logger, timing_identity
+
+            logger.info(
+                "turn: CPU preparation completed",
+                extra={
+                    "extra_data": {
+                        **timing_identity(),
+                        "stage": task_label,
+                        "queue_seconds": round(queue_seconds, 6),
+                        "duration_seconds": round(run_seconds, 6),
+                    }
+                },
+            )
 
     worker = run()
     try:

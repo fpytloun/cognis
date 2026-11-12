@@ -1,0 +1,55 @@
+id: work-feedback-task-result
+description: |
+  Produces an actual completed task deliverable for revision-feedback acceptance.
+  All infrastructure findings are synthetic; no external action is taken.
+trigger: "scenario:work-feedback-task-result"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_validate_feedback_task_result
+        name: validate_tool_call
+        arguments:
+          tool: "builtin:write_deliverable"
+          arguments: &weekly_result
+            title: "Weekly infrastructure review"
+            format: markdown
+            content: |
+              # Weekly infrastructure review
+
+              Synthetic Work Feedback acceptance fixture. No live infrastructure was changed.
+
+              ## Completed
+
+              - Reviewed the isolated staging inventory.
+              - Prepared the backup-verification checklist.
+
+              ## Needs human review
+
+              The staging-cluster upgrade is waiting for a reviewed execution
+              and rollback plan. Production remains unchanged.
+
+              Add comments to ask questions or request a revised result. Sending
+              feedback to revise this task does not bypass its normal gates.
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_write_feedback_task_result
+        name: write_deliverable
+        arguments: *weekly_result
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_complete_feedback_task_result
+        name: step_complete
+        arguments:
+          summary: "Prepared the synthetic weekly review with explicit human-review follow-ups; no external changes."
+          metadata:
+            result_status: completed
+            verification:
+              checks_run: ["Inspected the synthetic weekly review and human-review follow-ups."]
+              results: ["Review delivered; no external changes were made or authorized."]
+              checks_not_run: ["Live operational checks: this fixture uses synthetic content."]
+              synthetic_content: true
+              external_changes: false
+        delay_ms: 20

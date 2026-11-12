@@ -12,9 +12,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from cognis.core.executor_pool import ExecutorPoolRefresher
+
 
 class ExecutorConfigurationError(RuntimeError):
     """Executor configuration must be corrected before execution can start."""
+
+
+def require_explicit_executor(execution: dict[str, Any] | None) -> None:
+    """Reject execution without a configured primary executor target."""
+    config = execution or {}
+    if not config.get("executor_id") and not config.get("executor_selector"):
+        raise ExecutorConfigurationError(
+            "Agent must explicitly configure executor_id or executor_selector. "
+            "Configure an executor on the agent page before activating it or "
+            "sharing it with owner_executor scope."
+        )
 
 
 class TransientExecutorUnavailable(RuntimeError):
@@ -88,6 +101,8 @@ class ResolvedStepRuntime:
     executor_pool: Any = None  # Optional[ExecutorPool] (avoid forward ref)
     active_executor_id: str | None = None
     rebuild_tool_registry: Callable[[Any], Awaitable[Any]] | None = None
+    program_policy: Callable[[Any], Awaitable[bool]] | None = None
+    refresh_executor_pool: ExecutorPoolRefresher | None = None
 
 
 def build_local_executor_environment(

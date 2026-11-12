@@ -8,7 +8,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import delete, exists, or_, select, true, update
 from sqlalchemy.engine import CursorResult
@@ -58,7 +58,10 @@ from cognis.store.models import (
     ManagedConversationSignal,
     NotificationRow,
 )
-from cognis.store.queries import create_or_get_channel_delivery_outbox
+from cognis.store.queries import create_or_get_channel_delivery_outbox, get_channel_account
+
+if TYPE_CHECKING:
+    from cognis.core.turn_scheduler import TurnError
 
 MANAGED_CHANNEL_FINAL_SOURCE = "managed_channel_final"
 logger = logging.getLogger(__name__)
@@ -314,6 +317,233 @@ class ManagedChannelService:
             owner_epoch=owner_epoch,
         )
 
+    async def submit_controller_instruction(
+        self,
+        *,
+        link: ManagedConversationLink,
+        message: str,
+        turn_id: str,
+        wait: bool,
+        turn_observers: tuple[ManagedConversationTurnObserver, ...] = (),
+        control_metadata: dict[str, Any] | None = None,
+    ) -> TurnError | None:
+        """Admit privately, reconciling durable acceptance before compensating reservations.
+
+        Binding/link locks fence preparation and settlement, never scheduler I/O.
+        The scheduler owns cancellation; durable request identity owns retry evidence.
+        """
+        if self._turn_scheduler is None:
+            raise ValueError("Managed channel runtime is unavailable.")
+        signal = None
+        resume_request_id = None
+        async with self._session_factory() as db:
+            current_row = await _binding_with_link_id(db, link.link_id, lock=True)
+            current = current_row[1] if current_row else None
+            if (
+                current is None
+                or current.kind != "channel"
+                or current.owner_epoch != link.owner_epoch
+                or current.conversation_state != "open"
+            ):
+                raise ValueError("Managed channel ownership or lifecycle changed.")
+            if current.turn_state == "waiting_controller":
+                if self._turn_scheduler.has_active_turn(link.target_conversation_id):
+                    raise ValueError("The agent is still finishing its controller wait.")
+                resume_request_id = f"dtr_mcr_{uuid.uuid4().hex}"
+                signal = await queries.consume_waiting_managed_conversation_signal(
+                    db,
+                    link_id=link.link_id,
+                    owner_epoch=link.owner_epoch,
+                    resume_request_id=resume_request_id,
+                    resume_turn_id=turn_id,
+                )
+                if signal is None:
+                    raise ValueError("The controller wait is no longer available.")
+                await db.commit()
+
+        request_id = resume_request_id or f"dtr_mci_{uuid.uuid4().hex}"
+        prepared = None
+        held_token = None
+        admitted = False
+        admitted_in_transaction = False
+
+        async def admit_turn(db: AsyncSession, admitted_turn_id: str) -> None:
+            nonlocal admitted_in_transaction
+            if not await guard(db):
+                raise ValueError("Managed channel ownership or lifecycle changed before admission.")
+            updated = await queries.admit_managed_conversation_turn(
+                db,
+                link.link_id,
+                turn_id=admitted_turn_id,
+                turn_state="running",
+                notify_on_completion=not wait,
+                control_metadata=control_metadata,
+            )
+            if updated is None:
+                raise ValueError("Managed channel admission changed.")
+            admitted_in_transaction = True
+
+        async def admit(db: AsyncSession, request: DirectTurnRequestRow, created: bool) -> None:
+            nonlocal admitted_in_transaction
+            if created:
+                await admit_turn(db, request.turn_id)
+            else:
+                admitted_in_transaction = True
+
+        async def on_admitted(admitted_turn_id: str, queued: bool) -> None:
+            nonlocal admitted_in_transaction
+            if not admitted_in_transaction:
+                async with self._session_factory() as db:
+                    current_row = await _binding_with_link_id(db, link.link_id, lock=True)
+                    receipt = (
+                        await queries.get_managed_controller_turn_receipt(
+                            db,
+                            link=current_row[1],
+                            turn_id=admitted_turn_id,
+                            request_id=request_id,
+                        )
+                        if current_row is not None
+                        else None
+                    )
+                    if receipt is not None:
+                        admitted_in_transaction = True
+                    else:
+                        await admit_turn(db, admitted_turn_id)
+                    await db.commit()
+
+        async def guard(db: AsyncSession) -> bool:
+            row = await _binding_with_link_id(db, link.link_id, lock=True)
+            if row is None or prepared is None:
+                return False
+            binding, current = row
+            if (
+                current.kind != "channel"
+                or current.owner_epoch != link.owner_epoch
+                or current.conversation_state != "open"
+                or current.turn_state != "running"
+                or current.active_turn_id != turn_id
+                or binding.binding_id != prepared[0]
+                or binding.version != prepared[1]
+                or binding.state != "processing"
+                or binding.active_route_key is None
+                or _as_utc(binding.expires_at) <= datetime.now(UTC)
+                or (
+                    binding.delivery_lease_token is not None
+                    and binding.delivery_lease_expires_at is not None
+                    and _as_utc(binding.delivery_lease_expires_at) > datetime.now(UTC)
+                )
+            ):
+                return False
+            if signal is None or resume_request_id is None:
+                return True
+            return await queries.validate_managed_conversation_signal_resume_admission(
+                db,
+                signal_id=signal.signal_id,
+                link_id=link.link_id,
+                owner_epoch=link.owner_epoch,
+                resume_request_id=resume_request_id,
+                resume_turn_id=turn_id,
+            )
+
+        try:
+            prepared = await self.prepare_controller_turn(
+                link_id=link.link_id, owner_epoch=link.owner_epoch, turn_id=turn_id
+            )
+            if prepared is None:
+                raise ValueError("Managed channel ownership or lifecycle changed.")
+            binding_id, binding_version = prepared
+            context_messages: list[dict[str, Any]] = []
+            if signal is not None:
+                held_token, context_messages = await self.reserve_held_context(
+                    binding_id=binding_id, conversation_id=link.target_conversation_id
+                )
+            error = await self._turn_scheduler.submit_turn(
+                link.target_conversation_id,
+                message,
+                user_email=link.user_email,
+                turn_id=turn_id,
+                allow_queue=False,
+                intention_eligible=True,
+                user_message_metadata={
+                    "source": "controller_instruction",
+                    "private_controller_instruction": True,
+                    "memory_eligible": False,
+                    "resumed_signal_id": signal.signal_id if signal is not None else None,
+                },
+                contextual_messages=context_messages,
+                turn_observers=(
+                    *turn_observers,
+                    self.observer(
+                        binding_id=binding_id,
+                        binding_version=binding_version,
+                        owner_epoch=link.owner_epoch,
+                    ),
+                ),
+                durable_request_id=request_id,
+                durable_admission_guard=guard,
+                admission_transaction_participant=admit,
+                admission_observer=on_admitted,
+            )
+            admitted = error is None
+        finally:
+            if not admitted or signal is not None:
+                async with self._session_factory() as db:
+                    current_row = await _binding_with_link_id(db, link.link_id, lock=True)
+                    if not admitted and current_row is not None:
+                        receipt = await queries.get_managed_controller_turn_receipt(
+                            db, link=current_row[1], turn_id=turn_id, request_id=request_id
+                        )
+                        admitted = receipt is not None
+                    if signal is not None:
+                        settled = await queries.settle_managed_conversation_signal_resume(
+                            db,
+                            signal_id=signal.signal_id,
+                            succeeded=admitted,
+                            expected_resume_request_id=resume_request_id,
+                            expected_resume_turn_id=turn_id,
+                            expected_binding_version=prepared[1] if prepared else None,
+                        )
+                        admitted = admitted or (settled is not None and settled.state == "consumed")
+                    elif not admitted and prepared is not None:
+                        await queries.abort_managed_channel_controller_turn(
+                            db,
+                            binding_id=prepared[0],
+                            owner_epoch=link.owner_epoch,
+                            turn_id=turn_id,
+                            binding_version=prepared[1],
+                        )
+                    await db.commit()
+            if held_token:
+                await self.settle_held_context(held_token, succeeded=admitted)
+        return None if admitted else cast("TurnError | None", error)
+
+    async def terminate_controller_conversation(
+        self, *, link_id: str, owner_epoch: int, reason: str
+    ) -> None:
+        """Fence the route before cancellation; never retry an uncertain delivery."""
+        async with self._session_factory() as db:
+            row = await _binding_with_link_id(db, link_id, lock=True)
+            if row is None or row[1].owner_epoch != owner_epoch:
+                raise ValueError("Managed channel ownership changed.")
+            _, link = row
+            if link.conversation_state == "open":
+                closed = await queries.complete_managed_channel_conversation(
+                    db,
+                    link_id=link_id,
+                    owner_epoch=owner_epoch,
+                    status="cancelled",
+                    summary=reason,
+                )
+                if closed is None:
+                    raise ValueError(
+                        "A delivery is still settling. Retry termination after it settles."
+                    )
+            conversation_id = link.target_conversation_id
+            await db.commit()
+        if self._turn_scheduler is not None:
+            # A retry must still cancel a turn if the caller disconnected after the fence committed.
+            await self._turn_scheduler.cancel_turn(conversation_id)
+
     async def prepare_controller_turn(
         self,
         *,
@@ -398,22 +628,9 @@ class ManagedChannelService:
         """Compensate a controller admission that did not reach the scheduler."""
 
         async with self._session_factory() as session:
-            row = await _binding_with_link(session, binding_id, lock=True)
-            if row is None:
-                return
-            binding, link = row
-            if (
-                link.owner_epoch != owner_epoch
-                or link.active_turn_id != turn_id
-                or link.conversation_state != "open"
-            ):
-                return
-            link.turn_state = "idle"
-            link.active_turn_id = None
-            link.updated_at = datetime.now(UTC)
-            binding.state = "waiting_external"
-            binding.version += 1
-            binding.updated_at = datetime.now(UTC)
+            await queries.abort_managed_channel_controller_turn(
+                session, binding_id=binding_id, owner_epoch=owner_epoch, turn_id=turn_id
+            )
             await session.commit()
 
     async def admit_inbound(
@@ -517,6 +734,25 @@ class ManagedChannelService:
             if row is None:
                 return None
             binding, link = row
+            if message.channel_type == "web":
+                from cognis.store.models import AppContactBlockRow, User
+
+                participant = await session.get(User, message.sender_id)
+                app_account = await get_channel_account(session, message.account_id)
+                if (
+                    message.platform_data.get("app_binding_id") != binding.binding_id
+                    or participant is None
+                    or not participant.is_active
+                    or participant.role == "viewer"
+                    or app_account is None
+                    or not app_account.enabled
+                    or app_account.user_email != user_email
+                    or app_account.channel_type != "web"
+                    or await session.get(
+                        AppContactBlockRow, (participant.email, binding.user_email)
+                    )
+                ):
+                    return None
             if _as_utc(binding.expires_at) <= now and binding.state not in {
                 "delivery_pending",
                 "delivery_sent",
@@ -564,6 +800,22 @@ class ManagedChannelService:
                     await session.flush()
             except IntegrityError:
                 await session.rollback()
+                if message.channel_type == "web":
+                    previous = (
+                        await session.execute(
+                            select(ChannelInboundLedgerRow).where(
+                                ChannelInboundLedgerRow.account_id == message.account_id,
+                                ChannelInboundLedgerRow.message_id == message.message_id,
+                            )
+                        )
+                    ).scalar_one_or_none()
+                    if previous is not None and (
+                        previous.binding_id != message.platform_data.get("app_binding_id")
+                        or previous.content != message.content
+                    ):
+                        raise ValueError(
+                            "Reply idempotency key conflicts with existing content"
+                        ) from None
                 return True
 
             if (
@@ -1451,6 +1703,72 @@ class ManagedChannelService:
             if drain:
                 await self.submit_next_held(binding_id)
         return reconciled
+
+    async def submit_participant_admission(
+        self,
+        message: InboundMessage,
+        admission: ManagedInboundAdmission,
+        *,
+        sender_label: str | None = None,
+    ) -> Any:
+        """Submit one admitted reply using the existing managed runtime fence."""
+        if self._turn_scheduler is None:
+            raise RuntimeError("Managed turn scheduler unavailable")
+        error = await self._turn_scheduler.submit_turn(
+            admission.conversation_id,
+            admission.content,
+            user_email=admission.user_email,
+            intention_eligible=False,
+            attachments=admission.attachments,
+            user_message_metadata=message_metadata(
+                ts=message.timestamp,
+                channel=message.channel_type,
+                sender=sender_label or message.sender_name or message.sender_id,
+                untrusted=True,
+            ),
+            contextual_messages=admission.contextual_messages,
+            turn_observers=(
+                self.observer(
+                    binding_id=admission.binding_id,
+                    binding_version=admission.version,
+                    owner_epoch=admission.owner_epoch,
+                ),
+            ),
+            client_message_id=admission.message_id,
+            allow_queue=False,
+        )
+        if error is not None:
+            await self.release_after_failure(
+                binding_id=admission.binding_id,
+                admitted_version=admission.version,
+                admitted_owner_epoch=admission.owner_epoch,
+                reason=error.message,
+            )
+        return error
+
+    async def end_app_contact(self, *, binding_id: str, recipient_email: str) -> None:
+        """Let an exact in-app participant refuse only their own exchange."""
+        async with self._session_factory() as db:
+            row = await _binding_with_link(db, binding_id, lock=True)
+            if row is None:
+                raise LookupError("Contact not found")
+            binding, link = row
+            if (
+                binding.channel_type != "web"
+                or binding.chat_id != recipient_email
+                or binding.sender_id != recipient_email
+            ):
+                raise LookupError("Contact not found")
+            if binding.active_route_key is None:
+                return
+            _release_binding(
+                binding, link, state="closed", reason="participant_ended", now=datetime.now(UTC)
+            )
+            await queries.persist_managed_terminal_notification(db, link=link, status="completed")
+            target_conversation_id = link.target_conversation_id
+            await db.commit()
+        if self._turn_scheduler is not None:
+            await self._turn_scheduler.cancel_turn(target_conversation_id)
 
     async def submit_next_held(self, binding_id: str) -> bool:
         """Admit the next concurrent participant reply after a turn settles."""
@@ -2591,12 +2909,24 @@ async def create_managed_channel_conversation(
     target_agent = await require_target_agent(str(tc.arguments.get("agent_id") or "").strip())
     if isinstance(target_agent, ToolResult):
         return target_agent
-    if target.channel_type == "matrix" and account.agent_id != target_agent.agent_id:
+    if target.channel_type in {"matrix", "web"} and account.agent_id != target_agent.agent_id:
         return error(
-            "The Matrix transport account does not match the requested agent identity. "
-            "Use a target observed by that agent's Matrix account.",
+            "The transport account does not match the requested agent identity. "
+            "Use a target observed by that agent's account.",
             code="managed_channel_transport_identity_mismatch",
         )
+    if target.channel_type == "web":
+        from cognis.store.models import AppContactBlockRow, User
+
+        async with loop.session_manager.session_factory() as db:
+            recipient = await db.get(User, target.chat_id)
+            if (
+                recipient is None
+                or not recipient.is_active
+                or target.sender_id != recipient.email
+                or await db.get(AppContactBlockRow, (recipient.email, user_email))
+            ):
+                return error("App managed destination unavailable.")
     try:
         profile_id = normalize_agent_profile_id(tc.arguments.get("agent_profile_id"))
         if profile_id is not None:
@@ -2667,6 +2997,7 @@ async def create_managed_channel_conversation(
         user_email=user_email,
         agent_id=target_agent.agent_id,
         agent_profile_id=profile_id,
+        agent_profile_mode=tc.arguments.get("agent_profile_mode"),
         context=managed_context,
         title=title,
         title_source="managed_channel",
@@ -2746,7 +3077,7 @@ async def create_managed_channel_conversation(
                     db,
                     conversation.conversation_id,
                     context_data={
-                        **dict(managed_context.platform_data),
+                        **dict(conversation.context.platform_data),
                         "link_id": link.link_id,
                         "managed_binding_id": binding.binding_id,
                         "channel_transcript_ref": transcript_ref,

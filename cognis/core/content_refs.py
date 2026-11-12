@@ -144,15 +144,37 @@ async def authorize_deliverable_access(
     choosing it as a ``supersedes`` revision target.
     """
 
-    from cognis.core.artifact_access import content_read_predicate
+    from cognis.core.artifact_access import readable_deliverable_ids
 
     if not user_email:
         return None
     if deliverable.owner_email != user_email:
-        # Another person's revision is readable only through project access.
+        # Explicit document sharing is authoritative. Task/chat publication can
+        # supply read-only provenance for outputs without a document project.
+        task = (
+            await task_for_step_run(session, deliverable.step_run_id)
+            if deliverable.step_run_id is not None
+            else None
+        )
+        project_id = deliverable.project_id
+        if project_id is None:
+            from cognis.core.project_access import can_read_conversation, can_read_task
+            from cognis.store.queries import get_conversation
+
+            if deliverable.step_run_id is not None:
+                if task is None or not await can_read_task(session, task, user_email):
+                    return None
+                project_id = task.project_id
+            elif deliverable.conversation_id is not None:
+                conversation = await get_conversation(session, deliverable.conversation_id)
+                if conversation is None or not await can_read_conversation(
+                    session, conversation, user_email
+                ):
+                    return None
+                project_id = conversation.project_id
         if not await _project_document_accessible(
             session,
-            deliverable.project_id,
+            project_id,
             user_email=user_email,
             agent_id=accessor_agent_id,
             conversation_id=accessor_conversation_id,
@@ -160,11 +182,6 @@ async def authorize_deliverable_access(
             access="read",
         ):
             return None
-        task = (
-            await task_for_step_run(session, deliverable.step_run_id)
-            if deliverable.step_run_id is not None
-            else None
-        )
         if scope_task_id is not None and (task is None or task.task_id != scope_task_id):
             return None
         return DeliverableAccess(
@@ -173,19 +190,15 @@ async def authorize_deliverable_access(
             task=task,
         )
     if accessor_agent_id or accessor_conversation_id:
-        predicate = await content_read_predicate(
+        allowed = await readable_deliverable_ids(
             session,
+            [deliverable.deliverable_id],
             owner_email=user_email,
             agent_id=accessor_agent_id,
             conversation_id=accessor_conversation_id,
             session_id=accessor_session_id,
-            model=DeliverableRow,
         )
-        if not await session.scalar(
-            select(DeliverableRow.deliverable_id).where(
-                DeliverableRow.deliverable_id == deliverable.deliverable_id, predicate
-            )
-        ):
+        if deliverable.deliverable_id not in allowed:
             return None
     task = (
         await task_for_step_run(session, deliverable.step_run_id)
@@ -276,6 +289,12 @@ async def authorize_supersedes_target(
     """
 
     if lock:
+        from cognis.store.document_locks import lock_document_lineages
+
+        root = await session.scalar(
+            select(DeliverableRow.lineage_id).where(DeliverableRow.deliverable_id == deliverable_id)
+        )
+        await lock_document_lineages(session, DeliverableRow, [root or deliverable_id])
         deliverable = await session.scalar(
             select(DeliverableRow)
             .where(DeliverableRow.deliverable_id == deliverable_id)
@@ -284,34 +303,20 @@ async def authorize_supersedes_target(
         )
     else:
         deliverable = await get_deliverable(session, deliverable_id)
-    if (
-        deliverable is not None
-        and user_email
-        and await _project_document_accessible(
-            session,
-            deliverable.project_id,
-            user_email=user_email,
-            agent_id=accessor_agent_id,
-            conversation_id=accessor_conversation_id,
-            session_id=accessor_session_id,
-            access="write",
-        )
-    ):
-        return deliverable
-    if (
-        deliverable is None
-        # Project documents are revised only through project write access.
-        or deliverable.project_id
-        or deliverable.owner_agent_id != accessor_agent_id
-        or (
-            await authorize_deliverable_access(
-                session,
-                deliverable,
-                user_email,
-                accessor_conversation_id=accessor_conversation_id,
-                accessor_agent_id=accessor_agent_id,
-            )
-            is None
+    from cognis.core.artifact_access import content_read_predicate
+
+    predicate = await content_read_predicate(
+        session,
+        owner_email=user_email,
+        agent_id=accessor_agent_id,
+        conversation_id=accessor_conversation_id,
+        session_id=accessor_session_id,
+        model=DeliverableRow,
+        access="write",
+    )
+    if deliverable is None or not await session.scalar(
+        select(DeliverableRow.deliverable_id).where(
+            DeliverableRow.deliverable_id == deliverable_id, predicate
         )
     ):
         raise DeliverableRevisionError(

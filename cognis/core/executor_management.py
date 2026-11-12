@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import or_, update
+from sqlalchemy import or_, select, update
 
 from cognis.api.common import api_exception
 from cognis.api.models import (
@@ -38,13 +39,14 @@ from cognis.models.executor_resources import normalize_executor_resource_snapsho
 from cognis.models.runtime_capabilities import normalize_runtime_capability_report
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
 from cognis.store.local_models import lock_local_model_dispatch_guard
-from cognis.store.models import ExecutorRow
+from cognis.store.models import Agent, CredentialRow, ExecutorRow
 from cognis.store.queries import (
     bump_executor_reconfigure_generation,
     create_executor,
     delete_executor,
     get_executor_row,
     list_executors,
+    update_agent_if_updated_at,
     update_executor,
 )
 
@@ -62,6 +64,7 @@ class ExecutorManagementDependencies:
     reconfigure: Callable[[str], None]
     trigger_reconcile: Callable[[str], None]
     sign_token: Callable[..., str]
+    credentials: Any | None = None
 
 
 def _executor_is_shared(row: Any) -> bool:
@@ -286,6 +289,140 @@ async def generate_executor_token_route(
         token_version=token_version,
     )
     return ExecutorTokenResponse(executor_id=executor_id, token=token, expires_in=None)
+
+
+async def provision_executor_token(
+    deps: ExecutorManagementDependencies,
+    actor: ManagementActor,
+    executor_id: str,
+    *,
+    agent_id: str,
+    operation_id: str,
+    expected_updated_at: str,
+) -> dict[str, Any]:
+    """Atomically rotate, encrypt and grant a token; reconcile fencing on replay.
+
+    The DB transaction owns the version, encrypted credential and agent grant.
+    No external I/O occurs inside it. Cancellation before commit rolls everything
+    back; after commit the same operation resumes its pending fence, never signs
+    or rotates twice. The existing token lock owns local rotation/fence ordering.
+    """
+    actor.require_mutation()
+    stage = getattr(deps.credentials, "create_credential_in_transaction", None)
+    if not callable(stage):
+        raise api_exception(503, "unavailable", "Transactional credential storage unavailable")
+    if not agent_id or not operation_id or len(operation_id) > 128:
+        raise api_exception(
+            400, "validation_error", "An agent and stable operation_id are required"
+        )
+    digest = hashlib.sha256(f"{executor_id}\0{operation_id}".encode()).hexdigest()[:32]
+    credential_id = f"executor-token-{digest}"
+    async with executor_token_lock(executor_id):
+        async with deps.session_factory() as session:
+            row = await get_executor_row(session, executor_id, owner_email=actor.email)
+            if row is None or _executor_is_shared(row):
+                raise api_exception(404, "not_found", "Private executor not found")
+            _require_executor_mutation_access(actor, row)
+            if row.executor_type != "websocket" or row.status != "active":
+                raise api_exception(
+                    400, "validation_error", "An active private WebSocket executor is required"
+                )
+            agent = await session.scalar(
+                select(Agent).where(Agent.agent_id == agent_id, Agent.owner_email == actor.email)
+            )
+            if agent is None or agent.status != "active":
+                raise api_exception(403, "forbidden", "An active owner agent is required")
+            credential = await session.scalar(
+                select(CredentialRow).where(
+                    CredentialRow.user_email == actor.email,
+                    CredentialRow.credential_id == credential_id,
+                )
+            )
+            if credential is None:
+                check_updated_at(row, expected_updated_at)
+                previous_version = int(row.token_version or 0)
+                result = await session.execute(
+                    update(ExecutorRow)
+                    .where(
+                        ExecutorRow.executor_id == executor_id,
+                        ExecutorRow.owner_email == actor.email,
+                        ExecutorRow.token_version == previous_version,
+                    )
+                    .values(token_version=ExecutorRow.token_version + 1)
+                    .returning(ExecutorRow.token_version)
+                )
+                version = result.scalar_one_or_none()
+                if version is None:
+                    raise api_exception(
+                        409, "conflict", "Executor token changed; reconcile before retrying"
+                    )
+                token = deps.sign_token(executor_id, token_version=int(version))
+                credential = await stage(
+                    session,
+                    credential_id=credential_id,
+                    user_email=actor.email,
+                    agent_id=agent_id,
+                    label=f"Executor provisioning: {executor_id}",
+                    payload={"token": token},
+                    metadata={
+                        "purpose": "executor_provisioning",
+                        "executor_id": executor_id,
+                        "executor_token_version": int(version),
+                        "operation_id": operation_id,
+                        "fence_pending": True,
+                    },
+                )
+                permissions = dict(agent.permissions or {})
+                permissions["allowed_credentials"] = sorted(
+                    set(permissions.get("allowed_credentials", [])) | {credential_id}
+                )
+                if not await update_agent_if_updated_at(
+                    session,
+                    agent_id,
+                    expected_updated_at=agent.updated_at,
+                    updates={"permissions": permissions},
+                ):
+                    raise api_exception(
+                        409, "conflict", "Agent permissions changed; reconcile before retrying"
+                    )
+                await session.commit()
+            else:
+                meta = credential.metadata_json or {}
+                if (
+                    meta.get("purpose") != "executor_provisioning"
+                    or meta.get("executor_id") != executor_id
+                    or meta.get("operation_id") != operation_id
+                    or credential.agent_id != agent_id
+                    or credential.status != "active"
+                    or meta.get("executor_token_version") != row.token_version
+                    or credential_id not in (agent.permissions or {}).get("allowed_credentials", [])
+                ):
+                    raise api_exception(
+                        409, "conflict", "Provisioning operation is stale or no longer authorized"
+                    )
+            pending = bool((credential.metadata_json or {}).get("fence_pending"))
+            version = int(credential.metadata_json["executor_token_version"])
+        if pending:
+            await deps.fence(executor_id)
+            async with deps.session_factory() as session:
+                credential = await session.scalar(
+                    select(CredentialRow).where(
+                        CredentialRow.user_email == actor.email,
+                        CredentialRow.credential_id == credential_id,
+                    )
+                )
+                credential.metadata_json = {**credential.metadata_json, "fence_pending": False}
+                await session.commit()
+    return {
+        "executor_id": executor_id,
+        "operation_id": operation_id,
+        "token_version": version,
+        "credential_id": credential_id,
+        "token_ref": f"$credential:{credential_id}.token",
+        "agent_id": agent_id,
+        "persisted": True,
+        "fenced": True,
+    }
 
 
 async def update_executor_route(

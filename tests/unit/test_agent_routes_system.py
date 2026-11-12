@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -46,6 +46,7 @@ async def _seed_unavailable_backend_agent(app: object) -> None:
                 "memory_backend": "future-memory",
                 "memory_backend_options": {"future_option": True},
                 "guardrails_backend": "intaris",
+                "intaris_evaluation": "legacy",
             },
             agent_profiles={
                 "specialist": {
@@ -60,7 +61,7 @@ async def _seed_unavailable_backend_agent(app: object) -> None:
 
 def test_memory_backend_descriptors_are_authoritative(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.get("/api/v1/agents/memory-backends", headers=headers)
@@ -187,8 +188,8 @@ def test_duplicate_preserves_unavailable_backend_fail_closed_configuration(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
-        asyncio.run(_seed_unavailable_backend_agent(client.app))
+        client.portal.call(_seed_user, client.app)
+        client.portal.call(_seed_unavailable_backend_agent, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post("/api/v1/agents/future-agent/duplicate", headers=headers)
@@ -196,12 +197,13 @@ def test_duplicate_preserves_unavailable_backend_fail_closed_configuration(
         assert response.status_code == 200
         body = response.json()
         assert body["capabilities"] == {
+            "analytics_enabled": True,
             "memory_backend": "future-memory",
             "memory_backend_options": {"future_option": True},
             "guardrails_backend": "intaris",
             "minimum_outcome": None,
             "maximum_outcome": None,
-            "intaris_evaluation": "balanced",
+            "intaris_evaluation": "legacy",
             "approval_mode": "ask",
             "escalation_timeout_seconds": None,
         }
@@ -210,22 +212,62 @@ def test_duplicate_preserves_unavailable_backend_fail_closed_configuration(
         }
 
 
+@pytest.mark.parametrize("backend", ["none", "intaris"])
+def test_analytics_agent_api_create_update_roundtrip(monkeypatch, tmp_path, backend) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        client.portal.call(_seed_user, client.app)
+        headers = _auth_headers(client.app, email="user@example.com")
+        monkeypatch.setattr(
+            client.app.state.providers.memory, "replace_bootstrap_identity", AsyncMock()
+        )
+        payload = {
+            "agent_id": "analytics-agent",
+            "name": "Analytics",
+            "status": "draft",
+            "capabilities": {
+                "memory_backend": "none",
+                "guardrails_backend": backend,
+                "analytics_enabled": False,
+            },
+        }
+        created = client.post("/api/v1/agents", headers=headers, json=payload)
+        assert created.status_code == 200, created.text
+        assert created.json()["capabilities"]["analytics_enabled"] is False
+        assert (
+            client.get("/api/v1/agents/analytics-agent", headers=headers).json()["capabilities"][
+                "analytics_enabled"
+            ]
+            is False
+        )
+        payload["capabilities"]["analytics_enabled"] = True
+        updated = client.put("/api/v1/agents/analytics-agent", headers=headers, json=payload)
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["capabilities"]["analytics_enabled"] is True
+        payload["capabilities"]["analytics_enabled"] = "false"
+        rejected = client.put("/api/v1/agents/analytics-agent", headers=headers, json=payload)
+        assert rejected.status_code in {400, 422}
+
+
 def test_system_agent_detail_includes_default_skills(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.get("/api/v1/agents/system:implement", headers=headers)
 
         assert response.status_code == 200
         body = response.json()
-        assert body["skills"] == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
+        assert body["skills"] == {
+            "items": [
+                {"skill_id": "cognis-coding", "enabled": True, "auto_load_instructions": True}
+            ]
+        }
         assert "skills" in body["editable_fields"]
 
 
 def test_system_agent_update_accepts_skill_overrides(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         update = client.put(
@@ -254,7 +296,7 @@ def test_system_agent_update_accepts_runtime_profile_overrides(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         profiles = {
             "junior": {
@@ -332,7 +374,7 @@ def test_system_agent_update_rejects_invalid_runtime_profile_key(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         update = client.put(
@@ -357,7 +399,7 @@ def test_reset_system_agent_overrides_restores_default_skills(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         update = client.put(
@@ -379,7 +421,9 @@ def test_reset_system_agent_overrides_restores_default_skills(
         detail = client.get("/api/v1/agents/system:implement", headers=headers)
         assert detail.status_code == 200
         assert detail.json()["skills"] == {
-            "items": [{"skill_id": "cognis-coding", "enabled": True}]
+            "items": [
+                {"skill_id": "cognis-coding", "enabled": True, "auto_load_instructions": True}
+            ]
         }
 
 
@@ -387,7 +431,7 @@ def test_partial_system_agent_override_updates_preserve_existing_fields(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         first = client.put(
@@ -417,7 +461,7 @@ def test_system_agent_update_accepts_tool_and_permission_overrides(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         update = client.put(

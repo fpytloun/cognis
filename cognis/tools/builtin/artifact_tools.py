@@ -21,6 +21,7 @@ from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.artifacts.preview import supports_artifact_view
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.audio.transcription import transcribe_audio_bytes
+from cognis.core.artifact_revisions import ArtifactWriteParticipant
 from cognis.core.attachment_analysis import (
     get_attachment_analysis_route as _get_attachment_analysis_route,
 )
@@ -34,12 +35,21 @@ from cognis.core.content_refs import (
     is_deliverable_ref,
     record_deliverable_access,
 )
+from cognis.core.feedback.comment_links import create_comment_link
+from cognis.core.feedback.primitives import FeedbackError
+from cognis.core.feedback.public import PublicFeedback
 from cognis.core.json_utils import extract_text_from_response
 from cognis.logging import get_logger
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.deliverable import DeliverableRevisionError
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
-from cognis.models.tool import ToolResult, ToolSource
+from cognis.models.tool import (
+    NativeToolOperation,
+    ToolMutationKind,
+    ToolResult,
+    ToolSource,
+    ToolValueSemantics,
+)
 from cognis.store.models import DeliverableRow
 from cognis.store.queries import (
     create_artifact_record,
@@ -312,14 +322,24 @@ ARTIFACT_GET_URL_TOOL = ToolDefinition(
             "mode": {
                 "type": "string",
                 "enum": ["download", "view"],
-                "description": "URL serving mode. Default download serves files as attachments; view opens the best supported artifact preview.",
+                "description": "URL serving mode. Defaults to view when allow_comments is true; otherwise download.",
+            },
+            "allow_comments": {
+                "type": "boolean",
+                "default": False,
+                "description": "Create a public, revocable exact-revision guest-comment link. Requires the owning agent and authenticated caller. Never grants agent dispatch; check existing links after an uncertain result.",
             },
         },
         "required": ["artifact_id"],
     },
     source=_SOURCE,
     category="artifact",
-    read_only=True,
+    read_only=False,
+    non_bypassable=True,
+    mutation_kind="create",
+    side_effects=[
+        "With allow_comments=true, creates a public comment-link grant; otherwise only returns a signed URL."
+    ],
     timeout_seconds=15,
     max_result_size=30_000,
 )
@@ -364,7 +384,8 @@ ARTIFACT_WRITE_TOOL = ToolDefinition(
         "Save text content (for example JSON configuration or state) as a persistent Cognis "
         "artifact without an executor file. To update an existing document, pass the art_ ID "
         "you last read as supersedes: the write creates the next revision and fails with "
-        "latest_artifact_id when a newer revision exists, so re-read and retry. Writes are "
+        "latest_artifact_id when a newer revision exists; re-read and decide before writing "
+        "again. Requires ownership, project write access, or an explicit lineage write grant. Writes are "
         "silent: nothing is attached to the reply or sent anywhere. Documents written in "
         "shared project work join that project; revisions keep their document's project."
     ),
@@ -425,21 +446,87 @@ ARTIFACT_TOOL_NAMES = frozenset(
 ARTIFACT_SHARE_TOOL = ToolDefinition(
     name="artifact_share",
     description=(
-        "Grant or revoke read access to an artifact or deliverable owned by this agent "
-        "for another agent owned by the same user. Reading shared content does not "
-        "permit resharing, editing, or deleting it. KB and delegated-work access "
+        "Inspect (get), replace (set), grant or revoke lineage-wide read/write sharing for "
+        "an artifact or deliverable, as in the Library UI. Root owner primary chats "
+        "can manage the user's documents; other agents can share only their own. "
+        "Set replaces explicit recipients with agent_ids; get lists explicit and inherited access. "
+        "Grant/revoke use agent_id. Existing and future revisions share the grants. "
+        "Read is the default; write permits superseding the current head, not "
+        "resharing or deleting it. Explicit grants work without project assignment. KB and delegated-work access "
         "remain independent of this explicit grant."
     ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "content_ref": {"type": "string"},
-            "agent_id": {"type": "string"},
-            "action": {"type": "string", "enum": ["grant", "revoke"]},
-        },
-        "required": ["content_ref", "agent_id", "action"],
-        "additionalProperties": False,
-    },
+    parameters={},
+    native_operations=[
+        NativeToolOperation(
+            operation=action,
+            summary=f"{action.capitalize()} document lineage sharing.",
+            mutation_kind=ToolMutationKind.READ if action == "get" else ToolMutationKind.UPDATE,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "content_ref": {"type": "string", "minLength": 1},
+                    "action": {"type": "string", "const": action},
+                    **(
+                        {
+                            "agent_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 100,
+                            },
+                            "write_agent_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "maxItems": 100,
+                                "description": "Subset of agent_ids granted write; others get read.",
+                            },
+                        }
+                        if action == "set"
+                        else {"agent_id": {"type": "string", "minLength": 1}}
+                        if action in {"grant", "revoke"}
+                        else {}
+                    ),
+                    **(
+                        {
+                            "permission": {
+                                "type": "string",
+                                "enum": ["read", "write"],
+                                "default": "read",
+                            }
+                        }
+                        if action == "grant"
+                        else {}
+                    ),
+                },
+                "required": ["content_ref", "action", *fields],
+                "additionalProperties": False,
+            },
+            semantics=ToolValueSemantics(
+                omitted="required fields must be supplied",
+                null="not accepted",
+                arrays="set replaces explicit recipients; [] clears them",
+                concurrency="mutations serialize with document revisions under the lineage lock",
+            ),
+            examples=[
+                {
+                    "action": action,
+                    "content_ref": "art_0123456789abcdef0123456789abcdef",
+                    **(
+                        {"agent_ids": ["managed-agent"]}
+                        if action == "set"
+                        else {"agent_id": "managed-agent"}
+                        if action in {"grant", "revoke"}
+                        else {}
+                    ),
+                }
+            ],
+        )
+        for action, fields in (
+            ("get", ()),
+            ("set", ("agent_ids",)),
+            ("grant", ("agent_id",)),
+            ("revoke", ("agent_id",)),
+        )
+    ],
     source=_SOURCE,
     category="artifact",
     read_only=False,
@@ -514,6 +601,10 @@ async def handle_artifact_tool(
     current_provider_id: str | None = None,
     owner_email: str | None = None,
     runtime_metadata: dict[str, Any] | None = None,
+    write_participant: ArtifactWriteParticipant | None = None,
+    source_tool_call_id: str | None = None,
+    comment_sharing: PublicFeedback | None = None,
+    comment_actor_email: str | None = None,
 ) -> ToolResult:
     """Handle artifact inspection tools."""
 
@@ -534,26 +625,39 @@ async def handle_artifact_tool(
             session_factory=session_factory,
             user_email=user_email,
             runtime_metadata=runtime_metadata,
+            write_participant=write_participant,
+            source_tool_call_id=source_tool_call_id,
         )
     if tool_name == ARTIFACT_SHARE_TOOL.name:
-        from cognis.core.artifact_sharing import set_artifact_share
+        from cognis.core.artifact_sharing import manage_document_shares
+        from cognis.runtime_context import current_runtime_access_context
 
         if not session_factory or not user_email or not accessor_agent_id:
             return ToolResult(output="Artifact access context is unavailable.", is_error=True)
         try:
+            access = current_runtime_access_context.get()
+            root_owner = (
+                access is not None
+                and access.is_root_owner_primary_chat
+                and access.user_email == user_email
+                and access.agent_id == accessor_agent_id
+            )
             async with session_factory() as db_session:
-                await set_artifact_share(
+                sharing = await manage_document_shares(
                     db_session,
                     owner_email=user_email,
-                    owner_agent_id=accessor_agent_id,
+                    owner_agent_id=None if root_owner else accessor_agent_id,
                     content_ref=arguments["content_ref"],
-                    grantee_agent_id=arguments["agent_id"],
-                    revoke=arguments["action"] == "revoke",
+                    agent_id=arguments.get("agent_id"),
+                    agent_ids=arguments.get("agent_ids"),
+                    write_agent_ids=arguments.get("write_agent_ids"),
+                    permission=arguments.get("permission", "read"),
+                    action=arguments["action"],
                 )
                 await db_session.commit()
         except ValueError as exc:
             return ToolResult(output=str(exc), is_error=True)
-        return ToolResult(output="Artifact sharing updated.")
+        return ToolResult(output=json.dumps(sharing))
     from cognis.core.artifact_access import artifact_authorized_for_conversation
 
     accessor_session_id = (runtime_metadata or {}).get("session_id")
@@ -652,6 +756,8 @@ async def handle_artifact_tool(
     if tool_name == ARTIFACT_GET_URL_TOOL.name:
         return await _handle_artifact_get_url(
             arguments,
+            comment_sharing=comment_sharing,
+            comment_actor_email=comment_actor_email,
             artifact_store=artifact_store,
             session_factory=session_factory,
             user_email=user_email,
@@ -831,8 +937,10 @@ async def _read_authorized_artifact(
             return ToolResult(
                 output=(
                     f"Prepared artifact '{attachment.filename}' for native model inspection. "
-                    "The next model cycle receives it as an attachment; use the attachment "
-                    "content directly to answer the user's request."
+                    "It is prepared for a subsequent model cycle, subject to context budgets, "
+                    "authorization and provider materialization. This is not confirmation of "
+                    "model delivery or a textual analysis. Use its content if visually available; "
+                    "otherwise report that limitation."
                     f"{prompt_note}"
                 ),
                 metadata={
@@ -1201,6 +1309,8 @@ async def _handle_artifact_get_url(
     accessor_conversation_id: str | None = None,
     accessor_agent_id: str | None = None,
     accessor_session_id: str | None = None,
+    comment_sharing: PublicFeedback | None = None,
+    comment_actor_email: str | None = None,
 ) -> ToolResult:
     if artifact_store is None or session_factory is None:
         return ToolResult(output="Artifact support is not available.", is_error=True)
@@ -1210,7 +1320,12 @@ async def _handle_artifact_get_url(
         return ToolResult(output="artifact_id is required.", is_error=True)
     ttl_seconds = _coerce_limit(arguments.get("ttl_seconds"), default=3600, maximum=604800)
     ttl_seconds = max(60, ttl_seconds)
-    mode = str(arguments.get("mode") or "download").strip().lower()
+    allow_comments = arguments.get("allow_comments", False)
+    if not isinstance(allow_comments, bool):
+        return ToolResult(output="allow_comments must be a boolean.", is_error=True)
+    mode = str(arguments.get("mode") or ("view" if allow_comments else "download")).strip().lower()
+    if allow_comments and mode != "view":
+        return ToolResult(output="Comment-enabled links require mode='view'.", is_error=True)
     if mode not in {"download", "view"}:
         return ToolResult(output="mode must be 'download' or 'view'.", is_error=True)
 
@@ -1233,6 +1348,15 @@ async def _handle_artifact_get_url(
             return ToolResult(
                 output=f"Artifact preview is not supported: {artifact_id}",
                 is_error=True,
+            )
+        if allow_comments:
+            return await _comment_url_result(
+                comment_sharing,
+                item=deliverable_metadata_item(ref),
+                content_ref=ref.artifact_id,
+                user_email=comment_actor_email,
+                agent_id=accessor_agent_id,
+                ttl_seconds=ttl_seconds,
             )
         try:
             url = build_deliverable_public_url(
@@ -1276,8 +1400,17 @@ async def _handle_artifact_get_url(
             is_error=True,
         )
 
+    ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
+    if allow_comments:
+        return await _comment_url_result(
+            comment_sharing,
+            item=_artifact_metadata_item(row),
+            content_ref=row.artifact_id,
+            user_email=comment_actor_email,
+            agent_id=accessor_agent_id,
+            ttl_seconds=ttl_seconds,
+        )
     try:
-        ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
         url = await artifact_store.async_get_public_url(
             row.namespace,
             row.object_id,
@@ -1301,6 +1434,42 @@ async def _handle_artifact_get_url(
         output=json.dumps(item, indent=2, sort_keys=True),
         metadata=item,
     )
+
+
+async def _comment_url_result(
+    sharing: PublicFeedback | None,
+    *,
+    item: dict[str, Any],
+    content_ref: str,
+    user_email: str | None,
+    agent_id: str | None,
+    ttl_seconds: int,
+) -> ToolResult:
+    try:
+        link = await create_comment_link(
+            sharing,
+            content_ref=content_ref,
+            user_email=user_email,
+            agent_id=agent_id,
+            ttl_seconds=ttl_seconds,
+        )
+    except FeedbackError as exc:
+        return ToolResult(
+            output=json.dumps({"error": exc.code, "message": str(exc)}), is_error=True
+        )
+    except Exception:
+        return ToolResult(
+            output=json.dumps(
+                {
+                    "error": "comment_link_unconfirmed",
+                    "message": "Check existing sharing links before retrying.",
+                }
+            ),
+            is_error=True,
+        )
+    item.update(link)
+    item.update(url=link["comment_url"], mode="view", expires_at=link["comment_link_expires_at"])
+    return ToolResult(output=json.dumps(item, sort_keys=True), metadata=item)
 
 
 async def analyze_attachment_ref(
@@ -1425,7 +1594,8 @@ async def analyze_attachment_ref(
                 )
                 model_info = None
 
-    if attachment.kind == ArtifactKind.PDF and model_info is None:
+    file_url = attachment.url if isinstance(attachment.url, str) and attachment.url else None
+    if attachment.kind == ArtifactKind.PDF and (model_info is None or file_url is None):
         extracted = _extract_pdf_text(content, attachment.filename)
         if extracted is not None:
             return ToolResult(
@@ -1454,7 +1624,6 @@ async def analyze_attachment_ref(
             is_error=True,
         )
 
-    file_url = attachment.url if isinstance(attachment.url, str) and attachment.url else None
     if attachment.kind != ArtifactKind.IMAGE and file_url is None:
         return ToolResult(
             output=f"Could not obtain a signed URL for artifact {attachment.artifact_id}.",
@@ -1999,6 +2168,9 @@ def _analysis_response_diagnostics(
 
 
 def _extract_pdf_text(content: bytes, filename: str) -> str | None:
+    # The parser can include invalid source bytes in its header warnings.
+    if not content.startswith(b"%PDF-"):
+        return None
     try:
         from pypdf import PdfReader
 
@@ -2635,6 +2807,9 @@ def _artifact_metadata_item(row: Any) -> dict[str, Any]:
         "created_at": _serialize_datetime(getattr(row, "created_at", None)),
         "expires_at": _serialize_datetime(getattr(row, "expires_at", None)),
         "deleted_at": _serialize_datetime(getattr(row, "deleted_at", None)),
+        "owner_agent_id": row.owner_agent_id,
+        "author_email": row.author_email,
+        "author_agent_id": row.author_agent_id,
         "lineage_id": getattr(row, "lineage_id", None) or str(row.artifact_id),
         "revision": int(getattr(row, "revision", None) or 1),
         "supersedes_artifact_id": getattr(row, "supersedes_artifact_id", None),
@@ -2725,6 +2900,8 @@ async def _artifact_revision_facts(
                 "revision": int(item.revision or 1),
                 "created_at": _serialize_datetime(item.created_at),
                 "owner_email": item.owner_email,
+                "author_email": item.author_email,
+                "author_agent_id": item.author_agent_id,
             }
             for item in await list_artifact_lineage(
                 session, view.lineage_id, access_predicate=predicate
@@ -2753,6 +2930,9 @@ async def _deliverable_revision_facts(
     summary = await get_deliverable_lineage_summary(session, row)
     facts: dict[str, Any] = {
         "lineage_id": summary.lineage_id,
+        "owner_agent_id": row.owner_agent_id,
+        "author_email": row.author_email,
+        "author_agent_id": row.author_agent_id,
         "revision": int(row.revision or 1),
         "supersedes_deliverable_id": row.supersedes_deliverable_id,
         "latest_deliverable_id": summary.latest_deliverable_id,
@@ -2783,6 +2963,8 @@ async def _deliverable_revision_facts(
         facts["revisions"] = [
             {
                 "deliverable_id": item.deliverable_id,
+                "author_email": item.author_email,
+                "author_agent_id": item.author_agent_id,
                 "revision": int(item.revision or 1),
                 "created_at": _serialize_datetime(item.created_at),
             }
@@ -2935,6 +3117,8 @@ async def _handle_artifact_write(
     session_factory: Any | None,
     user_email: str | None,
     runtime_metadata: dict[str, Any] | None,
+    write_participant: ArtifactWriteParticipant | None = None,
+    source_tool_call_id: str | None = None,
 ) -> ToolResult:
     """Create a document or its next revision from inline text, without presenting it."""
 
@@ -2977,6 +3161,8 @@ async def _handle_artifact_write(
             purpose=_optional_string(arguments.get("purpose")) or "artifact_write",
             supersedes=_optional_string(arguments.get("supersedes")),
             project_id=_optional_string(arguments.get("project_id")),
+            source_tool_call_id=source_tool_call_id,
+            transaction_participant=write_participant,
         )
     except DeliverableRevisionError as exc:
         payload = exc.to_tool_result()

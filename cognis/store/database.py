@@ -97,12 +97,18 @@ def create_engine(database_url: str) -> AsyncEngine:
         connect_args["check_same_thread"] = False
         pool_kwargs["poolclass"] = NullPool
     else:
-        pool_kwargs["pool_size"] = 5
-        pool_kwargs["max_overflow"] = 10
+        # Retain the existing 15-connection cap instead of discarding burst
+        # connections and repeating synchronous driver authentication.
+        pool_kwargs["pool_size"] = 15
+        pool_kwargs["max_overflow"] = 0
         pool_kwargs["pool_pre_ping"] = True
         if database_url.startswith("postgresql+asyncpg:"):
             connect_args["server_settings"] = {
                 "application_name": f"cognis-controller:{os.getpid()}",
+                # Authorization subqueries inflate plan costs past the JIT
+                # thresholds; compiling then takes seconds for queries that
+                # execute in milliseconds.
+                "jit": "off",
             }
 
     engine = create_async_engine(

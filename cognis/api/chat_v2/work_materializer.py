@@ -35,6 +35,7 @@ from cognis.api.chat_v2.schemas import (
     ArtifactTimelineItem,
     AssistantDeliverableTimelineItem,
     FileDiffRef,
+    MessageTimelineItem,
     TimelineItem,
     ToolCallTimelineItem,
 )
@@ -57,7 +58,7 @@ from cognis.store.models import (
 
 logger = get_logger(__name__)
 
-WORK_MATERIALIZER_VERSION = "work-v8"
+WORK_MATERIALIZER_VERSION = "work-v9"
 WORK_RECORD_MAX_BYTES = 128 * 1024
 WORK_REPAIR_PAGE_SIZE = 500
 WORK_REPAIR_CONCURRENCY = 2
@@ -406,6 +407,31 @@ def _record_metadata(
         "additions": additions,
         "deletions": deletions,
     }
+
+
+def _work_attachment_items(items: Sequence[TimelineItem]) -> list[TimelineItem]:
+    """Expose assistant message attachments without changing the chat timeline."""
+
+    expanded: list[TimelineItem] = []
+    for item in items:
+        expanded.append(item)
+        if not isinstance(item, MessageTimelineItem) or item.role != "assistant":
+            continue
+        for attachment in {ref.artifact_id: ref for ref in item.attachments}.values():
+            expanded.append(
+                ArtifactTimelineItem(
+                    id=f"artifact:{attachment.artifact_id}",
+                    sort_key=item.sort_key,
+                    source_refs=item.source_refs,
+                    created_at=item.created_at,
+                    updated_at=item.updated_at,
+                    artifact_id=attachment.artifact_id,
+                    filename=attachment.filename,
+                    mime_type=attachment.mime_type,
+                    size_bytes=attachment.size_bytes,
+                )
+            )
+    return expanded
 
 
 def _published_artifact_item(item: TimelineItem) -> TimelineItem:
@@ -1351,7 +1377,7 @@ class WorkMaterializer:
         timeline = project_timeline(normalize_session_events(raw_events).events).timeline
         definitions = self._tool_definitions()
         file_facts_changed = False
-        for ordinal, item in enumerate(timeline.items):
+        for ordinal, item in enumerate(_work_attachment_items(timeline.items)):
             if not isinstance(item, ToolCallTimelineItem) and not is_work_evidence_item(
                 item, definitions
             ):
@@ -1551,7 +1577,9 @@ class WorkMaterializer:
                     func.count().filter(evidence),
                     func.count().filter(evidence, WorkRecordRow.category == "mutations"),
                     func.count().filter(evidence, WorkRecordRow.category == "commands"),
-                    func.count().filter(evidence, WorkRecordRow.category == "artifacts"),
+                    func.count(func.distinct(WorkRecordRow.entity_id)).filter(
+                        evidence, WorkRecordRow.category == "artifacts"
+                    ),
                     func.count(func.distinct(WorkRecordRow.entity_id)).filter(
                         evidence, WorkRecordRow.category == "deliverables"
                     ),

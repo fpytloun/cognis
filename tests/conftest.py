@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -13,7 +13,11 @@ from pathlib import Path
 import httpx
 import jwt
 import pytest
+import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
+from sqlalchemy import schema as sa_schema
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +64,29 @@ def _healthcheck(url: str) -> None:
             response.raise_for_status()
     except Exception as exc:  # pragma: no cover - integration guard
         pytest.skip(f"Live service unavailable at {url}: {exc}")
+
+
+@pytest_asyncio.fixture
+async def postgres_migration_engine() -> AsyncIterator[AsyncEngine]:
+    """Provide an empty PostgreSQL schema without changing other tests' tables."""
+    database_url = os.environ.get("COGNIS_TEST_POSTGRES_URL")
+    if not database_url:
+        pytest.skip("COGNIS_TEST_POSTGRES_URL is not configured")
+    url = make_url(database_url).set(drivername="postgresql+asyncpg")
+    schema = f"migration_{uuid.uuid4().hex}"
+    admin = create_async_engine(url)
+    engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    try:
+        async with admin.begin() as connection:
+            await connection.execute(sa_schema.CreateSchema(schema))
+        try:
+            yield engine
+        finally:
+            await engine.dispose()
+            async with admin.begin() as connection:
+                await connection.execute(sa_schema.DropSchema(schema, cascade=True))
+    finally:
+        await admin.dispose()
 
 
 @pytest.fixture(scope="session")

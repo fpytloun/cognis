@@ -16,9 +16,11 @@ from pydantic import (
 )
 from pydantic_core import PydanticCustomError
 
+from cognis.api.datetimes import utc_datetime
 from cognis.core.question_sets import normalize_questions, normalize_reply
 from cognis.models.config import GenerationPerformanceSnapshot, TokenUsage
 from cognis.models.conversation_state import ConversationStateEnvelope
+from cognis.models.deliverable import TaskDeliverableFreshness, TaskOutputPresentation
 from cognis.models.executor_resources import ExecutorResourceSnapshot
 from cognis.models.runtime_capabilities import RuntimeCapabilityReport
 from cognis.models.task import TaskDelivery
@@ -51,6 +53,7 @@ DashboardIssueKind = Literal[
     "schedule_auto_disabled",
     "provider_health",
     "provider_quota",
+    "provider_auth",
 ]
 
 
@@ -358,6 +361,7 @@ class UserChatPreferences(BaseModel):
     model_config = {"extra": "forbid"}
 
     enter_to_send: bool = True
+    adapt_tts: bool = False
     show_thinking_blocks: bool = False
     group_tool_calls: bool = True
     keep_assistant_messages_separate: bool = False
@@ -403,6 +407,7 @@ class LLMProviderTestResponse(ProviderTestResultResponse):
 class HealthResponse(BaseModel):
     status: str
     providers: dict[str, dict[str, Any]]
+    usage_analytics_enabled: bool = True
     remember_queue: dict[str, Any] | None = None
     trusted_evidence_policy: dict[str, Any] | None = None
 
@@ -542,6 +547,7 @@ class ConversationResolveRequest(BaseModel):
 
     agent_id: str
     agent_profile_id: str | None = None
+    agent_profile_mode: Literal["auto", "default"] | None = None
     context_type: str = "web"
     scope: Literal["latest", "agent_direct"] = "latest"
 
@@ -561,6 +567,7 @@ class ConversationOpenRequest(BaseModel):
 
     agent_id: str
     agent_profile_id: str | None = None
+    agent_profile_mode: Literal["auto", "default"] | None = None
     context_type: str = "web"
     include_state: bool = Field(
         True,
@@ -591,6 +598,10 @@ class HandoffLinkResponse(BaseModel):
 class ConversationCreateRequest(BaseModel):
     agent_id: str
     agent_profile_id: str | None = None
+    agent_profile_mode: Literal["auto", "default"] | None = Field(
+        default=None,
+        description="Startup profile policy; omission follows the target agent. An explicit profile ID wins.",
+    )
     title: str | None = None
     project_id: str | None = Field(
         default=None,
@@ -760,6 +771,20 @@ class ConversationResponse(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     conversation_state: ConversationStateEnvelope | None = None
+
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "last_message_at",
+        "last_read_at",
+        "starred_at",
+        "active_session_updated_at",
+        "active_executor_assigned_at",
+        "active_executor_expires_at",
+    )
+    @classmethod
+    def _normalize_timestamps(cls, value: datetime | None) -> datetime | None:
+        return utc_datetime(value) if value is not None else None
 
 
 class ManagedConversationActionRequest(BaseModel):
@@ -986,6 +1011,18 @@ class AgentProjectAssignmentResponse(BaseModel):
     caller_role: str | None = None
 
 
+class AgentSkillUsageResponse(BaseModel):
+    """Per-agent skill load counters with an advisory curation suggestion."""
+
+    skill_id: str
+    name: str
+    assignment: Literal["attached", "unattached", "global", "auto_loaded"]
+    load_count: int = 0
+    search_load_count: int = 0
+    last_loaded_at: datetime | None = None
+    suggestion: Literal["consider_removing", "consider_attaching"] | None = None
+
+
 class ProjectTaskSummaryResponse(BaseModel):
     task_id: str
     title: str | None = None
@@ -1161,6 +1198,8 @@ class IntarisSessionDetailResponse(BaseModel):
     intention: str | None = None
     summary: str | None = None
     status: str
+    analytics_enabled: bool = True
+    guardrails_enabled: bool = True
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = None
     total_calls: int
     approved_count: int
@@ -1203,6 +1242,9 @@ class AgentRequestBase(BaseModel):
     ) -> dict[str, Any] | None:
         if value is None:
             return value
+        from cognis.models.agent import auto_profile_selection_settings
+
+        auto_profile_selection_settings(value)
         raw_mode = value.get("default_chat_mode")
         if raw_mode is not None and raw_mode not in {"default", "plan", "build"}:
             raise ValueError("execution.default_chat_mode must be one of: default, plan, build")
@@ -1240,6 +1282,9 @@ class AgentUpdateRequest(BaseModel):
     ) -> dict[str, Any] | None:
         if value is None:
             return value
+        from cognis.models.agent import auto_profile_selection_settings
+
+        auto_profile_selection_settings(value)
         raw_mode = value.get("default_chat_mode")
         if raw_mode is not None and raw_mode not in {"default", "plan", "build"}:
             raise ValueError("execution.default_chat_mode must be one of: default, plan, build")
@@ -1286,6 +1331,8 @@ class AgentResponse(BaseModel):
     )
     sync_metadata: dict[str, Any] | None = None
     status: str
+    is_contact_only: bool = False
+    contact_conversation_id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -1530,8 +1577,9 @@ class ProviderUsageResponse(BaseModel):
     """Hosted usage and limit windows for one LLM provider.
 
     ``source`` identifies the upstream report (``chatgpt_codex_usage``,
-    ``anthropic_subscription_usage``, ``anthropic_rate_limit_headers``, or
-    ``unsupported``). ``ok`` is false when the provider reports nothing.
+    ``anthropic_subscription_usage``, ``anthropic_rate_limit_headers``,
+    ``elevenlabs_subscription_usage``, or ``unsupported``). ``ok`` is false
+    when the provider reports nothing.
     """
 
     provider_id: str
@@ -1599,10 +1647,12 @@ class ModelRoutingResponse(CompanionRoutingEntries):
     video_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    auxiliary_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    audio_narrative: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
@@ -1614,10 +1664,12 @@ class ModelRoutingUpdateRequest(CompanionRoutingEntries):
     video_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     default: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     classifier: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    auxiliary_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     compaction: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     evaluator: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     speech_to_text: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     text_to_speech: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
+    audio_narrative: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     image_generation: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     attachment_analysis: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
     embedding: ModelRoutingEntry = Field(default_factory=ModelRoutingEntry)
@@ -1717,6 +1769,7 @@ class TaskCreateRequest(BaseModel):
     delivery_target: str | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    on_finish_instructions: str | None = Field(default=None, max_length=8000)
     interaction_mode_override: InteractionModeOverride | None = None
     escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
@@ -1759,6 +1812,7 @@ class TaskUpdateRequest(BaseModel):
     delivery_target: str | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    on_finish_instructions: str | None = Field(default=None, max_length=8000)
     interaction_mode_override: InteractionModeOverride | None = None
     escalation_timeout_seconds: int | None = Field(default=None, ge=1, le=86400, strict=True)
     session_policy: SessionPolicy | None = None
@@ -1979,8 +2033,9 @@ class TaskResponse(BaseModel):
     source_type: str
     source_ref: str | None = None
     delivery: TaskDelivery = Field(default_factory=TaskDelivery)
-    completion_mode_family: str = "default"
+    completion_mode_family: str = "auto"
     allow_silent_completion: bool = False
+    on_finish_instructions: str | None = None
     interaction_mode_override: InteractionModeOverride | None = None
     escalation_timeout_seconds: int | None = None
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
@@ -2043,6 +2098,8 @@ class TaskBoardDoneGroupResponse(BaseModel):
     title: str
     latest: TaskBoardItemResponse
     task_count: int = 1
+    failed_count: int = 0
+    cancelled_count: int = 0
 
 
 class TaskBoardColumnResponse(BaseModel):
@@ -2072,7 +2129,10 @@ class WorkflowRunResponse(BaseModel):
 
 
 class DeliverableResponse(BaseModel):
+    task_freshness: TaskDeliverableFreshness | None = None
     deliverable_id: str
+    author_email: str | None = None
+    author_agent_id: str | None = None
     step_run_id: str | None = None
     conversation_id: str | None = None
     session_id: str | None = None
@@ -2105,6 +2165,8 @@ class DeliverableRevisionSummary(BaseModel):
     """One live revision in a deliverable lineage."""
 
     deliverable_id: str
+    author_email: str | None = None
+    author_agent_id: str | None = None
     revision: int
     title: str | None = None
     format: str = "markdown"
@@ -2128,6 +2190,8 @@ class ArtifactRevisionSummary(BaseModel):
     """One live revision in an artifact lineage."""
 
     artifact_id: str
+    author_email: str | None = None
+    author_agent_id: str | None = None
     revision: int
     filename: str
     mime_type: str
@@ -2168,6 +2232,7 @@ class ChannelPairingRequestResponse(BaseModel):
 
 
 class StepRunResponse(BaseModel):
+    deliverable_freshness: dict[str, TaskDeliverableFreshness] = Field(default_factory=dict)
     step_run_id: str
     task_id: str
     step_name: str
@@ -2199,8 +2264,11 @@ class StepRunResponse(BaseModel):
 
 
 class TaskDetailResponse(TaskResponse):
+    output_presentation: TaskOutputPresentation | None = None
+    deliverable_freshness: dict[str, TaskDeliverableFreshness] = Field(default_factory=dict)
     dependencies: list[DependencyResponse] = Field(default_factory=list)
     step_runs: list[StepRunResponse] = Field(default_factory=list)
+    final_deliverable: DeliverableResponse | None = None
     workflow_run: WorkflowRunResponse | None = None
     pending_pause: PendingPauseResponse | None = None
     workflow_projection: TaskWorkflowProjection | None = None
@@ -2230,8 +2298,9 @@ class CreateScheduleRequest(BaseModel):
     delete_after_run: bool = False
     retry_failed_tasks: bool = False
     fail_paused_task_on_next_fire: bool = True
-    completion_mode_family: str = "default"
+    completion_mode_family: str = "auto"
     allow_silent_completion: bool = False
+    on_finish_instructions: str | None = Field(default=None, max_length=8000)
     interaction_mode_override: InteractionModeOverride | None = "none"
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
 
@@ -2285,6 +2354,7 @@ class UpdateScheduleRequest(BaseModel):
     fail_paused_task_on_next_fire: bool | None = None
     completion_mode_family: str | None = None
     allow_silent_completion: bool | None = None
+    on_finish_instructions: str | None = Field(default=None, max_length=8000)
     interaction_mode_override: InteractionModeOverride | None = None
     session_policy: SessionPolicy | None = None
 
@@ -2326,8 +2396,9 @@ class ScheduleResponse(BaseModel):
     delete_after_run: bool = False
     retry_failed_tasks: bool = False
     fail_paused_task_on_next_fire: bool = True
-    completion_mode_family: str = "default"
+    completion_mode_family: str = "auto"
     allow_silent_completion: bool = False
+    on_finish_instructions: str | None = None
     interaction_mode_override: InteractionModeOverride | None = "none"
     session_policy: SessionPolicy = Field(default_factory=SessionPolicy)
     last_fired_at: datetime | None = None
@@ -3032,32 +3103,6 @@ class WebSocketPong(BaseModel):
 # ---------------------------------------------------------------------------
 # Voice mode (TTS / STT)
 # ---------------------------------------------------------------------------
-
-
-class TtsSynthesizeRequest(BaseModel):
-    """Request body for ``POST /api/v1/tts/synthesize``.
-
-    ``message_id`` enables artifact caching keyed on
-    ``(message_id, voice, model)``. ``agent_id`` lets the server resolve
-    the per-agent voice override. ``voice`` overrides everything.
-    """
-
-    text: str
-    message_id: str | None = None
-    agent_id: str | None = None
-    voice: str | None = None
-    format: str = "mp3"
-    speed: float = Field(default=1.0, ge=0.25, le=4.0)
-    low_latency: bool = False
-
-
-class TtsSynthesizeResponse(BaseModel):
-    audio_url: str
-    content_type: str
-    duration_seconds: float | None = None
-    voice: str
-    model: str
-    cached: bool = False
 
 
 class SttTranscribeResponse(BaseModel):

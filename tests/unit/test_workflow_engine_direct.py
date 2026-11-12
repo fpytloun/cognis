@@ -35,9 +35,8 @@ async def test_run_direct_turn_enables_questions() -> None:
     captured: dict[str, object] = {}
 
     class _AgentLoop:
-        async def run_step(self, ctx: object, **_: object) -> str:
+        async def run_step(self, ctx: object, **_: object) -> None:
             captured["ctx"] = ctx
-            return "ok"
 
     async def _runtime_factory(**_: object) -> ResolvedStepRuntime:
         async def _cleanup() -> None:
@@ -68,7 +67,7 @@ async def test_run_direct_turn_enables_questions() -> None:
             conversation_id="conv-1",
             context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
-        session=SimpleNamespace(user_email="user@example.com"),
+        session=SimpleNamespace(session_id="session-1", user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="Need help",
         user_message_already_recorded=True,
@@ -90,9 +89,8 @@ async def test_run_direct_turn_injects_recovery_as_system_context() -> None:
     captured: dict[str, object] = {}
 
     class _AgentLoop:
-        async def run_step(self, ctx: object, **_: object) -> str:
+        async def run_step(self, ctx: object, **_: object) -> None:
             captured["ctx"] = ctx
-            return "ok"
 
     async def _runtime_factory(**_: object) -> ResolvedStepRuntime:
         async def _cleanup() -> None:
@@ -122,7 +120,7 @@ async def test_run_direct_turn_injects_recovery_as_system_context() -> None:
             conversation_id="conv-1",
             context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
-        session=SimpleNamespace(user_email="user@example.com"),
+        session=SimpleNamespace(session_id="session-1", user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="Continue the operation",
         recovery_context="The prior attempt was interrupted. Verify external state.",
@@ -143,9 +141,8 @@ async def test_run_direct_turn_threads_follow_up_metadata() -> None:
     captured: dict[str, object] = {}
 
     class _AgentLoop:
-        async def run_step(self, ctx: object, **_: object) -> str:
+        async def run_step(self, ctx: object, **_: object) -> None:
             captured["ctx"] = ctx
-            return "ok"
 
     async def _runtime_factory(**_: object) -> ResolvedStepRuntime:
         async def _cleanup() -> None:
@@ -190,7 +187,7 @@ async def test_run_direct_turn_threads_follow_up_metadata() -> None:
             conversation_id="conv-1",
             context=SimpleNamespace(type="web", ref=None, platform_data={}),
         ),
-        session=SimpleNamespace(user_email="user@example.com"),
+        session=SimpleNamespace(session_id="session-1", user_email="user@example.com"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         user_message="",
         system_initiated=True,

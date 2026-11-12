@@ -2,16 +2,24 @@
 
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import sqlalchemy as sa
 
 from cognis.store.models import Base
 
-PRESERVED_TABLES = ("project_knowledgebases", "inference_routes", "agent_hooks")
+PRESERVED_TABLES = (
+    "project_knowledgebases",
+    "inference_routes",
+    "agent_hooks",
+    "feedback_subjects",
+    "feedback_grants",
+)
 
 
 def seed_bootstrap_data(connection: sa.Connection) -> dict[str, list[dict[str, Any]]]:
     owner = "bootstrap-owner@cognis.test"
+    subject_id = f"fbs_{uuid4().hex}"
     rows = {
         "users": {"email": owner},
         "projects": {"project_id": "bootstrap-project", "owner_email": owner, "name": "Preserved"},
@@ -38,6 +46,20 @@ def seed_bootstrap_data(connection: sa.Connection) -> dict[str, list[dict[str, A
             "owner_email": owner,
             "revision": 3,
             "definition": {"name": "Preserved hook", "trigger": "conversation_idle"},
+        },
+        "feedback_subjects": {
+            "subject_id": subject_id,
+            "source_key": f"bootstrap-source-{uuid4().hex}",
+            "owner_email": owner,
+            "source": {"kind": "document", "content_ref": f"art_{uuid4().hex}"},
+            "content_digest": uuid4().hex,
+            "version": 3,
+        },
+        "feedback_grants": {
+            "subject_id": subject_id,
+            "principal_email": owner,
+            "version": 7,
+            "capabilities": {"read": True, "comment": False},
         },
     }
     for name, values in rows.items():

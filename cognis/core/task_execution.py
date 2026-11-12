@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -16,6 +17,12 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from cognis import json_codec as json
+from cognis.core.followups import (
+    LLM_CYCLE_CEILING_CONTINUATION_REASON,
+    TOOL_CALL_CEILING_CONTINUATION_REASON,
+    ContinuationFollowUp,
+)
 from cognis.store.coordination import (
     Lease,
     _lease_expiry_expression,
@@ -25,6 +32,13 @@ from cognis.store.models import CoordinationLeaseRow, Task
 
 TASK_LEASE_TTL_SECONDS = 60.0
 TASK_LEASE_RENEW_SECONDS = 15.0
+
+
+def delegation_arguments_binding(arguments: dict[str, Any]) -> str:
+    """Bind a reserved delegation to its exact original arguments."""
+    return hashlib.sha256(
+        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 class StaleTaskExecutionOwner(RuntimeError):
@@ -234,6 +248,7 @@ class TaskExecutionStore:
         task_id: str,
         *,
         statuses: set[str],
+        capacity: bool = True,
     ) -> TaskExecutionClaim | None:
         """Claim a specific task already transitioned by an explicit task API."""
         async with self._session_factory() as session:
@@ -251,6 +266,16 @@ class TaskExecutionStore:
                 claim_owner_id,
                 ttl_seconds=self.ttl_seconds,
             )
+            if task_lease is not None and not capacity:
+                await session.commit()
+                return TaskExecutionClaim(
+                    task.task_id,
+                    task.agent_id,
+                    int(task.attempt_number or 1),
+                    task_lease,
+                    None,
+                    None,
+                )
             global_lease = (
                 await self._acquire_capacity(
                     session,
@@ -580,13 +605,385 @@ class TaskExecutionFence:
         turn_id: str | None,
         descriptors: list[dict[str, Any]],
     ) -> None:
-        """Fence a scheduled task before its tool batch can be dispatched."""
-        await self.checkpoint(
-            "tool_in_flight",
-            session_id=session_id,
-            turn_id=turn_id,
-            tool_calls=descriptors,
-        )
+        """Persist dispatch identities only; arguments/content remain in Intaris."""
+        allowed = {"call_id", "tool_name", "dispatch_state"}
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            assert task is not None
+            data = dict(task.result_data or {})
+            batches = dict(data.get("execution_recovery") or {})
+            key = f"{session_id}:{turn_id}"
+            previous = batches.get(key, {})
+            prior_calls = {d["call_id"]: d for d in previous.get("tool_calls", [])}
+            for descriptor in descriptors:
+                call_id = descriptor["call_id"]
+                if call_id not in prior_calls:
+                    prior_calls[call_id] = {k: v for k, v in descriptor.items() if k in allowed}
+                    prior_calls[call_id]["canonical_turn_id"] = turn_id
+            batches[key] = {
+                "attempt_number": self.claim.attempt_number,
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "tool_calls": list(prior_calls.values()),
+            }
+            task.result_data = {**data, "execution_recovery": batches}
+            await db.commit()
+
+    async def bind_tool_dispatch(
+        self,
+        call_id: str,
+        executor_id: str,
+        executor_instance_id: str | None,
+        *,
+        session_id: str,
+        turn_id: str | None,
+        dispatch_state: str,
+    ) -> None:
+        """Commit dispatch identity or proven non-delivery within the current call scope."""
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            assert task is not None
+            data = dict(task.result_data or {})
+            batches = dict(data.get("execution_recovery") or {})
+            key = f"{session_id}:{turn_id}"
+            batch = dict(batches.get(key) or {})
+            calls = [dict(d) for d in batch.get("tool_calls", [])]
+            descriptor = next((d for d in calls if d["call_id"] == call_id), None)
+            if descriptor is None:
+                raise StaleTaskExecutionOwner("Missing durable task dispatch descriptor")
+            descriptor.update(
+                executor_id=executor_id,
+                executor_instance_id=executor_instance_id,
+                dispatch_state=dispatch_state,
+            )
+            batches[key] = {**batch, "tool_calls": calls}
+            task.result_data = {**data, "execution_recovery": batches}
+            await db.commit()
+
+    async def recovery_batches(self) -> dict[str, Any]:
+        """Read current attempt metadata, not a stale task-model snapshot."""
+        async with self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id)
+            if task is None:
+                raise StaleTaskExecutionOwner(self.claim.task_id)
+            return {
+                key: batch
+                for key, batch in ((task.result_data or {}).get("execution_recovery") or {}).items()
+                if batch.get("attempt_number") == self.claim.attempt_number
+            }
+
+    async def reserve_delegation(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        call_id: str,
+        binding: str,
+        step_run_id: str | None = None,
+    ) -> tuple[str, str]:
+        """Reserve immutable child identities before provisioning or execution."""
+        from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            assert task is not None
+            data = dict(task.result_data or {})
+            batches = dict(data.get("execution_recovery") or {})
+            key = f"{session_id}:{turn_id}"
+            batch = dict(batches.get(key) or {})
+            calls = [dict(d) for d in batch.get("tool_calls", [])]
+            descriptor = next((d for d in calls if d["call_id"] == call_id), None)
+            if descriptor is None or descriptor.get("tool_name") != "delegate":
+                raise TaskRecoveryBlocked("Delegation has no owned durable call reservation.")
+            if descriptor.get("canonical_turn_id", turn_id) != turn_id:
+                raise TaskRecoveryBlocked(
+                    "Delegation canonical call turn differs from its reserved turn. "
+                    "Cancel the task and start a fresh run after reconciling existing effects."
+                )
+            if descriptor.get("delegate_binding") not in (None, binding):
+                raise TaskRecoveryBlocked("Delegation reservation binding does not match.")
+            if not descriptor.get("child_session_id"):
+                descriptor.update(
+                    child_session_id=f"sess_{uuid.uuid4().hex}",
+                    child_turn_id=f"turn_{uuid.uuid4().hex[:12]}",
+                    delegate_binding=binding,
+                )
+                if step_run_id is not None:
+                    descriptor.update(
+                        task_id=self.claim.task_id,
+                        attempt_number=self.claim.attempt_number,
+                        step_run_id=step_run_id,
+                    )
+            if not descriptor.get("child_turn_id") or not descriptor.get("delegate_binding"):
+                raise TaskRecoveryBlocked("Delegation reservation identity is incomplete.")
+            batches[key] = {**batch, "tool_calls": calls}
+            task.result_data = {**data, "execution_recovery": batches}
+            await db.commit()
+            return descriptor["child_session_id"], descriptor["child_turn_id"]
+
+    async def restore_child_reservation(
+        self, *, child_session_id: str, parent_session_id: str, call: dict[str, Any]
+    ) -> None:
+        """Restore a lost attachment only from complete same-turn task provenance."""
+        from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+        from cognis.store.models import Session, StepRun
+
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            child = await db.get(Session, child_session_id, with_for_update=True)
+            proof = (child.delegation_metadata or {}).get("task_call", {}) if child else {}
+            parent = await db.get(Session, parent_session_id)
+            step = (
+                await db.get(StepRun, proof.get("step_run_id"))
+                if proof.get("step_run_id")
+                else None
+            )
+            if (
+                task is None
+                or child is None
+                or parent is None
+                or child.parent_session_id != parent_session_id
+                or child.user_email != parent.user_email
+                or child.conversation_id != parent.conversation_id
+                or proof.get("task_id") != self.claim.task_id
+                or proof.get("attempt_number") != self.claim.attempt_number
+                or not (child.delegation_metadata or {}).get("task_runtime_fingerprint")
+                or not (child.delegation_metadata or {}).get("task_execution_turn_id")
+                or step is None
+                or step.task_id != self.claim.task_id
+                or step.attempt_number != self.claim.attempt_number
+                or step.superseded_by_step_run_id is not None
+                or proof.get("session_id") != parent_session_id
+                or proof.get("child_session_id") != child_session_id
+                or call.get("call_id") != proof.get("call_id")
+                or call.get("name") != "delegate"
+                or call.get("turn_id") != proof.get("turn_id")
+                or delegation_arguments_binding(
+                    call.get("recovery_arguments") or call.get("arguments") or {}
+                )
+                != proof.get("binding")
+                or not proof.get("child_turn_id")
+            ):
+                raise TaskRecoveryBlocked(
+                    f"Delegated child {child_session_id} has missing or conflicting "
+                    "task/attempt/StepRun or same-turn canonical-call proof. "
+                    "Cancel the task and start a fresh run after reconciling existing effects."
+                )
+            data = dict(task.result_data or {})
+            batches = dict(data.get("execution_recovery") or {})
+            key = f"{proof['session_id']}:{proof['turn_id']}"
+            batch = dict(batches.get(key) or {})
+            calls = list(batch.get("tool_calls") or [])
+            existing = next((d for d in calls if d["call_id"] == proof["call_id"]), None)
+            descriptor = {
+                "call_id": proof["call_id"],
+                "tool_name": "delegate",
+                "session_id": proof["session_id"],
+                "turn_id": proof["turn_id"],
+                "canonical_turn_id": proof["turn_id"],
+                "attempt_number": self.claim.attempt_number,
+                "child_session_id": child_session_id,
+                "child_turn_id": proof["child_turn_id"],
+                "delegate_binding": proof["binding"],
+            }
+            if existing is not None:
+                if any(
+                    existing.get(k) != v for k, v in descriptor.items() if k != "canonical_turn_id"
+                ):
+                    raise TaskRecoveryBlocked(
+                        "Conflicting delegated-child reservation; cancel the task."
+                    )
+                return
+            calls.append(descriptor)
+            batches[key] = {
+                **batch,
+                "session_id": proof["session_id"],
+                "turn_id": proof["turn_id"],
+                "attempt_number": self.claim.attempt_number,
+                "tool_calls": calls,
+            }
+            task.result_data = {**data, "execution_recovery": batches}
+            owned_receipt = False
+            for pending in batches.values():
+                if pending.get("attempt_number") != self.claim.attempt_number or not pending.get(
+                    "tool_calls"
+                ):
+                    continue
+                descendant = await db.get(Session, pending.get("session_id"))
+                if (
+                    descendant is not None
+                    and pending.get("turn_id")
+                    == (descendant.delegation_metadata or {}).get("task_execution_turn_id")
+                    and await self._owns_reserved_child(db, task, descendant)
+                ):
+                    owned_receipt = True
+                    break
+            if not owned_receipt:
+                raise TaskRecoveryBlocked(
+                    "Delegated child has no current-attempt receipt with consistent session "
+                    "lineage and active turn; cancel the task after reconciling existing effects."
+                )
+            await db.commit()
+
+    async def bind_child_runtime(
+        self, session_id: str, fingerprint: str
+    ) -> tuple[str, ContinuationFollowUp | None]:
+        """Validate scope and restore the active, durably reserved child turn."""
+        from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+        from cognis.store.models import Session
+
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id)
+            row = await db.get(Session, session_id, with_for_update=True)
+            if row is None or task is None or not await self._owns_reserved_child(db, task, row):
+                raise TaskRecoveryBlocked("Reserved delegated child is unavailable.")
+            metadata = dict(row.delegation_metadata or {})
+            previous = metadata.get("task_runtime_fingerprint")
+            if previous is not None and previous != fingerprint:
+                raise TaskRecoveryBlocked(
+                    "Delegated runtime configuration or tool scope changed; automatic recovery stopped."
+                )
+            original_turn = metadata["task_call"]["child_turn_id"]
+            turn_id = metadata.get("task_execution_turn_id", original_turn)
+            continuation = None
+            try:
+                if saved := metadata.get("task_continuation"):
+                    continuation = ContinuationFollowUp.model_validate(saved)
+                    if (
+                        continuation.reason
+                        not in {
+                            TOOL_CALL_CEILING_CONTINUATION_REASON,
+                            LLM_CYCLE_CEILING_CONTINUATION_REASON,
+                        }
+                        or continuation.attempt > continuation.max_attempts
+                        or continuation.topic_ref != turn_id
+                    ):
+                        raise ValueError("Invalid continuation identity")
+                elif turn_id != original_turn:
+                    raise ValueError("Missing continuation identity")
+                if not isinstance(turn_id, str) or not turn_id:
+                    raise ValueError("Missing child turn")
+            except ValueError as exc:
+                raise TaskRecoveryBlocked("Delegated continuation identity is invalid.") from exc
+            row.delegation_metadata = {
+                **metadata,
+                "task_runtime_fingerprint": fingerprint,
+                "task_execution_turn_id": turn_id,
+            }
+            await db.commit()
+            return turn_id, continuation
+
+    async def advance_child_continuation(
+        self, session_id: str, *, prior_turn_id: str, follow_up: ContinuationFollowUp
+    ) -> str:
+        """Reserve the next child turn before inference, keeping provenance unchanged."""
+        from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+        from cognis.store.models import Session
+
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id)
+            row = await db.get(Session, session_id, with_for_update=True)
+            if row is None or task is None or not await self._owns_reserved_child(db, task, row):
+                raise TaskRecoveryBlocked("Reserved delegated child is unavailable.")
+            metadata = dict(row.delegation_metadata or {})
+            if metadata.get("task_execution_turn_id") != prior_turn_id:
+                raise TaskRecoveryBlocked("Delegated continuation no longer owns its prior turn.")
+            if any(
+                batch.get("session_id") == (row.intaris_session_id or row.session_id)
+                and batch.get("tool_calls")
+                for batch in ((task.result_data or {}).get("execution_recovery") or {}).values()
+            ):
+                raise TaskRecoveryBlocked("Delegated continuation still has unsettled tools.")
+            turn_id = f"turn_{uuid.uuid4().hex[:12]}"
+            row.delegation_metadata = {
+                **metadata,
+                "task_execution_turn_id": turn_id,
+                "task_continuation": {
+                    **follow_up.model_dump(mode="json", exclude={"pending_todos"}),
+                    "topic_ref": turn_id,
+                },
+            }
+            await db.commit()
+            return turn_id
+
+    async def _owns_reserved_child(self, db: AsyncSession, task: Any, child: Any) -> bool:
+        from cognis.store.models import Session
+
+        binding = (child.delegation_metadata or {}).get("task_call") or {}
+        roots = [
+            descriptor["child_session_id"]
+            for batch in ((task.result_data or {}).get("execution_recovery") or {}).values()
+            for descriptor in batch.get("tool_calls", [])
+            if (
+                batch.get("attempt_number") == self.claim.attempt_number
+                and batch.get("session_id") == binding.get("session_id")
+                and child.parent_session_id == binding.get("session_id")
+                and batch.get("turn_id") == binding.get("turn_id")
+                and descriptor.get("tool_name") == "delegate"
+                and descriptor.get("call_id") == binding.get("call_id")
+                and descriptor.get("child_session_id")
+                and descriptor.get("child_turn_id") == binding.get("child_turn_id")
+                and descriptor.get("delegate_binding") == binding.get("binding")
+            )
+        ]
+        if len(roots) != 1:
+            return False
+        cursor = child
+        seen = set()
+        for _ in range(128):
+            if (
+                cursor.user_email != task.created_by
+                or cursor.parent_session_id != child.parent_session_id
+                or cursor.conversation_id != child.conversation_id
+                or cursor.agent_id != child.agent_id
+                or (cursor.delegation_metadata or {}).get("task_call") != binding
+                or cursor.session_id in seen
+            ):
+                return False
+            if cursor.session_id == roots[0]:
+                return True
+            seen.add(cursor.session_id)
+            if not cursor.previous_session_id:
+                return False
+            cursor = await db.get(Session, cursor.previous_session_id)
+            if cursor is None:
+                return False
+        return False
+
+    async def cancel_child_if_requested(
+        self, session_id: str, *, explicit_cancel: bool = False
+    ) -> bool:
+        """Apply task cancellation or resolved human denial, never shutdown."""
+        from cognis.store.models import Session
+        from cognis.store.queries import set_session_status
+
+        async with self._claim_lock, self.store._session_factory() as db:
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            if task is None or task.attempt_number != self.claim.attempt_number:
+                return False
+            if task.status != "cancelled":
+                if not explicit_cancel or task.status not in {"running", "paused"}:
+                    return False
+                await self.assert_current(db)
+            child = await db.get(Session, session_id, with_for_update=True)
+            if child is None or not await self._owns_reserved_child(db, task, child):
+                return False
+            await set_session_status(
+                db,
+                session_id,
+                "cancelled",
+                result_summary="Cancelled (parent task cancelled)",
+                allowed_from={"active", "idle", "suspended"},
+            )
+            await db.commit()
+            return True
 
     async def complete_tool_dispatch(
         self,
@@ -594,14 +991,28 @@ class TaskExecutionFence:
         session_id: str,
         turn_id: str | None,
         call_ids: list[str],
-    ) -> None:
-        """Fence a scheduled task after its tool batch has settled."""
-        await self.checkpoint(
-            "tool_result_persisted",
-            session_id=session_id,
-            turn_id=turn_id,
-            call_ids=call_ids,
-        )
+    ) -> list[dict[str, Any]]:
+        """Release settled descriptors after the canonical result boundary."""
+        async with self._claim_lock, self.store._session_factory() as db:
+            await self.assert_current(db)
+            task = await db.get(Task, self.claim.task_id, with_for_update=True)
+            assert task is not None
+            data = dict(task.result_data or {})
+            batches = dict(data.get("execution_recovery") or {})
+            key = f"{session_id}:{turn_id}"
+            batch = batches.get(key, {})
+            remaining = [d for d in batch.get("tool_calls", []) if d["call_id"] not in call_ids]
+            settled = [d for d in batch.get("tool_calls", []) if d["call_id"] in call_ids]
+            if remaining:
+                batches[key] = {**batch, "tool_calls": remaining}
+            else:
+                batches.pop(key, None)
+            task.result_data = {**data, "execution_recovery": batches}
+            await db.commit()
+            return [
+                {**descriptor, "session_id": session_id, "turn_id": turn_id}
+                for descriptor in settled
+            ]
 
     def mark_terminal(self, status: str) -> None:
         """Permit post-commit cleanup and delivery for this exact terminal winner."""

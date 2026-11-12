@@ -1,4 +1,4 @@
-"""Conversation title ownership and Intaris adoption rules."""
+"""Canonical conversation title eligibility and publication policy."""
 
 from __future__ import annotations
 
@@ -7,9 +7,8 @@ from typing import Any
 from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.events import Event, EventBus, EventType
 from cognis.models.session import ConversationModel
-from cognis.store.queries import update_conversation, update_conversation_context_data
+from cognis.store.queries import update_conversation_context_data
 
-PROTECTED_TITLE_SOURCES = frozenset({"manual", "channel_seed"})
 INTARIS_TITLE_KEY = "intaris_latest_title"
 INTARIS_TITLE_UPDATED_AT_KEY = "intaris_latest_title_at"
 
@@ -19,8 +18,8 @@ def _context_platform_data(conversation: ConversationModel) -> dict[str, object]
     return dict(data or {})
 
 
-def can_adopt_intaris_title(conversation: ConversationModel) -> bool:
-    """Return True when Cognis may update the conversation title from Intaris."""
+def can_generate_title(conversation: ConversationModel) -> bool:
+    """Return whether Cognis may initialize an automatic visible title."""
 
     if is_agent_direct_context(
         conversation.context.type if conversation.context else None,
@@ -51,7 +50,7 @@ async def sync_intaris_title(
     *,
     updated_at: str | None = None,
 ) -> bool:
-    """Store the latest Intaris title and initialize the visible title once."""
+    """Store an optional suggestion; the result never indicates a visible change."""
 
     normalized = (title or "").strip()[:200]
     if not normalized:
@@ -69,19 +68,6 @@ async def sync_intaris_title(
         context_data=platform_data,
     )
 
-    if not can_adopt_intaris_title(conversation):
-        return changed
-
-    ok = await update_conversation(
-        db_session,
-        conversation.conversation_id,
-        title=normalized,
-        title_source="intaris",
-    )
-    if ok:
-        conversation.title = normalized
-        conversation.title_source = "intaris"
-        changed = True
     return changed
 
 

@@ -92,8 +92,8 @@ LIST_CHANNEL_ACCOUNTS_TOOL = _tool(
     "list_channel_accounts",
     (
         "List channel accounts owned by the current user without exposing provider identifiers. "
-        "Results identify the shared transport account; outbound identity does not follow the "
-        "initiating agent."
+        "Each account determines the transport identity. Built-in app accounts identify their "
+        "configured agent and the sending user; external identity does not follow the initiating agent."
     ),
     {"enabled_only": {"type": "boolean", "default": True}},
     read_only=True,
@@ -102,11 +102,16 @@ SEARCH_CHANNEL_TARGETS_TOOL = _tool(
     "search_channel_targets",
     (
         "Search direct chats and groups already observed or successfully contacted by Cognis. "
-        "Provider directory discovery is not available. Use read_channel_messages on a "
+        "On a built-in app account, an exact active Cognis user email is also supported. "
+        "Broad provider directory discovery is not available. Use read_channel_messages on a "
         "returned target_ref for the observed external transcript."
     ),
     {
-        "query": {"type": "string", "default": ""},
+        "query": {
+            "type": "string",
+            "default": "",
+            "description": "Name or external-ID hint. For in-app contact, use an exact active Cognis user's email.",
+        },
         "account_ref": {"type": "string"},
         "kinds": {
             "type": "array",
@@ -122,8 +127,10 @@ SEND_CHANNEL_MESSAGE_TOOL = _tool(
     (
         "Queue one durable text and/or artifact message to an observed target or an explicit "
         "recipient. "
-        "This creates no Cognis conversation and does not wait for a reply. The provider uses "
-        "the shared channel account identity, not the initiating agent identity."
+        "This creates no managed execution and does not wait for a reply. Built-in app delivery "
+        "uses the recipient's main chat when the agent is available, otherwise a no-reply native "
+        "notification. Prefer agent_conversation_create_channel when feedback is useful. "
+        "External providers use the shared channel account identity, not the initiating agent identity."
     ),
     {
         "target_ref": {"type": "string"},
@@ -298,6 +305,18 @@ def build_channel_tool_handlers(
                 accounts = await list_channel_accounts(
                     session, enabled_only=True, user_email=user_email
                 )
+            from cognis.channels.app_contact import observe_app_recipient
+
+            requested_channel_type = arguments.get("channel_type")
+            if requested_channel_type:
+                accounts = [
+                    account
+                    for account in accounts
+                    if account.channel_type == requested_channel_type
+                ]
+            await observe_app_recipient(
+                session, accounts=accounts, user_email=user_email, query=query
+            )
             targets = await _observed_targets(
                 session,
                 codec=codec,
@@ -1082,7 +1101,10 @@ def _transport_identity(row: ChannelAccountRow) -> dict[str, Any]:
         "configured_agent_id": row.agent_id,
         "per_message_agent_identity": False,
         "detail": (
-            "The provider displays the shared channel account identity. "
+            "Cognis displays this account's configured agent on behalf of the sending user. "
+            "Receiving a message does not grant agent access."
+            if row.channel_type == "web"
+            else "The provider displays the shared channel account identity. "
             "It does not follow the agent that initiated this message."
         ),
     }

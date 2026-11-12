@@ -322,7 +322,9 @@ async def list_accounts(request: Request) -> list[dict[str, Any]]:
 
         # Add runtime status if channel manager is available
         channel_manager = getattr(request.app.state, "channel_manager", None)
-        if channel_manager:
+        if row.channel_type == "web":
+            account["status"] = {"status": "connected"}
+        elif channel_manager:
             status = await channel_manager.get_account_status(row.account_id)
             if status:
                 account["status"] = status.model_dump()
@@ -344,6 +346,10 @@ async def create_account(request: Request) -> Any:
     user_email = require_current_user(request).email
 
     channel_type = body.get("channel_type")
+    if channel_type == "web":
+        return error_response(
+            400, "validation_error", "Cognis app channels are created automatically"
+        )
     if not channel_type:
         return error_response(400, "validation_error", "channel_type is required")
 
@@ -475,7 +481,9 @@ async def get_account(request: Request, account_id: str) -> Any:
     }
 
     channel_manager = getattr(request.app.state, "channel_manager", None)
-    if channel_manager:
+    if row.channel_type == "web":
+        result["status"] = {"status": "connected"}
+    elif channel_manager:
         status = await channel_manager.get_account_status(account_id)
         result["status"] = status.model_dump() if status else {"status": "stopped"}
 
@@ -497,6 +505,27 @@ async def update_account(request: Request, account_id: str) -> Any:
         existing_row = await _get_account(session, account_id)
     if existing_row is None or existing_row.user_email != user_email:
         return error_response(404, "not_found", "Channel account not found")
+    if existing_row.channel_type == "web":
+        if set(body) - {"preferred_for_task_delivery"} or not isinstance(
+            body.get("preferred_for_task_delivery"), bool
+        ):
+            return error_response(
+                400,
+                "validation_error",
+                "The always-enabled app channel only supports channel preference updates",
+            )
+        async with session_factory() as session:
+            row = await update_channel_account(session, account_id, **body)
+            if row is None:
+                return error_response(404, "not_found", "Channel account not found")
+            preferred = row.preferred_for_task_delivery
+            await session.commit()
+        return {
+            "account_id": account_id,
+            "channel_type": "web",
+            "enabled": True,
+            "preferred_for_task_delivery": preferred,
+        }
     if "config" in body:
         if not isinstance(body["config"], dict):
             return error_response(400, "validation_error", "config must be an object")
@@ -646,6 +675,8 @@ async def delete_account(request: Request, account_id: str) -> Any:
         return error_response(404, "not_found", "Channel account not found")
 
     # Stop the adapter first
+    if existing_row.channel_type == "web":
+        return error_response(400, "validation_error", "The app channel cannot be deleted")
     channel_manager = getattr(request.app.state, "channel_manager", None)
     if channel_manager:
         await channel_manager.stop_account(account_id)
@@ -669,6 +700,11 @@ async def delete_account(request: Request, account_id: str) -> Any:
 @router.post("/accounts/{account_id}/start", response_model=None)
 async def start_account(request: Request, account_id: str) -> Any:
     """Start a channel account."""
+    row = await _owned_account(request, account_id)
+    if row is None:
+        return error_response(404, "not_found", "Channel account not found")
+    if row.channel_type == "web":
+        return {"status": {"status": "connected"}}
     channel_manager = getattr(request.app.state, "channel_manager", None)
     if channel_manager is None:
         return error_response(503, "unavailable", "Channel manager not initialized")
@@ -696,6 +732,11 @@ async def start_account(request: Request, account_id: str) -> Any:
 @router.post("/accounts/{account_id}/stop", response_model=None)
 async def stop_account(request: Request, account_id: str) -> Any:
     """Stop a channel account."""
+    row = await _owned_account(request, account_id)
+    if row is None:
+        return error_response(404, "not_found", "Channel account not found")
+    if row.channel_type == "web":
+        return error_response(400, "validation_error", "The app channel is always enabled")
     channel_manager = getattr(request.app.state, "channel_manager", None)
     if channel_manager is None:
         return error_response(503, "unavailable", "Channel manager not initialized")
@@ -714,6 +755,11 @@ async def stop_account(request: Request, account_id: str) -> Any:
 @router.get("/accounts/{account_id}/status", response_model=None)
 async def get_account_status(request: Request, account_id: str) -> Any:
     """Get runtime status for a channel account."""
+    row = await _owned_account(request, account_id)
+    if row is None:
+        return error_response(404, "not_found", "Channel account not found")
+    if row.channel_type == "web":
+        return {"status": "connected"}
     channel_manager = getattr(request.app.state, "channel_manager", None)
     if channel_manager is None:
         return {"status": "stopped", "detail": "Channel manager not initialized"}
@@ -722,6 +768,17 @@ async def get_account_status(request: Request, account_id: str) -> Any:
     if status is None:
         return {"status": "stopped"}
     return status.model_dump()
+
+
+async def _owned_account(request: Request, account_id: str) -> Any:
+    """Read the recipient-owned channel independently of adapter availability."""
+    from cognis.store.queries import get_channel_account
+
+    async with request.app.state.session_factory() as session:
+        row = await get_channel_account(session, account_id)
+    if row is None or row.user_email != require_current_user(request).email:
+        return None
+    return row
 
 
 # ---------------------------------------------------------------------------

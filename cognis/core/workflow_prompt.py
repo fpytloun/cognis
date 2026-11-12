@@ -296,6 +296,7 @@ def compose_workflow_prompt(
             source="workflow_controller",
             trust="controller",
             content=_completion_contract(
+                workflow_id=workflow_id,
                 require_step_complete=require_step_complete,
                 deliverable_owned=deliverable_owned,
                 completion_delivery=completion_delivery,
@@ -325,43 +326,25 @@ def render_context_comment(
 
 def _responsibility_guard(step: StepDefinition) -> str:
     lines = [
-        "Complete only the active step.",
-        "Do not perform work owned by a later workflow step.",
+        "Complete the active step's objective and explicit responsibilities above.",
+        "Defer only work explicitly assigned to another step. A step name alone does not "
+        "prohibit authorized implementation, validation, commit or delivery.",
+        "Preserve all runtime authorization and tool restrictions.",
     ]
-    if step.responsibilities:
-        lines.append("Owned now: " + "; ".join(step.responsibilities))
     if step.defer_to:
         lines.append("Deferred downstream:")
         lines.extend(f"- {name}" for name in step.defer_to)
-    else:
-        lines.extend(_legacy_step_guard(step.name))
     lines.append(
-        "Do not enforce path-level write restrictions. Report boundary violations in "
-        "completion metadata or later review evidence."
+        "Respect user, repository and runtime write restrictions. Workflow phase boundaries "
+        "describe ownership; they do not grant write authority. If the authorized objective "
+        "requires crossing an explicit restriction, stop before the write and report the conflict."
     )
     return "\n".join(lines)
 
 
-def _legacy_step_guard(step_name: str) -> list[str]:
-    normalized = step_name.lower()
-    if any(token in normalized for token in ("plan", "design", "architect")):
-        return [
-            "This step is read-only unless its objective explicitly authorizes changes.",
-            "Defer implementation, validation, documentation, commit, and final delivery.",
-        ]
-    if any(token in normalized for token in ("implement", "code", "fix")):
-        return ["Defer commit, publication, memory, and final-summary work."]
-    if "review" in normalized:
-        return ["Produce review findings only. Do not fix them unless the objective says to."]
-    if "commit" in normalized:
-        return ["Perform only the authorized commit or publication work."]
-    if any(token in normalized for token in ("summary", "final", "report")):
-        return ["Summarize and deliver only. Do not start new implementation work."]
-    return []
-
-
 def _completion_contract(
     *,
+    workflow_id: str | None,
     require_step_complete: bool,
     deliverable_owned: bool,
     completion_delivery: CompletionDeliveryPolicy,
@@ -382,6 +365,17 @@ def _completion_contract(
         "Call step_complete with the summary, structured outputs, verifiable claims, and "
         "an explicit non-success outcome when applicable."
     )
+    if workflow_id == "system:general-task":
+        actions.append(
+            "Use metadata.result_status=completed only when the requested work and required "
+            "verification are complete, including a verified no-op. Use blocked when required "
+            "work remains because of a concrete blocker; also set outcome.status=failed with "
+            "the blocker and next action. For completed, verification must contain checks_run, "
+            "results and checks_not_run arrays of nonblank strings; results must be nonempty. "
+            "Use an empty array when no checks apply or none were omitted, and explain omitted "
+            "required checks. A completed review may reject the reviewed work: rejected is "
+            "not a failure to perform the review. Completed must not use outcome.status=failed."
+        )
     actions.append(
         "Delivery family: "
         f"{completion_delivery.completion_mode_family}. Silent completion allowed: "

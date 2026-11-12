@@ -50,7 +50,7 @@ def test_regular_user_can_create_user_secret(monkeypatch: object, tmp_path: Path
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(client.app, email="user@example.com", role="user")
 
         user_response = client.post(

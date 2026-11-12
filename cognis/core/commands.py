@@ -53,6 +53,7 @@ from cognis.models.session import (
     SessionTransition,
 )
 from cognis.models.task import TaskDelivery
+from cognis.providers.guardrails.event_keys import event_idempotency_key
 from cognis.providers.llm.reasoning import (
     normalize_reasoning_effort,
     reasoning_efforts_for_model,
@@ -3091,9 +3092,12 @@ class CommandDispatcher:
                     session.intaris_session_id or session.session_id,
                     [event],
                     source="cognis_command",
-                    idempotency_key=(
-                        f"slash-skill:{session.session_id}:{skill.skill_id}:{content_hash}"
-                        + (f":{uuid.uuid4().hex}" if skill.asset_manifest else "")
+                    idempotency_key=event_idempotency_key(
+                        session.intaris_session_id or session.session_id,
+                        "slash-skill",
+                        skill.skill_id,
+                        content_hash,
+                        uuid.uuid4().hex if skill.asset_manifest else "",
                     ),
                     retry_missing_session=True,
                     user_email=user_email,

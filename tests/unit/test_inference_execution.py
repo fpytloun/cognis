@@ -1,11 +1,15 @@
 """Service-boundary tests: named and direct inference share exactly one recovery."""
 
 import asyncio
+import base64
+from contextlib import aclosing
 
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from cognis.core.speech_streaming import render_speech_stream
+from cognis.models.speech import SpeechStreamEvent
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.errors import LLMStreamProviderError
 from cognis.providers.llm.execution import PreparedInference
@@ -30,7 +34,7 @@ def test_json_object_mode_does_not_require_schema_support():
 
 
 @pytest_asyncio.fixture
-async def service(tmp_path):
+async def service(tmp_path, usage_capture):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/execution.db")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with engine.begin() as connection:
@@ -47,6 +51,8 @@ async def service(tmp_path):
                 config={
                     "preset": "openai",
                     "models": [
+                        {"model_id": "tts-1"},
+                        {"model_id": "gpt-4o-transcribe"},
                         {"model_id": "gpt-4o-mini", "supports_responses_api": False},
                         {"model_id": "text-embedding-3-small", "supports_embedding": True},
                     ],
@@ -70,8 +76,152 @@ async def service(tmp_path):
         ),
         owner=SYSTEM_USER_EMAIL,
     )
-    yield LLMService(factory)
+    yield LLMService(factory, usage_capture=usage_capture)
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["tts", "stt"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_native_speech_accepts_facade_metadata_without_forwarding_it(
+    service, monkeypatch, operation, fails
+):
+    """Exercise the real backend signature, not a permissive backend mock."""
+    calls = []
+
+    async def physical(*args, **kwargs):
+        calls.append(kwargs)
+        assert not any(key.startswith("_cognis_usage") for key in kwargs["request_kwargs"])
+        if fails:
+            raise LLMStreamProviderError("Quota exhausted", payload={"category": "quota_exhausted"})
+        yield SpeechStreamEvent(type="start")
+        yield SpeechStreamEvent(type="done")
+
+    monkeypatch.setattr("cognis.providers.llm.speech_streaming.stream_synthesis", physical)
+    monkeypatch.setattr("cognis.providers.llm.speech_streaming.stream_transcription", physical)
+    if operation == "tts":
+        stream = service.synthesize_stream(
+            "Spoken text", model="tts-1", provider_id="primary", voice="alloy"
+        )
+    else:
+
+        async def audio():
+            yield b"\0\0"
+
+        stream = service.transcribe_stream(
+            audio(), model="gpt-4o-transcribe", provider_id="primary"
+        )
+    if fails:
+        with pytest.raises(LLMStreamProviderError):
+            async for _ in stream:
+                pass
+    else:
+        assert [event["type"] async for event in stream] == ["start", "done"]
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_tts_crosses_the_real_recovery_boundary(service, monkeypatch):
+    events = [
+        SpeechStreamEvent(type="start"),
+        *[
+            SpeechStreamEvent(
+                type="audio",
+                sample_offset=index * 16384,
+                audio_base64=base64.b64encode(b"\0" * 32768).decode(),
+            )
+            for index in range(4)
+        ],
+        SpeechStreamEvent(type="done", sample_offset=65536),
+    ]
+
+    async def physical(self, *args, **kwargs):
+        for event in events:
+            yield event.model_dump()
+
+    monkeypatch.setattr(LiteLLMProvider, "synthesize_stream", physical)
+    actual = [
+        event
+        async for event in service.synthesize_stream(
+            "Spoken text",
+            model="tts-1",
+            provider_id="primary",
+            voice="alloy",
+        )
+    ]
+    assert [event["type"] for event in actual] == [event.type for event in events]
+    assert actual[1]["audio_base64"] == events[1].audio_base64
+
+    async def recorded():
+        for event in actual:
+            yield event
+
+    result = await render_speech_stream(recorded(), format="pcm", model="tts-1", voice="alloy")
+    assert result.audio_bytes == b"\0" * (4 * 32768)
+
+
+@pytest.mark.asyncio
+async def test_live_stt_ready_precedes_microphone_input(service, monkeypatch):
+    received = []
+
+    async def audio():
+        received.append(b"\0\0")
+        yield b"\0\0"
+
+    async def physical(self, frames, **kwargs):
+        yield SpeechStreamEvent(type="start").model_dump()
+        async for frame in frames:
+            assert frame == b"\0\0"
+        yield SpeechStreamEvent(type="transcript", text="A committed utterance.").model_dump()
+        yield SpeechStreamEvent(type="done").model_dump()
+
+    monkeypatch.setattr(LiteLLMProvider, "transcribe_stream", physical)
+    async with asyncio.timeout(5):
+        async with aclosing(
+            service.transcribe_stream(
+                audio(),
+                model="gpt-4o-transcribe",
+                provider_id="primary",
+            )
+        ) as stream:
+            assert (await anext(stream))["type"] == "start"
+            assert not received
+            rest = [event async for event in stream]
+    assert [event["type"] for event in rest] == ["transcript", "done"]
+    assert received == [b"\0\0"]
+
+
+@pytest.mark.asyncio
+async def test_native_speech_does_not_replay_a_dispatched_candidate(service, monkeypatch):
+    await InferenceRouteStore(service.session_factory).save(
+        NamedRouteConfig(
+            name="speech-no-replay",
+            targets=[
+                {"provider_id": "primary", "model": "tts-1", "priority": 0},
+                {"provider_id": "backup", "model": "tts-1", "priority": 1},
+            ],
+        ),
+        owner=SYSTEM_USER_EMAIL,
+    )
+    calls = []
+
+    async def physical(self, *args, **kwargs):
+        calls.append(kwargs["provider_id"])
+        yield SpeechStreamEvent(type="start").model_dump()
+        raise OSError("Connection lost after speech dispatch")
+
+    monkeypatch.setattr(LiteLLMProvider, "synthesize_stream", physical)
+    with pytest.raises(LLMStreamProviderError):
+        _ = [
+            event
+            async for event in service.synthesize_stream(
+                "Spoken text",
+                model="cognis/speech-no-replay",
+                voice="alloy",
+                acting_user_email=SYSTEM_USER_EMAIL,
+            )
+        ]
+    assert calls == ["primary"]
 
 
 @pytest.mark.asyncio

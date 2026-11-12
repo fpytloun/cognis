@@ -3,7 +3,7 @@ description: |
   Real-world research session pattern: multiple searches, then a
   comprehensive response.
 
-  Synthetic reconstruction of a production-inspired interaction pattern:
+  Inspired by production sessions (sess_7c00454e):
   - Turn 0: multiple web searches (some fail, some succeed)
   - Turn 1: comprehensive response with findings
 

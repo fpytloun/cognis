@@ -49,11 +49,7 @@ def run_migrations_online_sync() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        normalize_legacy_profile_override_revision(connection)
-        connection.commit()
-        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
-        with context.begin_transaction():
-            context.run_migrations()
+        _do_run_migrations(connection)
 
 
 async def run_migrations_online_async() -> None:
@@ -70,9 +66,21 @@ async def run_migrations_online_async() -> None:
 def _do_run_migrations(connection: Connection) -> None:
     normalize_legacy_profile_override_revision(connection)
     connection.commit()
-    context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
-    with context.begin_transaction():
-        context.run_migrations()
+    legacy_alter_table = None
+    if connection.dialect.name == "sqlite":
+        # Old stamps may coexist with bootstrap triggers referencing batch-recreated tables.
+        legacy_alter_table = int(
+            connection.exec_driver_sql("PRAGMA legacy_alter_table").scalar_one()
+        )
+        connection.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+        connection.commit()
+    try:
+        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        if legacy_alter_table is not None:
+            connection.exec_driver_sql(f"PRAGMA legacy_alter_table={legacy_alter_table}")
 
 
 provided_connection = config.attributes.get("connection")

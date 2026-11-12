@@ -118,7 +118,15 @@ class ScheduleFireStore:
             if not await self._lock_lease(session, lease):
                 await session.rollback()
                 return None
-            schedule_stmt = select(Schedule).where(Schedule.schedule_id == schedule_id)
+            # The selection made by a timer is only a hint. Revalidate due time
+            # under the lease and row lock, before touching any occurrence.
+            due = Schedule.next_fire_at <= database_now_expression(session)
+            if session.bind is not None and session.bind.dialect.name == "sqlite":
+                due = func.julianday(Schedule.next_fire_at) <= func.julianday("now")
+            schedule_stmt = select(Schedule).where(
+                Schedule.schedule_id == schedule_id,
+                due,
+            )
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 schedule_stmt = schedule_stmt.with_for_update()
             schedule = (await session.execute(schedule_stmt)).scalar_one_or_none()
@@ -572,6 +580,17 @@ class ScheduleFireStore:
             fire.last_error = f"terminal:{status}"
             fire.status = "dispatched" if status in {"completed", "cancelled"} else "failed"
             fire.updated_at = database_now_expression(session)
+            newer_fire = await session.scalar(
+                select(ScheduleFireRow.fire_id)
+                .where(
+                    ScheduleFireRow.schedule_id == fire.schedule_id,
+                    ScheduleFireRow.fire_kind == "recurring",
+                    ScheduleFireRow.scheduled_fire_at > fire.scheduled_fire_at,
+                )
+                .limit(1)
+            )
+            previous_status = schedule.last_run_status
+            previous_terminal = schedule.last_terminal_task_id
             schedule.last_terminal_task_id = task_id
             disabled = False
             auto_disabled_state = str(schedule.disabled_reason or "").startswith(
@@ -590,7 +609,7 @@ class ScheduleFireStore:
                     schedule.disabled_reason = f"auto_consecutive_failures:{errors}"
                     auto_disabled_state = True
                     disabled = was_enabled
-                elif schedule.enabled:
+                elif schedule.enabled and newer_fire is None:
                     schedule.next_fire_at = next_fire_at
             else:
                 errors = 0
@@ -598,6 +617,9 @@ class ScheduleFireStore:
                 schedule.consecutive_errors = 0
                 if schedule.enabled:
                     schedule.disabled_reason = None
+            if newer_fire is not None and not schedule.disabled_reason:
+                schedule.last_run_status = previous_status
+                schedule.last_terminal_task_id = previous_terminal
             schedule.updated_at = database_now_expression(session)
             await session.commit()
             return {

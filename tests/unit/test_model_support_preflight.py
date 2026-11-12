@@ -26,6 +26,17 @@ OPENAI_INDEX = """\
 - [GPT-6 Luna](/api/docs/models/gpt-6-luna.md): model
 - [GPT-Image](/api/docs/models/gpt-image-2.md): image
 """
+OPENAI_CATALOG = """\
+# All models
+## Flagship models
+- [GPT-6 Sol](/api/docs/models/gpt-6-sol.md): model
+## More models
+- [GPT-6 Luna](/api/docs/models/gpt-6-luna.md): model
+- [GPT-Image](/api/docs/models/gpt-image-2.md): image
+## Deprecated models
+- [GPT-4.1](/api/docs/models/gpt-4.1.md): Deprecated. Older model
+- [GPT-4](/api/docs/models/gpt-4.md): Shut down. Older model
+"""
 CODEX_CATALOG = {
     "models": [
         {
@@ -68,7 +79,7 @@ def prepare_checkout(root: Path) -> None:
             {
                 "schema_version": 2,
                 "claude": preflight.claude_models(CLAUDE_TABLE),
-                "openai": preflight.openai_models(OPENAI_INDEX),
+                "openai": sorted(preflight.openai_catalog(OPENAI_CATALOG)),
                 "openai_details": {
                     "gpt-6-sol": preflight.openai_model_details(OPENAI_PAGE, "gpt-6-sol")
                 },
@@ -80,7 +91,14 @@ def prepare_checkout(root: Path) -> None:
 
 def test_extracts_public_ids_and_rejects_incomplete_claude_table() -> None:
     assert sorted(preflight.claude_models(CLAUDE_TABLE)) == ["claude-luna-6", "claude-sol-6"]
-    assert preflight.openai_models(OPENAI_INDEX) == ["gpt-6-luna", "gpt-6-sol"]
+    assert preflight.openai_models(OPENAI_INDEX) == ["gpt-6-luna", "gpt-6-sol", "gpt-image-2"]
+    assert preflight.openai_catalog(OPENAI_CATALOG) == {
+        "gpt-4": "shutdown",
+        "gpt-4.1": "deprecated",
+        "gpt-6-luna": "listed",
+        "gpt-6-sol": "listed",
+        "gpt-image-2": "listed",
+    }
     with pytest.raises(ValueError, match="incomplete"):
         preflight.claude_models(
             CLAUDE_TABLE.replace("| Max output | 128K tokens | 32K tokens |\n", "")
@@ -111,6 +129,7 @@ def test_check_noop_and_new_public_model(monkeypatch: pytest.MonkeyPatch, tmp_pa
     pages = {
         "claude": CLAUDE_TABLE,
         "openai": OPENAI_INDEX,
+        "openai_catalog": OPENAI_CATALOG,
         "codex": json.dumps(CODEX_CATALOG),
     }
 
@@ -123,10 +142,24 @@ def test_check_noop_and_new_public_model(monkeypatch: pytest.MonkeyPatch, tmp_pa
         return {"gpt-6-sol": preflight.openai_model_details(OPENAI_PAGE, "gpt-6-sol")}
 
     monkeypatch.setattr(preflight, "fetch_openai_details", fake_details)
-    result, _ = asyncio.run(preflight.check(tmp_path))
-    assert result["status"] == "no_change"
+    result, baseline = asyncio.run(preflight.check(tmp_path))
+    assert result["status"] == "change"  # Initial schema-2 lifecycle observations.
     assert result["check_complete"] is True
-    assert result["update_required"] is False
+    assert result["differences"]["openai"]["removed"] == []
+    assert result["openai_missing_from_index"] == ["gpt-4", "gpt-4.1"]
+    assert baseline["openai_status"]["gpt-4"] == "shutdown"
+    assert baseline["openai_status"]["gpt-4.1"] == "deprecated"
+    (tmp_path / preflight.BASELINE).write_text(json.dumps(baseline))
+    stable, refreshed = asyncio.run(preflight.check(tmp_path))
+    assert stable["status"] == "no_change"
+    assert refreshed == baseline
+
+    pages["openai_catalog"] = OPENAI_CATALOG.replace(
+        "Deprecated. Older model", "Shut down. Older model"
+    )
+    changed_status, _ = asyncio.run(preflight.check(tmp_path))
+    assert changed_status["differences"]["openai_status"]["changed"] == ["gpt-4.1"]
+    pages["openai_catalog"] = OPENAI_CATALOG
 
     pages["claude"] = CLAUDE_TABLE.replace(
         "| Claude API ID | `claude-sol-6` | `claude-luna-6` |",
@@ -159,6 +192,201 @@ def test_check_source_failure_cannot_return_noop(
 
     monkeypatch.setattr(preflight, "fetch_sources", failing_sources)
     with pytest.raises(preflight.httpx.ConnectError):
+        asyncio.run(preflight.check(tmp_path))
+
+
+@pytest.mark.parametrize("model_id", ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"])
+def test_image_release_and_endpoint_price_changes_are_not_silent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model_id: str
+) -> None:
+    """Exercise discovery, detail fetching and baseline transitions through check()."""
+    prepare_checkout(tmp_path)
+    image_page = f"""\
+Model ID: `{model_id}`
+## Model details
+- Input modalities: text, image
+- Output modalities: image
+## Pricing
+### Text tokens
+| Input | $5 | 1M tokens |
+| Cached input | $1.25 | 1M tokens |
+### Image tokens
+| Input | $8 | 1M tokens |
+| Cached input | $2 | 1M tokens |
+| Output | $30 | 1M tokens |
+## Endpoints
+| Responses | `v1/responses` | Not supported |
+| Image generation | `v1/images/generations` | Supported |
+| Image edit | `v1/images/edits` | Supported |
+"""
+    pages = {
+        preflight.SOURCES["claude"]: CLAUDE_TABLE,
+        preflight.SOURCES["openai"]: OPENAI_INDEX,
+        preflight.SOURCES["openai_catalog"]: OPENAI_CATALOG,
+        preflight.SOURCES["codex"]: json.dumps(CODEX_CATALOG),
+        "https://developers.openai.com/api/docs/models/gpt-6-sol.md": OPENAI_PAGE,
+        "https://developers.openai.com/api/docs/models/gpt-6-luna.md": OPENAI_PAGE.replace(
+            "gpt-6-sol", "gpt-6-luna"
+        ),
+        f"https://developers.openai.com/api/docs/models/{model_id}.md": image_page,
+    }
+    client = preflight.httpx.AsyncClient
+    transport = preflight.httpx.MockTransport(
+        lambda request: preflight.httpx.Response(200, text=pages[str(request.url)])
+    )
+    monkeypatch.setattr(
+        preflight.httpx, "AsyncClient", lambda **kwargs: client(transport=transport, **kwargs)
+    )
+    _, baseline = asyncio.run(preflight.check(tmp_path))
+    (tmp_path / preflight.BASELINE).write_text(json.dumps(baseline))
+    # The release need not appear in the abbreviated index.
+    pages[preflight.SOURCES["openai_catalog"]] = OPENAI_CATALOG.replace(
+        "## More models\n",
+        f"## More models\n- [New image](/api/docs/models/{model_id}.md): image\n",
+    )
+    result, observed = asyncio.run(preflight.check(tmp_path))
+    assert result["status"] == "change"
+    assert result["differences"]["openai"]["added"] == [model_id]
+    assert result["differences"]["openai_details"]["added"] == [model_id]
+    assert observed["openai_details"][model_id] == {
+        "input_modalities": "text, image",
+        "output_modalities": "image",
+        "endpoints": {
+            "v1/responses": False,
+            "v1/images/generations": True,
+            "v1/images/edits": True,
+        },
+        "pricing": {
+            "text_tokens": {"input": "$5", "cached_input": "$1.25"},
+            "image_tokens": {"input": "$8", "cached_input": "$2", "output": "$30"},
+        },
+    }
+    (tmp_path / preflight.BASELINE).write_text(json.dumps(observed))
+    stable, _ = asyncio.run(preflight.check(tmp_path))
+    assert stable["status"] == "no_change"
+    pages[f"https://developers.openai.com/api/docs/models/{model_id}.md"] = image_page.replace(
+        "$30", "$40"
+    ).replace(
+        "| Image edit | `v1/images/edits` | Supported |",
+        "| Image edit | `v1/images/edits` | Not supported |",
+    )
+    changed, _ = asyncio.run(preflight.check(tmp_path))
+    assert changed["differences"]["openai_details"]["changed"] == [model_id]
+    pages[f"https://developers.openai.com/api/docs/models/{model_id}.md"] = image_page.replace(
+        "| Output | $30 | 1M tokens |\n", ""
+    )
+    with pytest.raises(ValueError, match="image pricing incomplete"):
+        asyncio.run(preflight.check(tmp_path))
+
+
+def test_deferred_model_remains_monitored(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    prepare_checkout(tmp_path)
+    cyber_page = OPENAI_PAGE.replace(
+        "Model ID: `gpt-6-sol`",
+        "Model ID: `gpt-6-cyber`\n\nDaybreak Red approval is required.",
+    ).replace("`reasoning.effort` supports `low`, `medium`, and `high`.\n", "")
+    cyber_details = preflight.openai_model_details(cyber_page, "gpt-6-cyber")
+    baseline_path = tmp_path / preflight.BASELINE
+    baseline = json.loads(baseline_path.read_text())
+    baseline["schema_version"] = 3
+    baseline["openai"].append("gpt-6-cyber")
+    baseline["openai_status"] = preflight.openai_catalog(OPENAI_CATALOG)
+    baseline["openai_status"]["gpt-6-cyber"] = "listed"
+    baseline["openai_details"]["gpt-6-cyber"] = cyber_details
+    baseline_path.write_text(json.dumps(baseline))
+    pages = {
+        "claude": CLAUDE_TABLE,
+        "openai": OPENAI_INDEX,
+        "openai_catalog": OPENAI_CATALOG.replace(
+            "## More models\n",
+            "## More models\n- [Cyber](/api/docs/models/gpt-6-cyber.md): model\n",
+        ),
+        "codex": json.dumps(CODEX_CATALOG),
+    }
+    details = {
+        "gpt-6-sol": preflight.openai_model_details(OPENAI_PAGE, "gpt-6-sol"),
+        "gpt-6-cyber": cyber_details,
+    }
+
+    async def fake_sources() -> dict[str, str]:
+        return pages
+
+    async def fake_details(model_ids: list[str]) -> dict[str, dict[str, object]]:
+        return details
+
+    monkeypatch.setattr(preflight, "fetch_sources", fake_sources)
+    monkeypatch.setattr(preflight, "fetch_openai_details", fake_details)
+    result, observed = asyncio.run(preflight.check(tmp_path))
+    assert result["status"] == "no_change"
+    assert observed["openai_status"]["gpt-6-cyber"] == "listed"
+    assert observed["openai_details"]["gpt-6-cyber"]["access_requirements"] == (
+        "Daybreak Red approval is required."
+    )
+
+    pages["openai_catalog"] = pages["openai_catalog"].replace(
+        "## More models\n",
+        "## More models\n- [New](/api/docs/models/gpt-6-new.md): model\n",
+    )
+    result, _ = asyncio.run(preflight.check(tmp_path))
+    assert result["differences"]["openai"]["added"] == ["gpt-6-new"]
+    assert result["status"] == "change"
+    pages["openai_catalog"] = pages["openai_catalog"].replace(
+        "- [New](/api/docs/models/gpt-6-new.md): model\n", ""
+    )
+
+    details["gpt-6-cyber"] = preflight.openai_model_details(
+        cyber_page.replace("Daybreak Red approval is required.", "Access is open."),
+        "gpt-6-cyber",
+    )
+    result, _ = asyncio.run(preflight.check(tmp_path))
+    assert result["differences"]["openai_details"]["changed"] == ["gpt-6-cyber"]
+    details["gpt-6-cyber"] = cyber_details
+    pages["openai_catalog"] = (
+        pages["openai_catalog"]
+        .replace(
+            "- [Cyber](/api/docs/models/gpt-6-cyber.md): model\n",
+            "",
+        )
+        .replace(
+            "## Deprecated models\n",
+            "## Deprecated models\n- [Cyber](/api/docs/models/gpt-6-cyber.md): Deprecated. model\n",
+        )
+    )
+    result, observed = asyncio.run(preflight.check(tmp_path))
+    assert result["differences"]["openai_status"]["changed"] == ["gpt-6-cyber"]
+    assert observed["openai_status"]["gpt-6-cyber"] == "deprecated"
+    pages["openai_catalog"] = pages["openai_catalog"].replace(
+        "- [Cyber](/api/docs/models/gpt-6-cyber.md): Deprecated. model\n", ""
+    )
+    with pytest.raises(ValueError, match="missing tracked"):
+        asyncio.run(preflight.check(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        OPENAI_CATALOG.replace("## Deprecated models", "## Archived models"),
+        OPENAI_CATALOG.replace(
+            "- [GPT-4](/api/docs/models/gpt-4.md): Shut down. Older model\n", ""
+        ),
+        OPENAI_CATALOG.replace("Deprecated. Older model", "Unknown. Older model"),
+    ],
+)
+def test_incomplete_full_catalog_never_removes_tracked_ids(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog: str
+) -> None:
+    prepare_checkout(tmp_path)
+
+    async def fake_sources() -> dict[str, str]:
+        return {
+            "claude": CLAUDE_TABLE,
+            "openai": OPENAI_INDEX,
+            "openai_catalog": catalog,
+            "codex": json.dumps(CODEX_CATALOG),
+        }
+
+    monkeypatch.setattr(preflight, "fetch_sources", fake_sources)
+    with pytest.raises(ValueError, match="OpenAI"):
         asyncio.run(preflight.check(tmp_path))
 
 
@@ -235,6 +463,7 @@ def test_pinned_revision_ignores_dirty_checkout(
         return {
             "claude": CLAUDE_TABLE,
             "openai": OPENAI_INDEX,
+            "openai_catalog": OPENAI_CATALOG,
             "codex": json.dumps(CODEX_CATALOG),
         }
 
@@ -244,7 +473,7 @@ def test_pinned_revision_ignores_dirty_checkout(
     monkeypatch.setattr(preflight, "fetch_sources", fake_sources)
     monkeypatch.setattr(preflight, "fetch_openai_details", fake_details)
     result, _ = asyncio.run(preflight.check(tmp_path, revision))
-    assert result["status"] == "no_change"
+    assert result["status"] == "change"
     assert result["baseline_ref"] == revision
 
 

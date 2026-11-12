@@ -7,7 +7,9 @@ import base64
 import contextlib
 import hashlib
 import math
+import uuid
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 from starlette.websockets import WebSocket, WebSocketDisconnect
@@ -16,20 +18,22 @@ from cognis import __version__
 from cognis import json_codec as json
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
 from cognis.logging import get_logger
+from cognis.models.program import ProgramRuntimeBinding, ProgramToolValue
 from cognis.models.tool import ToolCall
+from cognis.providers.executor.bridge_limits import BRIDGE_MAX_CALLS, BRIDGE_MAX_PROGRAM_RPCS
 from cognis.providers.executor.delivery import ExecutorDeliveryError
+from cognis.providers.executor.program_rpc import program_rpc_key, program_rpc_key_from_params
 from cognis.providers.executor.websocket import EXECUTOR_BRIDGE_FAILURES, ExecutorRPCError
 
 logger = get_logger(__name__)
 
 BRIDGE_MAX_FRAME_BYTES = 1024 * 1024
-BRIDGE_MAX_CALLS = 32
 BRIDGE_SEND_TIMEOUT_SECONDS = 10.0
 BRIDGE_MAX_TIMEOUT_SECONDS = 600.0
 BRIDGE_MAX_TOOL_TIMEOUT_SECONDS = 3605.0
 BRIDGE_FIRST_FRAME_TIMEOUT_SECONDS = 5.0
-BRIDGE_PROTOCOL_VERSION = 1
-BRIDGE_CAPABILITIES = ("result_chunks_v1",)
+BRIDGE_PROTOCOL_VERSION = 2
+BRIDGE_CAPABILITIES = ("result_chunks_v1", "program_rpc_v1")
 BRIDGE_RESULT_MAX_BYTES = 32 * 1024 * 1024
 BRIDGE_RESULT_CHUNK_BYTES = 180 * 1024
 BRIDGE_RESULT_FRAME_BYTES = 256 * 1024
@@ -77,6 +81,7 @@ class _BridgeCall:
     inference_request_id: str | None = None
     accepted: bool = False
     executor_instance_id: str | None = None
+    program_binding: ProgramRuntimeBinding | None = None
 
 
 def _bounded_frame(value: Any) -> dict[str, Any]:
@@ -106,6 +111,10 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
     connection: Any | None = None
     tearing_down = False
     negotiated_chunks = False
+    negotiated_program_rpc = False
+    program_rpc_waiters: dict[
+        str, tuple[str, ProgramRuntimeBinding, int, asyncio.Future[dict[str, Any]]]
+    ] = {}
     # Pre-bound so open-phase rejections can still be attributed in logs.
     executor_id = ""
     requester_owner_id = ""
@@ -158,9 +167,16 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
             peer_version = 0
         if not isinstance(peer_capabilities, list):
             peer_capabilities = []
-        negotiated_chunks = (
-            peer_version >= BRIDGE_PROTOCOL_VERSION and "result_chunks_v1" in peer_capabilities
-        )
+        negotiated_capabilities = {
+            capability
+            for capability, minimum_version in (
+                ("result_chunks_v1", 1),
+                ("program_rpc_v1", 2),
+            )
+            if peer_version >= minimum_version and capability in peer_capabilities
+        }
+        negotiated_chunks = "result_chunks_v1" in negotiated_capabilities
+        negotiated_program_rpc = "program_rpc_v1" in negotiated_capabilities
         await send(
             {
                 "type": "opened",
@@ -170,7 +186,7 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 "server_version": __version__,
                 "protocol_version": BRIDGE_PROTOCOL_VERSION,
                 "capabilities": list(BRIDGE_CAPABILITIES),
-                "negotiated_capabilities": (["result_chunks_v1"] if negotiated_chunks else []),
+                "negotiated_capabilities": sorted(negotiated_capabilities),
                 "executor_instance_id": getattr(connection, "executor_instance_id", None),
             }
         )
@@ -184,6 +200,7 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     "epoch": owner.epoch,
                     "executor_instance_id": getattr(connection, "executor_instance_id", None),
                     "result_chunks": negotiated_chunks,
+                    "program_rpc": negotiated_program_rpc,
                 }
             },
         )
@@ -246,9 +263,15 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 }
             )
 
+        def release_call(bridge_call_id: str, task: asyncio.Task[None] | None) -> None:
+            call = calls.get(bridge_call_id)
+            if call is not None and call.task is task:
+                calls.pop(bridge_call_id)
+
         async def run_call(frame: dict[str, Any]) -> None:
             bridge_call_id = str(frame["call_id"])
             accepted = False
+            registered_program_binding: ProgramRuntimeBinding | None = None
             raw_operation = str(frame.get("operation") or "")
             operation = (
                 raw_operation if raw_operation in {"rpc", "tool", "inference"} else "unknown"
@@ -320,6 +343,87 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                         },
                     )
 
+            async def relay_program_tool_call(params: dict[str, Any]) -> dict[str, Any]:
+                bridge_call = calls.get(bridge_call_id)
+                binding = bridge_call.program_binding if bridge_call is not None else None
+                if (
+                    not negotiated_program_rpc
+                    or binding is None
+                    or bridge_call is None
+                    or not bridge_call.accepted
+                    or program_rpc_key_from_params(params) != program_rpc_key(binding)
+                    or app.state.providers.executor.websocket.get_local_connection(executor_id)
+                    is not connection
+                    or not await app.state.executor_connection_ownership.is_current(owner)
+                ):
+                    return ProgramToolValue(
+                        text="The live program bridge binding is no longer valid.",
+                        is_error=True,
+                        outcome_certainty="unknown",
+                    ).model_dump(mode="json")
+                sequence = params.get("sequence")
+                generation = params.get("kernel_generation")
+                if (
+                    isinstance(sequence, bool)
+                    or not isinstance(sequence, int)
+                    or sequence < 1
+                    or isinstance(generation, bool)
+                    or not isinstance(generation, int)
+                    or generation < 1
+                    or (
+                        binding.expected_generation is not None
+                        and generation != binding.expected_generation
+                    )
+                ):
+                    return ProgramToolValue(
+                        text="Nested program call generation or sequence is stale.",
+                        is_error=True,
+                        outcome_certainty="unknown",
+                    ).model_dump(mode="json")
+                if len(program_rpc_waiters) >= BRIDGE_MAX_PROGRAM_RPCS:
+                    return ProgramToolValue(
+                        text="Nested program bridge capacity is exhausted.",
+                        is_error=True,
+                    ).model_dump(mode="json")
+                request_id = uuid.uuid4().hex
+                future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+                program_rpc_waiters[request_id] = (
+                    bridge_call_id,
+                    binding,
+                    sequence,
+                    future,
+                )
+                try:
+                    await send(
+                        {
+                            "type": "program_tool_call",
+                            "call_id": bridge_call_id,
+                            "request_id": request_id,
+                            "sequence": sequence,
+                            "params": params,
+                        }
+                    )
+                    result = await asyncio.wait_for(future, timeout=BRIDGE_MAX_TOOL_TIMEOUT_SECONDS)
+                    value = ProgramToolValue.model_validate(result)
+                    if binding.expected_generation is None:
+                        binding.expected_generation = generation
+                    return value.model_dump(mode="json")
+                except asyncio.CancelledError:
+                    if not tearing_down:
+                        with contextlib.suppress(Exception):
+                            await send(
+                                {
+                                    "type": "program_tool_call_cancel",
+                                    "call_id": bridge_call_id,
+                                    "request_id": request_id,
+                                }
+                            )
+                    raise
+                finally:
+                    program_rpc_waiters.pop(request_id, None)
+                    if not future.done():
+                        future.cancel()
+
             try:
                 current = app.state.providers.executor.websocket.get_local_connection(executor_id)
                 if (
@@ -357,6 +461,16 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                         )
                         await send_result(bridge_call_id, {"reconciled": reconciled})
                         return
+                    if method == "tool.list" and not params:
+                        # Cache only at the physical owner, behind the same
+                        # admission/ownership checks as an actual RPC send.
+                        tools = await connection.list_tools(
+                            timeout=timeout,
+                            on_sent=on_sent,
+                            stable_call_id=stable_call_id,
+                        )
+                        await send_result(bridge_call_id, {"tools": tools})
+                        return
                     rpc_kwargs = {"timeout": timeout, "on_sent": on_sent}
                     if replay_safe:
                         rpc_kwargs.update(
@@ -368,6 +482,33 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                 elif operation == "tool":
                     tool_call = ToolCall.model_validate(payload.get("tool_call"))
                     calls[bridge_call_id].executor_call_id = tool_call.call_id
+                    if tool_call.name == "python_execute":
+                        if not negotiated_program_rpc:
+                            raise PermissionError(
+                                "Bridge peer does not support governed program RPC"
+                            )
+                        runtime_metadata = tool_call.runtime_metadata
+                        binding_data = (
+                            runtime_metadata.get("program_runtime")
+                            if isinstance(runtime_metadata, dict)
+                            else None
+                        )
+                        registered_program_binding = ProgramRuntimeBinding.model_validate(
+                            binding_data
+                        )
+                        if (
+                            registered_program_binding.executor_id != executor_id
+                            or registered_program_binding.executor_instance_id
+                            != getattr(connection, "executor_instance_id", None)
+                            or registered_program_binding.program_id != tool_call.call_id
+                        ):
+                            raise PermissionError(
+                                "Forwarded program call is not bound to this executor process"
+                            )
+                        calls[bridge_call_id].program_binding = registered_program_binding
+                        connection.register_program_tool_call_handler(
+                            registered_program_binding, relay_program_tool_call
+                        )
 
                     async def progress(chunk: str, stream: str | None) -> None:
                         await send(
@@ -520,7 +661,17 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     }
                 )
             finally:
-                calls.pop(bridge_call_id, None)
+                if registered_program_binding is not None:
+                    with contextlib.suppress(Exception):
+                        connection.unregister_program_tool_call_handler(registered_program_binding)
+                    for _request_id, (call_id, _binding, _sequence, future) in tuple(
+                        program_rpc_waiters.items()
+                    ):
+                        if call_id == bridge_call_id and not future.done():
+                            future.set_exception(
+                                ConnectionError("Forwarded program invocation ended.")
+                            )
+                release_call(bridge_call_id, asyncio.current_task())
 
         while True:
             frame = _bounded_frame(await websocket.receive_json())
@@ -542,6 +693,9 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     continue
                 task = asyncio.create_task(run_call(frame), name=f"bridge-call-{call_id}")
                 calls[call_id] = _BridgeCall(task=task)
+                # Cancellation before the coroutine starts never enters its
+                # finally block. Task completion must also release that slot.
+                task.add_done_callback(partial(release_call, call_id))
             elif frame_type == "cancel":
                 call_id = str(frame.get("call_id") or "")
                 call = calls.get(call_id)
@@ -551,6 +705,77 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
                     if call.inference_request_id:
                         await connection.cancel_inference(call.inference_request_id)
                     call.task.cancel()
+            elif frame_type == "program_tool_call_result":
+                request_id = str(frame.get("request_id") or "")
+                waiter = program_rpc_waiters.get(request_id)
+                if waiter is None:
+                    continue
+                expected_call_id, binding, sequence, future = waiter
+                call_id = str(frame.get("call_id") or "")
+                result = frame.get("result")
+                valid = (
+                    negotiated_program_rpc
+                    and call_id == expected_call_id
+                    and frame.get("binding_key") == list(program_rpc_key(binding))
+                    and frame.get("sequence") == sequence
+                    and isinstance(result, dict)
+                    and calls.get(call_id) is not None
+                    and calls[call_id].accepted
+                    and calls[call_id].program_binding == binding
+                    and app.state.providers.executor.websocket.get_local_connection(executor_id)
+                    is connection
+                    and await app.state.executor_connection_ownership.is_current(owner)
+                )
+                if not valid:
+                    if not future.done():
+                        future.set_result(
+                            ProgramToolValue(
+                                text="Forwarded nested response binding is stale or invalid.",
+                                is_error=True,
+                                outcome_certainty="unknown",
+                            ).model_dump(mode="json")
+                        )
+                    continue
+                try:
+                    value = ProgramToolValue.model_validate(result)
+                except Exception:
+                    value = ProgramToolValue(
+                        text="Forwarded nested response failed validation.",
+                        is_error=True,
+                        outcome_certainty="unknown",
+                    )
+                if not future.done():
+                    future.set_result(value.model_dump(mode="json"))
+            elif frame_type == "program_tool_call_cancel":
+                request_id = str(frame.get("request_id") or "")
+                waiter = program_rpc_waiters.get(request_id)
+                if waiter is not None and waiter[0] == str(frame.get("call_id") or ""):
+                    future = waiter[3]
+                    if not future.done():
+                        future.cancel()
+            elif frame_type == "program_status":
+                bridge_call_id = str(frame.get("call_id") or "")
+                call = calls.get(bridge_call_id)
+                params = frame.get("params")
+                status_binding = call.program_binding if call is not None else None
+                if (
+                    negotiated_program_rpc
+                    and call is not None
+                    and call.accepted
+                    and status_binding is not None
+                    and isinstance(params, dict)
+                    and params.get("program_id") == status_binding.program_id
+                    and params.get("execution_id") == status_binding.execution_id
+                    and params.get("scope_id") == status_binding.scope_id
+                    and (
+                        status_binding.expected_generation is None
+                        or params.get("kernel_generation") == status_binding.expected_generation
+                    )
+                    and app.state.providers.executor.websocket.get_local_connection(executor_id)
+                    is connection
+                    and await app.state.executor_connection_ownership.is_current(owner)
+                ):
+                    await connection.send_program_status(params)
             else:
                 raise ValueError("Unsupported bridge frame")
     except (WebSocketDisconnect, asyncio.CancelledError):
@@ -573,6 +798,11 @@ async def handle_controller_executor_websocket(websocket: WebSocket) -> None:
             await send({"type": "error", "delivery_state": "not_sent", "message": str(exc)[:500]})
     finally:
         tearing_down = True
+        for _request_id, (_call_id, _binding, _sequence, future) in tuple(
+            program_rpc_waiters.items()
+        ):
+            if not future.done():
+                future.set_exception(ConnectionError("Forwarded controller bridge disconnected."))
         active_calls = tuple(calls.values())
         if active_calls:
             logger.warning(

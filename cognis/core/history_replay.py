@@ -77,10 +77,22 @@ def interrupted_batch_evidence(
     }
 
 
+def is_program_child_tool_event(event: Any) -> bool:
+    """Identify nested program tool exchanges retained for audit but not model input."""
+    kind = event.get("type") if isinstance(event, dict) else event.type
+    if kind not in {"tool_call", "tool_result"}:
+        return False
+    data = event.get("data", {}) if isinstance(event, dict) else event.data
+    caller = data.get("caller")
+    return isinstance(caller, dict) and caller.get("type") == "program"
+
+
 def is_model_history_event(event: Any) -> bool:
     """Exclude audit-only events before they can change tool replay state."""
     kind = event.get("type") if isinstance(event, dict) else event.type
     data = event.get("data", {}) if isinstance(event, dict) else event.data
+    if is_program_child_tool_event(event):
+        return False
     if kind == "evaluation":
         return bool(data.get("event") == "evaluation_feedback")
     if kind == "lifecycle":

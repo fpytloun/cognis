@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -272,6 +273,7 @@ def _registered_stub():
 
     return SimpleNamespace(
         definition=SimpleNamespace(
+            name="bash",
             max_result_size=1000,
             content_trust="untrusted",
             category="shell",
@@ -300,9 +302,17 @@ def _recovery_router(*, persist_raises: bool = False):
         metadata["credential_persisted"] = True
         return result.model_copy(update={"metadata": metadata})
 
-    async def _materialize(result, session, tool_name, *, arguments=None):
+    async def _materialize(
+        result,
+        session,
+        tool_name,
+        *,
+        arguments=None,
+        call_id: str | None = None,
+        write_participant=None,
+    ):
         del session, tool_name, arguments
-        calls.append("materialize")
+        calls.append(f"materialize:{call_id}")
         return result
 
     async def _postprocess(result, tool_call, session):
@@ -319,6 +329,7 @@ def _recovery_router(*, persist_raises: bool = False):
         return ToolResult(output=f"credential error: {exc}", is_error=True)
 
     router._persist_browser_auth_state_if_needed = _persist  # type: ignore[method-assign]
+    router._prepare_feedback_document_write = AsyncMock(return_value=None)
     router._materialize_inline_attachments = _materialize  # type: ignore[method-assign]
     router._postprocess_tool_result = _postprocess  # type: ignore[method-assign]
     router._sanitize_result = _sanitize  # type: ignore[method-assign]
@@ -352,7 +363,7 @@ async def test_recovered_result_crosses_the_full_post_execution_pipeline() -> No
         agent=SimpleNamespace(agent_id="agent-1"),
     )
 
-    assert calls == ["persist", "materialize", "postprocess", "sanitize"]
+    assert calls == ["persist", "materialize:call-1", "postprocess", "sanitize"]
     # Credential state encrypted away, output sanitized, audit metadata kept.
     assert "browser_auth_state" not in (finalized.metadata or {})
     assert finalized.metadata["credential_persisted"] is True

@@ -8,6 +8,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import inspect, text
 
+from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.store import queries
 from cognis.store.database import create_engine, create_session_factory
@@ -139,11 +140,13 @@ async def test_populated_cutover_drops_only_generation_tables(tmp_path: Path) ->
             ).one()
             preserved = (
                 await connection.execute(
+                    # Bootstrap creates the live row at the current materializer version.
                     text(
                         "SELECT target_seq, covered_through_seq, state, command_count "
                         "FROM work_session_projections WHERE session_id = 'session' "
-                        "AND materializer_version = 'work-v8'"
-                    )
+                        "AND materializer_version = :version"
+                    ),
+                    {"version": WORK_MATERIALIZER_VERSION},
                 )
             ).one()
             await connection.run_sync(upgrade)

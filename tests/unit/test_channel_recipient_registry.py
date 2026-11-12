@@ -5,6 +5,7 @@ from cognis.channels.registry import CHANNEL_REGISTRY
 
 def test_registered_channel_recipient_capabilities_are_complete() -> None:
     expected = {
+        "web": ({"cognis_user_email"}, {"direct"}, False, False),
         "signal": (
             {"signal_e164", "signal_uuid", "signal_group_id"},
             {"direct", "group"},

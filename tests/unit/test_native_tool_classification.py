@@ -142,6 +142,49 @@ def test_incomplete_or_inconsistent_native_metadata_fails_at_both_boundaries(
         ToolRegistry().register(RegisteredTool(tool))
 
 
+def test_query_usage_declares_read_only_metadata_and_canonical_examples() -> None:
+    from cognis.core.usage.query_models import UsageToolArguments
+    from cognis.models.tool import ToolMutationKind, tool_input_schema
+    from cognis.tools.builtin.workflow import QUERY_USAGE_TOOL
+    from cognis.tools.introspection import audit_tool_registration, validate_available_tool_call
+
+    tool = QUERY_USAGE_TOOL
+    assert tool.read_only and tool.capabilities == [ToolCapability.READ]
+    assert tool.profile_group == "system" and tool.category == "usage"
+    assert native_tool_classification_error(tool) is None
+    assert tool_input_schema(tool) == UsageToolArguments.model_json_schema()
+    assert audit_tool_registration(tool) == []
+    assert tool.native_operations
+    for operation in tool.native_operations:
+        assert operation.mutation_kind is ToolMutationKind.READ
+        assert operation.examples
+        for example in operation.examples:
+            parsed = UsageToolArguments.model_validate(example)
+            assert parsed.request.operation == "query"
+            assert parsed.request.query.scope.mode == "personal"
+            result = validate_available_tool_call([tool], tool.name, example)
+            assert result["valid"], result
+
+
+def test_query_usage_null_example_is_still_rejected_by_registry() -> None:
+    from cognis.core.usage.query_models import UsageToolArguments
+
+    tool = NativeToolDefinition(
+        name="query_usage",
+        description="Read authorized usage accounting.",
+        parameters=UsageToolArguments.model_json_schema(),
+        read_only=True,
+        category="usage",
+        profile_group="system",
+        source=ToolSource(type="builtin"),
+        examples=[{"request": None}],
+    )
+    registry = ToolRegistry()
+    with pytest.raises(ValueError, match="Invalid native tool contract"):
+        registry.register(RegisteredTool(definition=tool))
+    assert registry.get("query_usage") is None
+
+
 def test_new_native_category_requires_an_explicit_group_before_registration() -> None:
     tool = NativeToolDefinition(
         name="list_channel_accounts",

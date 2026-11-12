@@ -363,6 +363,7 @@ async def test_local_inference_disabled_is_advertised_and_enforced_at_dispatch()
     expected_methods = {
         "llm.complete",
         "llm.discover_models",
+        "llm.discover_voices",
         "llm.image_generate",
         "llm.video",
         "llm.transcribe",
@@ -994,7 +995,8 @@ async def test_skill_assets_prepare_uses_current_bundle_without_reconfigure(
         assert Path(result["asset_manifest"][0]["local_path"]).read_bytes() == content
         assert result["version_id"] == version
     assert not any(t.name == "skill_asset_materialize" for t in runner._configured_tool_definitions)
-    assert "skill_manifests" not in ws.sent[0]["result"]["runtime_metadata"]
+    configured = next(message for message in ws.sent if message.get("id") == "cfg-1")
+    assert "skill_manifests" not in configured["result"]["runtime_metadata"]
 
 
 @pytest.mark.asyncio
@@ -1002,11 +1004,16 @@ async def test_handle_tool_list_returns_configured_definitions() -> None:
     runner = ExecutorRunner(ExecutorConfig(executor_id="remote", controller_token="t"))
     ws = DummyWebSocket()
     await runner._handle_configure(ws, "cfg-1", {"enabled_tools": ["read"], "config": {}})
+    assert ws.sent[0]["method"] == "executor.tools_changed"
     ws.sent.clear()
 
     await runner._handle_tool_list(ws, "list-1")
 
     assert ws.sent[-1]["result"]["tools"][0]["name"] == "read"
+    assert ws.sent[-1]["result"]["catalog_notifications"] is True
+    async with runner._runtime_config_lock:
+        await runner._handle_tool_list(ws, "list-configuring")
+        assert ws.sent[-1]["result"]["catalog_notifications"] is False
 
 
 @pytest.mark.asyncio

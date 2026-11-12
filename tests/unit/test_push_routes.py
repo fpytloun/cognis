@@ -103,9 +103,7 @@ class _WrongOwnerArtifactStore:
 
 def test_vapid_public_key_is_available(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
 
         response = client.get(
             "/api/v1/push/vapid-public-key",
@@ -121,9 +119,7 @@ def test_vapid_public_key_is_available(monkeypatch: object, tmp_path: Path) -> N
 
 def test_register_push_subscription_upserts_endpoint(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
         headers = _auth_headers(client.app, email="user@example.com")
         payload = {
             "endpoint": "https://fcm.googleapis.com/fcm/send/sub-1",
@@ -147,7 +143,7 @@ def test_register_push_subscription_upserts_endpoint(monkeypatch: object, tmp_pa
             async with client.app.state.session_factory() as session:
                 return await session.get(PushSubscriptionRow, first_id)
 
-        row = asyncio.run(_load())
+        row = client.portal.call(_load)
         assert row is not None
         assert row.p256dh == "next-key"
         assert row.auth == "next-auth"
@@ -158,9 +154,7 @@ def test_push_subscription_status_reports_delivery_error(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
         headers = _auth_headers(client.app, email="user@example.com")
         response = client.post(
             "/api/v1/push/subscriptions",
@@ -180,7 +174,7 @@ def test_push_subscription_status_reports_delivery_error(
                 row.last_error = "push endpoint rejected request"
                 await session.commit()
 
-        asyncio.run(_set_error())
+        client.portal.call(_set_error)
 
         response = client.get("/api/v1/push/subscriptions/status", headers=headers)
 
@@ -196,9 +190,7 @@ def test_unregister_push_subscription_disables_endpoint(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
         headers = _auth_headers(client.app, email="user@example.com")
         endpoint = "https://fcm.googleapis.com/fcm/send/sub-2"
         response = client.post(
@@ -224,7 +216,7 @@ def test_unregister_push_subscription_disables_endpoint(
             async with client.app.state.session_factory() as session:
                 return await session.get(PushSubscriptionRow, subscription_id)
 
-        row = asyncio.run(_load())
+        row = client.portal.call(_load)
         assert row is not None
         assert row.enabled is False
 
@@ -233,9 +225,7 @@ def test_push_subscription_test_endpoint_sends_to_current_user(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
 
         async def _fake_send_to_user(**kwargs: object) -> dict[str, int]:
             assert kwargs["user_email"] == "user@example.com"
@@ -259,7 +249,6 @@ def test_push_subscription_test_endpoint_sends_to_current_user(
 
 def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> dict[str, str] | None:
             await _seed_user(client)
@@ -304,7 +293,7 @@ def test_turn_completed_web_chat_creates_push_payload(monkeypatch: object, tmp_p
                 )
             )
 
-        payload = asyncio.run(_run())
+        payload = client.portal.call(_run)
 
         assert payload is not None
         assert payload.pop("occurred_at") == "2026-08-31T18:00:00+00:00"
@@ -325,7 +314,6 @@ def test_nonterminal_turn_completion_does_not_create_push_payload(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> tuple[dict[str, str] | None, dict[str, str] | None]:
             await _seed_user(client)
@@ -375,7 +363,7 @@ def test_nonterminal_turn_completion_does_not_create_push_payload(
             )
             return continuation, partial
 
-        continuation, partial = asyncio.run(_run())
+        continuation, partial = client.portal.call(_run)
 
         assert continuation is None
         assert partial is None
@@ -383,7 +371,6 @@ def test_nonterminal_turn_completion_does_not_create_push_payload(
 
 def test_turn_error_web_chat_creates_push_payload(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> tuple[dict[str, str] | None, dict[str, str] | None]:
             await _seed_user(client)
@@ -434,7 +421,7 @@ def test_turn_error_web_chat_creates_push_payload(monkeypatch: object, tmp_path:
             )
             return failed, stopped
 
-        failed, stopped = asyncio.run(_run())
+        failed, stopped = client.portal.call(_run)
 
         assert failed == {
             "user_email": "user@example.com",
@@ -453,7 +440,6 @@ def test_turn_completed_push_payload_omits_avatar_when_signing_fails(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> dict[str, str] | None:
             await _seed_user(client)
@@ -491,7 +477,7 @@ def test_turn_completed_push_payload_omits_avatar_when_signing_fails(
                 )
             )
 
-        payload = asyncio.run(_run())
+        payload = client.portal.call(_run)
 
         assert payload is not None
         assert payload["conversation_id"] == "conv_signing_failure"
@@ -502,7 +488,6 @@ def test_turn_completed_push_payload_does_not_sign_wrong_owner_avatar(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> dict[str, str] | None:
             await _seed_user(client)
@@ -540,7 +525,7 @@ def test_turn_completed_push_payload_does_not_sign_wrong_owner_avatar(
                 )
             )
 
-        payload = asyncio.run(_run())
+        payload = client.portal.call(_run)
 
         assert payload is not None
         assert payload["conversation_id"] == "conv_wrong_owner_avatar"
@@ -551,7 +536,6 @@ def test_turn_completed_push_payload_rejects_protocol_relative_avatar_url(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> dict[str, str] | None:
             await _seed_user(client)
@@ -589,7 +573,7 @@ def test_turn_completed_push_payload_rejects_protocol_relative_avatar_url(
                 )
             )
 
-        payload = asyncio.run(_run())
+        payload = client.portal.call(_run)
 
         assert payload is not None
         assert "icon" not in payload
@@ -599,7 +583,6 @@ def test_turn_completed_push_payload_allows_same_origin_avatar_url(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _run() -> dict[str, str] | None:
             await _seed_user(client)
@@ -636,7 +619,7 @@ def test_turn_completed_push_payload_allows_same_origin_avatar_url(
                 )
             )
 
-        payload = asyncio.run(_run())
+        payload = client.portal.call(_run)
 
         assert payload is not None
         assert payload["icon"] == "/avatars/local.png"
@@ -646,9 +629,7 @@ def test_register_push_subscription_rejects_untrusted_endpoint(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
-
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
         response = client.post(
             "/api/v1/push/subscriptions",
             headers=_auth_headers(client.app, email="user@example.com"),

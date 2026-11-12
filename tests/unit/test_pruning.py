@@ -179,6 +179,7 @@ def test_tool_attachment_context_pruned_with_matching_tool_result() -> None:
             "_tool_attachment_context": True,
             "_tool_call_id": "c1",
         },
+        _assistant_with_tool_calls([{"id": "c2", "name": "read"}]),
         _tool_result("c2", "recent"),
     ]
 

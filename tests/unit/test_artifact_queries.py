@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -140,7 +139,7 @@ def test_artifact_query_helpers_filter_and_order(monkeypatch: object, tmp_path: 
                     [row.artifact_id for row in date_filtered],
                 )
 
-        recent_ids, filename_ids, purpose_ids, date_ids = asyncio.run(_exercise())
+        recent_ids, filename_ids, purpose_ids, date_ids = client.portal.call(_exercise)
 
     assert recent_ids == ["doc_new", "doc_old"]
     assert filename_ids == ["doc_new"]
@@ -202,7 +201,7 @@ def test_tool_artifact_source_identity_is_explicit(monkeypatch: object, tmp_path
                     materialized.artifact_id if materialized else None,
                 )
 
-        output_id, materialized_id = asyncio.run(_exercise())
+        output_id, materialized_id = client.portal.call(_exercise)
 
     assert output_id == "toolout_1"
     assert materialized_id == "att_1"

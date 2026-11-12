@@ -29,7 +29,8 @@ from cognis.api.chat_v2.snapshot_metrics import (
 from cognis.api.chat_v2.sync import ConversationSessionRef, current_projection_version
 from cognis.core.redis_service import RedisService
 
-SNAPSHOT_CACHE_SCHEMA_VERSION = 3
+# Best-effort pairing projections from older workers are not history-ready.
+SNAPSHOT_CACHE_SCHEMA_VERSION = 4
 _DEFAULT_LOCK_LEASE_SECONDS = 15
 _DEFAULT_BUILD_DEADLINE_SECONDS = 120.0
 _LOCK_POLL_MAX_SECONDS = 0.1

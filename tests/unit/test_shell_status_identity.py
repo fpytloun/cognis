@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.core.shell_target_evidence import shell_target_evidence
+from cognis.models.tool import ExecutorCapabilities
 from cognis.providers.executor.forwarding import ForwardedExecutorConnection
 from cognis.providers.executor.websocket import WebSocketExecutorConnection
 from tests.unit.test_shell_target_evidence import row
@@ -11,8 +12,22 @@ from tests.unit.test_shell_target_evidence import row
 
 @pytest.fixture(params=[WebSocketExecutorConnection, ForwardedExecutorConnection])
 def connection(request):
-    transport = object.__new__(request.param)
-    transport.executor_id = "fixture-executor"
+    if request.param is WebSocketExecutorConnection:
+        transport = WebSocketExecutorConnection(
+            ws=SimpleNamespace(),
+            executor_id="fixture-executor",
+            capabilities=ExecutorCapabilities(),
+        )
+    else:
+        transport = ForwardedExecutorConnection(
+            executor_id="fixture-executor",
+            capabilities=ExecutorCapabilities(),
+            owner_id="controller-b",
+            epoch=1,
+            owner_internal_url="http://controller-b:8080",
+            requester_owner_id="controller-a",
+            auth_provider=SimpleNamespace(),
+        )
     transport.rpc_call = AsyncMock()
     return transport
 

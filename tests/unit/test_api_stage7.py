@@ -212,6 +212,73 @@ def test_task_timeout_crud_round_trip_and_clear(monkeypatch: object, tmp_path: P
         assert invalid.status_code == 422
 
 
+def test_task_outcome_crud_round_trip_clear_and_cross_field_validation(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as db:
+                await create_user(
+                    db,
+                    email="outcome@example.com",
+                    name="Outcome",
+                    password_hash="hash",
+                    role="user",
+                )
+                await create_agent(
+                    db, agent_id="outcome-agent", owner_email="outcome@example.com", name="Outcome"
+                )
+                await db.commit()
+
+        client.portal.call(seed)
+        headers = _auth_headers(client.app, email="outcome@example.com")
+        base = {"agent_id": "outcome-agent", "title": "Check", "status": "draft"}
+        created = client.post(
+            "/api/v1/tasks",
+            headers=headers,
+            json={
+                **base,
+                "on_finish_instructions": "Inspect and verify one authorized repair.",
+            },
+        )
+        assert created.status_code in (200, 201), created.text
+        path = f"/api/v1/tasks/{created.json()['task_id']}"
+        assert (
+            client.get(path, headers=headers).json()["on_finish_instructions"]
+            == "Inspect and verify one authorized repair."
+        )
+        renamed = client.patch(path, headers=headers, json={"title": "Updated"})
+        assert renamed.status_code == 200, renamed.text
+        assert (
+            renamed.json()["on_finish_instructions"] == "Inspect and verify one authorized repair."
+        )
+        invalid = client.patch(path, headers=headers, json={"completion_mode_family": "direct"})
+        assert invalid.status_code == 400, invalid.text
+        updated = client.patch(
+            path,
+            headers=headers,
+            json={
+                "on_finish_instructions": None,
+                "completion_mode_family": "direct",
+                "delivery_mode": "in_app_notifications",
+            },
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["on_finish_instructions"] is None
+        assert updated.json()["delivery"]["mode"] == "in_app_notifications"
+        invalid_create = client.post(
+            "/api/v1/tasks",
+            headers=headers,
+            json={
+                **base,
+                "delivery_mode": "in_app_notifications",
+                "completion_mode_family": "default",
+            },
+        )
+        assert invalid_create.status_code == 400, invalid_create.text
+
+
 def test_managed_conversation_queue_mutations_are_read_only(
     monkeypatch: object,
     tmp_path: Path,
@@ -267,7 +334,7 @@ def test_managed_conversation_queue_mutations_are_read_only(
                 await session.commit()
                 return target.conversation_id
 
-        conversation_id = asyncio.run(_seed_managed_conversation())
+        conversation_id = client.portal.call(_seed_managed_conversation)
         turn_scheduler = SimpleNamespace(
             get_queued_messages=AsyncMock(return_value=[]),
             submit_turn=AsyncMock(),
@@ -351,7 +418,7 @@ def test_task_control_conversation_cannot_be_archived_deleted_or_purged(
                 await session.commit()
                 return task.task_id, conversation.conversation_id
 
-        task_id, conversation_id = asyncio.run(_seed())
+        task_id, conversation_id = client.portal.call(_seed)
         owner_headers = _auth_headers(client.app, email="owner@example.com")
         admin_headers = _auth_headers(client.app, email="admin@example.com")
 
@@ -387,7 +454,72 @@ def test_task_control_conversation_cannot_be_archived_deleted_or_purged(
                 assert task is not None
                 assert task.control_conversation_id == conversation_id
 
-        asyncio.run(_verify())
+        client.portal.call(_verify)
+
+
+def test_task_control_chat_lookup_is_read_only(monkeypatch: object, tmp_path: Path) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def _seed() -> tuple[str, str]:
+            async with client.app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="owner@example.com",
+                    name="Owner",
+                    password_hash=client.app.state.password_hasher.hash("password123"),
+                    role="user",
+                )
+                await create_agent(
+                    session,
+                    agent_id="agent-1",
+                    owner_email="owner@example.com",
+                    name="Agent",
+                    status="active",
+                )
+                without_chat = await create_task(
+                    session,
+                    created_by="owner@example.com",
+                    agent_id="agent-1",
+                    title="Never opened",
+                    status="paused",
+                )
+                with_chat = await create_task(
+                    session,
+                    created_by="owner@example.com",
+                    agent_id="agent-1",
+                    title="Opened before",
+                    status="paused",
+                )
+                conversation = await create_conversation(
+                    session,
+                    user_email="owner@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                )
+                conversation.active_session_id = "sess-control"
+                with_chat.control_conversation_id = conversation.conversation_id
+                await session.commit()
+                return without_chat.task_id, with_chat.task_id
+
+        without_chat, with_chat = client.portal.call(_seed)
+        headers = _auth_headers(client.app, email="owner@example.com")
+
+        missing = client.get(f"/api/v1/tasks/{without_chat}/control-chat", headers=headers)
+        existing = client.get(f"/api/v1/tasks/{with_chat}/control-chat", headers=headers)
+
+        assert missing.status_code == 404
+        assert missing.json()["error"]["code"] == "control_chat_not_created"
+        assert existing.status_code == 200
+        assert existing.json()["session_id"] == "sess-control"
+        assert existing.json()["task_status"] == "paused"
+
+        async def _verify() -> None:
+            async with client.app.state.session_factory() as session:
+                task = await get_task(session, without_chat)
+                assert task is not None
+                assert task.control_conversation_id is None
+
+        client.portal.call(_verify)
 
 
 async def _seed_api_managed_conversation(
@@ -459,7 +591,9 @@ def test_managed_conversation_send_rejects_active_turn(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        conversation_id = asyncio.run(_seed_api_managed_conversation(client, turn_state="running"))
+        conversation_id = client.portal.call(
+            lambda: _seed_api_managed_conversation(client, turn_state="running")
+        )
         submit_turn = AsyncMock()
         client.app.state.turn_scheduler = SimpleNamespace(
             has_active_turn=lambda _conversation_id: True,
@@ -483,8 +617,8 @@ def test_managed_conversation_retry_rejects_closed_conversation(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        conversation_id = asyncio.run(
-            _seed_api_managed_conversation(
+        conversation_id = client.portal.call(
+            lambda: _seed_api_managed_conversation(
                 client,
                 turn_state="interrupted",
                 conversation_state="closed",
@@ -513,8 +647,8 @@ def test_managed_conversation_retry_rejects_active_turn(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        conversation_id = asyncio.run(
-            _seed_api_managed_conversation(
+        conversation_id = client.portal.call(
+            lambda: _seed_api_managed_conversation(
                 client,
                 turn_state="failed",
                 active_turn_id="turn-active",
@@ -543,7 +677,9 @@ def test_managed_conversation_retry_preserves_one_shot_mode(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        conversation_id = asyncio.run(_seed_api_managed_conversation(client, turn_state="failed"))
+        conversation_id = client.portal.call(
+            lambda: _seed_api_managed_conversation(client, turn_state="failed")
+        )
         submit_turn = AsyncMock(return_value=None)
         client.app.state.turn_scheduler = SimpleNamespace(
             has_active_turn=lambda _conversation_id: False,
@@ -645,7 +781,7 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
                 await session.commit()
                 return target.conversation_id
 
-        conversation_id = asyncio.run(_seed_managed_conversation())
+        conversation_id = client.portal.call(_seed_managed_conversation)
         stop_conversation = AsyncMock(return_value=True)
         client.app.state.command_dispatcher = SimpleNamespace(stop_conversation=stop_conversation)
         client.app.state.turn_scheduler = SimpleNamespace(
@@ -676,7 +812,7 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
                 assert link is not None
                 return link.control_metadata or {}
 
-        control_metadata = asyncio.run(_load_metadata())
+        control_metadata = client.portal.call(_load_metadata)
         assert control_metadata["cancelled_by_user"] is True
         assert control_metadata["cancel_source"] == "managed_ui"
 
@@ -695,7 +831,7 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
                 )
                 await session.commit()
 
-        asyncio.run(_mark_idle())
+        client.portal.call(_mark_idle)
 
         async def _submit_managed_turn(
             _conversation_id: str,
@@ -718,7 +854,7 @@ def test_managed_conversation_stop_uses_stop_dispatcher_and_marks_manual_cancel(
         )
 
         assert send_response.status_code == 200
-        control_metadata = asyncio.run(_load_metadata())
+        control_metadata = client.portal.call(_load_metadata)
         assert "cancelled_by_user" not in control_metadata
         assert "cancel_source" not in control_metadata
         assert "cancelled_at" not in control_metadata
@@ -803,7 +939,7 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
                 await session.commit()
                 return target.conversation_id
 
-        conversation_id = asyncio.run(_seed_managed_conversation())
+        conversation_id = client.portal.call(_seed_managed_conversation)
 
         async def _fork_into_normal_conversation(**_kwargs: object) -> tuple[object, object, bool]:
             from cognis.core.session import _to_conversation_model, _to_session_model
@@ -873,7 +1009,7 @@ def test_managed_conversation_take_control_creates_normal_fork_and_closes_link(
                 assert follow_up is not None
                 return link.conversation_state, link.control_metadata or {}, follow_up.context_type
 
-        state, control_metadata, follow_up_context_type = asyncio.run(_load_state())
+        state, control_metadata, follow_up_context_type = client.portal.call(_load_state)
         assert state == "closed"
         assert control_metadata["follow_up_conversation_id"] == follow_up_conversation_id
         assert control_metadata["closed_reason"] == "taken_over_by_user"
@@ -949,7 +1085,7 @@ def test_session_intaris_detail_prefers_intaris_summary(
                 await session.commit()
                 return session_row.session_id
 
-        session_id = asyncio.run(_seed())
+        session_id = client.portal.call(_seed)
 
         original_guardrails = app.state.providers.guardrails
         original_client = original_guardrails.client
@@ -1062,7 +1198,7 @@ def test_session_intaris_detail_falls_back_without_summary(
                 await session.commit()
                 return session_row.session_id
 
-        session_id = asyncio.run(_seed())
+        session_id = client.portal.call(_seed)
 
         original_guardrails = app.state.providers.guardrails
         original_client = original_guardrails.client
@@ -1138,7 +1274,7 @@ def test_session_local_detail_is_owner_scoped_and_does_not_call_intaris(
                 await session.commit()
                 return row.session_id
 
-        session_id = asyncio.run(_seed())
+        session_id = client.portal.call(_seed)
         get_session = AsyncMock(side_effect=AssertionError("local detail called Intaris"))
         app.state.providers.guardrails.get_session = get_session
 
@@ -1194,7 +1330,7 @@ def test_batch_submit_returns_per_item_results(monkeypatch: object, tmp_path: Pa
                 await session.commit()
                 return task_one.task_id, task_two.task_id
 
-        task_one, task_two = asyncio.run(_seed())
+        task_one, task_two = client.portal.call(_seed)
         submitted_task_ids: list[str] = []
 
         async def _batch_submit(task_ids: list[str]) -> dict[str, object]:
@@ -1264,7 +1400,7 @@ def test_task_list_uses_keyset_cursor(monkeypatch: object, tmp_path: Path) -> No
                     task.updated_at = now - timedelta(minutes=index)
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         first = client.get(
             "/api/v1/tasks?limit=2",
@@ -1337,13 +1473,13 @@ def test_task_board_limits_columns_and_pages_independently(
                     created_by="user@example.com",
                     agent_id="agent-1",
                     title="Done",
-                    status="completed",
+                    status="failed",
                 )
                 done_older_same_group.task_id = "board-done-1"
                 done_older_same_group.updated_at = now - timedelta(hours=2)
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/tasks/board?limit=2",
@@ -1365,6 +1501,9 @@ def test_task_board_limits_columns_and_pages_independently(
         assert [item["task_id"] for item in done["items"]] == ["board-done-0"]
         assert [group["latest"]["task_id"] for group in done["groups"]] == ["board-done-0"]
         assert done["groups"][0]["task_count"] == 2
+        # Earlier runs' outcomes stay visible on the collapsed group.
+        assert done["groups"][0]["failed_count"] == 1
+        assert done["groups"][0]["cancelled_count"] == 0
         assert done["total_count"] == 1
         group_key = quote(done["groups"][0]["key"], safe="")
         group_history = client.get(
@@ -1543,7 +1682,7 @@ def test_task_board_progress_summary_is_optional_owned_and_bounded(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         default_response = client.get(
             "/api/v1/tasks/board?limit=10",
@@ -1738,7 +1877,7 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         summary = client.get(f"/api/v1/tasks/{task_id}/summary", headers=headers)
@@ -1797,6 +1936,125 @@ def test_task_detail_projection_endpoints_omit_heavy_step_payloads(
             },
             {"type": "markdown", "content": "Persisted rich body"},
         ]
+
+
+@pytest.mark.parametrize(
+    "result_state",
+    ["approved", "delivered", "draft", "stale", "missing", "storage_error", "timeout"],
+)
+def test_task_detail_includes_only_the_readable_current_canonical_result(
+    monkeypatch: object,
+    tmp_path: Path,
+    result_state: str,
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def seed() -> str:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="user@example.com",
+                    name="User",
+                    role="user",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                )
+                await create_agent(
+                    session,
+                    agent_id="inline-agent",
+                    owner_email="user@example.com",
+                    name="Inline agent",
+                    status="active",
+                )
+                task = await create_task(
+                    session,
+                    created_by="user@example.com",
+                    agent_id="inline-agent",
+                    title="Canonical result",
+                    status="completed",
+                    workflow_id="system:general-task",
+                )
+                task.result_data = {"final_deliverable_id": "inline-task-result"}
+                await create_user(
+                    session,
+                    email="other@example.com",
+                    name="Other",
+                    role="user",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                )
+                run = await create_step_run(
+                    session,
+                    task_id=task.task_id,
+                    step_run_id="inline-task-step",
+                    step_name="execute",
+                    step_type="run",
+                    agent_id="inline-agent",
+                    status="approved",
+                    attempt_number=0 if result_state == "stale" else 1,
+                )
+                result = await create_deliverable(
+                    session,
+                    step_run_id=run.step_run_id,
+                    deliverable_id="inline-task-result",
+                    attempt_number=run.attempt_number,
+                    content="Complete canonical fallback",
+                    format="rich",
+                    rich={"blocks": [{"type": "markdown", "content": "Complete canonical body"}]},
+                    artifact_store=app.state.artifact_store,
+                )
+                result.status = (
+                    "buffered"
+                    if result_state == "draft"
+                    else result_state
+                    if result_state in {"approved", "delivered"}
+                    else "approved"
+                )
+                await session.commit()
+                return task.task_id
+
+        task_id = client.portal.call(seed)
+        if result_state in {"storage_error", "timeout"}:
+            from botocore.exceptions import ClientError
+
+            from cognis.api.routes import tasks as task_routes
+
+            if result_state == "storage_error":
+                monkeypatch.setattr(
+                    task_routes,
+                    "hydrate_deliverable_payload",
+                    AsyncMock(
+                        side_effect=ClientError({"Error": {"Code": "AccessDenied"}}, "GetObject")
+                    ),
+                )
+            else:
+
+                async def blocked(*_args):
+                    await asyncio.Event().wait()
+
+                monkeypatch.setattr(task_routes, "hydrate_deliverable_payload", blocked)
+        if result_state == "missing":
+            client.portal.call(
+                app.state.artifact_store.async_delete,
+                "deliverables",
+                "inline-task-result",
+                "content.md",
+            )
+        response = client.get(
+            f"/api/v1/tasks/{task_id}", headers=_auth_headers(app, email="user@example.com")
+        )
+        assert response.status_code == 200
+        final = response.json()["final_deliverable"]
+        if result_state in {"approved", "delivered"}:
+            assert final["deliverable_id"] == "inline-task-result"
+            assert final["content"] == "Complete canonical fallback"
+            assert final["rich_payload"]["blocks"][0]["content"] == "Complete canonical body"
+            assert final["step_run_id"] == "inline-task-step"
+        else:
+            assert final is None
+        denied = client.get(
+            f"/api/v1/tasks/{task_id}", headers=_auth_headers(app, email="other@example.com")
+        )
+        assert denied.status_code == 404
 
 
 def test_failed_task_preserves_approved_rich_step_deliverable(
@@ -1879,7 +2137,7 @@ def test_failed_task_preserves_approved_rich_step_deliverable(
                 task.result_data = None
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
             headers=_auth_headers(app, email="user@example.com"),
@@ -1888,12 +2146,11 @@ def test_failed_task_preserves_approved_rich_step_deliverable(
         assert response.status_code == 200
         assert response.json()["rich_payload"]["blocks"] == rich_blocks
 
-        asyncio.run(
-            app.state.artifact_store.async_delete(
-                "deliverables",
-                "approved-rich-deliverable",
-                "rich.chart-v1.json",
-            )
+        client.portal.call(
+            app.state.artifact_store.async_delete,
+            "deliverables",
+            "approved-rich-deliverable",
+            "rich.chart-v1.json",
         )
         unavailable = client.get(
             "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
@@ -1902,14 +2159,13 @@ def test_failed_task_preserves_approved_rich_step_deliverable(
         assert unavailable.status_code == 409
         assert unavailable.json()["error"]["code"] == "deliverable_payload_unavailable"
 
-        asyncio.run(
-            app.state.artifact_store.async_save(
-                "deliverables",
-                "approved-rich-deliverable",
-                "rich.chart-v1.json",
-                b'{"blocks":[{}]}',
-                "application/json",
-            )
+        client.portal.call(
+            app.state.artifact_store.async_save,
+            "deliverables",
+            "approved-rich-deliverable",
+            "rich.chart-v1.json",
+            b'{"blocks":[{}]}',
+            "application/json",
         )
         corrupt = client.get(
             "/api/v1/step-runs/approved-operate/deliverables/approved-rich-deliverable",
@@ -1972,7 +2228,7 @@ def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_p
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         app.state.pause_waiter.register(
             PendingPause(
                 pause_id="gate_1",
@@ -1997,7 +2253,7 @@ def test_gate_response_conflict_when_already_resolved(monkeypatch: object, tmp_p
                 row.workflow_state = {"status": "running", "current_step_index": 1}
                 await session.commit()
 
-        asyncio.run(_consume())
+        client.portal.call(_consume)
         second = client.post(
             f"/api/v1/tasks/{task_id}/gate-response",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2044,7 +2300,7 @@ def test_task_mutation_rejects_non_owner(monkeypatch: object, tmp_path: Path) ->
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         response = client.post(
             f"/api/v1/tasks/{task_id}/cancel",
             headers=_auth_headers(app, email="attacker@example.com"),
@@ -2162,7 +2418,7 @@ def test_task_rerun_returns_new_task_target(monkeypatch: object, tmp_path: Path)
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
 
         async def _fake_rerun(task_id: str) -> TaskRerunResult:
             return TaskRerunResult(
@@ -2232,7 +2488,7 @@ def test_gate_response_returns_conflict_for_unsupported_action(
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         app.state.pause_waiter.register(
             PendingPause(
                 pause_id="gate_conflict",
@@ -2274,7 +2530,7 @@ def test_task_create_allows_non_chat_source_refs(monkeypatch: object, tmp_path: 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.post(
             "/api/v1/tasks",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2338,7 +2594,7 @@ def test_task_create_rejects_same_conversation_outside_chat(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.post(
             "/api/v1/tasks",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2373,7 +2629,7 @@ def test_task_create_rejects_unknown_delivery_mode(monkeypatch: object, tmp_path
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.post(
             "/api/v1/tasks",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2408,7 +2664,7 @@ def test_task_create_rejects_chat_without_source_ref(monkeypatch: object, tmp_pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.post(
             "/api/v1/tasks",
             headers=_auth_headers(app, email="user@example.com"),
@@ -2468,7 +2724,7 @@ def test_task_update_validates_specific_conversation_target(
                 await session.commit()
                 return task.task_id, foreign_conversation.conversation_id
 
-        task_id, foreign_conversation_id = asyncio.run(_seed())
+        task_id, foreign_conversation_id = client.portal.call(_seed)
         response = client.patch(
             f"/api/v1/tasks/{task_id}",
             headers=_auth_headers(app, email="owner@example.com"),
@@ -2509,7 +2765,7 @@ def test_task_update_rejects_specific_conversation_without_target(
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         response = client.patch(
             f"/api/v1/tasks/{task_id}",
             headers=_auth_headers(app, email="owner@example.com"),
@@ -2570,29 +2826,18 @@ def test_step_response_resumes_recovered_step_input(monkeypatch: object, tmp_pat
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
-        asyncio.run(app.state.task_queue.recover_paused_tasks())
+        # Recovery re-arms the step-input waiter on the app's own loop.
+        task_id = client.portal.call(_seed)
+        client.portal.call(app.state.task_queue.recover_paused_tasks)
+        assert (
+            app.state.pause_waiter.find_pending(task_id=task_id, pause_type="step_input")
+            is not None
+        )
 
-        called: dict[str, bool] = {"resume": False}
+        async def _unexpected_resume(task_id: str) -> TaskModel:
+            raise AssertionError("a recovered waiter must receive the answer, not a new run")
 
-        async def _fake_resume(task_id: str) -> TaskModel:
-            called["resume"] = True
-            return TaskModel(
-                task_id=task_id,
-                title="Paused question",
-                description="",
-                status=TaskStatus.RUNNING,
-                priority=0,
-                created_by="user@example.com",
-                agent_id="agent-1",
-                source_type="api",
-                source_ref=None,
-                delivery=TaskDelivery(),
-                workflow_id=None,
-                workflow_state=WorkflowState(),
-            )
-
-        app.state.task_queue.resume_task = _fake_resume
+        app.state.task_queue.resume_task = _unexpected_resume
 
         response = client.post(
             f"/api/v1/tasks/{task_id}/step-response",
@@ -2610,7 +2855,7 @@ def test_step_response_resumes_recovered_step_input(monkeypatch: object, tmp_pat
             },
         )
         assert response.status_code == 200
-        assert called["resume"] is True
+        assert app.state.pause_waiter.find_pending(task_id=task_id, pause_type="step_input") is None
 
 
 def test_websocket_direct_chat_step_response_resolves_notification(
@@ -2655,9 +2900,9 @@ def test_websocket_direct_chat_step_response_resolves_notification(
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id
 
-        conversation_id, session_id = asyncio.run(_seed())
-        notification = asyncio.run(
-            app.state.notification_service.create(
+        conversation_id, session_id = client.portal.call(_seed)
+        notification = client.portal.call(
+            lambda: app.state.notification_service.create(
                 notification_type="step_question",
                 user_email="user@example.com",
                 conversation_id=conversation_id,
@@ -2696,43 +2941,41 @@ def test_websocket_direct_chat_step_response_resolves_notification(
             role="user",
         )
 
-        asyncio.run(
-            _handle_step_response(
-                app,
-                manager,
-                connection,
-                {
-                    "type": "step_response",
-                    "notification_id": notification.notification_id,
-                    "mode": "structured",
-                    "answers": [
-                        {
-                            "question_id": "q1",
-                            "selected_option_ids": ["A"],
-                            "custom_answer": None,
-                        }
-                    ],
-                },
-            )
+        client.portal.call(
+            _handle_step_response,
+            app,
+            manager,
+            connection,
+            {
+                "type": "step_response",
+                "notification_id": notification.notification_id,
+                "mode": "structured",
+                "answers": [
+                    {
+                        "question_id": "q1",
+                        "selected_option_ids": ["A"],
+                        "custom_answer": None,
+                    }
+                ],
+            },
         )
-        asyncio.run(
-            _handle_step_response(
-                app,
-                manager,
-                connection,
-                {
-                    "type": "step_response",
-                    "notification_id": notification.notification_id,
-                    "mode": "structured",
-                    "answers": [
-                        {
-                            "question_id": "q1",
-                            "selected_option_ids": ["B"],
-                            "custom_answer": None,
-                        }
-                    ],
-                },
-            )
+        client.portal.call(
+            _handle_step_response,
+            app,
+            manager,
+            connection,
+            {
+                "type": "step_response",
+                "notification_id": notification.notification_id,
+                "mode": "structured",
+                "answers": [
+                    {
+                        "question_id": "q1",
+                        "selected_option_ids": ["B"],
+                        "custom_answer": None,
+                    }
+                ],
+            },
         )
         assert manager.errors[-1]["code"] == "conflict"
 
@@ -2747,7 +2990,9 @@ def test_websocket_direct_chat_step_response_resolves_notification(
             wait_for_intention=True,
             wait_timeout_ms=10000,
         )
-        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        resolved = client.portal.call(
+            app.state.notification_service.get, notification.notification_id
+        )
         assert resolved is not None
         assert resolved.status == "resolved"
         assert resolved.resolution == {
@@ -2803,9 +3048,9 @@ def test_websocket_direct_chat_step_response_resolves_auth_challenge(
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id
 
-        conversation_id, session_id = asyncio.run(_seed())
-        notification = asyncio.run(
-            app.state.notification_service.create(
+        conversation_id, session_id = client.portal.call(_seed)
+        notification = client.portal.call(
+            lambda: app.state.notification_service.create(
                 notification_type="auth_challenge",
                 user_email="user@example.com",
                 conversation_id=conversation_id,
@@ -2830,21 +3075,22 @@ def test_websocket_direct_chat_step_response_resolves_auth_challenge(
             role="user",
         )
 
-        asyncio.run(
-            _handle_step_response(
-                app,
-                manager,
-                connection,
-                {
-                    "type": "step_response",
-                    "notification_id": notification.notification_id,
-                    "response": "123456",
-                },
-            )
+        client.portal.call(
+            _handle_step_response,
+            app,
+            manager,
+            connection,
+            {
+                "type": "step_response",
+                "notification_id": notification.notification_id,
+                "response": "123456",
+            },
         )
 
         assert manager.errors == []
-        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        resolved = client.portal.call(
+            app.state.notification_service.get, notification.notification_id
+        )
         assert resolved is not None
         assert resolved.status == "resolved"
         assert resolved.resolution is not None
@@ -2960,9 +3206,9 @@ def test_websocket_direct_chat_step_response_uses_persisted_questions_without_lo
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id
 
-        conversation_id, session_id = asyncio.run(_seed())
-        notification = asyncio.run(
-            app.state.notification_service.create(
+        conversation_id, session_id = client.portal.call(_seed)
+        notification = client.portal.call(
+            lambda: app.state.notification_service.create(
                 notification_type="step_question",
                 user_email="user@example.com",
                 conversation_id=conversation_id,
@@ -3000,27 +3246,28 @@ def test_websocket_direct_chat_step_response_uses_persisted_questions_without_lo
             role="user",
         )
 
-        asyncio.run(
-            _handle_step_response(
-                app,
-                manager,
-                connection,
-                {
-                    "type": "step_response",
-                    "notification_id": notification.notification_id,
-                    "mode": "structured",
-                    "answers": [
-                        {
-                            "question_id": "q1",
-                            "selected_option_ids": ["A"],
-                            "custom_answer": None,
-                        }
-                    ],
-                },
-            )
+        client.portal.call(
+            _handle_step_response,
+            app,
+            manager,
+            connection,
+            {
+                "type": "step_response",
+                "notification_id": notification.notification_id,
+                "mode": "structured",
+                "answers": [
+                    {
+                        "question_id": "q1",
+                        "selected_option_ids": ["A"],
+                        "custom_answer": None,
+                    }
+                ],
+            },
         )
         assert manager.errors == []
-        resolved = asyncio.run(app.state.notification_service.get(notification.notification_id))
+        resolved = client.portal.call(
+            app.state.notification_service.get, notification.notification_id
+        )
         assert resolved is not None
         assert resolved.status == "resolved"
         answer_record = app.state.providers.guardrails.record_events.await_args_list[0]
@@ -3078,9 +3325,9 @@ def test_websocket_step_response_rejects_mismatched_task_and_notification(
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id, task.task_id
 
-        conversation_id, session_id, task_id = asyncio.run(_seed())
-        notification = asyncio.run(
-            app.state.notification_service.create(
+        conversation_id, session_id, task_id = client.portal.call(_seed)
+        notification = client.portal.call(
+            lambda: app.state.notification_service.create(
                 notification_type="step_question",
                 user_email="user@example.com",
                 conversation_id=conversation_id,
@@ -3106,18 +3353,17 @@ def test_websocket_step_response_rejects_mismatched_task_and_notification(
             role="user",
         )
 
-        asyncio.run(
-            _handle_step_response(
-                app,
-                manager,
-                connection,
-                {
-                    "type": "step_response",
-                    "notification_id": notification.notification_id,
-                    "task_id": "task-other",
-                    "response": "A",
-                },
-            )
+        client.portal.call(
+            _handle_step_response,
+            app,
+            manager,
+            connection,
+            {
+                "type": "step_response",
+                "notification_id": notification.notification_id,
+                "task_id": "task-other",
+                "response": "A",
+            },
         )
         assert manager.errors[-1]["code"] == "conflict"
 
@@ -3166,7 +3412,7 @@ def test_conversation_list_filters_by_agent(monkeypatch: object, tmp_path: Path)
                 await session.commit()
                 return first.conversation_id, second.conversation_id
 
-        first_id, second_id = asyncio.run(_seed())
+        first_id, second_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations?agent_id=agent-2",
@@ -3229,7 +3475,7 @@ def test_conversation_list_filters_by_multiple_agents_and_channels(
                 await session.commit()
                 return {key: row.conversation_id for key, row in rows.items()}
 
-        ids = asyncio.run(_seed())
+        ids = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations?agent_ids=agent-1&agent_ids=agent-2"
@@ -3293,7 +3539,7 @@ def test_conversation_search_fans_out_for_multiple_agent_filters(
                 await session.commit()
                 return session_ids
 
-        session_ids = asyncio.run(_seed())
+        session_ids = client.portal.call(_seed)
         requested_agent_ids: list[str | None] = []
         original_guardrails = app.state.providers.guardrails
 
@@ -3363,7 +3609,7 @@ def test_conversation_search_rejects_too_many_agent_filters(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/search/conversations",
@@ -3380,7 +3626,7 @@ def test_conversation_search_rejects_too_many_agent_filters(
         assert response.json()["error"]["code"] == "too_many_agent_filters"
 
 
-def test_conversation_list_paginates_before_attention_hydration(
+def test_conversation_list_paginates_summary_metadata_in_activity_order(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
@@ -3417,25 +3663,7 @@ def test_conversation_list_paginates_before_attention_hydration(
                 await session.commit()
                 return [conversation.conversation_id for conversation in conversations]
 
-        conversation_ids = asyncio.run(_seed())
-        hydration_batch_sizes: list[int] = []
-
-        async def _fake_attention_context(
-            _session: object,
-            conversations: list[object],
-            _user_email: str,
-        ) -> tuple[dict[str, object], dict[str, list[str]]]:
-            hydration_batch_sizes.append(len(conversations))
-            return {}, {}
-
-        from cognis.api.routes import conversations as conversation_routes
-
-        monkeypatch.setattr(
-            conversation_routes,
-            "_conversation_attention_context",
-            _fake_attention_context,
-        )
-
+        conversation_ids = client.portal.call(_seed)
         first_response = client.get(
             "/api/v1/conversations?limit=2",
             headers=_auth_headers(app, email="user@example.com"),
@@ -3459,7 +3687,9 @@ def test_conversation_list_paginates_before_attention_hydration(
             conversation_ids[0],
         ]
         assert second_body["has_more"] is False
-        assert hydration_batch_sizes == [2, 1]
+        assert second_body["cursor"] is None
+        assert [item["attention_actions"] for item in first_body["items"]] == [[], []]
+        assert [item["attention_actions"] for item in second_body["items"]] == [[]]
 
 
 def test_conversation_list_filters_titles_before_pagination(
@@ -3509,7 +3739,7 @@ def test_conversation_list_filters_titles_before_pagination(
                 await session.commit()
                 return matching_ids
 
-        matching_ids = asyncio.run(_seed())
+        matching_ids = client.portal.call(_seed)
         first_response = client.get(
             "/api/v1/conversations",
             params={"limit": 1, "q": " NEEDLE "},
@@ -3592,7 +3822,7 @@ def test_conversation_list_ignores_metadata_updated_at_for_activity_ordering(
                 await session.commit()
                 return updated_activity.conversation_id, newer_message.conversation_id
 
-        metadata_updated_id, message_id = asyncio.run(_seed())
+        metadata_updated_id, message_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations",
@@ -3650,7 +3880,7 @@ def test_conversation_context_types_projection(monkeypatch: object, tmp_path: Pa
                 archived.status = "archived"
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         active_response = client.get(
             "/api/v1/conversations/context-types",
@@ -3713,7 +3943,7 @@ def test_conversation_open_prefers_valid_selected_agent_candidate(
                 await session.commit()
                 return selected.conversation_id, other_agent.conversation_id
 
-        selected_id, other_agent_id = asyncio.run(_seed())
+        selected_id, other_agent_id = client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/conversations/open",
@@ -3761,7 +3991,7 @@ def test_conversation_open_allows_viewer_to_open_existing_candidate(
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/conversations/open",
@@ -3784,7 +4014,7 @@ def test_conversation_open_allows_viewer_to_open_existing_candidate(
                     "chat.last_opened:viewer-agent\x1f\x1fweb",
                 )
 
-        assert asyncio.run(_state()) is None
+        assert client.portal.call(_state) is None
 
 
 def test_conversation_open_honors_requested_agent_profile(
@@ -3833,7 +4063,7 @@ def test_conversation_open_honors_requested_agent_profile(
                 await session.commit()
                 return fast.conversation_id, quality.conversation_id
 
-        fast_id, quality_id = asyncio.run(_seed())
+        fast_id, quality_id = client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/conversations/open",
@@ -3899,7 +4129,7 @@ def test_conversation_open_fallback_finds_latest_matching_profile(
                 await session.commit()
                 return quality.conversation_id, fast.conversation_id
 
-        quality_id, fast_id = asyncio.run(_seed())
+        quality_id, fast_id = client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/conversations/open",
@@ -3959,7 +4189,7 @@ def test_conversation_open_uses_server_persisted_last_opened(
                 await session.commit()
                 return older.conversation_id, newer.conversation_id
 
-        older_id, newer_id = asyncio.run(_seed())
+        older_id, newer_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         first = client.post(
@@ -4027,7 +4257,7 @@ def test_conversation_open_prefers_fresher_client_candidate_over_server_state(
                 await session.commit()
                 return older.conversation_id, newer.conversation_id
 
-        older_id, newer_id = asyncio.run(_seed())
+        older_id, newer_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         first = client.post(
@@ -4124,7 +4354,7 @@ def test_conversation_opened_endpoint_persists_direct_open(
                 await session.commit()
                 return opened.conversation_id, latest.conversation_id
 
-        opened_id, latest_id = asyncio.run(_seed())
+        opened_id, latest_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         opened = client.post(f"/api/v1/conversations/{opened_id}/opened", headers=headers)
@@ -4201,7 +4431,7 @@ def test_conversation_sidebar_projection_returns_shaped_sidebar_payload(
                 await session.commit()
                 return web.conversation_id, direct.conversation_id
 
-        web_id, direct_id = asyncio.run(_seed())
+        web_id, direct_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations/sidebar?context_type=web&agent_id=agent-1&limit=10",
@@ -4290,7 +4520,7 @@ def test_conversation_sidebar_task_filter_isolated_and_paginated(
                     second_task.conversation_id,
                 )
 
-        normal_id, first_task_id, second_task_id = asyncio.run(_seed())
+        normal_id, first_task_id, second_task_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         first_page = client.get(
@@ -4403,7 +4633,7 @@ def test_conversation_sidebar_legacy_delta_request_returns_filtered_full_reconci
                     since,
                 )
 
-        unchanged_id, changed_id, archived_id, deleted_id, since = asyncio.run(_seed())
+        unchanged_id, changed_id, archived_id, deleted_id, since = client.portal.call(_seed)
         response = client.get(
             f"/api/v1/conversations/sidebar?context_type=web&changed_since={quote(since.isoformat())}",
             headers=_auth_headers(app, email="user@example.com"),
@@ -4502,7 +4732,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 await session.commit()
                 return own_agent.agent_id, grant.grant_id
 
-        own_agent_id, grant_id = asyncio.run(_seed())
+        own_agent_id, grant_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         baseline = client.get("/api/v1/conversations/sidebar", headers=headers).json()
@@ -4516,7 +4746,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 agent.updated_at = baseline_timestamp + timedelta(microseconds=1)
                 await session.commit()
 
-        asyncio.run(_update_agent())
+        client.portal.call(_update_agent)
         agent_delta = client.get(
             "/api/v1/conversations/sidebar",
             params={
@@ -4547,7 +4777,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 assert grant is not None
                 await session.commit()
 
-        asyncio.run(_patch_grant())
+        client.portal.call(_patch_grant)
         patch_delta = client.get(
             "/api/v1/conversations/sidebar",
             params={
@@ -4572,7 +4802,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 grant.revoked_at = after_patch_timestamp + timedelta(microseconds=1)
                 await session.commit()
 
-        asyncio.run(_revoke_grant())
+        client.portal.call(_revoke_grant)
         grant_delta = client.get(
             "/api/v1/conversations/sidebar",
             params={
@@ -4603,7 +4833,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 conversation.updated_at = conversation.created_at
                 await session.commit()
 
-        asyncio.run(_create_new_context_type())
+        client.portal.call(_create_new_context_type)
         context_delta = client.get(
             "/api/v1/conversations/sidebar",
             params={
@@ -4630,7 +4860,7 @@ def test_conversation_sidebar_delta_requires_resync_for_metadata_sources(
                 assert deleted is True
                 await session.commit()
 
-        asyncio.run(_reset_override())
+        client.portal.call(_reset_override)
         override_delta = client.get(
             "/api/v1/conversations/sidebar",
             params={
@@ -4721,7 +4951,7 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
                 await session.commit()
             return active_conversation_ids
 
-        active_conversation_ids = asyncio.run(_seed())
+        active_conversation_ids = client.portal.call(_seed)
 
         async def _running_states(conversation_ids: list[str], *, session=None):
             assert session is not None
@@ -4736,6 +4966,13 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
         )
         statements: list[str] = []
 
+        # The running app has background loops (leases, heartbeats) on the same
+        # engine; count only statements from tasks started by this request.
+        async def _existing_tasks() -> set[asyncio.Task[object]]:
+            return asyncio.all_tasks()
+
+        background = client.portal.call(_existing_tasks)
+
         def _count_statement(
             _conn: object,
             _cursor: object,
@@ -4744,7 +4981,8 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
             _context: object,
             _executemany: object,
         ) -> None:
-            statements.append(statement)
+            if asyncio.current_task() not in background:
+                statements.append(statement)
 
         sa_event.listen(app.state.engine.sync_engine, "before_cursor_execute", _count_statement)
         try:
@@ -4763,7 +5001,7 @@ def test_conversation_sidebar_projection_query_count_is_bounded(
         body = response.json()
         assert len(body["conversations"]["items"]) == 12
         assert len(body["agent_direct_chats"]) == 12
-        assert len(statements) <= 30
+        assert 0 < len(statements) <= 30
 
 
 def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_path: Path) -> None:
@@ -4816,7 +5054,7 @@ def test_conversation_list_includes_attention_status(monkeypatch: object, tmp_pa
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations",
@@ -4904,7 +5142,7 @@ def test_conversation_list_defaults_to_active_and_supports_starred_and_archived_
                     task_control.conversation_id,
                 )
 
-        active_id, archived_id, starred_id, deleted_id, task_control_id = asyncio.run(_seed())
+        active_id, archived_id, starred_id, deleted_id, task_control_id = client.portal.call(_seed)
 
         active_response = client.get(
             "/api/v1/conversations",
@@ -4989,7 +5227,7 @@ def test_conversation_update_sets_and_clears_starred_at(
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         star_response = client.patch(
@@ -5062,7 +5300,7 @@ def test_conversation_detail_uses_scheduler_active_turn_state(
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id
 
-        conversation_id, session_id = asyncio.run(_seed())
+        conversation_id, session_id = client.portal.call(_seed)
         app.state.turn_scheduler.running_turn_state = lambda _conversation_id: None
 
         response = client.get(
@@ -5124,7 +5362,7 @@ def test_conversation_list_orders_by_latest_activity_even_without_messages(
                 await session.commit()
                 return older.conversation_id, newer.conversation_id
 
-        older_id, newer_id = asyncio.run(_seed())
+        older_id, newer_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations",
@@ -5185,7 +5423,7 @@ def test_conversation_list_ignores_update_time_when_conversation_has_no_messages
                 await session.commit()
                 return finished_later.conversation_id, no_messages.conversation_id
 
-        finished_later_id, no_messages_id = asyncio.run(_seed())
+        finished_later_id, no_messages_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/conversations",
@@ -5230,7 +5468,7 @@ def test_deleted_conversation_is_hidden_from_detail(monkeypatch: object, tmp_pat
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         detail_response = client.get(f"/api/v1/conversations/{conversation_id}", headers=headers)
@@ -5271,7 +5509,7 @@ def test_websocket_replay_skips_missing_active_session_error(
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
 
         class _Socket:
             def __init__(self) -> None:
@@ -5289,7 +5527,9 @@ def test_websocket_replay_skips_missing_active_session_error(
             role="user",
         )
 
-        asyncio.run(manager.replay(connection, conversation_id=conversation_id, last_seq=0))
+        client.portal.call(
+            lambda: manager.replay(connection, conversation_id=conversation_id, last_seq=0)
+        )
 
         assert [payload["type"] for payload in socket.sent] == [
             "queued_messages_updated",
@@ -5347,7 +5587,7 @@ def test_websocket_replay_includes_user_messages(monkeypatch: object, tmp_path: 
                 await session.commit()
                 return conversation.conversation_id, session_row.session_id
 
-        conversation_id, session_id = asyncio.run(_seed())
+        conversation_id, session_id = client.portal.call(_seed)
 
         async def _fake_read_events(
             session_id: str,
@@ -5399,13 +5639,28 @@ def test_websocket_replay_includes_user_messages(monkeypatch: object, tmp_path: 
             role="user",
         )
 
-        asyncio.run(manager.replay(connection, conversation_id=conversation_id, last_seq=3))
+        client.portal.call(
+            lambda: manager.replay(connection, conversation_id=conversation_id, last_seq=3)
+        )
 
         assert conversation_id in connection.subscriptions
 
 
+@pytest.mark.parametrize(
+    ("filename", "content_type", "view", "range_header"),
+    [
+        ("assets/tool.py", "text/x-python", False, None),
+        ("assets/tool.py", "text/x-python", False, "bytes=0-4"),
+        ("assets/video.mp4", "video/mp4", True, "bytes=0-4"),
+    ],
+)
 def test_signed_artifact_route_serves_skill_assets_without_artifact_record(
-    monkeypatch: object, tmp_path: Path
+    monkeypatch: object,
+    tmp_path: Path,
+    filename: str,
+    content_type: str,
+    view: bool,
+    range_header: str | None,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
@@ -5415,9 +5670,9 @@ def test_signed_artifact_route_serves_skill_assets_without_artifact_record(
             await artifact_store.async_save(
                 "skills",
                 "ska_script",
-                "assets/tool.py",
+                filename,
                 b"print('hi')\n",
-                "text/x-python",
+                content_type,
                 owner_email="user@example.com",
             )
             async with app.state.session_factory() as session:
@@ -5446,28 +5701,30 @@ def test_signed_artifact_route_serves_skill_assets_without_artifact_record(
                     session,
                     asset_id="sa_script",
                     skill_version_id=version.version_id,
-                    filename="assets/tool.py",
+                    filename=filename,
                     artifact_namespace="skills",
                     artifact_object_id="ska_script",
                     content_hash="content-hash",
                     size_bytes=12,
-                    content_type="text/x-python",
+                    content_type=content_type,
                 )
                 await session.commit()
             return await artifact_store.async_get_public_url(
-                "skills", "ska_script", "assets/tool.py"
+                "skills", "ska_script", filename, mode="view" if view else "download"
             )
 
-        signed_url = asyncio.run(_seed())
-        response = client.get(signed_url)
+        signed_url = client.portal.call(_seed)
+        response = client.get(signed_url, headers={"Range": range_header} if range_header else {})
 
-        assert response.status_code == 200
-        assert response.content == b"print('hi')\n"
-        assert response.headers["content-type"].startswith("text/x-python")
+        assert response.status_code == (206 if range_header else 200)
+        assert response.content == (b"print" if range_header else b"print('hi')\n")
+        assert response.headers["content-type"].startswith(content_type)
+        if range_header:
+            assert response.headers["content-range"] == "bytes 0-4/12"
 
 
 def test_signed_artifact_view_route_serves_html_inline_only_with_view_signature(
-    monkeypatch: object, tmp_path: Path
+    monkeypatch: object, tmp_path: Path, standalone_ui_build: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
@@ -5512,10 +5769,11 @@ def test_signed_artifact_view_route_serves_html_inline_only_with_view_signature(
             )
             return download_url, view_url
 
-        download_url, view_url = asyncio.run(_seed())
+        download_url, view_url = client.portal.call(_seed)
 
         download_response = client.get(download_url)
         view_response = client.get(view_url)
+        raw_response = client.get(f"{view_url}&raw=1")
         forged_view_response = client.get(download_url.replace("/content/", "/view/"))
 
         assert download_response.status_code == 200
@@ -5524,6 +5782,13 @@ def test_signed_artifact_view_route_serves_html_inline_only_with_view_signature(
         assert view_response.headers["content-type"].startswith("text/html")
         assert view_response.headers["content-disposition"].startswith("inline;")
         csp = view_response.headers["content-security-policy"]
+        assert "connect-src 'self'" in csp
+        assert "window.ok" not in view_response.text
+        assert "embeddedDocumentUrl" in view_response.text
+        assert "raw=1" in view_response.text
+        assert raw_response.status_code == 200
+        assert "window.ok=true" in raw_response.text
+        csp = raw_response.headers["content-security-policy"]
         assert csp.startswith("sandbox allow-scripts")
         assert "connect-src 'none'" in csp
         assert "https:" not in csp
@@ -5574,7 +5839,7 @@ def test_signed_artifact_view_route_renders_text(monkeypatch: object, tmp_path: 
                 "reports", "plain_report", "report.txt", mode="view"
             )
 
-        response = client.get(asyncio.run(_seed()))
+        response = client.get(client.portal.call(_seed))
 
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/html")
@@ -5612,7 +5877,7 @@ def test_artifact_signed_url_api_returns_view_url_for_html_artifact(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/artifacts/html_api_report/signed-url?ttl_seconds=604800&mode=view",
@@ -5655,7 +5920,7 @@ def test_artifact_signed_url_api_returns_view_url_for_text_artifact(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/artifacts/plain_api_report/signed-url?mode=view",
@@ -5841,7 +6106,7 @@ def test_task_revision_comment_attempt_cas_has_no_stale_side_effects(
                 await session.commit()
                 return task.task_id
 
-        task_id = asyncio.run(_seed())
+        task_id = client.portal.call(_seed)
         headers = _auth_headers(client.app, email="owner@example.com")
         client.app.state.task_queue._execution_store.claim_existing = AsyncMock(  # noqa: SLF001
             return_value=None
@@ -5879,7 +6144,7 @@ def test_task_revision_comment_attempt_cas_has_no_stale_side_effects(
             assert comments == []
             assert {row.status for row in step_runs} == {"approved"}
 
-        asyncio.run(_verify_stale())
+        client.portal.call(_verify_stale)
 
         current = client.post(
             f"/api/v1/tasks/{task_id}/comments",
@@ -5920,7 +6185,7 @@ def test_task_revision_comment_attempt_cas_has_no_stale_side_effects(
                 "review": "superseded",
             }
 
-        asyncio.run(_verify_current())
+        client.portal.call(_verify_current)
 
 
 @pytest.mark.asyncio

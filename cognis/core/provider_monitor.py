@@ -9,17 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+from urllib.parse import quote
 
 import httpx
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.api.models import ProviderMonitorResponse, ProviderUsageResponse
+from cognis.core.inbox import stage_notification
 from cognis.core.maintenance_lease import run_periodic_maintenance
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.providers.llm.errors import ProviderReauthorizationRequired
 from cognis.providers.llm.monitoring import (
     as_utc,
     monitoring_options,
@@ -27,9 +32,20 @@ from cognis.providers.llm.monitoring import (
     usage_severity,
 )
 from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now
-from cognis.store.models import CoordinationLeaseRow, LLMProvider, ProviderMonitorSnapshot
+from cognis.store.models import (
+    CoordinationLeaseRow,
+    InboxNotificationRow,
+    LLMProvider,
+    ProviderMonitorSnapshot,
+    User,
+)
+
+if TYPE_CHECKING:
+    from cognis.core.inbox import InboxService
 
 REFRESH_TIMEOUT_SECONDS = 25
+REAUTHORIZATION_REQUIRED_ERROR = "Reauthorization required"
+logger = logging.getLogger(__name__)
 
 
 class MonitorSource(Protocol):
@@ -83,13 +99,22 @@ class ProviderMonitor:
     """Lifecycle-managed, shared monitor with bounded non-generating checks."""
 
     def __init__(
-        self, session_factory: async_sessionmaker[AsyncSession], source: MonitorSource
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        source: MonitorSource,
+        *,
+        usage_observer: Callable[[str, str, str, str, datetime, ProviderUsageResponse], None]
+        | None = None,
+        inbox: InboxService | None = None,
     ) -> None:
         self.sessions = session_factory
         self.source = source
+        self.usage_observer = usage_observer
+        self.inbox = inbox
         self.leases = DatabaseLeaseStore(session_factory)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._reauthorization_checks: dict[str, asyncio.Task[None]] = {}
         self._concurrency = asyncio.Semaphore(2)
 
     async def start(self) -> None:
@@ -109,11 +134,39 @@ class ProviderMonitor:
     async def stop(self) -> None:
         """Cancel pending checks and release ownership."""
         self._stop.set()
+        pending = [*self._reauthorization_checks.values()]
         if self._task:
-            self._task.cancel()
+            pending.append(self._task)
+        for task in pending:
+            task.cancel()
+        for task in pending:
             with contextlib.suppress(asyncio.CancelledError):
-                await self._task
-            self._task = None
+                await task
+        self._reauthorization_checks.clear()
+        self._task = None
+
+    def report_reauthorization_required(self, provider_id: str) -> None:
+        """Publish a rejected credential now instead of at the next scheduled check.
+
+        Inference failures call this synchronously. The check itself runs in the
+        background through the normal lease-coalesced refresh, so a report made
+        during the monitor's own check reuses that check's result.
+        """
+        if self._stop.is_set() or provider_id in self._reauthorization_checks:
+            return
+        task = asyncio.create_task(
+            self._check_reauthorization(provider_id),
+            name=f"provider-monitor-reauthorization:{provider_id}",
+        )
+        self._reauthorization_checks[provider_id] = task
+        task.add_done_callback(lambda _: self._reauthorization_checks.pop(provider_id, None))
+
+    async def _check_reauthorization(self, provider_id: str) -> None:
+        _, snapshot, _ = await self._read(provider_id)
+        if snapshot is not None and snapshot.error == REAUTHORIZATION_REQUIRED_ERROR:
+            return
+        with contextlib.suppress(ValueError, TimeoutError):
+            await self.get(provider_id, force=True)
 
     async def list_visible(self, user_email: str) -> list[ProviderMonitorResponse]:
         """Read shared snapshots, never fetch upstream from a list request."""
@@ -189,6 +242,7 @@ class ProviderMonitor:
         health = previous.health if previous else {"status": "unknown", "detail": "Not checked"}
         health_at = previous.health_checked_at if previous else None
         usage = previous.usage if previous else None
+        fresh_usage: ProviderUsageResponse | None = None
         error = None
         failures = 0
         try:
@@ -198,11 +252,24 @@ class ProviderMonitor:
                 report = ProviderUsageResponse.model_validate(
                     {**report, "provider_id": provider.provider_id}
                 ).model_dump(mode="json", exclude={"provider_id"})
+                if report["ok"]:
+                    fresh_usage = ProviderUsageResponse.model_validate(
+                        {**report, "provider_id": provider.provider_id}
+                    )
                 # Do not erase a shared header observation on a replica with no responses.
-                if report["ok"] or usage is None:
+                if (
+                    report["ok"]
+                    or usage is None
+                    or report["source"] == "elevenlabs_subscription_usage"
+                ):
                     usage = report
                 if (
-                    report["source"] in {"chatgpt_codex_usage", "anthropic_subscription_usage"}
+                    report["source"]
+                    in {
+                        "chatgpt_codex_usage",
+                        "anthropic_subscription_usage",
+                        "elevenlabs_subscription_usage",
+                    }
                     and report["ok"]
                 ):
                     health = {
@@ -213,6 +280,11 @@ class ProviderMonitor:
                     health = await self.source.check_provider_connectivity(provider)
                 async with self.sessions() as session:
                     health_at = await database_now(session)
+        except ProviderReauthorizationRequired as exc:
+            failures = (previous.failures if previous else 0) + 1
+            error = REAUTHORIZATION_REQUIRED_ERROR
+            # The message is built by Cognis from the provider label, never upstream text.
+            health = {"status": "error", "detail": str(exc)}
         except Exception as exc:
             failures = (previous.failures if previous else 0) + 1
             status = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
@@ -226,6 +298,8 @@ class ProviderMonitor:
                 health = {"status": "error", "detail": error}
             elif status == 429:
                 health = {"status": "warning", "detail": "Provider usage endpoint rate limited"}
+        published = None
+        notifications: list[InboxNotificationRow] = []
         async with self.sessions() as session:
             if not await self.leases.is_current_in_session(session, lease):
                 return
@@ -254,9 +328,63 @@ class ProviderMonitor:
             row.health = health
             row.health_checked_at = health_at
             row.usage = usage
+            if error == REAUTHORIZATION_REQUIRED_ERROR and (
+                previous is None or previous.error != REAUTHORIZATION_REQUIRED_ERROR
+            ):
+                notifications = await self._stage_reauthorization_notifications(session, current)
             row.error = error
             row.failures = failures
+            if fresh_usage is not None and current.owner_email is not None:
+                published = (
+                    current.provider_id,
+                    current.owner_email,
+                    fingerprint,
+                    f"umonitor_{lease.fencing_token}",
+                    now,
+                    fresh_usage,
+                )
             await session.commit()
+        if self.inbox is not None:
+            for notification in notifications:
+                await self.inbox.publish(notification)
+        if published is not None and self.usage_observer is not None:
+            try:
+                self.usage_observer(*published)
+            except Exception as exc:
+                logger.warning("Usage quota observer failed: %s", type(exc).__name__)
+
+    @staticmethod
+    async def _stage_reauthorization_notifications(
+        session: AsyncSession, provider: LLMProvider
+    ) -> list[InboxNotificationRow]:
+        """Tell whoever can reauthorize: the owner, or admins for shared providers."""
+        if provider.owner_email and provider.owner_email != SYSTEM_USER_EMAIL:
+            recipients = [provider.owner_email]
+        else:
+            recipients = list(
+                (
+                    await session.scalars(
+                        select(User.email)
+                        .where(User.role == "admin", User.is_active.is_(True))
+                        .order_by(User.email)
+                    )
+                ).all()
+            )
+        href = f"/settings?tab=providers&provider={quote(provider.provider_id, safe='')}"
+        return [
+            stage_notification(
+                session,
+                user_email=recipient,
+                kind="provider.reauthorization_required",
+                title=f"{provider.display_name} needs reauthorization",
+                body=(
+                    f"{provider.display_name} sign-in expired or was revoked. Requests that "
+                    "use it fail until you reauthorize it in Settings > Providers."
+                ),
+                href=href,
+            )
+            for recipient in recipients
+        ]
 
     async def check_due(self) -> None:
         """One bounded scheduler pass; user refreshes advance the same deadlines."""

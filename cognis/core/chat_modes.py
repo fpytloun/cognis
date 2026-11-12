@@ -182,6 +182,8 @@ def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
         operation.mutation_kind is ToolMutationKind.READ for operation in operations
     ):
         return False
+    if tool.source.type == "builtin" and tool.name == "artifact_get_url":
+        return False
     capabilities = tool_capabilities(tool)
     if ToolCapability.DESTRUCTIVE in capabilities or ToolCapability.PRIVILEGED in capabilities:
         return True
@@ -221,6 +223,8 @@ def is_plan_hidden_tool(tool: ToolDefinition) -> bool:
 def is_plan_mutating_tool_call(tool: ToolDefinition, arguments: dict[str, object]) -> bool:
     """Return whether a concrete tool call can mutate state in plan mode."""
 
+    if tool.source.type == "builtin" and tool.name == "artifact_get_url":
+        return arguments.get("allow_comments") is True
     if is_plan_command_tool(tool):
         # Exposure is not read-only proof; the router requires command evaluation.
         return False

@@ -82,6 +82,7 @@ def _ctx(
         orchestration_mode=MagicMock(),
         interaction_mode="step_requests",
         controller_tool_surface="workflow",
+        feedback_comment_turn=False,
         step_definition=SimpleNamespace(allow_questions=False, metadata_contract=None),
         deliverable_step_run_id=None,
         post_deliverable_pending=False,

@@ -152,6 +152,8 @@ async def probe_connectivity(
         headers.update({"anthropic-version": "2023-06-01"})
         if key:
             headers["x-api-key"] = str(key)
+    elif preset == "elevenlabs" and key:
+        headers["xi-api-key"] = str(key)
     elif preset == "gemini" and key:
         headers["x-goog-api-key"] = str(key)
     elif key:

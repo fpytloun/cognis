@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -38,7 +37,7 @@ def test_generate_field_handles_reasoning_only_response(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         client.app.state.providers.llm.generate = AsyncMock(  # type: ignore[attr-defined]
             return_value={"choices": [{"message": {"content": None}}]}
         )
@@ -62,7 +61,7 @@ def test_generate_avatar_prompt_falls_back_on_reasoning_only_response(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         client.app.state.providers.llm.generate = AsyncMock(  # type: ignore[attr-defined]
             return_value={"choices": [{"message": {"content": None}}]}
         )

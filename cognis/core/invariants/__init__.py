@@ -28,11 +28,12 @@ from datetime import UTC, datetime
 from typing import Any
 
 from prometheus_client import Counter, Gauge
-from sqlalchemy import exists, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.orm import aliased
 
 from cognis.logging import get_logger
 from cognis.store.models import (
+    Agent,
     Conversation,
     DirectTurnRequestRow,
     ManagedConversationLink,
@@ -50,6 +51,135 @@ logger = get_logger(__name__)
 _TASK_TERMINAL_STATES = ("failed", "completed", "cancelled")
 _STEPRUN_NON_TERMINAL_STATES = ("running", "paused", "evaluating", "pending")
 _SESSION_TERMINAL_STATES = ("completed", "failed", "cancelled", "terminated")
+
+
+class UntitledConversationReconciler:
+    """Generate unset Cognis titles independently of turn/controller lifetimes.
+
+    Only the scan cursor is process-local; candidates are reconstructed from DB.
+    The shared maintenance lease owns cancellation and avoids duplicate scans.
+    External reads hold no DB session. Adoption is an idempotent unset-only CAS,
+    so a concurrent manual rename or another controller always remains protected.
+    """
+
+    def __init__(
+        self,
+        session_factory: Any,
+        guardrails: Any,
+        event_bus: Any,
+        llm: Any,
+        *,
+        batch_size: int = 4,
+    ) -> None:
+        self._session_factory = session_factory
+        self._guardrails = guardrails
+        self._event_bus = event_bus
+        from cognis.core.conversation_titles import ConversationTitleService
+
+        self._titles = ConversationTitleService(session_factory, guardrails, llm, event_bus)
+        self._batch_size = batch_size
+        self._after: tuple[str, datetime, str] | None = None
+
+    async def reconcile(self) -> int:
+        """Inspect one fair, bounded page; retry empty titles and errors next cycle."""
+        from cognis.core.agent_direct import is_agent_direct_context
+
+        # A predecessor's title can arrive after compaction rotated the session.
+        # Page all eligible sessions, newest first per conversation, rather than
+        # repeatedly polling only a title-less successor. The page bounds I/O.
+        page_conditions: list[Any] = []
+        if self._after is not None:
+            cid, started_at, sid = self._after
+            page_conditions.append(
+                or_(
+                    Conversation.conversation_id > cid,
+                    and_(
+                        Conversation.conversation_id == cid,
+                        or_(
+                            SessionRow.started_at < started_at,
+                            and_(
+                                SessionRow.started_at == started_at,
+                                SessionRow.session_id < sid,
+                            ),
+                        ),
+                    ),
+                )
+            )
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        Conversation.conversation_id,
+                        Conversation.user_email,
+                        Conversation.agent_id,
+                        Conversation.context_type,
+                        Conversation.context_data,
+                        SessionRow.session_id,
+                        SessionRow.intaris_session_id,
+                        SessionRow.started_at,
+                        Agent.owner_email,
+                    )
+                    .join(
+                        SessionRow,
+                        and_(
+                            SessionRow.conversation_id == Conversation.conversation_id,
+                            SessionRow.user_email == Conversation.user_email,
+                            SessionRow.agent_id == Conversation.agent_id,
+                            SessionRow.delegation_mode.is_(None),
+                        ),
+                    )
+                    .outerjoin(Agent, Agent.agent_id == Conversation.agent_id)
+                    .where(
+                        *page_conditions,
+                        Conversation.title_source == "unset",
+                        func.trim(func.coalesce(Conversation.title, "")) == "",
+                        Conversation.status != "deleted",
+                        or_(
+                            Conversation.title_generation_retry_at.is_(None),
+                            Conversation.title_generation_retry_at <= datetime.now(UTC),
+                        ),
+                    )
+                    .order_by(
+                        Conversation.conversation_id,
+                        SessionRow.started_at.desc(),
+                        SessionRow.session_id.desc(),
+                    )
+                    .limit(self._batch_size)
+                )
+            ).all()
+        self._after = (
+            (rows[-1].conversation_id, rows[-1].started_at, rows[-1].session_id)
+            if len(rows) == self._batch_size
+            else None
+        )
+        adopted = 0
+        named: set[str] = set()
+        for row in rows:
+            if row.conversation_id in named or is_agent_direct_context(
+                row.context_type, row.context_data
+            ):
+                continue
+            try:
+                changed = await self._titles.generate(
+                    conversation_id=row.conversation_id,
+                    session_id=row.session_id,
+                    intaris_session_id=row.intaris_session_id or row.session_id,
+                    user_email=row.user_email,
+                    agent_id=row.agent_id,
+                    agent_owner_email=row.owner_email or row.user_email,
+                )
+                if changed:
+                    adopted += 1
+                    named.add(row.conversation_id)
+            except Exception as exc:
+                logger.debug(
+                    "Untitled conversation refresh failed",
+                    extra={
+                        "conversation_id": row.conversation_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+        return adopted
 
 
 def _managed_active_turn_has_durable_request() -> Any:

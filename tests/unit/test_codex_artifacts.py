@@ -301,11 +301,11 @@ async def test_normalization_cache_enforces_byte_bound_and_lru_order(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("authorized", "record_updates", "content"),
+    ("authorized", "record_updates", "content", "category"),
     [
-        (False, {}, _png()),
-        (True, {"status": ArtifactStatus.DELETED}, _png()),
-        (True, {}, b"not-an-image"),
+        (False, {}, _png(), "unauthorized"),
+        (True, {"status": ArtifactStatus.DELETED}, _png(), "record_unavailable"),
+        (True, {}, b"not-an-image", "normalization_failed"),
     ],
 )
 async def test_materialize_codex_artifact_images_drops_unavailable_or_invalid_images(
@@ -313,6 +313,8 @@ async def test_materialize_codex_artifact_images_drops_unavailable_or_invalid_im
     authorized: bool,
     record_updates: dict[str, Any],
     content: bytes,
+    category: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def _records(session: object, artifact_ids: list[str]) -> list[SimpleNamespace]:
         return [_record(**record_updates)]
@@ -339,6 +341,14 @@ async def test_materialize_codex_artifact_images_drops_unavailable_or_invalid_im
 
     assert not _image_parts(result)
     assert any("img_123" in text for text in _text_parts(result))
+    rejection = next(
+        record.extra_data
+        for record in caplog.records
+        if record.getMessage() == "Native image materialization rejected"
+    )
+    assert rejection["category"] == category
+    assert "cognis.invalid" not in str(rejection)
+    assert "not-an-image" not in str(rejection)
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,7 @@ from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
 )
 from cognis.core.tool_output_recovery import COMPACT_RESULT_RENDERING_POLICY_VERSION
+from cognis.core.tool_result_context import COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION
 
 # ── Public constants ──────────────────────────────────────────────────────────
 
@@ -266,9 +267,26 @@ def compaction_shrinks_tool_result(message: dict[str, Any]) -> bool:
     return len(content) >= 2 * len(build_compacted_tool_result_placeholder(message))
 
 
-def build_compacted_tool_attachment_placeholder(message: dict[str, Any]) -> str:
+def build_compacted_tool_attachment_placeholder(
+    message: dict[str, Any],
+    *,
+    rendering_policy_version: int = COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION,
+) -> str:
     """Build a deterministic placeholder for compacted tool attachment context."""
 
+    if rendering_policy_version == COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION:
+        artifact_ids = message.get("_tool_attachment_artifact_ids") or []
+        refs = ", ".join(
+            f"artifact_read(artifact_id={json.dumps(ref)})"
+            for ref in artifact_ids
+            if isinstance(ref, str) and ref
+        )
+        recovery = refs or "artifact_read with the attachment's exact artifact_id"
+        return (
+            "[Tool attachment context cleared from view. Tool attachment context compacted "
+            "from prompt; this does not mean the underlying file is unavailable or deleted. "
+            f"Use {recovery} to prepare it again if its content matters.]"
+        )
     recovery_call_id = message.get(RECOVERY_CALL_ID) or message.get(TOOL_CALL_ID)
     if isinstance(recovery_call_id, str) and recovery_call_id.strip():
         return (
@@ -277,6 +295,25 @@ def build_compacted_tool_attachment_placeholder(message: dict[str, Any]) -> str:
             "if the missing attachment content matters.]"
         )
     return "[Tool attachment context cleared from view. Tool attachment context compacted from prompt.]"
+
+
+def compact_tool_attachment_context(
+    message: dict[str, Any],
+    *,
+    rendering_policy_version: int = COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION,
+) -> dict[str, Any]:
+    """Keep attachment recovery rendering stable through canonical replay."""
+    if message.get(PROJECTED_COMPACTED):
+        return dict(message)
+    return {
+        **message,
+        "role": "system",
+        "content": build_compacted_tool_attachment_placeholder(
+            message, rendering_policy_version=rendering_policy_version
+        ),
+        PROJECTED_COMPACTED: True,
+        "_compact_attachment_rendering_version": rendering_policy_version,
+    }
 
 
 def clear_large_tool_call_arguments(
@@ -472,7 +509,11 @@ def projection_decisions_from_diff(
                 rendering_policy_version=message.get("_compact_result_rendering_version", 1),
             )
         elif message.get(TOOL_ATTACHMENT_CONTEXT):
-            add(message.get(TOOL_CALL_ID) or message.get("tool_call_id"), "compact_attachment")
+            add(
+                message.get(TOOL_CALL_ID) or message.get("tool_call_id"),
+                "compact_attachment",
+                rendering_policy_version=message.get("_compact_attachment_rendering_version", 1),
+            )
     before_event_seqs = {
         seq
         for index, message in enumerate(before)
@@ -608,12 +649,12 @@ def apply_projection_decisions(
                 if (
                     decision.get("operation") == "compact_attachment"
                     and decision.get("rendering_policy_version")
-                    == PROJECTION_RENDERING_POLICY_VERSION
+                    in (1, COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION)
                     and not updated.get(PROJECTED_COMPACTED)
                 ):
-                    updated["role"] = "system"
-                    updated["content"] = build_compacted_tool_attachment_placeholder(message)
-                    updated[PROJECTED_COMPACTED] = True
+                    updated = compact_tool_attachment_context(
+                        message, rendering_policy_version=decision["rendering_policy_version"]
+                    )
         projected.append(updated)
     return projected
 
@@ -1357,6 +1398,30 @@ def _latest_real_user_index(messages: list[dict[str, Any]]) -> int:
     return len(messages)
 
 
+def _unconsumed_tool_image_indices(messages: list[dict[str, Any]]) -> set[int]:
+    """Retain fresh image blocks until a subsequent assistant response exists.
+
+    Serialized tool settlement precedes inference. Deriving this from canonical
+    message order also protects retries/cold replay without a delivery flag or
+    permanent tool-result pin. Text results remain prunable and hard budgets
+    still decide whether the request can be admitted.
+    """
+    indices: set[int] = set()
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") == "assistant" or _is_real_turn_boundary(message):
+            break
+        content = message.get("content")
+        if (
+            message.get(TOOL_ATTACHMENT_CONTEXT)
+            and not message.get(PROJECTED_COMPACTED)
+            and isinstance(content, list)
+            and any(isinstance(part, dict) and part.get("type") == "image_url" for part in content)
+        ):
+            indices.add(index)
+    return indices
+
+
 # ── Oversized result detection ────────────────────────────────────────────────
 
 
@@ -1743,6 +1808,7 @@ def project_messages(
 
     compacted_assistant_indices = {group.assistant_index for group in compacted_groups}
     compacted_call_ids = {call_id for group in compacted_groups for call_id in group.call_ids}
+    unconsumed_images = _unconsumed_tool_image_indices(messages)
 
     projected: list[dict[str, Any]] = []
     for index, message in enumerate(messages):
@@ -1758,18 +1824,15 @@ def project_messages(
         ):
             projected.append(compact_tool_result(message))
             continue
-        if message.get(TOOL_ATTACHMENT_CONTEXT) and (
-            message.get(TOOL_CALL_ID) in compacted_call_ids
-            or message.get("tool_call_id") in compacted_call_ids
-        ):
-            projected.append(
-                {
-                    **message,
-                    "role": "system",
-                    "content": build_compacted_tool_attachment_placeholder(message),
-                    PROJECTED_COMPACTED: True,
-                }
+        if (
+            index not in unconsumed_images
+            and message.get(TOOL_ATTACHMENT_CONTEXT)
+            and (
+                message.get(TOOL_CALL_ID) in compacted_call_ids
+                or message.get("tool_call_id") in compacted_call_ids
             )
+        ):
+            projected.append(compact_tool_attachment_context(message))
             continue
         projected.append(dict(message))
 
@@ -1824,6 +1887,7 @@ def prune_projected_messages(
     pruneable_result_indices: list[int] = []
     pruneable_call_ids: set[str] = set()
     pruneable_attachment_indices: list[int] = []
+    unconsumed_images = _unconsumed_tool_image_indices(result)
     recovery_pin_ids = {call_id for call_id in (recovery_result_call_ids or set()) if call_id}
     recovery_pin_result_indices: set[int] = set()
     if recovery_pin_ids:
@@ -1892,6 +1956,8 @@ def prune_projected_messages(
             pruneable_call_indices.append(index)
 
     for index in range(min_index_to_modify, max_call_index):
+        if index in unconsumed_images:
+            continue
         message = result[index]
         if not message.get(TOOL_ATTACHMENT_CONTEXT) or message.get(PROJECTED_COMPACTED):
             continue
@@ -1929,12 +1995,7 @@ def prune_projected_messages(
         )
     for index in pruneable_attachment_indices:
         message = result[index]
-        result[index] = {
-            **message,
-            "role": "system",
-            "content": build_compacted_tool_attachment_placeholder(message),
-            PROJECTED_COMPACTED: True,
-        }
+        result[index] = compact_tool_attachment_context(message)
     return result
 
 

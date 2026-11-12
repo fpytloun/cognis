@@ -86,6 +86,7 @@ async def create_user_schedule(
     CompletionDeliveryPolicy(
         completion_mode_family=request_model.completion_mode_family,
         allow_silent_completion=bool(request_model.allow_silent_completion),
+        on_finish_instructions=request_model.on_finish_instructions,
     )
     task_template = dict(request_model.task_template)
     if request_model.session_policy:
@@ -110,6 +111,7 @@ async def create_user_schedule(
             delete_after_run=bool(request_model.delete_after_run),
             completion_mode_family=request_model.completion_mode_family,
             allow_silent_completion=bool(request_model.allow_silent_completion),
+            on_finish_instructions=request_model.on_finish_instructions,
             interaction_mode_override=request_model.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=owner_email,

@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import ANY
 
 import pytest
 from sqlalchemy import select
@@ -51,6 +52,18 @@ from cognis.providers.llm.retry import is_retryable_error
 from cognis.providers.llm.service import LLMService
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider, ModelRouting
+
+
+@pytest.fixture(autouse=True)
+def _configured_service_capture(monkeypatch, usage_capture):
+    """All service fixtures use the same explicit capture dependency as production."""
+    original = LLMService.__init__
+
+    def initialize(self, *args, **kwargs):
+        kwargs.setdefault("usage_capture", usage_capture)
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(LLMService, "__init__", initialize)
 
 
 async def _session_factory(tmp_path: object):
@@ -938,6 +951,7 @@ async def test_chatgpt_generate_uses_streaming_direct_codex_transport(
             "conversation_id": "conv_123",
             "agent_id": "agent_123",
             "session_id": None,
+            "llm_request_id": None,
         }
     ]
     assert result["choices"][0]["message"]["content"] == "hello"
@@ -1233,8 +1247,12 @@ async def test_chatgpt_stream_uses_direct_codex_transport_by_default(
             "owner_email": "owner@example.com",
             "conversation_id": "conv_123",
             "agent_id": "agent_123",
+            "session_id": "session-123",
+            "llm_request_id": ANY,
         }
     ]
+    assert isinstance(prepare_calls[0]["llm_request_id"], str)
+    assert prepare_calls[0]["llm_request_id"]
     assert captured["stream"] is True
     assert captured["store"] is False
     assert chunks[0]["choices"][0]["delta"]["content"] == "hello"
@@ -1428,7 +1446,18 @@ async def test_chatgpt_discovery_merges_live_codex_models(
 
 
 @pytest.mark.asyncio
-async def test_user_owned_anthropic_provider_visible_with_actor_scope(tmp_path: object) -> None:
+async def test_user_owned_anthropic_provider_visible_with_actor_scope(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    catalog_requests: list[str] = []
+
+    def model_metadata(model_id: str, **kwargs: Any) -> dict[str, Any]:
+        assert kwargs["preset"] == "anthropic"
+        catalog_requests.append(model_id)
+        return {"context_window": 200_000}
+
+    # Authorization coverage must not depend on a remote model catalog.
+    monkeypatch.setattr(litellm_provider_module, "resolve_model_metadata", model_metadata)
     engine, session_factory = await _session_factory(tmp_path)
     async with session_factory() as session:
         session.add(
@@ -1457,6 +1486,7 @@ async def test_user_owned_anthropic_provider_visible_with_actor_scope(tmp_path: 
     with pytest.raises(ValueError, match="not visible"):
         await provider.resolve_model_target(explicit_provider_id="meridian-claude")
 
+    assert catalog_requests == []
     model, provider_id = await provider.resolve_model_target(
         explicit_provider_id="meridian-claude",
         acting_user_email="filip@example.com",
@@ -1471,6 +1501,50 @@ async def test_user_owned_anthropic_provider_visible_with_actor_scope(tmp_path: 
     assert provider_id == "meridian-claude"
     assert model_info.model_id == "claude-opus-4-7"
     assert model_info.context_window >= 200_000
+    assert catalog_requests == ["claude-opus-4-7"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("location", ["controller", "executor"])
+async def test_elevenlabs_usage_uses_resolved_credentials_without_generation(
+    monkeypatch, tmp_path, location
+):
+    from cognis.providers.llm import elevenlabs_usage
+
+    engine, session_factory = await _session_factory(tmp_path)
+    monkeypatch.setenv("COGNIS_TEST_ELEVENLABS_QUOTA_KEY", "test-key")
+    async with session_factory() as session:
+        session.add(
+            LLMProvider(
+                provider_id="elevenlabs",
+                display_name="ElevenLabs",
+                backend="litellm",
+                location=location,
+                config={
+                    "preset": "elevenlabs",
+                    "auth_config": {
+                        "mode": "env",
+                        "env_var": "COGNIS_TEST_ELEVENLABS_QUOTA_KEY",
+                    },
+                },
+            )
+        )
+        await session.commit()
+    calls = []
+
+    async def fetch(kwargs):
+        calls.append(kwargs)
+        assert kwargs["api_key"] == "test-key"
+        return elevenlabs_usage.normalize_subscription_usage(
+            {"tier": "free", "character_count": 100, "character_limit": 10000}
+        )
+
+    monkeypatch.setattr(elevenlabs_usage, "fetch_subscription_usage", fetch)
+    result = await LiteLLMProvider(session_factory).get_provider_usage("elevenlabs")
+    assert result["source"] == "elevenlabs_subscription_usage"
+    assert result["ok"] is (location == "controller")
+    assert len(calls) == (1 if location == "controller" else 0)
     await engine.dispose()
 
 
@@ -1791,9 +1865,14 @@ async def test_chatgpt_provider_test_uses_direct_codex_health_check(
     calls: list[tuple[str, float]] = []
 
     async def fake_test(
-        auth: codex_support.CodexAuth, *, model: str, timeout: float = 15.0
+        auth: codex_support.CodexAuth,
+        *,
+        model: str,
+        timeout: float = 15.0,
+        usage_binding: object = None,
     ) -> None:
         assert auth.account_id == "account"
+        assert usage_binding is None
         calls.append((model, timeout))
 
     async def fail_resolve_kwargs(_provider: object) -> dict[str, object]:
@@ -1936,6 +2015,9 @@ async def test_chatgpt_codex_auth_refreshes_without_litellm_authenticator(
 
     class _RefreshResponse:
         status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
 
         def json(self) -> dict[str, str]:
             return {
@@ -2726,13 +2808,14 @@ async def test_litellm_provider_forwards_all_openai_images_and_mask(
     await provider.image_generate(
         prompt="Combine the images.",
         model="gpt-image-2",
-        images=[ImageInput(b64_json="first"), ImageInput(b64_json="second")],
-        mask=ImageInput(b64_json="mask"),
+        images=[ImageInput(b64_json="YWJj"), ImageInput(b64_json="ZGVm")],
+        mask=ImageInput(b64_json="bWFzaw=="),
     )
 
-    assert captured["image"] == ["first", "second"]
-    assert captured["mask"] == "mask"
-    assert captured["operation"] == "image_edit(gpt-image-2)"
+    assert captured["image"] == [b"abc", b"def"]
+    assert captured["mask"] == b"mask"
+    assert captured["model"] == "openai/gpt-image-2"
+    assert captured["operation"] == "image_edit(openai/gpt-image-2)"
     await engine.dispose()
 
 
@@ -3426,7 +3509,10 @@ async def test_litellm_provider_does_not_infer_native_apply_patch_for_compatible
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("model_id", ["gpt-5.5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"])
+@pytest.mark.parametrize(
+    "model_id",
+    ["gpt-5.5", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"],
+)
 async def test_litellm_provider_infers_native_apply_patch_for_direct_openai(
     tmp_path: object,
     model_id: str,
@@ -3450,7 +3536,7 @@ async def test_litellm_provider_infers_native_apply_patch_for_direct_openai(
 
     assert model_info.supports_responses_api is True
     assert model_info.supports_openai_apply_patch is True
-    if model_id == "gpt-6.1-sol":
+    if model_id in {"gpt-6.1-sol", "gpt-6.1-terra"}:
         assert model_info.context_window == 1_050_000
         assert model_info.max_input_tokens == 922_000
         assert model_info.max_context_window == 1_050_000
@@ -3741,7 +3827,30 @@ def test_litellm_provider_count_memo_skips_small_inputs_and_failures(
         lambda **_: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     provider.count_messages_tokens(_large_messages(), "claude-opus-5")
-    assert provider._count_memo == {}, "fallback estimates must never be memoised"
+    assert provider._count_memo, "a successful fallback count has its own backend-specific memo"
+
+
+def test_tiktoken_fallback_memo_is_model_content_and_backend_specific(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    provider = LiteLLMProvider(object())  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        "cognis.providers.llm.litellm.litellm.token_counter",
+        lambda **_: (_ for _ in ()).throw(RuntimeError("native counter unavailable")),
+    )
+    encode = Mock(return_value=[1, 2, 3])
+    monkeypatch.setattr("tiktoken.get_encoding", lambda _: SimpleNamespace(encode=encode))
+    text = "large token estimate " * 2000
+    assert provider.count_tokens(text, "claude-opus-5") == 3
+    assert provider.count_tokens(text, "claude-opus-5") == 3
+    assert encode.call_count == 1
+    provider.count_tokens(text + "changed", "claude-opus-5")
+    provider.count_tokens(text, "claude-sonnet-5")
+    assert encode.call_count == 3
+    # A repaired native tokenizer is not hidden by a prior fallback estimate.
+    monkeypatch.setattr("cognis.providers.llm.litellm.litellm.token_counter", lambda **_: 99)
+    assert provider.count_tokens(text, "claude-opus-5") == 99
 
 
 def test_litellm_provider_count_tokens_memo_is_bounded(

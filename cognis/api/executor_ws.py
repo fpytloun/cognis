@@ -22,8 +22,15 @@ from cognis.api.mcp_policy import invalid_mcp_config_reason
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwnership
 from cognis.core.executor_policy import is_executor_type_allowed, load_executor_policy
 from cognis.core.executor_token_locks import executor_token_lock
+from cognis.core.mcp_credentials import (
+    executor_supports_mcp_credentials,
+    mcp_credential_failure_status,
+    mcp_credential_revision,
+    resolve_mcp_credential,
+)
 from cognis.core.mcp_oauth import MCPOAuthError, oauth_required_mcp_status
 from cognis.logging import get_logger
+from cognis.models.credential import CredentialAccessError
 from cognis.models.executor_calls import normalize_executor_call_snapshot
 from cognis.models.executor_resources import (
     ExecutorResourceSnapshot,
@@ -31,6 +38,7 @@ from cognis.models.executor_resources import (
 )
 from cognis.models.runtime_capabilities import normalize_runtime_capability_report
 from cognis.models.tool import (
+    MCP_CREDENTIAL_BINDING_PROTOCOL,
     MCP_SERVER_IDS_KEY,
     ExecutorCapabilities,
     MCPAuthConfig,
@@ -275,6 +283,16 @@ async def handle_executor_websocket(
                 connection=conn,
             )
 
+        message_transport = conn.negotiate_message_transport(params.get("message_transport"))
+        from cognis.transfers.models import BINARY_TRANSFER_PROTOCOL
+
+        conn.capabilities.binary_transfers = (
+            params.get("binary_transfer_protocol") == BINARY_TRANSFER_PROTOCOL
+        )
+        conn.capabilities.durable_tool_receipts = params.get("durable_tool_receipts") is True
+        conn.capabilities.mcp_credential_bindings = (
+            params.get("mcp_credential_binding_protocol") == MCP_CREDENTIAL_BINDING_PROTOCOL
+        )
         conn.register_call_snapshot_callback(_call_snapshot_received)
         conn.start_receiver()
 
@@ -284,7 +302,11 @@ async def handle_executor_websocket(
     await ws.send_json(
         {
             "jsonrpc": "2.0",
-            "result": {"status": "registered", "executor_id": executor_id},
+            "result": {
+                "status": "registered",
+                "executor_id": executor_id,
+                "message_transport": message_transport,
+            },
             "id": msg_id,
         }
     )
@@ -520,6 +542,51 @@ async def _resolve_executor_mcp_payload(
                 continue
             headers = mcp_row.headers or {}
             auth_config = effective_mcp_auth_config(mcp_row.auth_config, headers)
+            if auth_config.type == "credential_bearer":
+                try:
+                    websocket_provider = getattr(
+                        getattr(providers, "executor", None), "websocket", None
+                    )
+                    connection = (
+                        websocket_provider.get_connection(getattr(row, "executor_id", None))
+                        if websocket_provider is not None
+                        else None
+                    )
+                    if not executor_supports_mcp_credentials(
+                        getattr(connection, "capabilities", None)
+                    ):
+                        raise CredentialAccessError(
+                            "mcp_credential_executor_upgrade_required",
+                            "Executor must support credential bearer binding enforcement.",
+                        )
+                    MCPServerConfig(
+                        name=mcp_row.name,
+                        transport=mcp_row.transport,
+                        url=mcp_row.url,
+                        headers=headers,
+                        auth_config=auth_config,
+                    )
+                    if mcp_row.owner_email != row.owner_email:
+                        raise CredentialAccessError("mcp_credential_denied", "Owner mismatch.")
+                    resolved = await resolve_mcp_credential(
+                        session_factory=providers._session_factory,
+                        credentials=getattr(providers, "credentials", None),
+                        owner_email=row.owner_email,
+                        auth=auth_config,
+                    )
+                except (CredentialAccessError, ValueError) as exc:
+                    skipped_statuses.append(
+                        mcp_credential_failure_status(
+                            mcp_row,
+                            exc.code
+                            if isinstance(exc, CredentialAccessError)
+                            else "mcp_credential_invalid_config",
+                        )
+                    )
+                    continue
+                headers = {**headers, "Authorization": f"Bearer {resolved.value}"}
+                credential_revisions[str(server_id)] = mcp_credential_revision(mcp_row, resolved)
+                auth_config = MCPAuthConfig(type="static_headers")
             oauth_service = getattr(providers, "mcp_oauth_service", None) or getattr(
                 providers, "_mcp_oauth_service", None
             )

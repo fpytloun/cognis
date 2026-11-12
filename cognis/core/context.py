@@ -68,6 +68,7 @@ from cognis.core.immutable_prefix import (
     build_prefix_message_events,
     sort_prefix_entries,
 )
+from cognis.core.initial_profile_selection import SELECTION_KEY
 from cognis.core.long_lived_chat import NON_CHANNEL_CONTEXT_TYPES, is_web_main_chat_context
 from cognis.core.message_envelope import render_user_event_content, render_user_message
 from cognis.core.message_markers import (
@@ -97,7 +98,7 @@ from cognis.core.prompts import (
 )
 from cognis.core.runtime import ExecutorEnvironmentSnapshot, build_local_executor_environment
 from cognis.core.session_cache import CachedEvent, CanonicalContextSnapshot
-from cognis.core.title_policy import publish_conversation_title_updated, sync_intaris_title
+from cognis.core.title_policy import sync_intaris_title
 from cognis.core.tool_output_presentation import (
     is_safe_lazy_artifact_ref,
 )
@@ -105,6 +106,7 @@ from cognis.core.tool_output_presentation import (
     lazy_artifact_refs as build_lazy_artifact_refs,
 )
 from cognis.core.tool_result_settlement import CanonicalToolHistoryError
+from cognis.core.turn_timing import turn_stage
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind
@@ -179,7 +181,7 @@ _DEFAULT_MEMORY_INSTRUCTIONS_MAX_TOKENS = 2000
 _DEFAULT_CORE_MEMORIES_MAX_TOKENS = 2000
 _DEFAULT_IMMUTABLE_PREFIX_REPAIR_COOLDOWN_SECONDS = 300
 _DEFAULT_RECALL_TTL_SECONDS = 86400
-_DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS = 5.0
+_DEFAULT_OPTIONAL_RECALL_TIMEOUT_SECONDS = 0.5
 _VISIBLE_HISTORY_EVENT_TYPES = {
     "system_message",
     "developer_message",
@@ -744,7 +746,7 @@ def _format_executor_pool_reminder(
     targets = list(getattr(executor_pool, "all", None) or [])
     if not targets or (len(targets) == 1 and not include_single_executor):
         return ""
-    lines = ["Assigned executors (Stage 36 multi-executor agents):"]
+    lines = ["Assigned executors:"]
     for target in targets:
         kind = "primary" if getattr(target, "is_primary", False) else "additional"
         marker = (
@@ -766,15 +768,10 @@ def _format_executor_pool_reminder(
         lines.append(line)
     lines.append(
         "Use primary executors for normal work. Additional executors are "
-        "special-purpose targets (for example remote hosts or attached devices); "
-        "do not use them as fallback capacity when a primary executor is down. "
-        "Route to an additional executor only when the task explicitly requires "
-        "that specific machine or the user asks for it. After completing that "
-        "specific work, switch back to a primary executor before unrelated or "
-        "generic follow-up work. Pass target_executor=<id> on a tool call to route "
-        "a single call without changing the active executor. Call switch_executor "
-        "only when you intentionally want subsequent tool calls to stay on that "
-        "specific executor."
+        "special-purpose machines, not fallback capacity: use one only when the task "
+        "needs that machine or the user asks, then return to a primary executor. Pass "
+        "target_executor=<id> to route a single call; call switch_executor only to keep "
+        "later calls on that executor."
     )
     return "\n".join(lines)
 
@@ -888,7 +885,11 @@ def _format_executor_label(env: ExecutorEnvironmentSnapshot) -> str:
 
 def _compose_identity_prompt(agent: AgentDefinition) -> str | None:
     """Compose the immutable identity prompt for an agent."""
-    identity_parts = [part for part in [agent.compose_personality(), agent.system_prompt] if part]
+    from cognis.core.agent_registry import compose_system_agent_prompt
+
+    identity_parts = [
+        part for part in [agent.compose_personality(), compose_system_agent_prompt(agent)] if part
+    ]
     return "\n\n".join(identity_parts) if identity_parts else None
 
 
@@ -1327,58 +1328,70 @@ class ContextAssembler:
             performed_refresh = True
             if not self.session_cache.get_prefix_entries(session.session_id):
                 await self.session_cache.mark_prefix_repair_needed(session.session_id)
-        prefix_entries = await self._ensure_immutable_prefix(
-            session=session,
-            agent=agent,
-            project_instructions=[],
-            memory_labels=conversation.context.memory_labels,
-            context=cached_intention,
-            memory_policy=memory_policy,
-        )
-
         with scoped_runtime_context(
             user_email=session.user_email,
             agent_id=session.agent_id,
             agent_owner_email=agent.owner_email,
         ):
-            if memory_policy.auto_recall:
-                recall_task = asyncio.wait_for(
-                    self.memory.recall(
-                        query=user_message,
-                        session_id=session.mnemory_session_id,
-                        labels=conversation.context.memory_labels,
+
+            async def prepare_prefix() -> Any:
+                with turn_stage("context.identity", session_id=session.session_id):
+                    return await self._ensure_immutable_prefix(
+                        session=session,
+                        agent=agent,
+                        project_instructions=[],
+                        memory_labels=conversation.context.memory_labels,
                         context=cached_intention,
-                        search_mode="search",
-                        include_instructions=False,
-                        managed=True,
-                        instruction_mode=None,
-                        ttl=self.recall_ttl_seconds,
-                    ),
-                    timeout=self.optional_recall_timeout_seconds,
-                )
-            else:
-                recall_task = asyncio.sleep(0, result={"search_results": []})
-            intention_task = self.guardrails.get_session(
-                session.intaris_session_id or session.session_id
+                        memory_policy=memory_policy,
+                    )
+
+            prefix_task = asyncio.create_task(prepare_prefix())
+
+            async def recall_after_prefix() -> Any:
+                await prefix_task
+                if not memory_policy.auto_recall:
+                    return {"search_results": []}
+                with turn_stage("context.recall", session_id=session.session_id):
+                    return await asyncio.wait_for(
+                        self.memory.recall(
+                            query=user_message,
+                            session_id=session.mnemory_session_id,
+                            labels=conversation.context.memory_labels,
+                            context=cached_intention,
+                            search_mode="search",
+                            include_instructions=False,
+                            managed=True,
+                            instruction_mode=None,
+                            ttl=self.recall_ttl_seconds,
+                        ),
+                        timeout=self.optional_recall_timeout_seconds,
+                    )
+
+            async def refresh_after_prefix() -> Any:
+                # Prefix persistence and cache refresh are both writers: keep
+                # them serialized even while the independent status read runs.
+                await prefix_task
+                if performed_refresh:
+                    return refreshed_cache_entry
+                with turn_stage("context.events", session_id=session.session_id):
+                    return await self.session_cache.refresh(session)
+
+            async def read_intention() -> Any:
+                with turn_stage("context.intaris_status", session_id=session.session_id):
+                    return await self.guardrails.get_session(
+                        session.intaris_session_id or session.session_id
+                    )
+
+            gathered_results: tuple[Any, Any, Any, Any] = await asyncio.gather(
+                prefix_task,
+                recall_after_prefix(),
+                refresh_after_prefix(),
+                read_intention(),
+                return_exceptions=True,
             )
-            if performed_refresh:
-                recall_result, intention_result = await asyncio.gather(
-                    recall_task,
-                    intention_task,
-                    return_exceptions=True,
-                )
-                cache_result: Any = refreshed_cache_entry
-            else:
-                refresh_task = self.session_cache.refresh(session)
-                # Providers are mandatory — any failure propagates immediately.
-                # Intention is best-effort (non-critical for turn execution).
-                gathered_results: tuple[Any, Any, Any] = await asyncio.gather(
-                    recall_task,
-                    refresh_task,
-                    intention_task,
-                    return_exceptions=True,
-                )
-                recall_result, cache_result, intention_result = gathered_results
+            prefix_result, recall_result, cache_result, intention_result = gathered_results
+            if isinstance(prefix_result, BaseException):
+                raise prefix_result
 
         degraded_sources: list[str] = []
         system_notices: list[str] = []
@@ -1495,12 +1508,6 @@ class ContextAssembler:
                         )
                         if ok:
                             await db_session.commit()
-                            if conversation.title:
-                                await publish_conversation_title_updated(
-                                    self.session_manager.event_bus,
-                                    conversation_id=conversation.conversation_id,
-                                    title=conversation.title,
-                                )
                 except Exception:
                     logger.debug(
                         "context: failed to sync title from Intaris",
@@ -1688,6 +1695,7 @@ class ContextAssembler:
         if agent_profile_context := render_agent_profile_context(
             resolved_agent_profile,
             switch_eligible_profiles=agent_switch_eligible_profiles(agent),
+            startup_selection=conversation.context.platform_data.get(SELECTION_KEY),
         ):
             messages.append(
                 {
@@ -1765,7 +1773,9 @@ class ContextAssembler:
 
         if follow_up is not None:
             follow_up_prompt_context = (
-                PromptContext.FOLLOW_UP_INTEGRATE
+                PromptContext.FOLLOW_UP_OUTCOME
+                if follow_up.mode is FollowUpMode.HANDLE
+                else PromptContext.FOLLOW_UP_INTEGRATE
                 if follow_up.mode is FollowUpMode.INTEGRATE
                 else PromptContext.FOLLOW_UP_NOTIFY
             )
@@ -1813,8 +1823,10 @@ class ContextAssembler:
             if user_message_role == "user"
             else user_message
         )
-        effective_user_message_metadata = user_message_metadata or {
-            "ts": datetime.datetime.now(datetime.UTC)
+        # Metadata without a timestamp (for example feedback links) still needs an envelope.
+        effective_user_message_metadata = {
+            "ts": datetime.datetime.now(datetime.UTC),
+            **(user_message_metadata or {}),
         }
         persisted_model_user_message = (
             render_user_message(
@@ -2334,6 +2346,7 @@ class ContextAssembler:
         if agent_profile_context := render_agent_profile_context(
             resolved_agent_profile,
             switch_eligible_profiles=agent_switch_eligible_profiles(agent),
+            startup_selection=conversation.context.platform_data.get(SELECTION_KEY),
         ):
             messages.append(
                 {
@@ -2397,7 +2410,9 @@ class ContextAssembler:
 
         if follow_up is not None:
             follow_up_prompt_context = (
-                PromptContext.FOLLOW_UP_INTEGRATE
+                PromptContext.FOLLOW_UP_OUTCOME
+                if follow_up.mode is FollowUpMode.HANDLE
+                else PromptContext.FOLLOW_UP_INTEGRATE
                 if follow_up.mode is FollowUpMode.INTEGRATE
                 else PromptContext.FOLLOW_UP_NOTIFY
             )
@@ -2440,8 +2455,10 @@ class ContextAssembler:
             if user_message_role == "user"
             else user_message
         )
-        effective_user_message_metadata = user_message_metadata or {
-            "ts": datetime.datetime.now(datetime.UTC)
+        # Metadata without a timestamp (for example feedback links) still needs an envelope.
+        effective_user_message_metadata = {
+            "ts": datetime.datetime.now(datetime.UTC),
+            **(user_message_metadata or {}),
         }
         persisted_model_user_message = (
             render_user_message(
@@ -3308,6 +3325,7 @@ class ContextAssembler:
             agent_id=agent.agent_id,
             include_work_routing=include_work_routing,
             model_id=resolved_model,
+            visible_tool_names=visible_tool_names,
         )
         if system_instructions:
             tagged_instructions = _tagged_section("instructions", system_instructions)
@@ -3348,11 +3366,11 @@ class ContextAssembler:
             )
 
         skill_metadata = self._get_available_skills_metadata(agent)
-        if skill_metadata:
-            sections.append(skill_metadata)
-            auto_loaded_skill_context = self._get_auto_loaded_skill_context(agent)
-            if auto_loaded_skill_context:
-                sections.append(auto_loaded_skill_context)
+        auto_loaded_skill_context = self._get_auto_loaded_skill_context(agent)
+        if skill_metadata or auto_loaded_skill_context:
+            sections.extend(
+                section for section in (skill_metadata, auto_loaded_skill_context) if section
+            )
             skill_guidance = build_skill_guidance(visible_tool_names=visible_tool_names)
             tagged_skills_guidance = _tagged_section(
                 "skills_guidance",

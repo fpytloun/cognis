@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 from pathlib import Path
 from time import monotonic
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -66,7 +67,7 @@ class TestFindProjectRoot:
         assert _should_skip_server_for_path("pyright", "/var/tmp/cognis/foo.py", "/var/tmp")
         assert not _should_skip_server_for_path("ruff", "/tmp/cognis/foo.py", "/tmp/cognis")
         assert not _should_skip_server_for_path(
-            "pyright", "/home/alice/src/sample-app/foo.py", "/home/alice/src/sample-app"
+            "pyright", "/home/alice/src/sample/foo.py", "/home/alice/src/sample"
         )
 
 
@@ -93,13 +94,16 @@ class TestLSPManagerBasic:
         assert len(manager._clients) == 0
 
     @pytest.mark.asyncio()
-    async def test_touch_file_skips_pyright_for_scratch_files(self, tmp_path: Path) -> None:
+    async def test_touch_file_skips_pyright_for_scratch_files(self) -> None:
         """Temp file edits should avoid spawning expensive Pyright clients."""
-        target = tmp_path / "module.py"
+        # The scratch roots are /tmp and /var/tmp, whatever TMPDIR points to.
+        scratch = tempfile.TemporaryDirectory(dir="/tmp")
+        target = Path(scratch.name) / "module.py"
         target.write_text("x = 1\n")
         manager = LSPManager(enabled=True)
 
         with (
+            scratch,
             patch(
                 "cognis.tools.executor.lsp.manager.resolve_command",
                 new=AsyncMock(return_value="cmd"),

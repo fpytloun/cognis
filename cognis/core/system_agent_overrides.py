@@ -48,6 +48,9 @@ SYSTEM_AGENT_LLM_FIELDS = frozenset(
         "max_tokens",
         "reasoning_effort",
         "fast_mode",
+        "tts_provider_id",
+        "tts_model",
+        "tts_voice",
     }
 )
 

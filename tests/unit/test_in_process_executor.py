@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -63,6 +64,33 @@ def _contract_call(
             "tool_contract_hash": contract_hash or descriptor.schema_hash,
         },
         execution_scope_id=execution_scope_id,
+    )
+
+
+def _connection_with_tool(
+    name: str,
+    handler: Callable[[dict[str, object], object], Awaitable[str]],
+) -> InProcessExecutorConnection:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=ToolDefinition(
+                name=name,
+                description=name,
+                parameters={"type": "object", "properties": {}},
+                source=ToolSource(type="builtin"),
+            ),
+            handler=handler,
+        )
+    )
+    return InProcessExecutorConnection(
+        ExecutorHandle(
+            executor_id="exec",
+            executor_type="in_process",
+            capabilities=ExecutorCapabilities(tools=[name]),
+        ),
+        registry,
+        CircuitBreaker(),
     )
 
 
@@ -128,7 +156,75 @@ while True:
         )
     else:
         write_message({"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32601, "message": "Unknown method"}})
-"""
+    """
+
+
+@pytest.mark.asyncio
+async def test_in_process_rpc_dispatch_disables_zero_transport_timeout() -> None:
+    async def quick_handler(arguments: dict[str, object], context: object) -> str:
+        del arguments, context
+        return "completed"
+
+    connection = _connection_with_tool("quick", quick_handler)
+    registered = connection.registry.get("quick")
+    assert registered is not None
+    descriptor = registered.definition.descriptor
+    assert descriptor is not None
+
+    result = await connection.rpc_call(
+        "tool.execute",
+        {
+            "call_id": "zero-timeout",
+            "tool_name": "quick",
+            "arguments": {},
+            "runtime_metadata": {"tool_contract_hash": descriptor.schema_hash},
+            "timeout_seconds": 0,
+        },
+    )
+
+    assert result["output"] == "completed"
+    assert result["is_error"] is False
+
+
+@pytest.mark.asyncio
+async def test_in_process_rpc_dispatch_enforces_positive_timeout() -> None:
+    async def blocked_handler(arguments: dict[str, object], context: object) -> str:
+        del arguments, context
+        await asyncio.Event().wait()
+        return "unreachable"
+
+    connection = _connection_with_tool("blocked", blocked_handler)
+    registered = connection.registry.get("blocked")
+    assert registered is not None
+    descriptor = registered.definition.descriptor
+    assert descriptor is not None
+
+    result = await connection.rpc_call(
+        "tool.execute",
+        {
+            "call_id": "positive-timeout",
+            "tool_name": "blocked",
+            "arguments": {},
+            "runtime_metadata": {"tool_contract_hash": descriptor.schema_hash},
+            "timeout_seconds": 1,
+        },
+    )
+
+    assert result["output"] == "Tool execution timed out."
+    assert result["is_error"] is True
+
+
+def test_in_process_connection_executor_id_tracks_current_handle() -> None:
+    handle = ExecutorHandle(executor_id="executor-a", executor_type="in_process")
+    connection = InProcessExecutorConnection(handle, ToolRegistry(), CircuitBreaker())
+    connection_instance_id = connection.executor_instance_id
+
+    assert connection.executor_id == "executor-a"
+
+    connection.handle = handle.model_copy(update={"executor_id": "executor-b"})
+
+    assert connection.executor_id == "executor-b"
+    assert connection.executor_instance_id == connection_instance_id
 
 
 @pytest.mark.asyncio

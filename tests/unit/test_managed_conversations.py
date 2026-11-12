@@ -11,7 +11,10 @@ from cognis.core.managed_conversations import (
     managed_conversation_target_error,
 )
 from cognis.models.session import EventReadResult
-from cognis.tools.builtin.orchestration import AGENT_CONVERSATION_CREATE_TOOL
+from cognis.tools.builtin.orchestration import (
+    AGENT_CONVERSATION_CREATE_CHANNEL_TOOL,
+    AGENT_CONVERSATION_CREATE_TOOL,
+)
 
 
 def test_managed_conversation_allows_primary_agent_targets() -> None:
@@ -36,6 +39,16 @@ def test_managed_conversation_create_tool_guidance_rejects_system_agents() -> No
     assert "primary/user agents" in description
     assert "delegate()" in description
     assert "system:*" in description
+
+
+@pytest.mark.parametrize(
+    "tool", [AGENT_CONVERSATION_CREATE_TOOL, AGENT_CONVERSATION_CREATE_CHANNEL_TOOL]
+)
+def test_managed_create_exposes_startup_auto_and_default_without_fake_profile_ids(tool) -> None:
+    properties = tool.parameters["properties"]
+    assert properties["agent_profile_mode"]["enum"] == ["auto", "default"]
+    assert "agent_profile_mode" not in tool.parameters["required"]
+    assert "enum" not in properties["agent_profile_id"]
 
 
 def test_managed_conversation_retry_message_preserves_one_shot_mode() -> None:

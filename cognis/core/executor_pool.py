@@ -23,7 +23,8 @@ Hard rules enforced here:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any
 
@@ -59,6 +60,7 @@ class ExecutorAvailability(StrEnum):
     NOT_FOUND = "not_found"  # executor row missing
     UNAUTHORIZED = "unauthorized"  # row exists but not visible to user
     UNAVAILABLE = "unavailable"  # local executor package is absent
+    UNKNOWN = "unknown"  # current eligibility could not be verified
 
 
 _USABLE_STATES = frozenset({ExecutorAvailability.USABLE, ExecutorAvailability.DEGRADED})
@@ -139,6 +141,63 @@ class ExecutorPool:
 
     def is_primary(self, executor_id: str) -> bool:
         return any(t.executor_id == executor_id for t in self.primary)
+
+
+ExecutorPoolRefresher = Callable[[ExecutorPool], Awaitable[ExecutorPool]]
+
+
+def unknown_executor_eligibility(pool: ExecutorPool) -> ExecutorPool:
+    """Fail closed without misreporting a failed observation as an offline socket."""
+    return ExecutorPool(
+        primary=[replace(target, state=ExecutorAvailability.UNKNOWN) for target in pool.primary],
+        additional=[
+            replace(target, state=ExecutorAvailability.UNKNOWN) for target in pool.additional
+        ],
+    )
+
+
+async def refresh_executor_eligibility(
+    pool: ExecutorPool,
+    *,
+    session_factory: Any,
+    agent_execution: dict[str, Any],
+    user_email: str,
+    executor_owner_email: str,
+    policy: ExecutorPolicy,
+) -> ExecutorPool:
+    """Refresh admission observations without adding assignments or rebuilding inventory."""
+    current = await resolve_executor_pool(
+        session_factory=session_factory,
+        agent_execution=agent_execution,
+        user_email=user_email,
+        executor_owner_email=executor_owner_email,
+        policy=policy,
+        defer_observed_tools=True,
+    )
+
+    def refreshed(target: ResolvedExecutorTarget) -> ResolvedExecutorTarget:
+        observed = current.by_id(target.executor_id)
+        if observed is None or observed.state in {
+            ExecutorAvailability.NOT_FOUND,
+            ExecutorAvailability.UNAUTHORIZED,
+        }:
+            return replace(
+                target,
+                state=observed.state if observed is not None else ExecutorAvailability.NOT_FOUND,
+                row=None,
+            )
+        return replace(
+            observed,
+            is_primary=target.is_primary,
+            selection_source=target.selection_source,
+            description=target.description,
+            observed_tools=target.observed_tools,
+        )
+
+    return ExecutorPool(
+        primary=[refreshed(target) for target in pool.primary],
+        additional=[refreshed(target) for target in pool.additional],
+    )
 
 
 def parse_additional_executors(execution: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -244,6 +303,7 @@ def _target_from_row(
     selection_source: str,
     description: str | None,
     state: ExecutorAvailability,
+    defer_observed_tools: bool = False,
 ) -> ResolvedExecutorTarget:
     return ResolvedExecutorTarget(
         executor_id=getattr(row, "executor_id", "") or "",
@@ -254,7 +314,9 @@ def _target_from_row(
         state=state,
         enabled_tools=list(getattr(row, "enabled_tools", []) or []),
         enabled_tool_groups=list(getattr(row, "enabled_tool_groups", []) or []),
-        observed_tools=list(getattr(row, "observed_tools", []) or []),
+        observed_tools=(
+            [] if defer_observed_tools else list(getattr(row, "observed_tools", []) or [])
+        ),
         runtime_state=str(getattr(row, "runtime_state", "offline") or "offline"),
         desired_config_version=int(getattr(row, "desired_config_version", 0) or 0),
         applied_config_version=int(getattr(row, "applied_config_version", 0) or 0),
@@ -273,12 +335,14 @@ async def resolve_executor_pool(
     user_email: str,
     executor_owner_email: str,
     policy: ExecutorPolicy,
+    defer_observed_tools: bool = False,
 ) -> ExecutorPool:
     """Resolve the agent's primary + additional executor pool.
 
     Read eligible configurations once and partition into primary and additional
     buckets. Explicit-only pools do not decode unrelated executors' tool schemas.
     Primary membership wins on overlap.
+    Eligibility-only reads defer catalogs; refresh retains the turn-owned catalog.
     """
 
     from cognis.store.queries import list_executors
@@ -313,6 +377,7 @@ async def resolve_executor_pool(
             owner_email=executor_owner_email,
             include_shared=True,
             executor_ids=candidate_ids,
+            defer_observed_tools=defer_observed_tools,
         )
         rows_by_id = {row.executor_id: row for row in all_rows}
 
@@ -341,6 +406,7 @@ async def resolve_executor_pool(
                         selection_source="explicit",
                         description=None,
                         state=state,
+                        defer_observed_tools=defer_observed_tools,
                     )
                 )
                 seen_ids.add(row.executor_id)
@@ -364,6 +430,7 @@ async def resolve_executor_pool(
                         selection_source="selector",
                         description=None,
                         state=state,
+                        defer_observed_tools=defer_observed_tools,
                     )
                 )
                 seen_ids.add(row.executor_id)
@@ -401,6 +468,7 @@ async def resolve_executor_pool(
                         selection_source="additional_explicit",
                         description=description,
                         state=state,
+                        defer_observed_tools=defer_observed_tools,
                     )
                 )
                 seen_ids.add(row.executor_id)
@@ -421,6 +489,7 @@ async def resolve_executor_pool(
                             selection_source="additional_selector",
                             description=description,
                             state=state,
+                            defer_observed_tools=defer_observed_tools,
                         )
                     )
                     seen_ids.add(row.executor_id)

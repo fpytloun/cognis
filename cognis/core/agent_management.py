@@ -15,7 +15,7 @@ from sqlalchemy import select, update
 from cognis import json_codec as json
 from cognis.api.error_sanitizer import sanitize_client_error_detail
 from cognis.api.serializers import agent_to_response
-from cognis.core.agent_management_catalog import assignable_knowledgebases, available_workflows
+from cognis.core.agent_management_catalog import assignable_knowledgebases
 from cognis.core.agent_profiles import (
     agent_profile_options,
     resolve_agent_profile,
@@ -44,9 +44,11 @@ from cognis.models.agent import (
     AgentDefinition,
     AgentDelegationPolicy,
     AgentRuntimeProfile,
+    auto_profile_selection_settings,
+    strip_retired_execution_settings,
 )
 from cognis.models.skill import AgentSkillRef
-from cognis.models.tool import stable_tool_id
+from cognis.models.tool import MCPServerConfig, stable_tool_id
 from cognis.providers.backends import get_backend
 from cognis.providers.base import CredentialsProvider
 from cognis.providers.memory.policy import memory_backend_descriptors
@@ -82,7 +84,8 @@ from cognis.store.queries import (
 from cognis.tools.builtin.image import _image_bytes
 from cognis.tools.builtin.knowledgebase import knowledgebase_tools
 from cognis.tools.builtin.projects import PROJECT_MANAGE_TOOL_IDS, PROJECT_READ_TOOL_IDS
-from cognis.tools.skills import is_agent_assignable_skill
+from cognis.tools.builtin.system_management import SYSTEM_MANAGEMENT_TOOLS
+from cognis.tools.skills import agent_skill_usage_report, is_agent_assignable_skill
 
 logger = get_logger(__name__)
 
@@ -96,6 +99,25 @@ KNOWLEDGEBASE_READ_TOOL_IDS = (
     "builtin:knowledgebase_diagnostics",
     "builtin:knowledgebase_search",
     "builtin:knowledgebase_read_source_context",
+)
+
+
+GUARDRAIL_SETTING_FIELDS = (
+    "guardrails_backend",
+    "intaris_evaluation",
+    "approval_mode",
+    "minimum_outcome",
+    "maximum_outcome",
+)
+
+TOOL_ASSIGNMENT_FIELDS = (
+    "tool_groups",
+    "allow_tools",
+    "deny_tools",
+    "disabled_tools",
+    "disabled_mcp_servers",
+    "intaris_mcp_servers",
+    "mcp_servers",
 )
 
 
@@ -962,7 +984,7 @@ async def _tools_update(
             key: _apply_assignment_delta(
                 current.get(key, []), delta.get(key, []), remove=mode == "remove"
             )
-            for key in ("tool_groups", "allow_tools", "deny_tools")
+            for key in TOOL_ASSIGNMENT_FIELDS
         }
     validation = _validate_tool_assignment(row, proposed, deps.assignable_tools)
     if not validation["valid"]:
@@ -1015,11 +1037,14 @@ async def _skills_get(
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    async with deps.session_factory() as session:
+        skill_usage = await agent_skill_usage_report(session, agent=row, owner_email=actor_email)
     return {
         "status": "ok",
         "agent_id": row.agent_id,
         "skill_assignments": _configured_skill_assignments(row),
         "available_skills": await _available_skill_options(deps, actor_email),
+        "skill_usage": skill_usage,
     }
 
 
@@ -1237,11 +1262,16 @@ async def _create_agent(
     agent_type = str(arguments.get("agent_type") or "primary")
     if agent_type not in {"primary", "secondary"}:
         raise AgentManagementError("agent_type must be primary or secondary")
-    # Secondary agents cannot hold management tools; keep their defaults valid.
+    if agent_type == "primary" and arguments.get("status") == "active":
+        from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+        try:
+            require_explicit_executor(None)
+        except ExecutorConfigurationError as exc:
+            raise AgentManagementError(str(exc)) from exc
+    # Assignability is not an opt-in: new agents need an explicit management grant.
     default_tools = [
-        tool
-        for tool in deps.assignable_tools
-        if agent_type == "primary" or tool.name not in _MANAGEMENT_TOOL_NAMES
+        tool for tool in deps.assignable_tools if tool.name not in _MANAGEMENT_TOOL_NAMES
     ]
 
     avatar_image_id = arguments.get("avatar_image_id")
@@ -1295,8 +1325,17 @@ async def _create_agent(
                 "deny_tools": denied_static_ids,
             },
             permissions=permissions or None,
+            capabilities=_validated_guardrail_settings({}, arguments),
             llm_config=None,
-            execution=None,
+            execution=(
+                {
+                    "auto_profile_selection": auto_profile_selection_settings(
+                        {"auto_profile_selection": arguments["auto_profile_selection"]}
+                    ).model_dump()
+                }
+                if "auto_profile_selection" in arguments
+                else None
+            ),
             avatar_image_id=_optional_string(avatar_image_id),
             agent_type=agent_type,
             status=str(arguments.get("status") or "draft"),
@@ -1318,6 +1357,19 @@ async def _update_agent(
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
     previous_definition = AgentDefinition.model_validate(agent_to_response(row).model_dump())
     updates = _agent_updates(arguments)
+    if "auto_profile_selection" in arguments:
+        execution = dict(row.execution or {})
+        _apply_execution_setting(
+            execution, "auto_profile_selection", arguments["auto_profile_selection"], set()
+        )
+        updates["execution"] = execution
+    if row.agent_type == "primary" and updates.get("status") == "active":
+        from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+        try:
+            require_explicit_executor(updates.get("execution", row.execution))
+        except ExecutorConfigurationError as exc:
+            raise AgentManagementError(str(exc)) from exc
     if "delegation" in arguments:
         permissions = dict(row.permissions) if isinstance(row.permissions, dict) else {}
         permissions["delegation"] = AgentDelegationPolicy.model_validate(
@@ -1376,6 +1428,13 @@ async def _set_status(
     status: str,
 ) -> dict[str, Any]:
     row = await _require_owned_target(deps, actor_email, current_agent_id, arguments)
+    if status == "active" and row.agent_type == "primary":
+        from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+        try:
+            require_explicit_executor(row.execution)
+        except ExecutorConfigurationError as exc:
+            raise AgentManagementError(str(exc)) from exc
     async with deps.session_factory() as session:
         ok = await set_agent_status(session, row.agent_id, status)
         await session.commit()
@@ -1496,6 +1555,13 @@ async def _share_create(
     executor_scope = str(arguments.get("executor_scope") or "owner_executor")
     if executor_scope not in {"owner_executor", "grantee_executor"}:
         raise AgentManagementError("executor_scope must be owner_executor or grantee_executor")
+    if executor_scope == "owner_executor":
+        from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+        try:
+            require_explicit_executor(row.execution)
+        except ExecutorConfigurationError as exc:
+            raise AgentManagementError(str(exc)) from exc
     async with deps.session_factory() as session:
         if await get_user(session, grantee_email) is None:
             raise AgentManagementError("Grantee user not found")
@@ -1689,7 +1755,7 @@ _SYSTEM_AGENT_ACTIONS = frozenset(
         "system_enable",
     }
 )
-_MANAGEMENT_TOOL_NAMES = frozenset({"manage_agents", "manage_mcp"})
+_MANAGEMENT_TOOL_NAMES = frozenset({"manage_agents", "manage_mcp"}) | SYSTEM_MANAGEMENT_TOOLS
 _SYSTEM_TOOL_OVERRIDE_KEYS = frozenset(
     {
         "builtin_tools",
@@ -1866,6 +1932,9 @@ async def _validated_system_overrides(
         await _check_provider_model(
             llm_config.get("provider_id"), llm_config.get("model"), "llm_config"
         )
+        if {"tts_provider_id", "tts_model"} & llm_config.keys():
+            shipped = base.llm_config.model_dump() if base.llm_config else {}
+            _validate_tts_binding({**shipped, **llm_config}, await _provider_catalog())
     profiles = overrides.get("agent_profiles")
     if isinstance(profiles, dict):
         for profile_id, profile in profiles.items():
@@ -2066,8 +2135,10 @@ def _agent_settings_payload(
     skills = row.skills if isinstance(row.skills, dict) else None
     permissions = row.permissions if isinstance(row.permissions, dict) else None
     llm_config = row.llm_config if isinstance(row.llm_config, dict) else None
-    execution = row.execution if isinstance(row.execution, dict) else None
-    capabilities = row.capabilities if isinstance(row.capabilities, dict) else {}
+    execution = strip_retired_execution_settings(
+        row.execution if isinstance(row.execution, dict) else None
+    )
+    capabilities = AgentCapabilities.model_validate(row.capabilities or {}).model_dump(mode="json")
     return {
         "tools": tools,
         "tools_state": _tools_state(tools, raw_value=row.tools),
@@ -2077,21 +2148,17 @@ def _agent_settings_payload(
         "permissions": permissions,
         "llm_config": llm_config,
         "execution": execution,
+        "auto_profile_selection": auto_profile_selection_settings(execution).model_dump(),
         "capabilities": capabilities,
+        **{field: capabilities[field] for field in GUARDRAIL_SETTING_FIELDS},
         "escalation_timeout_seconds": capabilities.get("escalation_timeout_seconds"),
+        "analytics_enabled": capabilities.get("analytics_enabled", True),
         "memory": {
             "backend": capabilities.get("memory_backend", "mnemory"),
             "options": capabilities.get("memory_backend_options", {}),
             "backends": memory_backend_descriptors(),
         },
         "workflow": {
-            "available_workflow_ids": _string_list(execution.get("available_workflow_ids"))
-            if execution
-            else [],
-            "default_workflow_id": execution.get("default_workflow_id") if execution else None,
-            "workflow_selection_mode": execution.get("workflow_selection_mode", "automatic")
-            if execution
-            else "automatic",
             "step_agent_overrides": execution.get("step_agent_overrides", {}) if execution else {},
         },
         "executor": {
@@ -2180,9 +2247,6 @@ async def _settings_updates(
         )
 
     async with deps.session_factory() as session:
-        workflow_ids = {
-            workflow.workflow_id for workflow in await available_workflows(session, actor_email)
-        }
         skill_ids = {
             skill.skill_id for skill in await list_skills(session, owner_email=actor_email)
         }
@@ -2232,10 +2296,15 @@ async def _settings_updates(
     if memory_fields.intersection(settings):
         capabilities = _validated_memory_capabilities(capabilities, settings)
         updates["capabilities"] = capabilities
-    if "escalation_timeout_seconds" in settings:
+    if set(GUARDRAIL_SETTING_FIELDS).intersection(settings):
+        capabilities = _validated_guardrail_settings(capabilities, settings)
+        updates["capabilities"] = capabilities
+    for capability_field in ("escalation_timeout_seconds", "analytics_enabled"):
+        if capability_field not in settings:
+            continue
         candidate = {
             **capabilities,
-            "escalation_timeout_seconds": settings["escalation_timeout_seconds"],
+            capability_field: settings[capability_field],
         }
         try:
             capabilities = AgentCapabilities.model_validate(candidate).model_dump(mode="json")
@@ -2245,13 +2314,7 @@ async def _settings_updates(
 
     ordered_settings = sorted(
         settings.items(),
-        key=lambda item: (
-            0
-            if item[0] in {"provider_id", "available_workflow_ids"}
-            else 1
-            if item[0] in {"model", "default_workflow_id"}
-            else 2
-        ),
+        key=lambda item: 0 if item[0] == "provider_id" else 1 if item[0] == "model" else 2,
     )
     for field, value in ordered_settings:
         if field in {"tools", "skills", "permissions", "llm_config", "execution"}:
@@ -2261,15 +2324,13 @@ async def _settings_updates(
             skills["items"] = [{"skill_id": skill_id, "enabled": True} for skill_id in selected]
             updates["skills"] = skills
         elif field in {
-            "available_workflow_ids",
-            "default_workflow_id",
-            "workflow_selection_mode",
+            "auto_profile_selection",
             "step_agent_overrides",
             "executor_id",
             "executor_selector",
             "additional_executors",
         }:
-            _apply_execution_setting(execution, field, value, workflow_ids, executor_ids)
+            _apply_execution_setting(execution, field, value, executor_ids)
             updates["execution"] = execution
         elif field in {
             "provider_id",
@@ -2278,6 +2339,10 @@ async def _settings_updates(
             "max_tokens",
             "reasoning_effort",
             "voice",
+            "voices",
+            "tts_provider_id",
+            "tts_model",
+            "tts_voice",
         }:
             _apply_llm_setting(
                 llm_config,
@@ -2287,7 +2352,13 @@ async def _settings_updates(
                 provider_models,
             )
             updates["llm_config"] = llm_config
-        elif field in {"memory_backend", "memory_backend_options", "escalation_timeout_seconds"}:
+        elif field in {
+            "memory_backend",
+            "memory_backend_options",
+            "escalation_timeout_seconds",
+            "analytics_enabled",
+            *GUARDRAIL_SETTING_FIELDS,
+        }:
             # Validated atomically above so backend/options transitions do not
             # depend on input field order.
             continue
@@ -2316,14 +2387,27 @@ async def _settings_updates(
         }:
             _apply_permissions_setting(permissions, field, value)
             updates["permissions"] = permissions
+    if {"tts_provider_id", "tts_model"} & settings.keys():
+        _validate_tts_binding(llm_config, provider_models)
     return {**updates, **raw_updates}
+
+
+def _validate_tts_binding(llm_config: dict[str, Any], provider_models: dict[str, set[str]]) -> None:
+    provider_id = _nullable_string(llm_config.get("tts_provider_id"), "tts_provider_id")
+    model = _nullable_string(llm_config.get("tts_model"), "tts_model")
+    if provider_id and provider_id not in provider_models:
+        raise AgentManagementError(f"Invalid tts_provider_id: {provider_id}")
+    if provider_id and not model:
+        raise AgentManagementError("Choose a speech model for the selected TTS provider.")
+    allowed_models = provider_models.get(provider_id, set()) if provider_id else set()
+    if model is not None and allowed_models and model not in allowed_models:
+        raise AgentManagementError(f"Invalid tts_model for provider {provider_id}: {model}")
 
 
 def _settings_field_names() -> set[str]:
     return {
-        "available_workflow_ids",
-        "default_workflow_id",
-        "workflow_selection_mode",
+        *GUARDRAIL_SETTING_FIELDS,
+        "auto_profile_selection",
         "executor_id",
         "executor_selector",
         "provider_id",
@@ -2332,26 +2416,44 @@ def _settings_field_names() -> set[str]:
         "max_tokens",
         "reasoning_effort",
         "voice",
+        "voices",
+        "tts_provider_id",
+        "tts_model",
+        "tts_voice",
         "memory_backend",
         "memory_backend_options",
         "escalation_timeout_seconds",
+        "analytics_enabled",
         "delegation",
     }
+
+
+def _validated_guardrail_settings(
+    capabilities: dict[str, Any], settings: dict[str, Any]
+) -> dict[str, Any]:
+    candidate = {
+        **capabilities,
+        **{field: settings[field] for field in GUARDRAIL_SETTING_FIELDS if field in settings},
+    }
+    try:
+        return AgentCapabilities.model_validate(candidate).model_dump(mode="json")
+    except ValueError as exc:
+        raise AgentManagementError(str(exc)) from exc
 
 
 def _apply_execution_setting(
     execution: dict[str, Any],
     field: str,
     value: Any,
-    workflow_ids: set[str],
     executor_ids: set[str],
 ) -> None:
-    if field == "available_workflow_ids":
-        execution[field] = _validated_string_list(value, field, valid=workflow_ids)
-    elif field == "default_workflow_id":
-        execution[field] = _nullable_enum(value, field, valid=workflow_ids)
-    elif field == "workflow_selection_mode":
-        execution[field] = _enum(value, field, valid={"automatic", "always_ask", "use_default"})
+    if field == "auto_profile_selection":
+        if value is None:
+            execution.pop(field, None)
+        else:
+            previous = auto_profile_selection_settings(execution).model_dump()
+            merged = {**previous, **_object(value, field)}
+            execution[field] = auto_profile_selection_settings({field: merged}).model_dump()
     elif field == "step_agent_overrides":
         execution[field] = _object(value, field)
     elif field == "executor_id":
@@ -2375,7 +2477,7 @@ def _apply_llm_setting(
     provider_ids: set[str],
     provider_models: dict[str, set[str]],
 ) -> None:
-    if field == "provider_id":
+    if field in {"provider_id", "tts_provider_id"}:
         llm_config[field] = _nullable_enum(value, field, valid=provider_ids)
     elif field == "model":
         model = _nullable_string(value, field)
@@ -2386,8 +2488,13 @@ def _apply_llm_setting(
         if model is not None and allowed_models and model not in allowed_models:
             raise AgentManagementError(f"Invalid model for provider {provider_id}: {model}")
         llm_config[field] = model
-    elif field in {"reasoning_effort", "voice"}:
+    elif field in {"reasoning_effort", "voice", "tts_model", "tts_voice"}:
         llm_config[field] = _nullable_string(value, field)
+    elif field == "voices":
+        voices = _object(value, field)
+        if any(not isinstance(voice, str) for voice in voices.values()):
+            raise AgentManagementError("voices values must be strings")
+        llm_config[field] = dict(voices)
     elif field == "temperature":
         if value is not None and not isinstance(value, (int, float)):
             raise AgentManagementError("temperature must be a number")
@@ -2425,15 +2532,14 @@ def _apply_tools_setting(
         selected = _validated_string_list(
             value,
             field,
-            valid={
-                "manage_agents",
-                "builtin:manage_agents",
-                "manage_mcp",
-                "builtin:manage_mcp",
-            },
+            valid=set(_MANAGEMENT_TOOL_NAMES)
+            | {f"builtin:{name}" for name in _MANAGEMENT_TOOL_NAMES},
         )
         if selected and getattr(row, "agent_type", "primary") == "secondary":
             raise AgentManagementError("secondary agents cannot opt into management tools")
+        available = _available_tool_map(assignable_tools)
+        if any(f"builtin:{item.removeprefix('builtin:')}" not in available for item in selected):
+            raise AgentManagementError("Management opt-in exceeds caller-assignable inventory")
         tools[field] = [item.removeprefix("builtin:") for item in selected]
     elif field in {
         "disabled_categories",
@@ -2446,7 +2552,14 @@ def _apply_tools_setting(
         tools[field] = _validated_string_list(value, field, valid=set(_tool_group_map()))
     elif field in {"allow_tools", "deny_tools"}:
         valid_tools = set(_available_tool_map(assignable_tools))
-        tools[field] = _validated_string_list(value, field, valid=valid_tools)
+        selected = _validated_string_list(value, field, valid=valid_tools)
+        if (
+            field == "allow_tools"
+            and getattr(row, "agent_type", "primary") == "secondary"
+            and any(item.removeprefix("builtin:") in _MANAGEMENT_TOOL_NAMES for item in selected)
+        ):
+            raise AgentManagementError("secondary agents cannot hold management tools")
+        tools[field] = selected
     elif field == "mcp_servers":
         if not isinstance(value, list):
             raise AgentManagementError("mcp_servers must be a list")
@@ -2524,23 +2637,18 @@ def _validated_string_list(value: Any, field: str, *, valid: set[str] | None = N
     return items
 
 
-def _configured_tool_assignment(row: Any) -> dict[str, list[str]]:
+def _configured_tool_assignment(row: Any) -> dict[str, Any]:
     tools = row.tools if isinstance(row.tools, dict) else {}
     return {
-        "tool_groups": _string_list(tools.get("tool_groups")),
-        "allow_tools": _string_list(tools.get("allow_tools")),
-        "deny_tools": _string_list(tools.get("deny_tools")),
+        key: list(tools.get(key) or []) if key == "mcp_servers" else _string_list(tools.get(key))
+        for key in TOOL_ASSIGNMENT_FIELDS
     }
 
 
 def _tool_assignment_from_arguments(
     arguments: dict[str, Any], row: Any, *, default_empty: bool = False
-) -> dict[str, list[str]]:
-    current: dict[str, list[str]] = {
-        "tool_groups": [],
-        "allow_tools": [],
-        "deny_tools": [],
-    }
+) -> dict[str, Any]:
+    current: dict[str, Any] = {key: [] for key in TOOL_ASSIGNMENT_FIELDS}
     if not default_empty:
         current = _configured_tool_assignment(row)
     raw_tools = arguments.get("tools")
@@ -2550,10 +2658,22 @@ def _tool_assignment_from_arguments(
         source = raw_tools
     else:
         source = arguments
-    return {
-        key: _validated_string_list(source[key], key) if key in source else list(current[key])
-        for key in ("tool_groups", "allow_tools", "deny_tools")
-    }
+    for key in TOOL_ASSIGNMENT_FIELDS:
+        if key not in source:
+            continue
+        if key == "mcp_servers":
+            if not isinstance(source[key], list):
+                raise AgentManagementError("mcp_servers must be a list")
+            try:
+                current[key] = [
+                    MCPServerConfig.model_validate(item).model_dump(mode="json")
+                    for item in source[key]
+                ]
+            except ValueError as exc:
+                raise AgentManagementError(str(exc)) from exc
+        else:
+            current[key] = _validated_string_list(source[key], key)
+    return current
 
 
 def _agent_tool_assignment_payload(
@@ -2622,9 +2742,14 @@ def _validate_tool_assignment(
                     ),
                 }
             )
+    from cognis.api.runtime_support import static_tool_definitions
+
+    deny_ids = {
+        stable_tool_id(tool) for tool in static_tool_definitions(knowledgebase_enabled=True)
+    }
     for field in ("allow_tools", "deny_tools"):
         for tool_id in configured[field]:
-            if tool_id not in tools:
+            if tool_id not in tools and not (field == "deny_tools" and tool_id in deny_ids):
                 errors.append({"field": field, "id": tool_id, "reason": "Unknown tool"})
     overlap = sorted(
         set(_normalize_tool_identifier(item, tools) for item in configured["allow_tools"])
@@ -2637,12 +2762,12 @@ def _validate_tool_assignment(
     if getattr(row, "agent_type", "primary") == "secondary":
         for tool_id in _effective_assignment_tools(configured, tools):
             tool = tools.get(tool_id)
-            if tool and tool.name == "manage_agents":
+            if tool and tool.name in _MANAGEMENT_TOOL_NAMES:
                 errors.append(
                     {
                         "field": "allow_tools",
                         "id": tool_id,
-                        "reason": "secondary agents cannot manage agents",
+                        "reason": "secondary agents cannot hold management tools",
                     }
                 )
     if any(
@@ -2661,6 +2786,8 @@ def _validate_tool_assignment(
 def _effective_assignment_tools(
     configured: dict[str, list[str]], tools: dict[str, Any]
 ) -> list[str]:
+    from cognis.api.runtime_support import tool_disabled_by_agent_config
+
     groups = _tool_group_map()
     selected: list[str] = []
     for group_id in configured["tool_groups"]:
@@ -2672,6 +2799,14 @@ def _effective_assignment_tools(
     normalized: list[str] = []
     for tool_id in selected:
         stable_id = _normalize_tool_identifier(tool_id, tools)
+        tool = tools.get(tool_id)
+        if tool is not None and tool_disabled_by_agent_config(
+            tool,
+            disabled_categories=set(),
+            disabled_tools=set(configured.get("disabled_tools", [])),
+            disabled_mcp_servers=set(configured.get("disabled_mcp_servers", [])),
+        ):
+            continue
         if stable_id not in denied and stable_id not in normalized:
             normalized.append(stable_id)
     return normalized
@@ -2682,10 +2817,9 @@ def _normalize_tool_identifier(identifier: str, tools: dict[str, Any]) -> str:
     return stable_tool_id(tool) if tool else identifier
 
 
-def _apply_assignment_delta(current: list[str], delta: list[str], *, remove: bool) -> list[str]:
+def _apply_assignment_delta(current: list[Any], delta: list[Any], *, remove: bool) -> list[Any]:
     if remove:
-        removal = set(delta)
-        return [item for item in current if item not in removal]
+        return [item for item in current if item not in delta]
     result = list(current)
     for item in delta:
         if item not in result:

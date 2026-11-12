@@ -15,7 +15,12 @@ from __future__ import annotations
 import copy
 import logging
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from cognis.tools.builtin.workflow import FEEDBACK_CHILD_PROPERTIES
+
+if TYPE_CHECKING:
+    from cognis.core.session import SessionCreationParticipant
 
 from cognis import json_codec as json
 from cognis.channels.constants import MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS
@@ -42,6 +47,7 @@ from cognis.models.tool import (
     tool_input_schema,
     tool_with_input_schema,
 )
+from cognis.models.workflow import CompletionModeFamily
 
 logger = logging.getLogger(__name__)
 
@@ -149,17 +155,15 @@ DELEGATE_TOOL = ToolDefinition(
     name="delegate",
     description=(
         "Delegate work to a focused sub-session and receive the result.\n\n"
-        "Treat the child as an isolated context. For substantial work, provide a "
-        "compact contract with a proportional objective, exact references, scope, "
-        "acceptance, and return evidence; do not make the child rediscover verified "
-        "context or pass the parent transcript.\n\n"
+        "The child receives task, context, and expected_output, not the parent "
+        "conversation. Use these fields together as one brief without repeating "
+        "the same information in each.\n\n"
         "agent_id is required and must identify an eligible secondary specialist "
         "from the current caller-scoped target catalog. Use managed conversations "
         "for primary user agents.\n\n"
         "Before creating a fresh child, inspect existing sub-sessions. Continue only "
-        "for the same problem, specifically the same bounded problem, with a compatible "
-        "specialist role, tool/authority scope, and expected output remain compatible; "
-        "responsibilities must also remain compatible. Continue only when retained "
+        "for the same bounded problem with compatible specialist role, responsibilities, "
+        "tool/authority scope, and expected output. Continue only when retained "
         "context is materially useful; send the context delta only. Create a fresh "
         "isolated child for a materially different role, responsibility, tool or "
         "authority scope, or an independent workstream. Follow-up and fork preserve the "
@@ -167,8 +171,7 @@ DELEGATE_TOOL = ToolDefinition(
         "only an independent branch requiring inherited context, not an ordinary "
         "handoff, correction, or review; use a fresh specialist when compatibility "
         "changes. Use follow_up_subsession for compatible continuation and "
-        "fork_subsession only for that independent branch. Start fresh with the "
-        "appropriate specialist when compatibility changes. "
+        "fork_subsession only for that independent branch. "
         "This applies to implementation, research, debugging, review, and other delegated "
         "work—not only code review.\n\n"
         "## Wait behavior\n\n"
@@ -190,11 +193,12 @@ DELEGATE_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "task": {
                 "type": "string",
                 "description": (
-                    "Clear bounded objective. Include scope/non-goals and acceptance "
-                    "criteria here when they are central to the delegated task."
+                    "The outcome or question and relevant work boundaries. "
+                    "For implementation, state the behavior and write scope."
                 ),
             },
             "agent_id": {
@@ -214,18 +218,15 @@ DELEGATE_TOOL = ToolDefinition(
             "context": {
                 "type": "string",
                 "description": (
-                    "Curated confirmed context, exact source-of-truth references, "
-                    "dependencies, relevant decisions, and explicitly marked assumptions. "
-                    "Do not dump the parent transcript."
+                    "Relevant facts, exact references, and decisions the child needs "
+                    "but does not already have. Mark assumptions as such."
                 ),
             },
             "expected_output": {
                 "type": "string",
                 "description": (
-                    "Required return contract: status, summary, changes or findings, "
-                    "changed references, verification evidence, risks/assumptions, "
-                    "and open questions as relevant. Keep detailed logs inspectable "
-                    "outside the parent's active context."
+                    "The useful answer or result and supporting evidence to return; "
+                    "scale detail to the task."
                 ),
             },
             "wait": {
@@ -334,6 +335,7 @@ RETRY_SUBSESSION_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "session_id": {"type": "string", "description": "Terminal child session to retry."},
         },
         "required": ["session_id"],
@@ -358,6 +360,7 @@ FOLLOW_UP_SUBSESSION_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "session_id": {"type": "string", "description": "Terminal child context to continue."},
             "instruction": {"type": "string", "description": "New specialist instruction."},
         },
@@ -383,6 +386,7 @@ FORK_SUBSESSION_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "session_id": {"type": "string", "description": "Terminal child context to branch."},
             "instruction": {"type": "string", "description": "Instruction for the branch."},
         },
@@ -396,6 +400,41 @@ FORK_SUBSESSION_TOOL = ToolDefinition(
 # ---------------------------------------------------------------------------
 # Task tool definitions
 # ---------------------------------------------------------------------------
+
+TASK_OUTCOME_PROPERTIES: dict[str, Any] = {
+    "delivery_mode": {
+        "type": "string",
+        "enum": [
+            "same_conversation",
+            "preferred_channel",
+            "latest_active_for_agent",
+            "specific_conversation",
+            "in_app_notifications",
+            "silent",
+        ],
+        "description": "Destination for terminal outcomes. App main chat is a channel. in_app_notifications targets the inbox and requires direct mode.",
+    },
+    "delivery_target": {
+        "type": ["string", "null"],
+        "description": "Conversation ID for specific_conversation. Null clears on update.",
+    },
+    "completion_mode_family": {
+        "type": "string",
+        "enum": [family.value for family in CompletionModeFamily],
+        "description": (
+            "auto (Default) delivers successful results directly and uses an agent for other outcomes; "
+            "default (Agent, legacy wire value) always uses agent handling; "
+            "direct delivers every outcome without an agent turn."
+        ),
+    },
+    "allow_silent_completion": {"type": "boolean"},
+    "on_finish_instructions": {
+        "type": ["string", "null"],
+        "maxLength": 8000,
+        "description": "Optional Agent handling instructions. With auto (Default), they run only for non-success outcomes. No extra permissions. Null clears on update.",
+    },
+}
+
 
 CREATE_TASK_TOOL = ToolDefinition(
     name="create_task",
@@ -417,6 +456,7 @@ CREATE_TASK_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "title": {
                 "type": "string",
                 "description": "Short task title (shown in task board).",
@@ -444,8 +484,7 @@ CREATE_TASK_TOOL = ToolDefinition(
             "workflow_id": {
                 "type": "string",
                 "description": (
-                    "Optional workflow template ID. If omitted, the system "
-                    "auto-selects based on the task description."
+                    "Optional workflow template ID. If omitted, uses system:general-task."
                 ),
             },
             "project_id": {
@@ -492,6 +531,7 @@ CREATE_TASK_TOOL = ToolDefinition(
                     "Prefer plain English strings for policy entries."
                 ),
             },
+            **TASK_OUTCOME_PROPERTIES,
         },
         "required": ["title", "description"],
     },
@@ -604,7 +644,8 @@ UPDATE_TASK_TOOL = ToolDefinition(
     name="update_task",
     description=(
         "Update a task that has not yet started executing (draft or queued). "
-        "Can modify title, description, priority, or workflow."
+        "Can modify title, description, priority, workflow, delivery destination, or finish instructions. "
+        "Omitted fields preserve existing values; nullable fields can be cleared with null."
     ),
     parameters={
         "type": "object",
@@ -648,6 +689,7 @@ UPDATE_TASK_TOOL = ToolDefinition(
                 "maximum": 86400,
                 "description": "Optional timeout override in seconds. Null clears it to inherit the agent/global timeout.",
             },
+            **TASK_OUTCOME_PROPERTIES,
         },
         "required": ["task_id"],
     },
@@ -687,7 +729,7 @@ def _task_control_mutation_tool(
         "expected_attempt": {
             "type": "integer",
             "minimum": 1,
-            "description": "Current task attempt from refreshed control context.",
+            "description": "Current task attempt from get_task or refreshed task-control context.",
         },
     }
     properties.update(extra_properties or {})
@@ -732,7 +774,8 @@ RESUME_TASK_TOOL = _task_control_mutation_tool(
 )
 REQUEST_TASK_REVISION_TOOL = _task_control_mutation_tool(
     "request_task_revision",
-    "Request an in-place task revision from an optional workflow step.",
+    "Request an in-place task revision from an optional workflow step. Available in the owner's "
+    "primary chat or the task-control chat. Use get_task first for expected_attempt.",
     extra_properties={
         "instruction": {"type": "string", "minLength": 1},
         "target_step": {"type": "string"},
@@ -959,12 +1002,8 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
         "delegate result or a structured workflow task. Target agent IDs must be "
         "primary/user agents; use delegate() for system specialist agents (`system:*`) "
         "available in this agent session. Not available in tasks. "
-        "Treat the new conversation as an isolated context. For substantial work, "
-        "initial_message should include a proportional contract: objective, confirmed "
-        "context/references, scope and non-goals, acceptance/verification, and required "
-        "return status/evidence. The contract may define any assignment convention that "
-        "fits the configured agent and skills. Do not force rediscovery of known context. "
-        "Use exact references in a compact contract; never pass the parent transcript. "
+        "The new conversation does not inherit parent history; initial_message and "
+        "attached artifacts supply its brief. "
         "With wait=false, this is "
         "fire-and-follow-up: after starting the managed turn, do "
         "not continue the same scoped work in parallel; finish the parent turn unless "
@@ -986,22 +1025,39 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "agent_id": {"type": "string", "description": "Target agent ID."},
             "agent_profile_id": {
                 "type": "string",
                 "description": (
-                    "Optional runtime profile ID for the target agent. If omitted, the "
-                    "managed conversation uses the target agent default profile and does "
-                    "not inherit the controller conversation profile. Eligible profile IDs "
+                    "Optional explicit runtime profile ID for the target agent; overrides "
+                    "agent_profile_mode. If omitted, startup selection follows the target "
+                    "agent's Auto/Default setting, never the controller's profile. Eligible profile IDs "
                     "and descriptions are included in the dynamic target catalog."
+                ),
+            },
+            "agent_profile_mode": {
+                "type": "string",
+                "enum": ["auto", "default"],
+                "description": (
+                    "Startup selection policy. Omission follows the target agent: Auto when "
+                    "enabled, otherwise its configured default. Auto uses only agent-selectable "
+                    "profiles and keeps the default unless sufficiently confident. Default "
+                    "skips classification. An explicit agent_profile_id wins."
                 ),
             },
             "title": {"type": "string", "description": "Conversation title."},
             "initial_message": {
                 "type": "string",
+                "description": "Self-contained first brief for this new managed conversation.",
+            },
+            "project_id": {
+                "type": "string",
                 "description": (
-                    "First instruction and full relevant task contract for this new "
-                    "managed conversation."
+                    "Optional project the work belongs to, from list_projects. Omit to use this "
+                    "conversation's project, or the target agent's default project when this "
+                    "conversation has none. Set it when the work clearly belongs to another "
+                    "project than those."
                 ),
             },
             "artifact_ids": {
@@ -1036,7 +1092,9 @@ AGENT_CONVERSATION_CREATE_TOOL = ToolDefinition(
 AGENT_CONVERSATION_CREATE_CHANNEL_TOOL = ToolDefinition(
     name="agent_conversation_create_channel",
     description=(
-        "Create a managed external-channel conversation for one opaque observed target. "
+        "Create a sender-owned managed channel conversation for one opaque observed target, "
+        "including Cognis app users. Native recipients see the exchange in normal app chat, "
+        "without access to the sender's execution session. Prefer this when feedback is useful. "
         "The objective, target identity, expiry, and tool allowlist are immutable. "
         "expires_at must be in the future and no more than 30 days away. "
         "agent_conversation_send_controller and agent_conversation_complete are added "
@@ -1053,6 +1111,9 @@ AGENT_CONVERSATION_CREATE_CHANNEL_TOOL = ToolDefinition(
                 "type": "string",
                 "maxLength": MANAGED_CHANNEL_OBJECTIVE_MAX_CHARS,
             },
+            "agent_profile_mode": dict(
+                AGENT_CONVERSATION_CREATE_TOOL.parameters["properties"]["agent_profile_mode"]
+            ),
             "initial_message": {"type": "string"},
             "artifact_ids": {
                 "type": "array",
@@ -1111,6 +1172,7 @@ AGENT_CONVERSATION_SEND_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
             "message": {
                 "type": "string",
@@ -1242,7 +1304,7 @@ AGENT_CONVERSATION_FORK_TOOL = ToolDefinition(
         "Use this only for an independent branch requiring inherited context. Start "
         "initial independent review fresh; use agent_conversation_send for compatible "
         "re-review when retained investigative context remains materially useful. Start "
-        "re-review fresh with a compact review contract when that context is not useful. "
+        "re-review fresh when that context is not useful. "
         "Use agent_conversation_send for same-problem continuation, handoff, or correction. "
         "Create a fresh isolated child when role, responsibility, tool/authority scope, "
         "or output contract changes."
@@ -1250,6 +1312,7 @@ AGENT_CONVERSATION_FORK_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "conversation_id": {"type": "string", "description": "Agent work conversation ID."},
             "message": {"type": "string", "description": "Optional first message in the fork."},
             "wait": {"type": "boolean", "default": False},
@@ -1466,11 +1529,8 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
         "delegate result or a structured workflow task. Target agent IDs must be "
         "primary/user agents; use delegate() for system specialist agents (`system:*`) "
         "available in this agent session. On restricted task surfaces, the child is linked "
-        "to the active step. The contract must include the objective, confirmed context "
-        "and exact references, scope and non-goals, acceptance and verification, and "
-        "return status and evidence. It may use any assignment convention that fits the "
-        "configured agent and skills. "
-        "Use a compact contract and never pass the parent transcript. The started "
+        "to the active step. The new conversation does not inherit parent history; "
+        "initial_message and attached artifacts supply its brief. The started "
         "managed turn is joined before returning."
     ),
     "agent_conversation_send": (
@@ -1495,7 +1555,7 @@ _SYNC_MANAGED_CONVERSATION_DESCRIPTIONS = {
         "an initial independent review, ordinary handoff, correction, or review. Start "
         "initial independent review fresh; use agent_conversation_send for compatible "
         "re-review when retained investigative context remains materially useful. Start "
-        "re-review fresh with a compact review contract when that context is not useful. "
+        "re-review fresh when that context is not useful. "
         "On this conversation surface, a started managed turn in the fork is joined before "
         "returning."
     ),
@@ -1596,8 +1656,10 @@ GET_WORKFLOW_TOOL = ToolDefinition(
 
 _WORKFLOW_STEPS_DESCRIPTION = (
     "Workflow step definitions. Existing run/gate definitions remain supported. Deterministic "
-    "steps use type tool_call, condition, or complete and exactly one same-named config. They may "
-    "use when, on_skip, on_error, and next, but cannot use agent, input, completion, review, "
+    "steps use type tool_call, program, condition, or complete and exactly one same-named config. "
+    "Program source is literal and never rendered; pass workflow data through typed inputs. "
+    "Program code remains a versioned candidate until an owner reviews and accepts it. Deterministic "
+    "steps may use when, on_skip, on_error, and next, but cannot use agent, input, completion, review, "
     "question, or outcome-route fields. Expressions are constrained Jinja and must produce strict "
     "booleans. Named targets must exist and deterministic jump cycles are rejected. Run steps "
     "can compose a concise contract with objective, responsibilities, and defer_to. Example: "
@@ -1612,7 +1674,7 @@ _WORKFLOW_STEP_AUTHORING_SCHEMA = {
         "name": {"type": "string", "minLength": 1},
         "type": {
             "type": "string",
-            "enum": ["run", "gate", "tool_call", "condition", "complete"],
+            "enum": ["run", "gate", "tool_call", "program", "condition", "complete"],
         },
         "description": {"type": "string"},
         "prompt": {"type": "string"},
@@ -1673,6 +1735,54 @@ _WORKFLOW_STEP_AUTHORING_SCHEMA = {
                 "redact_args": {"type": "array", "items": {"type": "string"}},
             },
             "required": ["tool"],
+            "additionalProperties": False,
+        },
+        "program": {
+            "type": "object",
+            "properties": {
+                "language": {"type": "string", "const": "python"},
+                "description": {"type": "string", "minLength": 1},
+                "code": {"type": "string", "minLength": 1},
+                "inputs": {"type": "object"},
+                "input_schema": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {"type": {"const": "object"}},
+                    "description": "JSON Schema for the separately rendered inputs object.",
+                },
+                "output_schema": {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {"type": {"const": "object"}},
+                    "description": "JSON Schema for the single emitted object.",
+                },
+                "tools": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "pattern": "^(builtin|controller|mcp|skill):.+$",
+                    },
+                    "uniqueItems": True,
+                    "description": "Explicit allowlist of canonical tool IDs.",
+                },
+                "limits": {
+                    "type": "object",
+                    "properties": {
+                        "wall_seconds": {"type": "integer", "minimum": 1},
+                        "max_calls": {"type": "integer", "minimum": 1},
+                        "concurrency": {"type": "integer", "minimum": 1},
+                        "output_bytes": {"type": "integer", "minimum": 1},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "required": [
+                "description",
+                "code",
+                "input_schema",
+                "output_schema",
+                "tools",
+            ],
             "additionalProperties": False,
         },
         "condition": {
@@ -1860,6 +1970,7 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
     parameters={
         "type": "object",
         "properties": {
+            **FEEDBACK_CHILD_PROPERTIES,
             "intent": {"type": "string", "description": "Distilled statement of the user's goal."},
             "context": {
                 "type": "string",
@@ -1922,6 +2033,7 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                             "latest_active_for_agent",
                             "specific_conversation",
                             "silent",
+                            "in_app_notifications",
                         ],
                         "description": (
                             "Use same_conversation for work tied to this chat, "
@@ -1929,8 +2041,15 @@ COMPOSE_AND_RUN_WORKFLOW_TOOL = ToolDefinition(
                         ),
                     },
                     "target": {"type": "string"},
-                    "completion_mode_family": {"type": "string", "enum": ["default", "direct"]},
+                    "completion_mode_family": copy.deepcopy(
+                        TASK_OUTCOME_PROPERTIES["completion_mode_family"]
+                    ),
                     "allow_silent_completion": {"type": "boolean"},
+                    "on_finish_instructions": {
+                        "type": "string",
+                        "maxLength": 8000,
+                        "description": "Optional Agent handling instructions. With auto (Default), they run only for non-success outcomes. Not available with direct delivery; does not grant permissions.",
+                    },
                 },
             },
             "interaction_mode_override": {
@@ -1975,22 +2094,8 @@ _DELEGATE_SYNC_TOOL = _native_tool_with_input_schema(
     {
         "type": "object",
         "properties": {
-            "task": {
-                "type": "string",
-                "description": "Clear description of what the sub-session should do.",
-            },
-            "agent_id": {
-                "type": "string",
-                "description": "Required eligible secondary specialist ID.",
-            },
-            "context": {
-                "type": "string",
-                "description": "Background context the sub-session needs.",
-            },
-            "expected_output": {
-                "type": "string",
-                "description": "What the result should look like.",
-            },
+            name: copy.deepcopy(DELEGATE_TOOL.parameters["properties"][name])
+            for name in ("task", "agent_id", "context", "expected_output")
         },
         "required": ["task", "agent_id"],
     },
@@ -2000,7 +2105,9 @@ _DELEGATE_SYNC_TOOL = _native_tool_with_input_schema(
         "executes the task and returns its output directly as the tool result. "
         "Use for focused sub-tasks within a workflow step. Multiple delegates "
         "can run in parallel via parallel tool calls. Target an eligible secondary "
-        "specialist from the dynamic catalog."
+        "specialist from the dynamic catalog. The child receives task, context, "
+        "and expected_output, not the parent conversation; use these fields as "
+        "one brief without repeating information."
     ),
 )
 
@@ -2179,6 +2286,7 @@ async def handle_delegate_tool_call(
     wait: bool | None = None,
     workspace_root: str | None = None,
     working_directory: str | None = None,
+    creation_participant: SessionCreationParticipant | None = None,
 ) -> tuple[ToolResult, SessionModel | None]:
     """Handle the delegate tool call — creates a child session.
 
@@ -2258,12 +2366,27 @@ async def handle_delegate_tool_call(
                 task_description=args.get("task", ""),
                 agent_id=target_agent_id,
                 effective_agent_id=target_agent_id,
+                parent_agent=agent,
                 agent_profile_id=child_agent_profile_id,
                 expected_output=args.get("expected_output"),
                 delegation_metadata=tool_call.runtime_metadata.get("delegate_lineage"),
+                **(
+                    {"session_id": tool_call.runtime_metadata["reserved_child_session_id"]}
+                    if tool_call.runtime_metadata.get("reserved_child_session_id")
+                    else {}
+                ),
                 workspace_root=workspace_root,
                 working_directory=working_directory,
+                **(
+                    {"creation_participant": creation_participant}
+                    if creation_participant is not None
+                    else {}
+                ),
             )
+            if tool_call.runtime_metadata.get("reserved_child_session_id"):
+                child_session = await session_manager.resolve_reserved_child_continuation(
+                    child_session
+                )
             return (
                 ToolResult(
                     output=json.dumps(
@@ -2291,6 +2414,18 @@ async def handle_delegate_tool_call(
                 child_session,
             )
         except Exception as exc:
+            from cognis.core.task_execution import StaleTaskExecutionOwner
+            from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+            from cognis.providers.guardrails.errors import IntarisDependencyError
+
+            if isinstance(
+                exc, (StaleTaskExecutionOwner, TaskRecoveryBlocked, IntarisDependencyError)
+            ):
+                raise
+            if tool_call.runtime_metadata.get("reserved_child_session_id"):
+                raise TaskRecoveryBlocked(
+                    "Delegation provisioning could not be reconciled; its reservation is retained."
+                ) from exc
             requested_agent_id = args.get("agent_id") or getattr(agent, "agent_id", "")
             if isinstance(exc, ValueError) and str(exc).startswith("Unknown agent:"):
                 error_code = "delegate_agent_not_found"

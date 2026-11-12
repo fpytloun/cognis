@@ -237,6 +237,19 @@ async def test_append_proxy_holds_exact_identity_and_forwards_bytes_and_auth():
             assert response.status_code == 200
             assert received[0].content == raw
             assert received[0].headers["authorization"] == "Bearer synthetic-test-token"
+            metadata = proxy.snapshot_request_metadata()
+            assert len(metadata) == 1
+            assert metadata[0] == {
+                "operation": "record_events",
+                "method": "POST",
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 8123,
+                "status_code": 200,
+                "duration_ms": metadata[0]["duration_ms"],
+            }
+            assert "synthetic" not in json.dumps(metadata)
+            assert "fixture-session" not in json.dumps(metadata)
     finally:
         await proxy.close()
 

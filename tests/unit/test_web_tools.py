@@ -900,7 +900,7 @@ class TestWebSearchHandler:
 
             await handle_web_search(
                 {
-                    "query": "Lovosice weather today forecast",
+                    "query": "DemoTown weather today forecast",
                     "backend": "tavily",
                     "search_depth": "advanced",
                     "topic": "general",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -12,6 +13,7 @@ from cognis.api.chat_v2 import work_graph, work_materializer, work_repository
 from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.event_store_refs import session_read_refs
 from cognis.api.chat_v2.schemas import (
+    AssistantDeliverableTimelineItem,
     ConversationStateView,
     ConversationSummary,
     QueueState,
@@ -29,6 +31,7 @@ from cognis.bootstrap import run_schema_bootstrap
 from cognis.providers.guardrails.events import EventStoreAuthority
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Conversation, Session, User
+from cognis.store.queries import create_conversation, create_deliverable
 from tests.unit.api.chat_v2.test_cached_event_store import (
     AUTHORITY,
     Delegate,
@@ -139,6 +142,62 @@ async def test_snapshot_overlay_always_removes_embedded_activity_overview(
     assert snapshot.activity_overview is None
 
 
+async def test_inline_documents_are_request_time_only_and_not_shared_from_cached_owner_data(
+    task_continuation_db,
+    monkeypatch,
+):
+    factory = task_continuation_db
+    async with factory() as session:
+        await create_conversation(
+            session,
+            "owner@example.com",
+            "agent-owner",
+            "agent_direct",
+            conversation_id="conversation-a",
+        )
+        await create_deliverable(
+            session,
+            conversation_id="conversation-a",
+            deliverable_id="dlv_cached",
+            content="Owner render body",
+            artifact_store=factory.artifact_store,
+        )
+        await session.commit()
+    clock = FakeClock()
+    bound = make_cache(Delegate(), FakeRedis(clock), clock).bind(AUTHORITY)
+    context = replace(_context(bound, "session-a"), owner_email="owner@example.com")
+    base = await build_test_snapshot(bound)
+    base.timeline.items = [
+        AssistantDeliverableTimelineItem(
+            id="assistant-deliverable:dlv_cached",
+            sort_key="0001",
+            deliverable_id="dlv_cached",
+            format="markdown",
+            stable=True,
+        )
+    ]
+    monkeypatch.setattr(
+        coordinator,
+        "_hydrate_snapshot_attachments",
+        AsyncMock(side_effect=lambda app, snapshot, **kwargs: snapshot),
+    )
+    app = SimpleNamespace(
+        state=SimpleNamespace(
+            session_factory=factory,
+            artifact_store=factory.artifact_store,
+        )
+    )
+    owner = await coordinator._apply_mutable_snapshot_overlay(app, base, context)
+    assert owner.timeline.items[0].deliverable.content == "Owner render body"
+    assert base.timeline.items[0].deliverable is None
+    shared = await coordinator._apply_mutable_snapshot_overlay(
+        app,
+        base,
+        replace(context, shared_reader=True),
+    )
+    assert shared.timeline.items[0].deliverable is None
+
+
 @pytest.mark.anyio
 async def test_session_read_refs_batches_database_authority_resolution() -> None:
     active_sessions = 0
@@ -183,6 +242,7 @@ async def test_session_read_refs_batches_database_authority_resolution() -> None
             agent_id=f"agent-{suffix}",
             status="active",
             completion_reason=None,
+            previous_session_id=None,
         )
         for suffix in ("a", "b")
     ]
@@ -499,7 +559,8 @@ async def test_lineage_change_during_build_restarts_with_fresh_context(
         async def get_or_build_result(self, *, build, **_kwargs):
             return SnapshotCacheResult(await build(), "build")
 
-    async def build_immutable(context):
+    async def build_immutable(context, *, initial_read_window=None):
+        assert initial_read_window is None
         builds.append(context.session_refs[0].session_id)
         return base
 

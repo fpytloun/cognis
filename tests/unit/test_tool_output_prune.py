@@ -2,11 +2,7 @@
 
 from __future__ import annotations
 
-from cognis.core.context_projection import (
-    PROJECTION_RENDERING_POLICY_VERSION,
-    PressureMode,
-    project_messages,
-)
+from cognis.core.context_projection import project_messages, projection_decisions_from_diff
 from cognis.core.tool_output_prune import (
     PRUNE_PROTECT,
     PRUNE_PROTECTED_TOOL_NAMES,
@@ -141,46 +137,44 @@ def test_cleared_marker_includes_call_id_recovery_hint() -> None:
     assert "cleared" in text.lower()
 
 
-def test_events_to_messages_replays_a_durable_tool_result_projection() -> None:
-    """Pruned tool results render as the clearance marker, not their content."""
+def test_events_to_messages_substitutes_clearance_marker_for_pruned_ids() -> None:
+    """Accepted projections replay their recovery marker from canonical events."""
 
     from cognis.core.context import events_to_messages
 
     events = [
         {
+            "seq": 1,
             "type": "tool_call",
             "data": {"name": "read", "call_id": "old-1", "arguments": {"file_path": "a.py"}},
         },
         {
+            "seq": 2,
             "type": "tool_result",
             "data": {
                 "call_id": "old-1",
                 "name": "read",
-                "result": "ORIGINAL CONTENT",
+                "result": "ORIGINAL CONTENT " * 100,
                 "has_full_output": True,
                 "recovery_call_id": "stored-old-1",
             },
         },
         {
+            "seq": 3,
             "type": "tool_call",
             "data": {"name": "read", "call_id": "fresh-1", "arguments": {"file_path": "b.py"}},
         },
         {
+            "seq": 4,
             "type": "tool_result",
             "data": {"call_id": "fresh-1", "name": "read", "result": "FRESH CONTENT"},
         },
     ]
 
+    original = events_to_messages(events)
+    projected = project_messages(original, pressure_mode="pressure", required_savings_tokens=1)
     messages = events_to_messages(
-        events,
-        projection_decisions={
-            "old-1": [
-                {
-                    "operation": "compact_result",
-                    "rendering_policy_version": PROJECTION_RENDERING_POLICY_VERSION,
-                }
-            ]
-        },
+        events, projection_decisions=projection_decisions_from_diff(original, projected.messages)
     )
 
     tool_messages = [m for m in messages if m.get("role") == "tool"]
@@ -193,63 +187,67 @@ def test_events_to_messages_replays_a_durable_tool_result_projection() -> None:
 
     # Untouched results must still render their original content.
     assert by_id["fresh-1"]["content"] == "FRESH CONTENT"
-    assert by_id["fresh-1"].get("_projected_compacted", False) is False
+    assert not by_id["fresh-1"].get("_projected_compacted")
 
 
-def test_unrecoverable_results_are_ineligible_and_replay_inline() -> None:
+def test_events_to_messages_keeps_unrecoverable_pruned_ids_inline() -> None:
     from cognis.core.context import events_to_messages
 
     events = [
         {
+            "seq": 1,
             "type": "tool_call",
             "data": {"name": "read", "call_id": "old-1", "arguments": {"file_path": "a.py"}},
         },
         {
+            "seq": 2,
             "type": "tool_result",
-            "data": {"call_id": "old-1", "name": "read", "result": "ORIGINAL CONTENT"},
+            "data": {"call_id": "old-1", "name": "read", "result": "ORIGINAL CONTENT " * 100},
         },
     ]
 
-    assert prune_candidate_from_event_data(events[1]["data"]) is None
-    messages = events_to_messages(events)
+    original = events_to_messages(events)
+    projected = project_messages(original, pressure_mode="pressure", required_savings_tokens=1)
+    messages = events_to_messages(
+        events, projection_decisions=projection_decisions_from_diff(original, projected.messages)
+    )
     tool_message = next(message for message in messages if message.get("role") == "tool")
 
-    assert tool_message["content"] == "ORIGINAL CONTENT"
-    assert tool_message.get("_projected_compacted", False) is False
+    assert tool_message["content"] == "ORIGINAL CONTENT " * 100
+    assert not tool_message.get("_projected_compacted")
 
 
-def test_replayed_protected_results_survive_critical_projection() -> None:
-    """Replay retains the protection consumed by the canonical projection policy."""
+def test_events_to_messages_respects_protect_from_pruning_flag() -> None:
+    """Protected recoverable output remains intact when projection needs savings."""
 
     from cognis.core.context import events_to_messages
 
     events = [
         {
+            "seq": 1,
             "type": "tool_call",
-            "data": {"name": "skill_load", "call_id": "skill-1", "arguments": {"skill_id": "s"}},
+            "data": {"name": "read", "call_id": "protected-1", "arguments": {"file_path": "a.py"}},
         },
         {
+            "seq": 2,
             "type": "tool_result",
             "data": {
-                "call_id": "skill-1",
-                "name": "skill_load",
-                "result": "PROTECTED CONTENT" * 1000,
+                "call_id": "protected-1",
+                "name": "read",
+                "result": "PROTECTED CONTENT " * 100,
+                "has_full_output": True,
+                "recovery_call_id": "stored-protected-1",
                 "protect_from_pruning": True,
             },
         },
     ]
 
-    messages = events_to_messages(events)
-    protected = next(message for message in messages if message.get("role") == "tool")
-    assert protected["_protected_tool_output"] is True
-    messages = project_messages(
-        messages,
-        preserve_recent_completed_tool_groups=0,
-        pressure_mode=PressureMode.critical,
-        required_savings_tokens=100_000,
-        allow_unrecoverable_projection=True,
-    ).messages
+    original = events_to_messages(events)
+    projected = project_messages(original, pressure_mode="pressure", required_savings_tokens=1)
+    messages = events_to_messages(
+        events, projection_decisions=projection_decisions_from_diff(original, projected.messages)
+    )
     tool_message = next(m for m in messages if m.get("role") == "tool")
 
-    assert tool_message["content"] == "PROTECTED CONTENT" * 1000
-    assert tool_message.get("_projected_compacted", False) is False
+    assert tool_message["content"] == "PROTECTED CONTENT " * 100
+    assert not tool_message.get("_projected_compacted")

@@ -11,6 +11,7 @@ import httpx
 
 from cognis import json_codec as json
 from cognis.models.config import normalize_reasoning_level
+from cognis.providers.llm.usage_binding import UsageBinding
 
 CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models"
 CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses"
@@ -203,6 +204,7 @@ async def test_codex_responses(
     *,
     model: str,
     timeout: float = 15.0,
+    usage_binding: UsageBinding | None = None,
 ) -> None:
     """Make a minimal direct Codex Responses request for provider health checks.
 
@@ -219,14 +221,40 @@ async def test_codex_responses(
         "store": False,
         "stream": True,
     }
-    async with (
-        httpx.AsyncClient(timeout=timeout) as client,
-        client.stream("POST", CODEX_RESPONSES_URL, headers=auth.headers, json=payload) as response,
-    ):
-        response.raise_for_status()
-        async for line in response.aiter_lines():
-            if line.strip():
-                return
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        attempt = (
+            usage_binding.begin(
+                operation="responses",
+                streaming=True,
+                parameters=payload,
+                semantic_profile="openai",
+            )
+            if usage_binding is not None
+            else None
+        )
+        try:
+            async with client.stream(
+                "POST",
+                CODEX_RESPONSES_URL,
+                headers=auth.headers,
+                json=payload,
+            ) as response:
+                if attempt is not None:
+                    attempt.observe({"response_headers": response.headers}, generated=False)
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if line.strip():
+                        # The probe deliberately closes before generation completes.
+                        if attempt is not None:
+                            attempt.finish(outcome="cancelled")
+                        return
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.finish(error=exc)
+            raise
+        finally:
+            if attempt is not None:
+                attempt.finish(outcome="unknown")
     raise RuntimeError("Codex Responses health check returned an empty stream")
 
 

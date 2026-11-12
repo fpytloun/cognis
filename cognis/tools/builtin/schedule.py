@@ -28,7 +28,7 @@ from cognis.models.tool import (
     ToolSource,
     ToolValueSemantics,
 )
-from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy
+from cognis.models.workflow import CompletionDeliveryPolicy, CompletionModeFamily, SessionPolicy
 from cognis.store.queries import (
     count_active_tasks_for_schedule,
     create_schedule,
@@ -155,6 +155,7 @@ _BASE_SCHEMA: dict[str, Any] = {
                 "preferred_channel",
                 "latest_active_for_agent",
                 "specific_conversation",
+                "in_app_notifications",
             ],
             "description": (
                 "How task results are delivered. "
@@ -176,11 +177,12 @@ _BASE_SCHEMA: dict[str, Any] = {
         },
         "completion_mode_family": {
             "type": "string",
-            "enum": ["default", "direct"],
+            "enum": [family.value for family in CompletionModeFamily],
             "description": (
-                "How successful task completion is delivered. 'default' uses the normal "
-                "follow-up flow. 'direct' sends the final assistant message directly to the "
-                "resolved target channel."
+                "'auto' (Default) uses Direct on success and Agent otherwise. "
+                "'default' (Agent, legacy wire value) uses agent handling for every outcome. "
+                "'direct' notifies without an agent turn, "
+                "including on failure or cancellation. in_app_notifications requires direct."
             ),
         },
         "allow_silent_completion": {
@@ -189,6 +191,11 @@ _BASE_SCHEMA: dict[str, Any] = {
                 "If true, the agent may complete silently when the work succeeded and there is "
                 "nothing user-actionable to report."
             ),
+        },
+        "on_finish_instructions": {
+            "type": ["string", "null"],
+            "maxLength": 8000,
+            "description": "Optional Agent instructions, including bounded failure recovery. With auto (Default), they run only for non-success outcomes. Not available with direct delivery. Null clears on update.",
         },
         "max_concurrent_runs": {
             "type": "integer",
@@ -311,6 +318,7 @@ _DEFINITION_FIELDS = (
     "expected_output",
     "completion_mode_family",
     "allow_silent_completion",
+    "on_finish_instructions",
     "max_concurrent_runs",
     "delete_after_run",
     "retry_failed_tasks",
@@ -432,8 +440,13 @@ MANAGE_SCHEDULES_TOOL = ToolDefinition(
 _TOOL_NAMES = {"manage_schedules"}
 _ACTIONS = ("list", "get", "create", "update", "delete", "trigger", "status")
 _SCHEDULE_TYPES = ("cron", "interval", "one_shot")
-_DELIVERY_MODES = ("preferred_channel", "latest_active_for_agent", "specific_conversation")
-_COMPLETION_MODE_FAMILIES = ("default", "direct")
+_DELIVERY_MODES = (
+    "preferred_channel",
+    "latest_active_for_agent",
+    "specific_conversation",
+    "in_app_notifications",
+)
+_COMPLETION_MODE_FAMILIES = tuple(family.value for family in CompletionModeFamily)
 _INTERACTION_MODE_OVERRIDES = ("none", "explicit_gates", "step_requests")
 
 
@@ -674,8 +687,9 @@ async def _handle_create(
             delete_after_run=arguments.get("delete_after_run", False),
             retry_failed_tasks=arguments.get("retry_failed_tasks", False),
             fail_paused_task_on_next_fire=arguments.get("fail_paused_task_on_next_fire", True),
-            completion_mode_family=arguments.get("completion_mode_family", "default"),
+            completion_mode_family=arguments.get("completion_mode_family", "auto"),
             allow_silent_completion=arguments.get("allow_silent_completion", False),
+            on_finish_instructions=arguments.get("on_finish_instructions"),
             interaction_mode_override=arguments.get("interaction_mode_override", "none"),
             next_fire_at=next_fire,
             created_by=user_email,
@@ -736,9 +750,13 @@ async def _handle_update(
             "fail_paused_task_on_next_fire",
             "completion_mode_family",
             "allow_silent_completion",
+            "on_finish_instructions",
             "interaction_mode_override",
         ):
-            if key == "agent_profile_id":
+            if key == "on_finish_instructions":
+                if key in arguments:
+                    fields[key] = arguments[key]
+            elif key == "agent_profile_id":
                 if key in arguments:
                     try:
                         fields[key] = normalize_agent_profile_id(arguments[key])
@@ -944,6 +962,7 @@ def _row_to_model(row: Any) -> ScheduleModel:
         completion_delivery=CompletionDeliveryPolicy(
             completion_mode_family=getattr(row, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+            on_finish_instructions=getattr(row, "on_finish_instructions", None),
         ),
         session_policy=SessionPolicy.model_validate(
             (row.task_template or {}).get("session_policy") or {}
@@ -997,6 +1016,7 @@ def _schedule_definition_payload(row: Any, *, active_tasks: int | None = None) -
         "delivery": _redact_sensitive(delivery),
         "completion_mode_family": getattr(row, "completion_mode_family", "default"),
         "allow_silent_completion": bool(getattr(row, "allow_silent_completion", False)),
+        "on_finish_instructions": getattr(row, "on_finish_instructions", None),
         "enabled": row.enabled,
         "max_concurrent_runs": row.max_concurrent_runs,
         "delete_after_run": row.delete_after_run,

@@ -403,7 +403,7 @@ async def test_kb_image_discovery_inference_and_hydration_agree(
             return image.getvalue(), "image/jpeg"
 
         async def async_get_public_url(self, *args, **kwargs):
-            return "https://cognis.example.com/authorized-image"
+            return "https://cognis.fpy.cz/authorized-image"
 
     class VisionModel:
         async def get_model_info(self, *args, **kwargs):
@@ -507,7 +507,7 @@ async def test_kb_image_discovery_inference_and_hydration_agree(
                     {
                         "type": "image_url",
                         "image_url": {
-                            "url": "https://cognis.example.com/authorized-image",
+                            "url": "https://cognis.fpy.cz/authorized-image",
                             "cognis_artifact": attachment,
                         },
                     }

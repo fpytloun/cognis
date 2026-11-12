@@ -1668,7 +1668,7 @@ async def test_context_assembler_skips_disabled_artifact_urls() -> None:
         max_context_tokens=4096,
         compaction_threshold=0.85,
     )
-    blocked_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
 
     result = await assembler.assemble(
         session=_session(),
@@ -1696,7 +1696,7 @@ async def test_context_assembler_skips_disabled_artifact_urls() -> None:
 @pytest.mark.asyncio
 async def test_context_assembler_skips_disabled_artifact_urls_from_history() -> None:
     cache = _SessionCache()
-    blocked_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    blocked_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
     cache.history_events = [
         {
             "type": "user_message",
@@ -2006,7 +2006,7 @@ async def test_context_assembler_prioritizes_current_attachments_over_bounded_hi
 @pytest.mark.asyncio
 async def test_context_assembler_skips_disabled_artifact_ids_from_history() -> None:
     cache = _SessionCache()
-    artifact_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
     cache.history_events = [
         {
             "type": "user_message",
@@ -2059,7 +2059,7 @@ async def test_context_assembler_skips_disabled_artifact_ids_from_current_turn()
         max_context_tokens=4096,
         compaction_threshold=0.85,
     )
-    artifact_url = "https://cognis.example.com/api/v1/artifacts/content/documents/doc_1/report.pdf"
+    artifact_url = "https://cognis.fpy.cz/api/v1/artifacts/content/documents/doc_1/report.pdf"
 
     result = await assembler.assemble(
         session=_session(),
@@ -2468,6 +2468,100 @@ async def test_context_assembler_degrades_on_mnemory_failure() -> None:
         for m in result.messages
     )
     assert not mutable_search_block_present
+
+
+@pytest.mark.asyncio
+async def test_intaris_status_overlaps_identity_but_recall_uses_adopted_memory_session() -> None:
+    status_started = asyncio.Event()
+    identity_finished = asyncio.Event()
+
+    class Memory(_Memory):
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            await status_started.wait()
+            result = await super().load_session_identity(**kwargs)
+            identity_finished.set()
+            return result
+
+        async def recall(self, **kwargs: object) -> dict[str, object]:
+            assert identity_finished.is_set()
+            assert kwargs["session_id"] == "mem-1"
+            return await super().recall(**kwargs)
+
+    class Guardrails(_Guardrails):
+        async def get_session(self, session_id: str) -> object:
+            status_started.set()
+            return await super().get_session(session_id)
+
+    memory = Memory()
+    assembler = ContextAssembler(
+        memory=memory,
+        guardrails=Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(cold=True),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    result = await asyncio.wait_for(
+        assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="hello",
+            tool_definitions=[],
+        ),
+        3,
+    )
+    assert memory.recall_calls
+    assert "prefers Python" in str(result.messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_cancelled_context_preparation_joins_prefix_and_status_reads() -> None:
+    identity_started, status_started = asyncio.Event(), asyncio.Event()
+    identity_stopped, status_stopped = asyncio.Event(), asyncio.Event()
+    release = asyncio.Event()
+
+    class Memory(_Memory):
+        async def load_session_identity(self, **kwargs: object) -> dict[str, object]:
+            identity_started.set()
+            try:
+                await release.wait()
+                return {}
+            finally:
+                identity_stopped.set()
+
+    class Guardrails(_Guardrails):
+        async def get_session(self, session_id: str) -> object:
+            status_started.set()
+            try:
+                await release.wait()
+                return None
+            finally:
+                status_stopped.set()
+
+    assembler = ContextAssembler(
+        memory=Memory(),
+        guardrails=Guardrails(),
+        llm=_LLM(),
+        session_cache=_SessionCache(cold=True),
+        session_manager=_SessionManager(),
+        compaction_threshold=0.85,
+    )
+    pending = asyncio.create_task(
+        assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="hello",
+            tool_definitions=[],
+        )
+    )
+    await asyncio.wait_for(asyncio.gather(identity_started.wait(), status_started.wait()), 3)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert identity_stopped.is_set()
+    assert status_stopped.is_set()
 
 
 @pytest.mark.asyncio
@@ -3556,9 +3650,7 @@ async def test_context_assembler_appends_executor_pool_tail_reminder() -> None:
     contents = [str(message.get("content", "")) for message in result.messages]
     reminder = next(content for content in contents if "Assigned executors" in content)
     assert "Use primary executors for normal work" in reminder
-    assert "do not use them as fallback capacity" in reminder
-    assert "only when the task explicitly requires that specific machine" in reminder
-    assert "switch back to a primary executor before unrelated or generic" in reminder
+    assert "not fallback capacity" in reminder
 
 
 @pytest.mark.asyncio
@@ -3914,9 +4006,7 @@ async def test_context_assembler_consolidates_immutable_prefix_into_first_messag
     assert "<skills_guidance>" in content
     assert "skill_write" not in content
     assert "<critical_rules>" in content
-    assert "If the task names a skill" in content
-    assert "Skills are managed exclusively through Cognis-provided skill tools" in content
-    assert "not filesystem SKILL.md files or other filesystem skill manifests" in content
+    assert "managed only through Cognis skill tools" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "Mutable recalled memory" not in content
@@ -3958,10 +4048,7 @@ async def test_context_assembler_mentions_skill_write_only_when_visible() -> Non
     content = str(result.messages[0]["content"])
     assert "<skills_guidance>" in content
     assert "skill_write" in content
-    assert "Use skill_write to create or update skills for future use" in content
-    assert "task reveals reusable workflow, tool, safety, or style guidance" in content
-    assert "use skill_asset_write for reusable references, templates, or scripts" in content
-    assert "do not create SKILL.md files instead" in content
+    assert "skill_asset_write" in content
 
 
 @pytest.mark.asyncio
@@ -3990,8 +4077,7 @@ async def test_context_assembler_includes_auto_loaded_skill_context() -> None:
     assert "<loaded_skills>" in content
     assert "<loaded_skill>" in content
     assert "Use careful implementation discipline." in content
-    assert "is not already marked as loaded" in content
-    assert "unless the skill is already marked as loaded" in content
+    assert "not already loaded" in content
 
 
 @pytest.mark.asyncio
@@ -4028,11 +4114,7 @@ async def test_context_assembler_skip_memory_path_uses_consolidated_immutable_pr
     assert "Release Helper" in content
     assert "<skills_guidance>" in content
     assert "<critical_rules>" in content
-    assert "If the task names a skill" in content
-    assert "Skills are managed exclusively through Cognis-provided skill tools" in content
-    assert "task teaches a durable reusable procedure" in content
-    assert "Prefer updating an existing relevant skill over creating a new one" in content
-    assert "recurring class-level workflows" in content
+    assert "managed only through Cognis skill tools" in content
     assert "This is a continuation from a previous session." in content
     assert "<continuation_summary>" in content
     assert "<memory_instructions>" not in content
@@ -4203,7 +4285,7 @@ async def test_context_assembler_renders_follow_up_boundary_and_active_block() -
     contents = [str(message.get("content", "")) for message in result.messages]
     assert any("historical conversation context" in content for content in contents)
     assert any('<follow_up_event mode="notify"' in content for content in contents)
-    assert any("system-initiated follow-up" in content for content in contents)
+    assert any("## Follow-up notification" in content for content in contents)
     assert all(message.get("content") != "" for message in result.messages)
 
 
@@ -4252,12 +4334,12 @@ async def test_context_assembler_keeps_follow_up_data_out_of_immutable_prefix() 
     )
     assert "Implement auth" not in immutable_contents
     assert "Refresh token support implemented." not in immutable_contents
-    assert "follow-up result" not in immutable_contents
+    assert "## Follow-up integration" not in immutable_contents
 
     suffix_contents = "\n".join(
         str(message.get("content", "")) for message in result.messages[breakpoint + 1 :]
     )
-    assert "follow-up result" in suffix_contents
+    assert "## Follow-up integration" in suffix_contents
 
 
 def test_follow_up_prompt_guidance_is_suffix_only() -> None:
@@ -4266,10 +4348,11 @@ def test_follow_up_prompt_guidance_is_suffix_only() -> None:
 
     assert integrate_prefix == notify_prefix
     assert integrate_prefix is not None
-    assert "follow-up result" not in integrate_prefix
-    assert "system-initiated follow-up" not in integrate_prefix
-    assert "follow-up result" in (build_follow_up_guidance(PromptContext.FOLLOW_UP_INTEGRATE) or "")
-    assert "system-initiated follow-up" in (
+    assert "## Follow-up" not in integrate_prefix
+    assert "## Follow-up integration" in (
+        build_follow_up_guidance(PromptContext.FOLLOW_UP_INTEGRATE) or ""
+    )
+    assert "## Follow-up notification" in (
         build_follow_up_guidance(PromptContext.FOLLOW_UP_NOTIFY) or ""
     )
 

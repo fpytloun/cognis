@@ -41,7 +41,7 @@ from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
 def scope(*, origin="owner_configured", creator=None, rendered=None):
-    args = rendered or {"command": "printf %s café", "target_executor": "fixture-executor"}
+    args = rendered or {"command": "printf %s café", "target_executor": "sample-desktop"}
     step = StepDefinition(
         name="inspect",
         type="tool_call",
@@ -76,7 +76,7 @@ def declaration(binding=None, **overrides):
         "call_id": "call_scope",
         "tool": "bash",
         "args": {"command": "printf %s café"},
-        "executor_id": "fixture-executor",
+        "executor_id": "sample-desktop",
     }
     return (binding or scope()).declaration(**(args | overrides))
 
@@ -326,7 +326,7 @@ async def test_router_declares_final_arguments_and_never_dispatches_on_failure(f
     )
     executor = MagicMock()
     executor.tool_execute = AsyncMock(return_value=ToolResult(output="ok"))
-    executor.executor_id = "fixture-executor"
+    executor.executor_id = "sample-desktop"
     agent = AgentDefinition(
         agent_id="agent_scope",
         name="Scope",
@@ -346,7 +346,7 @@ async def test_router_declares_final_arguments_and_never_dispatches_on_failure(f
         registry=registry,
         executor=executor,
         workflow_step_scope=scope(),
-        workflow_executor_id="fixture-executor",
+        workflow_executor_id="sample-desktop",
     )
     guardrails.declare_workflow_step.assert_awaited_once()
     sent = guardrails.declare_workflow_step.call_args.args[0]

@@ -5,27 +5,26 @@ from __future__ import annotations
 _SAFETY = """
 # Access and safety
 
-- These tools are default-off. They require explicit agent tool opt-in and a root
-  owner primary chat. Tasks, delegated sessions, and participant chats are denied.
-- Discover the tool, then call `describe_tool` with its exact operation name before
-  mutations. Never guess resource IDs, schema fields, model names, or revisions.
-- Read first. Preserve unrelated configuration. Omitted fields preserve values;
-  config objects and arrays replace, rather than deep-merge.
-- Use validation-only `preview=true` where the operation supports it. Review the
-  proposed values and affected dependencies before applying the exact change.
-- Supply the precondition returned by the latest read where supported. A conflict requires a new
-  read and reassessment, not an automatic retry with a fresh revision.
-- Never put credentials, tokens, cookies, or private keys in arguments or prose.
-  Use authorized stored-secret references. Authentication and executor token
-  provisioning use secure user-facing flows.
-- Ask for explicit user confirmation before destructive operations, changing
-  security controls, disconnecting authentication, or affecting this chat's
-  provider/executor. Do not weaken policy to authorize yourself.
-- If a mutation times out or its result is uncertain, read the current resource
-  and reconcile before retrying. Create operations require explicit IDs.
-- After a mutation, read back durable state and relevant runtime status. Report
-  persisted, applied, pending, and failed states separately. Never equate a saved
-  configuration with successful remote initialization.
+- These tools are off by default: they need explicit agent opt-in and the
+  owner's root primary chat. Tasks, delegated sessions, and participant chats are
+  denied.
+- Call `describe_tool` with the exact operation before mutating. Never guess IDs,
+  fields, model names, or revisions.
+- Read first and preserve unrelated configuration. Omitted fields keep their
+  values; config objects and arrays replace rather than merge.
+- Use `preview=true` where supported and review affected dependencies before
+  applying. Pass the latest read's precondition; on conflict, re-read and
+  reassess instead of retrying with a fresh revision.
+- Never put credentials, tokens, cookies, or keys in arguments or prose. Use
+  stored-secret references and the secure authentication flows.
+- Ask the user before destructive operations, security-control changes,
+  disconnecting authentication, or changes to this chat's provider or executor.
+  Never weaken policy to authorize yourself.
+- After a timeout or uncertain result, read current state before retrying.
+  Create operations require explicit IDs.
+- After a mutation, read back durable and runtime state and report persisted,
+  applied, pending, and failed separately. Saved configuration does not prove
+  remote initialization succeeded.
 """
 
 
@@ -148,7 +147,7 @@ SYSTEM_MANAGEMENT_SKILLS = {
    availability, default status, desired/applied generations, runtime state,
    observed capabilities, browser configuration, and local-inference settings.
 2. For `create`, choose an explicit stable executor ID. Shared/local executors
-   require admin. Persistent token provisioning/rotation uses the secure UI;
+   require admin. Use `provision_token` for a reference, or the secure UI for manual rotation;
    never request or return executor token material in conversation history.
 3. Preview `update` before applying it. Config objects, enabled tools, groups,
    and labels replace their collections. Preserve unrelated entries.
@@ -159,6 +158,14 @@ SYSTEM_MANAGEMENT_SKILLS = {
    Use `reconfigure` to retry initialization, not to conceal an invalid config.
 6. `set_default` operates within ownership scope. Never delete the default
    executor or one with unresolved dependencies; no implicit cascading cleanup.
+7. To provision a private WebSocket executor, read `get`, then call
+   `provision_token` with that `expected_updated_at` and a stable `operation_id`.
+   It atomically rotates, encrypts and grants a caller-agent credential, returning
+   `token_ref`, never a token. Use an authorized executor tool's secure credential
+   input; do not interpolate references in shell commands or print resolved values.
+   After an uncertain outcome, repeat the same operation ID and original
+   precondition to reconcile pending fencing. A new operation ID rotates again.
+   Superseded/revoked operations fail closed. No Kubernetes provisioner is added.
 """,
     ),
     "cognis-mcp-manager": _skill(
@@ -173,6 +180,16 @@ SYSTEM_MANAGEMENT_SKILLS = {
    assignments, tool metadata, and visibility before making changes.
 2. Use stored credentials and documented secret references. Never paste tokens,
    passwords, headers, or executor registration tokens into tool arguments.
+   For an existing token, set `auth_config.type=credential_bearer`,
+   `credential_ref=$credential:<credential_id>.token`, and
+   `credential_agent_id=<current agent_id>`. Use discovered IDs and an HTTPS
+   endpoint, not templating or a copy into user secrets. The owner agent must have
+   the credential grant. Assign only private WebSocket executors of that owner.
+   Each call checks current grants, credential status and client generation.
+   After rotation, reconfigure the executor before retrying a stale client.
+   The executor must advertise `credential-bearer-v1` on its current connection;
+   `mcp_credential_executor_upgrade_required` means upgrade/reconnect it, not
+   substitute a raw header or broaden access.
 3. Preserve server ownership and deployment scope. Server commands run on assigned
    executors, not necessarily on the controller. Never broaden executor visibility
    or enable an integration without authorization.

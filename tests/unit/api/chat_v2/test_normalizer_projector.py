@@ -36,6 +36,130 @@ from cognis.api.chat_v2.schemas import (
 )
 
 
+@pytest.mark.parametrize("auto", [True, False])
+def test_compaction_copied_recaps_are_hidden_but_original_recaps_remain(auto: bool) -> None:
+    def recap(session_id: str, seq: int, *, copied: bool) -> RawSessionEvent:
+        return RawSessionEvent(
+            store_id="intaris",
+            session_id=session_id,
+            seq=seq,
+            type="lifecycle",
+            data={
+                "event": "conversation_recap",
+                "text": f"Summary {seq}",
+                "auto": auto,
+                "compaction_tail": copied,
+                "source_session_id": "previous-session" if copied else session_id,
+                "source_seq": seq,
+            },
+        )
+
+    original = normalize_session_events([recap("previous-session", 1262, copied=False)])
+    assert [item.kind for item in project_timeline(original.events).timeline.items] == ["recap"]
+    copied = normalize_session_events(
+        [recap("rotated-session", 70, copied=True), recap("rotated-session", 147, copied=True)]
+    )
+    assert copied.skipped_count == 2
+    assert project_timeline(copied.events).timeline.items == []
+    new = normalize_session_events([recap("rotated-session", 200, copied=False)])
+    assert [item.kind for item in project_timeline(new.events).timeline.items] == ["recap"]
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (
+            {"source": "controller_instruction", "private_controller_instruction": True},
+            {"private_controller_instruction": True},
+        ),
+        (
+            {
+                "ts": "2026-10-28T20:00:00Z",
+                "channel": "web",
+                "sender": "Remote participant",
+                "untrusted": True,
+                "private_payload": "must not be projected",
+            },
+            {
+                "ts": "2026-10-28T20:00:00Z",
+                "channel": "web",
+                "sender": "Remote participant",
+                "untrusted": True,
+            },
+        ),
+        (
+            {
+                "ts": "2026-10-28T20:00:00Z",
+                "feedback": {
+                    "submission_id": "fbsu_1",
+                    "manifest_hash": "a" * 64,
+                    "private_payload": "must not be projected",
+                },
+            },
+            {
+                "ts": "2026-10-28T20:00:00Z",
+                "feedback": {"submission_id": "fbsu_1", "manifest_hash": "a" * 64},
+            },
+        ),
+    ],
+)
+def test_message_provenance_survives_canonical_replay_without_arbitrary_metadata(
+    metadata: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    raw = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-channel-provenance",
+            seq=1,
+            type="user_message",
+            data={"content": "A message", "message_metadata": metadata},
+        )
+    ]
+    first = project_timeline(normalize_session_events(raw).events).timeline
+    replay = project_timeline(normalize_session_events(raw).events).timeline
+    assert first == replay
+    message = first.items[0]
+    assert isinstance(message, MessageTimelineItem)
+    assert message.message_metadata == expected
+
+
+@pytest.mark.parametrize("attachment_index", [0, 1, 2])
+def test_assistant_attachments_survive_same_phase_text_updates(attachment_index: int) -> None:
+    raw = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-attachments",
+            seq=index + 1,
+            type="assistant_message",
+            data={
+                "content": f"Text {index}",
+                "turn_id": "turn-attachments",
+                "message_id": "turn-attachments",
+                "assistant_phase_index": 0,
+                "attachments": (
+                    [
+                        {
+                            "artifact_id": "art_report",
+                            "filename": "report.csv",
+                            "mime_type": "text/csv",
+                            "kind": "file",
+                            "size_bytes": 10,
+                        }
+                    ]
+                    if index == attachment_index
+                    else []
+                ),
+            },
+        )
+        for index in range(3)
+    ]
+    items = project_timeline(normalize_session_events(raw).events).timeline.items
+    assert len(items) == 1
+    assert isinstance(items[0], MessageTimelineItem)
+    assert items[0].content == "Text 2"
+    assert [attachment.artifact_id for attachment in items[0].attachments] == ["art_report"]
+
+
 def test_output_continuation_segments_rebuild_one_complete_assistant_bubble() -> None:
     raw = [
         RawSessionEvent(
@@ -658,8 +782,21 @@ def test_turn_error_lifecycle_projects_as_error() -> None:
     assert projection.timeline.items[0].recoverable is True
 
 
-def test_user_interaction_lifecycle_projects_a_safe_answer_card() -> None:
+@pytest.mark.parametrize("event_type", ["user_message", "message"])
+def test_user_interaction_lifecycle_projects_a_safe_answer_card(event_type: str) -> None:
     raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_interaction",
+            seq=2,
+            type=event_type,
+            data={
+                "role": "user",
+                "content": "Answer 1: Staging\nAnswer 2: Verify the migration",
+                "source": "question_answer",
+                "question_id": "notif_question",
+            },
+        ),
         RawSessionEvent(
             store_id="intaris",
             session_id="sess_interaction",
@@ -677,7 +814,7 @@ def test_user_interaction_lifecycle_projects_a_safe_answer_card() -> None:
                 ],
                 "status": "complete",
             },
-        )
+        ),
     ]
 
     projection = project_timeline(normalize_session_events(raw_events).events)
@@ -691,6 +828,10 @@ def test_user_interaction_lifecycle_projects_a_safe_answer_card() -> None:
         ("Deployment target?", "Staging"),
         ("Why?", "Verify the migration"),
     ]
+
+    # Identical ordinary user prose must not be deduplicated by content.
+    ordinary = raw_events[0].model_copy(update={"data": {"role": "user", "content": "Staging"}})
+    assert len(project_timeline(normalize_session_events([ordinary]).events).timeline.items) == 1
 
 
 def test_cancelled_turn_lifecycle_projects_as_system_message() -> None:
@@ -942,7 +1083,7 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
                 "kind": "model_error",
                 "scope": "failed_turn",
                 "reason_class": "rate_limit",
-                "provider_id": "anthropic-sample",
+                "provider_id": "anthropic-demo",
                 "model": "claude-fable-5",
                 "retry_after_seconds": 23,
                 "provider_retry_after_seconds": 23,
@@ -976,7 +1117,7 @@ def test_lifecycle_system_notice_projects_to_system_message() -> None:
     assert item.notice_kind == "model_error"
     assert item.notice_scope == "failed_turn"
     assert item.reason_class == "rate_limit"
-    assert item.provider_id == "anthropic-sample"
+    assert item.provider_id == "anthropic-demo"
     assert item.model == "claude-fable-5"
     assert item.retry_after_seconds == 23
     assert item.provider_retry_after_seconds == 23
@@ -2338,6 +2479,7 @@ def test_assistant_deliverable_event_projects_reference_only_item() -> None:
             data={
                 "event": "assistant_deliverable",
                 "deliverable_id": "dlv_rich",
+                "turn_id": "report-turn",
                 "format": "rich",
                 "title": "Rich report",
                 "render_metadata": {"presentation": "rich"},
@@ -2351,6 +2493,7 @@ def test_assistant_deliverable_event_projects_reference_only_item() -> None:
     item = projection.timeline.items[0]
     assert isinstance(item, AssistantDeliverableTimelineItem)
     assert item.deliverable_id == "dlv_rich"
+    assert item.turn_id == "report-turn"
     assert item.format == "rich"
     assert item.title == "Rich report"
     assert item.render_metadata == {"presentation": "rich"}
@@ -2522,3 +2665,121 @@ def _item_summary(item: TimelineItem) -> dict[str, Any]:
             }
         )
     return base
+
+
+def test_program_linkage_survives_call_result_coalescing_without_changing_identity_or_order() -> (
+    None
+):
+    raw_events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_program",
+            seq=10,
+            type="tool_call",
+            data={
+                "call_id": "call-program",
+                "name": "python_execute",
+                "arguments": {"description": "Read and summarize the report", "code": "print(1)"},
+                "turn_id": "turn-program",
+                "assistant_phase_index": 2,
+                "turn_cycle_index": 1,
+                "program_id": "program-7",
+                "kernel_generation": 4,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_program",
+            seq=11,
+            type="tool_call",
+            data={
+                "call_id": "call-child",
+                "name": "read",
+                "arguments": {"file_path": "report.csv"},
+                "turn_id": "turn-program",
+                "assistant_phase_index": 2,
+                "turn_cycle_index": 1,
+                "parent_call_id": "call-program",
+                "program_id": "program-7",
+                "kernel_generation": 4,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_program",
+            seq=12,
+            type="tool_result",
+            data={
+                "call_id": "call-child",
+                "name": "read",
+                "result": "report contents",
+                "is_error": False,
+                "turn_id": "turn-program",
+                "assistant_phase_index": 2,
+                "turn_cycle_index": 1,
+                "parent_call_id": "call-program",
+                "program_id": "program-7",
+                "kernel_generation": 4,
+            },
+        ),
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess_program",
+            seq=13,
+            type="tool_result",
+            data={
+                "call_id": "call-program",
+                "name": "python_execute",
+                "result": '{"rows": 1}',
+                "is_error": False,
+                "turn_id": "turn-program",
+                "assistant_phase_index": 2,
+                "turn_cycle_index": 1,
+                "program_id": "changed-program",
+                "kernel_generation": 5,
+            },
+        ),
+    ]
+
+    timeline = project_timeline(normalize_session_events(raw_events).events).timeline
+    parent = next(item for item in timeline.items if item.id == "tool:call-program")
+    child = next(item for item in timeline.items if item.id == "tool:call-child")
+
+    assert isinstance(parent, ToolCallTimelineItem)
+    assert isinstance(child, ToolCallTimelineItem)
+    assert parent.parent_call_id is None
+    assert parent.program_id == "program-7"
+    assert parent.kernel_generation == 4
+    assert parent.sort_key.startswith("0000:000000000000010:")
+    assert child.parent_call_id == "call-program"
+    assert child.program_id == "program-7"
+    assert child.kernel_generation == 4
+    assert child.sort_key.startswith("0000:000000000000011:")
+    assert [parent.id, child.id] == ["tool:call-program", "tool:call-child"]
+
+
+def test_program_linkage_can_be_hydrated_from_a_result_only_window() -> None:
+    raw_result = RawSessionEvent(
+        store_id="intaris",
+        session_id="sess_program",
+        seq=21,
+        type="tool_result",
+        data={
+            "call_id": "call-window-child",
+            "name": "read",
+            "result": "partial history",
+            "is_error": False,
+            "parent_call_id": "call-outside-window",
+            "program_id": "program-window",
+            "kernel_generation": "generation-a",
+        },
+    )
+
+    items = project_timeline(normalize_session_events([raw_result]).events).timeline.items
+    assert len(items) == 1
+    item = items[0]
+    assert isinstance(item, ToolCallTimelineItem)
+    assert item.id == "tool:call-window-child"
+    assert item.parent_call_id == "call-outside-window"
+    assert item.program_id == "program-window"
+    assert item.kernel_generation == "generation-a"

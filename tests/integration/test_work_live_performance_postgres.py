@@ -22,7 +22,11 @@ from cognis.api.chat_v2.event_store import (
     SessionEventPage,
     SessionHistoryAvailability,
 )
-from cognis.api.chat_v2.work_materializer import WorkMaterializer, _PendingWorkAppend
+from cognis.api.chat_v2.work_materializer import (
+    WORK_MATERIALIZER_VERSION,
+    WorkMaterializer,
+    _PendingWorkAppend,
+)
 from cognis.models.session import SessionEvent
 from cognis.providers.guardrails.events import EventStoreAuthority
 from cognis.store import queries
@@ -71,6 +75,8 @@ async def _seed_topology(client: TestClient) -> None:
                 user_email=OWNER,
                 agent_id=AGENT,
                 context_type="web",
+                title=f"Work performance {root}",
+                title_source="user",
             )
             root_session = f"{root}-session-000"
             previous: dict[int, str] = {}
@@ -150,7 +156,7 @@ async def _seed_rows(client: TestClient) -> None:
                 SELECT 'perf-record-' || g, :owner,
                     'work-perf-max-session-' ||
                         lpad(((g - 1) % :physical)::text, 3, '0'),
-                    'work-v8', 'intaris',
+                    :materializer_version, 'intaris',
                     'source-work-perf-max-session-' ||
                         lpad(((g - 1) % :physical)::text, 3, '0'),
                     ((g - 1) / :physical) + 1,
@@ -201,7 +207,11 @@ async def _seed_rows(client: TestClient) -> None:
                 FROM generate_series(1, 100000) AS g
                 """
             ),
-            {"owner": OWNER, "physical": MAX_PHYSICAL_SESSIONS},
+            {
+                "owner": OWNER,
+                "physical": MAX_PHYSICAL_SESSIONS,
+                "materializer_version": WORK_MATERIALIZER_VERSION,
+            },
         )
         await connection.execute(
             sa.text(
@@ -251,7 +261,7 @@ async def _seed_rows(client: TestClient) -> None:
                 SELECT 'perf-current-' || g, :owner,
                     'work-perf-max-session-' ||
                         lpad(((g - 1) % :physical)::text, 3, '0'),
-                    'work-v8', 'work-files-v3', 'perf-generation-' || g,
+                    :materializer_version, 'work-files-v3', 'perf-generation-' || g,
                     'source-work-perf-max-session-' ||
                         lpad(((g - 1) % :physical)::text, 3, '0'),
                     400, 'tool:perf-' || g, 'repo',
@@ -260,7 +270,11 @@ async def _seed_rows(client: TestClient) -> None:
                 FROM generate_series(1, 2500) AS g
                 """
             ),
-            {"owner": OWNER, "physical": MAX_PHYSICAL_SESSIONS},
+            {
+                "owner": OWNER,
+                "physical": MAX_PHYSICAL_SESSIONS,
+                "materializer_version": WORK_MATERIALIZER_VERSION,
+            },
         )
         await connection.execute(
             sa.text(
@@ -274,7 +288,7 @@ async def _seed_rows(client: TestClient) -> None:
                 SELECT 'perf-file-' || g, :owner,
                     'work-perf-max-session-' ||
                         lpad(((g - 1) % :physical)::text, 3, '0'),
-                    'work-v8', 'perf-record-' || g, 0,
+                    :materializer_version, 'perf-record-' || g, 0,
                     'src/file-' || g || '.py',
                     'repo:src/file-' || g || '.py',
                     'perf-generation-' || g,
@@ -283,7 +297,11 @@ async def _seed_rows(client: TestClient) -> None:
                 FROM generate_series(1, 80000) AS g
                 """
             ),
-            {"owner": OWNER, "physical": MAX_PHYSICAL_SESSIONS},
+            {
+                "owner": OWNER,
+                "physical": MAX_PHYSICAL_SESSIONS,
+                "materializer_version": WORK_MATERIALIZER_VERSION,
+            },
         )
         await connection.execute(
             sa.text(
@@ -295,13 +313,13 @@ async def _seed_rows(client: TestClient) -> None:
                     additions, deletions, status
                 ) VALUES (
                     'perf-history-file', :owner, 'work-perf-max-session-095',
-                    'work-v8', 'perf-record-100000', 0, 'src/history.py',
+                    :materializer_version, 'perf-record-100000', 0, 'src/history.py',
                     'repo:src/history.py', 'perf-history-generation',
                     400, 0, 2, 1, 'modified'
                 )
                 """
             ),
-            {"owner": OWNER},
+            {"owner": OWNER, "materializer_version": WORK_MATERIALIZER_VERSION},
         )
         await connection.execute(
             sa.text(

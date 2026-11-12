@@ -18,10 +18,12 @@ from cognis.store.models import (
 )
 
 
-def add_grant(db: DBSession, owner: str, ref: str, recipient: str, source: str) -> None:
+def add_grant(
+    db: DBSession, owner: str, ref: str, recipient: str, source: str, permission: str = "read"
+) -> None:
     key = dict(owner_email=owner, content_ref=ref, agent_id=recipient, source=source)
     if db.get(ArtifactGrantRow, key) is None:
-        db.add(ArtifactGrantRow(**key))
+        db.add(ArtifactGrantRow(**key, permission=permission))
 
 
 def session_ancestors(db: DBSession, producer: Session) -> list[Session]:
@@ -121,12 +123,11 @@ def content_recipients(db: DBSession, row: ArtifactRecordRow | DeliverableRow) -
     )
 
 
-def register_content_entitlements(db: DBSession, row: ArtifactRecordRow | DeliverableRow) -> None:
-    """Resolve durable ownership and snapshot only validated output ancestors."""
+def initialize_content_owner(db: DBSession, row: ArtifactRecordRow | DeliverableRow) -> None:
+    """Resolve omitted or transient ownership before first publication."""
     if not row.owner_email:
         return
     owner = row.owner_email
-    ref = row.artifact_id if isinstance(row, ArtifactRecordRow) else row.deliverable_id
     producer = db.get(Session, row.session_id) if row.session_id else None
     if producer is not None and producer.user_email != owner:
         return
@@ -156,6 +157,35 @@ def register_content_entitlements(db: DBSession, row: ArtifactRecordRow | Delive
         row.owner_agent_id = next(
             (item for item in candidates if item and not item.startswith("system:")), None
         )
+
+
+def register_content_entitlements(db: DBSession, row: ArtifactRecordRow | DeliverableRow) -> None:
+    """Snapshot validated read provenance without changing initialized ownership."""
+    if not row.owner_email:
+        return
+    owner = row.owner_email
+    ref = row.artifact_id if isinstance(row, ArtifactRecordRow) else row.deliverable_id
+    predecessor = (
+        row.supersedes_artifact_id
+        if isinstance(row, ArtifactRecordRow)
+        else row.supersedes_deliverable_id
+    )
+    if not predecessor and row.lineage_id and row.lineage_id != ref:
+        predecessor = row.lineage_id
+    if predecessor:
+        # Lineage grants belong to the original owner, independently of whether
+        # the producer's cross-user project context can supply read provenance.
+        for recipient, permission in db.execute(
+            sa.select(ArtifactGrantRow.agent_id, ArtifactGrantRow.permission).where(
+                ArtifactGrantRow.owner_email == owner,
+                ArtifactGrantRow.content_ref == predecessor,
+                ArtifactGrantRow.source == "explicit",
+            )
+        ):
+            add_grant(db, owner, ref, recipient, "explicit", permission)
+    producer = db.get(Session, row.session_id) if row.session_id else None
+    if producer is not None and producer.user_email != owner:
+        return
     if producer is not None:
         for ancestor in session_ancestors(db, producer):
             add_grant(
@@ -168,20 +198,6 @@ def register_content_entitlements(db: DBSession, row: ArtifactRecordRow | Delive
     if row.owner_agent_id:
         add_grant(db, owner, ref, row.owner_agent_id, "output")
     db.flush()
-    predecessor = (
-        row.supersedes_artifact_id
-        if isinstance(row, ArtifactRecordRow)
-        else row.supersedes_deliverable_id
-    )
-    if predecessor:
-        for recipient in db.scalars(
-            sa.select(ArtifactGrantRow.agent_id).where(
-                ArtifactGrantRow.owner_email == owner,
-                ArtifactGrantRow.content_ref == predecessor,
-                ArtifactGrantRow.source == "explicit",
-            )
-        ):
-            add_grant(db, owner, ref, recipient, "explicit")
     for agent_id in content_recipients(db, row):
         if agent_id == row.owner_agent_id:
             continue

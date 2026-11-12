@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
 import sqlalchemy as sa
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.store.models import (
@@ -23,6 +23,9 @@ class AgentAccess(BaseModel):
     name: str
     explicit: bool
     inherited: bool
+    explicit_permission: Literal["read", "write"] | None = None
+    inherited_permission: Literal["read", "write"] | None = None
+    inherited_sources: list[str] = Field(default_factory=list)
     avatar_url: str | None = None
 
 
@@ -34,6 +37,14 @@ class DocumentAccess(BaseModel):
 
 class AgentSharesRequest(BaseModel):
     agent_ids: list[str] = Field(max_length=100)
+    write_agent_ids: list[str] = Field(default_factory=list, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_write_recipients(self) -> AgentSharesRequest:
+        """Write is an explicit capability of a selected recipient."""
+        if not set(self.write_agent_ids) <= set(self.agent_ids):
+            raise ValueError("write_agent_ids must be a subset of agent_ids")
+        return self
 
 
 class PublicLink(BaseModel):
@@ -75,22 +86,24 @@ async def public_link(
             )
         )
         return PublicLink(url=url, expires_at=link.expires_at, mode=effective)
-    previewable = supports_artifact_view(row.filename, row.mime_type)
+    # Public links follow the document, so judge format and expiry by its newest revision.
+    from cognis.store.queries import get_artifact_lineage_head
+
+    async with session_factory() as session:
+        head = await get_artifact_lineage_head(session, row.lineage_id or row.artifact_id)
+    current = head if head is not None and head.owner_email == row.owner_email else row
+    previewable = supports_artifact_view(current.filename, current.mime_type)
     effective = mode or ("view" if previewable else "download")
     if effective == "view" and not previewable:
         raise ValueError("This format cannot be viewed in the browser. Select Download file.")
-    if row.expires_at:
-        remaining = int((row.expires_at.replace(tzinfo=UTC) - datetime.now(UTC)).total_seconds())
+    if current.expires_at:
+        remaining = int(
+            (current.expires_at.replace(tzinfo=UTC) - datetime.now(UTC)).total_seconds()
+        )
         if remaining < 60:
             raise ValueError("This artifact expires in less than one minute.")
         ttl_seconds = min(ttl_seconds, remaining)
-    url = await artifact_store.async_get_public_url(
-        row.namespace,
-        row.object_id,
-        row.filename,
-        ttl_seconds=ttl_seconds,
-        mode=effective,
-    )
+    url = artifact_store.get_document_link_url(ref, ttl_seconds=ttl_seconds, mode=effective)
     from datetime import timedelta
 
     return PublicLink(
@@ -152,15 +165,15 @@ async def document_access(
 ) -> DocumentAccess:
     """Describe selectable agents plus persisted inherited access on this revision."""
     ref = row.deliverable_id if isinstance(row, DeliverableRow) else row.artifact_id
-    grants: dict[str, set[str]] = {}
-    for recipient, source in (
+    grants: dict[str, dict[str, str]] = {}
+    for recipient, source, permission in (
         await session.execute(
-            sa.select(ArtifactGrantRow.agent_id, ArtifactGrantRow.source).where(
-                ArtifactGrantRow.owner_email == owner, ArtifactGrantRow.content_ref == ref
-            )
+            sa.select(
+                ArtifactGrantRow.agent_id, ArtifactGrantRow.source, ArtifactGrantRow.permission
+            ).where(ArtifactGrantRow.owner_email == owner, ArtifactGrantRow.content_ref == ref)
         )
     ).all():
-        grants.setdefault(recipient, set()).add(source)
+        grants.setdefault(recipient, {})[source] = permission
     agents = (
         await session.scalars(
             sa.select(Agent)
@@ -191,10 +204,25 @@ async def document_access(
                 avatar_url=f"/api/v1/images/{a.avatar_image_id}"
                 if a.avatar_image_id
                 else a.avatar_url,
-                explicit="explicit" in grants.get(a.agent_id, set()),
-                inherited=bool(grants.get(a.agent_id, set()) - {"explicit"})
+                explicit="explicit" in grants.get(a.agent_id, {}),
+                inherited=bool(set(grants.get(a.agent_id, {})) - {"explicit"})
                 or a.agent_id == row.owner_agent_id
                 or a.agent_id in project_agents,
+                explicit_permission=cast(
+                    Literal["read", "write"] | None, grants.get(a.agent_id, {}).get("explicit")
+                ),
+                inherited_permission=(
+                    "write"
+                    if a.agent_id in project_agents or a.agent_id == row.owner_agent_id
+                    else "read"
+                    if set(grants.get(a.agent_id, {})) - {"explicit"}
+                    else None
+                ),
+                inherited_sources=(
+                    (["project"] if a.agent_id in project_agents else [])
+                    + (["owner"] if a.agent_id == row.owner_agent_id else [])
+                    + sorted(set(grants.get(a.agent_id, {})) - {"explicit"})
+                ),
             )
             for a in agents
         ],
@@ -204,10 +232,15 @@ async def document_access(
 
 
 async def replace_explicit_shares(
-    session: AsyncSession, row: ArtifactRecordRow | DeliverableRow, owner: str, agent_ids: list[str]
+    session: AsyncSession,
+    row: ArtifactRecordRow | DeliverableRow,
+    owner: str,
+    agent_ids: list[str],
+    write_agent_ids: list[str] | None = None,
 ) -> DocumentAccess:
     """Apply explicit access to existing revisions; future revisions inherit it."""
-    await validate_recipients(session, owner, agent_ids)
+    request = AgentSharesRequest(agent_ids=agent_ids, write_agent_ids=write_agent_ids or [])
+    await validate_recipients(session, owner, request.agent_ids)
     model = type(row)
     key = (
         DeliverableRow.deliverable_id
@@ -218,8 +251,8 @@ async def replace_explicit_shares(
         await session.scalars(
             sa.select(key).where(
                 model.owner_email == owner,
-                model.lineage_id == row.lineage_id,
-                model.status != "deleted",
+                sa.func.coalesce(model.lineage_id, key)
+                == (row.lineage_id or getattr(row, key.key)),
             )
         )
     )
@@ -233,7 +266,11 @@ async def replace_explicit_shares(
     session.add_all(
         [
             ArtifactGrantRow(
-                owner_email=owner, content_ref=ref, agent_id=recipient, source="explicit"
+                owner_email=owner,
+                content_ref=ref,
+                agent_id=recipient,
+                source="explicit",
+                permission="write" if recipient in request.write_agent_ids else "read",
             )
             for ref in refs
             for recipient in set(agent_ids)

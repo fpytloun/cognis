@@ -18,7 +18,7 @@ from cognis.api.models import (
     DashboardIssuesResponse,
     DashboardIssuesSummary,
 )
-from cognis.core.provider_monitor import project_monitor
+from cognis.core.provider_monitor import REAUTHORIZATION_REQUIRED_ERROR, project_monitor
 from cognis.models.tool import effective_mcp_auth_config
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.store.models import (
@@ -225,7 +225,25 @@ async def collect_dashboard_issues(
     ).all()
     for provider, snapshot in provider_rows:
         observation = project_monitor(provider, snapshot, now=generated_at)
-        if observation.alert_severity:
+        action_url = f"/settings?tab=providers&provider={quote(provider.provider_id, safe='')}"
+        resource = DashboardIssueResource(
+            type="llm_provider", id=provider.provider_id, label=provider.display_name
+        )
+        if observation.error == REAUTHORIZATION_REQUIRED_ERROR:
+            issues.append(
+                DashboardIssue(
+                    id=f"provider-monitor:{provider.provider_id}",
+                    severity="critical",
+                    kind="provider_auth",
+                    title=f"{provider.display_name} needs reauthorization",
+                    detail=observation.health_detail,
+                    resource=resource,
+                    observed_at=observation.checked_at,
+                    action_url=action_url,
+                    action_label="Reauthorize",
+                )
+            )
+        elif observation.alert_severity:
             unhealthy = observation.health_status in {"error", "warning"} or bool(observation.error)
             issues.append(
                 DashboardIssue(
@@ -236,11 +254,9 @@ async def collect_dashboard_issues(
                     detail=observation.error or observation.health_detail
                     if unhealthy
                     else f"Remaining usage is at or below the configured {observation.alert_severity} threshold.",
-                    resource=DashboardIssueResource(
-                        type="llm_provider", id=provider.provider_id, label=provider.display_name
-                    ),
+                    resource=resource,
                     observed_at=observation.checked_at,
-                    action_url=f"/settings?tab=providers&provider={quote(provider.provider_id, safe='')}",
+                    action_url=action_url,
                     action_label="Provider",
                 )
             )

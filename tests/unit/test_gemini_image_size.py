@@ -101,7 +101,12 @@ async def test_gemini_generation_and_edit_use_image_config(
     images = [ImageInput(b64_json="YWJj")] if edit else None
     if execution == "controller":
         result = await provider.image_generate(
-            prompt="draw", model="gemini-nano-banana-2.1", size=size, images=images
+            prompt="draw",
+            model="gemini-nano-banana-2.1",
+            size=size,
+            images=images,
+            max_retries=0,
+            timeout=30,
         )
         assert len(result.images) == 1
     else:
@@ -117,6 +122,8 @@ async def test_gemini_generation_and_edit_use_image_config(
     kwargs = complete.await_args.kwargs
     assert kwargs["modalities"] == ["image", "text"]
     assert kwargs["stream"] is False
+    if execution == "controller":
+        assert kwargs["timeout"] == 30
     for key in ("size", "image_size", "extra_body", "generationConfig"):
         assert key not in kwargs
     if size == "1536x1024":
@@ -137,6 +144,7 @@ async def test_openai_image_size_unchanged(provider, monkeypatch, execution, edi
     generate = AsyncMock(return_value=SimpleNamespace(data=[{"b64_json": "YWJj"}]))
     complete = AsyncMock()
     monkeypatch.setattr("litellm.aimage_generation", generate)
+    monkeypatch.setattr("litellm.aimage_edit", generate)
     monkeypatch.setattr("litellm.acompletion", complete)
     images = [ImageInput(b64_json="YWJj")] if edit else None
     if execution == "controller":
@@ -156,7 +164,7 @@ async def test_openai_image_size_unchanged(provider, monkeypatch, execution, edi
     assert "imageConfig" not in kwargs
     assert "extra_body" not in kwargs
     if edit:
-        assert kwargs["image"] == ["YWJj"]
+        assert kwargs["image"] == [b"abc"]
     complete.assert_not_awaited()
 
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import mimetypes
 import time
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Annotated, Any, Literal
@@ -28,11 +28,12 @@ from cognis.core.deliverable_links import (
     DeliverableShareUnavailable,
     signed_deliverable_view_link,
 )
-from cognis.core.project_access import can_project_read_artifact
 from cognis.models.artifact import ArtifactKind
 from cognis.rendering.deliverables import DeliverableRenderError, render_standalone_shell
+from cognis.store.document_people import person_may_read_document
 from cognis.store.queries import (
     create_artifact_record,
+    get_artifact_lineage_head,
     get_artifact_lineage_summary,
     get_artifact_record,
     get_skill_asset_by_artifact_object,
@@ -47,6 +48,7 @@ ArtifactURLMode = Literal["download", "view"]
 class ArtifactShareRequest(BaseModel):
     agent_id: str
     action: Literal["grant", "revoke"]
+    permission: Literal["read", "write"] = "read"
 
 
 @router.post("/{artifact_id}/share")
@@ -69,6 +71,7 @@ async def share_artifact(
                 content_ref=artifact_id,
                 grantee_agent_id=body.agent_id,
                 revoke=body.action == "revoke",
+                permission=body.permission,
             )
         except ValueError:
             raise api_exception(404, "not_found", "Artifact or recipient not found") from None
@@ -80,7 +83,7 @@ TEXT_PREVIEW_MAX_BYTES = artifact_preview.TEXT_PREVIEW_MAX_BYTES
 ARTIFACT_VIEWER_CSP = (
     "sandbox allow-scripts allow-same-origin allow-downloads; default-src 'none'; "
     "script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; "
-    "img-src 'self' data:; font-src 'self' data:; media-src 'self' data:"
+    "img-src 'self' data:; font-src 'self' data:; media-src 'self' data: https:; frame-src 'self'"
 )
 
 
@@ -133,9 +136,10 @@ def _artifact_viewer_response(
     content_type: str,
     content: bytes,
     standalone_url: str,
+    raw: bool = False,
 ) -> Response:
     kind = artifact_preview.classify_artifact_preview(filename, content_type)
-    if kind not in {"csv", "markdown", "mermaid", "text"}:
+    if raw or kind not in {"csv", "markdown", "mermaid", "text", "html"}:
         effective_content_type = (
             "text/html" if kind == "html" else "application/pdf" if kind == "pdf" else content_type
         )
@@ -146,16 +150,19 @@ def _artifact_viewer_response(
             mode="view",
         )
         return Response(content=content, media_type=effective_content_type, headers=headers)
-    payload = artifact_preview.artifact_preview_payload(
-        filename=filename,
-        content_type=content_type,
-        content=content,
+    raw_url = f"{standalone_url}{'&' if '?' in standalone_url else '?'}raw=1"
+    payload = (
+        {"content": "", "rich_payload": {"blocks": []}}
+        if kind == "html"
+        else artifact_preview.artifact_preview_payload(
+            filename=filename, content_type=content_type, content=content
+        )
     )
     row = SimpleNamespace(
         content=str(payload.get("content") or ""),
         deliverable_id=artifact_id,
         format="rich",
-        rich_payload=artifact_preview.artifact_preview_rich_payload(payload),
+        rich_payload=payload["rich_payload"],
         title=filename,
     )
     try:
@@ -164,6 +171,8 @@ def _artifact_viewer_response(
             media_base="",
             standalone_url=standalone_url,
             pdf_url="",
+            html_url=raw_url if kind == "html" else standalone_url,
+            embedded_document_url=raw_url if kind == "html" else "",
         ).encode()
     except DeliverableRenderError as exc:
         raise api_exception(
@@ -226,11 +235,10 @@ async def upload_artifact(
     user = require_current_user(request)
     artifact_store = request.app.state.artifact_store
 
-    content = await file.read()
-    content_hash = hashlib.sha256(content).hexdigest()
-    max_size = artifact_store._config.max_size_bytes  # noqa: SLF001
-    if len(content) > max_size:
-        raise api_exception(400, "validation_error", "Artifact too large")
+    from cognis.artifacts.streaming import storage_io
+
+    size_bytes = await storage_io(file.file.seek, 0, 2)
+    await file.seek(0)
 
     artifact_id = artifact_store.generate_id("att")
     filename = sanitize_artifact_filename(file.filename, default="attachment")
@@ -239,13 +247,18 @@ async def upload_artifact(
     )
     kind = _kind_for_content_type(content_type)
 
-    await artifact_store.async_save(
+    async def chunks() -> AsyncIterator[bytes]:
+        while chunk := await file.read(1024 * 1024):
+            yield chunk
+
+    size_bytes, content_hash = await artifact_store.async_receive_stream(
         "attachments",
         artifact_id,
         filename,
-        content,
+        chunks(),
         content_type,
         owner_email=user.email,
+        expected_size=size_bytes,
     )
 
     async with request.app.state.session_factory() as session:
@@ -259,7 +272,7 @@ async def upload_artifact(
             purpose=purpose,
             kind=kind.value,
             mime_type=content_type,
-            size_bytes=len(content),
+            size_bytes=size_bytes,
             status="temporary",
             expires_at=datetime.now(UTC) + timedelta(hours=24),
             content_hash=content_hash,
@@ -272,14 +285,14 @@ async def upload_artifact(
         "kind": kind.value,
         "mime_type": content_type,
         "filename": filename,
-        "size_bytes": len(content),
+        "size_bytes": size_bytes,
         "url": signed_url,
     }
 
 
 async def _project_reader_may_read(request: Request, row: Any, user_email: str) -> bool:
     async with request.app.state.session_factory() as session:
-        return await can_project_read_artifact(session, row, user_email)
+        return await person_may_read_document(session, row, user_email)
 
 
 @router.get("/{artifact_id}/revisions", response_model=ArtifactRevisionsResponse)
@@ -303,6 +316,8 @@ async def artifact_revisions(request: Request, artifact_id: str) -> ArtifactRevi
         revisions = [
             ArtifactRevisionSummary(
                 artifact_id=item.artifact_id,
+                author_email=item.author_email,
+                author_agent_id=item.author_agent_id,
                 revision=int(item.revision or 1),
                 filename=item.filename,
                 mime_type=item.mime_type,
@@ -324,8 +339,45 @@ async def artifact_revisions(request: Request, artifact_id: str) -> ArtifactRevi
 
 
 async def _person_may_read_artifact(session: Any, row: Any, user_email: str) -> bool:
-    return row.owner_email == user_email or await can_project_read_artifact(
-        session, row, user_email
+    return await person_may_read_document(session, row, user_email)
+
+
+@router.get("/{artifact_id}/bytes")
+async def private_artifact_bytes(
+    request: Request, artifact_id: str, mode: ArtifactURLMode = "download"
+) -> Response:
+    """Serve human-readable bytes without turning a document grant into a public URL."""
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_artifact_record(session, artifact_id)
+        if (
+            row is None
+            or row.status == "deleted"
+            or _is_expired(row)
+            or not await _person_may_read_artifact(session, row, user.email)
+        ):
+            raise api_exception(404, "not_found", "Artifact not found")
+    if mode == "view":
+        _assert_view_allowed(row.filename, row.mime_type)
+    try:
+        content, mime = await request.app.state.artifact_store.async_load(
+            row.namespace, row.object_id, row.filename
+        )
+    except FileNotFoundError as exc:
+        raise api_exception(404, "not_found", "Artifact not found") from exc
+    return Response(
+        content,
+        media_type=mime,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": (
+                f"{'inline' if mode == 'view' else 'attachment'}; "
+                f"filename*=UTF-8''{quote(sanitize_artifact_filename(row.filename))}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        },
     )
 
 
@@ -381,6 +433,13 @@ async def get_signed_url(
     if mode == "view":
         _assert_view_allowed(row.filename, row.mime_type)
     ttl_seconds = _clamp_ttl_to_artifact_expiry(row, ttl_seconds)
+    if row.owner_email and row.owner_email != user.email:
+        return {
+            "artifact_id": artifact_id,
+            "url": f"/api/v1/artifacts/{quote(artifact_id)}/bytes?mode={mode}",
+            "mode": mode,
+            "expires_at": (datetime.now(UTC) + timedelta(seconds=ttl_seconds)).isoformat(),
+        }
     url = await artifact_store.async_get_public_url(
         row.namespace,
         row.object_id,
@@ -571,6 +630,7 @@ async def serve_signed_artifact_view(
     filename: str,
     exp: int,
     sig: str,
+    raw: bool = False,
 ) -> Response:
     return await _serve_signed_artifact(
         request,
@@ -580,6 +640,41 @@ async def serve_signed_artifact_view(
         exp=exp,
         sig=sig,
         mode="view",
+        raw=raw,
+    )
+
+
+@router.get("/latest/{artifact_id}/{mode}")
+async def serve_document_link(
+    request: Request,
+    artifact_id: str,
+    mode: ArtifactURLMode,
+    exp: int,
+    sig: str,
+    raw: bool = False,
+) -> Response:
+    """Serve a public document link: always the newest live revision of the document."""
+    artifact_store = request.app.state.artifact_store
+    if not artifact_store.verify_document_link(artifact_id, exp=exp, sig=sig, mode=mode):
+        raise api_exception(403, "forbidden", "Invalid or expired artifact signature")
+    async with request.app.state.session_factory() as session:
+        linked = await get_artifact_record(session, artifact_id)
+        if linked is None:
+            raise api_exception(404, "not_found", "Artifact not found")
+        head = await get_artifact_lineage_head(session, linked.lineage_id or linked.artifact_id)
+    # A revision chain never crosses owners; without a live head the document is gone.
+    row = head if head is not None and head.owner_email == linked.owner_email else None
+    if row is None or getattr(row, "status", None) == "deleted" or _is_expired(row):
+        raise api_exception(404, "not_found", "Artifact not found")
+    return await _artifact_body_response(
+        request,
+        namespace=row.namespace,
+        object_id=row.object_id,
+        filename=row.filename,
+        mime_type=row.mime_type,
+        size_bytes=row.size_bytes,
+        mode=mode,
+        raw=raw,
     )
 
 
@@ -592,6 +687,7 @@ async def _serve_signed_artifact(
     exp: int,
     sig: str,
     mode: ArtifactURLMode,
+    raw: bool = False,
 ) -> Response:
     artifact_store = request.app.state.artifact_store
     if not artifact_store.verify_signed_request(
@@ -631,13 +727,50 @@ async def _serve_signed_artifact(
         raise api_exception(404, "not_found", "Artifact not found")
     if getattr(row, "filename", None) != filename:
         raise api_exception(404, "not_found", "Artifact not found")
-    if getattr(row, "mime_type", "").startswith("video/"):
+    size_bytes = getattr(row, "size_bytes", None)
+    mime_type = (
+        skill_asset_row.content_type
+        if skill_asset_row is not None and row is skill_asset_row
+        else getattr(row, "mime_type", None)
+    )
+    return await _artifact_body_response(
+        request,
+        namespace=namespace,
+        object_id=object_id,
+        filename=filename,
+        mime_type=mime_type,
+        size_bytes=size_bytes,
+        mode=mode,
+        raw=raw,
+    )
+
+
+async def _artifact_body_response(
+    request: Request,
+    *,
+    namespace: str,
+    object_id: str,
+    filename: str,
+    mime_type: object,
+    size_bytes: object,
+    mode: ArtifactURLMode,
+    raw: bool,
+) -> Response:
+    """Stream or render one authorized stored artifact file."""
+    artifact_store = request.app.state.artifact_store
+    if mode == "download" or (isinstance(mime_type, str) and mime_type.startswith("video/")):
         from cognis.artifacts.ranges import parse_byte_range
 
-        size_bytes = getattr(row, "size_bytes", None)
-        mime_type = getattr(row, "mime_type", "")
-        if not isinstance(size_bytes, int):
-            raise api_exception(404, "not_found", "Artifact not found")
+        if not isinstance(size_bytes, int) or not isinstance(mime_type, str):
+            raise api_exception(404, "not_found", "Artifact metadata not found")
+        if size_bytes == 0:
+            return Response(
+                content=b"",
+                media_type=mime_type,
+                headers=_artifact_response_headers(
+                    filename=filename, content_type=mime_type, content_length=0, mode=mode
+                ),
+            )
         try:
             start, end, partial = parse_byte_range(request.headers.get("range"), size_bytes)
         except ValueError:
@@ -665,6 +798,7 @@ async def _serve_signed_artifact(
             content_type=content_type,
             content=content,
             standalone_url=str(request.url),
+            raw=raw,
         )
     headers = _artifact_response_headers(
         filename=filename,

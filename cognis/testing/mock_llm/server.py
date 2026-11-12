@@ -22,6 +22,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from cognis.testing.mock_llm.policy import PTC_POLICY_MODEL, build_ptc_policy_assessment
 from cognis.testing.mock_llm.scenarios import (
     ScenarioCatalog,
     build_default_response,
@@ -82,6 +83,25 @@ def _conversation_turn_index(messages: list[dict[str, Any]]) -> int:
     return sum(1 for m in messages if m.get("role") == "assistant")
 
 
+def _exposed_tool_names(body: dict[str, Any]) -> list[str]:
+    """Record model-facing names without retaining the tool schemas."""
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return []
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.append(function["name"])
+        elif isinstance(tool.get("name"), str):
+            names.append(tool["name"])
+        elif isinstance(tool.get("type"), str):
+            names.append(tool["type"])
+    return list(dict.fromkeys(names))
+
+
 # ---------------------------------------------------------------------------
 # Chat completions endpoint
 # ---------------------------------------------------------------------------
@@ -103,6 +123,69 @@ async def chat_completions(request: Request) -> Response:
     # tool result — but the scenario is still identified by the original trigger.
     first_msg = _first_user_message(messages)
     last_msg = _last_user_message(messages)
+
+    if model == PTC_POLICY_MODEL:
+        try:
+            content, _assessment_trace = build_ptc_policy_assessment(
+                messages, body.get("response_format")
+            )
+        except ValueError as exc:
+            return JSONResponse(
+                {"error": {"message": str(exc), "type": "invalid_test_policy_schema"}},
+                status_code=503,
+            )
+        turn_index = _conversation_turn_index(messages)
+        _catalog.record_request(
+            {
+                "model": model,
+                "messages_count": len(messages),
+                "first_user_message": first_msg[:200],
+                "last_user_message": last_msg[:200],
+                "turn_index": turn_index,
+                "stream": stream,
+                "policy_model": True,
+                "exposed_tool_names": _exposed_tool_names(body),
+            },
+            None,
+        )
+        if stream:
+
+            async def _policy_stream() -> Any:
+                chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": content},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                yield f"data: {json.dumps({**chunk, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(_policy_stream(), media_type="text/event-stream")
+        return JSONResponse(
+            {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            }
+        )
+
     scenario = _catalog.resolve(first_msg) or _catalog.resolve(last_msg)
     scenario_id = scenario.get("id") if scenario else None
 
@@ -114,11 +197,13 @@ async def chat_completions(request: Request) -> Response:
 
     _catalog.record_request(
         {
+            "model": model,
             "messages_count": len(messages),
             "first_user_message": first_msg[:200],
             "last_user_message": last_msg[:200],
             "turn_index": turn_index,
             "stream": stream,
+            "exposed_tool_names": _exposed_tool_names(body),
         },
         scenario_id,
     )
@@ -231,7 +316,12 @@ async def responses_api(request: Request) -> Response:
     model = body.get("model", "mock-model")
 
     # Reuse chat completions logic
-    fake_request_body = {"messages": messages, "model": model, "stream": stream}
+    fake_request_body = {
+        "messages": messages,
+        "model": model,
+        "stream": stream,
+        "tools": body.get("tools", []),
+    }
     fake_request = Request(request.scope, request.receive)
     fake_request._body = json.dumps(fake_request_body).encode()
 
@@ -290,6 +380,7 @@ async def list_models(request: Request) -> Response:
             "data": [
                 {"id": "mock-model", "object": "model", "created": 0, "owned_by": "mock"},
                 {"id": "mock-embedding", "object": "model", "created": 0, "owned_by": "mock"},
+                {"id": PTC_POLICY_MODEL, "object": "model", "created": 0, "owned_by": "mock"},
             ],
         }
     )

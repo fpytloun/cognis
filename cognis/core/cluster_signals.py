@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import random
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
 from time import monotonic
@@ -98,6 +99,8 @@ class ClusterSignalKind(StrEnum):
     EVENT_STORE_SESSION_INVALIDATED = "event_store_session_invalidated"
     WORK_INVALIDATED = "work_invalidated"
     TURN_CANCEL_REQUESTED = "turn_cancel_requested"
+    USAGE_CHANGED = "usage_changed"
+    USAGE_PRICING_CHANGED = "usage_pricing_changed"
 
 
 class ClusterEventStoreId(StrEnum):
@@ -133,6 +136,11 @@ class ClusterSignal(BaseModel):
 
     @model_validator(mode="after")
     def _validate_event_store_scope(self) -> ClusterSignal:
+        if self.kind in (
+            ClusterSignalKind.USAGE_CHANGED,
+            ClusterSignalKind.USAGE_PRICING_CHANGED,
+        ) and self.scope.model_dump(exclude_none=True):
+            raise ValueError("Usage wake scope must be identity-free")
         event_scope = (self.scope.event_store_id, self.scope.event_session_token)
         if self.kind == ClusterSignalKind.EVENT_STORE_SESSION_INVALIDATED:
             if any(value is None for value in event_scope):
@@ -235,6 +243,8 @@ class ClusterSignalService:
         enabled: bool = True,
         event_store: Any = None,
         owner_token_secret: str = "",
+        usage_waker: Callable[[], None] | None = None,
+        usage_pricing_waker: Callable[[], None] | None = None,
     ) -> None:
         self.enabled = enabled and database_url.startswith(
             ("postgresql://", "postgresql+asyncpg://")
@@ -244,6 +254,8 @@ class ClusterSignalService:
         self._event_bus = event_bus
         self._scope_provider = scope_provider
         self._event_store = event_store
+        self._usage_waker = usage_waker
+        self._usage_pricing_waker = usage_pricing_waker
         self._owner_token_secret = owner_token_secret.encode("utf-8")
         self._transport = transport or (
             AsyncpgClusterSignalTransport(database_url) if self.enabled else None
@@ -494,6 +506,14 @@ class ClusterSignalService:
             return
         if signal.origin_controller_id == self.controller_id:
             return
+        if signal.kind == ClusterSignalKind.USAGE_CHANGED:
+            if self._usage_waker is not None:
+                self._usage_waker()
+            return
+        if signal.kind == ClusterSignalKind.USAGE_PRICING_CHANGED:
+            if self._usage_pricing_waker is not None:
+                self._usage_pricing_waker()
+            return
         key = (signal.kind, signal.scope.model_dump_json(exclude_none=True), signal.revision)
         if key in self._dedup:
             self._dedup.move_to_end(key)
@@ -609,6 +629,12 @@ class ClusterSignalService:
         while not self._stopping.is_set():
             try:
                 connection = await self._transport.listen(CHANNEL, self.receive_payload)
+                # Indexed usage catch-up runs only after a real LISTEN connection,
+                # not in subscribed-UI-scope periodic reconciliation.
+                if self._usage_waker is not None:
+                    self._usage_waker()
+                if self._usage_pricing_waker is not None:
+                    self._usage_pricing_waker()
                 failures = 0
                 self._reconcile_now.set()
                 while not self._stopping.is_set() and not connection.is_closed():

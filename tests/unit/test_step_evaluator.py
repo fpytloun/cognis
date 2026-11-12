@@ -574,7 +574,7 @@ async def test_evaluator_prompt_includes_full_long_content() -> None:
     prompt = str(capture.messages[1]["content"])
     assert "### Strengths" in prompt
     assert "### Verdict" in prompt
-    assert "truncated" not in prompt
+    assert long_review in prompt
 
 
 @pytest.mark.asyncio
@@ -595,12 +595,11 @@ async def test_evaluator_prompt_explicitly_allows_success_for_review_steps() -> 
     assert result.decision == "approved"
     assert capture.messages is not None
     prompt = str(capture.messages[1]["content"])
-    assert 'outcome of "success"' in prompt
-    assert '"rejected"' in prompt
-    assert '"failed"' in prompt
-    assert "Success is valid when the review approves the plan or work" in prompt
-    assert 'self-reported outcome of "failed"' in prompt
-    assert "workflow can continue" in prompt
+    assert "A correct review may reject the work it" in prompt
+    assert "negative business result does not by itself mean the review failed" in prompt
+    assert "Do not presume success or failure" in prompt
+    assert "request a specific revision for recoverable missing work" in prompt
+    assert "fail when completion is impossible under current authority or constraints" in prompt
 
 
 @pytest.mark.asyncio
@@ -638,7 +637,13 @@ async def test_evaluator_prompt_separates_prose_metadata_and_execution_evidence(
     assert "step_complete metadata:" in prompt
     assert "Notification:" in prompt
     assert "Execution evidence:" in prompt
-    assert "require step_complete metadata" in prompt
-    assert "Expected output as strong guidance for output shape" in prompt
-    assert "Silent completion can be valid" in prompt
-    assert "Direct completion can also be valid" in prompt
+    assert (
+        "Do not demand raw transcript duplication or metadata inside the written deliverable"
+        in prompt
+    )
+    assert "Preserve substantive requirements in Expected output" in prompt
+    assert (
+        "Permitted silence or direct delivery changes notification, not completion criteria"
+        in prompt
+    )
+    assert "inspect their results before concluding it succeeded" in prompt

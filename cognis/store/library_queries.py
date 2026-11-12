@@ -8,6 +8,8 @@ from typing import Any
 import sqlalchemy as sa
 from sqlalchemy.orm import InstrumentedAttribute, aliased
 
+from cognis.store.document_people import user_grant_clause
+from cognis.store.document_visibility import unmanaged_deliverable_clause
 from cognis.store.models import (
     DELIVERABLE_LIVE_STATUSES,
     Agent,
@@ -58,13 +60,8 @@ def human_content_clause(model: Any, user_email: str) -> Any:
                 .where(Task.visibility == "project", Task.project_id.in_(projects))
             ),
         )
-        shared = sa.and_(
-            shared,
-            ~sa.exists().where(
-                ManagedConversationLink.target_conversation_id == model.conversation_id
-            ),
-        )
-    return sa.or_(model.owner_email == user_email, shared)
+        shared = sa.and_(shared, unmanaged_deliverable_clause(model))
+    return sa.or_(model.owner_email == user_email, shared, user_grant_clause(model, user_email))
 
 
 def discoverable_content_clause(model: Any, *, exact: bool = False) -> Any:
@@ -136,9 +133,20 @@ def content_origin_clause(model: Any) -> Any:
     )
 
 
-def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
-    """Normalized metadata projection. Never reads object storage or message content."""
+def library_items(
+    user_email: str, kind: str, *, exact: bool = False, ref_id: str | None = None
+) -> Any:
+    """Normalized metadata projection. Never reads object storage or message content.
+
+    ``ref_id`` limits the projection, including its recursive producer lookup, to one
+    document. The recursive CTE is always materialized, so an unrestricted seed would
+    walk every readable document's sessions for a single-item read.
+    """
     model = DeliverableRow if kind == "deliverable" else ArtifactRecordRow
+    key_column = (
+        DeliverableRow.deliverable_id if kind == "deliverable" else ArtifactRecordRow.artifact_id
+    )
+    only_ref = key_column == ref_id if ref_id is not None else sa.true()
     # Match work_project's bounded parent-session lookup, including specialist
     # output. Keep one nearest task per producer instead of multiplying rows.
     parent = aliased(Session)
@@ -152,7 +160,7 @@ def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
         )
         .where(
             Session.session_id.in_(
-                sa.select(model.session_id).where(human_content_clause(model, user_email))
+                sa.select(model.session_id).where(only_ref, human_content_clause(model, user_email))
             )
         )
         .cte("library_session_ancestors", recursive=True)
@@ -174,20 +182,45 @@ def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
         )
         .where(ancestors.c.depth < 15)
     )
-    session_task_id = (
-        sa.select(StepRun.task_id)
-        .join(ancestors, ancestors.c.session_id == StepRun.session_id)
-        .join(Task, Task.task_id == StepRun.task_id)
-        .where(
-            ancestors.c.producer_id == model.session_id,
-            ancestors.c.user_email == model.owner_email,
-            Task.created_by == model.owner_email,
+    # Resolve the nearest owned task once per producer session. A correlated
+    # lookup rescans the whole ancestor CTE for every readable document.
+    ancestor_run = aliased(StepRun)
+    ancestor_task = aliased(Task)
+    # Partition by task creator and collapse groups with an aggregate rather than
+    # filtering: filters on the creator or row number make PostgreSQL estimate a
+    # handful of rows and rescan the result per document in a nested loop.
+    ranked = (
+        sa.select(
+            ancestors.c.producer_id,
+            ancestors.c.user_email,
+            ancestor_task.created_by,
+            ancestor_run.task_id,
+            sa.func.row_number()
+            .over(
+                partition_by=(
+                    ancestors.c.producer_id,
+                    ancestors.c.user_email,
+                    ancestor_task.created_by,
+                ),
+                order_by=(ancestors.c.depth, ancestor_run.step_run_id),
+            )
+            .label("nearest"),
         )
-        .order_by(ancestors.c.depth, StepRun.step_run_id)
-        .limit(1)
-        .correlate(model)
-        .scalar_subquery()
+        .join(ancestor_run, ancestor_run.session_id == ancestors.c.session_id)
+        .join(ancestor_task, ancestor_task.task_id == ancestor_run.task_id)
+        .subquery()
     )
+    producer_task = (
+        sa.select(
+            ranked.c.producer_id,
+            ranked.c.user_email,
+            ranked.c.created_by,
+            sa.func.min(sa.case((ranked.c.nearest == 1, ranked.c.task_id))).label("task_id"),
+        )
+        .group_by(ranked.c.producer_id, ranked.c.user_email, ranked.c.created_by)
+        .subquery("library_producer_task")
+    )
+    session_task_id = producer_task.c.task_id
     ref = DeliverableRow.deliverable_id if kind == "deliverable" else ArtifactRecordRow.artifact_id
     projects = readable_projects(user_email)
     source_readable = sa.or_(
@@ -229,6 +262,8 @@ def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
             "format"
         ),
         model.owner_email,
+        model.author_email,
+        model.author_agent_id,
         model.owner_agent_id.label("agent_id"),
         sa.func.coalesce(Agent.display_name, Agent.name).label("agent_name"),
         project_id.label("project_id"),
@@ -256,6 +291,14 @@ def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
             Conversation,
             sa.and_(Conversation.conversation_id == model.conversation_id, source_readable),
         )
+        .outerjoin(
+            producer_task,
+            sa.and_(
+                producer_task.c.producer_id == model.session_id,
+                producer_task.c.user_email == model.owner_email,
+                producer_task.c.created_by == model.owner_email,
+            ),
+        )
     )
     if kind == "deliverable":
         stmt = stmt.outerjoin(StepRun, StepRun.step_run_id == DeliverableRow.step_run_id).outerjoin(
@@ -272,7 +315,7 @@ def library_items(user_email: str, kind: str, *, exact: bool = False) -> Any:
             sa.and_(ProjectRow.project_id == project_id, ProjectRow.project_id.in_(projects)),
         )
         .outerjoin(Agent, Agent.agent_id == model.owner_agent_id)
-        .where(human_content_clause(model, user_email))
+        .where(only_ref, human_content_clause(model, user_email))
     )
     stmt = stmt.where(discoverable_content_clause(model, exact=exact))
     return stmt.subquery()

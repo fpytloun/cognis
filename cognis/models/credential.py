@@ -49,6 +49,8 @@ class CredentialResolution(BaseModel):
     credential_id: str
     field: str | None = None
     value: Any
+    version: int = 1
+    instance_id: str | None = None
 
 
 class CredentialAccessError(Exception):

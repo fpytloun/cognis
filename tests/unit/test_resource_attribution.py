@@ -199,6 +199,31 @@ def test_stack_metadata_is_detached_before_thread_stat_io(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_loop_delay_is_measured_without_claiming_cpu_time(monkeypatch) -> None:
+    sampler = attribution.ResourceAttribution(configured=True, duration=1)
+    clock = [0.0]
+    monkeypatch.setattr(attribution.time, "monotonic", lambda: clock[0])
+    calls = 0
+
+    async def delayed_wait(awaitable, *, timeout):
+        nonlocal calls
+        awaitable.close()
+        clock[0] += timeout + 0.020
+        calls += 1
+        if calls == 3:
+            sampler._stop.set()
+        raise TimeoutError
+
+    monkeypatch.setattr(attribution.asyncio, "wait_for", delayed_wait)
+    await sampler._observe_loop_delay()
+    result = sampler.report["event_loop"]
+    assert result["kind"] == "scheduling_delay_not_cpu_time"
+    assert result["samples"] == 2
+    assert result["max_delay_seconds"] == pytest.approx(0.020)
+    assert sum(result["bucket_counts"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_active_stop_joins_and_measurement_failure_is_fail_open(monkeypatch) -> None:
     monkeypatch.setenv("COGNIS_RESOURCE_PROFILING", "true")
     monkeypatch.delenv("COGNIS_RESOURCE_PROFILE_POD", raising=False)

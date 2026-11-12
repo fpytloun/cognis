@@ -21,25 +21,25 @@ async def test_image_generate_forwards_multiple_images_and_mask(
         def model_dump(self) -> dict[str, object]:
             return {"data": [{"b64_json": "YWJj"}]}
 
-    async def fake_aimage_generation(**kwargs: object) -> _Response:
+    async def fake_aimage_edit(**kwargs: object) -> _Response:
         captured.update(kwargs)
         return _Response()
 
     monkeypatch.setattr(
-        "cognis.executor.backends.litellm.litellm.aimage_generation",
-        fake_aimage_generation,
+        "cognis.executor.backends.litellm.litellm.aimage_edit",
+        fake_aimage_edit,
     )
 
     result = await handler.image_generate(
         prompt="Combine the images.",
         model="gpt-image-2",
-        images=[ImageInput(b64_json="first"), ImageInput(b64_json="second")],
-        mask=ImageInput(b64_json="mask"),
+        images=[ImageInput(b64_json="YWJj"), ImageInput(b64_json="ZGVm")],
+        mask=ImageInput(b64_json="bWFzaw=="),
         request_kwargs={},
     )
 
-    assert captured["image"] == ["first", "second"]
-    assert captured["mask"] == "mask"
+    assert captured["image"] == [b"abc", b"def"]
+    assert captured["mask"] == b"mask"
     assert result == {
         "images": [
             {

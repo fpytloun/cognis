@@ -23,6 +23,19 @@ class TestAgentCapabilities:
         assert cap.guardrails_backend == "intaris"
         assert cap.memory_enabled is True
         assert cap.guardrails_enabled is True
+        assert cap.analytics_enabled is True
+
+    @pytest.mark.parametrize("backend", ["none", "intaris"])
+    @pytest.mark.parametrize("analytics", [False, True])
+    def test_analytics_is_independent(self, backend, analytics) -> None:
+        cap = AgentCapabilities(guardrails_backend=backend, analytics_enabled=analytics)
+        assert cap.analytics_enabled is analytics
+        assert AgentCapabilities.model_validate(cap.model_dump()).analytics_enabled is analytics
+
+    @pytest.mark.parametrize("value", [None, "false", 0, 1])
+    def test_analytics_requires_boolean(self, value) -> None:
+        with pytest.raises(ValueError):
+            AgentCapabilities(analytics_enabled=value)
 
     def test_none_backends(self) -> None:
         cap = AgentCapabilities(memory_backend="none", guardrails_backend="none")

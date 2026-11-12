@@ -602,6 +602,7 @@ def _project_exact_file_diff(
     fact: WorkRecordFileRow,
     scope: Any,
     projection_version: str,
+    activity_scope_id: str | None = None,
 ) -> FileDiffRef | None:
     source_item = next(
         (
@@ -613,9 +614,17 @@ def _project_exact_file_diff(
     )
     if source_item is None or file_ordinal >= len(source_item.file_diffs):
         return None
-    selected_item = source_item.model_copy(
-        update={"file_diffs": [source_item.file_diffs[file_ordinal]]}
+    from cognis.api.chat_v2.feedback_evidence import bind_feedback_diff
+
+    source = next((ref for ref in source_item.source_refs if ref.seq == fact.source_seq), None)
+    selected = bind_feedback_diff(
+        source_item.file_diffs[file_ordinal],
+        activity_scope_id=activity_scope_id,
+        source=source,
+        source_item_id=source_item_id,
+        file_ordinal=file_ordinal,
     )
+    selected_item = source_item.model_copy(update={"file_diffs": [selected]})
     projection = build_work_projection(
         scope=scope,
         projection_version=projection_version,
@@ -808,6 +817,7 @@ async def work_file_history(
             fact=fact,
             scope=payload.scope,
             projection_version=WORK_MATERIALIZER_VERSION,
+            activity_scope_id=session.activity_scope_id,
         )
         if diff is None:
             raise api_exception(

@@ -280,6 +280,14 @@ class VideoJobStore:
     async def record_result(self, attempt_id: str, result: VideoRemoteResult) -> None:
         """Late workers may record evidence, but cannot publish or resubmit."""
         async with self.session_factory() as session:
+            job_id = await session.scalar(
+                select(VideoAttemptRow.job_id).where(VideoAttemptRow.attempt_id == attempt_id)
+            )
+            if job_id is None:
+                return
+            # Match admission's job -> attempt lock order and fence Usage's
+            # settled marker against newly arriving provider evidence.
+            job = await session.get(VideoJobRow, job_id, with_for_update=True)
             row = await session.scalar(
                 select(VideoAttemptRow)
                 .where(VideoAttemptRow.attempt_id == attempt_id)
@@ -293,6 +301,26 @@ class VideoJobStore:
                 or (previous["state"] != "running" and result.state == "running")
             ):
                 return
+            if previous:
+                old = VideoRemoteResult.model_validate(previous)
+                result = result.model_copy(
+                    update={
+                        name: getattr(result, name)
+                        if getattr(result, name) is not None
+                        else getattr(old, name)
+                        for name in ("cost_usd", "output_duration_ms")
+                    }
+                )
+            if (
+                job is not None
+                and "usage_origin" in job.binding
+                and (
+                    (previous or {}).get("cost_usd")
+                    != (str(result.cost_usd) if result.cost_usd is not None else None)
+                    or (previous or {}).get("output_duration_ms") != result.output_duration_ms
+                )
+            ):
+                job.binding = {**job.binding, "usage_settled": False}
             await session.execute(
                 update(VideoAttemptRow)
                 .where(

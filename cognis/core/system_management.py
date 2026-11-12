@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any
@@ -56,6 +57,7 @@ class SystemManagementDependencies:
     provider_test_cooldowns: dict[str, float]
     provider_test_results: dict[str, Any]
     step_profiles: StepProfileManagement | None = None
+    usage_price_publisher: Any | None = None
 
 
 _SECRET_KEYS = frozenset(
@@ -111,7 +113,21 @@ class _OAuthResponse:
     status: LLMProviderOAuthStatusResponse
 
 
+@dataclass(frozen=True)
+class _ExecutorProvisioningResponse:
+    payload: dict[str, Any]
+
+
 def _output(value: Any) -> Any:
+    if isinstance(value, _ExecutorProvisioningResponse):
+        payload = dict(value.payload)
+        reference = payload.pop("token_ref")
+        if not isinstance(reference, str) or not re.fullmatch(
+            r"\$credential:executor-token-[0-9a-f]{32}\.token", reference
+        ):
+            raise ValueError("Invalid executor provisioning reference")
+        # Only this typed operation may return its generated, value-free reference.
+        return {**_output(payload), "token_ref": reference}
     if isinstance(value, _OAuthResponse):
         status = value.status.model_dump(mode="json")
         urls = {}
@@ -150,7 +166,7 @@ async def handle_system_management_tool(
         )
     actor = ManagementActor(user.email, user.role)
     try:
-        value = await _dispatch(name, arguments, deps, actor)
+        value = await _dispatch(name, arguments, deps, actor, agent_id=access.agent_id or "")
         return ToolResult(output=json.dumps(_output(value), sort_keys=True))
     except HTTPException as exc:
         detail = (
@@ -173,7 +189,12 @@ async def handle_system_management_tool(
 
 
 async def _dispatch(
-    name: str, args: dict[str, Any], deps: SystemManagementDependencies, actor: ManagementActor
+    name: str,
+    args: dict[str, Any],
+    deps: SystemManagementDependencies,
+    actor: ManagementActor,
+    *,
+    agent_id: str,
 ) -> Any:
     action = args["action"]
     if name == "manage_providers":
@@ -181,7 +202,7 @@ async def _dispatch(
     if name == "manage_routes":
         return await _routes(action, args, deps, actor)
     if name == "manage_executors":
-        return await _executors(action, args, deps, actor)
+        return await _executors(action, args, deps, actor, agent_id=agent_id)
     if name == "manage_settings":
         return await _settings(action, args, deps, actor)
     raise ValueError("Unknown management tool")
@@ -202,7 +223,9 @@ async def _providers(
                 session, acting_user_email=actor.email, include_inactive=True
             )
         return [llm_provider_to_response(row) for row in rows]
-    service = ProviderManagement(deps.session_factory, deps.llm)
+    service = ProviderManagement(
+        deps.session_factory, deps.llm, usage_price_publisher=deps.usage_price_publisher
+    )
     preview = args.get("preview", False)
     if action == "create":
         payload = LLMProviderRequest.model_validate(
@@ -258,7 +281,11 @@ async def _providers(
             raise api_exception(429, "rate_limited", "Provider test cooldown is still active")
         deps.provider_test_cooldowns[provider_id] = monotonic()
         try:
-            result = await deps.llm.test_provider(provider_id, timeout_seconds=15)
+            result = await deps.llm.test_provider(
+                provider_id,
+                timeout_seconds=15,
+                acting_user_email=actor.email,
+            )
         finally:
             deps.provider_test_cooldowns[provider_id] = monotonic()
         deps.provider_test_results[provider_id] = result
@@ -370,14 +397,19 @@ async def _routes(
 
 
 async def _executors(
-    action: str, args: dict[str, Any], deps: SystemManagementDependencies, actor: ManagementActor
+    action: str,
+    args: dict[str, Any],
+    deps: SystemManagementDependencies,
+    actor: ManagementActor,
+    *,
+    agent_id: str,
 ) -> Any:
     service = executor_management
     if action == "schema":
         return {
             "create": ExecutorCreateRequest.model_json_schema(),
             "update": ExecutorUpdateRequest.model_json_schema(),
-            "tokens": "Provision and rotate persistent tokens through the secure Settings UI, never agent history.",
+            "tokens": "Use provision_token for an encrypted agent-scoped reference, or the secure Settings UI for manual rotation.",
         }
     if action == "list":
         return await service.list_executors_route(deps.executors, actor)
@@ -418,6 +450,17 @@ async def _executors(
         return {"preview": preview, "deleted": not preview}
     elif action == "reconfigure":
         return await service.reconfigure_executor_route(deps.executors, actor, args["executor_id"])
+    elif action == "provision_token":
+        return _ExecutorProvisioningResponse(
+            await service.provision_executor_token(
+                deps.executors,
+                actor,
+                args["executor_id"],
+                agent_id=agent_id,
+                operation_id=args["operation_id"],
+                expected_updated_at=args["expected_updated_at"],
+            )
+        )
     else:
         raise ValueError("Unknown executor operation")
     return {"preview": preview, "executor": result}

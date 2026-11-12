@@ -43,8 +43,9 @@ from cognis.store.queries import topic_conversation_clause, visible_agent_ids
 
 Kind = Literal["agent", "project", "conversation", "task", "schedule", "deliverable", "artifact"]
 MAX_PAGE = 40
-DB_TIMEOUT_SECONDS = 2.0
-OPERATION_TIMEOUT_SECONDS = 3.0
+RELEVANCE_QUERY_LENGTH = 3
+DB_TIMEOUT_SECONDS = 10.0
+OPERATION_TIMEOUT_SECONDS = 15.0
 
 
 class InvalidPaletteCursor(ValueError):
@@ -222,6 +223,9 @@ async def search(
     terms = tokens(_plain(query))
     if (query and not terms) or kinds == []:
         return PalettePage(items=[])
+    # Blank and one- or two-letter queries cannot express relevance; they act as
+    # a quick switcher over the most recently updated destinations of every kind.
+    recent = len(query) < RELEVANCE_QUERY_LENGTH
     scope = _scope(user_email, query, kinds)
     after = _decode(cursor, scope)
     dialect = session.get_bind().dialect.name
@@ -328,43 +332,42 @@ async def search(
             if model is Agent
             else sa.func.coalesce(name, "Untitled")
         )
-        lower = sa.func.lower(title)
-        rank: sa.ColumnElement[int] = (
-            sa.case(
-                (lower == query.lower(), 0),
-                (_indexed(model, kind, ref, name, terms, dialect, approximate=False), 20),
-                else_=200,
-            )
-            if terms
-            else sa.literal(0)
-        )
         origin = (
             content_origin_clause(model)
             if model in (DeliverableRow, ArtifactRecordRow)
             else sa.null()
         )
-        # A word match anywhere outranks anchored typo candidates. Operational
-        # destinations beat file floods within that band, before update time.
-        priority = {
-            "agent": 0,
-            "project": 1,
-            "task": 2,
-            "schedule": 3,
-            "conversation": 4,
-            "deliverable": 5,
-            "artifact": 6,
-        }
-        rank = (
-            rank
-            + priority[kind] * 4
-            + (sa.case((origin == "agent", 0), else_=1) if model is ArtifactRecordRow else 0)
-        )
-        if model is Task:
-            rank = rank + sa.case(
-                (Task.status.in_(["pending", "running", "waiting", "paused"]), 0), else_=1
+        rank: sa.ColumnElement[int] = sa.literal(0)
+        if not recent:
+            rank = sa.case(
+                (sa.func.lower(title) == query.lower(), 0),
+                (_indexed(model, kind, ref, name, terms, dialect, approximate=False), 20),
+                else_=200,
             )
-        if kind in ("artifact", "deliverable") and (
-            kinds is None or set(kinds) - {"artifact", "deliverable"}
+            # A word match anywhere outranks anchored typo candidates. Operational
+            # destinations beat file floods within that band, before update time.
+            priority = {
+                "agent": 0,
+                "project": 1,
+                "task": 2,
+                "schedule": 3,
+                "conversation": 4,
+                "deliverable": 5,
+                "artifact": 6,
+            }
+            rank = (
+                rank
+                + priority[kind] * 4
+                + (sa.case((origin == "agent", 0), else_=1) if model is ArtifactRecordRow else 0)
+            )
+            if model is Task:
+                rank = rank + sa.case(
+                    (Task.status.in_(["pending", "running", "waiting", "paused"]), 0), else_=1
+                )
+        if (
+            not recent
+            and kind in ("artifact", "deliverable")
+            and (kinds is None or set(kinds) - {"artifact", "deliverable"})
         ):
             # Promote only a small content head when operational destinations
             # are enabled. Compute it before seek/limit so every remaining file
@@ -411,7 +414,10 @@ async def search(
         ).where(accessible, _seek(rank, updated, kind, ref, after))
         if terms:
             stmt = stmt.where(_indexed(model, kind, ref, name, terms, dialect))
-        branches.append(stmt.order_by(rank, updated.desc(), ref).limit(limit + 1).subquery())
+        # A constant recent-mode rank stays out of the branch order so the
+        # planner can stop at the newest accessible rows.
+        order = (updated.desc(), ref) if recent else (rank, updated.desc(), ref)
+        branches.append(stmt.order_by(*order).limit(limit + 1).subquery())
     rows = sa.union_all(*(sa.select(branch) for branch in branches)).subquery()
     page = (
         sa.select(rows)
@@ -522,7 +528,7 @@ async def search(
 class PaletteAdmission:
     """Per-controller admission without a waiter queue or unbounded per-user state."""
 
-    def __init__(self, *, per_user_rate: int = 4, global_rate: int = 12) -> None:
+    def __init__(self, *, per_user_rate: int = 8, global_rate: int = 24) -> None:
         self.active: set[str] = set()
         self.limit = 4
         self.per_user_rate = per_user_rate

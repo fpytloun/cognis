@@ -104,7 +104,7 @@ class HookRuntime:
         self.agent_loop: Any = None
         self._idle_evidence: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
         self._idle_recovery_cursor = ""
-        self._run_recovery_cursors = {"ready": "", "waiting": ""}
+        self._run_recovery_cursors = {"owned": "", "ready": "", "waiting": ""}
         event_bus.subscribe(EventType.TURN_COMPLETED, self._on_completed)
         event_bus.subscribe(EventType.TURN_ERROR, self._on_error)
         event_bus.subscribe(EventType.TURN_STARTED, self._on_activity)
@@ -1172,52 +1172,56 @@ class HookRuntime:
 
     async def scan(self) -> None:
         """Startup/slow recovery only: rediscover deadlines and missed execution signals."""
-        await self._match_idle(recovery=True)
-        async with self.session_factory() as db:
-            active = aliased(AgentHookRunRow)
-            blocked = and_(
-                AgentHookRunRow.status == "pending",
-                AgentHookRunRow.configuration["mode"].as_string() == "fork",
-                exists(
-                    select(active.run_id).where(
-                        active.fork_slot.is_not(None),
-                        active.run_id != AgentHookRunRow.run_id,
-                        active.owner_email == AgentHookRunRow.owner_email,
-                        active.agent_id == AgentHookRunRow.agent_id,
-                        active.conversation_id == AgentHookRunRow.conversation_id,
-                    )
-                ),
-            )
-            ready = and_(
+        active = aliased(AgentHookRunRow)
+        blocked = and_(
+            AgentHookRunRow.status == "pending",
+            AgentHookRunRow.configuration["mode"].as_string() == "fork",
+            exists(
+                select(active.run_id).where(
+                    active.fork_slot.is_not(None),
+                    active.run_id != AgentHookRunRow.run_id,
+                    active.owner_email == AgentHookRunRow.owner_email,
+                    active.agent_id == AgentHookRunRow.agent_id,
+                    active.conversation_id == AgentHookRunRow.conversation_id,
+                )
+            ),
+        )
+        ready = and_(
+            AgentHookRunRow.status.in_(["preparing", "pending", "dispatching", "running"]),
+            func.coalesce(AgentHookRunRow.handoff["execution"]["phase"].as_string(), "")
+            != "terminal",
+        )
+        candidates = select(AgentHookRunRow).where(
+            or_(
                 AgentHookRunRow.status.in_(["preparing", "pending", "dispatching", "running"]),
-                func.coalesce(AgentHookRunRow.handoff["execution"]["phase"].as_string(), "")
-                != "terminal",
-            )
-            candidates = select(AgentHookRunRow).where(
-                or_(
-                    AgentHookRunRow.status.in_(["preparing", "pending", "dispatching", "running"]),
-                    AgentHookRunRow.lifecycle_pending.is_(True),
-                    AgentHookRunRow.handoff["settlement_pending"].as_boolean().is_(True),
-                    AgentHookRunRow.fork_slot.is_not(None),
-                ),
-                not_(blocked),
-            )
-            runs = []
-            # Independent rotating pages keep failed card delivery and cooldown
-            # timers from starving due execution (or each other) after a restart.
-            for group, predicate in (("ready", ready), ("waiting", not_(ready))):
+                AgentHookRunRow.lifecycle_pending.is_(True),
+                AgentHookRunRow.handoff["settlement_pending"].as_boolean().is_(True),
+                AgentHookRunRow.fork_slot.is_not(None),
+            ),
+            not_(blocked),
+        )
+        # Owned executions must recover before idle evidence can exhaust the
+        # maintenance pass. Admit newly matched occurrences in the same pass.
+        # Independent rotating pages preserve fairness for all three groups.
+        for group, predicate in (
+            ("owned", and_(ready, AgentHookRunRow.fork_slot.is_not(None))),
+            ("ready", and_(ready, AgentHookRunRow.fork_slot.is_(None))),
+            ("waiting", not_(ready)),
+        ):
+            if group == "ready":
+                await self._match_idle(recovery=True)
+            async with self.session_factory() as db:
                 query = candidates.where(predicate).order_by(AgentHookRunRow.run_id).limit(100)
                 cursor = self._run_recovery_cursors[group]
                 page = (await db.scalars(query.where(AgentHookRunRow.run_id > cursor))).all()
                 if not page and cursor:
                     page = (await db.scalars(query)).all()
                 self._run_recovery_cursors[group] = page[-1].run_id if page else ""
-                runs.extend(page)
-        for run in runs:
-            if self._started and internal_execution(run):
-                self._wake_run(run.run_id)
-            else:
-                await self._run(run.run_id)
+            for run in page:
+                if self._started and internal_execution(run):
+                    self._wake_run(run.run_id)
+                else:
+                    await self._run(run.run_id)
 
     async def _process_run(self, run: Any) -> None:
         try:

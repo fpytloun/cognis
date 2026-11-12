@@ -65,6 +65,39 @@ async def catalog(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model_id", ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"])
+async def test_gpt_image_26_catalog_picker_and_routing(catalog, model_id, usage_capture):
+    async with catalog() as session:
+        row = await session.get(LLMProvider, "openai")
+        row.config = {"preset": "openai", "models": [{"model_id": model_id}]}
+        await session.commit()
+    provider = LLMService(catalog, usage_capture=usage_capture)
+    info = await provider.get_model_info(model_id, provider_id="openai")
+    assert info.model_mode == "image_generation"
+    assert info.supports_image_generation is True
+    assert info.supports_tools is False
+    tools = await enrich_image_tool_model_descriptions(
+        [IMAGE_GENERATE_TOOL, IMAGE_EDIT_TOOL], provider, acting_user_email="alice@example.com"
+    )
+    for tool in tools:
+        assert tool.parameters["properties"]["model"]["enum"] == [
+            "gemini/gemini-nano-banana-2.1",
+            f"openai/{model_id}",
+            "personal/gpt-image-personal",
+        ]
+    plan = await provider.inference_plan(
+        model=f"openai/{model_id}",
+        task_type="image_generation",
+        acting_user_email="alice@example.com",
+    )
+    assert plan.candidates[0].target.reference == f"openai/{model_id}"
+    assert await provider.resolve_model_target(model_id, task_type="image_generation") == (
+        model_id,
+        "openai",
+    )
+
+
+@pytest.mark.asyncio
 async def test_model_list_filters_inactive_and_invisible_providers(catalog):
     provider = LiteLLMProvider(catalog)
     assert {model["provider_id"] for model in await provider.list_models()} == {
@@ -91,8 +124,10 @@ async def test_model_list_filters_inactive_and_invisible_providers(catalog):
         (None, ("gemini-nano-banana-2.1", "gemini")),
     ],
 )
-async def test_image_model_target_resolves_references(catalog, provider_class, reference, expected):
-    provider = provider_class(catalog)
+async def test_image_model_target_resolves_references(
+    catalog, provider_class, reference, expected, usage_capture
+):
+    provider = provider_class(catalog, usage_capture=usage_capture)
     assert await provider.resolve_model_target(reference, task_type="image_generation") == expected
     if reference:
         assert await provider.resolve_model_reference(reference) == expected
@@ -102,14 +137,14 @@ async def test_image_model_target_resolves_references(catalog, provider_class, r
 @pytest.mark.parametrize(
     "reference", ["litellm/gpt-image-2", "private/gpt-image-private", "gpt-image-private"]
 )
-async def test_image_model_target_rejects_unavailable_references(catalog, reference):
-    provider = LLMService(catalog)
+async def test_image_model_target_rejects_unavailable_references(catalog, reference, usage_capture):
+    provider = LLMService(catalog, usage_capture=usage_capture)
     with pytest.raises(ValueError, match="No inference provider configured"):
         await provider.inference_plan(model=reference, task_type="image_generation")
 
 
 @pytest.mark.asyncio
-async def test_image_model_target_reports_ambiguous_bare_id(catalog):
+async def test_image_model_target_reports_ambiguous_bare_id(catalog, usage_capture):
     async with catalog() as session:
         session.add(
             LLMProvider(
@@ -122,7 +157,7 @@ async def test_image_model_target_reports_ambiguous_bare_id(catalog):
             )
         )
         await session.commit()
-    provider = LLMService(catalog)
+    provider = LLMService(catalog, usage_capture=usage_capture)
     with pytest.raises(ValueError, match="ambiguous.*openai/gpt-image-2.5-sunburst"):
         await provider.resolve_model_target("gpt-image-2.5-sunburst", task_type="image_generation")
     assert await provider.resolve_model_target(
@@ -131,8 +166,8 @@ async def test_image_model_target_reports_ambiguous_bare_id(catalog):
 
 
 @pytest.mark.asyncio
-async def test_image_tool_enum_contains_only_usable_qualified_references(catalog):
-    provider = LLMService(catalog)
+async def test_image_tool_enum_contains_only_usable_qualified_references(catalog, usage_capture):
+    provider = LLMService(catalog, usage_capture=usage_capture)
     tools = await enrich_image_tool_model_descriptions(
         [IMAGE_GENERATE_TOOL, IMAGE_EDIT_TOOL], provider, acting_user_email="alice@example.com"
     )
@@ -156,8 +191,8 @@ async def test_image_tool_enum_contains_only_usable_qualified_references(catalog
 
 
 @pytest.mark.asyncio
-async def test_missing_image_route_does_not_hide_available_models(catalog):
-    provider = LLMService(catalog)
+async def test_missing_image_route_does_not_hide_available_models(catalog, usage_capture):
+    provider = LLMService(catalog, usage_capture=usage_capture)
     provider.resolve_model_target = AsyncMock(side_effect=ValueError("No image route"))
     tools = await enrich_image_tool_model_descriptions([IMAGE_GENERATE_TOOL], provider)
     model = tools[0].parameters["properties"]["model"]
@@ -179,7 +214,7 @@ async def test_model_target_preserves_unknown_metadata_and_explicit_provider_pin
 @pytest.mark.parametrize("tool_name", ["image_generate", "image_edit"])
 @pytest.mark.parametrize("explicit_model", [None, "personal/gpt-image-personal"])
 async def test_image_handler_executes_in_callers_model_scope(
-    catalog, monkeypatch, tool_name, explicit_model
+    catalog, monkeypatch, tool_name, explicit_model, usage_capture
 ):
     async with catalog() as session:
         session.add(
@@ -207,7 +242,10 @@ async def test_image_handler_executes_in_callers_model_scope(
             AsyncMock(return_value=[ImageInput(b64_json="YWJj", content_type="image/png")]),
         )
     result = await handle_image_tool(
-        tool_name, arguments, LLMService(catalog), user_email="alice@example.com"
+        tool_name,
+        arguments,
+        LLMService(catalog, usage_capture=usage_capture),
+        user_email="alice@example.com",
     )
     assert not result.is_error, result.output
     assert transport.await_count == 1

@@ -31,6 +31,8 @@ from cognis.store.models import (
     KnowledgebaseChunkRow,
     KnowledgebaseIndexJobRow,
     KnowledgebaseRow,
+    StepRun,
+    Task,
     User,
 )
 from cognis.store.queries import (
@@ -1526,12 +1528,58 @@ async def test_alembic_upgrade_accepts_schema_already_updated_by_bootstrap(
     command.upgrade(config, "105_managed_join_handoffs")
     engine = create_async_engine(f"sqlite+aiosqlite:///{database_path}")
     await run_schema_bootstrap(engine)
+    async with engine.begin() as connection:
+        await connection.execute(
+            sa.insert(User).values(email="upgrade@example.com", name="Upgrade", role="user")
+        )
+        await connection.execute(
+            sa.insert(Agent).values(
+                agent_id="upgrade-agent", name="Upgrade", owner_email="upgrade@example.com"
+            )
+        )
+        await connection.execute(
+            sa.insert(Task).values(
+                task_id="upgrade-task",
+                title="Upgrade task",
+                created_by="upgrade@example.com",
+                agent_id="upgrade-agent",
+                description="Preserve this task through bootstrap and formal migration",
+                status="paused",
+                attempt_number=2,
+            )
+        )
+        await connection.execute(
+            sa.insert(StepRun).values(
+                step_run_id="upgrade-step",
+                task_id="upgrade-task",
+                step_name="preserved",
+                step_type="agent",
+                agent_id="upgrade-agent",
+                status="completed",
+                attempt_number=2,
+            )
+        )
+    await run_schema_bootstrap(engine)
     await engine.dispose()
 
-    command.upgrade(config, "head")
     sync_engine = sa.create_engine(f"sqlite:///{database_path}")
     try:
         with sync_engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA legacy_alter_table").scalar_one() == 0
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
+            assert connection.exec_driver_sql("PRAGMA legacy_alter_table").scalar_one() == 0
+            assert connection.execute(
+                sa.select(Task.task_id, Task.description, Task.status, Task.attempt_number)
+            ).one() == (
+                "upgrade-task",
+                "Preserve this task through bootstrap and formal migration",
+                "paused",
+                2,
+            )
+            assert connection.execute(
+                sa.select(StepRun.step_run_id, StepRun.task_id, StepRun.attempt_number)
+            ).one() == ("upgrade-step", "upgrade-task", 2)
             columns = {
                 column["name"]: column
                 for column in inspect(connection).get_columns("knowledgebase_artifacts")

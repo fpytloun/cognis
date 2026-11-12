@@ -768,9 +768,9 @@ async def test_production_deadlines_allow_a_moderately_slow_read(palette_app, mo
 
     async def delayed(session, *args, **kwargs):
         if engine.dialect.name == "postgresql":
-            await session.execute(sa.text("SELECT pg_sleep(0.45)"))
+            await session.execute(sa.text("SELECT pg_sleep(3.1)"))
         else:
-            await asyncio.sleep(0.45)
+            await asyncio.sleep(3.1)
         return await original(session, *args, **kwargs)
 
     monkeypatch.setattr(palette, "search", delayed)
@@ -1010,6 +1010,39 @@ async def test_blank_query_with_content_has_complete_duplicate_free_continuation
     assert len(seen) == len(set(seen)) == 41
     assert ("artifact", "palette-image") in seen
     assert sum(kind == "deliverable" for kind, _ in seen) == 1
+
+
+@pytest.mark.parametrize("query", ["", "c", "co"])
+async def test_blank_and_short_queries_list_recent_destinations_of_every_kind(palette_app, query):
+    from cognis.store.models import ArtifactRecordRow, DeliverableRow, ProjectRow
+
+    app, client, _ = palette_app
+    old = datetime(2020, 1, 1, tzinfo=UTC)
+    async with app.state.session_factory() as session:
+        for model in (ProjectRow, Conversation, Task, Schedule):
+            await session.execute(sa.update(model).values(updated_at=old))
+        await session.execute(sa.update(Agent).values(status="active", updated_at=old))
+        await session.execute(
+            sa.update(ArtifactRecordRow).values(updated_at=datetime(2026, 1, 3, tzinfo=UTC))
+        )
+        await session.execute(
+            sa.update(DeliverableRow).values(updated_at=datetime(2026, 1, 2, tzinfo=UTC))
+        )
+        await session.execute(
+            sa.update(Conversation)
+            .where(Conversation.conversation_id == "palette-chat-07")
+            .values(updated_at=datetime(2026, 1, 1, tzinfo=UTC))
+        )
+        await session.commit()
+    response = await client.get(
+        "/api/v1/search/palette", headers={"x-user": OWNER}, params={"q": query, "limit": 3}
+    )
+    assert response.status_code == 200, response.text
+    assert [(row["kind"], row["id"]) for row in response.json()["items"]][:3] == [
+        ("artifact", "palette-image"),
+        ("deliverable", response.json()["items"][1]["id"]),
+        ("conversation", "palette-chat-07"),
+    ]
 
 
 async def test_destination_visibility_aliases_and_canonical_routes(palette_app):

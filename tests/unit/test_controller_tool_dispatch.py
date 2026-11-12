@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,6 +11,7 @@ from cognis.core.agent_loop import WORKFLOW_POLICY, AgentLoop, StepContext
 from cognis.models.agent import AgentDefinition
 from cognis.models.tool import NativeToolDefinition, ToolCall, ToolResult, ToolSource
 from cognis.models.workflow import StepDefinition
+from cognis.tools.executor.definitions import ALL_EXECUTOR_TOOLS
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 
 
@@ -30,10 +32,83 @@ class _Router:
         after_executor_send: object = None,
         workflow_step_scope: object = None,
         workflow_executor_id: str | None = None,
+        turn_id: str | None = None,
     ) -> ToolResult:
-        del output_chunk_callback, before_executor_send, after_executor_send
+        del output_chunk_callback, before_executor_send, after_executor_send, turn_id
         self.calls.append((tool_call, executor))
         return ToolResult(output="ok", metadata={"executor_id": "executor-b"})
+
+
+@pytest.mark.asyncio
+async def test_program_target_checks_actual_connection_before_prepare() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=next(tool for tool in ALL_EXECUTOR_TOOLS if tool.name == "python_execute")
+        )
+    )
+    router = _Router()
+    loop = object.__new__(AgentLoop)
+    loop.tool_router = router
+    loop.providers = SimpleNamespace(executor=None)
+    loop.session_manager = SimpleNamespace(session_factory=None)
+    loop.session_cache = SimpleNamespace(
+        get_loaded_skill_snapshots=lambda _: {},
+        get_events_since_compaction=lambda *_, **__: [],
+    )
+    target_connection = SimpleNamespace(
+        executor_id="executor-b", prepare_program_runtime=AsyncMock()
+    )
+    loop._resolve_target_connection = lambda **_: target_connection
+    target = SimpleNamespace(
+        executor_id="executor-b",
+        executor_type="in_process",
+        usable=True,
+        state=SimpleNamespace(value="usable"),
+    )
+    seen = []
+
+    async def program_policy(connection):
+        seen.append(connection.executor_id)
+        return connection.executor_id == "executor-a"
+
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+    ctx = StepContext(
+        step_definition=StepDefinition(name="run", type="run"),
+        session=SimpleNamespace(
+            session_id="session-1",
+            intaris_session_id="session-1",
+            user_email="user@example.com",
+            parent_session_id=None,
+            delegation_mode=None,
+        ),
+        conversation=SimpleNamespace(
+            conversation_id="conversation-1",
+            context=SimpleNamespace(type="task", ref="task-1", platform_data={}),
+        ),
+        agent=agent,
+        tool_registry=registry,
+        executor_connection=SimpleNamespace(executor_id="executor-a"),
+        executor_pool=SimpleNamespace(by_id=lambda executor_id: target),
+        active_executor_id="executor-a",
+        program_policy=program_policy,
+    )
+    result = await loop.execute_controller_tool(
+        ctx,
+        ToolCall(
+            call_id="call-ptc",
+            name="python_execute",
+            arguments={
+                "target_executor": "executor-b",
+                "description": "Check the selected executor policy",
+                "code": "print(1)",
+            },
+        ),
+    )
+    assert result.is_error and result.metadata["code"] == "program_runtime_disabled"
+    assert seen == ["executor-b"]
+    target_connection.prepare_program_runtime.assert_not_awaited()
+    assert not router.calls
 
 
 @pytest.mark.asyncio
@@ -131,6 +206,7 @@ async def test_regular_agent_tool_uses_shared_dispatch_and_strips_target_executo
         step_definition=StepDefinition(name="fetch", type="run"),
         session=SimpleNamespace(
             session_id="session-1",
+            intaris_session_id="session-1",
             user_email="user@example.com",
             parent_session_id=None,
             delegation_mode=None,

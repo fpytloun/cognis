@@ -19,7 +19,7 @@ from cognis.core.question_sets import (
 )
 from cognis.core.questions import AGENT_QUESTION
 from cognis.models.task import TaskModel
-from cognis.models.workflow import WorkflowState
+from cognis.models.workflow import WorkflowState, effective_gate_options
 from cognis.store.queries import get_task, get_workflow, update_task_workflow_state
 
 _ACTIVE_WORKFLOW_TASK_STATUSES = {"queued", "ready", "running", "paused"}
@@ -32,6 +32,13 @@ def task_pending_pause_response(pause_waiter: Any, task: TaskModel) -> PendingPa
         return None
     state = task.workflow_state
     payload = (state.pending_pause_payload or {}) if state else {}
+    if (
+        state is not None
+        and state.pending_pause_type == "gate"
+        and payload.get("options") is not None
+        and not isinstance(payload["options"], list)
+    ):
+        raise ValueError("Invalid stored gate options")
     live_pause = next(
         (
             pause
@@ -48,32 +55,37 @@ def task_pending_pause_response(pause_waiter: Any, task: TaskModel) -> PendingPa
         ),
         None,
     )
-    if live_pause is not None:
-        return pending_pause_to_response(live_pause)
-    if task.workflow_state is None or task.workflow_state.pending_pause_type in {
-        None,
-        AGENT_QUESTION,
-    }:
-        return None
-
-    payload = task.workflow_state.pending_pause_payload or {}
-    if not isinstance(payload.get("pause_id"), str) or not payload["pause_id"]:
-        return None
-    recovered_pause = PendingPause(
-        pause_id=payload["pause_id"],
-        pause_type=task.workflow_state.pending_pause_type or "unknown",
-        task_id=task.task_id,
-        step_name=payload.get("step_name"),
-        step_run_id=payload.get("step_run_id"),
-        session_id=payload.get("session_id"),
-        question=payload.get("message") or payload.get("question"),
-        options=payload.get("options") if isinstance(payload.get("options"), list) else None,
-        questions=normalize_questions(payload.get("questions"))
-        if payload.get("questions") is not None
-        else None,
-        context=normalize_context(payload.get("context")),
-    )
-    return pending_pause_to_response(recovered_pause)
+    if live_pause is None:
+        if task.workflow_state is None or task.workflow_state.pending_pause_type in {
+            None,
+            AGENT_QUESTION,
+        }:
+            return None
+        payload = task.workflow_state.pending_pause_payload or {}
+        if not isinstance(payload.get("pause_id"), str) or not payload["pause_id"]:
+            return None
+        live_pause = PendingPause(
+            pause_id=payload["pause_id"],
+            pause_type=task.workflow_state.pending_pause_type or "unknown",
+            task_id=task.task_id,
+            step_name=payload.get("step_name"),
+            step_run_id=payload.get("step_run_id"),
+            session_id=payload.get("session_id"),
+            question=payload.get("message") or payload.get("question"),
+            options=payload.get("options") if isinstance(payload.get("options"), list) else None,
+            questions=normalize_questions(payload.get("questions"))
+            if payload.get("questions") is not None
+            else None,
+            context=normalize_context(payload.get("context")),
+        )
+    response = pending_pause_to_response(live_pause)
+    if (
+        response is not None
+        and response.pause_type == "gate"
+        and isinstance(response.options, list)
+    ):
+        response.options = effective_gate_options(response.options)
+    return response
 
 
 async def task_workflow_run_response(

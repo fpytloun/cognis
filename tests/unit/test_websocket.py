@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from cognis.api.chat_v2.realtime import (
     runtime_items_from_snapshots as _runtime_items_from_snapshots,
 )
 from cognis.api.chat_v2.schemas import (
+    ChatSyncResponse,
     MessageTimelineItem,
     RuntimeAuthority,
     TimelineItem,
@@ -57,6 +59,7 @@ from cognis.api.websocket import (
     _handle_update_queued_message,
     _has_unread_from_payload,
     _is_transient_runtime_notice,
+    _program_event_linkage_kwargs,
     _render_command_result,
     _runtime_relay_cumulative_boundary,
     _workflow_composed_payload,
@@ -78,6 +81,7 @@ from cognis.core.turn_scheduler import (
     classify_turn_error,
 )
 from cognis.models.config import ProviderHealth
+from cognis.models.program import ProgramEventMetadata
 from cognis.store.queries import (
     create_agent,
     create_conversation,
@@ -98,6 +102,7 @@ async def test_targeted_runtime_hydration_does_not_broadcast_to_other_connection
             chat_v2_cursors={scope.key: "cursor"},
             chat_v2_session_ids={},
             send_text=AsyncMock(),
+            send_scope_invalidation_nowait=Mock(return_value=True),
         )
         for cid in ("first", "second")
     }
@@ -418,7 +423,8 @@ async def test_runtime_relay_classifies_message_items_without_observer_failure()
         relay_generation_context=Mock(return_value=context),
         running_turn_state=Mock(return_value={"status": "running"}),
     )
-    envelope = SimpleNamespace(authority=None, volatile_items_complete=True)
+    envelope = Mock(authority=None, volatile_items_complete=True, volatile_items=[])
+    envelope.bounded_overlay.return_value = envelope
     relay = SimpleNamespace(
         make_envelope=Mock(return_value=envelope),
         enqueue=Mock(return_value=True),
@@ -557,10 +563,10 @@ async def test_terminal_runtime_relay_logs_enqueue_rejection(
         relay_generation_context=Mock(return_value=context),
         running_turn_state=Mock(return_value=None),
     )
+    envelope = Mock(authority=None, volatile_items_complete=True, volatile_items=[])
+    envelope.bounded_overlay.return_value = envelope
     relay = SimpleNamespace(
-        make_envelope=Mock(
-            return_value=SimpleNamespace(authority=None, volatile_items_complete=True)
-        ),
+        make_envelope=Mock(return_value=envelope),
         enqueue=Mock(return_value=False),
     )
     manager = WebSocketConnectionManager(
@@ -878,12 +884,10 @@ async def test_work_invalidation_coalescing_never_regresses_revision() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("initial_session_id", ["session-1", None])
+@pytest.mark.parametrize("initial_session_id", [None, "session-1"])
 async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscribers(
     initial_session_id: str | None,
 ) -> None:
-    from cognis.store.models import Conversation
-
     cache = SimpleNamespace(
         invalidate_session_token=AsyncMock(return_value=True),
         session_token=lambda store_id, session_id: f"{store_id}:{session_id}",
@@ -906,15 +910,11 @@ async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscrib
         async def __aexit__(self, *_: object) -> None:
             return None
 
-        async def execute(self, statement: Any) -> Result:
-            conversation_query = statement.column_descriptions[0]["entity"] is Conversation
-            for index, result in enumerate(results):
-                if isinstance(result.rows[0], tuple) == conversation_query:
-                    return results.pop(index)
-            raise AssertionError("No queued result for this routing query")
+        async def execute(self, _: object) -> Result:
+            return results.pop(0)
 
     results = [
-        Result([("conv-1", "session-2"), ("conv-2", "session-3")]),
+        Result([("conv-1", "session-2")]),
         Result(
             [
                 SimpleNamespace(session_id="session-2", intaris_session_id="intaris-2"),
@@ -939,23 +939,15 @@ async def test_event_store_invalidation_refreshes_only_matching_chat_v2_subscrib
     foreign_scope = TimelineScope(
         key="session:session-3",
         kind="session",
-        conversation_id="conv-1",
-        session_id="session-3",
-    )
-    foreign_conversation = TimelineScope(
-        key="conversation:conv-2",
-        kind="conversation",
         conversation_id="conv-2",
+        session_id="session-3",
     )
     owner = SimpleNamespace(
         chat_v2_scopes={owner_scope.key: owner_scope},
         send_scope_invalidation_nowait=Mock(return_value=True),
     )
     foreign = SimpleNamespace(
-        chat_v2_scopes={
-            foreign_scope.key: foreign_scope,
-            foreign_conversation.key: foreign_conversation,
-        },
+        chat_v2_scopes={foreign_scope.key: foreign_scope},
         send_scope_invalidation_nowait=Mock(return_value=True),
     )
     manager._connections = {"owner": owner, "foreign": foreign}  # noqa: SLF001
@@ -2848,6 +2840,38 @@ async def test_compaction_lifecycle_updates_one_chat_v2_runtime_item(trigger: st
     assert compacted_item.session_id == "session-new"
     assert compacted_item.previous_session_id == "session-old"
     assert compacted_item.summary_preview == "Older context was compacted."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        EventType.SESSION_COMPACTION_STARTED,
+        EventType.SESSION_COMPACTION_FINISHED,
+        EventType.SESSION_COMPACTED,
+    ],
+)
+async def test_delegate_compaction_does_not_enter_parent_runtime_or_rotate_its_view(
+    event_type: EventType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager = _RecordingWebSocketManager()
+    is_subsession = AsyncMock(return_value=True)
+    monkeypatch.setattr(manager, "_is_subsession", is_subsession)
+    await manager._handle_event(  # noqa: SLF001
+        Event(
+            type=event_type,
+            data={
+                "conversation_id": "conversation-1",
+                "session_id": "delegate-continuation",
+                "previous_session_id": "delegate-root",
+                "compaction_id": "delegate-compaction",
+                "status": "failed",
+            },
+        )
+    )
+    is_subsession.assert_awaited_once_with("delegate-continuation")
+    assert manager.chat_v2_runtime_payloads == []
+    assert manager.sent_payloads == []
 
 
 @pytest.mark.asyncio
@@ -5673,8 +5697,6 @@ def test_ws_auth_valid_token_authenticates(monkeypatch: object, tmp_path: Path) 
     with _create_ws_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        import asyncio
-
         from cognis.store.queries import create_user
 
         async def _seed() -> str:
@@ -5691,7 +5713,7 @@ def test_ws_auth_valid_token_authenticates(monkeypatch: object, tmp_path: Path) 
                 app.state.auth_provider.sign_access_token("wstest@example.com", "WS Test", "user")
             )
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
 
         with client.websocket_connect("/api/ws") as ws:
             ws.send_json({"type": "auth", "token": token})
@@ -5745,7 +5767,7 @@ def test_ws_auth_rejects_disabled_user(monkeypatch: object, tmp_path: Path) -> N
                 )
             )
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
         with (
             pytest.raises(WebSocketDisconnect) as exc_info,
             client.websocket_connect("/api/ws") as ws,
@@ -5780,7 +5802,7 @@ def test_ws_auth_uses_current_database_role_and_name(monkeypatch: object, tmp_pa
             )
             return await websocket_module._authenticate_websocket(socket)
 
-        claims = asyncio.run(_authenticate())
+        claims = client.portal.call(_authenticate)
         assert claims is not None
         assert claims["role"] == "user"
         assert claims["name"] == "Current Name"
@@ -5809,7 +5831,7 @@ def test_ws_auth_rejects_stale_user_auth_version(monkeypatch: object, tmp_path: 
                 await session.commit()
                 return str(token)
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
         with (
             pytest.raises(WebSocketDisconnect) as exc_info,
             client.websocket_connect("/api/ws") as ws,
@@ -5845,7 +5867,7 @@ def test_authenticated_ws_closes_before_ping_after_auth_version_change(
                     )
                 )
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
         with client.websocket_connect("/api/ws") as ws:
             ws.send_json({"type": "auth", "token": token})
             assert ws.receive_json()["type"] == "authenticated"
@@ -5859,7 +5881,7 @@ def test_authenticated_ws_closes_before_ping_after_auth_version_change(
                     user.auth_version += 1
                     await session.commit()
 
-            asyncio.run(_revoke())
+            ws.portal.call(_revoke)
             time.sleep(0.08)
             ws.send_json({"type": "ping"})
             with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -5883,7 +5905,7 @@ def test_app_local_factor_enrollment_removes_ws_before_outbound_fanout(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         login = client.post(
             "/api/auth/login",
             json={
@@ -5977,7 +5999,7 @@ def test_ws_auth_watchdog_removes_stale_connection_before_outbound_fanout(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         login = client.post(
             "/api/auth/login",
             json={"email": "watchdog@example.com", "password": "password123"},
@@ -6236,7 +6258,7 @@ def test_ws_browser_session_rejects_stale_bound_version(
                 await session.commit()
                 return raw_token
 
-        client.cookies.set("cognis_session", asyncio.run(_seed()))
+        client.cookies.set("cognis_session", client.portal.call(_seed))
         with (
             pytest.raises(WebSocketDisconnect) as exc_info,
             client.websocket_connect("/api/ws") as ws,
@@ -6249,8 +6271,6 @@ def test_ws_ping_returns_pong(monkeypatch: object, tmp_path: Path) -> None:
     """After auth, a ping message should return pong."""
     with _create_ws_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         from cognis.store.queries import create_user
 
@@ -6268,7 +6288,7 @@ def test_ws_ping_returns_pong(monkeypatch: object, tmp_path: Path) -> None:
                 app.state.auth_provider.sign_access_token("wsping@example.com", "WS Ping", "user")
             )
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
 
         with client.websocket_connect("/api/ws") as ws:
             ws.send_json({"type": "auth", "token": token})
@@ -6284,8 +6304,6 @@ def test_ws_unknown_message_type_returns_error(monkeypatch: object, tmp_path: Pa
     """An unknown message type should return a validation_error."""
     with _create_ws_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         from cognis.store.queries import create_user
 
@@ -6305,7 +6323,7 @@ def test_ws_unknown_message_type_returns_error(monkeypatch: object, tmp_path: Pa
                 )
             )
 
-        token = asyncio.run(_seed())
+        token = client.portal.call(_seed)
 
         with client.websocket_connect("/api/ws") as ws:
             ws.send_json({"type": "auth", "token": token})
@@ -6379,9 +6397,14 @@ async def test_chat_v2_subscribe_catch_up_sends_sync_delta_after_registration(
     )
     load_context = AsyncMock(return_value=context)
     monkeypatch.setattr(snapshot_coordinator, "load_conversation_snapshot_context", load_context)
-    build = AsyncMock(
-        return_value=SimpleNamespace(model_dump=lambda mode: {"cursor_before": "c1", "ops": []})
+    response = ChatSyncResponse(
+        projection_version=sync_module.PROJECTION_VERSION,
+        scope=scope,
+        cursor_before="c1",
+        cursor_after="c2",
+        server_time=datetime.now(UTC).isoformat(),
     )
+    build = AsyncMock(return_value=response)
     monkeypatch.setattr(sync_module, "build_chat_sync_response", build)
     app = SimpleNamespace(
         state=SimpleNamespace(chat_v2_cursor_secret="secret", session_factory=_AsyncNullContext)
@@ -6401,7 +6424,7 @@ async def test_chat_v2_subscribe_catch_up_sends_sync_delta_after_registration(
         {
             "type": "chat_v2_catch_up",
             "scope_key": "conversation:conv-1",
-            "sync": {"cursor_before": "c1", "ops": []},
+            "sync": response.model_dump(mode="json"),
         }
     ]
     assert build.await_args.kwargs["cursor"] == "c1"
@@ -6495,7 +6518,14 @@ async def test_chat_v2_catch_up_requires_rest_equivalent_read_authority(
     )
     load_context = AsyncMock(return_value=context)
     monkeypatch.setattr(snapshot_coordinator, "load_conversation_snapshot_context", load_context)
-    build = AsyncMock(return_value=SimpleNamespace(model_dump=lambda mode: {"ops": []}))
+    response = ChatSyncResponse(
+        projection_version=sync_module.PROJECTION_VERSION,
+        scope=scope,
+        cursor_before="c1",
+        cursor_after="c2",
+        server_time=datetime.now(UTC).isoformat(),
+    )
+    build = AsyncMock(return_value=response)
     monkeypatch.setattr(sync_module, "build_chat_sync_response", build)
     app = SimpleNamespace(state=SimpleNamespace(session_factory=_AsyncNullContext))
 
@@ -6508,6 +6538,32 @@ async def test_chat_v2_catch_up_requires_rest_equivalent_read_authority(
         load_context.assert_not_awaited()
         build.assert_not_awaited()
     else:
-        assert sent[0]["sync"] == {"ops": []}
+        assert sent[0]["sync"] == response.model_dump(mode="json")
         assert load_context.await_args.kwargs["user_email"] == "author@example.com"
         assert load_context.await_args.kwargs["shared_reader"] is shared_reader
+
+
+def test_program_event_linkage_is_forwarded_only_to_compatible_producers() -> None:
+    linkage = ProgramEventMetadata(
+        parent_call_id=uuid.uuid4().hex,
+        program_id=uuid.uuid4().hex,
+        kernel_generation=3,
+    )
+
+    def compatible_item(
+        *,
+        parent_call_id: str | None = None,
+        program_id: str | None = None,
+        kernel_generation: int | None = None,
+    ) -> None:
+        return None
+
+    def legacy_item(*, call_id: str) -> None:
+        return None
+
+    assert _program_event_linkage_kwargs(compatible_item, linkage) == {
+        "parent_call_id": linkage.parent_call_id,
+        "program_id": linkage.program_id,
+        "kernel_generation": linkage.kernel_generation,
+    }
+    assert _program_event_linkage_kwargs(legacy_item, linkage) == {}

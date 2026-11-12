@@ -6,6 +6,7 @@ from typing import Any
 
 from cognis import json_codec as json
 from cognis.core.attachment_utils import merge_content_and_attachment_note
+from cognis.core.history_replay import is_program_child_tool_event
 from cognis.core.message_envelope import render_user_event_content
 
 _MESSAGE_MAX_CHARS = 12_000
@@ -27,6 +28,8 @@ def format_events_for_compaction(events: list[Any]) -> str:
     """Render a list of session events as a compact text block for the LLM."""
     lines: list[str] = []
     for event in events:
+        if is_program_child_tool_event(event):
+            continue
         etype = event.type
         data = event.data
 

@@ -26,6 +26,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.agent_direct import agent_direct_context_ref
+from cognis.models.agent import strip_retired_execution_settings
 from cognis.models.deliverable import (
     ArtifactRevisionError,
     DeliverableRevisionError,
@@ -1019,6 +1020,11 @@ async def _touch_sidebar_metadata_revision(session: AsyncSession, user_email: st
     )
 
 
+async def touch_sidebar_metadata_revision(session: AsyncSession, user_email: str) -> None:
+    """Invalidate native client identity projections without granting agent access."""
+    await _touch_sidebar_metadata_revision(session, user_email)
+
+
 # --- Settings ---
 
 
@@ -1517,7 +1523,7 @@ async def create_agent(
         capabilities=capabilities,
         agent_profiles=agent_profiles,
         default_agent_profile_id=default_agent_profile_id,
-        execution=execution,
+        execution=strip_retired_execution_settings(execution),
         avatar_url=avatar_url,
         avatar_image_id=avatar_image_id,
         agent_type=agent_type,
@@ -1525,6 +1531,17 @@ async def create_agent(
     )
     session.add(row)
     await session.flush()
+    if agent_type == "primary":
+        from cognis.store.app_channels import app_channel_id
+
+        await create_channel_account(
+            session,
+            account_id=app_channel_id(owner_email, agent_id),
+            user_email=owner_email,
+            agent_id=agent_id,
+            channel_type="web",
+            display_name="Cognis app",
+        )
     return row
 
 
@@ -1555,6 +1572,8 @@ async def update_agent(
     }
     for field_name, value in updates.items():
         if hasattr(row, field_name) and (value is not None or field_name in nullable_fields):
+            if field_name == "execution":
+                value = strip_retired_execution_settings(value)
             setattr(row, field_name, value)
     row.updated_at = datetime.now(UTC)
     await session.flush()
@@ -1573,6 +1592,8 @@ async def update_agent_if_updated_at(
     values = {
         field_name: value for field_name, value in updates.items() if hasattr(Agent, field_name)
     }
+    if "execution" in values:
+        values["execution"] = strip_retired_execution_settings(values["execution"])
     values["updated_at"] = datetime.now(UTC)
     result = await session.execute(
         update(Agent)
@@ -3547,6 +3568,16 @@ async def consume_waiting_managed_conversation_signal(
     link = await get_managed_conversation_link(session, link_id, for_update=True)
     if link is None or link.owner_epoch != owner_epoch:
         raise ValueError("Managed channel ownership changed.")
+    now = datetime.now(UTC)
+    if (
+        link.kind != "channel"
+        or link.conversation_state != "open"
+        or link.turn_state != "waiting_controller"
+        or binding.state != "waiting_controller"
+        or binding.active_route_key is None
+        or _as_utc(binding.expires_at) <= now
+    ):
+        return None
     result = await session.execute(
         select(ManagedConversationSignal)
         .where(
@@ -3560,7 +3591,6 @@ async def consume_waiting_managed_conversation_signal(
     signal = result.scalar_one_or_none()
     if signal is None:
         return None
-    now = datetime.now(UTC)
     if (
         binding.delivery_lease_token
         and binding.delivery_lease_expires_at
@@ -3590,6 +3620,7 @@ async def settle_managed_conversation_signal_resume(
     succeeded: bool,
     expected_resume_request_id: str | None = None,
     expected_resume_turn_id: str | None = None,
+    expected_binding_version: int | None = None,
 ) -> ManagedConversationSignal | None:
     """Commit or compensate one reserved controller resume."""
 
@@ -3623,6 +3654,26 @@ async def settle_managed_conversation_signal_resume(
     if signal is None:
         return None
     now = datetime.now(UTC)
+    if not succeeded and link is not None:
+        receipt = await get_managed_controller_turn_receipt(
+            session,
+            link=link,
+            turn_id=signal.resume_turn_id,
+            request_id=signal.resume_request_id,
+        )
+        succeeded = receipt is not None
+    if not succeeded and (
+        link is None
+        or link.kind != "channel"
+        or link.conversation_state != "open"
+        or link.owner_epoch != signal.owner_epoch
+        or link.active_turn_id != signal.resume_turn_id
+        or binding.state != "processing"
+        or binding.active_route_key is None
+        or _as_utc(binding.expires_at) <= now
+        or (expected_binding_version is not None and binding.version != expected_binding_version)
+    ):
+        return None
     if succeeded:
         signal.state = "consumed"
         signal.consumed_at = now
@@ -3631,7 +3682,7 @@ async def settle_managed_conversation_signal_resume(
     else:
         signal.state = "waiting_controller"
         signal.consumed_at = None
-        if link is not None and link.conversation_state == "open":
+        if link is not None:
             link.turn_state = "waiting_controller"
             link.active_turn_id = None
             link.updated_at = now
@@ -3640,6 +3691,93 @@ async def settle_managed_conversation_signal_resume(
         binding.updated_at = now
     await session.flush()
     return signal
+
+
+async def get_managed_controller_turn_receipt(
+    session: AsyncSession,
+    *,
+    link: ManagedConversationLink,
+    turn_id: str | None,
+    request_id: str | None = None,
+) -> DirectTurnRequestRow | None:
+    """Read durable admission under the caller's binding/link lock, including terminal requests."""
+    if turn_id is None:
+        return None
+    query = select(DirectTurnRequestRow).where(
+        DirectTurnRequestRow.conversation_id == link.target_conversation_id,
+        DirectTurnRequestRow.user_id == link.user_email,
+        DirectTurnRequestRow.turn_id == turn_id,
+    )
+    if request_id is not None:
+        query = query.where(DirectTurnRequestRow.request_id == request_id)
+    return (await session.execute(query)).scalar_one_or_none()
+
+
+async def abort_managed_channel_controller_turn(
+    session: AsyncSession,
+    *,
+    binding_id: str,
+    owner_epoch: int,
+    turn_id: str,
+    binding_version: int | None = None,
+) -> bool:
+    """Atomically compensate a definitely unadmitted reservation, never a terminal/newer turn."""
+    binding = (
+        await session.execute(
+            select(ManagedChannelBinding)
+            .where(ManagedChannelBinding.binding_id == binding_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        return False
+    link = await get_managed_conversation_link(session, binding.link_id, for_update=True)
+    if (
+        link is None
+        or link.kind != "channel"
+        or link.owner_epoch != owner_epoch
+        or link.conversation_state != "open"
+        or link.active_turn_id != turn_id
+        or binding.state != "processing"
+        or binding.active_route_key is None
+        or (binding_version is not None and binding.version != binding_version)
+    ):
+        return False
+    if await get_managed_controller_turn_receipt(session, link=link, turn_id=turn_id):
+        return False
+    signal = (
+        await session.execute(
+            select(ManagedConversationSignal)
+            .where(
+                ManagedConversationSignal.link_id == link.link_id,
+                ManagedConversationSignal.owner_epoch == owner_epoch,
+                ManagedConversationSignal.state == "resuming",
+                ManagedConversationSignal.resume_turn_id == turn_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if signal is not None:
+        return (
+            await settle_managed_conversation_signal_resume(
+                session,
+                signal_id=signal.signal_id,
+                succeeded=False,
+                expected_resume_request_id=signal.resume_request_id,
+                expected_resume_turn_id=turn_id,
+                expected_binding_version=binding_version,
+            )
+            is not None
+        )
+    now = datetime.now(UTC)
+    link.turn_state = "idle"
+    link.active_turn_id = None
+    link.updated_at = now
+    binding.state = "waiting_external"
+    binding.version += 1
+    binding.updated_at = now
+    await session.flush()
+    return True
 
 
 async def validate_managed_conversation_signal_resume_admission(
@@ -3666,6 +3804,12 @@ async def validate_managed_conversation_signal_resume_admission(
         or link.active_turn_id != resume_turn_id
         or binding.state != "processing"
         or binding.active_route_key is None
+        or _as_utc(binding.expires_at) <= datetime.now(UTC)
+        or (
+            binding.delivery_lease_token is not None
+            and binding.delivery_lease_expires_at is not None
+            and _as_utc(binding.delivery_lease_expires_at) > datetime.now(UTC)
+        )
     ):
         return False
     signal = (
@@ -4405,6 +4549,7 @@ async def admit_managed_conversation_turn(
     A link can represent at most one queued controller admission. Re-admitting
     the same ID is idempotent for scheduler retries, while a different queued
     ID is rejected instead of silently orphaning the earlier turn.
+    Closed channel routes cannot reopen; ordinary managed-agent restart semantics remain unchanged.
     """
 
     if not created:
@@ -4417,6 +4562,10 @@ async def admit_managed_conversation_turn(
         update(ManagedConversationLink)
         .where(
             ManagedConversationLink.link_id == link_id,
+            sa.or_(
+                ManagedConversationLink.kind != "channel",
+                ManagedConversationLink.conversation_state == "open",
+            ),
             sa.or_(
                 ManagedConversationLink.active_turn_id.is_(None),
                 ManagedConversationLink.active_turn_id == turn_id,
@@ -4536,6 +4685,10 @@ async def mark_managed_conversation_turn_running(
         .where(
             ManagedConversationLink.target_conversation_id == target_conversation_id,
             sa.or_(
+                ManagedConversationLink.kind != "channel",
+                ManagedConversationLink.conversation_state == "open",
+            ),
+            sa.or_(
                 ManagedConversationLink.active_turn_id.is_(None),
                 ManagedConversationLink.active_turn_id == turn_id,
                 sa.and_(
@@ -4632,6 +4785,28 @@ async def settle_completed_fallback_managed_conversation_turn(
             completed_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
+        .execution_options(synchronize_session=False)
+    )
+    return int(getattr(result, "rowcount", 0) or 0) == 1
+
+
+async def initialize_conversation_title(
+    session: AsyncSession,
+    conversation_id: str,
+    *,
+    title: str,
+    title_source: str = "cognis",
+) -> bool:
+    """Initialize an unset title atomically, preserving concurrent manual edits."""
+    result = await session.execute(
+        update(Conversation)
+        .where(
+            Conversation.conversation_id == conversation_id,
+            Conversation.title_source == "unset",
+            func.trim(func.coalesce(Conversation.title, "")) == "",
+            Conversation.status != "deleted",
+        )
+        .values(title=title, title_source=title_source, updated_at=datetime.now(UTC))
         .execution_options(synchronize_session=False)
     )
     return int(getattr(result, "rowcount", 0) or 0) == 1
@@ -5685,11 +5860,12 @@ async def list_active_delegation_sessions(
 ) -> list[Session]:
     """Return bounded active child sessions across the user's conversations."""
 
-    active_session = aliased(Session)
+    # Scope lookup needs two columns, not an ORM alias and its full proxy graph.
+    active_scope = select(Session.session_id, Session.activity_scope_id).subquery()
     result = await session.execute(
         select(Session)
         .join(Conversation, Conversation.conversation_id == Session.conversation_id)
-        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .join(active_scope, active_scope.c.session_id == Conversation.active_session_id)
         .where(
             Session.user_email == user_email,
             Session.parent_session_id.is_not(None),
@@ -5700,7 +5876,7 @@ async def list_active_delegation_sessions(
                 if controller_conversation_id is not None
                 else []
             ),
-            Session.activity_scope_id == active_session.activity_scope_id,
+            Session.activity_scope_id == active_scope.c.activity_scope_id,
         )
         .order_by(Session.updated_at.desc(), Session.started_at.desc())
         .limit(max(1, min(limit, 501)))
@@ -5717,7 +5893,7 @@ async def list_delegation_sessions_in_active_scope(
 ) -> list[Session]:
     """List delegated sessions in the controller conversation's active scope."""
 
-    active_session = aliased(Session)
+    active_scope = select(Session.session_id, Session.activity_scope_id).subquery()
     result = await session.execute(
         select(Session)
         .join(
@@ -5727,12 +5903,12 @@ async def list_delegation_sessions_in_active_scope(
                 Conversation.active_session_id.is_not(None),
             ),
         )
-        .join(active_session, active_session.session_id == Conversation.active_session_id)
+        .join(active_scope, active_scope.c.session_id == Conversation.active_session_id)
         .where(
             Session.user_email == user_email,
             Session.conversation_id == controller_conversation_id,
             Session.parent_session_id.is_not(None),
-            Session.activity_scope_id == active_session.activity_scope_id,
+            Session.activity_scope_id == active_scope.c.activity_scope_id,
             Session.delegation_mode.is_distinct_from("hook"),
         )
         .order_by(Session.updated_at.desc(), Session.started_at.desc())
@@ -6555,8 +6731,9 @@ async def create_task(
     source_session_id: str | None = None,
     delivery_mode: str = "preferred_channel",
     delivery_target: str | None = None,
-    completion_mode_family: str = "default",
+    completion_mode_family: str = "auto",
     allow_silent_completion: bool = False,
+    on_finish_instructions: str | None = None,
     interaction_mode_override: str | None = None,
     escalation_timeout_seconds: int | None = None,
     session_policy: dict[str, Any] | None = None,
@@ -6570,6 +6747,17 @@ async def create_task(
     task_id: str | None = None,
 ) -> Task:
     """Create a new task."""
+    from cognis.models.task import TaskDelivery, validate_task_delivery
+    from cognis.models.workflow import CompletionDeliveryPolicy
+
+    validate_task_delivery(
+        TaskDelivery(mode=delivery_mode, target=delivery_target),
+        CompletionDeliveryPolicy(
+            completion_mode_family=completion_mode_family,
+            allow_silent_completion=allow_silent_completion,
+            on_finish_instructions=on_finish_instructions,
+        ),
+    )
     if working_directory and not workspace_root:
         workspace_root = working_directory
     if workspace_root and not working_directory:
@@ -6594,6 +6782,7 @@ async def create_task(
         delivery_target=delivery_target,
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
+        on_finish_instructions=on_finish_instructions,
         interaction_mode_override=interaction_mode_override,
         escalation_timeout_seconds=escalation_timeout_seconds,
         session_policy=session_policy,
@@ -7078,7 +7267,16 @@ async def update_task_status(
     if result_summary is not None:
         values["result_summary"] = result_summary
     if result_data is not None:
-        values["result_data"] = result_data
+        # Dispatch metadata has a fenced owner and cannot be resurrected or
+        # overwritten by a workflow's older in-memory business result snapshot.
+        current = await session.get(Task, task_id, with_for_update=True)
+        execution_recovery = (
+            (current.result_data or {}).get("execution_recovery") if current is not None else None
+        )
+        data = {key: value for key, value in result_data.items() if key != "execution_recovery"}
+        if execution_recovery:
+            data["execution_recovery"] = execution_recovery
+        values["result_data"] = data
     if applied_completion_mode is not None:
         values["applied_completion_mode"] = applied_completion_mode
     if applied_completion_reason is not None:
@@ -7197,6 +7395,13 @@ async def update_task_fields(
     clear_escalation_timeout_seconds: bool = False,
     clear_workflow_id: bool = False,
     clear_project_id: bool = False,
+    delivery_mode: str | None = None,
+    delivery_target: str | None = None,
+    clear_delivery_target: bool = False,
+    completion_mode_family: str | None = None,
+    allow_silent_completion: bool | None = None,
+    on_finish_instructions: str | None = None,
+    clear_on_finish_instructions: bool = False,
 ) -> bool:
     """Update mutable task fields.  Only allowed for draft/queued tasks.
 
@@ -7204,6 +7409,46 @@ async def update_task_fields(
     set the corresponding column to ``NULL``.
     """
     values: dict[str, object] = {}
+    outcome_values: dict[str, Any] = {
+        key: value
+        for key, value in {
+            "delivery_mode": delivery_mode,
+            "delivery_target": delivery_target,
+            "completion_mode_family": completion_mode_family,
+            "allow_silent_completion": allow_silent_completion,
+            "on_finish_instructions": on_finish_instructions,
+        }.items()
+        if value is not None
+    }
+    if clear_delivery_target:
+        outcome_values["delivery_target"] = None
+    if clear_on_finish_instructions:
+        outcome_values["on_finish_instructions"] = None
+    if outcome_values:
+        from cognis.models.task import TaskDelivery, validate_task_delivery
+        from cognis.models.workflow import CompletionDeliveryPolicy
+
+        row = await get_task(session, task_id)
+        if row is None:
+            return False
+        validate_task_delivery(
+            TaskDelivery(
+                mode=outcome_values.get("delivery_mode", row.delivery_mode),
+                target=outcome_values.get("delivery_target", row.delivery_target),
+            ),
+            CompletionDeliveryPolicy(
+                completion_mode_family=outcome_values.get(
+                    "completion_mode_family", row.completion_mode_family
+                ),
+                allow_silent_completion=outcome_values.get(
+                    "allow_silent_completion", row.allow_silent_completion
+                ),
+                on_finish_instructions=outcome_values.get(
+                    "on_finish_instructions", row.on_finish_instructions
+                ),
+            ),
+        )
+        values.update(outcome_values)
     if title is not None:
         values["title"] = title
     if description is not None:
@@ -7604,8 +7849,7 @@ async def _resolve_new_deliverable_lineage(
         ):
             raise DeliverableRevisionError(
                 "supersedes_not_latest",
-                "The deliverable to supersede already has a newer revision. "
-                "Supersede the latest revision instead.",
+                "Document lineage changed. Re-read the current head before writing.",
                 latest_deliverable_id=head.deliverable_id if head is not None else None,
                 latest_revision=head.revision if head is not None else None,
             )
@@ -7716,29 +7960,50 @@ async def get_deliverable_lineage_summary(
 ) -> DeliverableLineageSummary:
     """Summarize the live revisions of the lineage that contains ``row``."""
 
-    lineage_id = deliverable_lineage_key(row)
-    count, latest_revision = (
-        await session.execute(
-            select(func.count(), func.max(DeliverableRow.revision)).where(
-                DeliverableRow.lineage_id == lineage_id,
-                DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
+    return (await get_deliverable_lineage_summaries(session, [row]))[row.deliverable_id]
+
+
+async def get_deliverable_lineage_summaries(
+    session: AsyncSession, rows: Sequence[DeliverableRow]
+) -> dict[str, DeliverableLineageSummary]:
+    """Read live lineage heads and counts in one query for a document page."""
+    if not rows:
+        return {}
+    lineage_ids = {deliverable_lineage_key(row) for row in rows}
+    live = (
+        select(
+            DeliverableRow.lineage_id,
+            DeliverableRow.deliverable_id,
+            DeliverableRow.revision,
+            func.count().over(partition_by=DeliverableRow.lineage_id).label("revision_count"),
+            func.row_number()
+            .over(
+                partition_by=DeliverableRow.lineage_id,
+                order_by=(DeliverableRow.revision.desc(), DeliverableRow.created_at.desc()),
             )
+            .label("position"),
         )
-    ).one()
-    head = await get_deliverable_lineage_head(session, lineage_id) if count else None
-    if head is None:
-        return DeliverableLineageSummary(
-            lineage_id=lineage_id,
-            latest_deliverable_id=row.deliverable_id,
-            latest_revision=int(row.revision or 1),
-            revision_count=1,
+        .where(
+            DeliverableRow.lineage_id.in_(lineage_ids),
+            DeliverableRow.status.in_(DELIVERABLE_LIVE_STATUSES),
         )
-    return DeliverableLineageSummary(
-        lineage_id=lineage_id,
-        latest_deliverable_id=head.deliverable_id,
-        latest_revision=int(latest_revision or head.revision or 1),
-        revision_count=int(count),
+        .subquery()
     )
+    heads = {
+        head.lineage_id: head
+        for head in (await session.execute(select(live).where(live.c.position == 1))).all()
+    }
+    summaries = {}
+    for row in rows:
+        lineage_id = deliverable_lineage_key(row)
+        head = heads.get(lineage_id)
+        summaries[row.deliverable_id] = DeliverableLineageSummary(
+            lineage_id=lineage_id,
+            latest_deliverable_id=head.deliverable_id if head else row.deliverable_id,
+            latest_revision=int((head.revision if head else row.revision) or 1),
+            revision_count=int(head.revision_count) if head else 1,
+        )
+    return summaries
 
 
 async def create_deliverable(
@@ -7834,6 +8099,9 @@ async def create_deliverable(
     # Workflow writes revise one step output; direct-chat writes create
     # independent outputs whose returned references must remain readable.
     supersession_where = sa.and_(version_where, sa.literal(step_run_id is not None))
+    if supersedes_deliverable_id is not None:
+        # An explicitly named revision is immutable history, even in this step.
+        supersession_where = sa.false()
     # Sharing changes and all revision writers serialize on immutable lineage
     # roots, before draft/target row locks, so revocation includes new revisions.
     from cognis.store.document_locks import lock_document_lineages
@@ -7885,6 +8153,18 @@ async def create_deliverable(
             )
 
     row_deliverable_id = deliverable_id or f"dlv_{uuid.uuid4().hex}"
+    if supersedes_deliverable_id is None and any(
+        row.supersedes_deliverable_id is not None or row.revision > 1 for row in superseded_rows
+    ):
+        current = max(superseded_rows, key=lambda row: row.revision)
+        head = await get_deliverable_lineage_head(session, deliverable_lineage_key(current))
+        raise DeliverableRevisionError(
+            "supersedes_required",
+            "Pass supersedes with the current head to continue this document lineage.",
+            latest_deliverable_id=head.deliverable_id if head else None,
+            latest_revision=head.revision if head else None,
+            lineage_id=deliverable_lineage_key(current),
+        )
     lineage = await _resolve_new_deliverable_lineage(
         session,
         deliverable_id=row_deliverable_id,
@@ -7950,10 +8230,23 @@ async def create_deliverable(
             creator_session = await session.get(Session, session_id)
             if creator_session is not None and creator_session.user_email == content_owner_email:
                 content_owner_agent_id = creator_session.agent_id
+    author_email = media_owner_email or content_owner_email
+    author_agent_id = media_accessor_agent_id or content_owner_agent_id
+    if session_id:
+        author_session = await session.get(Session, session_id)
+        if author_session is not None and author_session.user_email == author_email:
+            author_agent_id = author_session.agent_id
+    if lineage.inherit_project:
+        root = await get_deliverable(session, lineage.lineage_id)
+        if root is not None:
+            content_owner_email = root.owner_email
+            content_owner_agent_id = root.owner_agent_id
     row = DeliverableRow(
         deliverable_id=row_deliverable_id,
         owner_email=content_owner_email,
         owner_agent_id=content_owner_agent_id,
+        author_email=author_email,
+        author_agent_id=author_agent_id,
         step_run_id=step_run_id,
         conversation_id=conversation_id,
         session_id=session_id,
@@ -8008,8 +8301,13 @@ async def create_deliverable(
                 lineage_id=lineage.lineage_id,
             ) from exc
         raise
-    from cognis.core.artifact_entitlements import register_content_entitlements
+    from cognis.core.artifact_entitlements import (
+        initialize_content_owner,
+        register_content_entitlements,
+    )
 
+    if not lineage.inherit_project:
+        await session.run_sync(initialize_content_owner, row)
     await session.run_sync(register_content_entitlements, row)
     if published_owner_email is not None:
         extension = {
@@ -8030,8 +8328,10 @@ async def create_deliverable(
             namespace=row.storage_namespace,
             object_id=row.storage_object_id,
             filename=filename,
-            owner_email=published_owner_email,
+            owner_email=row.owner_email,
             owner_agent_id=content_owner_agent_id,
+            author_email=row.author_email,
+            author_agent_id=row.author_agent_id,
             purpose="conversation_deliverable",
             kind="file",
             mime_type=row.content_mime,
@@ -8942,14 +9242,26 @@ async def create_schedule(
     delete_after_run: bool = False,
     retry_failed_tasks: bool = False,
     fail_paused_task_on_next_fire: bool = True,
-    completion_mode_family: str = "default",
+    completion_mode_family: str = "auto",
     allow_silent_completion: bool = False,
+    on_finish_instructions: str | None = None,
     interaction_mode_override: str | None = "none",
     next_fire_at: datetime | None = None,
     created_by: str,
     creation_origin: str | None = None,
 ) -> Schedule:
     """Create a schedule record."""
+    from cognis.models.task import TaskDelivery, validate_task_delivery
+    from cognis.models.workflow import CompletionDeliveryPolicy
+
+    validate_task_delivery(
+        TaskDelivery.model_validate(task_template.get("delivery") or {}),
+        CompletionDeliveryPolicy(
+            completion_mode_family=completion_mode_family,
+            allow_silent_completion=allow_silent_completion,
+            on_finish_instructions=on_finish_instructions,
+        ),
+    )
     row = Schedule(
         schedule_id=schedule_id or f"sched_{uuid.uuid4().hex}",
         name=name,
@@ -8972,6 +9284,7 @@ async def create_schedule(
         fail_paused_task_on_next_fire=fail_paused_task_on_next_fire,
         completion_mode_family=completion_mode_family,
         allow_silent_completion=allow_silent_completion,
+        on_finish_instructions=on_finish_instructions,
         interaction_mode_override=interaction_mode_override,
         next_fire_at=next_fire_at,
         created_by=created_by,
@@ -9022,6 +9335,20 @@ async def update_schedule(
     row = await get_schedule(session, schedule_id)
     if row is None:
         return None
+    from cognis.models.task import TaskDelivery, validate_task_delivery
+    from cognis.models.workflow import CompletionDeliveryPolicy
+
+    template = fields.get("task_template", row.task_template) or {}
+    validate_task_delivery(
+        TaskDelivery.model_validate(template.get("delivery") or {}),
+        CompletionDeliveryPolicy(
+            completion_mode_family=fields.get("completion_mode_family", row.completion_mode_family),
+            allow_silent_completion=fields.get(
+                "allow_silent_completion", row.allow_silent_completion
+            ),
+            on_finish_instructions=fields.get("on_finish_instructions", row.on_finish_instructions),
+        ),
+    )
     allowed = {
         "name",
         "description",
@@ -9043,6 +9370,7 @@ async def update_schedule(
         "fail_paused_task_on_next_fire",
         "completion_mode_family",
         "allow_silent_completion",
+        "on_finish_instructions",
         "interaction_mode_override",
         "next_fire_at",
         "disabled_reason",
@@ -9503,10 +9831,19 @@ async def create_skill_asset(
 
 async def list_skill_assets(session: AsyncSession, skill_version_id: str) -> list[SkillAssetRow]:
     """List all assets for a skill version."""
+    return await list_skill_assets_for_versions(session, [skill_version_id])
+
+
+async def list_skill_assets_for_versions(
+    session: AsyncSession, skill_version_ids: list[str]
+) -> list[SkillAssetRow]:
+    """List assets for already-visible skill versions, ordered within each version."""
+    if not skill_version_ids:
+        return []
     result = await session.execute(
         select(SkillAssetRow)
-        .where(SkillAssetRow.skill_version_id == skill_version_id)
-        .order_by(SkillAssetRow.filename.asc())
+        .where(SkillAssetRow.skill_version_id.in_(skill_version_ids))
+        .order_by(SkillAssetRow.skill_version_id.asc(), SkillAssetRow.filename.asc())
     )
     return list(result.scalars().all())
 
@@ -10582,6 +10919,11 @@ async def create_channel_account(
     )
     session.add(row)
     await session.flush()
+    if channel_type == "web":
+        from cognis.store.app_channels import ensure_app_channel_preference
+
+        await ensure_app_channel_preference(session, user_email=user_email, agent_id=agent_id)
+        await session.refresh(row)
     return row
 
 
@@ -10594,9 +10936,13 @@ async def update_channel_account(
     row = await get_channel_account(session, account_id)
     if row is None:
         return None
+    if row.channel_type == "web" and set(kwargs) - {"preferred_for_task_delivery"}:
+        raise ValueError("The built-in app channel only supports channel preference updates")
+    previous_owner = row.user_email
+    previous_agent_id = row.agent_id
     next_user_email = str(kwargs.get("user_email") or row.user_email)
     next_agent_id = str(kwargs.get("agent_id") or row.agent_id)
-    if kwargs.get("preferred_for_task_delivery") is True:
+    if kwargs.get("preferred_for_task_delivery", row.preferred_for_task_delivery) is True:
         await session.execute(
             update(ChannelAccountRow)
             .where(ChannelAccountRow.user_email == next_user_email)
@@ -10608,6 +10954,19 @@ async def update_channel_account(
         if hasattr(row, key):
             setattr(row, key, value)
     await session.flush()
+    if row.channel_type == "web":
+        from cognis.store.app_channels import ensure_app_channel_preference
+
+        await ensure_app_channel_preference(
+            session, user_email=row.user_email, agent_id=row.agent_id
+        )
+        await session.refresh(row)
+    elif (previous_owner, previous_agent_id) != (row.user_email, row.agent_id):
+        from cognis.store.app_channels import ensure_app_channel_preference
+
+        await ensure_app_channel_preference(
+            session, user_email=previous_owner, agent_id=previous_agent_id
+        )
     return row
 
 
@@ -10617,7 +10976,7 @@ async def get_preferred_channel_account_for_agent(
     user_email: str,
     agent_id: str,
 ) -> ChannelAccountRow | None:
-    """Return the preferred enabled task-delivery channel account for an agent."""
+    """Return the agent's preferred enabled messaging channel."""
 
     result = await session.execute(
         select(ChannelAccountRow)
@@ -10657,6 +11016,8 @@ async def get_latest_active_conversation_for_channel_account(
     fallback: Conversation | None = None
     for conversation in result.scalars().all():
         platform_data = conversation.context_data or {}
+        if platform_data.get("kind") == "project_task_results":
+            continue
         matched = False
         if str(platform_data.get("account_id") or "") == account_id:
             matched = True
@@ -10689,7 +11050,13 @@ async def delete_channel_account(
     row = await get_channel_account(session, account_id)
     if row is None:
         return False
+    if row.channel_type == "web":
+        raise ValueError("The built-in app channel cannot be deleted")
     await session.delete(row)
+    await session.flush()
+    from cognis.store.app_channels import ensure_app_channel_preference
+
+    await ensure_app_channel_preference(session, user_email=row.user_email, agent_id=row.agent_id)
     return True
 
 
@@ -11092,20 +11459,27 @@ async def create_artifact_record(
     content_hash: str | None = None,
     source_tool_call_id: str | None = None,
     source_anchor: str | None = None,
-    owner_agent_id: str | None = None,
+    owner_agent_id: str | None | _UnsetValue = _UNSET,
+    author_email: str | None = None,
+    author_agent_id: str | None = None,
     lineage_id: str | None = None,
     revision: int = 1,
     supersedes_artifact_id: str | None = None,
     project_id: str | None = None,
 ) -> ArtifactRecordRow:
-    if owner_agent_id is None and session_id is not None:
-        creator_session = await session.get(Session, session_id)
-        if creator_session is not None and creator_session.user_email == owner_email:
-            owner_agent_id = creator_session.agent_id
-    if owner_agent_id is None and conversation_id is not None:
-        creator = await get_conversation(session, conversation_id)
-        if creator is not None and creator.user_email == owner_email:
-            owner_agent_id = creator.agent_id
+    """Create artifact metadata; infer the owning agent only when it is omitted."""
+
+    infer_owner = isinstance(owner_agent_id, _UnsetValue)
+    if isinstance(owner_agent_id, _UnsetValue):
+        owner_agent_id = None
+        if session_id is not None:
+            creator_session = await session.get(Session, session_id)
+            if creator_session is not None and creator_session.user_email == owner_email:
+                owner_agent_id = creator_session.agent_id
+        if owner_agent_id is None and conversation_id is not None:
+            creator = await get_conversation(session, conversation_id)
+            if creator is not None and creator.user_email == owner_email:
+                owner_agent_id = creator.agent_id
     row = ArtifactRecordRow(
         artifact_id=artifact_id,
         namespace=namespace,
@@ -11113,6 +11487,8 @@ async def create_artifact_record(
         filename=filename,
         owner_email=owner_email,
         owner_agent_id=owner_agent_id,
+        author_email=author_email or owner_email,
+        author_agent_id=author_agent_id,
         conversation_id=conversation_id,
         session_id=session_id,
         message_role=message_role,
@@ -11146,8 +11522,15 @@ async def create_artifact_record(
                 lineage_id=row.lineage_id,
             ) from exc
         raise
-    from cognis.core.artifact_entitlements import register_content_entitlements
+    from cognis.core.artifact_entitlements import (
+        initialize_content_owner,
+        register_content_entitlements,
+    )
 
+    if supersedes_artifact_id is None and (
+        infer_owner or (owner_agent_id is not None and owner_agent_id.startswith("system:"))
+    ):
+        await session.run_sync(initialize_content_owner, row)
     await session.run_sync(register_content_entitlements, row)
     return row
 
@@ -11280,8 +11663,7 @@ async def lock_artifact_revision_target(
     if successor is not None or (head is not None and head.artifact_id != target.artifact_id):
         raise ArtifactRevisionError(
             "supersedes_not_latest",
-            "The artifact to supersede already has a newer revision. "
-            "Supersede the latest revision instead.",
+            "Document lineage changed. Re-read the current head before writing.",
             latest_artifact_id=head.artifact_id if head is not None else None,
             latest_revision=head.revision if head is not None else None,
         )
@@ -13328,10 +13710,15 @@ async def ensure_follow_up_result_delivery(
     )
     if direct_terminal is not None:
         return direct_terminal
-    source_type = "follow_up_result"
+    grace_row = await get_channel_delivery_outbox(session, grace_delivery_id)
+    project_result = (
+        grace_row is not None and grace_row.source_type == "project_task_result_follow_up"
+    )
+    source_type = "project_task_result_reply" if project_result else "follow_up_result"
+    # Keep both the originating grant/route fence and the terminal-turn identity.
+    source_id = f"{grace_delivery_id}:{turn_id}" if project_result else turn_id
     stable_key = hashlib.sha256(f"{source_type}:{grace_delivery_id}".encode()).hexdigest()[:20]
     result_delivery_id = f"cdel_{stable_key}"
-    grace_row = await get_channel_delivery_outbox(session, grace_delivery_id)
     route: tuple[str, str, str, str | None, str] | None
     if grace_row is not None:
         if grace_row.conversation_id != conversation_id:
@@ -13356,7 +13743,7 @@ async def ensure_follow_up_result_delivery(
         conversation_id=conversation_id,
         session_id=session_id,
         source_type=source_type,
-        source_id=turn_id,
+        source_id=source_id,
         channel_type=channel_type,
         account_id=account_id,
         chat_id=chat_id,
@@ -13369,7 +13756,7 @@ async def ensure_follow_up_result_delivery(
     if not created and (
         row.conversation_id != conversation_id
         or row.source_type != source_type
-        or row.source_id != turn_id
+        or row.source_id != source_id
         or row.channel_type != channel_type
         or row.account_id != account_id
         or row.chat_id != chat_id

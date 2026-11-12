@@ -1,0 +1,60 @@
+id: ptc-live-mutation
+description: |
+  Exercise one genuinely mutating Mnemory child tool in the ephemeral E2E
+  fixture through the live Python kernel, Intaris, and Chat v2 event stream.
+trigger: "scenario:ptc-live-mutation"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_mutation_discover_python
+        name: search_tools
+        arguments:
+          query: "Python executor persistent IPython kernel cell execution"
+          category: program
+          limit: 1
+
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_mutation_describe_python
+        name: describe_tool
+        arguments:
+          tool: "{{tool_result:ptc_mutation_discover_python:tool_id}}"
+
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_mutation_cell
+        name: call_tool
+        arguments:
+          tool: "{{tool_result:ptc_mutation_discover_python:tool_id}}"
+          arguments:
+            description: "PTC-MUTATION-01: add one ephemeral persistent memory and verify it once"
+            code: |
+              import json
+              content = "PTC-MUTATION-01 ephemeral nested memory"
+              await cognis.tools.memory_add(
+                  content=content,
+                  memory_type="fact",
+                  categories=["technical"],
+                  infer=False,
+              )
+              found = await cognis.tools.memory_search(
+                  query=content,
+                  memory_type="fact",
+                  categories=["technical"],
+                  limit=50,
+              )
+              search_result = found.text
+              if search_result.startswith("<tool_result "):
+                  search_result = search_result.split("\n", 1)[1].rsplit("\n<", 1)[0]
+              await cognis.emit({
+                  "content": content,
+                  "verified": json.loads(search_result),
+              })
+
+  - role: assistant
+    steps:
+      - type: text
+        content: "The nested memory write completed through the normal policy path."

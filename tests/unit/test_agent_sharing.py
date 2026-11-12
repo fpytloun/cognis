@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
@@ -52,6 +53,57 @@ def _auth_headers(app: object, *, email: str, role: str = "user") -> dict[str, s
     return {"Authorization": f"Bearer {token}"}
 
 
+def test_missing_executor_is_rejected_before_activation_or_owner_share(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as db:
+                for email in ("owner@example.com", "guest@example.com"):
+                    await create_user(db, email=email, name=email, password_hash="hashed")
+                await create_agent(
+                    db,
+                    agent_id="draft-reader",
+                    owner_email="owner@example.com",
+                    name="Draft reader",
+                    status="draft",
+                )
+                await db.commit()
+
+        client.portal.call(seed)
+        headers = _auth_headers(client.app, email="owner@example.com")
+        creation = client.post(
+            "/api/v1/agents",
+            headers=headers,
+            json={"agent_id": "unbound-active", "name": "Unbound active", "status": "active"},
+        )
+        assert creation.status_code == 400
+        assert creation.json()["error"]["code"] == "executor_configuration_invalid"
+        update = client.put(
+            "/api/v1/agents/draft-reader", headers=headers, json={"status": "active"}
+        )
+        assert update.status_code == 400
+        assert update.json()["error"]["code"] == "executor_configuration_invalid"
+        activation = client.post("/api/v1/agents/draft-reader/activate", headers=headers)
+        assert activation.status_code == 400
+        assert activation.json()["error"]["code"] == "executor_configuration_invalid"
+        owner_share = client.post(
+            "/api/v1/agents/draft-reader/shares",
+            headers=headers,
+            json={"grantee_email": "guest@example.com", "executor_scope": "owner_executor"},
+        )
+        assert owner_share.status_code == 400
+        assert owner_share.json()["error"]["code"] == "executor_configuration_invalid"
+        # A recipient-scoped share does not consume or require the owner's executor.
+        grantee_share = client.post(
+            "/api/v1/agents/draft-reader/shares",
+            headers=headers,
+            json={"grantee_email": "guest@example.com", "executor_scope": "grantee_executor"},
+        )
+        assert grantee_share.status_code == 201, grantee_share.text
+
+
 async def _agent_management_test_deps(tmp_path: Path) -> AgentManagementDependencies:
     from cognis.api.runtime_support import static_tool_definitions
 
@@ -61,6 +113,46 @@ async def _agent_management_test_deps(tmp_path: Path) -> AgentManagementDependen
         session_factory=create_session_factory(engine),
         assignable_tools=static_tool_definitions(knowledgebase_enabled=True),
     )
+
+
+@pytest.mark.asyncio
+async def test_agent_management_rejects_unbound_primary_activation_paths(tmp_path: Path) -> None:
+    from sqlalchemy import select
+
+    from cognis.store.models import Agent
+
+    deps = await _agent_management_test_deps(tmp_path)
+    engine = deps.session_factory.kw["bind"]
+    try:
+        async with deps.session_factory() as session:
+            await create_user(
+                session, email="owner@example.com", name="Owner", password_hash="hashed"
+            )
+            await create_agent(
+                session,
+                agent_id="unbound-primary",
+                owner_email="owner@example.com",
+                name="Draft primary",
+                status="draft",
+            )
+            await session.commit()
+        for arguments in (
+            {"action": "create", "name": "Unbound active", "status": "active"},
+            {"action": "update", "agent_id": "unbound-primary", "status": "active"},
+            {"action": "activate", "agent_id": "unbound-primary"},
+        ):
+            with pytest.raises(AgentManagementError, match="executor_id or executor_selector"):
+                await handle_agent_management_action(
+                    deps=deps,
+                    actor_email="owner@example.com",
+                    current_agent_id="controller-agent",
+                    arguments=arguments,
+                )
+        async with deps.session_factory() as session:
+            rows = list((await session.scalars(select(Agent))).all())
+            assert [(row.name, row.status) for row in rows] == [("Draft primary", "draft")]
+    finally:
+        await engine.dispose()
 
 
 def test_builtin_owner_self_get(tmp_path: Path) -> None:
@@ -576,6 +668,14 @@ def test_agent_management_service_can_create_and_revoke_share(
                     name="Managed Agent",
                     display_name="Managed Agent",
                     status="active",
+                    execution={"executor_id": "owner_exec"},
+                )
+                await create_executor(
+                    session,
+                    executor_id="owner_exec",
+                    name="Owner executor",
+                    executor_type="websocket",
+                    owner_email="owner@example.com",
                 )
                 await session.commit()
 
@@ -652,9 +752,6 @@ def test_agent_management_settings_get_schema_and_update(
                 "agent_id": "managed-agent",
                 "settings": {
                     "escalation_timeout_seconds": 45,
-                    "available_workflow_ids": ["software-development"],
-                    "default_workflow_id": "software-development",
-                    "workflow_selection_mode": "use_default",
                     "delegation": {
                         "enabled": True,
                         "allowed_agent_ids": [],
@@ -677,8 +774,7 @@ def test_agent_management_settings_get_schema_and_update(
         assert initial["settings"]["tools"] is None
         assert initial["settings"]["tools_state"]["config_state"] == "default_inherited"
         settings = updated["settings"]
-        assert settings["workflow"]["default_workflow_id"] == "software-development"
-        assert settings["workflow"]["workflow_selection_mode"] == "use_default"
+        assert settings["workflow"] == {"step_agent_overrides": {}}
         assert settings["executor"]["executor_id"] is None
         assert settings["permissions"]["delegation"] == {
             "enabled": True,
@@ -791,8 +887,11 @@ def test_agent_management_list_marks_current_agent_manageable(tmp_path: Path) ->
     asyncio.run(_run())
 
 
-def test_agent_management_settings_update_rejects_invalid_values(
-    monkeypatch: object, tmp_path: Path
+@pytest.mark.parametrize(
+    "retired_field", ["available_workflow_ids", "default_workflow_id", "workflow_selection_mode"]
+)
+def test_agent_management_settings_update_rejects_retired_workflow_fields(
+    monkeypatch: object, tmp_path: Path, retired_field: str
 ) -> None:
     del monkeypatch
 
@@ -820,13 +919,13 @@ def test_agent_management_settings_update_rejects_invalid_values(
                 arguments={
                     "action": "settings_update",
                     "agent_id": "managed-agent",
-                    "settings": {"default_workflow_id": "missing-workflow"},
+                    "settings": {retired_field: "missing-workflow"},
                 },
             )
         except ValueError as exc:
-            assert "Invalid default_workflow_id: missing-workflow" in str(exc)
+            assert f"Unsupported settings field(s): {retired_field}" in str(exc)
         else:
-            raise AssertionError("Expected settings_update to reject an invalid workflow ID")
+            raise AssertionError("Expected settings_update to reject a retired workflow setting")
 
     asyncio.run(_run())
 
@@ -1241,7 +1340,9 @@ def test_restricted_primary_cannot_expand_tool_assignment(tmp_path: Path) -> Non
             arguments={"action": "create", "name": "Restricted child"},
         )
         assert set(created["agent"]["tools"]["allow_tools"]) == {
-            stable_tool_id(tool) for tool in deps.assignable_tools or []
+            stable_tool_id(tool)
+            for tool in deps.assignable_tools or []
+            if tool.name != "manage_agents"
         }
         assert created["agent"]["permissions"] is None
         assert created["agent"]["execution"] is None
@@ -1322,7 +1423,6 @@ def test_settings_preflight_validates_provider_model_and_workflow_domains(
                 "settings": {
                     "provider_id": "provider-a",
                     "model": "model-a",
-                    "default_workflow_id": workflow.workflow_id,
                 },
             },
             context,
@@ -1346,7 +1446,7 @@ def test_settings_preflight_validates_provider_model_and_workflow_domains(
             {
                 "action": "settings_update",
                 "agent_id": "managed-agent",
-                "settings": {"default_workflow_id": "missing-workflow"},
+                "settings": {"default_workflow_id": workflow.workflow_id},
             },
             context,
         )
@@ -1355,7 +1455,7 @@ def test_settings_preflight_validates_provider_model_and_workflow_domains(
         assert invalid_model["valid"] is False
         assert "Invalid model" in invalid_model["errors"][0]["message"]
         assert invalid_workflow["valid"] is False
-        assert "Invalid default_workflow_id" in invalid_workflow["errors"][0]["message"]
+        assert "default_workflow_id" in invalid_workflow["errors"][0]
 
     asyncio.run(_run())
 

@@ -167,6 +167,40 @@ def test_pdf_view_returns_original_bytes_inline() -> None:
     assert response.headers["referrer-policy"] == "no-referrer"
 
 
+def test_html_view_wraps_an_opaque_raw_frame_without_injecting_source_code(monkeypatch) -> None:
+    captured = {}
+
+    def fake_shell(row, **kwargs):
+        captured["row"] = row
+        captured.update(kwargs)
+        return "<html>trusted viewer</html>"
+
+    monkeypatch.setattr("cognis.api.routes.artifacts.render_standalone_shell", fake_shell)
+    url = "https://cognis.test/view?exp=123"
+    content = b"<script>window.original=true</script>"
+    response = _artifact_viewer_response(
+        artifact_id="att_" + "1" * 32,
+        filename="page.html",
+        content_type="text/html",
+        content=content,
+        standalone_url=url,
+    )
+    assert captured["embedded_document_url"] == url + "&raw=1"
+    assert captured["row"].content == ""
+    assert captured["row"].rich_payload == {"blocks": []}
+    assert "window.original" not in response.body.decode()
+    raw = _artifact_viewer_response(
+        artifact_id="att_" + "1" * 32,
+        filename="page.html",
+        content_type="text/html",
+        content=content,
+        standalone_url=url,
+        raw=True,
+    )
+    assert raw.body == content
+    assert "connect-src 'none'" in raw.headers["content-security-policy"]
+
+
 def test_signed_view_rejects_active_svg_images() -> None:
     with pytest.raises(HTTPException) as exc_info:
         _assert_view_allowed("payload.svg", "image/svg+xml")

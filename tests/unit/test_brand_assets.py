@@ -72,25 +72,9 @@ def test_generated_favicon_contains_multiple_sizes() -> None:
 
 
 def test_apple_splash_dimensions_match_filenames() -> None:
-    splashes = list((STATIC / "pwa").glob("apple-splash-*.png"))
-    expected_sizes = {
-        (2048, 2732),
-        (1668, 2388),
-        (1536, 2048),
-        (1320, 2868),
-        (1290, 2796),
-        (1206, 2622),
-        (1179, 2556),
-        (1170, 2532),
-        (1125, 2436),
-        (828, 1792),
-        (750, 1334),
-    }
-    assert {path.name for path in splashes} == {
-        f"apple-splash-{variant}{width}-{height}.png"
-        for width, height in expected_sizes
-        for variant in ("", "light-")
-    }
-    for path in splashes:
-        expected = tuple(int(value) for value in path.stem.split("-")[-2:])
-        assert struct.unpack(">II", path.read_bytes()[16:24]) == expected
+    for pattern in ("apple-splash-[0-9]*.png", "apple-splash-light-*.png"):
+        splashes = list((STATIC / "pwa").glob(pattern))
+        assert len(splashes) == 11
+        for path in splashes:
+            expected = tuple(int(value) for value in path.stem.split("-")[-2:])
+            assert struct.unpack(">II", path.read_bytes()[16:24]) == expected

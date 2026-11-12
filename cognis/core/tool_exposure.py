@@ -58,6 +58,7 @@ _JSON_SCHEMA_SAME_INSTANCE_SCHEMA_KEYS = frozenset(
 _CRITICAL_GENERIC_TOOL_NAMES = frozenset(
     {
         "skill_load",
+        "skill_search",
         "read_tool_output",
         "search_tool_output",
         "list_tool_output_anchors",

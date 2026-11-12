@@ -163,7 +163,11 @@ async def test_intaris_create_session_verifies_duplicate_after_timeout_retry() -
             self.status_code = status_code
 
         def json(self) -> dict[str, object]:
-            return {"policy": {}}
+            return {
+                "policy": {},
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            }
 
         @property
         def is_success(self) -> bool:
@@ -354,10 +358,10 @@ async def test_intaris_record_events_retries_missing_session_when_requested() ->
     class _Response:
         def __init__(self, status_code: int, payload: dict[str, object] | None = None) -> None:
             self.status_code = status_code
-            self._payload = payload or {}
-            self.headers = httpx.Headers(
+            self.headers = (
                 {"X-Intaris-Event-Error": "session_not_found"} if status_code == 404 else {}
             )
+            self._payload = payload or {}
             self.request = httpx.Request(
                 "POST", "http://localhost:8060/api/v1/session/sess-1/events"
             )

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -42,7 +41,7 @@ def test_credentials_crud(monkeypatch: object, tmp_path: Path) -> None:
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/credentials",
@@ -65,7 +64,7 @@ def test_credentials_crud(monkeypatch: object, tmp_path: Path) -> None:
                 assert agent is not None
                 return agent.permissions or {}
 
-        permissions = asyncio.run(_agent_permissions())
+        permissions = client.portal.call(_agent_permissions)
         assert permissions["allowed_credentials"] == ["github_work"]
 
         listed = client.get(

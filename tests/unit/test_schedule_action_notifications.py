@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -204,7 +203,7 @@ def test_schedule_notification_deduplicates_escalates_resolves_and_is_owner_scop
                 assert reopened.payload["severity"] == "warning"
                 assert reopened.payload["auto_disabled"] is False
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
         assert [event.type for event in events].count(EventType.SCHEDULE_ACTION_CHANGED) == 6
         assert [event.type for event in events].count(EventType.NOTIFICATION_CREATED) == 0
         assert [event.type for event in events].count(EventType.NOTIFICATION_RESOLVED) == 0
@@ -307,7 +306,7 @@ def test_stale_schedule_failures_do_not_create_or_reopen_incidents(
             async with client.app.state.session_factory() as session:
                 assert await session.get(NotificationRow, "notif_schedule_sched-stale") is None
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
 
 
 def test_schedule_failure_uses_original_external_event_and_purpose_invalidation(
@@ -377,7 +376,7 @@ def test_schedule_failure_uses_original_external_event_and_purpose_invalidation(
                 assert row.status == "pending"
                 assert row.payload["action_url"] == "/schedules/sched-delivery"
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
         assert [event.type for event in external_events] == [EventType.SCHEDULE_ERROR]
         assert len(invalidations) == 1
         assert invalidations[0].data["status"] == "pending"
@@ -505,4 +504,4 @@ def test_overlapping_terminal_results_follow_canonical_projection_order(
                 assert row.status == "pending"
                 assert row.task_id == "task-b"
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)

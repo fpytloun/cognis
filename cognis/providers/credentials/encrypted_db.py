@@ -179,6 +179,35 @@ class EncryptedDBCredentialsProvider:
             await session.commit()
             return True
 
+    async def create_credential_in_transaction(
+        self,
+        session: Any,
+        *,
+        credential_id: str,
+        user_email: str,
+        agent_id: str,
+        label: str,
+        payload: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> CredentialRow:
+        """Stage a new agent-scoped token alongside its owner's atomic state change."""
+        row = CredentialRow(
+            row_id=f"credrow_{uuid.uuid4().hex[:12]}",
+            credential_id=credential_id,
+            user_email=user_email,
+            scope="agent",
+            agent_id=agent_id,
+            kind="token",
+            label=label,
+            metadata_json=metadata,
+            encrypted_payload=self._encrypt_payload(payload),
+            version=1,
+            status="active",
+        )
+        session.add(row)
+        await session.flush()
+        return row
+
     async def delete_credential(self, credential_id: str, user_email: str) -> bool:
         async with self.session_factory() as session:
             result = await session.execute(
@@ -227,7 +256,7 @@ class EncryptedDBCredentialsProvider:
                     f"Credential not allowed for agent: {credential_id}",
                     credential_id=credential_id,
                 )
-            if row.agent_id is not None and row.agent_id != agent.agent_id:
+            if row.scope == "agent" and row.agent_id != agent.agent_id:
                 raise CredentialAccessError(
                     "credential_not_allowed",
                     f"Credential not scoped to agent: {credential_id}",
@@ -246,6 +275,8 @@ class EncryptedDBCredentialsProvider:
                     credential_id=credential_id,
                 )
             kind = row.kind
+            version = row.version
+            instance_id = row.row_id
             payload = self._decrypt_payload(row.encrypted_payload)
         if kind == "totp_seed" and field == "otp":
             resolved_value: Any = _generate_totp(payload)
@@ -266,6 +297,8 @@ class EncryptedDBCredentialsProvider:
             credential_id=credential_id,
             field=field,
             value=resolved_value,
+            version=version,
+            instance_id=instance_id,
         )
 
     async def health(self) -> ProviderHealth:

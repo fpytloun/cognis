@@ -18,6 +18,7 @@ from sqlalchemy import select, update
 
 from cognis import json_codec as json
 from cognis.api.common import require_admin, require_current_user
+from cognis.api.inference_usage import observe_error, observe_outcome, observe_response
 from cognis.providers.llm.inference_accounting import attribution_from_headers
 from cognis.providers.llm.inference_api import (
     InferenceAPIService,
@@ -26,6 +27,8 @@ from cognis.providers.llm.inference_api import (
 )
 from cognis.providers.llm.inference_errors import safe_inference_error
 from cognis.providers.llm.systemone import SystemOneRequest, SystemOneResponse
+from cognis.providers.llm.usage_binding import USAGE_REQUEST_KEY
+from cognis.providers.llm.usage_proxy import proxy_request
 from cognis.store.models import InferenceCompanion
 
 router = APIRouter(tags=["inference"])
@@ -181,6 +184,14 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
     kwargs["timeout"] = 3.5 if target.requested == "routes/intaris_evaluation" else 120
     request_id = f"chatcmpl-{uuid.uuid4().hex}"
     kwargs["cognis_llm_request_id"] = request_id
+    kwargs[USAGE_REQUEST_KEY] = proxy_request(
+        request,
+        service,
+        principal,
+        target,
+        operation="chat",
+        parameters={**kwargs, "_usage_streaming": payload.stream},
+    )
     started = time.monotonic()
     usage: dict[str, Any] = {}
     if not payload.stream:
@@ -199,6 +210,7 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
             if actual:
                 target = replace(target, **actual)
             usage = response.get("usage") or {}
+            observe_response(request, response)
             outcome = "success"
             response = dict(response)
             response.update(id=request_id, object="chat.completion", model=payload.model)
@@ -213,6 +225,7 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
             outcome = "cancelled"
             raise
         except Exception as exc:
+            observe_error(request, exc)
             logger.warning(
                 "inference_provider_error",
                 extra={"extra_data": {"request_id": request_id, **safe_inference_error(exc)}},
@@ -221,6 +234,7 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
             response.headers["x-request-id"] = request_id
             return response
         finally:
+            observe_outcome(request, outcome)
             service.observe(
                 principal,
                 target,
@@ -254,6 +268,7 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
         try:
             async with service.admission(principal):
                 async for chunk in stream:
+                    observe_response(request, chunk)
                     if "_inference_selection" in chunk:
                         from dataclasses import replace
 
@@ -294,12 +309,14 @@ async def chat(request: Request, payload: ChatRequest) -> Any:
             outcome = "cancelled"
             raise
         except Exception as exc:
+            observe_error(request, exc)
             yield f"data: {bytes(upstream_failure(exc).body).decode()}\n\n"
             yield "data: [DONE]\n\n"
         finally:
             try:
                 await stream.aclose()
             finally:
+                observe_outcome(request, outcome)
                 service.observe(
                     principal,
                     serving_target,
@@ -334,6 +351,14 @@ async def systemone(request: Request, payload: SystemOneRequest) -> Any:
     except ValueError:
         return failure(InferenceError(400, "invalid_model", "Unknown or unavailable model"))
     request_id = f"systemone-{uuid.uuid4().hex}"
+    scope = proxy_request(
+        request,
+        service,
+        principal,
+        target,
+        operation="systemone",
+        parameters={"cognis_llm_request_id": request_id},
+    )
     started = time.monotonic()
     outcome = "error"
     usage: dict[str, Any] = {}
@@ -344,6 +369,7 @@ async def systemone(request: Request, payload: SystemOneRequest) -> Any:
                 provider_id=None if target.route_reference else target.provider_id,
                 acting_user_email=target.owner,
                 timeout=3.5 if target.requested == "routes/intaris_evaluation" else 120,
+                **{USAGE_REQUEST_KEY: scope},
             )
         from dataclasses import replace
 
@@ -359,6 +385,7 @@ async def systemone(request: Request, payload: SystemOneRequest) -> Any:
         outcome = "cancelled"
         raise
     except Exception as exc:
+        observe_error(request, exc)
         logger.warning(
             "inference_provider_error",
             extra={
@@ -375,6 +402,7 @@ async def systemone(request: Request, payload: SystemOneRequest) -> Any:
         response.headers["x-request-id"] = request_id
         return response
     finally:
+        observe_outcome(request, outcome)
         service.observe(
             principal,
             target,
@@ -410,6 +438,15 @@ async def embeddings(request: Request, payload: EmbeddingRequest) -> Any:
     }
     if payload.dimensions:
         kwargs["dimensions"] = payload.dimensions
+    kwargs["cognis_llm_request_id"] = request_id
+    kwargs[USAGE_REQUEST_KEY] = proxy_request(
+        request,
+        service,
+        principal,
+        target,
+        operation="embeddings",
+        parameters=kwargs,
+    )
     try:
         async with service.admission(principal):
             response = await service.llm.embed_response(texts, model=target.model, **kwargs)
@@ -443,8 +480,10 @@ async def embeddings(request: Request, payload: EmbeddingRequest) -> Any:
         outcome = "cancelled"
         raise
     except Exception as exc:
+        observe_error(request, exc)
         return upstream_failure(exc)
     finally:
+        observe_outcome(request, outcome)
         service.observe(
             principal,
             target,

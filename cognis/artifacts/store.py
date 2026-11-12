@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,6 +25,14 @@ from typing import Any, BinaryIO, Protocol, runtime_checkable
 from urllib.parse import quote
 
 from cognis import json_codec as json
+from cognis.artifacts.json_validation import JSONStreamValidator, is_json_mime_type
+from cognis.artifacts.streaming import (
+    FilesystemStreamWriter,
+    S3StreamWriter,
+    StreamWriter,
+    storage_io,
+    write_stream,
+)
 from cognis.logging import get_logger
 
 logger = get_logger(__name__)
@@ -99,8 +107,8 @@ def sanitize_artifact_filename(filename: str | None, *, default: str = "attachme
     return sanitized
 
 
-class ArtifactReadStream(Protocol):
-    """Minimal read contract for filesystem files and S3 response bodies."""
+class RangeReader(Protocol):
+    """Common readable boundary for local files and S3 response bodies."""
 
     def read(self, size: int = -1, /) -> bytes: ...
 
@@ -113,6 +121,15 @@ class ArtifactBackend(Protocol):
 
     Storage path: {namespace}/{object_id}/{filename}
     """
+
+    def stream_writer(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        size: int,
+        content_type: str = "application/octet-stream",
+    ) -> StreamWriter: ...
 
     def save(
         self,
@@ -147,12 +164,16 @@ class ArtifactBackend(Protocol):
 
     def open_range(
         self, namespace: str, object_id: str, filename: str, start: int, end: int
-    ) -> ArtifactReadStream: ...
+    ) -> RangeReader: ...
 
     def delete(self, namespace: str, object_id: str, filename: str) -> None: ...
 
     def delete_object(self, namespace: str, object_id: str) -> None:
         """Delete all files for an object."""
+        ...
+
+    def abort_uploads(self, namespace: str, object_id: str) -> None:
+        """Abort incomplete uploads for an unpublished storage object."""
         ...
 
     def exists(self, namespace: str, object_id: str, filename: str) -> bool: ...
@@ -190,6 +211,20 @@ class FilesystemArtifactBackend:
 
     def _metadata_path(self, namespace: str, object_id: str) -> Path:
         return self._base / namespace / object_id / ".metadata.json"
+
+    def stream_writer(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        size: int,
+        content_type: str = "application/octet-stream",
+    ) -> StreamWriter:
+        """Create a private, atomically committed streaming destination."""
+        return FilesystemStreamWriter(
+            self._resolve_path(namespace, object_id, filename),
+            self._metadata_path(namespace, object_id),
+        )
 
     def save(
         self,
@@ -248,7 +283,7 @@ class FilesystemArtifactBackend:
 
     def open_range(
         self, namespace: str, object_id: str, filename: str, start: int, end: int
-    ) -> ArtifactReadStream:
+    ) -> RangeReader:
         source = self._resolve_path(namespace, object_id, filename).open("rb")
         source.seek(start)
         return source
@@ -279,6 +314,9 @@ class FilesystemArtifactBackend:
         resolved = obj_dir.resolve()
         if resolved.is_relative_to(self._base.resolve()) and resolved.is_dir():
             shutil.rmtree(resolved)
+
+    def abort_uploads(self, namespace: str, object_id: str) -> None:
+        """Partial files are reclaimed by the following object-directory deletion."""
 
     def exists(self, namespace: str, object_id: str, filename: str) -> bool:
         try:
@@ -343,6 +381,24 @@ class S3ArtifactBackend:
 
     def _meta_key(self, namespace: str, object_id: str) -> str:
         return f"{namespace}/{object_id}/.metadata.json"
+
+    def stream_writer(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        size: int,
+        content_type: str = "application/octet-stream",
+    ) -> StreamWriter:
+        """Create a bounded-memory parallel multipart destination."""
+        return S3StreamWriter(
+            self._client,
+            self._bucket,
+            self._key(namespace, object_id, filename),
+            self._meta_key(namespace, object_id),
+            size,
+            content_type,
+        )
 
     def save(
         self,
@@ -409,7 +465,7 @@ class S3ArtifactBackend:
 
     def open_range(
         self, namespace: str, object_id: str, filename: str, start: int, end: int
-    ) -> ArtifactReadStream:
+    ) -> RangeReader:
         return self._client.get_object(
             Bucket=self._bucket,
             Key=self._key(namespace, object_id, filename),
@@ -442,6 +498,26 @@ class S3ArtifactBackend:
                 continue
             for obj in objects:
                 self._client.delete_object(Bucket=self._bucket, Key=obj["Key"])
+
+    def abort_uploads(self, namespace: str, object_id: str) -> None:
+        """Reclaim multipart state even when its creating controller has crashed."""
+        from botocore.exceptions import ClientError
+
+        _validate_path_component(namespace)
+        _validate_path_component(object_id)
+        prefix = f"{namespace}/{object_id}/"
+        paginator = self._client.get_paginator("list_multipart_uploads")
+        for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+            for upload in page.get("Uploads", []):
+                if not upload["Key"].startswith(prefix):
+                    continue
+                try:
+                    self._client.abort_multipart_upload(
+                        Bucket=self._bucket, Key=upload["Key"], UploadId=upload["UploadId"]
+                    )
+                except ClientError as exc:
+                    if exc.response.get("Error", {}).get("Code") != "NoSuchUpload":
+                        raise
 
     def exists(self, namespace: str, object_id: str, filename: str) -> bool:
         key = self._key(namespace, object_id, filename)
@@ -508,10 +584,7 @@ class ArtifactStore:
         content_type: str,
         owner_email: str | None = None,
     ) -> None:
-        """Save an artifact with size validation (sync)."""
-        if len(content) > self._config.max_size_bytes:
-            max_mb = self._config.max_size_bytes / (1024 * 1024)
-            raise ValueError(f"Artifact exceeds maximum size of {max_mb:.0f}MB")
+        """Save an already materialized artifact (sync), without a size ceiling."""
         self._backend.save(namespace, object_id, filename, content, content_type, owner_email)
 
     def load(self, namespace: str, object_id: str, filename: str) -> tuple[bytes, str]:
@@ -617,6 +690,38 @@ class ArtifactStore:
         path = f"/api/v1/artifacts/{route}/{quote(namespace)}/{quote(object_id)}/{quote(filename)}"
         return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
 
+    def _document_link_signature(self, artifact_id: str, exp: int, mode: str) -> str:
+        # A domain-separated key keeps document links from ever verifying as exact-object URLs.
+        key = hmac.new(
+            self._config.signing_secret.encode("utf-8"),
+            b"cognis-artifact-document-link-v1",
+            hashlib.sha256,
+        ).digest()
+        return hmac.new(key, f"{artifact_id}\n{exp}\n{mode}".encode(), hashlib.sha256).hexdigest()
+
+    def get_document_link_url(
+        self, artifact_id: str, *, ttl_seconds: int, mode: str = "download"
+    ) -> str:
+        """Sign a public link that always serves the newest revision of the artifact's document.
+
+        Unlike ``get_public_url()``, which addresses one stored revision, the route resolves the
+        revision chain at request time; internal revision-exact URLs are unaffected.
+        """
+        if mode not in {"download", "view"}:
+            raise ValueError(f"Unsupported artifact URL mode: {mode}")
+        if not self._config.base_url or not self._config.signing_secret:
+            raise ValueError("Artifact public URLs require base_url and signing_secret")
+        exp = int(time.time()) + ttl_seconds
+        sig = self._document_link_signature(artifact_id, exp, mode)
+        path = f"/api/v1/artifacts/latest/{quote(artifact_id)}/{mode}"
+        return f"{self._config.base_url}{path}?exp={exp}&sig={sig}"
+
+    def verify_document_link(self, artifact_id: str, *, exp: int, sig: str, mode: str) -> bool:
+        """Check a document link signature and expiry."""
+        if exp < int(time.time()) or not self._config.signing_secret:
+            return False
+        return hmac.compare_digest(self._document_link_signature(artifact_id, exp, mode), sig)
+
     def verify_signed_request(
         self,
         namespace: str,
@@ -661,6 +766,11 @@ class ArtifactStore:
 
         return await asyncio.to_thread(self.load, namespace, object_id, filename)
 
+    async def async_discard_staged_object(self, namespace: str, object_id: str) -> None:
+        """Reclaim abandoned streams and bytes after durable deletion fencing."""
+        await storage_io(self._backend.abort_uploads, namespace, object_id)
+        await storage_io(self._backend.delete_object, namespace, object_id)
+
     async def async_save_stream(
         self,
         namespace: str,
@@ -700,6 +810,35 @@ class ArtifactStore:
         finally:
             await asyncio.to_thread(source.close)
 
+    async def async_receive_stream(
+        self,
+        namespace: str,
+        object_id: str,
+        filename: str,
+        content: AsyncIterator[bytes],
+        content_type: str,
+        owner_email: str,
+        *,
+        expected_size: int,
+        check_current: Callable[[], Awaitable[None]] | None = None,
+        validate_json: bool = False,
+    ) -> tuple[int, str]:
+        """Store exact raw bytes without a file-size ceiling or whole-file buffers."""
+        writer = self._backend.stream_writer(
+            namespace, object_id, filename, expected_size, content_type
+        )
+        return await write_stream(
+            writer,
+            content,
+            expected_size=expected_size,
+            content_type=content_type,
+            owner_email=owner_email,
+            check_current=check_current,
+            validator=JSONStreamValidator()
+            if validate_json and is_json_mime_type(content_type)
+            else None,
+        )
+
     async def async_read_range(
         self,
         namespace: str,
@@ -709,19 +848,25 @@ class ArtifactStore:
         end: int,
     ) -> AsyncIterator[bytes]:
         """Stream an inclusive byte range without loading the whole object."""
-        source = await asyncio.to_thread(
-            self._backend.open_range, namespace, object_id, filename, start, end
-        )
+        source: RangeReader | None = None
+
+        def open_source() -> None:
+            nonlocal source
+            source = self._backend.open_range(namespace, object_id, filename, start, end)
+
         remaining = end - start + 1
         try:
+            await storage_io(open_source)
+            assert source is not None
             while remaining > 0:
-                chunk = await asyncio.to_thread(source.read, min(256 * 1024, remaining))
+                chunk = await storage_io(source.read, min(1024 * 1024, remaining))
                 if not chunk:
                     raise OSError("Artifact truncated during streaming")
                 remaining -= len(chunk)
                 yield chunk
         finally:
-            await asyncio.to_thread(source.close)
+            if source is not None:
+                await storage_io(source.close)
 
     async def async_load_metadata(
         self, namespace: str, object_id: str, filename: str

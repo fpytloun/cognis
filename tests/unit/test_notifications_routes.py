@@ -48,7 +48,7 @@ def test_auth_challenge_requires_code_when_declared(monkeypatch: object, tmp_pat
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -106,7 +106,7 @@ def test_durable_escalation_lookup_enforces_user_and_conversation_ownership(
             assert owned is not None
             assert owned.notification_id == "audit-owned"
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
 
 
 def test_notification_list_includes_managed_origin_escalations_for_the_owner(
@@ -148,7 +148,7 @@ def test_notification_list_includes_managed_origin_escalations_for_the_owner(
                 },
             )
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         owner_response = client.get(
             "/api/v1/notifications?conversation_id=conversation-parent",
@@ -188,7 +188,7 @@ def test_auth_challenge_cancel_does_not_require_declared_response_fields(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -221,7 +221,7 @@ def test_oauth_auth_challenge_cancel_is_allowed(monkeypatch: object, tmp_path: P
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -267,7 +267,7 @@ def test_expired_oauth_authorization_is_removed_from_pending_notifications(
                 await session.commit()
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
         client.app.state.pause_waiter.register(
             PendingPause(
                 pause_id=notification_id,
@@ -283,7 +283,9 @@ def test_expired_oauth_authorization_is_removed_from_pending_notifications(
 
         assert response.status_code == 200
         assert response.json() == []
-        notification = asyncio.run(client.app.state.notification_service.get(notification_id))
+        notification = client.portal.call(
+            client.app.state.notification_service.get, notification_id
+        )
         assert notification is not None
         assert notification.status == "resolved"
         assert notification.resolution == {"decision": "cancel", "reason": "expired"}
@@ -348,7 +350,7 @@ def test_callback_only_oauth_does_not_register_or_reconcile_as_pause(
             assert current is not None
             assert current.status == "pending"
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
 
 
 def test_orphaned_cleanup_does_not_overwrite_a_fresh_resolution_claim(
@@ -394,7 +396,7 @@ def test_orphaned_cleanup_does_not_overwrite_a_fresh_resolution_claim(
             assert pause is not None
             assert pause.resolved is False
 
-        asyncio.run(_exercise())
+        client.portal.call(_exercise)
 
 
 def test_direct_step_question_cancel_can_clear_stale_pending_notification(
@@ -429,7 +431,7 @@ def test_direct_step_question_cancel_can_clear_stale_pending_notification(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -474,7 +476,7 @@ def test_direct_step_question_response_uses_persisted_questions_without_local_pa
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
         client.app.state.pause_waiter.clear(notification_id)
 
         response = client.post(
@@ -534,7 +536,7 @@ def test_direct_step_question_cancel_ignores_incomplete_response_payload(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -581,7 +583,7 @@ def test_direct_step_question_continue_requires_response(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -624,7 +626,7 @@ def test_direct_step_question_continue_rejects_empty_plain_text_response(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -670,7 +672,7 @@ def test_direct_step_question_continue_accepts_plain_text_response(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -679,7 +681,7 @@ def test_direct_step_question_continue_accepts_plain_text_response(
         )
 
         assert response.status_code == 200
-        resolved = asyncio.run(client.app.state.notification_service.get(notification_id))
+        resolved = client.portal.call(client.app.state.notification_service.get, notification_id)
         assert resolved is not None
         assert resolved.resolution["answers"][0]["custom_answer"] == "Continue now"
 
@@ -765,7 +767,7 @@ def test_direct_step_question_owner_observes_remote_resolution(
             assert resolution.decision == "continue"
             assert resolution.data["answers"][0]["selected_option_ids"] == ["continue"]
 
-        asyncio.run(_run())
+        client.portal.call(_run)
 
 
 def test_credential_request_deny_does_not_store_credential(
@@ -791,7 +793,7 @@ def test_credential_request_deny_does_not_store_credential(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -847,7 +849,7 @@ def test_credential_request_approve_requires_declared_fields(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -905,7 +907,7 @@ def test_credential_request_approval_grants_created_credential_to_agent(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -924,7 +926,7 @@ def test_credential_request_approval_grants_created_credential_to_agent(
                 assert agent is not None
                 return agent.permissions or {}
 
-        permissions = asyncio.run(_agent_permissions())
+        permissions = client.portal.call(_agent_permissions)
         assert permissions["allowed_credentials"] == ["github_login"]
 
 
@@ -956,7 +958,7 @@ def test_credential_request_approve_rejects_empty_declared_fields(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -994,7 +996,7 @@ def test_credential_request_deny_drops_supplied_secret_payload(
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
 
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
@@ -1046,14 +1048,14 @@ def test_credential_request_parses_username_password_formats(
             )
             return notification.notification_id
 
-        asyncio.run(_seed_user())
+        client.portal.call(_seed_user)
 
         for response_text in [
             "user@example.com:secret-pass",
             "user@example.com\nsecret-pass",
             "username: user@example.com\npassword: secret-pass",
         ]:
-            notification_id = asyncio.run(_create_request())
+            notification_id = client.portal.call(_create_request)
             response = client.post(
                 f"/api/v1/notifications/{notification_id}/resolve",
                 headers=_auth_headers(client.app, email="user@example.com"),
@@ -1088,7 +1090,7 @@ def test_credential_request_parses_token_reply(monkeypatch: object, tmp_path: Pa
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
             headers=_auth_headers(client.app, email="user@example.com"),
@@ -1123,7 +1125,7 @@ def test_credential_request_accepts_response_payload(monkeypatch: object, tmp_pa
             )
             return notification.notification_id
 
-        notification_id = asyncio.run(_seed())
+        notification_id = client.portal.call(_seed)
         response = client.post(
             f"/api/v1/notifications/{notification_id}/resolve",
             headers=_auth_headers(client.app, email="user@example.com"),

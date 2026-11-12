@@ -106,7 +106,11 @@ def render_user_message(
         for item in contextual_messages:
             if not isinstance(item, dict) or not isinstance(item.get("content"), str):
                 continue
-            item_metadata = normalize_message_metadata(item.get("message_metadata"))
+            # Context recorded without its own timestamp belongs to the primary message's
+            # time; dropping it would silently remove admitted context such as feedback.
+            item_metadata = normalize_message_metadata(
+                item.get("message_metadata"), fallback_ts=primary_metadata["ts"]
+            )
             if item_metadata is None:
                 continue
             item_content = _truncate_content(item["content"], max_content_chars)

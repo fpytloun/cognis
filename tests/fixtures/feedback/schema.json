@@ -1,0 +1,5483 @@
+{
+  "$defs": {
+    "AnchorInput": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "locator": {
+          "discriminator": {
+            "mapping": {
+              "diff": "#/$defs/DiffLocator",
+              "html": "#/$defs/HtmlLocator",
+              "image": "#/$defs/ImageLocator",
+              "pdf": "#/$defs/PdfLocator",
+              "rich": "#/$defs/RichLocator",
+              "text": "#/$defs/TextLocator",
+              "whole": "#/$defs/WholeLocator"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/WholeLocator"
+            },
+            {
+              "$ref": "#/$defs/TextLocator"
+            },
+            {
+              "$ref": "#/$defs/RichLocator"
+            },
+            {
+              "$ref": "#/$defs/HtmlLocator"
+            },
+            {
+              "$ref": "#/$defs/ImageLocator"
+            },
+            {
+              "$ref": "#/$defs/PdfLocator"
+            },
+            {
+              "$ref": "#/$defs/DiffLocator"
+            }
+          ],
+          "title": "Locator"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source_token": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Source Token",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_token",
+        "content_digest",
+        "locator"
+      ],
+      "title": "AnchorInput",
+      "type": "object"
+    },
+    "AnchorMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "exact",
+            "remapped",
+            "not_located"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "mapped_anchor_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mapped Anchor Id"
+        },
+        "original_anchor_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Original Anchor Id",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        },
+        "target_content_ref": {
+          "title": "Target Content Ref",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "original_anchor_id",
+        "category",
+        "target_content_ref",
+        "reason",
+        "version"
+      ],
+      "title": "AnchorMapping",
+      "type": "object"
+    },
+    "Area": {
+      "additionalProperties": false,
+      "properties": {
+        "height": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "title": "Height",
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "rectangle",
+            "ellipse"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "width": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "title": "Width",
+          "type": "number"
+        },
+        "x": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Y",
+          "type": "number"
+        }
+      },
+      "required": [
+        "kind",
+        "x",
+        "y",
+        "width",
+        "height"
+      ],
+      "title": "Area",
+      "type": "object"
+    },
+    "Arrow": {
+      "additionalProperties": false,
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/Point"
+        },
+        "kind": {
+          "const": "arrow",
+          "title": "Kind",
+          "type": "string"
+        },
+        "to": {
+          "$ref": "#/$defs/Point"
+        }
+      },
+      "required": [
+        "kind",
+        "from",
+        "to"
+      ],
+      "title": "Arrow",
+      "type": "object"
+    },
+    "Attribution": {
+      "additionalProperties": false,
+      "properties": {
+        "is_self": {
+          "default": false,
+          "title": "Is Self",
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "verified_user",
+            "guest_unverified",
+            "agent"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "label"
+      ],
+      "title": "Attribution",
+      "type": "object"
+    },
+    "CanonicalText": {
+      "additionalProperties": false,
+      "properties": {
+        "available_ranges": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "title": "Available Ranges",
+          "type": "array"
+        },
+        "length": {
+          "minimum": 0,
+          "title": "Length",
+          "type": "integer"
+        },
+        "representation": {
+          "const": "feedback-text-v1",
+          "default": "feedback-text-v1",
+          "title": "Representation",
+          "type": "string"
+        },
+        "text_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Text Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "text_digest",
+        "length",
+        "available_ranges"
+      ],
+      "title": "CanonicalText",
+      "type": "object"
+    },
+    "CanonicalTextPage": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "integer"
+        },
+        "representation": {
+          "const": "feedback-text-v1",
+          "default": "feedback-text-v1",
+          "title": "Representation",
+          "type": "string"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "integer"
+        },
+        "text": {
+          "title": "Text",
+          "type": "string"
+        },
+        "text_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Text Digest",
+          "type": "string"
+        },
+        "total_length": {
+          "minimum": 0,
+          "title": "Total Length",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "text_digest",
+        "start",
+        "end",
+        "total_length",
+        "text"
+      ],
+      "title": "CanonicalTextPage",
+      "type": "object"
+    },
+    "CaptureRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "method": {
+          "const": "observed_pixels",
+          "default": "observed_pixels",
+          "title": "Method",
+          "type": "string"
+        },
+        "render_state_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Render State Digest",
+          "type": "string"
+        },
+        "source_token": {
+          "maxLength": 16384,
+          "title": "Source Token",
+          "type": "string"
+        },
+        "viewport": {
+          "$ref": "#/$defs/Viewport"
+        }
+      },
+      "required": [
+        "creation_key",
+        "source_token",
+        "content_digest",
+        "viewport",
+        "render_state_digest"
+      ],
+      "title": "CaptureRequest",
+      "type": "object"
+    },
+    "CaptureResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "capture_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Capture Id",
+          "type": "string"
+        },
+        "error_code": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Error Code"
+        },
+        "fidelity": {
+          "const": "observed",
+          "default": "observed",
+          "title": "Fidelity",
+          "type": "string"
+        },
+        "height": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Height"
+        },
+        "status": {
+          "enum": [
+            "awaiting_pixels",
+            "ready",
+            "failed"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "trust": {
+          "const": "untrusted_user_provided",
+          "default": "untrusted_user_provided",
+          "title": "Trust",
+          "type": "string"
+        },
+        "upload_limit_bytes": {
+          "default": 8388608,
+          "title": "Upload Limit Bytes",
+          "type": "integer"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "width": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Width"
+        }
+      },
+      "required": [
+        "capture_id",
+        "status",
+        "version"
+      ],
+      "title": "CaptureResponse",
+      "type": "object"
+    },
+    "ChatFeedbackContext": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "chat",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "conversation_id"
+      ],
+      "title": "ChatFeedbackContext",
+      "type": "object"
+    },
+    "ChildWorkRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "child_attempt_number": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Child Attempt Number"
+        },
+        "child_conversation_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Child Conversation Id"
+        },
+        "child_session_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Child Session Id"
+        },
+        "child_task_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Child Task Id"
+        },
+        "child_turn_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Child Turn Id"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        }
+      },
+      "required": [
+        "manifest_hash"
+      ],
+      "title": "ChildWorkRequest",
+      "type": "object"
+    },
+    "ChildWorkResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_number": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt Number"
+        },
+        "conversation_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Conversation Id"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Session Id"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        },
+        "task_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Task Id"
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Turn Id"
+        },
+        "work": {
+          "default": "unavailable",
+          "enum": [
+            "queued",
+            "working",
+            "waiting_for_input",
+            "completed",
+            "failed",
+            "cancelled",
+            "unavailable"
+          ],
+          "title": "Work",
+          "type": "string"
+        },
+        "work_link_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Work Link Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "work_link_id",
+        "submission_id"
+      ],
+      "title": "ChildWorkResponse",
+      "type": "object"
+    },
+    "ConversationAdmissionLink": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "conversation_turn",
+          "title": "Kind",
+          "type": "string"
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Request Id",
+          "type": "string"
+        },
+        "turn_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Turn Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "request_id",
+        "conversation_id",
+        "turn_id"
+      ],
+      "title": "ConversationAdmissionLink",
+      "type": "object"
+    },
+    "ConversationDestination": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "producer_conversation",
+            "existing_followup"
+          ],
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "conversation_id"
+      ],
+      "title": "ConversationDestination",
+      "type": "object"
+    },
+    "DestinationOption": {
+      "additionalProperties": false,
+      "properties": {
+        "available": {
+          "title": "Available",
+          "type": "boolean"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "existing_followup": "#/$defs/ConversationDestination",
+                  "new_followup": "#/$defs/NewFollowupDestination",
+                  "origin_chat": "#/$defs/OriginChatDestination",
+                  "producer_conversation": "#/$defs/ConversationDestination",
+                  "task_revision": "#/$defs/TaskRevisionDestination"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/OriginChatDestination"
+                },
+                {
+                  "$ref": "#/$defs/ConversationDestination"
+                },
+                {
+                  "$ref": "#/$defs/NewFollowupDestination"
+                },
+                {
+                  "$ref": "#/$defs/TaskRevisionDestination"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Destination"
+        },
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "recommended": {
+          "default": false,
+          "title": "Recommended",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "available",
+        "label"
+      ],
+      "title": "DestinationOption",
+      "type": "object"
+    },
+    "DestinationRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "subject_ids": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "minItems": 1,
+          "title": "Subject Ids",
+          "type": "array"
+        },
+        "surface": {
+          "anyOf": [
+            {
+              "enum": [
+                "task",
+                "library",
+                "other"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Surface"
+        }
+      },
+      "required": [
+        "context",
+        "subject_ids"
+      ],
+      "title": "DestinationRequest",
+      "type": "object"
+    },
+    "DestinationResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "options": {
+          "items": {
+            "$ref": "#/$defs/DestinationOption"
+          },
+          "title": "Options",
+          "type": "array"
+        }
+      },
+      "required": [
+        "options"
+      ],
+      "title": "DestinationResponse",
+      "type": "object"
+    },
+    "DiffLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "end_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End Line"
+        },
+        "hunk_digest": {
+          "anyOf": [
+            {
+              "pattern": "^[a-f0-9]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Hunk Digest"
+        },
+        "kind": {
+          "const": "diff",
+          "title": "Kind",
+          "type": "string"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Quote"
+        },
+        "scope": {
+          "enum": [
+            "file",
+            "lines"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "side": {
+          "anyOf": [
+            {
+              "enum": [
+                "old",
+                "new"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Side"
+        },
+        "start_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start Line"
+        }
+      },
+      "required": [
+        "kind",
+        "scope"
+      ],
+      "title": "DiffLocator",
+      "type": "object"
+    },
+    "DispositionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "addressed",
+            "needs_clarification",
+            "not_changed"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "result_ref": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result Ref"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "manifest_hash",
+        "entry_version_id",
+        "disposition",
+        "reason"
+      ],
+      "title": "DispositionRequest",
+      "type": "object"
+    },
+    "DocumentSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "content_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Content Ref",
+          "type": "string"
+        },
+        "kind": {
+          "const": "document",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "content_ref"
+      ],
+      "title": "DocumentSourceRef",
+      "type": "object"
+    },
+    "DocumentTextScope": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "document",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "DocumentTextScope",
+      "type": "object"
+    },
+    "DraftRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnchorInput"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "body": {
+          "default": "",
+          "maxLength": 16384,
+          "title": "Body",
+          "type": "string"
+        },
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "expected_version": {
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "overall_message": {
+          "anyOf": [
+            {
+              "maxLength": 100000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overall Message"
+        },
+        "selection": {
+          "items": {
+            "$ref": "#/$defs/SelectedVersion"
+          },
+          "maxItems": 100,
+          "title": "Selection",
+          "type": "array"
+        },
+        "source": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "document": "#/$defs/DocumentSourceRef",
+                  "transcript": "#/$defs/TranscriptSourceRef",
+                  "work_diff": "#/$defs/WorkDiffSourceRef"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/DocumentSourceRef"
+                },
+                {
+                  "$ref": "#/$defs/TranscriptSourceRef"
+                },
+                {
+                  "$ref": "#/$defs/WorkDiffSourceRef"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Source"
+        }
+      },
+      "required": [
+        "expected_version",
+        "context"
+      ],
+      "title": "DraftRequest",
+      "type": "object"
+    },
+    "DraftResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "draft": {
+          "$ref": "#/$defs/DraftRequest"
+        },
+        "draft_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Draft Key",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "draft_key",
+        "version",
+        "draft"
+      ],
+      "title": "DraftResponse",
+      "type": "object"
+    },
+    "EntryCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "expected_thread_version": {
+          "minimum": 1,
+          "title": "Expected Thread Version",
+          "type": "integer"
+        },
+        "reply_to_entry_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply To Entry Id"
+        }
+      },
+      "required": [
+        "creation_key",
+        "expected_thread_version",
+        "body",
+        "context"
+      ],
+      "title": "EntryCreateRequest",
+      "type": "object"
+    },
+    "EntryDelivery": {
+      "additionalProperties": false,
+      "properties": {
+        "delivery": {
+          "enum": [
+            "pending",
+            "accepted",
+            "rejected",
+            "uncertain"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "manifest_hash",
+        "delivery"
+      ],
+      "title": "EntryDelivery",
+      "type": "object"
+    },
+    "EntryEditRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "context": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "chat": "#/$defs/ChatFeedbackContext",
+                  "standalone": "#/$defs/StandaloneFeedbackContext"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ChatFeedbackContext"
+                },
+                {
+                  "$ref": "#/$defs/StandaloneFeedbackContext"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Context"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_version",
+        "body"
+      ],
+      "title": "EntryEditRequest",
+      "type": "object"
+    },
+    "EntryVersion": {
+      "additionalProperties": false,
+      "properties": {
+        "audience": {
+          "title": "Audience",
+          "type": "string"
+        },
+        "author": {
+          "$ref": "#/$defs/Attribution"
+        },
+        "body": {
+          "title": "Body",
+          "type": "string"
+        },
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "delivery": {
+          "items": {
+            "$ref": "#/$defs/EntryDelivery"
+          },
+          "title": "Delivery",
+          "type": "array"
+        },
+        "entry_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "reply_to_entry_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply To Entry Id"
+        },
+        "thread_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "entry_id",
+        "entry_version_id",
+        "version",
+        "thread_id",
+        "body",
+        "author",
+        "audience",
+        "created_at"
+      ],
+      "title": "EntryVersion",
+      "type": "object"
+    },
+    "EventRef": {
+      "additionalProperties": false,
+      "properties": {
+        "event_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Event Id"
+        },
+        "event_type": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Event Type",
+          "type": "string"
+        },
+        "seq": {
+          "minimum": 0,
+          "title": "Seq",
+          "type": "integer"
+        },
+        "session_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Session Id",
+          "type": "string"
+        },
+        "store": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Store",
+          "type": "string"
+        }
+      },
+      "required": [
+        "store",
+        "session_id",
+        "seq",
+        "event_type"
+      ],
+      "title": "EventRef",
+      "type": "object"
+    },
+    "FeedbackAnchor": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Anchor Id",
+          "type": "string"
+        },
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "locator": {
+          "discriminator": {
+            "mapping": {
+              "diff": "#/$defs/DiffLocator",
+              "html": "#/$defs/HtmlLocator",
+              "image": "#/$defs/ImageLocator",
+              "pdf": "#/$defs/PdfLocator",
+              "rich": "#/$defs/RichLocator",
+              "text": "#/$defs/TextLocator",
+              "whole": "#/$defs/WholeLocator"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/WholeLocator"
+            },
+            {
+              "$ref": "#/$defs/TextLocator"
+            },
+            {
+              "$ref": "#/$defs/RichLocator"
+            },
+            {
+              "$ref": "#/$defs/HtmlLocator"
+            },
+            {
+              "$ref": "#/$defs/ImageLocator"
+            },
+            {
+              "$ref": "#/$defs/PdfLocator"
+            },
+            {
+              "$ref": "#/$defs/DiffLocator"
+            }
+          ],
+          "title": "Locator"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentSourceRef",
+              "transcript": "#/$defs/TranscriptSourceRef",
+              "work_diff": "#/$defs/WorkDiffSourceRef"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentSourceRef"
+            },
+            {
+              "$ref": "#/$defs/TranscriptSourceRef"
+            },
+            {
+              "$ref": "#/$defs/WorkDiffSourceRef"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "anchor_id",
+        "source",
+        "content_digest",
+        "locator"
+      ],
+      "title": "FeedbackAnchor",
+      "type": "object"
+    },
+    "FeedbackCapabilities": {
+      "additionalProperties": false,
+      "properties": {
+        "comment": {
+          "default": false,
+          "title": "Comment",
+          "type": "boolean"
+        },
+        "disclose": {
+          "default": false,
+          "title": "Disclose",
+          "type": "boolean"
+        },
+        "dispatch": {
+          "default": false,
+          "title": "Dispatch",
+          "type": "boolean"
+        },
+        "moderate": {
+          "default": false,
+          "title": "Moderate",
+          "type": "boolean"
+        },
+        "read": {
+          "default": false,
+          "title": "Read",
+          "type": "boolean"
+        }
+      },
+      "title": "FeedbackCapabilities",
+      "type": "object"
+    },
+    "FeedbackModel": {
+      "additionalProperties": false,
+      "description": "Reject unknown properties and non-finite geometry on every boundary.",
+      "properties": {},
+      "title": "FeedbackModel",
+      "type": "object"
+    },
+    "FeedbackPacketReference": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "manifest_hash"
+      ],
+      "title": "FeedbackPacketReference",
+      "type": "object"
+    },
+    "FeedbackPreflight": {
+      "additionalProperties": false,
+      "properties": {
+        "context_items": {
+          "items": {
+            "$ref": "#/$defs/ManifestEntry"
+          },
+          "title": "Context Items",
+          "type": "array"
+        },
+        "destination": {
+          "discriminator": {
+            "mapping": {
+              "existing_followup": "#/$defs/ConversationDestination",
+              "new_followup": "#/$defs/NewFollowupDestination",
+              "origin_chat": "#/$defs/OriginChatDestination",
+              "producer_conversation": "#/$defs/ConversationDestination",
+              "task_revision": "#/$defs/TaskRevisionDestination"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OriginChatDestination"
+            },
+            {
+              "$ref": "#/$defs/ConversationDestination"
+            },
+            {
+              "$ref": "#/$defs/NewFollowupDestination"
+            },
+            {
+              "$ref": "#/$defs/TaskRevisionDestination"
+            }
+          ],
+          "title": "Destination"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "preflight_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Preflight Id",
+          "type": "string"
+        },
+        "selection": {
+          "items": {
+            "$ref": "#/$defs/SelectedVersion"
+          },
+          "title": "Selection",
+          "type": "array"
+        },
+        "source_summaries": {
+          "items": {
+            "$ref": "#/$defs/ResolvedFeedbackSource"
+          },
+          "title": "Source Summaries",
+          "type": "array"
+        },
+        "task_consequences": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskConsequences"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "update_mode": {
+          "enum": [
+            "follow_request",
+            "revise_source",
+            "answer_only",
+            "separate_result"
+          ],
+          "title": "Update Mode",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Warnings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "preflight_id",
+        "manifest_hash",
+        "expires_at",
+        "selection",
+        "context_items",
+        "source_summaries",
+        "destination",
+        "update_mode"
+      ],
+      "title": "FeedbackPreflight",
+      "type": "object"
+    },
+    "FeedbackPreflightRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "destination": {
+          "discriminator": {
+            "mapping": {
+              "existing_followup": "#/$defs/ConversationDestination",
+              "new_followup": "#/$defs/NewFollowupDestination",
+              "origin_chat": "#/$defs/OriginChatDestination",
+              "producer_conversation": "#/$defs/ConversationDestination",
+              "task_revision": "#/$defs/TaskRevisionDestination"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OriginChatDestination"
+            },
+            {
+              "$ref": "#/$defs/ConversationDestination"
+            },
+            {
+              "$ref": "#/$defs/NewFollowupDestination"
+            },
+            {
+              "$ref": "#/$defs/TaskRevisionDestination"
+            }
+          ],
+          "title": "Destination"
+        },
+        "overall_message": {
+          "anyOf": [
+            {
+              "maxLength": 100000,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overall Message"
+        },
+        "reviewed_guest_entry_version_ids": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 100,
+          "title": "Reviewed Guest Entry Version Ids",
+          "type": "array"
+        },
+        "selection": {
+          "items": {
+            "$ref": "#/$defs/SelectedVersion"
+          },
+          "maxItems": 100,
+          "minItems": 1,
+          "title": "Selection",
+          "type": "array"
+        },
+        "update_mode": {
+          "default": "follow_request",
+          "enum": [
+            "follow_request",
+            "revise_source",
+            "answer_only",
+            "separate_result"
+          ],
+          "title": "Update Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "selection",
+        "destination"
+      ],
+      "title": "FeedbackPreflightRequest",
+      "type": "object"
+    },
+    "FeedbackReference": {
+      "additionalProperties": false,
+      "properties": {
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "manifest_hash"
+      ],
+      "title": "FeedbackReference",
+      "type": "object"
+    },
+    "FeedbackThread": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/FeedbackAnchor"
+        },
+        "audience": {
+          "title": "Audience",
+          "type": "string"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/EntryVersion"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "hidden": {
+          "title": "Hidden",
+          "type": "boolean"
+        },
+        "state": {
+          "enum": [
+            "open",
+            "resolved"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        },
+        "thread_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Thread Id",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "thread_id",
+        "subject_id",
+        "version",
+        "state",
+        "hidden",
+        "audience",
+        "anchor",
+        "entries"
+      ],
+      "title": "FeedbackThread",
+      "type": "object"
+    },
+    "FollowupPreferenceRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Conversation Id"
+        },
+        "expected_version": {
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_version"
+      ],
+      "title": "FollowupPreferenceRequest",
+      "type": "object"
+    },
+    "Freehand": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "freehand",
+          "title": "Kind",
+          "type": "string"
+        },
+        "points": {
+          "items": {
+            "$ref": "#/$defs/Point"
+          },
+          "maxItems": 2048,
+          "minItems": 2,
+          "title": "Points",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "points"
+      ],
+      "title": "Freehand",
+      "type": "object"
+    },
+    "GrantListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/GrantResponse"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "GrantListResponse",
+      "type": "object"
+    },
+    "GrantRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/FeedbackCapabilities"
+        },
+        "expected_version": {
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "principal_email": {
+          "maxLength": 320,
+          "title": "Principal Email",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "principal_email",
+        "capabilities"
+      ],
+      "title": "GrantRequest",
+      "type": "object"
+    },
+    "GrantResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/FeedbackCapabilities"
+        },
+        "expected_version": {
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "principal_email": {
+          "maxLength": 320,
+          "title": "Principal Email",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_version",
+        "principal_email",
+        "capabilities",
+        "version"
+      ],
+      "title": "GrantResponse",
+      "type": "object"
+    },
+    "GuestSessionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "display_name": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        }
+      },
+      "title": "GuestSessionRequest",
+      "type": "object"
+    },
+    "GuestSessionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "guest_capability": {
+          "title": "Guest Capability",
+          "type": "string"
+        },
+        "guest_session_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Guest Session Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "guest_session_id",
+        "guest_capability",
+        "expires_at"
+      ],
+      "title": "GuestSessionResponse",
+      "type": "object"
+    },
+    "HistoryItem": {
+      "additionalProperties": false,
+      "properties": {
+        "created_at": {
+          "format": "date-time",
+          "title": "Created At",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Entry Version Id"
+        },
+        "kind": {
+          "enum": [
+            "submission",
+            "resolution",
+            "reattach",
+            "moderation",
+            "disposition",
+            "result"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "receipt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SubmissionReceipt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "result_ref": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Result Ref"
+        },
+        "state": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "State"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "subject_id",
+        "created_at"
+      ],
+      "title": "HistoryItem",
+      "type": "object"
+    },
+    "HistoryPage": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/HistoryItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "HistoryPage",
+      "type": "object"
+    },
+    "HtmlLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "capture_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Capture Id"
+        },
+        "element_key": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Element Key"
+        },
+        "kind": {
+          "const": "html",
+          "title": "Kind",
+          "type": "string"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "render_state_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Render State Digest",
+          "type": "string"
+        },
+        "selector_path": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Selector Path"
+        },
+        "shapes": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "arrow": "#/$defs/Arrow",
+                "ellipse": "#/$defs/Area",
+                "freehand": "#/$defs/Freehand",
+                "pin": "#/$defs/Pin",
+                "rectangle": "#/$defs/Area"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Pin"
+              },
+              {
+                "$ref": "#/$defs/Area"
+              },
+              {
+                "$ref": "#/$defs/Arrow"
+              },
+              {
+                "$ref": "#/$defs/Freehand"
+              }
+            ]
+          },
+          "maxItems": 64,
+          "title": "Shapes",
+          "type": "array"
+        },
+        "viewport": {
+          "$ref": "#/$defs/Viewport"
+        }
+      },
+      "required": [
+        "kind",
+        "viewport",
+        "render_state_digest"
+      ],
+      "title": "HtmlLocator",
+      "type": "object"
+    },
+    "ImageLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "intrinsic_height": {
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Intrinsic Height",
+          "type": "integer"
+        },
+        "intrinsic_width": {
+          "maximum": 100000,
+          "minimum": 1,
+          "title": "Intrinsic Width",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "image",
+          "title": "Kind",
+          "type": "string"
+        },
+        "orientation": {
+          "maximum": 8,
+          "minimum": 1,
+          "title": "Orientation",
+          "type": "integer"
+        },
+        "shapes": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "arrow": "#/$defs/Arrow",
+                "ellipse": "#/$defs/Area",
+                "freehand": "#/$defs/Freehand",
+                "pin": "#/$defs/Pin",
+                "rectangle": "#/$defs/Area"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Pin"
+              },
+              {
+                "$ref": "#/$defs/Area"
+              },
+              {
+                "$ref": "#/$defs/Arrow"
+              },
+              {
+                "$ref": "#/$defs/Freehand"
+              }
+            ]
+          },
+          "maxItems": 64,
+          "title": "Shapes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "intrinsic_width",
+        "intrinsic_height",
+        "orientation"
+      ],
+      "title": "ImageLocator",
+      "type": "object"
+    },
+    "IncludedFeedback": {
+      "additionalProperties": false,
+      "properties": {
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "preflight_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Preflight Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "creation_key",
+        "preflight_id",
+        "manifest_hash"
+      ],
+      "title": "IncludedFeedback",
+      "type": "object"
+    },
+    "ManifestEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/FeedbackAnchor"
+        },
+        "entry": {
+          "$ref": "#/$defs/EntryVersion"
+        },
+        "role": {
+          "enum": [
+            "instruction",
+            "context"
+          ],
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry",
+        "anchor",
+        "role"
+      ],
+      "title": "ManifestEntry",
+      "type": "object"
+    },
+    "ManifestSource": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "enum": [
+            "available",
+            "partial",
+            "unavailable"
+          ],
+          "title": "Availability",
+          "type": "string"
+        },
+        "canonical_text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "format": {
+          "title": "Format",
+          "type": "string"
+        },
+        "lineage_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lineage Id"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentSourceRef",
+              "transcript": "#/$defs/TranscriptSourceRef",
+              "work_diff": "#/$defs/WorkDiffSourceRef"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentSourceRef"
+            },
+            {
+              "$ref": "#/$defs/TranscriptSourceRef"
+            },
+            {
+              "$ref": "#/$defs/WorkDiffSourceRef"
+            }
+          ],
+          "title": "Source"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "subject_id",
+        "source",
+        "content_digest",
+        "format",
+        "availability"
+      ],
+      "title": "ManifestSource",
+      "type": "object"
+    },
+    "ModerationRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "hide",
+            "restore"
+          ],
+          "title": "Action",
+          "type": "string"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "action",
+        "reason"
+      ],
+      "title": "ModerationRequest",
+      "type": "object"
+    },
+    "NewFollowupDestination": {
+      "additionalProperties": false,
+      "properties": {
+        "agent_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Agent Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "new_followup",
+          "title": "Kind",
+          "type": "string"
+        },
+        "project_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Project Id"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "maxLength": 200,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "kind",
+        "agent_id"
+      ],
+      "title": "NewFollowupDestination",
+      "type": "object"
+    },
+    "OriginChatDestination": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "kind": {
+          "const": "origin_chat",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "conversation_id"
+      ],
+      "title": "OriginChatDestination",
+      "type": "object"
+    },
+    "PdfLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "pdf",
+          "title": "Kind",
+          "type": "string"
+        },
+        "page": {
+          "minimum": 1,
+          "title": "Page",
+          "type": "integer"
+        },
+        "page_height_pt": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "title": "Page Height Pt",
+          "type": "number"
+        },
+        "page_width_pt": {
+          "exclusiveMinimum": 0,
+          "maximum": 100000,
+          "title": "Page Width Pt",
+          "type": "number"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "rotation": {
+          "enum": [
+            0,
+            90,
+            180,
+            270
+          ],
+          "title": "Rotation",
+          "type": "integer"
+        },
+        "shapes": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "arrow": "#/$defs/Arrow",
+                "ellipse": "#/$defs/Area",
+                "freehand": "#/$defs/Freehand",
+                "pin": "#/$defs/Pin",
+                "rectangle": "#/$defs/Area"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Pin"
+              },
+              {
+                "$ref": "#/$defs/Area"
+              },
+              {
+                "$ref": "#/$defs/Arrow"
+              },
+              {
+                "$ref": "#/$defs/Freehand"
+              }
+            ]
+          },
+          "maxItems": 64,
+          "title": "Shapes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "kind",
+        "page",
+        "page_width_pt",
+        "page_height_pt",
+        "rotation"
+      ],
+      "title": "PdfLocator",
+      "type": "object"
+    },
+    "PdfPageTextScope": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "pdf_page",
+          "title": "Kind",
+          "type": "string"
+        },
+        "page": {
+          "minimum": 1,
+          "title": "Page",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "page"
+      ],
+      "title": "PdfPageTextScope",
+      "type": "object"
+    },
+    "PendingInteraction": {
+      "additionalProperties": false,
+      "properties": {
+        "notification_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Notification Id",
+          "type": "string"
+        },
+        "notification_type": {
+          "title": "Notification Type",
+          "type": "string"
+        },
+        "revision": {
+          "minimum": 1,
+          "title": "Revision",
+          "type": "integer"
+        },
+        "status": {
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "notification_id",
+        "revision",
+        "notification_type",
+        "status"
+      ],
+      "title": "PendingInteraction",
+      "type": "object"
+    },
+    "Pin": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "pin",
+          "title": "Kind",
+          "type": "string"
+        },
+        "point": {
+          "$ref": "#/$defs/Point"
+        }
+      },
+      "required": [
+        "kind",
+        "point"
+      ],
+      "title": "Pin",
+      "type": "object"
+    },
+    "Point": {
+      "additionalProperties": false,
+      "properties": {
+        "x": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "X",
+          "type": "number"
+        },
+        "y": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Y",
+          "type": "number"
+        }
+      },
+      "required": [
+        "x",
+        "y"
+      ],
+      "title": "Point",
+      "type": "object"
+    },
+    "PublicContentResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes_path": {
+          "const": "/api/v1/public/feedback/source/bytes",
+          "default": "/api/v1/public/feedback/source/bytes",
+          "title": "Bytes Path",
+          "type": "string"
+        },
+        "content": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Content"
+        },
+        "filename": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Filename"
+        },
+        "format": {
+          "title": "Format",
+          "type": "string"
+        },
+        "mime_type": {
+          "title": "Mime Type",
+          "type": "string"
+        },
+        "rich_payload": {
+          "anyOf": [
+            {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Rich Payload"
+        },
+        "theme_family": {
+          "default": "classic",
+          "title": "Theme Family",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format",
+        "mime_type"
+      ],
+      "title": "PublicContentResponse",
+      "type": "object"
+    },
+    "PublicEntryCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "expected_thread_version": {
+          "minimum": 1,
+          "title": "Expected Thread Version",
+          "type": "integer"
+        },
+        "reply_to_entry_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply To Entry Id"
+        }
+      },
+      "required": [
+        "creation_key",
+        "expected_thread_version",
+        "body"
+      ],
+      "title": "PublicEntryCreateRequest",
+      "type": "object"
+    },
+    "PublicEntryEditRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "expected_version",
+        "body"
+      ],
+      "title": "PublicEntryEditRequest",
+      "type": "object"
+    },
+    "PublicExchangeRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "create_guest": {
+          "default": false,
+          "title": "Create Guest",
+          "type": "boolean"
+        },
+        "display_name": {
+          "anyOf": [
+            {
+              "maxLength": 80,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Display Name"
+        },
+        "share_token": {
+          "maxLength": 1024,
+          "title": "Share Token",
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_token"
+      ],
+      "title": "PublicExchangeRequest",
+      "type": "object"
+    },
+    "PublicExchangeResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_comments": {
+          "title": "Allow Comments",
+          "type": "boolean"
+        },
+        "capability": {
+          "title": "Capability",
+          "type": "string"
+        },
+        "discussion": {
+          "enum": [
+            "own_only",
+            "shared"
+          ],
+          "title": "Discussion",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "guest_session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GuestSessionResponse"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "link_mode": {
+          "default": "view",
+          "enum": [
+            "view",
+            "download"
+          ],
+          "title": "Link Mode",
+          "type": "string"
+        },
+        "permitted_locator_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Permitted Locator Kinds",
+          "type": "array"
+        },
+        "share_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Share Id",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/PublicSource"
+        },
+        "viewer_path": {
+          "const": "/api/v1/public/feedback/viewer",
+          "default": "/api/v1/public/feedback/viewer",
+          "title": "Viewer Path",
+          "type": "string"
+        }
+      },
+      "required": [
+        "share_id",
+        "capability",
+        "expires_at",
+        "source",
+        "allow_comments",
+        "discussion",
+        "permitted_locator_kinds"
+      ],
+      "title": "PublicExchangeResponse",
+      "type": "object"
+    },
+    "PublicOutcome": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "addressed",
+            "needs_clarification",
+            "not_changed"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "thread_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Thread Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_version_id",
+        "thread_id",
+        "disposition",
+        "reason"
+      ],
+      "title": "PublicOutcome",
+      "type": "object"
+    },
+    "PublicOutcomePage": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/PublicOutcome"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "PublicOutcomePage",
+      "type": "object"
+    },
+    "PublicOutcomeRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "disposition": {
+          "enum": [
+            "addressed",
+            "needs_clarification",
+            "not_changed"
+          ],
+          "title": "Disposition",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_version_id",
+        "disposition",
+        "reason"
+      ],
+      "title": "PublicOutcomeRequest",
+      "type": "object"
+    },
+    "PublicSource": {
+      "additionalProperties": false,
+      "properties": {
+        "canonical_text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "content_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Content Ref",
+          "type": "string"
+        },
+        "format": {
+          "title": "Format",
+          "type": "string"
+        },
+        "source_token": {
+          "title": "Source Token",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "source_token",
+        "content_digest",
+        "content_ref",
+        "format"
+      ],
+      "title": "PublicSource",
+      "type": "object"
+    },
+    "PublicThreadCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/AnchorInput"
+        },
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "creation_key",
+        "anchor",
+        "body"
+      ],
+      "title": "PublicThreadCreateRequest",
+      "type": "object"
+    },
+    "ReattachRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/AnchorInput"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "anchor",
+        "reason"
+      ],
+      "title": "ReattachRequest",
+      "type": "object"
+    },
+    "Rejection": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "title": "Code",
+          "type": "string"
+        },
+        "recoverable": {
+          "title": "Recoverable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "recoverable"
+      ],
+      "title": "Rejection",
+      "type": "object"
+    },
+    "ResolutionRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 2048,
+          "title": "Reason",
+          "type": "string"
+        },
+        "state": {
+          "enum": [
+            "open",
+            "resolved"
+          ],
+          "title": "State",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "state",
+        "reason"
+      ],
+      "title": "ResolutionRequest",
+      "type": "object"
+    },
+    "ResolveSourceRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentSourceRef",
+              "transcript": "#/$defs/TranscriptSourceRef",
+              "work_diff": "#/$defs/WorkDiffSourceRef"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentSourceRef"
+            },
+            {
+              "$ref": "#/$defs/TranscriptSourceRef"
+            },
+            {
+              "$ref": "#/$defs/WorkDiffSourceRef"
+            }
+          ],
+          "title": "Source"
+        }
+      },
+      "required": [
+        "source",
+        "context"
+      ],
+      "title": "ResolveSourceRequest",
+      "type": "object"
+    },
+    "ResolvedFeedbackSource": {
+      "additionalProperties": false,
+      "properties": {
+        "availability": {
+          "enum": [
+            "available",
+            "partial",
+            "unavailable"
+          ],
+          "title": "Availability",
+          "type": "string"
+        },
+        "canonical_text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CanonicalText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "capabilities": {
+          "$ref": "#/$defs/FeedbackCapabilities"
+        },
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "format": {
+          "title": "Format",
+          "type": "string"
+        },
+        "latest_content_ref": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Latest Content Ref"
+        },
+        "lineage_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lineage Id"
+        },
+        "permitted_locator_kinds": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Permitted Locator Kinds",
+          "type": "array"
+        },
+        "revision": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revision"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentSourceRef",
+              "transcript": "#/$defs/TranscriptSourceRef",
+              "work_diff": "#/$defs/WorkDiffSourceRef"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentSourceRef"
+            },
+            {
+              "$ref": "#/$defs/TranscriptSourceRef"
+            },
+            {
+              "$ref": "#/$defs/WorkDiffSourceRef"
+            }
+          ],
+          "title": "Source"
+        },
+        "source_token": {
+          "title": "Source Token",
+          "type": "string"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        }
+      },
+      "required": [
+        "subject_id",
+        "source",
+        "source_token",
+        "context",
+        "content_digest",
+        "format",
+        "availability",
+        "permitted_locator_kinds",
+        "capabilities"
+      ],
+      "title": "ResolvedFeedbackSource",
+      "type": "object"
+    },
+    "RichFieldTextScope": {
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Block Id",
+          "type": "string"
+        },
+        "field_path": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Field Path",
+          "type": "array"
+        },
+        "identity": {
+          "enum": [
+            "semantic",
+            "revision_local"
+          ],
+          "title": "Identity",
+          "type": "string"
+        },
+        "item_key": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Item Key"
+        },
+        "kind": {
+          "const": "rich_field",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "block_id",
+        "identity",
+        "field_path"
+      ],
+      "title": "RichFieldTextScope",
+      "type": "object"
+    },
+    "RichLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "block_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Block Id",
+          "type": "string"
+        },
+        "field_path": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Field Path",
+          "type": "array"
+        },
+        "identity": {
+          "enum": [
+            "semantic",
+            "revision_local"
+          ],
+          "title": "Identity",
+          "type": "string"
+        },
+        "item_key": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Item Key"
+        },
+        "kind": {
+          "const": "rich",
+          "title": "Kind",
+          "type": "string"
+        },
+        "range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TextRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "table_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RichTableRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "kind",
+        "block_id",
+        "identity",
+        "field_path"
+      ],
+      "title": "RichLocator",
+      "type": "object"
+    },
+    "RichTableRange": {
+      "additionalProperties": false,
+      "description": "Exact authored row membership and a half-open authored column interval.",
+      "properties": {
+        "column_end": {
+          "maximum": 128,
+          "minimum": 1,
+          "title": "Column End",
+          "type": "integer"
+        },
+        "column_start": {
+          "exclusiveMaximum": 128,
+          "minimum": 0,
+          "title": "Column Start",
+          "type": "integer"
+        },
+        "representation": {
+          "const": "rich-table-v1",
+          "title": "Representation",
+          "type": "string"
+        },
+        "rows": {
+          "items": {
+            "exclusiveMaximum": 1000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 1000,
+          "minItems": 1,
+          "title": "Rows",
+          "type": "array"
+        },
+        "scope": {
+          "enum": [
+            "cells",
+            "rows",
+            "columns"
+          ],
+          "title": "Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "representation",
+        "scope",
+        "rows",
+        "column_start",
+        "column_end"
+      ],
+      "title": "RichTableRange",
+      "type": "object"
+    },
+    "ScopedCanonicalFeedbackText": {
+      "additionalProperties": false,
+      "properties": {
+        "content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Content Digest",
+          "type": "string"
+        },
+        "descriptor": {
+          "$ref": "#/$defs/CanonicalText"
+        },
+        "scope": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentTextScope",
+              "pdf_page": "#/$defs/PdfPageTextScope",
+              "rich_field": "#/$defs/RichFieldTextScope"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentTextScope"
+            },
+            {
+              "$ref": "#/$defs/RichFieldTextScope"
+            },
+            {
+              "$ref": "#/$defs/PdfPageTextScope"
+            }
+          ],
+          "title": "Scope"
+        },
+        "text_page": {
+          "$ref": "#/$defs/CanonicalTextPage"
+        }
+      },
+      "required": [
+        "scope",
+        "content_digest",
+        "descriptor",
+        "text_page"
+      ],
+      "title": "ScopedCanonicalFeedbackText",
+      "type": "object"
+    },
+    "ScopedTextRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "limit": {
+          "default": 16384,
+          "maximum": 65536,
+          "minimum": 1,
+          "title": "Limit",
+          "type": "integer"
+        },
+        "scope": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentTextScope",
+              "pdf_page": "#/$defs/PdfPageTextScope",
+              "rich_field": "#/$defs/RichFieldTextScope"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentTextScope"
+            },
+            {
+              "$ref": "#/$defs/RichFieldTextScope"
+            },
+            {
+              "$ref": "#/$defs/PdfPageTextScope"
+            }
+          ],
+          "title": "Scope"
+        },
+        "source": {
+          "discriminator": {
+            "mapping": {
+              "document": "#/$defs/DocumentSourceRef",
+              "transcript": "#/$defs/TranscriptSourceRef",
+              "work_diff": "#/$defs/WorkDiffSourceRef"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/DocumentSourceRef"
+            },
+            {
+              "$ref": "#/$defs/TranscriptSourceRef"
+            },
+            {
+              "$ref": "#/$defs/WorkDiffSourceRef"
+            }
+          ],
+          "title": "Source"
+        },
+        "start": {
+          "default": 0,
+          "minimum": 0,
+          "title": "Start",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source",
+        "context",
+        "scope"
+      ],
+      "title": "ScopedTextRequest",
+      "type": "object"
+    },
+    "SelectedVersion": {
+      "additionalProperties": false,
+      "properties": {
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "expected_entry_version": {
+          "minimum": 1,
+          "title": "Expected Entry Version",
+          "type": "integer"
+        },
+        "staging_version": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Staging Version"
+        }
+      },
+      "required": [
+        "entry_version_id",
+        "expected_entry_version"
+      ],
+      "title": "SelectedVersion",
+      "type": "object"
+    },
+    "ShapesLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "shapes": {
+          "items": {
+            "discriminator": {
+              "mapping": {
+                "arrow": "#/$defs/Arrow",
+                "ellipse": "#/$defs/Area",
+                "freehand": "#/$defs/Freehand",
+                "pin": "#/$defs/Pin",
+                "rectangle": "#/$defs/Area"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/Pin"
+              },
+              {
+                "$ref": "#/$defs/Area"
+              },
+              {
+                "$ref": "#/$defs/Arrow"
+              },
+              {
+                "$ref": "#/$defs/Freehand"
+              }
+            ]
+          },
+          "maxItems": 64,
+          "title": "Shapes",
+          "type": "array"
+        }
+      },
+      "title": "ShapesLocator",
+      "type": "object"
+    },
+    "ShareListResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/ShareResponse"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "ShareListResponse",
+      "type": "object"
+    },
+    "ShareRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_comments": {
+          "default": false,
+          "title": "Allow Comments",
+          "type": "boolean"
+        },
+        "discussion": {
+          "default": "own_only",
+          "enum": [
+            "own_only",
+            "shared"
+          ],
+          "title": "Discussion",
+          "type": "string"
+        },
+        "expected_content_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Expected Content Digest",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "link_mode": {
+          "default": "view",
+          "enum": [
+            "view",
+            "download"
+          ],
+          "title": "Link Mode",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/DocumentSourceRef"
+        }
+      },
+      "required": [
+        "source",
+        "expected_content_digest",
+        "expires_at"
+      ],
+      "title": "ShareRequest",
+      "type": "object"
+    },
+    "ShareResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_comments": {
+          "title": "Allow Comments",
+          "type": "boolean"
+        },
+        "can_copy": {
+          "default": false,
+          "title": "Can Copy",
+          "type": "boolean"
+        },
+        "discussion": {
+          "enum": [
+            "own_only",
+            "shared"
+          ],
+          "title": "Discussion",
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "date-time",
+          "title": "Expires At",
+          "type": "string"
+        },
+        "link_mode": {
+          "default": "view",
+          "enum": [
+            "view",
+            "download"
+          ],
+          "title": "Link Mode",
+          "type": "string"
+        },
+        "revoked": {
+          "title": "Revoked",
+          "type": "boolean"
+        },
+        "share_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Share Id",
+          "type": "string"
+        },
+        "share_token": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Share Token"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "share_id",
+        "version",
+        "allow_comments",
+        "discussion",
+        "expires_at",
+        "revoked"
+      ],
+      "title": "ShareResponse",
+      "type": "object"
+    },
+    "ShareUpdateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_comments": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Allow Comments"
+        },
+        "discussion": {
+          "anyOf": [
+            {
+              "enum": [
+                "own_only",
+                "shared"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Discussion"
+        },
+        "expected_version": {
+          "minimum": 1,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "expires_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expires At"
+        },
+        "revoked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Revoked"
+        }
+      },
+      "required": [
+        "expected_version"
+      ],
+      "title": "ShareUpdateRequest",
+      "type": "object"
+    },
+    "StagedItem": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Anchor Id",
+          "type": "string"
+        },
+        "entry_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Id",
+          "type": "string"
+        },
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "inclusion": {
+          "enum": [
+            "prepared",
+            "included"
+          ],
+          "title": "Inclusion",
+          "type": "string"
+        },
+        "staging_version": {
+          "minimum": 1,
+          "title": "Staging Version",
+          "type": "integer"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "entry_version_id",
+        "staging_version",
+        "inclusion",
+        "subject_id",
+        "anchor_id"
+      ],
+      "title": "StagedItem",
+      "type": "object"
+    },
+    "StagingSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/StagedItem"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "receipts": {
+          "items": {
+            "$ref": "#/$defs/SubmissionReceipt"
+          },
+          "title": "Receipts",
+          "type": "array"
+        },
+        "subject_ids": {
+          "items": {
+            "maxLength": 128,
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Subject Ids",
+          "type": "array"
+        },
+        "version": {
+          "minimum": 0,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "conversation_id",
+        "version",
+        "items",
+        "receipts"
+      ],
+      "title": "StagingSnapshot",
+      "type": "object"
+    },
+    "StagingUpdateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "entry_version_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Entry Version Id",
+          "type": "string"
+        },
+        "expected_version": {
+          "minimum": 0,
+          "title": "Expected Version",
+          "type": "integer"
+        },
+        "inclusion": {
+          "enum": [
+            "prepared",
+            "included"
+          ],
+          "title": "Inclusion",
+          "type": "string"
+        }
+      },
+      "required": [
+        "expected_version",
+        "entry_version_id",
+        "inclusion"
+      ],
+      "title": "StagingUpdateRequest",
+      "type": "object"
+    },
+    "StandaloneFeedbackContext": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "standalone",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "StandaloneFeedbackContext",
+      "type": "object"
+    },
+    "SubjectSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/FeedbackCapabilities"
+        },
+        "open_threads": {
+          "minimum": 0,
+          "title": "Open Threads",
+          "type": "integer"
+        },
+        "preferred_followup": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Preferred Followup"
+        },
+        "resolved_threads": {
+          "minimum": 0,
+          "title": "Resolved Threads",
+          "type": "integer"
+        },
+        "subject_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Subject Id",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "subject_id",
+        "capabilities",
+        "open_threads",
+        "resolved_threads",
+        "version"
+      ],
+      "title": "SubjectSummary",
+      "type": "object"
+    },
+    "SubmissionCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "preflight_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Preflight Id",
+          "type": "string"
+        },
+        "replaces_rejected_submission_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Replaces Rejected Submission Id"
+        }
+      },
+      "required": [
+        "creation_key",
+        "preflight_id",
+        "manifest_hash"
+      ],
+      "title": "SubmissionCreateRequest",
+      "type": "object"
+    },
+    "SubmissionDetail": {
+      "additionalProperties": false,
+      "properties": {
+        "children": {
+          "items": {
+            "$ref": "#/$defs/ChildWorkResponse"
+          },
+          "title": "Children",
+          "type": "array"
+        },
+        "manifest": {
+          "$ref": "#/$defs/SubmissionManifest"
+        },
+        "receipt": {
+          "$ref": "#/$defs/SubmissionReceipt"
+        }
+      },
+      "required": [
+        "receipt",
+        "manifest"
+      ],
+      "title": "SubmissionDetail",
+      "type": "object"
+    },
+    "SubmissionManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "destination": {
+          "discriminator": {
+            "mapping": {
+              "existing_followup": "#/$defs/ConversationDestination",
+              "new_followup": "#/$defs/NewFollowupDestination",
+              "origin_chat": "#/$defs/OriginChatDestination",
+              "producer_conversation": "#/$defs/ConversationDestination",
+              "task_revision": "#/$defs/TaskRevisionDestination"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OriginChatDestination"
+            },
+            {
+              "$ref": "#/$defs/ConversationDestination"
+            },
+            {
+              "$ref": "#/$defs/NewFollowupDestination"
+            },
+            {
+              "$ref": "#/$defs/TaskRevisionDestination"
+            }
+          ],
+          "title": "Destination"
+        },
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/ManifestEntry"
+          },
+          "title": "Entries",
+          "type": "array"
+        },
+        "overall_message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overall Message"
+        },
+        "schema_version": {
+          "const": 1,
+          "default": 1,
+          "title": "Schema Version",
+          "type": "integer"
+        },
+        "sources": {
+          "items": {
+            "$ref": "#/$defs/ManifestSource"
+          },
+          "title": "Sources",
+          "type": "array"
+        },
+        "task_consequences": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskConsequences"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "update_mode": {
+          "enum": [
+            "follow_request",
+            "revise_source",
+            "answer_only",
+            "separate_result"
+          ],
+          "title": "Update Mode",
+          "type": "string"
+        }
+      },
+      "required": [
+        "context",
+        "entries",
+        "sources",
+        "destination",
+        "update_mode"
+      ],
+      "title": "SubmissionManifest",
+      "type": "object"
+    },
+    "SubmissionReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "admission": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "conversation_turn": "#/$defs/ConversationAdmissionLink",
+                  "task_attempt": "#/$defs/TaskAdmissionLink"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ConversationAdmissionLink"
+                },
+                {
+                  "$ref": "#/$defs/TaskAdmissionLink"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Admission"
+        },
+        "check_delivery_available": {
+          "title": "Check Delivery Available",
+          "type": "boolean"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        },
+        "delivery": {
+          "enum": [
+            "pending",
+            "accepted",
+            "rejected",
+            "uncertain"
+          ],
+          "title": "Delivery",
+          "type": "string"
+        },
+        "manifest_hash": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Manifest Hash",
+          "type": "string"
+        },
+        "reconciling": {
+          "title": "Reconciling",
+          "type": "boolean"
+        },
+        "rejection": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Rejection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "review_again_available": {
+          "title": "Review Again Available",
+          "type": "boolean"
+        },
+        "submission_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Submission Id",
+          "type": "string"
+        },
+        "version": {
+          "minimum": 1,
+          "title": "Version",
+          "type": "integer"
+        },
+        "work": {
+          "enum": [
+            "queued",
+            "working",
+            "waiting_for_input",
+            "completed",
+            "failed",
+            "cancelled",
+            "unavailable"
+          ],
+          "title": "Work",
+          "type": "string"
+        }
+      },
+      "required": [
+        "submission_id",
+        "creation_key",
+        "manifest_hash",
+        "delivery",
+        "work",
+        "reconciling",
+        "version",
+        "check_delivery_available",
+        "review_again_available"
+      ],
+      "title": "SubmissionReceipt",
+      "type": "object"
+    },
+    "SubmissionResult": {
+      "additionalProperties": false,
+      "properties": {
+        "content_ref": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Content Ref",
+          "type": "string"
+        },
+        "relation": {
+          "enum": [
+            "revises_source",
+            "separate_result",
+            "answer_only"
+          ],
+          "title": "Relation",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content_ref",
+        "relation"
+      ],
+      "title": "SubmissionResult",
+      "type": "object"
+    },
+    "SubmissionResultsResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/SubmissionResult"
+          },
+          "title": "Items",
+          "type": "array"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "SubmissionResultsResponse",
+      "type": "object"
+    },
+    "TaskAdmissionLink": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_number": {
+          "minimum": 1,
+          "title": "Attempt Number",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "task_attempt",
+          "title": "Kind",
+          "type": "string"
+        },
+        "revision_request_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Revision Request Id",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "revision_request_id",
+        "task_id",
+        "attempt_number"
+      ],
+      "title": "TaskAdmissionLink",
+      "type": "object"
+    },
+    "TaskConsequences": {
+      "additionalProperties": false,
+      "properties": {
+        "downstream_steps": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Downstream Steps",
+          "type": "array"
+        },
+        "expected_attempt": {
+          "minimum": 1,
+          "title": "Expected Attempt",
+          "type": "integer"
+        },
+        "pending_interactions": {
+          "items": {
+            "$ref": "#/$defs/PendingInteraction"
+          },
+          "title": "Pending Interactions",
+          "type": "array"
+        },
+        "safety_token": {
+          "title": "Safety Token",
+          "type": "string"
+        },
+        "side_effect_warning": {
+          "title": "Side Effect Warning",
+          "type": "string"
+        },
+        "target_step": {
+          "title": "Target Step",
+          "type": "string"
+        },
+        "workflow_definition_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Workflow Definition Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "safety_token",
+        "expected_attempt",
+        "workflow_definition_digest",
+        "target_step",
+        "downstream_steps",
+        "side_effect_warning"
+      ],
+      "title": "TaskConsequences",
+      "type": "object"
+    },
+    "TaskRevisionDestination": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_attempt": {
+          "minimum": 1,
+          "title": "Expected Attempt",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "task_revision",
+          "title": "Kind",
+          "type": "string"
+        },
+        "target_step": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Target Step",
+          "type": "string"
+        },
+        "task_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Task Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "task_id",
+        "expected_attempt",
+        "target_step"
+      ],
+      "title": "TaskRevisionDestination",
+      "type": "object"
+    },
+    "TextLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "text",
+          "title": "Kind",
+          "type": "string"
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange"
+        }
+      },
+      "required": [
+        "kind",
+        "range"
+      ],
+      "title": "TextLocator",
+      "type": "object"
+    },
+    "TextRange": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "minimum": 0,
+          "title": "End",
+          "type": "integer"
+        },
+        "end_column": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End Column"
+        },
+        "end_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "End Line"
+        },
+        "exact": {
+          "maxLength": 2048,
+          "title": "Exact",
+          "type": "string"
+        },
+        "prefix": {
+          "default": "",
+          "maxLength": 512,
+          "title": "Prefix",
+          "type": "string"
+        },
+        "representation": {
+          "const": "feedback-text-v1",
+          "title": "Representation",
+          "type": "string"
+        },
+        "start": {
+          "minimum": 0,
+          "title": "Start",
+          "type": "integer"
+        },
+        "start_column": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start Column"
+        },
+        "start_line": {
+          "anyOf": [
+            {
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start Line"
+        },
+        "suffix": {
+          "default": "",
+          "maxLength": 512,
+          "title": "Suffix",
+          "type": "string"
+        },
+        "text_digest": {
+          "pattern": "^[a-f0-9]{64}$",
+          "title": "Text Digest",
+          "type": "string"
+        }
+      },
+      "required": [
+        "representation",
+        "text_digest",
+        "start",
+        "end",
+        "exact"
+      ],
+      "title": "TextRange",
+      "type": "object"
+    },
+    "ThreadCreateRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "anchor": {
+          "$ref": "#/$defs/AnchorInput"
+        },
+        "audience": {
+          "const": "internal",
+          "default": "internal",
+          "title": "Audience",
+          "type": "string"
+        },
+        "body": {
+          "maxLength": 16384,
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "context": {
+          "discriminator": {
+            "mapping": {
+              "chat": "#/$defs/ChatFeedbackContext",
+              "standalone": "#/$defs/StandaloneFeedbackContext"
+            },
+            "propertyName": "kind"
+          },
+          "oneOf": [
+            {
+              "$ref": "#/$defs/ChatFeedbackContext"
+            },
+            {
+              "$ref": "#/$defs/StandaloneFeedbackContext"
+            }
+          ],
+          "title": "Context"
+        },
+        "creation_key": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Creation Key",
+          "type": "string"
+        }
+      },
+      "required": [
+        "creation_key",
+        "context",
+        "anchor",
+        "body"
+      ],
+      "title": "ThreadCreateRequest",
+      "type": "object"
+    },
+    "ThreadPage": {
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "items": {
+            "$ref": "#/$defs/FeedbackThread"
+          },
+          "title": "Items",
+          "type": "array"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Next Cursor"
+        }
+      },
+      "required": [
+        "items"
+      ],
+      "title": "ThreadPage",
+      "type": "object"
+    },
+    "TranscriptSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "conversation_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Conversation Id",
+          "type": "string"
+        },
+        "field_path": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Field Path",
+          "type": "array"
+        },
+        "kind": {
+          "const": "transcript",
+          "title": "Kind",
+          "type": "string"
+        },
+        "representation": {
+          "anyOf": [
+            {
+              "const": "chat-item-as-of-event-v1",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Representation"
+        },
+        "source_event": {
+          "$ref": "#/$defs/EventRef"
+        },
+        "source_item_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Source Item Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "conversation_id",
+        "source_event",
+        "source_item_id",
+        "field_path"
+      ],
+      "title": "TranscriptSourceRef",
+      "type": "object"
+    },
+    "Viewport": {
+      "additionalProperties": false,
+      "properties": {
+        "device_pixel_ratio": {
+          "exclusiveMinimum": 0,
+          "maximum": 8,
+          "title": "Device Pixel Ratio",
+          "type": "number"
+        },
+        "height_css_px": {
+          "exclusiveMinimum": 0,
+          "maximum": 16384,
+          "title": "Height Css Px",
+          "type": "number"
+        },
+        "scroll_x_css_px": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Scroll X Css Px",
+          "type": "number"
+        },
+        "scroll_y_css_px": {
+          "maximum": 100000,
+          "minimum": 0,
+          "title": "Scroll Y Css Px",
+          "type": "number"
+        },
+        "width_css_px": {
+          "exclusiveMinimum": 0,
+          "maximum": 16384,
+          "title": "Width Css Px",
+          "type": "number"
+        }
+      },
+      "required": [
+        "width_css_px",
+        "height_css_px",
+        "scroll_x_css_px",
+        "scroll_y_css_px",
+        "device_pixel_ratio"
+      ],
+      "title": "Viewport",
+      "type": "object"
+    },
+    "WholeLocator": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "whole",
+          "title": "Kind",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "WholeLocator",
+      "type": "object"
+    },
+    "WorkDiffSourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "activity_scope_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Activity Scope Id",
+          "type": "string"
+        },
+        "file_ordinal": {
+          "maximum": 1000,
+          "minimum": 0,
+          "title": "File Ordinal",
+          "type": "integer"
+        },
+        "kind": {
+          "const": "work_diff",
+          "title": "Kind",
+          "type": "string"
+        },
+        "old_path": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Old Path"
+        },
+        "path": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "root_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Root Id"
+        },
+        "source_event": {
+          "$ref": "#/$defs/EventRef"
+        },
+        "source_item_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Source Item Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "activity_scope_id",
+        "source_event",
+        "source_item_id",
+        "file_ordinal",
+        "path"
+      ],
+      "title": "WorkDiffSourceRef",
+      "type": "object"
+    }
+  },
+  "maxItems": 106,
+  "minItems": 106,
+  "prefixItems": [
+    {
+      "$ref": "#/$defs/FeedbackModel"
+    },
+    {
+      "$ref": "#/$defs/EventRef"
+    },
+    {
+      "$ref": "#/$defs/DocumentSourceRef"
+    },
+    {
+      "$ref": "#/$defs/TranscriptSourceRef"
+    },
+    {
+      "$ref": "#/$defs/WorkDiffSourceRef"
+    },
+    {
+      "$ref": "#/$defs/ChatFeedbackContext"
+    },
+    {
+      "$ref": "#/$defs/StandaloneFeedbackContext"
+    },
+    {
+      "$ref": "#/$defs/TextRange"
+    },
+    {
+      "$ref": "#/$defs/Point"
+    },
+    {
+      "$ref": "#/$defs/Pin"
+    },
+    {
+      "$ref": "#/$defs/Area"
+    },
+    {
+      "$ref": "#/$defs/Arrow"
+    },
+    {
+      "$ref": "#/$defs/Freehand"
+    },
+    {
+      "$ref": "#/$defs/Viewport"
+    },
+    {
+      "$ref": "#/$defs/WholeLocator"
+    },
+    {
+      "$ref": "#/$defs/TextLocator"
+    },
+    {
+      "$ref": "#/$defs/RichTableRange"
+    },
+    {
+      "$ref": "#/$defs/RichLocator"
+    },
+    {
+      "$ref": "#/$defs/ShapesLocator"
+    },
+    {
+      "$ref": "#/$defs/HtmlLocator"
+    },
+    {
+      "$ref": "#/$defs/ImageLocator"
+    },
+    {
+      "$ref": "#/$defs/PdfLocator"
+    },
+    {
+      "$ref": "#/$defs/DiffLocator"
+    },
+    {
+      "$ref": "#/$defs/AnchorInput"
+    },
+    {
+      "$ref": "#/$defs/FeedbackAnchor"
+    },
+    {
+      "$ref": "#/$defs/FeedbackCapabilities"
+    },
+    {
+      "$ref": "#/$defs/CanonicalText"
+    },
+    {
+      "$ref": "#/$defs/ResolveSourceRequest"
+    },
+    {
+      "$ref": "#/$defs/ResolvedFeedbackSource"
+    },
+    {
+      "$ref": "#/$defs/SelectedVersion"
+    },
+    {
+      "$ref": "#/$defs/OriginChatDestination"
+    },
+    {
+      "$ref": "#/$defs/ConversationDestination"
+    },
+    {
+      "$ref": "#/$defs/NewFollowupDestination"
+    },
+    {
+      "$ref": "#/$defs/TaskRevisionDestination"
+    },
+    {
+      "$ref": "#/$defs/FeedbackPreflightRequest"
+    },
+    {
+      "$ref": "#/$defs/IncludedFeedback"
+    },
+    {
+      "$ref": "#/$defs/SubmissionCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/ConversationAdmissionLink"
+    },
+    {
+      "$ref": "#/$defs/TaskAdmissionLink"
+    },
+    {
+      "$ref": "#/$defs/Rejection"
+    },
+    {
+      "$ref": "#/$defs/SubmissionReceipt"
+    },
+    {
+      "$ref": "#/$defs/FeedbackReference"
+    },
+    {
+      "$ref": "#/$defs/EntryDelivery"
+    },
+    {
+      "$ref": "#/$defs/Attribution"
+    },
+    {
+      "$ref": "#/$defs/EntryVersion"
+    },
+    {
+      "$ref": "#/$defs/FeedbackThread"
+    },
+    {
+      "$ref": "#/$defs/ThreadPage"
+    },
+    {
+      "$ref": "#/$defs/ThreadCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/EntryCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicEntryEditRequest"
+    },
+    {
+      "$ref": "#/$defs/EntryEditRequest"
+    },
+    {
+      "$ref": "#/$defs/ResolutionRequest"
+    },
+    {
+      "$ref": "#/$defs/ReattachRequest"
+    },
+    {
+      "$ref": "#/$defs/ModerationRequest"
+    },
+    {
+      "$ref": "#/$defs/StagingUpdateRequest"
+    },
+    {
+      "$ref": "#/$defs/StagedItem"
+    },
+    {
+      "$ref": "#/$defs/StagingSnapshot"
+    },
+    {
+      "$ref": "#/$defs/DraftRequest"
+    },
+    {
+      "$ref": "#/$defs/DraftResponse"
+    },
+    {
+      "$ref": "#/$defs/TaskConsequences"
+    },
+    {
+      "$ref": "#/$defs/PendingInteraction"
+    },
+    {
+      "$ref": "#/$defs/ManifestEntry"
+    },
+    {
+      "$ref": "#/$defs/FeedbackPreflight"
+    },
+    {
+      "$ref": "#/$defs/SubmissionManifest"
+    },
+    {
+      "$ref": "#/$defs/ManifestSource"
+    },
+    {
+      "$ref": "#/$defs/SubmissionDetail"
+    },
+    {
+      "$ref": "#/$defs/DestinationRequest"
+    },
+    {
+      "$ref": "#/$defs/DestinationOption"
+    },
+    {
+      "$ref": "#/$defs/DestinationResponse"
+    },
+    {
+      "$ref": "#/$defs/CaptureRequest"
+    },
+    {
+      "$ref": "#/$defs/CaptureResponse"
+    },
+    {
+      "$ref": "#/$defs/GrantRequest"
+    },
+    {
+      "$ref": "#/$defs/GrantResponse"
+    },
+    {
+      "$ref": "#/$defs/GrantListResponse"
+    },
+    {
+      "$ref": "#/$defs/SubjectSummary"
+    },
+    {
+      "$ref": "#/$defs/FollowupPreferenceRequest"
+    },
+    {
+      "$ref": "#/$defs/AnchorMapping"
+    },
+    {
+      "$ref": "#/$defs/CanonicalTextPage"
+    },
+    {
+      "$ref": "#/$defs/DocumentTextScope"
+    },
+    {
+      "$ref": "#/$defs/RichFieldTextScope"
+    },
+    {
+      "$ref": "#/$defs/PdfPageTextScope"
+    },
+    {
+      "$ref": "#/$defs/ScopedTextRequest"
+    },
+    {
+      "$ref": "#/$defs/ScopedCanonicalFeedbackText"
+    },
+    {
+      "$ref": "#/$defs/HistoryItem"
+    },
+    {
+      "$ref": "#/$defs/HistoryPage"
+    },
+    {
+      "$ref": "#/$defs/ShareRequest"
+    },
+    {
+      "$ref": "#/$defs/ShareResponse"
+    },
+    {
+      "$ref": "#/$defs/ShareListResponse"
+    },
+    {
+      "$ref": "#/$defs/ShareUpdateRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicExchangeRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicSource"
+    },
+    {
+      "$ref": "#/$defs/PublicExchangeResponse"
+    },
+    {
+      "$ref": "#/$defs/GuestSessionRequest"
+    },
+    {
+      "$ref": "#/$defs/GuestSessionResponse"
+    },
+    {
+      "$ref": "#/$defs/PublicThreadCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicEntryCreateRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicContentResponse"
+    },
+    {
+      "$ref": "#/$defs/PublicOutcome"
+    },
+    {
+      "$ref": "#/$defs/PublicOutcomeRequest"
+    },
+    {
+      "$ref": "#/$defs/PublicOutcomePage"
+    },
+    {
+      "$ref": "#/$defs/FeedbackPacketReference"
+    },
+    {
+      "$ref": "#/$defs/ChildWorkRequest"
+    },
+    {
+      "$ref": "#/$defs/ChildWorkResponse"
+    },
+    {
+      "$ref": "#/$defs/SubmissionResult"
+    },
+    {
+      "$ref": "#/$defs/SubmissionResultsResponse"
+    },
+    {
+      "$ref": "#/$defs/DispositionRequest"
+    }
+  ],
+  "type": "array"
+}

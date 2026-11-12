@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -223,7 +222,7 @@ def test_schedule_routes_report_latest_task_status(monkeypatch: object, tmp_path
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         list_response = client.get("/api/v1/schedules", headers=headers)
@@ -264,7 +263,7 @@ def test_human_evaluation_round_trip_and_schedule_template(monkeypatch, tmp_path
                 )
                 await db.commit()
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         headers = _auth_headers(app, email="owner@example.com")
         updated = client.put(
             "/api/v1/agents/agent-evaluation",
@@ -368,7 +367,7 @@ def test_schedule_create_rejects_other_user_workflow(monkeypatch: object, tmp_pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/schedules",
@@ -420,7 +419,7 @@ def test_schedule_agent_profile_round_trip(monkeypatch: object, tmp_path: Path) 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(app, email="owner@example.com")
 
         create_response = client.post(
@@ -507,7 +506,7 @@ def test_schedule_update_rejects_clearing_project_for_bound_workflow(
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
 
         response = client.put(
             f"/api/v1/schedules/{schedule_id}",
@@ -572,7 +571,7 @@ def test_schedule_routes_preserve_scheduler_failure_without_new_task(
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         list_response = client.get("/api/v1/schedules", headers=headers)
@@ -638,7 +637,7 @@ def test_schedule_disable_response_keeps_latest_task_status(
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         disable_response = client.post(f"/api/v1/schedules/{schedule_id}/disable", headers=headers)
@@ -723,7 +722,7 @@ def test_schedule_status_ignores_other_users_tasks(monkeypatch: object, tmp_path
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         detail_response = client.get(f"/api/v1/schedules/{schedule_id}", headers=headers)
@@ -790,7 +789,7 @@ def test_schedule_list_filters_by_project(monkeypatch: object, tmp_path: Path) -
                 await session.commit()
                 return project_one.project_id, first.schedule_id
 
-        project_id, schedule_id = asyncio.run(_seed())
+        project_id, schedule_id = client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/schedules",
@@ -837,7 +836,7 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
                 await session.commit()
                 return schedule.schedule_id
 
-        schedule_id = asyncio.run(_seed())
+        schedule_id = client.portal.call(_seed)
         original_trigger_now = app.state.scheduler.trigger_now
         trigger_now_calls: list[str] = []
 
@@ -868,7 +867,7 @@ def test_schedule_trigger_returns_created_task_id(monkeypatch: object, tmp_path:
                 task = await get_task(session, task_id)
                 return task.agent_profile_id if task is not None else None
 
-        assert asyncio.run(_load_task_profile(body["task_id"])) == "fast"
+        assert client.portal.call(_load_task_profile, body["task_id"]) == "fast"
 
 
 def test_project_response_counts_active_schedules(monkeypatch: object, tmp_path: Path) -> None:
@@ -937,7 +936,7 @@ def test_project_response_counts_active_schedules(monkeypatch: object, tmp_path:
                 await session.commit()
                 return project.project_id
 
-        project_id = asyncio.run(_seed())
+        project_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         list_response = client.get("/api/v1/projects", headers=headers)

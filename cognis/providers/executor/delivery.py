@@ -6,6 +6,23 @@ from enum import StrEnum
 from typing import Any
 
 
+async def preserve_task_execution_on_interrupt() -> bool:
+    """Controller suspension/ownership loss must not cancel accepted tool work."""
+    from cognis.core.task_execution import current_task_execution_fence
+    from cognis.store.models import Task
+
+    fence = current_task_execution_fence()
+    if fence is None:
+        return False
+    try:
+        async with fence.store._session_factory() as db:
+            task = await db.get(Task, fence.claim.task_id)
+            return task is None or str(task.status) not in {"cancelled", "failed", "paused"}
+    except Exception:
+        # Unknown DB state cannot authorize cancelling an accepted mutation.
+        return True
+
+
 class DeliveryState(StrEnum):
     NOT_SENT = "not_sent"
     ACCEPTED_UNKNOWN = "accepted_unknown"

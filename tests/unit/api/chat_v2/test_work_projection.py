@@ -748,7 +748,7 @@ def test_trusted_roots_cover_unix_windows_outside_and_same_suffix_without_collis
 
 
 def test_absolute_file_paths_derive_safe_hierarchies_and_shared_identities() -> None:
-    actual_path = "/home/alice/src/sample-app/ui/src/routes/a/+page.svelte"
+    actual_path = "/home/demo1/src/sample-hotfix/ui/src/routes/a/+page.svelte"
     projection = _project(
         [
             _call(
@@ -757,7 +757,7 @@ def test_absolute_file_paths_derive_safe_hierarchies_and_shared_identities() -> 
                 diffs=[
                     FileDiffRef(path=actual_path, diff="+absolute"),
                     FileDiffRef(
-                        path="/home/alice/src/sample-app/ui/src/routes/b/+page.svelte",
+                        path="/home/demo1/src/sample-hotfix/ui/src/routes/b/+page.svelte",
                         diff="+sibling",
                     ),
                 ],
@@ -765,7 +765,7 @@ def test_absolute_file_paths_derive_safe_hierarchies_and_shared_identities() -> 
             _call(
                 "write",
                 seq=2,
-                arguments={"workdir": "/home/alice/src/sample-app"},
+                arguments={"workdir": "/home/demo1/src/sample-hotfix"},
                 diffs=[
                     FileDiffRef(
                         path="ui/src/routes/a/+page.svelte",
@@ -805,8 +805,8 @@ def test_absolute_file_paths_derive_safe_hierarchies_and_shared_identities() -> 
 
     diffs = [diff for mutation in projection.mutations for diff in mutation.file_diffs]
     by_preview = {diff.diff: diff for diff in diffs}
-    assert by_preview["+absolute"].path == ("src/sample-app/ui/src/routes/a/+page.svelte")
-    assert by_preview["+sibling"].path == ("src/sample-app/ui/src/routes/b/+page.svelte")
+    assert by_preview["+absolute"].path == ("src/sample-hotfix/ui/src/routes/a/+page.svelte")
+    assert by_preview["+sibling"].path == ("src/sample-hotfix/ui/src/routes/b/+page.svelte")
     assert by_preview["+absolute"].path_id == by_preview["+relative"].path_id
     assert by_preview["+absolute"].root_name == "src"
     assert by_preview["+absolute"].root_id == by_preview["+relative"].root_id
@@ -828,7 +828,7 @@ def test_absolute_file_paths_derive_safe_hierarchies_and_shared_identities() -> 
         == 4
     )
     serialized = projection.model_dump_json()
-    assert "/home/alice" not in serialized
+    assert "/home/demo1" not in serialized
     assert "/Users/alice" not in serialized
     assert "C:/Users/Dev" not in serialized
 
@@ -840,7 +840,7 @@ def test_shallow_home_paths_use_generic_labels_without_usernames() -> None:
                 "apply_patch",
                 seq=1,
                 diffs=[
-                    FileDiffRef(path="/home/bob/file.py", diff="+linux"),
+                    FileDiffRef(path="/home/demo1/file.py", diff="+linux"),
                     FileDiffRef(path="/Users/alice/file.py", diff="+mac"),
                     FileDiffRef(path=r"C:\Users\Dev\file.py", diff="+windows"),
                 ],
@@ -855,7 +855,7 @@ def test_shallow_home_paths_use_generic_labels_without_usernames() -> None:
     assert all(diff.root_label == "~" for diff in diffs)
     assert len({diff.root_id for diff in diffs}) == 3
     serialized = projection.model_dump_json()
-    for username in ("bob", "alice", "Dev"):
+    for username in ("demo1", "alice", "Dev"):
         assert username not in serialized
 
 

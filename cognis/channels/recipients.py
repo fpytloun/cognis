@@ -50,6 +50,7 @@ _GOOGLE_SPACE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
 _GOOGLE_USER = re.compile(r"^users/[A-Za-z0-9._~:-]+$")
 
 _CHAT_KINDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "web": {"cognis_user_email": ("direct",)},
     "signal": {
         "signal_e164": ("direct",),
         "signal_uuid": ("direct",),
@@ -103,7 +104,7 @@ def normalize_recipient(recipient: ChannelRecipient) -> ChannelRecipient:
         )
     if not _address_matches(kind, address):
         raise RecipientNormalizationError("malformed_address", "Recipient address is malformed")
-    if kind in {"signal_uuid", "telegram_public_username"} or (
+    if kind in {"signal_uuid", "telegram_public_username", "cognis_user_email"} or (
         kind == "imessage_handle" and "@" in address
     ):
         address = address.lower()
@@ -132,6 +133,8 @@ def normalize_recipient(recipient: ChannelRecipient) -> ChannelRecipient:
 
 
 def _address_matches(kind: str, address: str) -> bool:
+    if kind == "cognis_user_email":
+        return bool(re.fullmatch(r"[^@\s]+@[^@\s]+", address))
     if kind in {"signal_e164", "whatsapp_e164"}:
         return bool(_E164.fullmatch(address))
     if kind == "signal_uuid":
@@ -631,6 +634,30 @@ class RecipientResolutionService:
                 )
             await session.commit()
         target = _canonical_target(recipient, admission.account.account_id)
+        if target is not None and recipient.channel_type == "web":
+            from sqlalchemy import func
+
+            from cognis.store.models import AppContactBlockRow, User
+
+            async with self._session_factory() as session:
+                recipient_user = (
+                    await session.execute(
+                        select(User).where(
+                            func.lower(User.email) == recipient.address,
+                            User.is_active.is_(True),
+                        )
+                    )
+                ).scalar_one_or_none()
+                unavailable = recipient_user is None or bool(
+                    await session.get(AppContactBlockRow, (recipient_user.email, user_email))
+                )
+                if not unavailable:
+                    assert recipient_user is not None
+                    target = target.model_copy(update={"chat_id": recipient_user.email})
+            if unavailable:
+                return await self._mark_error(
+                    admission.intent_id, "recipient_unavailable", "Recipient unavailable"
+                )
         if target is not None:
             async with self._session_factory() as session:
                 if (
@@ -890,6 +917,7 @@ def _canonical_target(recipient: ChannelRecipient, account_id: str) -> ResolvedC
     if kind == "whatsapp_e164":
         chat_id = address[1:]
     if kind in {
+        "cognis_user_email",
         "signal_e164",
         "signal_uuid",
         "signal_group_id",

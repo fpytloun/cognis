@@ -285,6 +285,10 @@ async def test_queue_remote_wakeup_and_idle_attempt_reduction(
     monkeypatch.setattr(queue, "_try_pick_and_run", picks)
     monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
     monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    monkeypatch.setattr(
+        "cognis.core.invariants.task_dispatches.reconcile_cancelled_dispatches",
+        AsyncMock(return_value=0),
+    )
     await queue.start()
     try:
         await asyncio.sleep(0.02)
@@ -321,6 +325,10 @@ async def test_queue_dropped_signal_fallback_and_recovery(monkeypatch: pytest.Mo
     monkeypatch.setattr(queue, "_try_pick_and_run", picks)
     monkeypatch.setattr(queue, "recover_stale_tasks", recovery)
     monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    monkeypatch.setattr(
+        "cognis.core.invariants.task_dispatches.reconcile_cancelled_dispatches",
+        AsyncMock(return_value=0),
+    )
     await queue.start()
     try:
         await asyncio.sleep(0.11)
@@ -350,6 +358,10 @@ async def test_queue_error_backoff_is_interruptible(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(queue, "_try_pick_and_run", pick)
     monkeypatch.setattr(queue, "recover_stale_tasks", AsyncMock())
     monkeypatch.setattr(queue, "recover_paused_tasks", AsyncMock())
+    monkeypatch.setattr(
+        "cognis.core.invariants.task_dispatches.reconcile_cancelled_dispatches",
+        AsyncMock(return_value=0),
+    )
     monkeypatch.setattr(
         queue._execution_store, "next_scheduled_delay", AsyncMock(return_value=None)
     )
@@ -405,7 +417,7 @@ async def test_already_ready_submission_publishes_queue_hint(tmp_path: object) -
         queue = TaskQueue(
             session_factory=factory,
             workflow_engine=AsyncMock(),
-            workflow_registry=AsyncMock(),
+            workflow_registry=WorkflowRegistry(factory),
             event_bus=EventBus(),
         )
         publish = AsyncMock()
@@ -572,33 +584,23 @@ async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
             )
             await session.commit()
 
-        original_claim = TaskExecutionClaim(
-            task_id="task-retry-history",
-            agent_id="agent-1",
-            attempt_number=1,
-            task_lease=SimpleNamespace(),
-            global_capacity_lease=None,
-            agent_capacity_lease=None,
-        )
-
-        class _ExecutionStore:
-            async def claim_existing(
-                self, task_id: str, *, statuses: set[str]
-            ) -> TaskExecutionClaim:
-                assert task_id == "task-retry-history"
-                assert statuses == {"failed"}
-                return original_claim
-
-            async def release(self, claim: TaskExecutionClaim) -> None:
-                del claim
-
         queue = TaskQueue(
             session_factory=factory,
             workflow_engine=SimpleNamespace(),
             workflow_registry=SimpleNamespace(),
             event_bus=EventBus(),
         )
-        queue._execution_store = _ExecutionStore()  # type: ignore[assignment]
+        original_claim: TaskExecutionClaim | None = None
+        claim_existing = queue._execution_store.claim_existing
+
+        async def capture_claim(task_id: str, *, statuses: set[str]) -> TaskExecutionClaim | None:
+            nonlocal original_claim
+            assert task_id == "task-retry-history"
+            assert statuses == {"failed"}
+            original_claim = await claim_existing(task_id, statuses=statuses)
+            return original_claim
+
+        queue._execution_store.claim_existing = capture_claim
         launched: list[TaskExecutionClaim] = []
         queue._launch_claimed_task_run = (  # type: ignore[method-assign]
             lambda task, claim: launched.append(claim)
@@ -613,6 +615,7 @@ async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
         assert retried.status == TaskStatus.RUNNING
         assert len(launched) == 1
         assert launched[0].attempt_number == (1 if preserve_context else 2)
+        assert original_claim is not None
         assert launched[0].task_lease is original_claim.task_lease
         async with factory() as session:
             persisted = await get_task(session, "task-retry-history")
@@ -632,18 +635,31 @@ async def test_retry_failed_task_starts_new_attempt_and_clears_stale_result(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("history_available", [False, True])
+@pytest.mark.parametrize(
+    ("history_available", "pending_receipt", "continuation_required"),
+    [(False, False, False), (True, False, False), (True, True, False), (True, True, True)],
+)
 async def test_recovery_executes_failed_step_with_original_tool_evidence(
     tmp_path: object,
     history_available: bool,
+    pending_receipt: bool,
+    continuation_required: bool,
 ) -> None:
     from cognis.core.agent_loop import PauseWaiter
     from cognis.core.canonical_history import CanonicalHistoryUnavailable
     from cognis.core.runtime import ResolvedStepRuntime
+    from cognis.core.task_execution import (
+        TaskExecutionFence,
+        bind_task_execution_fence,
+        reset_task_execution_fence,
+    )
+    from cognis.core.task_tool_recovery import RecoveredTaskTools, recover_task_tools
     from cognis.core.workflow_engine import WorkflowEngine
     from cognis.models.agent import AgentDefinition
     from cognis.models.session import EventAppendResult, EventReadResult
     from cognis.models.workflow import CompletionConfig, StepOutput
+    from cognis.store.models import Session
+    from cognis.tools.registry import ToolRegistry
 
     db_engine, factory = await _bootstrap_db(tmp_path)
     source_events = [
@@ -696,6 +712,7 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
         read_events=read_events,
         record_events=record_events,
     )
+    fence_token = None
     try:
         async with factory() as db:
             conversation = await create_conversation(db, "user@test.com", "agent-1", "task_step")
@@ -727,6 +744,29 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
             run.session_id = source.session_id
             run.intaris_session_id = "intaris-source"
             run.status = "failed"
+            if pending_receipt:
+                for event in source_events:
+                    event["data"]["turn_id"] = run.step_run_id
+                    if event["type"] == "tool_result":
+                        event["data"]["is_error"] = False
+                    else:
+                        event["data"]["arguments"] = {"title": "Existing ticket"}
+                task.result_data = {
+                    "execution_recovery": {
+                        f"intaris-source:{run.step_run_id}": {
+                            "session_id": "intaris-source",
+                            "turn_id": run.step_run_id,
+                            "attempt_number": 1,
+                            "tool_calls": [
+                                {
+                                    "call_id": "create-ticket",
+                                    "tool_name": "create_ticket",
+                                    "canonical_turn_id": run.step_run_id,
+                                }
+                            ],
+                        }
+                    }
+                }
             await db.commit()
             task_id = task.task_id
 
@@ -738,12 +778,26 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
                     kwargs["user_email"],
                     kwargs["agent_id"],
                     intaris_session_id="intaris-recovered",
+                    previous_session_id=kwargs.get("previous_session_id"),
                 )
                 await db.commit()
                 return target
 
-        async def run_step(ctx: object, **kwargs: object) -> StepOutput:
+        async def run_step(ctx: object, **kwargs: object) -> StepOutput | RecoveredTaskTools | None:
             assert ctx.is_retry
+            if kwargs.get("settlement_only") and continuation_required:
+                assert ctx.session.session_id == source.session_id
+                return RecoveredTaskTools({}, set(), True)
+            if kwargs.get("settlement_only") or kwargs.get("recovery_only"):
+                assert ctx.session.session_id == source.session_id
+                ctx.turn_id = ctx.step_run_id
+                await recover_task_tools(
+                    agent_loop,
+                    ctx,
+                    await fence.recovery_batches(),
+                )
+                return None
+            assert not await fence.recovery_batches()
             assert ctx.session.session_id != source.session_id
             assert any(
                 event.type == "tool_result"
@@ -752,7 +806,11 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
             )
             return StepOutput(summary="Continued with the existing ticket")
 
-        agent_loop = SimpleNamespace(run_step=AsyncMock(side_effect=run_step))
+        agent_loop = SimpleNamespace(
+            run_step=AsyncMock(side_effect=run_step),
+            providers=SimpleNamespace(guardrails=guardrails),
+            _session_factory=factory,
+        )
         workflow_engine = WorkflowEngine(
             session_factory=factory,
             providers=SimpleNamespace(guardrails=guardrails, guardrail=guardrails, llm=None),
@@ -790,7 +848,7 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
         workflow_engine._resolve_step_agents = AsyncMock(return_value=(agent, agent))
         workflow_engine._step_runtime_factory = AsyncMock(
             return_value=ResolvedStepRuntime(
-                tool_registry=object(),
+                tool_registry=ToolRegistry(),
                 executor_connection=None,
                 cleanup=AsyncMock(),
                 executor_environment=None,
@@ -808,20 +866,13 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
             workflow_engine=workflow_engine,
             event_bus=EventBus(),
         )
-        claim = TaskExecutionClaim(
-            task_id=task_id,
-            agent_id="agent-1",
-            attempt_number=1,
-            task_lease=SimpleNamespace(),
-            agent_capacity_lease=None,
-            global_capacity_lease=None,
-        )
-        queue._execution_store = SimpleNamespace(
-            claim_existing=AsyncMock(return_value=claim),
-            release=AsyncMock(),
-        )
-        queue._launch_claimed_task_run = lambda *_: None
+        launched: list[TaskExecutionClaim] = []
+        queue._launch_claimed_task_run = lambda _task, claim: launched.append(claim)
         recovered = await queue.retry_failed_task(task_id, preserve_step_context=True)
+        fence = TaskExecutionFence(
+            queue._execution_store, launched[0], cancel_event=asyncio.Event()
+        )
+        fence_token = bind_task_execution_fence(fence)
         step = StepDefinition(
             name="execute",
             type="run",
@@ -835,7 +886,12 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
                 recovered, step, recovered.workflow_state, workflow
             )
             assert output.summary == "Continued with the existing ticket"
-            agent_loop.run_step.assert_awaited_once()
+            async with factory() as db:
+                continued_run = await db.get(StepRun, run.step_run_id)
+                target = await db.get(Session, continued_run.session_id)
+                assert target.previous_session_id == source.session_id
+            if not pending_receipt:
+                agent_loop.run_step.assert_awaited_once()
         else:
             with pytest.raises(CanonicalHistoryUnavailable):
                 await workflow_engine._execute_run_step(
@@ -843,6 +899,8 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
                 )
             agent_loop.run_step.assert_not_awaited()
     finally:
+        if fence_token is not None:
+            reset_task_execution_fence(fence_token)
         await db_engine.dispose()
 
 
@@ -852,7 +910,7 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
     [
         (
             [[]],
-            "ambiguous_tool_execution",
+            "infrastructure_wait",
         ),
         (
             [
@@ -876,7 +934,7 @@ async def test_recovery_executes_failed_step_with_original_tool_evidence(
                     }
                 ],
             ],
-            "ambiguous_tool_execution",
+            "infrastructure_wait",
         ),
         (
             [
@@ -1308,22 +1366,8 @@ async def test_rerun_task_rejects_active_statuses(tmp_path: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_select_workflow_for_task_can_materialize_attached_skill(tmp_path: object) -> None:
+async def test_omitted_workflow_uses_general_task_despite_attached_skill(tmp_path: object) -> None:
     engine, factory = await _bootstrap_db(tmp_path)
-
-    class _LLM:
-        async def generate(
-            self, _messages: list[dict[str, object]], **_kwargs: object
-        ) -> dict[str, object]:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"workflow_id":"skill:skill_release","confidence":0.99,"exact_skill_domain_match":true,"reason":"Attached release skill fits"}'
-                        }
-                    }
-                ]
-            }
 
     try:
         async with factory() as session:
@@ -1361,40 +1405,27 @@ async def test_select_workflow_for_task_can_materialize_attached_skill(tmp_path:
                 decomposition_source_hash="b" * 64,
             )
             await set_current_version(session, skill.skill_id, version.version_id)
-            task_row = await create_task(
-                session,
-                created_by="user@test.com",
-                agent_id="agent-1",
-                title="Ship release",
-                description="Use the attached release skill.",
-                status="draft",
-            )
             await session.commit()
 
         queue = TaskQueue(
             session_factory=factory,
-            workflow_engine=SimpleNamespace(),
+            workflow_engine=AsyncMock(),
             workflow_registry=WorkflowRegistry(factory),
-            event_bus=SimpleNamespace(publish=lambda *_args, **_kwargs: None),
+            event_bus=EventBus(),
             agent_registry=AgentRegistry(factory),
-            llm_provider=_LLM(),
         )
 
-        workflow_id = await queue._select_workflow_for_task(  # noqa: SLF001
-            TaskModel(
-                task_id=task_row.task_id,
-                title=task_row.title,
-                description=task_row.description or "",
-                created_by=task_row.created_by,
-                agent_id=task_row.agent_id,
-            )
+        task = await queue.submit(
+            title="Ship release",
+            description="Use the attached release skill.",
+            created_by="user@test.com",
+            agent_id="agent-1",
         )
-
-        assert workflow_id.startswith("wf_")
+        assert task.workflow_id == "system:general-task"
         async with factory() as session:
-            persisted_task = await get_task(session, task_row.task_id)
+            persisted_task = await get_task(session, task.task_id)
             assert persisted_task is not None
-            assert persisted_task.workflow_id == workflow_id
+            assert persisted_task.workflow_id == "system:general-task"
     finally:
         await engine.dispose()
 
@@ -2126,7 +2157,7 @@ async def test_request_revision_reopens_selected_step_and_supersedes_later_runs(
         ],
     )
     state = WorkflowState(
-        current_step_index=2,
+        current_step_index=3,
         status="completed",
         step_outputs={
             "plan": {"summary": "plan"},
@@ -2179,6 +2210,25 @@ async def test_request_revision_reopens_selected_step_and_supersedes_later_runs(
             statuses={"completed"},
         )
         assert old_owner is not None
+
+        with pytest.raises(ValueError, match="target step is required"):
+            await queue.request_revision(
+                "task-revision",
+                target_step=None,
+                instruction="Correct the implementation",
+                expected_attempt=1,
+            )
+        async with factory() as session:
+            unchanged = await get_task(session, "task-revision")
+            assert unchanged is not None
+            assert unchanged.attempt_number == 1
+            assert unchanged.status == "completed"
+            assert all(
+                row.status == "approved"
+                for row in await session.scalars(
+                    select(StepRun).where(StepRun.task_id == "task-revision")
+                )
+            )
 
         revised = await queue.request_revision(
             "task-revision",
@@ -2238,6 +2288,7 @@ async def test_second_queue_cancellation_is_durable_and_idempotent(tmp_path: obj
         workflow_engine = SimpleNamespace(
             _notification_service=None,
             _pause_waiter=SimpleNamespace(find_pending=lambda **_kwargs: None),
+            deliver_task_outcome=AsyncMock(),
         )
         queue = TaskQueue(
             session_factory=factory,
@@ -2252,6 +2303,7 @@ async def test_second_queue_cancellation_is_durable_and_idempotent(tmp_path: obj
 
         assert first.status == TaskStatus.CANCELLED
         assert second.status == TaskStatus.CANCELLED
+        workflow_engine.deliver_task_outcome.assert_awaited_once()
         async with factory() as session:
             task = await get_task(session, "task-cancel")
             step = await get_step_run(session, "sr-cancel")

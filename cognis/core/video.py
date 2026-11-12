@@ -15,6 +15,14 @@ from sqlalchemy.engine import CursorResult
 
 from cognis.core.artifact_access import readable_artifact_ids
 from cognis.core.project_access import resolve_agent_use_grant
+from cognis.models.usage import (
+    UsageAttribution,
+    UsageCorrection,
+    UsageIdentity,
+    UsageNumericExtra,
+    UsageProviderCost,
+    UsageResourceBinding,
+)
 from cognis.models.video import (
     TERMINAL_VIDEO_STATES,
     VideoAnalysis,
@@ -25,30 +33,49 @@ from cognis.models.video import (
     VideoRequest,
     VideoSpendPolicy,
 )
+from cognis.providers.llm.usage_binding import UsageBinding
+from cognis.providers.llm.usage_scope import current_usage_execution
 from cognis.providers.video import VideoConnection, VideoHTTPAdapter, VideoInput, VideoProviderError
-from cognis.store.models import ArtifactRecordRow, VideoJobRow
+from cognis.store.models import ArtifactRecordRow, VideoAttemptRow, VideoJobRow
 from cognis.store.queries import (
     create_artifact_record,
     get_agent,
     get_conversation,
     get_setting_value,
 )
+from cognis.store.usage.codec import terminal_event
+from cognis.store.usage.models import UsageAttemptRow
 from cognis.store.video_jobs import VideoJobStore, job_view, microusd
 
 if TYPE_CHECKING:
     from cognis.core.turn_scheduler import TurnScheduler
+    from cognis.core.usage.maintenance import UsageMaintenanceService
     from cognis.core.video_transfer import ExecutorVideoAdapter
+
+
+def _connection_binding(binding: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value for key, value in binding.items() if key not in {"usage_origin", "usage_settled"}
+    }
 
 
 class VideoService:
     """Own admission, pinned provider identity, reconciliation and publication."""
 
-    def __init__(self, *, session_factory: Any, artifacts: Any, llm: Any):
+    def __init__(
+        self,
+        *,
+        session_factory: Any,
+        artifacts: Any,
+        llm: Any,
+        usage_maintenance: UsageMaintenanceService | None = None,
+    ):
         self.sessions = session_factory
         self.artifacts = artifacts
         self.llm = llm
         self.store = VideoJobStore(session_factory)
         self.scheduler: TurnScheduler | None = None
+        self.usage_maintenance = usage_maintenance
 
     def adapter(
         self,
@@ -61,7 +88,57 @@ class VideoService:
             from cognis.core.video_transfer import ExecutorVideoAdapter
 
             return ExecutorVideoAdapter(self, connection, binding, row)
-        return VideoHTTPAdapter(connection, client)
+        return VideoHTTPAdapter(
+            connection,
+            client,
+            usage_binding=self.capture_binding(connection, binding, row),
+        )
+
+    def capture_binding(
+        self,
+        connection: VideoConnection,
+        binding: dict[str, Any],
+        row: VideoJobRow | None,
+    ) -> UsageBinding | None:
+        """Bind a verified video job without inventing a conversation session."""
+        if row is None:
+            return None
+        capture = self.llm.usage_capture
+        if capture is None:
+            return None
+        try:
+            request = capture.request(
+                request_id=row.attempt_id or row.job_id,
+                attribution=UsageAttribution(
+                    identity=UsageIdentity(
+                        principal_type="user",
+                        principal_subject=row.owner_email,
+                        usage_subject_kind="user",
+                        usage_subject_id=row.owner_email,
+                        resource_owner=row.owner_email,
+                        initiating_actor=row.owner_email,
+                        provider_payer=binding["provider_owner"],
+                    ),
+                    purpose="video",
+                    resources=UsageResourceBinding.model_validate(row.binding["usage_origin"])
+                    if "usage_origin" in row.binding
+                    else UsageResourceBinding(
+                        provenance="controller",
+                        conversation_id=row.conversation_id,
+                        project_id=row.project_id,
+                        agent_id=row.agent_id,
+                    ),
+                ),
+            )
+            return UsageBinding(
+                request,
+                binding["provider_id"],
+                connection.model,
+                media_operation="video_extend" if row.operation == "extend" else "video_generate",
+            )
+        except Exception:
+            capture.failed_events += 1
+            return None
 
     async def context(self, owner: str, conversation_id: str) -> Any:
         async with self.sessions() as session:
@@ -101,6 +178,34 @@ class VideoService:
         return cast(tuple[VideoConnection, dict[str, Any]], result)
 
     @staticmethod
+    def diagnostic_provider(owner: str, binding: dict[str, Any]) -> bool:
+        """The runtime/provider boundary shared by admission and capability reads."""
+        return (
+            binding.get("runtime") == "controller"
+            and binding.get("adapter") == "omni"
+            and binding.get("provider_owner") == owner
+        )
+
+    async def diagnostic_context(
+        self, owner: str, conversation_id: str, binding: dict[str, Any]
+    ) -> bool:
+        """Fail closed outside an owner-owned provider/agent and private origin."""
+        if not self.diagnostic_provider(owner, binding):
+            return False
+        async with self.sessions() as session:
+            conversation = await get_conversation(session, conversation_id)
+            if (
+                conversation is None
+                or conversation.user_email != owner
+                or conversation.status == "deleted"
+                or conversation.visibility != "private"
+                or conversation.project_id is not None
+            ):
+                return False
+            agent = await get_agent(session, conversation.agent_id)
+            return agent is not None and agent.owner_email == owner
+
+    @staticmethod
     def cost_bound(
         policy: VideoSpendPolicy, request: VideoRequest, binding: dict[str, Any]
     ) -> Decimal | None:
@@ -128,6 +233,7 @@ class VideoService:
         )
         async with httpx.AsyncClient() as client:
             capabilities = await self.adapter(connection, client, binding).capabilities()
+        capabilities.provider_error_messages &= self.diagnostic_provider(owner, binding)
         return {"binding": binding, "capabilities": capabilities.model_dump(mode="json")}
 
     async def analyze(
@@ -237,7 +343,7 @@ class VideoService:
                         ),
                         None,
                     )
-                    if parent is None or parent.binding != binding:
+                    if parent is None or _connection_binding(parent.binding) != binding:
                         raise ValueError("Source requires a retained same-provider/model output")
                     remote = await self.store.result(parent.attempt_id)
                     index = next(
@@ -270,7 +376,11 @@ class VideoService:
     async def create(self, owner: str, create: VideoJobCreate) -> dict[str, Any]:
         conversation = await self.context(owner, create.conversation_id)
         request = create.request
-        request_hash = hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+        # Existing persisted hashes predate this default-off option.
+        excluded = {"inspect_provider_error"} if not request.inspect_provider_error else set()
+        request_hash = hashlib.sha256(
+            request.model_dump_json(exclude=excluded).encode()
+        ).hexdigest()
         existing = await self.store.existing(owner, create.conversation_id, create.idempotency_key)
         if existing:
             if existing.request_hash != request_hash:
@@ -278,8 +388,16 @@ class VideoService:
             return job_view(existing).model_dump(mode="json")
         policy = await self.policy(owner)
         connection, binding = await self.connection(request, owner)
+        if request.inspect_provider_error and not await self.diagnostic_context(
+            owner, create.conversation_id, binding
+        ):
+            raise PermissionError(
+                "Provider diagnostics require an owner-owned Omni controller provider/agent "
+                "and a private non-project conversation"
+            )
         async with httpx.AsyncClient() as client:
             capabilities = await self.adapter(connection, client, binding).capabilities()
+        capabilities.provider_error_messages &= self.diagnostic_provider(owner, binding)
         capabilities.validate_request(request)
         from cognis.providers.video import validate_video_combination
 
@@ -299,6 +417,20 @@ class VideoService:
                 ),
                 "spending_limits_enabled": policy.enabled,
             }
+        origin = UsageResourceBinding(
+            provenance="controller",
+            conversation_id=create.conversation_id,
+            agent_id=conversation.agent_id,
+            project_id=getattr(conversation, "project_id", None),
+        )
+        execution = current_usage_execution.get()
+        if (
+            execution is not None
+            and execution.actor == owner
+            and execution.conversation_id == create.conversation_id
+        ):
+            origin = UsageResourceBinding(provenance="controller", **execution.request_values())
+        binding = {**binding, "usage_origin": origin.model_dump(mode="json", exclude_none=True)}
         job_id = "vjob_" + uuid.uuid4().hex
         request_id = "art_" + uuid.uuid4().hex
         pinned = request.model_copy(
@@ -311,7 +443,7 @@ class VideoService:
             "video_requests",
             request_id,
             "request.json",
-            pinned.model_dump_json().encode(),
+            pinned.model_dump_json(exclude=excluded).encode(),
             "application/json",
             owner,
         )
@@ -362,13 +494,26 @@ class VideoService:
         return row
 
     async def get(
-        self, owner: str, job_id: str, *, conversation_id: str | None = None, wait_seconds: int = 0
+        self,
+        owner: str,
+        job_id: str,
+        *,
+        conversation_id: str | None = None,
+        wait_seconds: int = 0,
+        inspect_provider_error: bool = False,
     ) -> dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + min(60, max(0, wait_seconds))
         while True:
             row = await self.authorized(owner, job_id, conversation_id)
             if row.status in TERMINAL_VIDEO_STATES or asyncio.get_running_loop().time() >= deadline:
-                return job_view(row).model_dump(mode="json")
+                view = job_view(row)
+                if inspect_provider_error:
+                    if conversation_id != row.conversation_id or not await self.diagnostic_context(
+                        owner, row.conversation_id, row.binding
+                    ):
+                        raise PermissionError("Provider diagnostics require the private origin")
+                    view.provider_error_message = row.provider_error_message
+                return view.model_dump(mode="json")
             await asyncio.sleep(min(1, max(0, deadline - asyncio.get_running_loop().time())))
 
     async def list(
@@ -442,9 +587,127 @@ class VideoService:
                 if current and current.status not in TERMINAL_VIDEO_STATES:
                     await self.store.postpone(current, 60, "video_reconciliation_failed")
         await self.notify()
+        await self.reconcile_usage()
         from cognis.core.video_transfer import VideoTransfers
 
         await VideoTransfers(self).cleanup()
+
+    async def reconcile_usage(self, limit: int = 32) -> None:
+        """Settle late provider facts without replaying submission or counting polls.
+
+        The job owns render evidence. Usage owns fact-version CAS and projection;
+        the metadata marker commits only after correction, so a restart can retry.
+        No database transaction spans another service operation or provider I/O.
+        """
+        if self.usage_maintenance is None:
+            return
+        from sqlalchemy import or_
+
+        capture_ready = (
+            select(UsageAttemptRow.row_id)
+            .where(
+                UsageAttemptRow.request_id == VideoJobRow.attempt_id,
+                UsageAttemptRow.provider_id == VideoJobRow.provider_id,
+                UsageAttemptRow.terminal_payload.is_not(None),
+            )
+            .exists()
+        )
+        has_evidence = (
+            select(VideoAttemptRow.attempt_id)
+            .where(
+                VideoAttemptRow.attempt_id == VideoJobRow.attempt_id,
+                or_(
+                    VideoAttemptRow.result["cost_usd"].as_string().is_not(None),
+                    VideoAttemptRow.result["output_duration_ms"].as_string().is_not(None),
+                ),
+            )
+            .exists()
+        )
+        async with self.sessions() as session:
+            jobs = list(
+                await session.scalars(
+                    select(VideoJobRow)
+                    .where(
+                        VideoJobRow.status.in_(TERMINAL_VIDEO_STATES),
+                        VideoJobRow.binding["usage_origin"].as_string().is_not(None),
+                        VideoJobRow.binding["usage_settled"].as_boolean().is_not(True),
+                        or_(capture_ready, ~has_evidence),
+                    )
+                    .order_by(VideoJobRow.updated_at)
+                    .limit(limit)
+                )
+            )
+        for job in jobs:
+            async with self.sessions() as session:
+                evidence = await session.get(VideoAttemptRow, job.attempt_id)
+                evidence_version = evidence.version if evidence is not None else None
+                remote = (
+                    VideoRemoteResult.model_validate(evidence.result)
+                    if evidence is not None and evidence.result
+                    else None
+                )
+            if remote is not None and (
+                remote.cost_usd is not None or remote.output_duration_ms is not None
+            ):
+                async with self.sessions() as session:
+                    facts = list(
+                        await session.scalars(
+                            select(UsageAttemptRow)
+                            .where(
+                                UsageAttemptRow.request_id == job.attempt_id,
+                                UsageAttemptRow.terminal_payload.is_not(None),
+                                UsageAttemptRow.provider_id == job.provider_id,
+                            )
+                            .order_by(UsageAttemptRow.attempt_ordinal.desc())
+                        )
+                    )
+                if not facts:
+                    # Capture is asynchronous; the durable job remains pending.
+                    continue
+                fact = facts[0]
+                final = terminal_event(fact)
+                extras = list(final.usage.extras)
+                if remote.output_duration_ms is not None:
+                    extras = [x for x in extras if x.name != "output_video_duration_ms"]
+                    extras.append(
+                        UsageNumericExtra(
+                            name="output_video_duration_ms",
+                            value=remote.output_duration_ms,
+                            unit="milliseconds",
+                            source="provider",
+                        )
+                    )
+                usage = final.usage.model_copy(
+                    update={
+                        "provider_cost": UsageProviderCost(amount=remote.cost_usd)
+                        if remote.cost_usd is not None
+                        else final.usage.provider_cost,
+                        "extras": tuple(extras),
+                    }
+                )
+                if usage != final.usage:
+                    await self.usage_maintenance.correct(
+                        UsageCorrection(
+                            correction_id="video:"
+                            + job.job_id
+                            + ":"
+                            + usage.observation_digest()[:32],
+                            expected_fact_version=fact.fact_version,
+                            reason="late_provider_usage",
+                            replacement=final.model_copy(update={"usage": usage}),
+                        )
+                    )
+            async with self.sessions() as session:
+                current = await session.get(VideoJobRow, job.job_id, with_for_update=True)
+                latest = await session.get(VideoAttemptRow, job.attempt_id)
+                if (
+                    current is not None
+                    and current.attempt_id == job.attempt_id
+                    and latest is not None
+                    and latest.version == evidence_version
+                ):
+                    current.binding = {**current.binding, "usage_settled": True}
+                    await session.commit()
 
     async def notify(self) -> None:
         """Durable follow-up admission, deduplicated by the existing turn scheduler."""
@@ -547,10 +810,15 @@ class VideoService:
             )
             request = VideoRequest.model_validate_json(data)
             connection, binding = await self.connection(request, row.owner_email)
-            if binding != row.binding:
+            if binding != _connection_binding(row.binding):
                 raise ValueError("Provider binding changed")
             policy = await self.policy(row.owner_email)
             inputs = await self.inputs(request, row.owner_email, conversation, binding)
+            if request.inspect_provider_error and not await self.diagnostic_context(
+                row.owner_email, row.conversation_id, binding
+            ):
+                # Diagnostic opt-in never broadens normal render authority.
+                request = request.model_copy(update={"inspect_provider_error": False})
         except (ValueError, PermissionError, FileNotFoundError):
             await self.store.transition(
                 row, "blocked", error_code="video_authority_or_binding_unavailable"
@@ -584,10 +852,16 @@ class VideoService:
                         await self.store.settle(row.job_id, 0, not_submitted=True)
                     if current is None or current.status in TERMINAL_VIDEO_STATES:
                         return
+                    message = None
+                    if request.inspect_provider_error and await self.diagnostic_context(
+                        row.owner_email, row.conversation_id, binding
+                    ):
+                        message = exc.provider_error_message
                     await self.store.transition(
                         current,
                         "failed" if exc.rejected else "needs_reconciliation",
                         error_code=exc.code,
+                        provider_error_message=message,
                     )
                     return
                 except (httpx.HTTPError, ValueError):
@@ -657,7 +931,7 @@ class VideoService:
 
                 if not isinstance(adapter, ExecutorVideoAdapter):
                     raise ValueError("Executor video adapter required")
-                staged_id = await adapter.stage_output(output)
+                staged_id = await adapter.stage_output(output, output_index=index)
                 metadata = await VideoTransfers(self).staged(row, staged_id)
                 content = self.artifacts.async_read_range(
                     "video_staging",
@@ -669,7 +943,7 @@ class VideoService:
             else:
                 if not isinstance(adapter, VideoHTTPAdapter):
                     raise ValueError("Controller video adapter required")
-                content = adapter.output_stream(output, policy.max_output_bytes)
+                content = adapter.output_stream(output, policy.max_output_bytes, output_index=index)
             size, digest = await self.artifacts.async_save_stream(
                 "videos",
                 artifact_id,

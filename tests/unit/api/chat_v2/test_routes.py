@@ -47,11 +47,13 @@ from cognis.api.chat_v2.routes import (
     router,
 )
 from cognis.api.chat_v2.schemas import (
+    ChatSyncResponse,
     ClientPerformanceRequest,
     ControlMutationV2Request,
     QueueUpdateV2Request,
     RuntimeAuthority,
     SendMessageV2Request,
+    TimelineBackfillResponse,
     TimelineScope,
 )
 from cognis.api.chat_v2.shared_snapshot_cache import SnapshotRequestTrace
@@ -865,6 +867,7 @@ async def test_session_read_refs_bind_each_lineage_to_exact_authority() -> None:
             owner="alice@example.com",
             conversation_id="conv-1",
             agent_id="agent-one",
+            previous_session_id="session-previous",
         ),
         user_email="alice@example.com",
         role="root",
@@ -897,6 +900,8 @@ async def test_session_read_refs_bind_each_lineage_to_exact_authority() -> None:
     ]
     assert first.reader.authority == bound[0]
     assert second.reader.authority == bound[1]
+    assert first.previous_session_id == "session-previous"
+    assert second.previous_session_id is None
     assert first.authority_token == "a" * 64
     assert second.authority_token == "b" * 64
     assert "alice@example.com" not in repr((first.authority_token, second.authority_token))
@@ -909,8 +914,11 @@ async def test_conversation_sync_and_backfill_forward_fresh_attachment_processor
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     processor = AsyncMock()
+    scope = TimelineScope(
+        key="conversation:conversation-a", kind="conversation", conversation_id="conversation-a"
+    )
     context = SimpleNamespace(
-        scope=object(),
+        scope=scope,
         conversation=object(),
         session_refs=[],
         event_store=object(),
@@ -921,8 +929,19 @@ async def test_conversation_sync_and_backfill_forward_fresh_attachment_processor
         session_cache=object(),
         event_post_processor=processor,
     )
-    sync_response = object()
-    timeline_response = object()
+    sync_response = ChatSyncResponse(
+        projection_version=PROJECTION_VERSION,
+        scope=scope,
+        cursor_before="cursor",
+        cursor_after="cursor",
+        server_time="2026-10-28T00:00:00Z",
+    )
+    timeline_response = TimelineBackfillResponse(
+        projection_version=PROJECTION_VERSION,
+        scope=scope,
+        server_time="2026-10-28T00:00:00Z",
+    )
+    request = cast(Any, _scoped_request("alice@example.com"))
     load = AsyncMock(return_value=context)
     build_sync = AsyncMock(return_value=sync_response)
     build_timeline = AsyncMock(return_value=timeline_response)
@@ -936,7 +955,7 @@ async def test_conversation_sync_and_backfill_forward_fresh_attachment_processor
 
     assert (
         await chat_v2_routes.chat_v2_sync(
-            cast(Any, object()),
+            request,
             "conversation-a",
             "cursor",
             500,
@@ -945,7 +964,7 @@ async def test_conversation_sync_and_backfill_forward_fresh_attachment_processor
     )
     assert (
         await chat_v2_routes.chat_v2_timeline(
-            cast(Any, object()),
+            request,
             "conversation-a",
             None,
             200,
@@ -2372,6 +2391,7 @@ def _session(
     owner: str,
     conversation_id: str,
     parent_session_id: str | None = None,
+    previous_session_id: str | None = None,
     agent_id: str = "agent",
     activity_scope_id: str = "scope-1",
 ) -> SimpleNamespace:
@@ -2380,6 +2400,7 @@ def _session(
         user_email=owner,
         conversation_id=conversation_id,
         parent_session_id=parent_session_id,
+        previous_session_id=previous_session_id,
         activity_scope_id=activity_scope_id,
         intaris_session_id=session_id,
         delegation_task="delegation",

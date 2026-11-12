@@ -13,8 +13,10 @@ from pydantic import ValidationError
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.api.routes.deliverables import DeliverableShareOptions, _public_base_url
 from cognis.core import artifact_authoring as authoring
+from cognis.core import document_people
 from cognis.core import document_sharing as sharing
 from cognis.core.deliverable_links import DeliverableShareUnavailable
+from cognis.core.feedback.primitives import FeedbackError
 from cognis.core.library import LibraryItem, item
 from cognis.models.deliverable import ArtifactRevisionError
 
@@ -25,6 +27,34 @@ class PublicLinkRequest(DeliverableShareOptions):
 
 router = APIRouter(prefix="/api/v1/library", tags=["library"])
 Kind = Literal["artifact", "deliverable"]
+
+
+@router.get("/items/{kind}/{ref}/people", response_model=document_people.PeoplePage)
+async def document_people_list(
+    request: Request, kind: Kind, ref: str
+) -> document_people.PeoplePage:
+    """List direct human grants, independently of agent and public-link access."""
+    owner = _author(request)
+    try:
+        async with request.app.state.session_factory() as session:
+            return await document_people.people(session, owner, kind, ref)
+    except LookupError as exc:
+        raise _error(exc) from exc
+
+
+@router.put("/items/{kind}/{ref}/people", response_model=document_people.PeoplePage)
+async def document_people_set(
+    request: Request, kind: Kind, ref: str, body: document_people.PersonGrantRequest
+) -> document_people.PeoplePage:
+    """Change explicit lineage access without publishing or sharing a producing conversation."""
+    owner = _author(request)
+    try:
+        async with request.app.state.session_factory() as session:
+            return await document_people.set_person(session, owner, kind, ref, body)
+    except FeedbackError as exc:
+        raise api_exception(exc.status, exc.code, str(exc)) from exc
+    except LookupError as exc:
+        raise _error(exc) from exc
 
 
 @router.get("/agents", response_model=list[sharing.AgentAccess])
@@ -172,7 +202,9 @@ async def set_access(
     async with request.app.state.session_factory() as session:
         try:
             row = await sharing.owned_document(session, kind, ref, owner, lock=True)
-            result = await sharing.replace_explicit_shares(session, row, owner, body.agent_ids)
+            result = await sharing.replace_explicit_shares(
+                session, row, owner, body.agent_ids, body.write_agent_ids
+            )
             await session.commit()
             return result
         except (ValueError, LookupError) as exc:

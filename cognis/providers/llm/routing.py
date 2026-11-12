@@ -9,10 +9,12 @@ INHERIT_COMPANION_MODEL = "__inherit_companion_model__"
 CORE_ROUTES = (
     "default",
     "classifier",
+    "auxiliary_generation",
     "compaction",
     "evaluator",
     "speech_to_text",
     "text_to_speech",
+    "audio_narrative",
     "image_generation",
     "video_generation",
     "video_editing",
@@ -38,7 +40,7 @@ EMBEDDING_ROUTES = frozenset(
     {"embedding", "companion_embedding", "intaris_embedding", "mnemory_embedding"}
 )
 TEXT_ROUTING_TASK_TYPES = frozenset(
-    {"default", "classifier", "compaction", "evaluator"}
+    {"default", "classifier", "auxiliary_generation", "compaction", "evaluator", "audio_narrative"}
     | ((set(COMPANION_DEFAULTS) | set(COMPANION_ROUTES)) - EMBEDDING_ROUTES)
 )
 
@@ -47,6 +49,8 @@ def route_chain(role: str) -> tuple[str, ...]:
     """Return bounded inheritance; embedding roles never fall back to chat."""
     if role in COMPANION_ROUTES:
         return (role, COMPANION_ROUTES[role])
+    if role == "audio_narrative":
+        return ("audio_narrative", "companion_lite")
     if role == "video_editing":
         return ("video_editing", "video_generation")
     if role == "video_analysis":

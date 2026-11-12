@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,6 +10,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.store.database import create_engine
@@ -466,91 +466,54 @@ def test_legacy_local_model_revision_is_normalized_before_upgrade(
     assert version == "094_artifact_tool_source_id"
 
 
-def test_artifact_source_identity_094_postgresql_when_available() -> None:
-    database_url = os.getenv("COGNIS_TEST_POSTGRES_URL")
-    if not database_url:
-        pytest.skip(
-            "COGNIS_TEST_POSTGRES_URL is not set; PostgreSQL artifact migration unavailable"
-        )
-    engine = sa.create_engine(database_url)
-    metadata = sa.MetaData()
-    artifacts = sa.Table(
-        "artifacts",
-        metadata,
-        sa.Column("artifact_id", sa.String(), primary_key=True),
-        sa.Column("owner_email", sa.String(), nullable=False),
-        sa.Column("filename", sa.String(), nullable=True),
-        sa.Column("purpose", sa.String(), nullable=False),
-        sa.Column("conversation_id", sa.String(), nullable=True),
-        sa.Column("session_id", sa.String(), nullable=True),
+@pytest.mark.asyncio
+async def test_artifact_source_identity_094_postgresql_when_available(
+    postgres_migration_engine: AsyncEngine,
+) -> None:
+    config = Config("cognis/store/migrations/alembic.ini")
+    config.set_main_option(
+        "sqlalchemy.url",
+        postgres_migration_engine.url.render_as_string(hide_password=False).replace("%", "%%"),
     )
-    test_schema_created = False
-    try:
-        existing_tables = set(sa.inspect(engine).get_table_names())
-        if existing_tables:
-            pytest.fail(
-                "COGNIS_TEST_POSTGRES_URL must reference an empty isolated database; "
-                f"found tables {sorted(existing_tables)}"
-            )
-        metadata.create_all(engine)
-        test_schema_created = True
-        with engine.begin() as connection:
-            connection.execute(
-                artifacts.insert(),
-                [
-                    {
-                        "artifact_id": "legacy_artifact",
-                        "owner_email": "user@example.com",
-                        "filename": "image.jpg",
-                        "purpose": "tool_artifact",
-                        "conversation_id": "call-artifact",
-                        "session_id": "media:1",
-                    },
-                    {
-                        "artifact_id": "legacy_output",
-                        "owner_email": "user@example.com",
-                        "filename": "call-output.txt",
-                        "purpose": "tool_output",
-                        "conversation_id": "conversation-1",
-                        "session_id": "session-1",
-                    },
-                ],
-            )
-        async_database_url = database_url
-        if async_database_url.startswith("postgresql+psycopg://"):
-            async_database_url = async_database_url.replace(
-                "postgresql+psycopg://", "postgresql+asyncpg://", 1
-            )
-        elif async_database_url.startswith("postgresql://"):
-            async_database_url = async_database_url.replace(
-                "postgresql://", "postgresql+asyncpg://", 1
-            )
-        async_engine = create_engine(async_database_url)
+    config.config_file_name = None
 
-        async def bootstrap_twice() -> None:
-            try:
-                await run_schema_bootstrap(async_engine)
-                await run_schema_bootstrap(async_engine)
-            finally:
-                await async_engine.dispose()
+    def create_legacy_schema(connection: sa.Connection) -> None:
+        config.attributes["connection"] = connection
+        command.upgrade(config, "093_canonical_chart_payloads")
 
-        asyncio.run(bootstrap_twice())
-        reflected = sa.Table("artifacts", sa.MetaData(), autoload_with=engine)
-        with engine.connect() as connection:
-            rows = {
-                row.artifact_id: (row.source_tool_call_id, row.source_anchor)
-                for row in connection.execute(sa.select(reflected))
-            }
-        assert rows["legacy_artifact"] == ("call-artifact", "media:1")
-        assert rows["legacy_output"] == ("call-output", None)
-        assert "ix_artifacts_tool_source" in {
-            index["name"] for index in sa.inspect(engine).get_indexes("artifacts")
+    async with postgres_migration_engine.connect() as connection:
+        await connection.run_sync(create_legacy_schema)
+    async with postgres_migration_engine.begin() as connection:
+        await connection.execute(
+            sa.text(
+                """
+                INSERT INTO artifacts (
+                    artifact_id, namespace, object_id, filename, owner_email,
+                    purpose, kind, mime_type, size_bytes, status,
+                    conversation_id, session_id, created_at
+                ) VALUES
+                    ('legacy_artifact', 'attachments', 'legacy_artifact',
+                     'image.jpg', 'user@example.com', 'tool_artifact',
+                     'image', 'image/jpeg', 10, 'attached',
+                     'call-artifact', 'media:1', CURRENT_TIMESTAMP),
+                    ('legacy_output', 'tool-outputs', 'legacy_output',
+                     'call-output.txt', 'user@example.com', 'tool_output',
+                     'file', 'text/plain', 10, 'temporary',
+                     'conversation-1', 'session-1', CURRENT_TIMESTAMP)
+                """
+            )
+        )
+    await run_schema_bootstrap(postgres_migration_engine)
+    await run_schema_bootstrap(postgres_migration_engine)
+    async with postgres_migration_engine.connect() as connection:
+        reflected = await connection.run_sync(
+            lambda bind: sa.Table("artifacts", sa.MetaData(), autoload_with=bind)
+        )
+        rows = {
+            row.artifact_id: (row.source_tool_call_id, row.source_anchor)
+            for row in await connection.execute(sa.select(reflected))
         }
-    finally:
-        if test_schema_created:
-            table_names = sa.inspect(engine).get_table_names()
-            quote = engine.dialect.identifier_preparer.quote
-            with engine.begin() as connection:
-                for table_name in table_names:
-                    connection.execute(sa.text(f"DROP TABLE IF EXISTS {quote(table_name)} CASCADE"))
-        engine.dispose()
+        indexes = await connection.run_sync(lambda bind: sa.inspect(bind).get_indexes("artifacts"))
+    assert rows["legacy_artifact"] == ("call-artifact", "media:1")
+    assert rows["legacy_output"] == ("call-output", None)
+    assert "ix_artifacts_tool_source" in {index["name"] for index in indexes}

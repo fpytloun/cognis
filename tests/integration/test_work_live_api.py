@@ -22,13 +22,14 @@ from cognis.api.chat_v2.event_store import (
     SessionEventPage,
     SessionHistoryAvailability,
 )
-from cognis.api.chat_v2.schemas import ToolCallTimelineItem
+from cognis.api.chat_v2.schemas import ArtifactTimelineItem, SourceRef, ToolCallTimelineItem
 from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.chat_v2.work_repository import _session_runtime_metadata
 from cognis.core.execution_metadata import persist_execution_metadata
 from cognis.store import queries
 from cognis.store.models import (
     Agent,
+    ArtifactRecordRow,
     DirectTurnRequestRow,
     ManagedConversationLink,
     Session,
@@ -162,6 +163,132 @@ def _seed_conversation(
 
     assert client.portal is not None
     client.portal.call(seed)
+
+
+def test_work_outputs_include_parent_history_children_and_canonical_revision_metadata(
+    work_api: TestClient,
+) -> None:
+    _seed_identity(work_api)
+    _seed_conversation(work_api, conversation_id="outputs", session_id="output-root")
+    created = datetime(2026, 1, 1, tzinfo=UTC)
+
+    async def seed() -> None:
+        async with work_api.app.state.session_factory() as db:
+            root = await db.get(Session, "output-root")
+            assert root is not None
+            previous = await queries.create_session(
+                db,
+                session_id="output-previous",
+                conversation_id="outputs",
+                user_email="owner@example.com",
+                agent_id="agent-owner@example.com",
+                intaris_session_id="source-output-previous",
+                activity_scope_id=root.activity_scope_id,
+            )
+            root.previous_session_id = previous.session_id
+            await queries.create_session(
+                db,
+                session_id="output-child",
+                conversation_id="outputs",
+                user_email="owner@example.com",
+                agent_id="agent-owner@example.com",
+                intaris_session_id="source-output-child",
+                parent_session_id=root.session_id,
+                activity_scope_id="output-child",
+            )
+            for index, session_id in enumerate(("output-previous", "output-root", "output-child")):
+                artifact_id = f"art_{session_id}"
+                db.add(
+                    ArtifactRecordRow(
+                        artifact_id=artifact_id,
+                        namespace="artifacts",
+                        object_id=artifact_id,
+                        filename=f"{session_id}.csv",
+                        owner_email="owner@example.com",
+                        owner_agent_id="agent-owner@example.com",
+                        session_id=session_id,
+                        message_role="assistant",
+                        purpose="tool_output",
+                        mime_type="text/csv",
+                        status="attached",
+                        revision=4,
+                        created_at=created,
+                        updated_at=created,
+                    )
+                )
+                item = ArtifactTimelineItem(
+                    id=f"artifact:{artifact_id}",
+                    sort_key=str(index),
+                    artifact_id=artifact_id,
+                    filename="old-name.csv",
+                    created_at=created.isoformat(),
+                    updated_at=created.isoformat(),
+                    source_refs=[
+                        SourceRef(
+                            store="intaris",
+                            session_id=f"source-{session_id}",
+                            seq=1,
+                            event_type="assistant_message",
+                        )
+                    ],
+                )
+                db.add(
+                    WorkRecordRow(
+                        work_record_id=f"record-{session_id}",
+                        owner_email="owner@example.com",
+                        session_id=session_id,
+                        source_store="intaris",
+                        source_session_id=f"source-{session_id}",
+                        source_seq=1,
+                        source_item_id=item.id,
+                        item_ordinal=0,
+                        materializer_version=WORK_MATERIALIZER_VERSION,
+                        occurred_at=created,
+                        record_type="artifact",
+                        category="artifacts",
+                        entity_id=artifact_id,
+                        is_evidence=True,
+                        timeline_item=item.model_dump(mode="json"),
+                    )
+                )
+            await db.commit()
+
+    assert work_api.portal is not None
+    work_api.portal.call(seed)
+    url = "/api/v1/chat/v2/conversations/outputs/work"
+    response = work_api.get(url, params={"category": "artifacts"}, headers=_auth_headers(work_api))
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert {item["artifact_id"] for item in payload["artifacts"]} == {
+        "art_output-previous",
+        "art_output-root",
+        "art_output-child",
+    }
+    for item in payload["artifacts"]:
+        assert item["revision"] == item["latest_revision"] == 4
+        assert item["created_at"] == item["updated_at"]
+        assert item["created_at"].startswith("2026-01-01T00:00:00")
+        assert item["filename"] != "old-name.csv"
+    child = work_api.get(
+        url,
+        params={
+            "category": "artifacts",
+            "session_id": "output-child",
+        },
+        headers=_auth_headers(work_api),
+    )
+    assert child.status_code == 200, child.text
+    assert [item["artifact_id"] for item in child.json()["artifacts"]] == ["art_output-child"]
+    recent = work_api.get(
+        url,
+        params={
+            "category": "artifacts",
+            "from": "2026-01-02T00:00:00Z",
+        },
+        headers=_auth_headers(work_api),
+    )
+    assert recent.status_code == 200, recent.text
+    assert recent.json()["artifacts"] == []
 
 
 def test_current_managed_rotation_survives_history_cap(work_api: TestClient) -> None:

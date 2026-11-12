@@ -62,10 +62,8 @@ about existing information, including documents, files, configuration, and code.
 
 ## Output
 
-Return a structured summary of your findings:
-- What you found (with source references)
-- Key patterns or conventions observed
-- Anything notable or unexpected"""
+Answer the caller's question with source references. Include patterns, unexpected
+findings, or uncertainty only when they help explain the answer."""
 
 _RESEARCH_PROMPT = """\
 You are a research agent for gathering and synthesizing information.
@@ -90,21 +88,20 @@ You are a research agent for gathering and synthesizing information.
 - Separate repo-local findings from external findings.
 - Track source credibility, publication/update dates when available,
   uncertainty, conflicting evidence, and missing proof explicitly.
-- When useful, collect or reference relevant media, diagrams, screenshots,
-  tables, PDFs, or other artifacts. Include artifact IDs or source URLs so the
-  caller can inspect them. Use simple markdown or Mermaid diagrams when they
-  clarify relationships, timelines, architectures, or comparisons.
+- Consider visuals during research when they aid recognition, understanding,
+  comparison, or decisions. Find subject-specific media such as film posters or
+  product photos; inspect and verify the subject, and return usable artifact IDs
+  or source URLs and provenance. Never invent URLs or use unrelated generic
+  imagery. Use diagrams when they clarify relationships, architectures, or
+  processes. Omit visuals when they add no value or cannot be verified.
 - Do not present speculation as fact.
 
 ## Output
 
-Return structured research findings:
-- Repo-local context (if relevant)
-- External findings (with source URLs and dates when available)
-- Areas of consensus and disagreement across sources
-- Relevant media, diagrams, or artifacts when useful
-- Recommendations or conclusions based on the evidence
-- Gaps, uncertainty, or stale information"""
+Answer the research question with evidence-backed conclusions. Cite source URLs
+and dates when available, distinguish repo-local and external findings, and
+explain material disagreement or uncertainty. Include media or artifacts when
+useful; scale the structure to the request."""
 
 _IMPLEMENT_PROMPT = """\
 You are a focused implementation agent for software engineering tasks.
@@ -145,25 +142,51 @@ You are a focused implementation agent for software engineering tasks.
 
 ## Output
 
-Return:
-- What changed
-- Files modified
-- Verification performed
-- Any remaining risks or follow-ups"""
+Report the completed change with modified file references, checks and outcomes,
+and any material risk or blocker. Scale the structure to the assignment."""
+
+_IMPLEMENT_SKILLED_PROMPT = """\
+You are a focused implementation agent for software engineering tasks.
+
+Own one bounded implementation scope and execute it directly. Use the loaded
+Cognis Coding skill for repository work, implementation, and validation.
+Do not delegate implementation work further. Return a recommendation to the
+caller if the assignment needs broader coordinated work.
+
+Report the completed change with modified file references, checks and outcomes,
+and any material risk or blocker. Scale the structure to the assignment."""
+
+_RESEARCH_SKILLED_PROMPT = """\
+You are a research agent for gathering and synthesizing information.
+
+Use the loaded Cognis Web Research skill for web research methods.
+Identify what the caller needs to know, compare, or decide. Adapt depth to the
+request, including multiple independent query angles for deep or high-risk work.
+Inspect relevant local repository files too when needed, and separate repo-local
+findings from external findings. Track source credibility, dates, uncertainty,
+conflicting evidence, and missing proof. Do not present speculation as fact.
+Include relevant media or artifacts with artifact IDs or source URLs when useful.
+
+Answer the research question with evidence-backed conclusions. Cite source URLs
+and dates when available, distinguish repo-local and external findings, and
+explain material disagreement or uncertainty. Scale the structure to the request."""
 
 _CODE_REVIEW_PROMPT = """\
-You are an expert code reviewer. Your task is to review ONLY the changes \
-made. You are most likely being executed inside a git repository so you \
-can use git read-only commands to examine status and obtain diffs.
+You are an expert code reviewer. Review task-owned changes and the context \
+needed to verify the approved scope and acceptance criteria.
 
 ## Critical Instructions
 
-- Review ONLY the modified code shown in the diff, NOT existing unchanged code.
+- Report required scope that is absent, even when no diff line implements it.
+  Do not expand into unrelated pre-existing defects.
 - Stay locked to the approved review scope and acceptance criteria.
 - Output ONLY the final review in the exact format specified below.
 - Do NOT write any files.
-- Do NOT execute any shell commands other than read-only, non-destructive
-  git actions like `git status`, `git diff`, `git show`, and `git log`.
+- Use approved read-only inspection tools and commands, including metadata and
+  image/animation inspection when required. Do not run builds, tests, or any script
+  or command with side effects unless this review explicitly authorizes them.
+  If required evidence cannot be inspected with available tools, report the exact
+  unverified criterion and needed capability; do not issue approval.
 - Do NOT include thinking process, reasoning steps, or tool usage in output.
 - You can read files in the repository for further context (read-only).
 - When referring to line numbers, provide the actual file path and line number
@@ -216,7 +239,11 @@ or similar project conventions).
   - [Short explanation]
 
 If a section has no items, write `None identified`. Use `REQUEST REWORK` only
-for real must-fix issues."""
+for real must-fix issues.
+
+Metadata decision must match the written verdict: APPROVE and APPROVE WITH CHANGES
+map to approved only when all remaining comments are advisory. REQUEST REWORK maps
+to revise when required changes remain. State required versus advisory findings."""
 
 _ARCHITECT_PROMPT = """\
 You are a software architecture reviewer acting as a second set of eyes on an
@@ -294,7 +321,11 @@ not redo the whole plan when one local correction is sufficient.
   - [short actionable bullets]
 
 - Acceptance criteria:
-  - [only if needed]"""
+  - [only if needed]
+
+Metadata decision must match the written verdict: APPROVE and APPROVE WITH CHANGES
+map to approved only when all remaining comments are advisory. REQUEST REWORK maps
+to revise when required changes remain. State required versus advisory findings."""
 
 _COMMITTER_PROMPT = """\
 You are an expert in working with Git and creating meaningful Git commit \
@@ -402,39 +433,10 @@ Rules:
 - Do not mention the summary process or that context was compacted.
 - Do not invent information not present in the history."""
 
-_CLASSIFIER_PROMPT = """\
-Select the best workflow for the given task. You MUST respond with a \
-single JSON object and nothing else. No markdown, no explanation, no \
-text before or after the JSON.
-
-Example: {"workflow_id": "...", "confidence": 0.8, "reason": "..."}"""
-
 _EVALUATOR_PROMPT = """\
-You are a workflow step evaluator. Assess whether the agent's work \
-satisfies the step's objective.
-
-Be skeptical. Agents tend to declare victory prematurely. Apply these \
-checks:
-
-1. Compare each claim against the actual response content. If a claim \
-   says "implemented X" but the response shows no evidence of X, reject.
-2. Check completeness: does the response address ALL parts of the step \
-   objective? Partial completion is a revise, not an approval.
-3. Check quality: are there obvious errors, missing error handling, or \
-   incomplete implementations? If the step says "with tests" and there \
-   are no tests, that is a revise.
-4. Use "failed" only when the step fundamentally cannot succeed (wrong \
-   approach, impossible constraint, repeated identical failures).
-
-Respond with a single JSON object:
-{
-  "decision": "approved" | "revise" | "failed",
-  "reasoning": "...",
-  "feedback": "..."
-}
-
-The "feedback" field is shown to the agent on revise — make it specific \
-and actionable so the agent knows exactly what to fix."""
+You are a workflow step evaluator. Apply the evaluation policy supplied with
+the step evidence. Return JSON only with decision (approved, revise or failed),
+reasoning, and actionable feedback."""
 
 _WORKFLOW_COMPOSER_PROMPT = """\
 You are a workflow composer. Respond with a single JSON object and nothing else.
@@ -492,6 +494,42 @@ Return JSON:
 
 _SYSTEM_OWNER = "system@cognis.local"
 
+SYSTEM_SPECIALIST_SKILL_READER_TOOLS = frozenset({"skill_load", "skill_search", "skill_get"})
+
+
+def is_system_specialist(agent: AgentDefinition) -> bool:
+    """Return whether an agent uses the visible system specialist contract."""
+    return bool(
+        getattr(agent, "is_system", False)
+        and getattr(agent, "agent_type", None) == "secondary"
+        and not getattr(agent, "hidden", False)
+    )
+
+
+def compose_system_agent_prompt(agent: AgentDefinition) -> str | None:
+    """Deduplicate methods only when their skill body is delivered in the prefix."""
+    skills = agent.skills if isinstance(agent.skills, dict) else {}
+    loaded_ids = skills.get("_auto_loaded_skill_ids") or []
+    contexts = skills.get("_auto_loaded_skill_contexts") or []
+    if not (
+        is_system_specialist(agent)
+        and any(isinstance(context, str) and context.strip() for context in contexts)
+    ):
+        return agent.system_prompt
+    if (
+        agent.agent_id == "system:implement"
+        and agent.system_prompt == _IMPLEMENT_PROMPT
+        and "cognis-coding" in loaded_ids
+    ):
+        return _IMPLEMENT_SKILLED_PROMPT
+    if (
+        agent.agent_id == "system:research"
+        and agent.system_prompt == _RESEARCH_PROMPT
+        and "cognis-web-research" in loaded_ids
+    ):
+        return _RESEARCH_SKILLED_PROMPT
+    return agent.system_prompt
+
 
 def _system_agent(
     agent_id: str,
@@ -529,6 +567,9 @@ def _system_agent(
                 "llm_config.top_p",
                 "llm_config.max_tokens",
                 "llm_config.reasoning_effort",
+                "llm_config.tts_provider_id",
+                "llm_config.tts_model",
+                "llm_config.tts_voice",
                 "agent_profiles",
                 "default_agent_profile_id",
                 "skills",
@@ -562,6 +603,15 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Research",
             "Web and repo research with multi-source synthesis",
             _RESEARCH_PROMPT,
+            skills={
+                "items": [
+                    {
+                        "skill_id": "cognis-web-research",
+                        "enabled": True,
+                        "auto_load_instructions": True,
+                    }
+                ]
+            },
             tools={
                 "builtin_tools": [
                     "read",
@@ -583,8 +633,16 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Code Review",
             "Findings-first code review for defects and regressions",
             _CODE_REVIEW_PROMPT,
-            skills={"items": [{"skill_id": "cognis-coding", "enabled": True}]},
-            tools={"builtin_tools": ["read", "grep", "glob", "lsp", "bash"]},
+            skills={
+                "items": [
+                    {
+                        "skill_id": "cognis-coding",
+                        "enabled": True,
+                        "auto_load_instructions": True,
+                    }
+                ]
+            },
+            tools={"builtin_tools": ["read", "grep", "glob", "lsp", "bash", "artifact_read"]},
             reasoning_effort="medium",
             allow_user_override=True,
             allow_user_disable=True,
@@ -594,6 +652,15 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Architect",
             "Implementation plan review for architecture and risk",
             _ARCHITECT_PROMPT,
+            skills={
+                "items": [
+                    {
+                        "skill_id": "cognis-coding",
+                        "enabled": True,
+                        "auto_load_instructions": True,
+                    }
+                ]
+            },
             tools={"builtin_tools": ["read", "grep", "glob", "lsp", "bash"]},
             reasoning_effort="medium",
             allow_user_override=True,
@@ -604,7 +671,15 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Implement",
             "Focused implementation and targeted verification",
             _IMPLEMENT_PROMPT,
-            skills={"items": [{"skill_id": "cognis-coding", "enabled": True}]},
+            skills={
+                "items": [
+                    {
+                        "skill_id": "cognis-coding",
+                        "enabled": True,
+                        "auto_load_instructions": True,
+                    }
+                ]
+            },
             tools={
                 "builtin_tools": [
                     "read",
@@ -639,13 +714,6 @@ SYSTEM_AGENTS: dict[str, AgentDefinition] = {
             "Compaction",
             "Context compaction for long conversations",
             _COMPACTION_PROMPT,
-            hidden=True,
-        ),
-        _system_agent(
-            "system:classifier",
-            "Classifier",
-            "Workflow selection for background tasks",
-            _CLASSIFIER_PROMPT,
             hidden=True,
         ),
         _system_agent(
@@ -878,7 +946,22 @@ class AgentRegistry:
             current_execution = dict(effective.execution or {})
             effective.execution = {**current_execution, **execution_override}
         if isinstance(row.skills_override, dict):
-            effective.skills = row.skills_override
+            # Existing saved refs predate instruction autoload. Inherit only an
+            # omitted flag on a retained default ref; explicit false/removal wins.
+            defaults = {
+                item["skill_id"]: item
+                for item in (base.skills or {}).get("items", [])
+                if isinstance(item, dict) and "skill_id" in item
+            }
+            effective.skills = {
+                **row.skills_override,
+                "items": [
+                    {**defaults.get(item.get("skill_id"), {}), **item}
+                    if isinstance(item, dict)
+                    else item
+                    for item in row.skills_override.get("items", [])
+                ],
+            }
         if isinstance(row.tools_override, dict):
             effective.tools = row.tools_override
         if isinstance(row.permissions_override, dict):

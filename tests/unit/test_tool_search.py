@@ -32,7 +32,7 @@ def _tool(name: str, description: str, category: str) -> ToolDefinition:
     )
 
 
-def _mcp_tool(name: str, raw_name: str, server_id: str = "slack-sample") -> ToolDefinition:
+def _mcp_tool(name: str, raw_name: str, server_id: str = "slack-example") -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description=f"MCP tool {raw_name}",
@@ -376,12 +376,12 @@ def test_resolve_inventory_tool_prefers_stable_id_and_requires_unique_name() -> 
 
 def _slack_tool_with_opaque_id(server_id: str = "mcp_111111111111") -> ToolDefinition:
     tool = _mcp_tool(
-        "mcp_slack-sample__conversations_search_messages",
+        "mcp_slack-example__conversations_search_messages",
         "conversations_search_messages",
         server_id=server_id,
     )
     return tool.model_copy(
-        update={"source": tool.source.model_copy(update={"server_name": "slack-sample"})}
+        update={"source": tool.source.model_copy(update={"server_name": "slack-example"})}
     )
 
 
@@ -389,10 +389,10 @@ def _slack_tool_with_opaque_id(server_id: str = "mcp_111111111111") -> ToolDefin
     "reference",
     [
         "mcp:mcp_111111111111:conversations_search_messages",
-        "mcp:slack-sample:conversations_search_messages",
-        "mcp_slack-sample__conversations_search_messages",
+        "mcp:slack-example:conversations_search_messages",
+        "mcp_slack-example__conversations_search_messages",
         "conversations_search_messages",
-        "mcp__cognis__mcp__slack-sample__conversations_search_messages",
+        "mcp__cognis__mcp__slack-example__conversations_search_messages",
     ],
 )
 def test_inventory_reference_resolution_and_selection_share_aliases(reference: str) -> None:
@@ -408,9 +408,9 @@ def test_inventory_reference_resolution_and_selection_share_aliases(reference: s
 @pytest.mark.parametrize(
     "reference",
     [
-        "mcp:slack-sample:conversations_search_messages",
+        "mcp:slack-example:conversations_search_messages",
         "conversations_search_messages",
-        "mcp_slack-sample__conversations_search_messages",
+        "mcp_slack-example__conversations_search_messages",
     ],
 )
 def test_inventory_reference_ambiguity_never_selects_first_match(reference: str) -> None:
@@ -429,10 +429,10 @@ def test_inventory_reference_ambiguity_never_selects_first_match(reference: str)
 @pytest.mark.parametrize(
     "query",
     [
-        "+slack-sample conversations_search_messages",
-        "slack-sample conversations_search_messages",
-        "mcp:slack-sample:conversations_search_messages",
-        "mcp_slack-sample__conversations_search_messages",
+        "+slack-example conversations_search_messages",
+        "slack-example conversations_search_messages",
+        "mcp:slack-example:conversations_search_messages",
+        "mcp_slack-example__conversations_search_messages",
         "conversations_search_messages",
     ],
 )
@@ -441,8 +441,8 @@ def test_exact_tool_search_returns_target_even_if_visible(
     query: str, already_visible: bool
 ) -> None:
     target = _slack_tool_with_opaque_id()
-    unrelated = _mcp_tool("mcp_slack-sample__usergroups_create", "usergroups_create")
-    unrelated.description = "slack sample " * 30
+    unrelated = _mcp_tool("mcp_slack-example__usergroups_create", "usergroups_create")
+    unrelated.description = "slack example " * 30
     matches = search_inventory(
         [unrelated, target],
         query,
@@ -562,26 +562,26 @@ def test_search_inventory_selects_claude_mcp_prefixed_tool_names() -> None:
     tools = [
         _tool("skill_load", "Load a skill", "skill"),
         _mcp_tool(
-            "mcp_slack-sample__conversations_search_messages",
+            "mcp_slack-example__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-example__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
         (
             "select:mcp__cognis__skill_load,"
-            "mcp__cognis__mcp_slack-sample__conversations_search_messages,"
-            "mcp__cognis__mcp_slack-sample__channels_list"
+            "mcp__cognis__mcp_slack-example__conversations_search_messages,"
+            "mcp__cognis__mcp_slack-example__channels_list"
         ),
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
         "skill_load",
-        "mcp_slack-sample__conversations_search_messages",
-        "mcp_slack-sample__channels_list",
+        "mcp_slack-example__conversations_search_messages",
+        "mcp_slack-example__channels_list",
     ]
     assert all(match["handle"]["confidence"] == 100.0 for match in matches)
 
@@ -589,45 +589,45 @@ def test_search_inventory_selects_claude_mcp_prefixed_tool_names() -> None:
 def test_search_inventory_select_accepts_stable_ids_and_raw_names() -> None:
     tools = [
         _mcp_tool(
-            "mcp_slack-sample__conversations_search_messages",
+            "mcp_slack-example__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-example__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
-        "select:mcp:slack-sample:conversations_search_messages,channels_list,missing",
+        "select:mcp:slack-example:conversations_search_messages,channels_list,missing",
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
-        "mcp_slack-sample__conversations_search_messages",
-        "mcp_slack-sample__channels_list",
+        "mcp_slack-example__conversations_search_messages",
+        "mcp_slack-example__channels_list",
     ]
 
 
 def test_search_inventory_select_accepts_double_underscore_mcp_aliases() -> None:
     tools = [
         _mcp_tool(
-            "mcp_slack-sample__conversations_search_messages",
+            "mcp_slack-example__conversations_search_messages",
             "conversations_search_messages",
         ),
-        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-example__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
         (
-            "select:mcp__cognis__mcp__slack-sample__conversations_search_messages,"
-            "mcp__cognis__mcp__slack-sample__channels_list"
+            "select:mcp__cognis__mcp__slack-example__conversations_search_messages,"
+            "mcp__cognis__mcp__slack-example__channels_list"
         ),
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
-        "mcp_slack-sample__conversations_search_messages",
-        "mcp_slack-sample__channels_list",
+        "mcp_slack-example__conversations_search_messages",
+        "mcp_slack-example__channels_list",
     ]
 
 
@@ -635,19 +635,19 @@ def test_search_inventory_select_returns_already_visible_tools() -> None:
     tools = [
         SEARCH_TOOLS_TOOL,
         _tool("skill_load", "Load a skill", "skill"),
-        _mcp_tool("mcp_slack-sample__channels_list", "channels_list"),
+        _mcp_tool("mcp_slack-example__channels_list", "channels_list"),
     ]
 
     matches = search_inventory(
         tools,
-        "select:mcp__cognis__search_tools,mcp__cognis__skill_load,mcp__cognis__mcp_slack-sample__channels_list",
+        "select:mcp__cognis__search_tools,mcp__cognis__skill_load,mcp__cognis__mcp_slack-example__channels_list",
         already_visible_tool_ids={"builtin:skill_load"},
         limit=5,
     )
 
     assert [match["handle"]["callable_name"] for match in matches] == [
         "skill_load",
-        "mcp_slack-sample__channels_list",
+        "mcp_slack-example__channels_list",
     ]
     assert matches[0]["already_visible"] is True
     assert matches[1]["already_visible"] is False

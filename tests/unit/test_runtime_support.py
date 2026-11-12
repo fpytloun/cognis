@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,8 +21,10 @@ from cognis.api.runtime_support import (
 )
 from cognis.core.executor_pin_lifecycle import ExecutorPinLifecycleResult
 from cognis.core.executor_policy import ExecutorPolicy
+from cognis.core.executor_pool import ExecutorPool
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.tool_router import ToolRoute, ToolRouter
+from cognis.core.turn_timing import isolate_turn_timing
 from cognis.models.agent import AgentDefinition
 from cognis.models.knowledgebase import KnowledgebaseModel
 from cognis.models.session import SessionModel
@@ -56,9 +59,28 @@ async def _executor_pin_lifecycle_settings(_session_factory: object) -> dict[str
     return {"retry_seconds": 0, "retry_interval_seconds": 0}
 
 
+@pytest.fixture
+def runtime_timing_records(monkeypatch):
+    records = []
+
+    def capture(message, *, extra):
+        assert message == "turn: stage completed"
+        records.append(extra["extra_data"])
+
+    monkeypatch.setattr("cognis.core.turn_timing.logger.info", capture)
+    return records
+
+
 @pytest.mark.asyncio
-async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(monkeypatch):
+@pytest.mark.parametrize("program_enabled", [False, True])
+@pytest.mark.parametrize("pool_failed", [False, True])
+async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(
+    monkeypatch, program_enabled, pool_failed, runtime_timing_records
+):
     from unittest.mock import AsyncMock
+
+    from cognis.core.program_config import PROGRAM_RUNTIME_TOOL_NAMES
+    from cognis.tools.executor.definitions import ALL_EXECUTOR_TOOLS
 
     observed = ToolDefinition(
         name="read",
@@ -72,12 +94,19 @@ async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(
         return_value={
             "executor_id": "alice_exec",
             "executor_type": "websocket",
-            "config": {},
+            "config": {"program_runtime": {"host_enabled": program_enabled}},
             "executor_owner_email": "alice@example.com",
             "owner_email": "alice@example.com",
             "selection_source": "explicit",
             "runtime_state": "active",
-            "observed_tools": [observed.model_dump(mode="json")],
+            "observed_tools": [
+                observed.model_dump(mode="json"),
+                *[
+                    tool.model_dump(mode="json")
+                    for tool in ALL_EXECUTOR_TOOLS
+                    if tool.name in PROGRAM_RUNTIME_TOOL_NAMES
+                ],
+            ],
         }
     )
     monkeypatch.setattr(
@@ -91,6 +120,14 @@ async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(
     )
     monkeypatch.setattr(
         runtime_support, "resolve_skills_for_agent", AsyncMock(return_value=ResolvedSkillSet())
+    )
+    pool = ExecutorPool()
+    monkeypatch.setattr(
+        "cognis.core.executor_pool.resolve_executor_pool",
+        AsyncMock(
+            return_value=pool,
+            side_effect=RuntimeError("pool resolution unavailable") if pool_failed else None,
+        ),
     )
     dispatcher = SimpleNamespace(dispatch_pending=AsyncMock())
     executor = SimpleNamespace(
@@ -110,15 +147,74 @@ async def test_prepare_only_runtime_retains_observed_tools_without_side_effects(
     )
     agent = _agent()
     agent.owner_email = "alice@example.com"
-    runtime = await factory(agent, agent.owner_email, prepare_only=True)
+
+    @isolate_turn_timing
+    async def resolve(*, session, turn_id):
+        return await factory(agent, agent.owner_email, prepare_only=True)
+
+    runtime = await resolve(
+        session=SimpleNamespace(session_id="session-runtime-timing"),
+        turn_id="turn-runtime-timing",
+    )
     assert runtime.tool_registry.get("read") is not None
+    for name in PROGRAM_RUNTIME_TOOL_NAMES:
+        assert (runtime.tool_registry.get(name) is not None) is program_enabled
     assert resolve_config.call_args.kwargs["read_only"] is True
     assert runtime.executor_connection is None
+    assert runtime.executor_pool is (None if pool_failed else pool)
     dispatcher.dispatch_pending.assert_not_awaited()
     executor.spawn.assert_not_awaited()
     executor.websocket.get_connection.assert_not_awaited()
     executor.websocket.list_tools.assert_not_awaited()
+    assert [record["stage"] for record in runtime_timing_records] == [
+        "runtime.policy_load",
+        "runtime.scope_resolve",
+        "runtime.executor_select",
+        "runtime.pool_resolve",
+        "runtime.web_config",
+        "runtime.image_tool_descriptions",
+        "runtime.skills_resolve",
+        "runtime.build_attempt",
+        "turn.total",
+    ]
+    for record in runtime_timing_records:
+        assert record["session_id"] == "session-runtime-timing"
+        assert record["turn_id"] == "turn-runtime-timing"
+        assert record["outcome"] == (
+            "interrupted"
+            if pool_failed and record["stage"] == "runtime.pool_resolve"
+            else "completed"
+        )
+        assert record["duration_seconds"] >= 0
+        assert set(record) == {"session_id", "turn_id", "stage", "duration_seconds", "outcome"}
     await runtime.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, asyncio.CancelledError])
+async def test_runtime_timing_preserves_policy_failure_and_cancellation(
+    monkeypatch, runtime_timing_records, error_type
+):
+    from unittest.mock import AsyncMock
+
+    failure = error_type("sensitive policy failure")
+    monkeypatch.setattr(runtime_support, "load_executor_policy", AsyncMock(side_effect=failure))
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers(),
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=_runtime_session_factory,
+    )
+    with pytest.raises(error_type) as caught:
+        await factory(_agent(), "user@example.com", prepare_only=True)
+    assert caught.value is failure
+    assert [record["stage"] for record in runtime_timing_records] == [
+        "runtime.policy_load",
+        "runtime.build_attempt",
+    ]
+    assert all(record["outcome"] == "interrupted" for record in runtime_timing_records)
+    assert "sensitive" not in repr(runtime_timing_records)
+    assert "user@example.com" not in repr(runtime_timing_records)
 
 
 def test_mcp_degraded_notice_exposes_only_authorization_failures() -> None:
@@ -1090,11 +1186,19 @@ class _ReadyWebSocketConnection:
     ],
 )
 async def test_remote_factory_rebuild_and_scoped_reader(
-    monkeypatch, task_continuation_db, reader_email, scope_task_id, expected
+    monkeypatch,
+    task_continuation_db,
+    reader_email,
+    scope_task_id,
+    expected,
+    runtime_timing_records,
 ) -> None:
     """Exercise real remote composition, inventory filters and controller hydration."""
     import json
     from unittest.mock import AsyncMock
+
+    from cognis.core.program_config import PROGRAM_RUNTIME_TOOL_NAMES
+    from cognis.tools.executor.definitions import ALL_EXECUTOR_TOOLS
 
     async def policy(_):
         return ExecutorPolicy(allow_in_process=True, allow_subprocess=True)
@@ -1120,6 +1224,17 @@ async def test_remote_factory_rebuild_and_scoped_reader(
     monkeypatch.setattr(runtime_support, "_resolve_web_config", web)
     monkeypatch.setattr(runtime_support, "resolve_skills_for_agent", skills)
     ws = _ReadyWebSocketProvider("alice_exec")
+    ws.connection.executor_id = "alice_exec"
+
+    async def program_policy(connection):
+        return getattr(connection, "executor_id", None) == "alice_exec"
+
+    monkeypatch.setattr(runtime_support, "ProgramPolicyResolver", lambda *args: program_policy)
+    program_tools = [
+        tool.model_dump(mode="json")
+        for tool in ALL_EXECUTOR_TOOLS
+        if tool.name in PROGRAM_RUNTIME_TOOL_NAMES
+    ]
 
     def advertised(name, server):
         return ToolDefinition(
@@ -1131,7 +1246,9 @@ async def test_remote_factory_rebuild_and_scoped_reader(
             read_only=True,
         ).model_dump(mode="json")
 
-    ws.connection.list_tools = AsyncMock(return_value=[advertised("calendar_search", "calendar")])
+    ws.connection.list_tools = AsyncMock(
+        return_value=[advertised("calendar_search", "calendar"), *program_tools]
+    )
     factory = runtime_support.build_step_runtime_factory(
         providers=_runtime_providers_with_ws(ws),
         shared_registry=ToolRegistry(),
@@ -1149,13 +1266,27 @@ async def test_remote_factory_rebuild_and_scoped_reader(
         ),
         user_email="owner@example.com",
     )
+    remote_stages = [
+        record["stage"]
+        for record in runtime_timing_records
+        if record["stage"]
+        in {"runtime.catalog_read", "runtime.inventory_merge", "runtime.registry_build"}
+    ]
+    assert remote_stages == [
+        "runtime.catalog_read",
+        "runtime.inventory_merge",
+        "runtime.registry_build",
+    ]
+    assert all(record["outcome"] == "completed" for record in runtime_timing_records)
     replacement_conn = SimpleNamespace(
+        executor_id="disabled_exec",
         list_tools=AsyncMock(
             return_value=[
                 advertised("gmail_search", "gmail"),
                 advertised("blocked_search", "blocked"),
+                *program_tools,
             ]
-        )
+        ),
     )
     # A websocket connection contains no store; only the controller handler closure does.
     router = ToolRouter.__new__(ToolRouter)
@@ -1190,6 +1321,9 @@ async def test_remote_factory_rebuild_and_scoped_reader(
     assert replacement.get("gmail_search") is not None
     assert replacement.get("calendar_search") is None
     assert replacement.get("blocked_search") is None
+    for name in PROGRAM_RUNTIME_TOOL_NAMES:
+        assert runtime.tool_registry.get(name) is not None
+        assert replacement.get(name) is None
     assert runtime.tool_registry.get("calendar_search") is not None
 
 
@@ -1227,7 +1361,10 @@ class _SecretsProvider:
     ],
 )
 async def test_inventory_discovery_uses_runtime_admission_recovery(
-    monkeypatch: pytest.MonkeyPatch, failure_kind: str, outcome: str
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+    outcome: str,
+    runtime_timing_records,
 ) -> None:
     import asyncio
     from unittest.mock import AsyncMock
@@ -1362,6 +1499,23 @@ async def test_inventory_discovery_uses_runtime_admission_recovery(
             notice_dispatcher=None,
         )
         waiter.assert_awaited_once()
+    catalogs = [
+        record for record in runtime_timing_records if record["stage"] == "runtime.catalog_read"
+    ]
+    attempts = [
+        record for record in runtime_timing_records if record["stage"] == "runtime.build_attempt"
+    ]
+    waits = [
+        record for record in runtime_timing_records if record["stage"] == "runtime.recovery_wait"
+    ]
+    assert catalogs[0]["outcome"] == attempts[0]["outcome"] == "interrupted"
+    assert len(attempts) == len(catalogs) == (2 if outcome == "ready" else 1)
+    assert len(waits) == (0 if outcome == "permanent" else 1)
+    assert any(record["stage"] == "runtime.pin_read" for record in runtime_timing_records)
+    if waits:
+        assert waits[0]["outcome"] == ("interrupted" if outcome == "cancel" else "completed")
+    if outcome == "ready":
+        assert catalogs[-1]["outcome"] == attempts[-1]["outcome"] == "completed"
 
 
 @pytest.mark.asyncio
@@ -1508,19 +1662,35 @@ async def test_inventory_recovery_preserves_durable_deadline_until_admission(
             execution={"executor_id": executor_id},
         )
         kwargs = {"conversation_id": conversation_id, "task_id": task_id}
-        if mode == "restart":
-            with pytest.raises(asyncio.CancelledError):
-                await factory()(agent, user_email, **kwargs)
-        if mode == "deadline":
-            with pytest.raises(ExecutorRecoveryTimeout) as error:
-                await factory()(agent, user_email, **kwargs)
-            assert error.value.window.deadline == original_deadline
-            assert error.value.phase == "runtime_admission"
+        if task_id:
+            # Tasks release execution capacity and retry through durable admission.
+            for _ in range(2):
+                with pytest.raises(TransientExecutorUnavailable) as unavailable:
+                    await factory()(agent, user_email, **kwargs)
+                assert unavailable.value.executor_id == executor_id
+                assert unavailable.value.retry_after_seconds == 30
+                if mode == "deadline":
+                    database_time += timedelta(seconds=2)
+            assert waits == 0
             assert attempts == 2
+            if mode != "deadline":
+                runtime = await factory()(agent, user_email, **kwargs)
+                assert runtime.executor_connection is ws.connection
+                assert attempts == 3
         else:
-            runtime = await factory()(agent, user_email, **kwargs)
-            assert runtime.executor_connection is ws.connection
-            assert attempts == 3
+            if mode == "restart":
+                with pytest.raises(asyncio.CancelledError):
+                    await factory()(agent, user_email, **kwargs)
+            if mode == "deadline":
+                with pytest.raises(ExecutorRecoveryTimeout) as error:
+                    await factory()(agent, user_email, **kwargs)
+                assert error.value.window.deadline == original_deadline
+                assert error.value.phase == "runtime_admission"
+                assert attempts == 2
+            else:
+                runtime = await factory()(agent, user_email, **kwargs)
+                assert runtime.executor_connection is ws.connection
+                assert attempts == 3
         assert recovery.await_count == 2
         async with sessions() as session:
             conversation = await store_queries.get_conversation(session, conversation_id)
@@ -1722,6 +1892,84 @@ def _executor_row(
         last_observed_at=None,
         runtime_state="active",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selection", ["pin", "selector", "concurrent_winner"])
+async def test_runtime_build_reuses_selection_pool_but_refreshes_admission(monkeypatch, selection):
+    from unittest.mock import AsyncMock
+
+    selected = _executor_row("selected", labels={"role": "worker"})
+    winner = _executor_row("winner", labels={"role": "worker"})
+    rows = AsyncMock(return_value=[selected])
+    monkeypatch.setattr(store_queries, "list_executors", rows)
+    monkeypatch.setattr(store_queries, "get_executor_row", AsyncMock(return_value=selected))
+    monkeypatch.setattr(
+        runtime_support, "load_executor_policy", AsyncMock(return_value=ExecutorPolicy())
+    )
+    monkeypatch.setattr(
+        runtime_support, "resolve_skills_for_agent", AsyncMock(return_value=ResolvedSkillSet())
+    )
+    execution = {
+        "executor_selector": {"role": "worker"},
+        "additional_executors": [{"executor_id": "selected"}],
+    }
+    if selection == "pin":
+        execution["executor_id"] = "selected"
+    monkeypatch.setattr(
+        store_queries,
+        "get_conversation",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                active_executor_id="selected" if selection == "pin" else None
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_support,
+        "_resolve_executor_scope",
+        AsyncMock(return_value=(execution, "alice@example.com", False)),
+    )
+    if selection == "concurrent_winner":
+        rows.side_effect = [[selected], [selected, winner]]
+        monkeypatch.setattr(
+            runtime_support,
+            "_resolve_eligible_executor_config",
+            AsyncMock(
+                return_value={
+                    "executor_id": "winner",
+                    "executor_type": "websocket",
+                    "config": {},
+                    "enabled_tools": [],
+                    "enabled_tool_groups": [],
+                }
+            ),
+        )
+    factory = runtime_support.build_step_runtime_factory(
+        providers=_runtime_providers(),
+        shared_registry=ToolRegistry(),
+        shared_connection=None,
+        session_factory=_runtime_session_factory,
+    )
+    runtime = await factory(
+        agent=AgentDefinition(
+            agent_id="pool-agent", name="Pool", owner_email="alice@example.com", execution=execution
+        ),
+        user_email="alice@example.com",
+        prepare_only=True,
+        conversation_id="pool-conversation",
+    )
+    assert rows.await_count == (2 if selection == "concurrent_winner" else 1)
+    assert (
+        runtime.executor_pool.by_id("winner" if selection == "concurrent_winner" else "selected")
+        is not None
+    )
+    assert runtime.executor_pool.additional == []
+    rows.side_effect = None
+    rows.return_value = []
+    refreshed = await runtime.refresh_executor_pool(runtime.executor_pool)
+    assert not refreshed.by_id("selected").usable
+    assert rows.call_args.kwargs["defer_observed_tools"] is True
 
 
 @pytest.mark.asyncio
@@ -1959,7 +2207,7 @@ async def test_eligible_executor_falls_back_to_grantee_default_for_grantee_scope
             agent_id="agent-1",
             owner_email="owner@example.com",
             name="Agent",
-            execution={"executor_id": "owner_exec"},
+            execution={},
         ),
         "guest@example.com",
         ExecutorPolicy(allow_in_process=True, allow_subprocess=True),
@@ -1967,6 +2215,47 @@ async def test_eligible_executor_falls_back_to_grantee_default_for_grantee_scope
 
     assert config["executor_id"] == "guest_default"
     assert config["selection_source"] == "default"
+
+
+@pytest.mark.asyncio
+async def test_grantee_without_default_gets_actionable_executor_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.core.runtime import ExecutorConfigurationError
+    from cognis.core.turn_scheduler import classify_turn_error
+
+    async def grant(*_: object, **__: object) -> SimpleNamespace:
+        return SimpleNamespace(executor_scope="grantee_executor", grantee_overrides={})
+
+    async def executors(*_: object, **__: object) -> list[object]:
+        return []
+
+    monkeypatch.setattr(store_queries, "get_active_agent_grant", grant)
+    monkeypatch.setattr(store_queries, "list_executors", executors)
+
+    async def policy(_: object) -> ExecutorPolicy:
+        return ExecutorPolicy()
+
+    monkeypatch.setattr(runtime_support, "load_executor_policy", policy)
+    providers = _runtime_providers()
+    factory = runtime_support.build_step_runtime_factory(
+        providers=providers,
+        shared_registry=ToolRegistry(),
+        shared_connection=_shared_in_process_connection(),
+        session_factory=_runtime_session_factory,
+    )
+    with pytest.raises(ExecutorConfigurationError) as failure:
+        await factory(
+            agent=AgentDefinition(
+                agent_id="shared-reader", owner_email="owner@example.com", name="Shared reader"
+            ),
+            user_email="guest@example.com",
+            prepare_only=True,
+        )
+    error = await classify_turn_error(providers, failure.value)
+    assert error.code == "executor_configuration_invalid"
+    assert "your account" in error.detail["client_safe_detail"]
+    assert "Settings > Executors" in error.detail["client_safe_detail"]
 
 
 @pytest.mark.asyncio

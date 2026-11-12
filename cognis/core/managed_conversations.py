@@ -77,9 +77,10 @@ def inherited_managed_session_policy(
     """Return the explicitly inherited policy, never a broader ambient fallback."""
 
     inherited = platform_data.get("managed_session_policy")
-    if isinstance(inherited, dict):
-        return normalize_session_policy(inherited)
-    return normalize_session_policy(fallback)
+    policy = normalize_session_policy(inherited if isinstance(inherited, dict) else fallback)
+    # A primary target owns evaluation selection; only access clauses cross this boundary.
+    policy.pop("intaris_evaluation", None)
+    return policy
 
 
 @dataclass(frozen=True, slots=True)

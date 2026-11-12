@@ -16,6 +16,7 @@ from cognis.providers.credentials.encrypted_db import EncryptedDBCredentialsProv
 from cognis.providers.guardrails.intaris import IntarisProvider
 from cognis.providers.llm.inference_router import InferenceRouter
 from cognis.providers.llm.service import LLMService
+from cognis.providers.llm.usage_capture import UsageCapture
 from cognis.providers.memory.mnemory import MnemoryProvider
 from cognis.providers.secrets.encrypted_db import EncryptedDBSecretsProvider
 
@@ -66,6 +67,7 @@ def build_provider_registry(
     session_factory: async_sessionmaker[Any],
     auth_provider: JWTAuthProvider,
     *,
+    usage_capture: UsageCapture | None,
     redis_service: RedisService | None = None,
 ) -> ProviderRegistry:
     # Executor implementations are optional for controller-only imports and
@@ -113,6 +115,7 @@ def build_provider_registry(
 
     llm_provider = LLMService(
         session_factory,
+        usage_capture=usage_capture,
         secrets_provider=secrets_provider,
         inference_router=inference_router,
         credentials_provider=credentials_provider,

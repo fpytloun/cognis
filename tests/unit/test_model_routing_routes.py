@@ -189,6 +189,67 @@ def test_model_routing_put_round_trips_nested_entries_and_deletes_legacy_rows(
         client.portal.call(_assert_db)
 
 
+def test_elevenlabs_transcription_models_can_be_saved_in_stt_routing(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    model_ids = ("scribe_v1", "scribe_v2", "scribe_v2_realtime")
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        app = client.app
+
+        async def seed() -> None:
+            async with app.state.session_factory() as session:
+                await create_user(
+                    session,
+                    email="admin@example.com",
+                    name="Admin",
+                    password_hash=app.state.password_hasher.hash("password123"),
+                    role="admin",
+                )
+                await create_llm_provider(
+                    session,
+                    provider_id="elevenlabs",
+                    display_name="ElevenLabs",
+                    location="controller",
+                    backend="litellm",
+                    owner_email=SYSTEM_USER_EMAIL,
+                    config={
+                        "preset": "elevenlabs",
+                        "models": [
+                            {
+                                "model_id": model_id,
+                                "model_mode": "audio_transcription",
+                                "supports_transcription": True,
+                                "supports_speech_synthesis": False,
+                            }
+                            for model_id in model_ids
+                        ],
+                    },
+                    status="active",
+                )
+                await session.commit()
+
+        client.portal.call(seed)
+        headers = _auth_headers(app, email="admin@example.com", role="admin")
+        for model_id in model_ids:
+            target = f"elevenlabs/{model_id}"
+            expected = {"model": target, "reasoning_effort": None}
+            response = client.put(
+                "/api/v1/model-routing", headers=headers, json={"speech_to_text": expected}
+            )
+            assert response.status_code == 200, response.text
+            assert response.json()["speech_to_text"] == expected
+            read = client.get("/api/v1/model-routing", headers=headers)
+            assert read.json()["speech_to_text"] == expected
+            rejected = client.put(
+                "/api/v1/model-routing", headers=headers, json={"text_to_speech": expected}
+            )
+            assert rejected.status_code == 422
+            assert (
+                client.get("/api/v1/model-routing", headers=headers).json()["speech_to_text"]
+                == expected
+            )
+
+
 def test_model_routing_get_does_not_invent_reasoning_defaults(
     monkeypatch: object, tmp_path: Path
 ) -> None:
@@ -344,8 +405,8 @@ def test_non_admin_can_create_and_manage_user_owned_anthropic_executor_provider(
                 )
                 await create_executor(
                     session,
-                    executor_id="exec-linux",
-                    name="Linux executor",
+                    executor_id="sample-desktop",
+                    name="Sample desktop",
                     executor_type="websocket",
                     owner_email="owner@example.com",
                 )
@@ -363,7 +424,7 @@ def test_non_admin_can_create_and_manage_user_owned_anthropic_executor_provider(
                 "default_model": "claude-opus-4-7",
                 "models": [{"model_id": "claude-opus-4-7", "supports_tools": True}],
                 "auth_config": {"mode": "none"},
-                "executor_id": "exec-linux",
+                "executor_id": "sample-desktop",
                 "base_url": "http://127.0.0.1:8090",
                 "api_base": "http://127.0.0.1:8090",
             },
@@ -407,8 +468,8 @@ def test_executor_provider_requires_explicit_executor_target(
                 )
                 await create_executor(
                     session,
-                    executor_id="exec-linux",
-                    name="Linux executor",
+                    executor_id="sample-desktop",
+                    name="Sample desktop",
                     executor_type="websocket",
                     shared=True,
                 )
@@ -432,10 +493,10 @@ def test_executor_provider_requires_explicit_executor_target(
         assert response.status_code == 400
         assert "executor_id or executor_labels" in response.text
 
-        payload["config"] = {**payload["config"], "executor_id": "exec-linux"}
+        payload["config"] = {**payload["config"], "executor_id": "sample-desktop"}
         response = client.post("/api/v1/llm-providers", headers=headers, json=payload)
         assert response.status_code == 200
-        assert response.json()["config"]["executor_id"] == "exec-linux"
+        assert response.json()["config"]["executor_id"] == "sample-desktop"
 
 
 def test_admin_provider_create_defaults_to_user_owned(monkeypatch: object, tmp_path: Path) -> None:

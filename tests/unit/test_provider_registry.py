@@ -120,7 +120,7 @@ def _test_config(tmp_path: Path, database_url: str) -> CognisConfig:
 
 @pytest.mark.asyncio
 async def test_provider_registry_llm_service_supports_direct_codex_path(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, usage_capture
 ) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
     session_factory = create_session_factory(engine)
@@ -128,7 +128,12 @@ async def test_provider_registry_llm_service_supports_direct_codex_path(
         await conn.run_sync(Base.metadata.create_all)
     config = _test_config(tmp_path, f"sqlite+aiosqlite:///{tmp_path}/cognis.db")
     auth_provider = JWTAuthProvider(config.jwt_private_key_path, config.jwt_public_key_path)
-    registry = build_provider_registry(config, session_factory, auth_provider)
+    registry = build_provider_registry(
+        config,
+        session_factory,
+        auth_provider,
+        usage_capture=usage_capture,
+    )
 
     assert isinstance(registry.llm, LLMService)
 

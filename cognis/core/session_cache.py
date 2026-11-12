@@ -50,6 +50,7 @@ from cognis.core.project_context import (
 )
 from cognis.core.redis_service import RedisService
 from cognis.core.tool_output_recovery import COMPACT_RESULT_RENDERING_POLICY_VERSION
+from cognis.core.tool_result_context import COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION
 from cognis.guardrails_redaction import redact_runtime_evidence
 from cognis.logging import get_logger
 from cognis.models.config import GenerationPerformanceSnapshot
@@ -323,6 +324,7 @@ def _entry_payload(
         "loaded_skill_ids": sorted(entry.loaded_skill_ids),
         "loaded_skill_context_hashes": dict(entry.loaded_skill_context_hashes),
         "loaded_skill_snapshots": dict(entry.loaded_skill_snapshots),
+        "projection_scope_version": 1,
         "projection_decisions": {
             call_id: [dict(decision) for decision in decisions]
             for call_id, decisions in sorted(entry.projection_decisions.items())
@@ -565,6 +567,11 @@ def _entry_from_payload(data: dict[str, Any]) -> CachedSessionState:
         },
         memory_aliases=MemoryAliasState(),
     )
+    # Old L2 entries may contain cross-session event-number collisions.
+    # Reconstruct affected entries from Intaris once after upgrade.
+    entry.canonical_stale = data.get("projection_scope_version") != 1 and any(
+        key.startswith("event:") for key in entry.projection_decisions
+    )
     entry.memory_aliases.apply(data.get("memory_aliases"))
     for raw_event in data.get("events", []):
         cached_event = CachedEvent(
@@ -772,6 +779,9 @@ class SessionCache:
         self._local_eviction_tasks: dict[str, asyncio.Task[None]] = {}
         self._conversation_owner_by_id: dict[str, str] = {}
         self._active_thinking: dict[str, ActiveThinkingState] = {}
+        # Diagnostic-only numeric cursors; never retain entries or change LRU order.
+        self._resource_session_cursor = 0
+        self._resource_field_cursor = 0
         # Tracks (session_id, turn_id) pairs that have been torn down via
         # clear_active_thinking so that a late thinking delta cannot re-create
         # the state after teardown.  Bounded to avoid unbounded growth.
@@ -2956,6 +2966,19 @@ class SessionCache:
         if event.type == "lifecycle" and event.data.get("event") == "context_projection":
             raw_decisions = event.data.get("decisions")
             if isinstance(raw_decisions, list):
+                if event.data.get("compaction_tail") is True:
+                    from cognis.core.compaction.projection import (
+                        carried_event_sequence_map,
+                        remap_projection_event_decisions,
+                    )
+
+                    # Legacy rotations copied sequence-local rules verbatim.
+                    raw_decisions = remap_projection_event_decisions(
+                        raw_decisions,
+                        carried_event_sequence_map(
+                            entry.events, event.data.get("source_session_id")
+                        ),
+                    )
                 for raw_decision in raw_decisions:
                     if not isinstance(raw_decision, dict):
                         continue
@@ -3012,6 +3035,8 @@ class SessionCache:
                         not in (
                             (1, COMPACT_RESULT_RENDERING_POLICY_VERSION)
                             if operation == "compact_result"
+                            else (1, COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION)
+                            if operation == "compact_attachment"
                             else (1,)
                         )
                         or not parameters_are_bounded_numeric
@@ -3240,12 +3265,12 @@ class SessionCache:
     async def resource_owner_accounting(self) -> dict[str, Any]:
         """Measure fixed application roots in bounded owner-loop slices.
 
-        Read-only diagnostic state lives for this invocation only. No entry is
+        Only numeric sampling cursors survive this invocation. No entry is
         touched, hydrated, copied, serialized or evicted. Each slice releases
         graph references before yielding; cancellation belongs to the capture.
         Roots may change between slices and shared roots are non-additive.
         """
-        from itertools import islice
+        from itertools import chain, islice
 
         from cognis.core.resource_attribution import measure_owned_objects
 
@@ -3265,8 +3290,18 @@ class SessionCache:
             "project_contexts",
             "memory_aliases",
             "skill_tool_classifications",
+            "projection_decisions",
+            "project_metadata_contexts",
         )
-        selected = list(islice(self._entries, 64))
+        total_sessions = len(self._entries)
+        start_session = self._resource_session_cursor % max(1, total_sessions)
+        start_field = self._resource_field_cursor % len(fields)
+        selected = list(
+            islice(
+                chain(islice(self._entries, start_session, None), self._entries),
+                min(64, total_sessions),
+            )
+        )
         counts = {
             name: {
                 "estimated_bytes": 0,
@@ -3274,45 +3309,114 @@ class SessionCache:
                 "shallow_only_objects": 0,
                 "roots_measured": 0,
                 "roots_truncated": 0,
+                "roots_complete": 0,
+                "container_items_observed": 0,
+                "largest_root_items": 0,
+                "largest_root_estimated_bytes": 0,
             }
             for name in fields
         }
         work = largest_slice = 0.0
-        missing = 0
+        slice_started = monotonic()
+        cache_roots = {
+            "active_thinking": measure_owned_objects(
+                (self._active_thinking,), max_nodes=2000, budget_seconds=0.002
+            )
+        }
+        work = largest_slice = monotonic() - slice_started
+        await asyncio.sleep(0)
+        missing: set[int] = set()
         reason = None
-        for session_id in selected:
-            for name in fields:
-                if work >= 0.100 or monotonic() - started >= 5:
-                    reason = "work" if work >= 0.100 else "wall"
-                    break
-                slice_started = monotonic()
-                entry = self._entries.get(session_id)
-                if entry is None:
-                    missing += 1
-                    break
-                measured = measure_owned_objects(
-                    (getattr(entry, name),), max_nodes=2000, budget_seconds=0.002
-                )
-                entry = None
-                row = counts[name]
-                for key in ("estimated_bytes", "visited_objects", "shallow_only_objects"):
-                    row[key] += int(measured[key])
-                row["roots_measured"] += 1
-                row["roots_truncated"] += int(measured["truncated"])
-                elapsed = monotonic() - slice_started
-                work += elapsed
-                largest_slice = max(largest_slice, elapsed)
-                await asyncio.sleep(0)
-            if reason is not None:
+        visited: dict[int, int] = {}
+        complete: dict[int, int] = {}
+        observed_identities: dict[int, int] = {}
+        replacement_seen = False
+        root_visits = 0
+        for offset in range(len(selected) * len(fields)):
+            if work >= 0.100 or monotonic() - started >= 5:
+                reason = "work" if work >= 0.100 else "wall"
                 break
+            position = start_field + offset
+            index, field_index = divmod(position, len(fields))
+            index %= len(selected)
+            name = fields[field_index]
+            # Advance before yielding, including when the capture is cancelled.
+            next_session, next_field = divmod(position + 1, len(fields))
+            self._resource_session_cursor = (start_session + next_session) % max(1, total_sessions)
+            self._resource_field_cursor = next_field
+            slice_started = monotonic()
+            entry = self._entries.get(selected[index])
+            if entry is None:
+                missing.add(index)
+                continue
+            identity = id(entry)
+            replacement_seen |= observed_identities.setdefault(index, identity) != identity
+            root = getattr(entry, name)
+            items = len(root) if type(root) in (dict, list, tuple, set, frozenset) else 0
+            measured = measure_owned_objects((root,), max_nodes=2000, budget_seconds=0.002)
+            root = None
+            entry = None
+            row = counts[name]
+            for key in ("estimated_bytes", "visited_objects", "shallow_only_objects"):
+                row[key] += int(measured[key])
+            row["roots_measured"] += 1
+            row["roots_truncated"] += int(measured["truncated"])
+            row["container_items_observed"] += items
+            row["largest_root_items"] = max(row["largest_root_items"], items)
+            row["largest_root_estimated_bytes"] = max(
+                row["largest_root_estimated_bytes"], int(measured["estimated_bytes"])
+            )
+            root_visits += 1
+            visited[index] = visited.get(index, 0) + 1
+            if not measured["truncated"] and not measured["shallow_only_objects"]:
+                complete[index] = complete.get(index, 0) + 1
+                row["roots_complete"] += 1
+            elapsed = monotonic() - slice_started
+            work += elapsed
+            largest_slice = max(largest_slice, elapsed)
+            await asyncio.sleep(0)
+        population_changed = (
+            replacement_seen
+            or len(self._entries) != total_sessions
+            or any(key not in self._entries for key in selected)
+            or any(
+                id(self._entries.get(selected[index])) != identity
+                for index, identity in observed_identities.items()
+            )
+        )
         return {
             "sessions": len(self._entries),
+            "cache_counts": {
+                "active_thinking": len(self._active_thinking),
+                "hydration_tasks": len(self._hydration_tasks),
+                "eviction_tasks": len(self._local_eviction_tasks),
+                "conversation_owners": len(self._conversation_owner_by_id),
+            },
             "accounting": {
+                "schema_version": 2,
                 "kind": "non_additive_reachable_estimates",
+                "truncated_roots_are_lower_bounds": True,
                 "fields": counts,
+                "cache_roots": cache_roots,
                 "selected_sessions": len(selected),
+                "visited_sessions": len(visited),
+                "fully_measured_sessions": sum(n == len(fields) for n in complete.values()),
+                "root_visits": root_visits,
+                "expected_root_visits": len(selected) * len(fields),
+                "selection_start": start_session,
+                "field_start": start_field,
+                "population_changed": population_changed,
+                "coverage_complete": (
+                    not population_changed
+                    and len(selected) == total_sessions
+                    and sum(n == len(fields) for n in complete.values()) == total_sessions
+                    and all(
+                        not row["truncated"] and not row["shallow_only_objects"]
+                        for row in cache_roots.values()
+                    )
+                ),
                 "unselected_sessions": max(0, len(self._entries) - len(selected)),
-                "missing_sessions": missing,
+                "missing_sessions": len(missing),
                 "work_seconds": work,
                 "wall_seconds": monotonic() - started,
                 "largest_slice_seconds": largest_slice,

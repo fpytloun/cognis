@@ -38,18 +38,26 @@ def route_model_is_eligible(task_type: str, *, model_id: str, model_info: Any) -
     """Apply the same modality constraints for bindings and custom-route candidates."""
     mode = getattr(model_info, "model_mode", None)
     if mode == "systemone":
-        return task_type == "intaris_evaluation"
+        return task_type in {"intaris_evaluation", "classifier"}
     chat = is_chat_model(
         {"model_mode": mode, "supports_embedding": getattr(model_info, "supports_embedding", False)}
     )
     names = [model_id, getattr(model_info, "display_name", "") or ""]
     names = [name.strip().lower().replace("_", "-") for name in names]
     if task_type == "speech_to_text":
-        return mode == "audio_transcription" or any(
+        if getattr(model_info, "supports_transcription", False):
+            return True
+        if mode:
+            return bool(mode == "audio_transcription")
+        return any(
             token in name for name in names for token in ("transcribe", "whisper", "speech-to-text")
         )
     if task_type == "text_to_speech":
-        return mode == "audio_speech" or any(
+        if getattr(model_info, "supports_speech_synthesis", False):
+            return True
+        if mode:
+            return bool(mode == "audio_speech")
+        return any(
             token in name
             for name in names
             for token in ("tts", "text-to-speech", "speech-1", "eleven", "elevenlabs", "piper")

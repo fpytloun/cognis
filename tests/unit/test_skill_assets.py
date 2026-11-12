@@ -20,6 +20,7 @@ from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.commands import CommandDispatcher
 from cognis.core.prompts import build_skill_guidance
+from cognis.core.skill_context import deduplicate_skill_instructions
 from cognis.core.tool_router import ToolRouter
 from cognis.executor.runner import ExecutorRunner
 from cognis.executor.skill_assets import prepare_skill_assets
@@ -35,6 +36,254 @@ from cognis.store.queries import create_user, get_skill_scoped, get_skill_versio
 from cognis.tools.builtin.skill_management import SKILL_LOAD_TOOL, handle_skill_management_tool
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from cognis.tools.skill_service import prepare_skill_assets as prepare_controller_assets
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("executor_scope", ["grantee_executor", "owner_executor"])
+async def test_shared_agent_skill_read_use_assets_and_mutation_boundary(
+    tmp_path, monkeypatch, executor_scope
+):
+    from cognis.api import runtime_support
+    from cognis.api.serializers import agent_to_response
+    from cognis.core.executor_policy import ExecutorPolicy
+    from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+    from cognis.store.queries import (
+        create_agent,
+        create_agent_grant,
+        revoke_agent_grant,
+        update_agent,
+    )
+    from cognis.tools.skills import resolve_skills_for_agent
+
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/shared.db")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(
+        ArtifactStoreConfig(backend="filesystem", path=str(tmp_path / "artifacts"))
+    )
+    owner, guest = "owner@example.com", "guest@example.com"
+    async with factory() as db:
+        for email in (owner, guest):
+            await create_user(db, email=email, name=email, password_hash="hashed")
+        await db.commit()
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "recipient-executor"))
+    executor = InProcessExecutorConnection(
+        ExecutorHandle(executor_id="recipient-executor", executor_type="in_process"),
+        ToolRegistry(),
+        CircuitBreaker(),
+    )
+
+    async def call(actor, name, arguments):
+        return await handle_skill_management_tool(
+            name, arguments, factory, actor, artifact_store=store, executor=executor
+        )
+
+    try:
+        assigned = await call(
+            owner, "skill_write", {"name": "Shared procedure", "instructions": "Read shared data."}
+        )
+        assert not assigned.is_error, assigned.output
+        skill_id = json.loads(assigned.output)["skill_id"]
+        asset = await call(
+            owner,
+            "skill_asset_write",
+            {"skill_id": skill_id, "filename": "reference.txt", "content": "shared asset bytes"},
+        )
+        assert not asset.is_error, asset.output
+        private = await call(
+            owner, "skill_write", {"name": "Private procedure", "instructions": "Never shared."}
+        )
+        private_id = json.loads(private.output)["skill_id"]
+        async with factory() as db:
+            row = await create_agent(
+                db,
+                agent_id="shared-reader",
+                owner_email=owner,
+                name="Shared reader",
+                status="active",
+                skills={"items": [{"skill_id": skill_id, "auto_load_instructions": True}]},
+            )
+            grant = await create_agent_grant(
+                db,
+                agent_id=row.agent_id,
+                grantee_user_email=guest,
+                granted_by=owner,
+                executor_scope=executor_scope,
+            )
+            await db.commit()
+            agent = AgentDefinition.model_validate(agent_to_response(row).model_dump())
+        token = current_runtime_access_context.set(
+            RuntimeAccessContext(user_email=guest, agent_id=agent.agent_id, agent_owner_email=owner)
+        )
+        try:
+            async with factory() as db:
+                resolved = await resolve_skills_for_agent(db, agent, owner_email=guest)
+            shared = next(s for s in resolved.skills if s.skill_id == skill_id)
+            assert shared.instructions == "Read shared data."
+            assert shared.auto_load_instructions
+            assert private_id not in {s.skill_id for s in resolved.skills}
+
+            config = {
+                "executor_id": "recipient-executor",
+                "executor_type": "websocket",
+                "owner_email": guest,
+                "executor_owner_email": guest,
+                "runtime_state": "active",
+                "enabled_tools": [],
+                "enabled_tool_groups": [],
+                "config": {},
+            }
+            monkeypatch.setattr(
+                runtime_support, "load_executor_policy", AsyncMock(return_value=ExecutorPolicy())
+            )
+            monkeypatch.setattr(
+                runtime_support,
+                "_resolve_eligible_executor_config",
+                AsyncMock(return_value=config),
+            )
+            providers = SimpleNamespace(_session_factory=factory)
+            runtime_factory = runtime_support.build_step_runtime_factory(
+                providers=providers,
+                shared_registry=ToolRegistry(),
+                shared_connection=None,
+                session_factory=factory,
+            )
+            await runtime_factory(agent=agent, user_email=guest, prepare_only=True)
+            assert agent.skills["_auto_loaded_skill_ids"] == [skill_id]
+            assert "Read shared data." in "\n".join(agent.skills["_auto_loaded_skill_contexts"])
+
+            loaded = await call(
+                guest, "skill_load", {"skill_id": skill_id, "require_assets_ready": True}
+            )
+            assert not loaded.is_error, loaded.output
+            assert "Read shared data." in loaded.metadata["protected_context"]
+            manifest = json.loads(loaded.output)["asset_manifest"]
+            assert manifest[0]["executor_id"] == "recipient-executor"
+            assert Path(manifest[0]["local_path"]).read_text() == "shared asset bytes"
+            detail = await call(guest, "skill_get", {"skill_id": skill_id})
+            assert not detail.is_error, detail.output
+            search = await call(guest, "skill_search", {"query": "procedure"})
+            assert {s["skill_id"] for s in json.loads(search.output)["skills"]} == {skill_id}
+            listing = await call(guest, "skill_list", {})
+            listed_ids = {s["skill_id"] for s in json.loads(listing.output)}
+            assert skill_id in listed_ids
+            assert private_id not in listed_ids
+
+            for name, arguments in (
+                ("skill_load", {"skill_id": private_id}),
+                ("skill_get", {"skill_id": private_id}),
+                ("skill_patch", {"skill_id": skill_id, "instructions": "Changed"}),
+                ("skill_delete", {"skill_id": skill_id}),
+                (
+                    "skill_asset_write",
+                    {"skill_id": skill_id, "filename": "reference.txt", "content": "Changed"},
+                ),
+            ):
+                denied = await call(guest, name, arguments)
+                assert denied.is_error, denied.output
+            async with factory() as db:
+                row = await get_skill_scoped(db, skill_id, owner_email=owner)
+                version = await get_skill_version(db, row.current_version_id)
+                assert version.instructions == "Read shared data."
+                await update_agent(
+                    db,
+                    agent.agent_id,
+                    updates={"skills": {"items": [{"skill_id": skill_id, "enabled": False}]}},
+                )
+                await db.commit()
+            disabled = await call(guest, "skill_load", {"skill_id": skill_id})
+            assert disabled.is_error
+            async with factory() as db:
+                await update_agent(
+                    db, agent.agent_id, updates={"skills": {"items": [{"skill_id": skill_id}]}}
+                )
+                await revoke_agent_grant(db, grant.grant_id)
+                await db.commit()
+            revoked = await call(guest, "skill_load", {"skill_id": skill_id})
+            assert revoked.is_error
+        finally:
+            current_runtime_access_context.reset(token)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_repeated_load_restores_assets_without_duplicating_instructions(
+    tmp_path, monkeypatch
+):
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/skills.db")
+    await run_schema_bootstrap(engine)
+    factory = create_session_factory(engine)
+    store = ArtifactStore(
+        ArtifactStoreConfig(backend="filesystem", path=str(tmp_path / "artifacts"))
+    )
+    email = "user@example.com"
+    async with factory() as session:
+        await create_user(session, email=email, name="User", password_hash="hashed")
+        await session.commit()
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "executor"))
+    executor = InProcessExecutorConnection(
+        ExecutorHandle(executor_id="authorized", executor_type="in_process"),
+        ToolRegistry(),
+        CircuitBreaker(),
+    )
+
+    async def call(name, arguments):
+        result = await handle_skill_management_tool(
+            name, arguments, factory, email, artifact_store=store, executor=executor
+        )
+        assert not result.is_error, result.output
+        return result
+
+    try:
+        created = await call("skill_write", {"name": "Portable", "instructions": "Read helper."})
+        skill_id = json.loads(created.output)["skill_id"]
+        await call(
+            "skill_asset_write",
+            {
+                "skill_id": skill_id,
+                "filename": "references/helper.txt",
+                "content": "portable reference",
+                "content_type": "text/plain",
+            },
+        )
+        first = await call("skill_load", {"skill_id": skill_id, "require_assets_ready": True})
+        messages = [{"role": "system", "content": first.metadata["protected_context"]}]
+        path = Path(json.loads(first.output)["asset_manifest"][0]["local_path"])
+        assert path.read_text() == "portable reference"
+        path.unlink()
+
+        repeated = deduplicate_skill_instructions(
+            await call("skill_load", {"skill_id": skill_id, "require_assets_ready": True}),
+            messages,
+        )
+        payload = json.loads(repeated.output)
+        assert payload["status"] == "already_loaded"
+        assert payload["instructions_loaded"] is False
+        assert payload["asset_preparation"]["status"] == "ready"
+        assert path.read_text() == "portable reference"
+        assert "protected_context" not in repeated.metadata
+
+        # A different executor still needs its own assets, not the first executor's paths.
+        monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path / "other-executor"))
+        executor = InProcessExecutorConnection(
+            ExecutorHandle(executor_id="other-authorized", executor_type="in_process"),
+            ToolRegistry(),
+            CircuitBreaker(),
+        )
+        moved = deduplicate_skill_instructions(
+            await call("skill_load", {"skill_id": skill_id, "require_assets_ready": True}),
+            messages,
+        )
+        moved_payload = json.loads(moved.output)
+        moved_path = Path(moved_payload["asset_manifest"][0]["local_path"])
+        assert moved_path != path
+        assert moved_path.read_text() == "portable reference"
+        assert moved_payload["asset_manifest"][0]["executor_id"] == "other-authorized"
+        assert moved_payload["instructions_loaded"] is False
+        assert "protected_context" not in moved.metadata
+    finally:
+        await engine.dispose()
 
 
 def _bundle(content: bytes = b"print('portable')\n") -> dict:
@@ -484,8 +733,7 @@ async def test_publish_load_replace_and_clean_execution_without_restart(tmp_path
 
 def test_portable_authoring_guidance_is_general():
     guidance = build_skill_guidance()
-    assert "Portable skill authoring" in guidance
-    assert "versioned Cognis skill assets" in guidance
+    assert "versioned skill assets" in guidance
     assert "never bundle secrets" in guidance
     assert "without the original workspace" in guidance
 

@@ -279,6 +279,122 @@ def _wire_wrapper(
     }
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "é" * MAX_RAW_PAYLOAD_BYTES,
+        base64.b64encode(os.urandom(600 * 1024)).decode(),
+    ],
+    ids=["raw-oversized-unicode", "incompressible-wire-oversized"],
+)
+def test_bounded_overlay_keeps_whole_current_items_and_authority(content: str) -> None:
+    original = _large_envelope(content).model_copy(update={"volatile_items_complete": True})
+    assert (
+        relay_module._encode_wire_sync(original, original.model_dump_json().encode()) is None  # noqa: SLF001
+    )
+    small = original.volatile_items[0].model_copy(
+        update={"id": "current-small", "content": "still live", "status": "running"}
+    )
+    original = original.model_copy(update={"volatile_items": [original.volatile_items[0], small]})
+    projected = original.bounded_overlay()
+
+    assert projected.volatile_items == [small]
+    assert not projected.volatile_items_complete
+    assert projected.authority == original.authority
+    assert projected.origin == original.origin
+    assert projected.source_revision == original.source_revision
+    assert projected.kind == original.kind
+    assert original.volatile_items[0].content == content
+    wire = relay_module._encode_wire_sync(projected, projected.raw_encoded())  # noqa: SLF001
+    assert wire is not None
+    assert len(wire) <= MAX_PAYLOAD_BYTES
+    assert projected.bounded_overlay() == projected
+
+
+def test_bounded_overlay_prioritizes_live_work_without_reordering_or_truncating() -> None:
+    original = _large_envelope("x" * 200_000)
+    base = original.volatile_items[0]
+    items = [
+        base.model_copy(
+            update={"id": f"phase-{index}", "status": "running" if index == 0 else "complete"}
+        )
+        for index in range(12)
+    ]
+    original = original.model_copy(
+        update={"volatile_items": items, "volatile_items_complete": True}
+    )
+    with pytest.raises(ValueError, match="raw limit"):
+        original.raw_encoded()
+    projected = original.bounded_overlay()
+
+    assert projected.volatile_items == [items[0], items[-1]]
+    assert not projected.volatile_items_complete
+    assert len(projected.raw_encoded()) <= MAX_PAYLOAD_BYTES
+    assert original.volatile_items == items
+    small = _envelope().model_copy(update={"volatile_items_complete": True})
+    assert small.bounded_overlay() is small
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [RelayKind.RUNTIME, RelayKind.TERMINAL, RelayKind.RELINQUISHED])
+async def test_bounded_overlay_survives_coalescing_remote_receive_and_reconnect(
+    kind: RelayKind,
+) -> None:
+    redis = _FakeRedis()
+    sender = _relay(redis)
+    original = _large_envelope("x" * (MAX_RAW_PAYLOAD_BYTES + 1))
+    small = original.volatile_items[0].model_copy(
+        update={"id": "latest-small", "content": "new phase"}
+    )
+    receipt = {
+        "session_id": "session-1",
+        "seq": 42,
+        "queue_id": "queue-1",
+        "client_message_id": "client-1",
+    }
+    first = original.model_copy(
+        update={"context_usage": {"__boundary_receipts": [receipt]}}
+    ).bounded_overlay()
+    assert sender.enqueue(first, cumulative_boundary=True)
+    candidate = original.model_copy(
+        update={
+            "kind": kind,
+            "has_active_turn": kind == RelayKind.RUNTIME,
+            "active_turn": original.active_turn if kind == RelayKind.RUNTIME else None,
+            "source_revision": 2,
+            "volatile_items": [*original.volatile_items, small],
+            "volatile_items_complete": True,
+        }
+    ).bounded_overlay()
+    assert sender.enqueue(candidate, cumulative_boundary=True)
+    queued = list(sender._queue.items)  # noqa: SLF001
+    assert len(queued) == 1
+    assert queued[0].envelope.context_usage == {"__boundary_receipts": [receipt]}
+    publisher = asyncio.create_task(sender._publisher_loop())  # noqa: SLF001
+    try:
+        await asyncio.wait_for(sender._drain(), timeout=2)  # noqa: SLF001
+    finally:
+        sender._stop.set()  # noqa: SLF001
+        await asyncio.wait_for(publisher, timeout=1)
+
+    wire = redis.eval_calls[-1][2][0]
+    received: list[ChatV2RuntimeRelayEnvelope] = []
+
+    async def apply(envelope: ChatV2RuntimeRelayEnvelope) -> None:
+        received.append(envelope)
+
+    receiver = _relay(redis, apply=apply)
+    assert await receiver.receive(wire)
+    assert received[-1].volatile_items == [small]
+    assert received[-1].kind == kind
+    assert received[-1].source_revision == 2
+    assert not received[-1].volatile_items_complete
+    assert not await receiver.receive(first.encoded())
+    redis.get_value = wire
+    hydrated = await _relay(redis).hydrate_latest(_context())
+    assert hydrated == received[-1]
+
+
 def _wire_bytes(wrapper: dict[str, Any]) -> bytes:
     return json.dumps(wrapper, separators=(",", ":")).encode()
 

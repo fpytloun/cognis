@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from cognis.core import turn_latency
 from cognis.store.coordination import LEASE_RENEWAL_DELAY_SECONDS, DatabaseLeaseStore, Lease
 from cognis.store.direct_turns import (
@@ -77,6 +79,15 @@ class DirectTurnExecutionFence:
     last_metadata: dict[str, Any] | None = None
     interruption_reason: str | None = None
     retry_after_seconds: float | None = None
+    stream_checkpoint_pending: bool = False
+
+    def begin_stream_checkpoint(self) -> None:
+        """Prevent terminal settlement until exposed output is accounted for."""
+        self.stream_checkpoint_pending = True
+
+    def confirm_stream_checkpoint(self) -> None:
+        """Allow settlement after durable output or an explicit failure marker."""
+        self.stream_checkpoint_pending = False
 
     def set_user_append_state(
         self,
@@ -87,8 +98,9 @@ class DirectTurnExecutionFence:
         self.user_append_phase = phase
         self.user_append_session_id = session_id
 
-    async def assert_current(self) -> None:
-        if not await self.store.has_fence(self.request_id, lease=self.lease):
+    async def assert_current(self, session: AsyncSession | None = None) -> None:
+        """Check ownership in the mutation's transaction when one is supplied."""
+        if not await self.store.has_fence(self.request_id, lease=self.lease, session=session):
             raise StaleDirectTurnOwner(f"Lost direct-turn fence for {self.request_id}")
 
     async def checkpoint(self, phase: str, **metadata: Any) -> None:
@@ -230,11 +242,13 @@ class BackgroundDirectTurnFence:
 
     parent: DirectTurnExecutionFence
 
-    async def assert_current(self) -> None:
+    async def assert_current(self, session: AsyncSession | None = None) -> None:
         """Allow a live parent owner or its successfully completed turn only."""
-        if await self.parent.store.has_fence(self.parent.request_id, lease=self.parent.lease):
+        if await self.parent.store.has_fence(
+            self.parent.request_id, lease=self.parent.lease, session=session
+        ):
             return
-        row = await self.parent.store.get(self.parent.request_id)
+        row = await self.parent.store.get(self.parent.request_id, session=session)
         if (
             row is not None
             and row.status == DirectTurnStatus.COMPLETED.value
@@ -553,6 +567,8 @@ class DurableDirectTurnRuntime:
             )
             retry_scheduled = True
         except PermanentDirectTurnPayloadError as exc:
+            if fence.stream_checkpoint_pending:
+                return
             failed = await self.store.mark_terminal(
                 row.request_id,
                 lease=lease,
@@ -565,7 +581,9 @@ class DurableDirectTurnRuntime:
             if failed is not None:
                 await self._publish_failure_visibility(failed, exc, lease=lease)
         except asyncio.CancelledError:
-            if not ownership_lost.is_set():
+            # The scheduler can return without settling an unconfirmed stream.
+            # Worker teardown must leave that same request lease-reclaimable.
+            if not ownership_lost.is_set() and not fence.stream_checkpoint_pending:
                 await self.store.mark_terminal(
                     row.request_id,
                     lease=lease,
@@ -574,6 +592,8 @@ class DurableDirectTurnRuntime:
                 )
             raise
         except Exception:
+            if fence.stream_checkpoint_pending:
+                return
             current = await self.store.get(row.request_id)
             current_outcome = (
                 current.outcome if current is not None and isinstance(current.outcome, dict) else {}

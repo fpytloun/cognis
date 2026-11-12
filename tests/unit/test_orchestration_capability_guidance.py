@@ -177,26 +177,6 @@ def test_policy_allows_but_hidden_tools_are_not_claimed() -> None:
     )
 
 
-def test_capability_guidance_preserves_runtime_precedence_boundary() -> None:
-    guidance = _guidance(
-        ConversationContext(
-            type="web",
-            ref="web:agent_direct:user@example.com:agent",
-            platform_data={"kind": "agent_direct"},
-        ),
-        OrchestrationMode.FULL,
-        {"delegate", "agent_conversation_create"},
-        async_delegate=True,
-        async_managed=True,
-    )
-    assert guidance is not None
-    assert "authorization, and safety are non-overridable" in guidance
-    assert "agent identity and system/developer instructions" in guidance
-    assert "explicit current user request, stored user preferences" in guidance
-    assert "Memories and preferences tune defaults only" in guidance
-    assert "cannot grant tools, permissions, target agent types, or asynchronous modes" in guidance
-
-
 @pytest.mark.parametrize(
     "tools",
     [
@@ -215,11 +195,76 @@ def test_message_readability_guidance_is_scoped_to_inter_agent_tools(tools: set[
 
     assert guidance is not None
     if "create_task" in tools:
-        assert "Keep inter-agent messages human-readable" not in guidance
+        assert "## Agent briefs" not in guidance
     else:
-        assert "Keep inter-agent messages human-readable" in guidance
-        assert "normal grammar and spaces between words and numbers" in guidance
-        assert "preserve identifiers and quoted text exactly" in guidance
+        assert guidance.count("## Agent briefs") == 1
+        assert "restrictions exactly" in guidance
+
+
+@pytest.mark.parametrize(
+    ("context", "prompt_context", "mode"),
+    [
+        (ConversationContext(type="web"), PromptContext.CHAT, OrchestrationMode.FULL),
+        (ConversationContext(type="signal"), PromptContext.CHAT, OrchestrationMode.FULL),
+        (
+            ConversationContext(type="agent_work", platform_data={"managed_depth": 1}),
+            PromptContext.CHAT,
+            OrchestrationMode.FULL,
+        ),
+        (
+            ConversationContext(type="task"),
+            PromptContext.TASK_STEP,
+            OrchestrationMode.TASK_PRIMARY,
+        ),
+        (
+            ConversationContext(type="task"),
+            PromptContext.TASK_STEP,
+            OrchestrationMode.DELEGATE_SYNC_ONLY,
+        ),
+    ],
+)
+def test_assembled_guidance_has_one_brief_across_surfaces_and_loaded_skills(
+    context: ConversationContext, prompt_context: PromptContext, mode: OrchestrationMode
+) -> None:
+    from cognis.core.system_skills import get_system_skill_default
+
+    tools = orchestration_tools(mode, expose_managed_conversation_wait_option=False)
+    guidance = _guidance(context, mode, {tool.name for tool in tools})
+    assert guidance is not None
+    messages = [
+        {"role": "system", "content": build_system_instructions(prompt_context)},
+    ]
+    replace_orchestration_capability_guidance(messages, guidance)
+    replace_orchestration_capability_guidance(messages, guidance)
+    assembled = "\n".join(str(message["content"]) for message in messages)
+    for skill_id in ("cognis-coding", "cognis-orchestrator"):
+        skill = get_system_skill_default(skill_id)
+        assert skill is not None
+        assembled += "\n" + str(skill["instructions"])
+    assembled += "\n" + "\n".join(f"{tool.description}\n{tool.parameters}" for tool in tools)
+
+    assert assembled.count("## Agent briefs") == 1
+    for obsolete in (
+        "compact contract",
+        "Required return contract",
+        "status, results/findings, changed references",
+        "Objective — the bounded outcome",
+        "The contract must include",
+    ):
+        assert obsolete not in assembled
+
+
+def test_sync_and_async_delegate_fields_share_one_source() -> None:
+    sync_delegate = next(
+        tool
+        for tool in orchestration_tools(OrchestrationMode.DELEGATE_SYNC_ONLY)
+        if tool.name == "delegate"
+    )
+    for name in ("task", "agent_id", "context", "expected_output"):
+        assert (
+            sync_delegate.parameters["properties"][name]
+            == DELEGATE_TOOL.parameters["properties"][name]
+        )
 
 
 def test_delegate_guidance_reuses_existing_child_context() -> None:
@@ -229,10 +274,10 @@ def test_delegate_guidance_reuses_existing_child_context() -> None:
     assert "fork_subsession" in description
     assert "same bounded problem" in description
     assert "Follow-up and fork preserve" in description
-    assert "start fresh with the appropriate specialist" in description.lower()
+    assert "fresh specialist when compatibility changes" in description
 
 
-def test_capability_guidance_starts_review_fresh_and_reuses_only_useful_reviewer_context() -> None:
+def test_capability_guidance_isolates_fresh_children_and_reviews() -> None:
     guidance = _guidance(
         ConversationContext(type="web"),
         OrchestrationMode.FULL,
@@ -240,32 +285,11 @@ def test_capability_guidance_starts_review_fresh_and_reuses_only_useful_reviewer
     )
 
     assert guidance is not None
-    assert "Start an initial independent review fresh" in guidance
-    assert "follow_up_subsession for re-review only" in guidance
-    assert "retained investigative context" in guidance
-    assert "otherwise start fresh" in guidance
-    assert "Fork only an independent branch requiring inherited context" in guidance
-
-
-def test_capability_guidance_compacts_child_context_and_review_contracts() -> None:
-    guidance = _guidance(
-        ConversationContext(type="web"),
-        OrchestrationMode.FULL,
-        {"delegate", "follow_up_subsession", "fork_subsession"},
-    )
-
-    assert guidance is not None
-    assert "same bounded problem" in guidance
-    assert "retained context is materially useful" in guidance
-    assert "send the context delta only" in guidance
-    assert "fresh isolated child" in guidance
-    assert "independent workstream" in guidance
-    assert "compact contract with exact references" in guidance
-    assert "never pass the parent transcript" in guidance
-    assert "ordinary handoff, correction, or review" in guidance
-    assert "implementation reasoning transcript" in guidance
-    assert "compact evidence" in guidance
-    assert "Detailed logs remain inspectable" in guidance
+    flat = " ".join(guidance.split())
+    assert flat.count("Start an initial independent review") == 1
+    assert "does not inherit the parent conversation" in flat
+    assert "never an implementation reasoning transcript" in flat
+    assert "Never include secrets" in flat
 
 
 def test_delegate_only_guidance_does_not_claim_hidden_continuation_or_fork_tools() -> None:
@@ -294,7 +318,7 @@ def test_managed_create_only_guidance_does_not_claim_hidden_continuation_or_fork
     assert "Fork only" not in guidance
 
 
-def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routing() -> None:
+def test_sync_managed_tool_descriptions_keep_context_isolation_and_review_routing() -> None:
     tools = {
         tool.name: tool
         for tool in orchestration_tools(
@@ -306,14 +330,10 @@ def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routi
     send = tools["agent_conversation_send"].description
     fork = tools["agent_conversation_fork"].description
 
-    for phrase in (
-        "objective",
-        "exact references",
-        "scope and non-goals",
-        "acceptance and verification",
-        "return status and evidence",
-    ):
-        assert phrase in create
+    assert "does not inherit parent history" in create
+    assert "initial_message and attached artifacts supply its brief" in create
+    assert "compact contract" not in create
+    assert "return status and evidence" not in create
     assert "Working mode:" not in create
     assert "initial independent review in a fresh conversation" in send
     assert "re-review only when" in send
@@ -323,7 +343,7 @@ def test_sync_managed_tool_descriptions_keep_complete_contracts_and_review_routi
     assert "ordinary handoff" in fork
     assert "fork for re-review" not in fork
     assert "this fork for re-review" not in fork
-    assert "re-review fresh with a compact review contract" in fork
+    assert "re-review fresh when that context is not useful" in fork
 
 
 def test_managed_guidance_uses_future_compatible_nested_wording() -> None:
@@ -417,7 +437,7 @@ def test_nested_session_policy_uses_explicit_inheritance_without_widening() -> N
     )
 
 
-def test_mutable_guidance_appends_audit_marked_updates_without_rewriting_history() -> None:
+def test_mutable_guidance_is_audit_marked_after_prefix_and_replaced_without_duplicates() -> None:
     messages = [
         {"role": "system", "content": "immutable", "_immutable_prefix": True},
         {"role": "user", "content": "request"},
@@ -432,24 +452,22 @@ def test_mutable_guidance_appends_audit_marked_updates_without_rewriting_history
         "_audit_role": "developer",
     }
     assert messages[0]["content"] == "immutable"
-    original_prefix = [dict(message) for message in messages]
 
-    replace_orchestration_capability_guidance(messages, "updated capabilities")
+    # Delivered notices are append-only: changes add a superseding notice, and an
+    # unchanged notice is not repeated.
+    assert replace_orchestration_capability_guidance(messages, "updated capabilities")
+    assert not replace_orchestration_capability_guidance(messages, "updated capabilities")
     capability_messages = [
         message for message in messages if message.get("_orchestration_capability_guidance")
     ]
-    assert messages[: len(original_prefix)] == original_prefix
     assert [message["content"] for message in capability_messages] == [
         "first capabilities",
         "updated capabilities",
     ]
-    assert not replace_orchestration_capability_guidance(messages, "updated capabilities")
 
-    replace_orchestration_capability_guidance(messages, None)
-    assert messages[: len(original_prefix)] == original_prefix
-    assert messages[-1]["_orchestration_capability_guidance"] is True
+    assert replace_orchestration_capability_guidance(messages, None)
     assert "no longer available" in messages[-1]["content"]
-    assert not replace_orchestration_capability_guidance(messages, None)
+    assert messages[0]["content"] == "immutable"
 
 
 @pytest.mark.parametrize(
@@ -482,27 +500,10 @@ def test_non_child_prompt_contexts_remain_distinct() -> None:
     )
     secondary_instructions = build_system_instructions(PromptContext.TASK_STEP)
     assert secondary_instructions is not None
-    assert "Then call `step_complete`" in secondary_instructions
+    assert "call `step_complete`" in secondary_instructions
     assert (
         prompt_context_for_step(
             SimpleNamespace(policy=CHAT_POLICY, orchestration_mode=OrchestrationMode.FULL)
         )
         is PromptContext.CHAT
     )
-
-
-def test_coding_skill_contains_only_model_neutral_execution_contract() -> None:
-    from cognis.core.system_skills import get_system_skill_default
-
-    skill = get_system_skill_default("cognis-coding")
-    assert skill is not None
-    content = str(skill["instructions"])
-    for required in (
-        "Follow the current role, user request, and workflow contract",
-        "A direct implementer owns the assigned implementation",
-        "Coordinated delivery can use a team",
-        "Advisory assistance returns analysis, plans, or review",
-        "bounded independent exploration or review",
-        "visible in the current context",
-    ):
-        assert required in content

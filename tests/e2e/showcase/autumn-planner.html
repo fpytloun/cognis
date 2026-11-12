@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lumen Autumn · launch planner</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #252b35; background: #f5f1ea; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 980px; margin: auto; padding: 3rem 1.5rem; }
+    .eyebrow { color: #a35e38; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; font-size: .75rem; }
+    h1 { font-family: Georgia, serif; font-weight: 400; font-size: clamp(2.5rem, 7vw, 4.5rem); line-height: 1; margin: .7rem 0 1rem; }
+    .intro { color: #5d6570; max-width: 40rem; line-height: 1.6; }
+    .layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; margin-top: 2rem; }
+    .card { background: #fffdf9; border: 1px solid #e7ded2; border-radius: 1rem; padding: 1.5rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 1rem; }
+    label { display: block; font-weight: 600; margin: 1rem 0 .5rem; }
+    select, input { width: 100%; font: inherit; }
+    select { padding: .65rem; border: 1px solid #cfc6b9; border-radius: .4rem; background: white; }
+    input { accent-color: #ad6641; }
+    .value { font-size: 2.4rem; font-family: Georgia, serif; color: #9a5130; margin: .25rem 0; }
+    .muted { color: #626b76; line-height: 1.5; font-size: .9rem; }
+    .bar { height: .7rem; background: #eee6dd; border-radius: 1rem; overflow: hidden; }
+    .bar span { display: block; height: 100%; background: #b96e49; transition: width .2s; }
+    footer { color: #6c7278; font-size: .8rem; margin-top: 2rem; }
+    @media (max-width: 650px) { .layout { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Lumen / Autumn launch</div>
+  <h1>Make room<br>for the glow.</h1>
+  <p class="intro">Plan the Autumn launch. Change the audience or allocation to see how the email reach responds.</p>
+  <div class="layout">
+    <section class="card" aria-labelledby="controls-title">
+      <h2 id="controls-title">Plan your launch</h2>
+      <label for="audience">Audience</label>
+      <select id="audience">
+        <option value="12000">Returning customers</option>
+        <option value="18000">All subscribers</option>
+        <option value="8000">Early-access members</option>
+      </select>
+      <label for="allocation">Email allocation: <output id="allocation-value" for="allocation">60%</output></label>
+      <input id="allocation" type="range" min="20" max="100" step="10" value="60">
+      <p class="muted">The remaining allocation is reserved for social and in-store channels.</p>
+    </section>
+    <section class="card" aria-labelledby="forecast-title" aria-live="polite">
+      <h2 id="forecast-title">Expected email reach</h2>
+      <p class="value" id="reach">7,200</p>
+      <p class="muted">people in the selected audience</p>
+      <div class="bar" aria-hidden="true"><span id="bar" style="width: 60%"></span></div>
+      <p class="muted" id="summary">60% of 12,000 returning customers.</p>
+    </section>
+  </div>
+  <footer>Lumen · Autumn collection launch planner</footer>
+</main>
+<script>
+  const audience = document.querySelector('#audience');
+  const allocation = document.querySelector('#allocation');
+  function update() {
+    const percent = Number(allocation.value);
+    const total = Number(audience.value);
+    document.querySelector('#allocation-value').value = `${percent}%`;
+    document.querySelector('#reach').textContent = Math.round(total * percent / 100).toLocaleString('en-US');
+    document.querySelector('#bar').style.width = `${percent}%`;
+    document.querySelector('#summary').textContent = `${percent}% of ${total.toLocaleString('en-US')} ${audience.selectedOptions[0].textContent.toLowerCase()}.`;
+  }
+  audience.addEventListener('change', update);
+  allocation.addEventListener('input', update);
+</script>
+</body>
+</html>

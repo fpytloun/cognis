@@ -9,7 +9,7 @@ short-circuiting the LLM-backed safety operations:
 
 This means:
   - Session content (events, timeline) is still stored in Intaris.
-  - No LLM calls are made by Intaris for this agent's sessions.
+  - Proactive guardrail analysis is disabled independently of analytics.
   - ALL tools are approved, including non-bypassable ones.
     (guardrails=none means no guardrails, period — this is intentional
     and should only be used for trusted/test agents.)
@@ -114,6 +114,8 @@ class NoGuardrailsProvider:
         parent_session_id: str | None = None,
         policy: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = False,
     ) -> None:
         return await self._intaris.create_session(
             session_id,
@@ -123,6 +125,8 @@ class NoGuardrailsProvider:
             parent_session_id=parent_session_id,
             policy=policy,
             details=details,
+            analytics_enabled=analytics_enabled,
+            guardrails_enabled=False,
         )
 
     async def checkpoint(self, session_id: str, content: str) -> None:

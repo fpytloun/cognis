@@ -384,6 +384,7 @@ def system_message_runtime_item(
         role="system",
         content=content,
         message_id=notice_id,
+        task_outcome=(metadata or {}).get("task_outcome"),
         notice_id=notice_id,
         notice_kind=notice_kind,
         notice_scope=notice_scope,
@@ -406,6 +407,9 @@ def tool_call_runtime_item(
     assistant_phase_index: int | None,
     turn_cycle_index: int | None,
     timestamp: str,
+    parent_call_id: str | None = None,
+    program_id: str | None = None,
+    kernel_generation: str | int | None = None,
 ) -> ToolCallTimelineItem:
     return ToolCallTimelineItem(
         id=f"tool:{call_id}",
@@ -424,6 +428,9 @@ def tool_call_runtime_item(
         stable=False,
         call_id=call_id,
         tool_name=tool_name,
+        parent_call_id=parent_call_id,
+        program_id=program_id,
+        kernel_generation=kernel_generation,
         turn_id=turn_id,
         assistant_phase_index=assistant_phase_index,
         turn_cycle_index=_cycle(turn_cycle_index),
@@ -448,6 +455,9 @@ def tool_result_runtime_item(
     turn_cycle_index: int | None,
     timestamp: str,
     presentation: dict[str, Any] | None = None,
+    parent_call_id: str | None = None,
+    program_id: str | None = None,
+    kernel_generation: str | int | None = None,
 ) -> ToolCallTimelineItem:
     presentation = presentation or {}
     pending_approval = bool(evaluation and evaluation.get("phase") == "waiting_for_approval")
@@ -478,6 +488,9 @@ def tool_result_runtime_item(
         stable=False,
         call_id=call_id,
         tool_name=tool_name,
+        parent_call_id=parent_call_id,
+        program_id=program_id,
+        kernel_generation=kernel_generation,
         turn_id=turn_id,
         assistant_phase_index=assistant_phase_index,
         turn_cycle_index=_cycle(turn_cycle_index),
@@ -524,6 +537,9 @@ def tool_output_runtime_item(
         stable=False,
         call_id=call_id,
         tool_name=tool_name,
+        parent_call_id=_str(snapshot.get("parent_call_id")),
+        program_id=_str(snapshot.get("program_id")),
+        kernel_generation=_str_or_int(snapshot.get("kernel_generation")),
         turn_id=_str(snapshot.get("turn_id")),
         assistant_phase_index=phase,
         turn_cycle_index=_cycle(snapshot.get("turn_cycle_index")),
@@ -774,6 +790,14 @@ def _str(value: Any) -> str | None:
 
 def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _str_or_int(value: Any) -> str | int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str | int):
+        return value
+    return None
 
 
 def _float(value: Any) -> float | None:

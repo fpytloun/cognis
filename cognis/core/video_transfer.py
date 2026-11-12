@@ -183,15 +183,39 @@ class ExecutorVideoAdapter:
         self.transfers = VideoTransfers(service)
 
     async def call(self, operation: str, **values: Any) -> dict[str, Any]:
-        result = await self.service.llm.video_rpc(
-            self.binding,
-            {
-                "operation": operation,
-                "connection": self.connection.model_dump(),
-                **values,
-            },
+        from cognis.providers.llm.usage_executor import executor_metadata, ingest_executor
+
+        usage = (
+            self.service.capture_binding(self.connection, self.binding, self.row)
+            if operation == "submit"
+            else None
         )
-        return cast(dict[str, Any], result)
+        metadata, context = executor_metadata(
+            usage,
+            None,
+            executor_id=self.binding.get("executor_id"),
+            parameters={},
+            streaming=False,
+        )
+        if metadata:
+            values["backend_metadata"] = metadata
+        try:
+            result = await self.service.llm.video_rpc(
+                self.binding,
+                {
+                    "operation": operation,
+                    "connection": self.connection.model_dump(),
+                    **values,
+                },
+            )
+        except BaseException:
+            if usage is not None:
+                usage.request.capture.failed_events += 1
+            raise
+        result = ingest_executor(result, usage, context)
+        if result.get("error"):
+            raise ValueError("Video operation failed; submission may be uncertain")
+        return result
 
     async def capabilities(self) -> VideoCapabilities:
         from cognis.models.video import VideoCapabilities
@@ -218,10 +242,17 @@ class ExecutorVideoAdapter:
             )
         )
 
-    async def stage_output(self, output: VideoOutput) -> str:
+    async def stage_output(self, output: VideoOutput, *, output_index: int | None = None) -> str:
+        from cognis.providers.video import VideoProviderError, omni_interaction_handle
+
+        inline = omni_interaction_handle(self.connection, output.locator) is not None
+        if inline and (type(output_index) is not int or output_index < 0):
+            raise VideoProviderError("invalid_inline_output_index")
         if self.row is None:
             raise ValueError("Video job is required to collect output")
         key = hashlib.sha256(output.locator.encode()).hexdigest()
+        if inline:
+            key = hashlib.sha256(f"{output.locator}\0{output_index}".encode()).hexdigest()
         artifact_id = self.transfers.artifact_id(self.row, key)
         try:
             await self.transfers.staged(self.row, artifact_id)
@@ -232,6 +263,7 @@ class ExecutorVideoAdapter:
             "collect",
             output=output.model_dump(),
             output_ticket=await self.transfers.issue(self.row, key),
+            **({"output_index": output_index} if inline else {}),
         )
         staged_artifact_id = result.get("artifact_id")
         if not isinstance(staged_artifact_id, str):

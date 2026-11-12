@@ -62,11 +62,36 @@ def test_workspace_wheels_have_exclusive_ownership(
 def test_workspace_wheels_name_the_existing_license(
     built_wheels: tuple[Path, Path, Path],
 ) -> None:
+    license_text = (REPOSITORY_ROOT / "LICENSE").read_bytes()
     for wheel in built_wheels:
         with zipfile.ZipFile(wheel) as archive:
             name = next(item for item in archive.namelist() if item.endswith(".dist-info/METADATA"))
             metadata = archive.read(name).decode("utf-8")
+            license_files = [
+                item for item in archive.namelist() if item.endswith(".dist-info/licenses/LICENSE")
+            ]
+            assert len(license_files) == 1, wheel.name
+            assert archive.read(license_files[0]) == license_text
         assert "License: BUSL-1.1\n" in metadata
+
+
+@pytest.mark.parametrize("package", ["cognis-common", "cognis-executor"])
+def test_standalone_source_archive_preserves_complete_license(package: str, tmp_path: Path) -> None:
+    subprocess.run(
+        ["uv", "build", "--package", package, "--sdist", "--out-dir", str(tmp_path)],
+        cwd=REPOSITORY_ROOT,
+        env={**os.environ, "COGNIS_SKIP_UI_BUILD": "1"},
+        check=True,
+        capture_output=True,
+    )
+    source = next(tmp_path.glob("*.tar.gz"))
+    with tarfile.open(source) as archive:
+        license_member = next(
+            member for member in archive.getmembers() if member.name.endswith("/LICENSE")
+        )
+        license_file = archive.extractfile(license_member)
+        assert license_file is not None
+        assert license_file.read() == (REPOSITORY_ROOT / "LICENSE").read_bytes()
 
 
 def test_controller_source_archive_preserves_distribution_exclusions(tmp_path: Path) -> None:
@@ -246,6 +271,7 @@ def test_workspace_console_scripts_start(command: str) -> None:
                 + RUNTIME_VERSION_ASSERTION
                 + "import cognis.core.tool_arguments; import cognis.tools.introspection; "
                 "import cognis.mcp_runtime; "
+                "import cognis.models.speech; import cognis.providers.llm.speech_streaming; "
                 "from cognis.channels.factory import create_adapter; "
                 "assert create_adapter('matrix').channel_type == 'matrix'; "
                 "assert create_adapter('google_chat').channel_type == 'google_chat'; "

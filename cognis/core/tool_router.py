@@ -6,10 +6,11 @@ import ast
 import asyncio
 import base64
 import hashlib
+import math
 import re
 import uuid
-from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -24,6 +25,7 @@ from cognis import json_codec as json
 from cognis.artifacts.store import sanitize_artifact_filename
 from cognis.core.admitted_dispatch import dispatch_admitted_tool
 from cognis.core.anchored_output import markdown_heading_anchors
+from cognis.core.artifact_revisions import ArtifactWriteParticipant, DocumentWriteFence
 from cognis.core.chat_modes import is_plan_command_tool, is_plan_mutating_tool_call
 from cognis.core.content_refs import (
     build_deliverable_public_url,
@@ -36,9 +38,15 @@ from cognis.core.credential_grants import (
     grant_credential_to_agent,
     grant_credential_to_agent_definition,
 )
+from cognis.core.feedback.agents import FeedbackAgents
+from cognis.core.feedback.authoring import prepare_result_write
+from cognis.core.feedback.comment_links import COMMENT_LINK_FIELDS, publication_comment_link
+from cognis.core.feedback.primitives import FeedbackError
+from cognis.core.feedback.public import PublicFeedback
 from cognis.core.lsp_telemetry import record_lsp_tool_result
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.core.memory_aliases import MemoryAliasState
+from cognis.core.program_config import PROGRAM_RUNTIME_TOOL_NAMES
 from cognis.core.session import executor_home_from_workspace_root
 from cognis.core.tool_arguments import validate_tool_arguments
 from cognis.core.tool_output_presentation import present_tool_output
@@ -60,6 +68,7 @@ from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.credential import CredentialAccessError, CredentialResolution
 from cognis.models.deliverable import DeliverableRevisionError
+from cognis.models.program import PROGRAM_APPROVAL_RESULT_GRACE_SECONDS
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
     EvaluationResult,
@@ -76,6 +85,7 @@ from cognis.models.tool import (
     tool_capabilities,
     tool_input_schema,
 )
+from cognis.ownership import is_shared_owner_email
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.providers.guardrails.conflicts import EvaluationConflict
 from cognis.runtime_context import (
@@ -116,6 +126,7 @@ from cognis.tools.builtin.skill_management import (
 )
 from cognis.tools.builtin.system_management import SYSTEM_MANAGEMENT_TOOLS
 from cognis.tools.builtin.tool_output import handle_tool_output_tool, is_tool_output_tool
+from cognis.tools.executor.definitions import PYTHON_EXECUTE_ACTIVE_TIMEOUT_SECONDS
 from cognis.tools.introspection import validate_available_tool_call_with_context
 from cognis.tools.native_validation import NativeValidationContext
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
@@ -130,6 +141,65 @@ TOOL_ROUTE_OUTCOMES = Counter(
     "Tool route outcomes",
     labelnames=("route", "outcome"),
 )
+
+
+@dataclass(slots=True)
+class _ProgramExecutionDeadline:
+    """Active-time tool deadline with an independent approval-wait deadline."""
+
+    active_remaining: float
+    active_started_at: float = field(default_factory=monotonic)
+    pending_approvals: dict[int, float | None] = field(default_factory=dict)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def update(
+        self,
+        status: str,
+        approval_timeout_seconds: Any = None,
+        sequence: int = 0,
+    ) -> None:
+        if status not in {"awaiting_approval", "running"}:
+            return
+        now = monotonic()
+        if status == "awaiting_approval":
+            if sequence in self.pending_approvals:
+                return
+            if not self.pending_approvals:
+                self.active_remaining = max(
+                    0.0, self.active_remaining - (now - self.active_started_at)
+                )
+            try:
+                timeout = float(approval_timeout_seconds)
+            except (TypeError, ValueError):
+                approval_deadline = None
+            else:
+                approval_deadline = (
+                    now + max(0.0, timeout) + PROGRAM_APPROVAL_RESULT_GRACE_SECONDS
+                    if math.isfinite(timeout)
+                    else None
+                )
+            self.pending_approvals[sequence] = approval_deadline
+        elif sequence in self.pending_approvals:
+            del self.pending_approvals[sequence]
+            if not self.pending_approvals:
+                self.active_started_at = now
+        else:
+            return
+        self.changed.set()
+
+    @property
+    def status(self) -> str:
+        return "awaiting_approval" if self.pending_approvals else "running"
+
+    def remaining_timeout(self) -> float | None:
+        if self.pending_approvals:
+            deadlines = [
+                deadline for deadline in self.pending_approvals.values() if deadline is not None
+            ]
+            if not deadlines:
+                return None
+            return max(0.0, min(deadlines) - monotonic())
+        return max(0.0, self.active_remaining - (monotonic() - self.active_started_at))
 
 
 def _mcp_oauth_setup_failed_result(
@@ -262,12 +332,15 @@ _ARTIFACT_VALUE_REF_FIELDS = frozenset(
 )
 _GUARDRAILS_RUNTIME_CONTEXT_KEYS = (
     "approval_call_id",
+    "caller",
+    "program",
     "workspace_root",
     "working_directory",
     "chat_mode",
     "chat_mode_source",
     "read_only_required",
     "shell_target",
+    "executed_scripts",
     "loaded_skills",
 )
 _GUARDRAILS_EXECUTOR_ENVIRONMENT_KEYS = (
@@ -294,6 +367,7 @@ class ToolRoute(StrEnum):
     ARTIFACT = "artifact"
     IMAGE = "image"
     VIDEO = "video"
+    SPEECH = "speech"
     AGENT_MANAGEMENT = "agent_management"
     MCP_MANAGEMENT = "mcp_management"
     SYSTEM_MANAGEMENT = "system_management"
@@ -324,14 +398,37 @@ class PermissionDecision:
 def caller_assignable_tools(
     registry: ToolRegistry,
     agent: AgentDefinition,
+    *,
+    access_context: RuntimeAccessContext | None = None,
 ) -> list[ToolDefinition]:
     """Return persistable tools inside the caller agent's effective authority."""
 
+    from cognis.api.runtime_support import DEFAULT_OFF_BUILTIN_TOOLS, select_static_tools
+
+    candidates = {stable_tool_id(tool): tool for tool in registry.list_tools()}
+    access = access_context or current_runtime_access_context.get()
+    # Assignment candidates do not enter the executable registry. Only the
+    # owner's root management chat may bootstrap default-off management tools.
+    if (
+        access is not None
+        and access.is_root_owner_primary_chat
+        and access.task_id is None
+        and access.agent_id == agent.agent_id
+        and access.agent_owner_email == agent.owner_email
+        and registry.get("manage_agents") is not None
+    ):
+        candidates.update(
+            (stable_tool_id(tool), tool)
+            for tool in select_static_tools(
+                agent, access_context=access, for_management_assignment=True
+            )
+            if tool.name in DEFAULT_OFF_BUILTIN_TOOLS
+        )
     return [
         tool
-        for tool in registry.list_tools()
+        for tool in candidates.values()
         if tool.configurable
-        and tool.source.type in {"builtin", "executor"}
+        and tool.source.type in {"builtin", "executor", "mcp"}
         and (
             agent.permissions is None
             or agent.permissions.resolve_permission(
@@ -456,6 +553,57 @@ class ToolRouter:
         self.non_bypassable_patterns = non_bypassable_patterns or []
         self._decision_cache_ttl_seconds = 15.0
         self._decision_cache: dict[tuple[str, str, str], tuple[float, PermissionDecision]] = {}
+        self._program_execution_deadlines: dict[str, _ProgramExecutionDeadline] = {}
+
+    def update_program_approval_status(
+        self,
+        program_id: str,
+        status: str,
+        approval_timeout_seconds: Any = None,
+        sequence: int = 0,
+    ) -> None:
+        """Pause/resume the active-time budget for one live Python execution."""
+        deadline = self._program_execution_deadlines.get(program_id)
+        if deadline is not None:
+            deadline.update(status, approval_timeout_seconds, sequence)
+
+    async def _wait_for_program_execution(
+        self,
+        awaitable: Coroutine[Any, Any, Any],
+        deadline: _ProgramExecutionDeadline,
+    ) -> Any:
+        execution = asyncio.create_task(awaitable)
+        try:
+            while True:
+                if execution.done():
+                    return await execution
+                deadline.changed.clear()
+                timeout = deadline.remaining_timeout()
+                if timeout == 0:
+                    if deadline.status == "awaiting_approval":
+                        raise TimeoutError("Program approval deadline expired")
+                    raise TimeoutError("Program execution exceeded its active-time deadline")
+                status_change = asyncio.create_task(deadline.changed.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {execution, status_change},
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    if not status_change.done():
+                        status_change.cancel()
+                    await asyncio.gather(status_change, return_exceptions=True)
+                if execution in done:
+                    return await execution
+                if not done:
+                    if deadline.status == "awaiting_approval":
+                        raise TimeoutError("Program approval deadline expired")
+                    raise TimeoutError("Program execution exceeded its active-time deadline")
+        finally:
+            if not execution.done():
+                execution.cancel()
+                await asyncio.gather(execution, return_exceptions=True)
 
     @classmethod
     async def from_session_factory(
@@ -508,8 +656,11 @@ class ToolRouter:
             return ToolRoute.TOOL_OUTPUT
         if is_artifact_tool(tool_name):
             return ToolRoute.ARTIFACT
+        from cognis.tools.builtin.speech import SPEECH_TOOL_NAMES
         from cognis.tools.builtin.video import VIDEO_TOOL_NAMES
 
+        if tool_name in SPEECH_TOOL_NAMES:
+            return ToolRoute.SPEECH
         if tool_name in VIDEO_TOOL_NAMES:
             return ToolRoute.VIDEO
         if is_image_tool(tool_name):
@@ -1086,6 +1237,52 @@ class ToolRouter:
         digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]  # noqa: S324
         return session_id, tool_name, digest
 
+    _feedback_agents: FeedbackAgents | None = None
+    _comment_sharing: PublicFeedback | None = None
+
+    def configure_feedback_tools(
+        self, agents: FeedbackAgents, *, sharing: PublicFeedback | None = None
+    ) -> None:
+        """Bind the document-write policy before accepting tool execution."""
+        if self._feedback_agents is not None:
+            raise RuntimeError("Feedback tools already configured")
+        self._feedback_agents = agents
+        self._comment_sharing = sharing
+
+    async def _prepare_feedback_document_write(
+        self,
+        tool_call: ToolCall,
+        session: SessionModel,
+        definition: ToolDefinition | None,
+        turn_id: str | None,
+        transaction_fence: DocumentWriteFence | None = None,
+    ) -> ArtifactWriteParticipant | None:
+        """Bind native document writes to this execution, never remote tool names."""
+        if definition is None:
+            return None
+        owns_write = (
+            definition.source.type == "builtin" and definition.name == "artifact_write"
+        ) or (definition.source.type == "executor" and definition.name == "artifact_publish")
+        if not owns_write:
+            return None
+        feedback_write = None
+        if self._feedback_agents is not None:
+            scope = await self._feedback_agents.scope(session.session_id, turn_id)
+            supersedes = tool_call.arguments.get("supersedes")
+            await self._feedback_agents.before_write(
+                scope, supersedes if isinstance(supersedes, str) else None
+            )
+            feedback_write = await prepare_result_write(self._feedback_agents, scope)
+        if transaction_fence is None:
+            return feedback_write
+
+        async def bind(db: AsyncSession, content_ref: str, created: bool) -> None:
+            await transaction_fence(db)
+            if feedback_write is not None:
+                await feedback_write(db, content_ref, created)
+
+        return bind
+
     async def execute(
         self,
         tool_call: ToolCall,
@@ -1098,17 +1295,68 @@ class ToolRouter:
         after_executor_send: Callable[[str, str | None], Coroutine[Any, Any, None]] | None = None,
         workflow_step_scope: WorkflowStepScope | None = None,
         workflow_executor_id: str | None = None,
+        turn_id: str | None = None,
+        transaction_fence: DocumentWriteFence | None = None,
+        program_policy: Callable[[Any], Awaitable[bool]] | None = None,
     ) -> ToolResult:
         """Execute a tool call using the appropriate route."""
 
         cid = tool_call.call_id
         route = self.classify(tool_call.name, registry)
         registered_tool = registry.get(tool_call.name)
+        if (
+            tool_call.name in PROGRAM_RUNTIME_TOOL_NAMES
+            and registered_tool is not None
+            and (program_policy is None or not await program_policy(executor))
+        ):
+            return ToolResult(
+                call_id=cid,
+                output="Program runtime is disabled for the selected executor.",
+                is_error=True,
+                metadata={"code": "program_runtime_disabled"},
+            )
+        try:
+            feedback_write = await self._prepare_feedback_document_write(
+                tool_call,
+                session,
+                registered_tool.definition if registered_tool else None,
+                turn_id,
+                transaction_fence,
+            )
+        except FeedbackError as exc:
+            return ToolResult(
+                call_id=cid,
+                is_error=True,
+                output=json.dumps({"code": exc.code, "message": str(exc)}),
+            )
         # Resolve before every admission path, including workflow and approval
         # retries. Never accept a model-supplied snapshot for this dispatch.
         runtime = dict(tool_call.runtime_metadata or {})
         runtime.pop("shell_target", None)
+        runtime.pop("executed_scripts", None)
         runtime.pop("_process_binding", None)
+        runtime.pop("_program_evaluation", None)
+        runtime.pop("mcp_binding_revision", None)
+        program_caller = runtime.pop("_program_caller", None)
+        if (
+            registered_tool is not None
+            and registered_tool.definition.source.type == "executor"
+            and registered_tool.definition.name == "bash"
+            and tool_call.name == "bash"
+        ):
+            from cognis.core.executed_script_evidence import executed_script_evidence
+
+            # Resolved on the selected executor for this dispatch only. A
+            # model-supplied value was discarded above; a failed read is
+            # unknown, never permission.
+            scripts = await executed_script_evidence(
+                executor,
+                command=tool_call.arguments.get("command"),
+                user_id=session.user_email,
+                session_id=_guardrails_session_id(session),
+            )
+            if scripts is not None:
+                runtime["executed_scripts"] = scripts
         if (
             registered_tool is not None
             and registered_tool.definition.source.type == "executor"
@@ -1191,7 +1439,12 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         workflow_decision: PermissionDecision | None = None
+        program_decision: PermissionDecision | None = None
+        program_evaluation: dict[str, Any] | None = None
         prepared_workflow_call: ToolCall | None = None
+        # Keep policy arguments separate; approved executor preparation must still
+        # resolve references from the original tool call.
+        guardrails_tool_call = tool_call
         if workflow_step_scope is not None:
             # Scope lasts for this dispatch only. Declare after the same projection
             # used by evaluation, before any route can perform external effects.
@@ -1265,6 +1518,66 @@ class ToolRouter:
                         }
                     },
                 )
+        if prepared_workflow_call is not None:
+            guardrails_tool_call = prepared_workflow_call
+        elif route is ToolRoute.LOCAL:
+            try:
+                guardrails_tool_call = await self._prepare_guardrails_tool_call(
+                    tool_call, session, agent
+                )
+            except CredentialAccessError as exc:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    self._credential_error_result(exc),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
+            except ValueError as exc:
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(output=str(exc), is_error=True),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
+        if isinstance(program_caller, dict):
+            program_decision = workflow_decision or await self.evaluate_tool_call(
+                guardrails_tool_call, agent, session, registry
+            )
+            program_evaluation = {
+                "decision": program_decision.decision,
+                "conflict_code": program_decision.conflict_code,
+                "reasoning": program_decision.reasoning,
+                "source": program_decision.source,
+                "risk": program_decision.risk,
+                "path": program_decision.path,
+                "latency_ms": program_decision.latency_ms,
+                "call_id": program_decision.call_id,
+                "session_status": program_decision.session_status,
+                "status_reason": program_decision.status_reason,
+            }
+            if program_decision.decision != "approve":
+                outcome = "denied" if program_decision.decision == "deny" else "escalated"
+                TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+                return self._sanitize_result(
+                    tool_call.name,
+                    ToolResult(
+                        output=program_decision.reasoning
+                        or (
+                            "Tool execution denied."
+                            if program_decision.decision == "deny"
+                            else "Tool requires user approval."
+                        ),
+                        is_error=True,
+                        metadata={"evaluation": program_evaluation},
+                    ),
+                    _tool_max_size(registry, tool_call.name),
+                    call_id=cid,
+                    runtime_metadata=tool_call.runtime_metadata,
+                )
         if route is ToolRoute.ORCHESTRATION:
             result, _child = await handle_delegate_tool_call(tool_call)
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="success").inc()
@@ -1303,6 +1616,15 @@ class ToolRouter:
                         if self._session_cache is not None
                         else None
                     ),
+                )
+            if program_evaluation is not None:
+                result = result.model_copy(
+                    update={
+                        "metadata": {
+                            **(result.metadata or {}),
+                            "evaluation": program_evaluation,
+                        }
+                    }
                 )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
@@ -1347,6 +1669,10 @@ class ToolRouter:
             result = await handle_artifact_tool(
                 tool_name=tool_call.name,
                 arguments=dict(tool_call.arguments),
+                comment_sharing=self._comment_sharing,
+                comment_actor_email=current_user_email.get() or session.user_email,
+                write_participant=feedback_write,
+                source_tool_call_id=cid,
                 llm=self.llm,
                 artifact_store=self.artifact_store,
                 session_factory=self._session_factory,
@@ -1365,6 +1691,33 @@ class ToolRouter:
             )
             outcome = "success" if not result.is_error else "failure"
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome=outcome).inc()
+            return self._sanitize_result(
+                tool_call.name,
+                result,
+                100_000,
+                call_id=cid,
+                runtime_metadata=tool_call.runtime_metadata,
+            )
+        if route is ToolRoute.SPEECH:
+            from cognis.core.artifact_revisions import ContentActor
+            from cognis.core.speech import SpeechService
+            from cognis.tools.builtin.speech import handle_speech_tool
+
+            result = await handle_speech_tool(
+                tool_call.name,
+                dict(tool_call.arguments),
+                service=SpeechService(
+                    session_factory=self._session_factory,
+                    artifacts=self.artifact_store,
+                    llm=self.llm,
+                ),
+                actor=ContentActor(
+                    session.user_email,
+                    session.agent_id,
+                    session.conversation_id,
+                    session.session_id,
+                ),
+            )
             return self._sanitize_result(
                 tool_call.name,
                 result,
@@ -1475,8 +1828,10 @@ class ToolRouter:
                     call_id=cid,
                     runtime_metadata=tool_call.runtime_metadata,
                 )
-            decision = workflow_decision or await self.evaluate_tool_call(
-                tool_call, agent, session, registry
+            decision = (
+                workflow_decision
+                or program_decision
+                or await self.evaluate_tool_call(tool_call, agent, session, registry)
             )
             eval_meta = {
                 "decision": decision.decision,
@@ -1518,7 +1873,11 @@ class ToolRouter:
                     llm=self.llm,
                     task_queue=getattr(self, "_task_queue", None),
                     guardrails=self.guardrails,
-                    assignable_tools=caller_assignable_tools(registry, agent),
+                    assignable_tools=caller_assignable_tools(
+                        registry,
+                        agent,
+                        access_context=self._runtime_access_from_tool_call(tool_call),
+                    ),
                     caller_agent_id=current_id,
                     credentials=self.credentials_provider,
                 )
@@ -1639,6 +1998,8 @@ class ToolRouter:
                             arguments=dict(tool_call.arguments),
                             deps=MCPManagementDependencies(
                                 session_factory=self._session_factory,
+                                credentials=self.credentials_provider,
+                                caller_agent_id=agent.agent_id,
                                 oauth_service=self._mcp_oauth_service,
                                 reconfigure_server=getattr(self, "_mcp_reconfigure_server", None),
                                 reconfigure_executor=getattr(
@@ -1660,6 +2021,17 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
         if route is ToolRoute.SKILL_MANAGEMENT:
+            validation_error = validate_tool_arguments(
+                tool_call.name,
+                tool_call.arguments,
+                schema=tool_input_schema(registered_tool.definition) if registered_tool else None,
+            )
+            if validation_error is not None:
+                return ToolResult(
+                    output=json.dumps(validation_error.as_tool_result()),
+                    is_error=True,
+                    metadata={"code": "invalid_tool_arguments"},
+                )
             # Skill management mutations go through guardrails evaluation
             # (non-bypassable tools are always evaluated).
             decision = workflow_decision or await self.evaluate_tool_call(
@@ -1713,6 +2085,11 @@ class ToolRouter:
                     artifact_store=self.artifact_store,
                     current_agent_id=current_agent_id.get() or agent.agent_id,
                     executor=executor,
+                    expected_version_id=tool_call.runtime_metadata.get(
+                        "skill_preparation_version_id"
+                    ),
+                    before_asset_prepare=before_executor_send,
+                    session_id=session.session_id,
                 )
             # Signal same-turn refresh for mutation tools so the agent loop
             # can re-resolve skills before the next model call.
@@ -1794,7 +2171,12 @@ class ToolRouter:
                 )
             result = await self._call_intaris_mcp(tool_call, session, registry)
             result = await self._materialize_inline_attachments(
-                result, session, tool_call.name, arguments=tool_call.arguments
+                result,
+                session,
+                tool_call.name,
+                arguments=tool_call.arguments,
+                call_id=tool_call.call_id,
+                write_participant=feedback_write,
             )
             if (
                 result.is_error
@@ -1826,32 +2208,6 @@ class ToolRouter:
                 runtime_metadata=tool_call.runtime_metadata,
             )
 
-        guardrails_tool_call = tool_call
-        try:
-            if prepared_workflow_call is not None:
-                guardrails_tool_call = prepared_workflow_call
-            elif route is ToolRoute.LOCAL:
-                guardrails_tool_call = await self._prepare_guardrails_tool_call(
-                    tool_call, session, agent
-                )
-        except CredentialAccessError as exc:
-            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
-            return self._sanitize_result(
-                tool_call.name,
-                self._credential_error_result(exc),
-                _tool_max_size(registry, tool_call.name),
-                call_id=cid,
-                runtime_metadata=tool_call.runtime_metadata,
-            )
-        except ValueError as exc:
-            TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
-            return self._sanitize_result(
-                tool_call.name,
-                ToolResult(output=str(exc), is_error=True),
-                _tool_max_size(registry, tool_call.name),
-                call_id=cid,
-                runtime_metadata=tool_call.runtime_metadata,
-            )
         if route is ToolRoute.LOCAL and registered_tool is not None:
             validation_error = validate_tool_arguments(
                 guardrails_tool_call.name,
@@ -1872,8 +2228,10 @@ class ToolRouter:
                     runtime_metadata=tool_call.runtime_metadata,
                 )
 
-        decision = workflow_decision or await self.evaluate_tool_call(
-            guardrails_tool_call, agent, session, registry
+        decision = (
+            workflow_decision
+            or program_decision
+            or await self.evaluate_tool_call(guardrails_tool_call, agent, session, registry)
         )
         eval_meta = {
             "decision": decision.decision,
@@ -1918,7 +2276,12 @@ class ToolRouter:
 
         try:
             if route is ToolRoute.LOCAL:
-                tool_call = await self._prepare_local_tool_call(tool_call, session, agent)
+                tool_call = await self._prepare_local_tool_call(
+                    tool_call,
+                    session,
+                    agent,
+                    binary_transfers=self._supports_binary_transfer(executor),
+                )
         except CredentialAccessError as exc:
             TOOL_ROUTE_OUTCOMES.labels(route=str(route), outcome="failure").inc()
             return self._sanitize_result(
@@ -1967,7 +2330,11 @@ class ToolRouter:
             )
         scoped_tool_call = tool_call.model_copy(
             update={
-                "execution_scope_id": session.session_id,
+                "execution_scope_id": (
+                    workflow_step_scope.step_run_id
+                    if tool_call.name == "python_execute" and workflow_step_scope is not None
+                    else session.session_id
+                ),
                 "runtime_metadata": {
                     **{
                         key: value
@@ -2002,20 +2369,27 @@ class ToolRouter:
                 },
             }
         )
-
-        if registered_tool.handler is not None:
+        provider_owned_program_tool = tool_call.name in PROGRAM_RUNTIME_TOOL_NAMES
+        if registered_tool.handler is not None and not provider_owned_program_tool:
             try:
-                result = await self._execute_local_handler(
+                result = await self._execute_binary_capable_tool(
                     scoped_tool_call,
                     registered_tool=registered_tool,
                     executor=executor,
+                    session=session,
+                    local_handler=True,
                     output_chunk_callback=output_chunk_callback,
                 )
                 result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             except CredentialAccessError as exc:
                 result = self._credential_error_result(exc)
             result = await self._materialize_inline_attachments(
-                result, session, tool_call.name, arguments=tool_call.arguments
+                result,
+                session,
+                tool_call.name,
+                arguments=tool_call.arguments,
+                call_id=tool_call.call_id,
+                write_participant=feedback_write,
             )
             result = await self._postprocess_tool_result(result, scoped_tool_call, session)
             if result.metadata is None:
@@ -2036,36 +2410,46 @@ class ToolRouter:
                 content_trust=_effective_content_trust(registered_tool, result),
             )
         try:
-            controller_result = await self._execute_controller_oauth_mcp_if_applicable(
+            controller_result = await self._prepare_http_mcp_dispatch(
                 scoped_tool_call,
                 registered_tool=registered_tool,
                 session=session,
+                agent=agent,
+                executor_id=getattr(executor, "executor_id", None),
+                executor_capabilities=getattr(executor, "capabilities", None),
             )
             if controller_result is not None:
                 result = controller_result
             else:
                 inner_timeout = registered_tool.definition.timeout_seconds
-                # Leave room for executor-side timeout cleanup and result delivery.
-                outer_timeout = inner_timeout + 20 if inner_timeout > 0 else inner_timeout
-                result = await asyncio.wait_for(
-                    dispatch_admitted_tool(
-                        executor,
-                        scoped_tool_call,
-                        timeout_seconds=inner_timeout,
-                        output_chunk_callback=output_chunk_callback,
-                        **(
-                            {"before_send": before_executor_send}
-                            if before_executor_send is not None
-                            else {}
-                        ),
-                        **(
-                            {"on_sent": after_executor_send}
-                            if after_executor_send is not None
-                            else {}
-                        ),
-                    ),
-                    timeout=outer_timeout,
+                if tool_call.name == "python_execute":
+                    # ProgramRuntime and the approval-aware outer deadline own
+                    # PTC timing; transport-level fixed timeouts must be disabled.
+                    inner_timeout = 0
+                remote_execution = self._execute_binary_capable_tool(
+                    scoped_tool_call,
+                    executor=executor,
+                    registered_tool=registered_tool,
+                    session=session,
+                    timeout_seconds=inner_timeout,
+                    output_chunk_callback=output_chunk_callback,
+                    before_send=before_executor_send,
+                    on_sent=after_executor_send,
                 )
+                if tool_call.name == "python_execute":
+                    # PTC's active runtime budget is 330 seconds; a normal
+                    # approval suspends that clock and has its own deadline.
+                    outer_timeout = PYTHON_EXECUTE_ACTIVE_TIMEOUT_SECONDS + 20
+                    deadline = _ProgramExecutionDeadline(float(outer_timeout))
+                    self._program_execution_deadlines[cid] = deadline
+                    try:
+                        result = await self._wait_for_program_execution(remote_execution, deadline)
+                    finally:
+                        self._program_execution_deadlines.pop(cid, None)
+                else:
+                    # Leave room for executor-side timeout cleanup and result delivery.
+                    outer_timeout = inner_timeout + 20 if inner_timeout > 0 else inner_timeout
+                    result = await asyncio.wait_for(remote_execution, timeout=outer_timeout)
                 result = await self._recover_remote_mcp_oauth_once(
                     result=result,
                     allow_replay=workflow_step_scope is None,
@@ -2079,7 +2463,12 @@ class ToolRouter:
                 )
                 result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(
-                result, session, tool_call.name, arguments=tool_call.arguments
+                result,
+                session,
+                tool_call.name,
+                arguments=tool_call.arguments,
+                call_id=tool_call.call_id,
+                write_participant=feedback_write,
             )
             result = await self._postprocess_tool_result(result, scoped_tool_call, session)
         except CredentialAccessError as exc:
@@ -2186,6 +2575,8 @@ class ToolRouter:
         registered_tool: Any,
         session: SessionModel,
         agent: AgentDefinition,
+        turn_id: str | None = None,
+        transaction_fence: DocumentWriteFence | None = None,
     ) -> ToolResult:
         """Run the normal post-execution pipeline over a recovered tool result.
 
@@ -2204,9 +2595,17 @@ class ToolRouter:
             if key in _CONTROLLER_OWNED_RESULT_METADATA_KEYS
         }
         try:
+            feedback_write = await self._prepare_feedback_document_write(
+                tool_call, session, registered_tool.definition, turn_id, transaction_fence
+            )
             result = await self._persist_browser_auth_state_if_needed(result, session, agent)
             result = await self._materialize_inline_attachments(
-                result, session, tool_call.name, arguments=tool_call.arguments
+                result,
+                session,
+                tool_call.name,
+                arguments=tool_call.arguments,
+                call_id=tool_call.call_id,
+                write_participant=feedback_write,
             )
             result = await self._postprocess_tool_result(result, tool_call, session)
         except CredentialAccessError as exc:
@@ -2412,33 +2811,30 @@ class ToolRouter:
             await asyncio.sleep(0.1)
         return False
 
-    async def _execute_controller_oauth_mcp_if_applicable(
+    async def _prepare_http_mcp_dispatch(
         self,
         tool_call: ToolCall,
         *,
         registered_tool: Any,
         session: SessionModel,
+        agent: AgentDefinition,
+        executor_id: str | None,
+        executor_capabilities: Any = None,
     ) -> ToolResult | None:
-        """Execute OAuth HTTP MCP tools in the controller with per-call token refresh."""
+        """Authorize credential bindings or execute the existing controller OAuth path."""
 
         source = registered_tool.definition.source
         if source.type != "local_mcp" or not source.server_id:
             return None
-        if self._session_factory is None or self._mcp_oauth_service is None:
+        if self._session_factory is None:
             return None
 
         async with self._session_factory() as store_session:
             mcp_row = await get_mcp_server(
                 store_session,
                 source.server_id,
-                owner_email=session.user_email,
+                owner_email=agent.owner_email,
                 include_shared=True,
-            )
-            tool_timeout_raw = await get_setting_value(
-                store_session, "mcp.tool_timeout_seconds", 300
-            )
-            connect_timeout_raw = await get_setting_value(
-                store_session, "mcp.connect_timeout_seconds", 15
             )
         if mcp_row is None or mcp_row.status != "active":
             return None
@@ -2447,10 +2843,45 @@ class ToolRouter:
 
         base_headers = mcp_row.headers or {}
         auth_config = effective_mcp_auth_config(mcp_row.auth_config, base_headers)
+        if auth_config.type == "credential_bearer":
+            from cognis.core.mcp_credentials import (
+                authorize_mcp_dispatch,
+                executor_supports_mcp_credentials,
+            )
+
+            if not executor_supports_mcp_credentials(executor_capabilities):
+                raise CredentialAccessError(
+                    "mcp_credential_executor_upgrade_required",
+                    "Executor must be upgraded before using this MCP credential binding.",
+                )
+            revision = await authorize_mcp_dispatch(
+                session_factory=self._session_factory,
+                credentials=self.credentials_provider,
+                executor_id=executor_id or "",
+                server_id=source.server_id,
+                agent_id=agent.agent_id,
+            )
+            tool_call.runtime_metadata["mcp_binding_revision"] = revision
+            return None
         if auth_config.type != "oauth2":
+            return None
+        if self._mcp_oauth_service is None:
+            return None
+        if getattr(
+            mcp_row, "owner_email", session.user_email
+        ) != session.user_email and not is_shared_owner_email(
+            getattr(mcp_row, "owner_email", None)
+        ):
             return None
         if mcp_headers_have_authorization(base_headers):
             return None
+        async with self._session_factory() as store_session:
+            tool_timeout_raw = await get_setting_value(
+                store_session, "mcp.tool_timeout_seconds", 300
+            )
+            connect_timeout_raw = await get_setting_value(
+                store_session, "mcp.connect_timeout_seconds", 15
+            )
 
         try:
             token_result = await self._mcp_oauth_service.inject_authorization_header(
@@ -2819,6 +3250,95 @@ class ToolRouter:
             update={"metadata": next_metadata, "attachments": analysis.attachments}
         )
 
+    @staticmethod
+    def _supports_binary_transfer(executor: Any) -> bool:
+        capabilities = getattr(executor, "capabilities", None)
+        if capabilities is None:
+            capabilities = getattr(getattr(executor, "handle", None), "capabilities", None)
+        return getattr(capabilities, "binary_transfers", False) is True
+
+    async def _execute_binary_capable_tool(
+        self,
+        tool_call: ToolCall,
+        *,
+        executor: Any,
+        registered_tool: Any,
+        session: SessionModel,
+        local_handler: bool = False,
+        timeout_seconds: int | None = None,
+        output_chunk_callback: ToolOutputChunkCallback | None = None,
+        before_send: Any = None,
+        on_sent: Any = None,
+    ) -> ToolResult:
+        """Bind upload authority to this dispatch without changing delivery certainty."""
+        from cognis.core.binary_transfers import BinaryTransferService
+
+        capabilities = getattr(executor, "capabilities", None)
+        if capabilities is None:
+            capabilities = getattr(getattr(executor, "handle", None), "capabilities", None)
+        service = (
+            BinaryTransferService(self._session_factory, self.artifact_store)
+            if self._session_factory is not None
+            and self.artifact_store is not None
+            and self._supports_binary_transfer(executor)
+            else None
+        )
+        scope_id = None
+        if service is not None:
+            scope_id, grant = await service.issue(
+                owner_email=session.user_email,
+                agent_id=session.agent_id,
+                conversation_id=session.conversation_id,
+                session_id=session.session_id,
+                call_id=tool_call.call_id,
+                tool_name=tool_call.name,
+                executor_id=str(
+                    getattr(executor, "executor_id", None)
+                    or getattr(getattr(executor, "handle", None), "executor_id", "")
+                ),
+            )
+            tool_call = tool_call.model_copy(
+                update={
+                    "runtime_metadata": {
+                        **tool_call.runtime_metadata,
+                        "binary_transfer_grant": grant.model_dump(),
+                    }
+                }
+            )
+        try:
+            if local_handler:
+                result = await self._execute_local_handler(
+                    tool_call,
+                    registered_tool=registered_tool,
+                    executor=executor,
+                    output_chunk_callback=output_chunk_callback,
+                )
+            else:
+                result = await dispatch_admitted_tool(
+                    executor,
+                    tool_call,
+                    timeout_seconds=timeout_seconds,
+                    output_chunk_callback=output_chunk_callback,
+                    **({"before_send": before_send} if before_send is not None else {}),
+                    **({"on_sent": on_sent} if on_sent is not None else {}),
+                )
+        except ExecutorDeliveryError as exc:
+            if (
+                service is not None
+                and scope_id is not None
+                and exc.delivery_state == DeliveryState.NOT_SENT
+            ):
+                await service.close_scope(scope_id, cancelled=True)
+            # Accepted-unknown calls may still finish and require normal reconciliation.
+            raise
+        except BaseException:
+            if service is not None and scope_id is not None:
+                await service.close_scope(scope_id, cancelled=True)
+            raise
+        if service is not None and scope_id is not None:
+            await service.close_scope(scope_id, cancelled=result.is_error)
+        return result
+
     async def _execute_local_handler(
         self,
         tool_call: ToolCall,
@@ -2862,6 +3382,14 @@ class ToolRouter:
             tool_input_schema(registered_tool.definition),
         )
         raw = await handler(normalized_arguments, context)
+        if isinstance(raw, ToolResult):
+            raw = raw.model_copy(
+                update={
+                    "attachments": await context.binary_transfers.prepare_attachments(
+                        raw.attachments
+                    )
+                }
+            )
         duration_ms = int((perf_counter() - start) * 1000)
         return self._normalize_local_tool_result(raw, duration_ms)
 
@@ -2925,7 +3453,6 @@ class ToolRouter:
                         f"browser_upload supports at most {_MAX_BROWSER_UPLOAD_FILES} files per call"
                     )
                 source_artifacts: list[dict[str, Any]] = []
-                total_bytes = 0
                 for artifact_id in artifact_ids:
                     if not isinstance(artifact_id, str) or not artifact_id.strip():
                         continue
@@ -2937,12 +3464,6 @@ class ToolRouter:
                         accessor_agent_id=session.agent_id,
                         accessor_session_id=session.session_id,
                     )
-                    total_bytes += int(metadata["size_bytes"] or 0)
-                    if total_bytes > _MAX_BROWSER_UPLOAD_BYTES:
-                        raise ValueError(
-                            "browser_upload artifact payload is too large: "
-                            f"{total_bytes} bytes exceeds {_MAX_BROWSER_UPLOAD_BYTES} bytes"
-                        )
                     source_artifacts.append(
                         {
                             "artifact_id": artifact_id,
@@ -2981,49 +3502,69 @@ class ToolRouter:
         return tool_call.model_copy(update={"arguments": arguments})
 
     async def _prepare_local_tool_call(
-        self, tool_call: ToolCall, session: SessionModel, agent: AgentDefinition
+        self,
+        tool_call: ToolCall,
+        session: SessionModel,
+        agent: AgentDefinition,
+        *,
+        binary_transfers: bool = False,
     ) -> ToolCall:
         arguments = dict(tool_call.arguments)
         if tool_call.name == "artifact_save" and (
             artifact_id := arguments.get("source_artifact_id")
         ):
-            content, mime_type, filename = await self._load_binary_content_ref(
-                str(artifact_id),
-                session.user_email,
-                scope_task_id=self._content_ref_scope_task_id(tool_call),
-                accessor_conversation_id=session.conversation_id,
-                accessor_agent_id=session.agent_id,
-                accessor_session_id=session.session_id,
-            )
-            arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
-            arguments.setdefault("source_artifact_filename", filename)
-            arguments.setdefault("source_artifact_mime_type", mime_type)
+            if binary_transfers:
+                arguments["source_artifact_download"] = await self._binary_download_descriptor(
+                    str(artifact_id), session, tool_call
+                )
+            else:
+                content, mime_type, filename = await self._load_binary_content_ref(
+                    str(artifact_id),
+                    session.user_email,
+                    scope_task_id=self._content_ref_scope_task_id(tool_call),
+                    accessor_conversation_id=session.conversation_id,
+                    accessor_agent_id=session.agent_id,
+                    accessor_session_id=session.session_id,
+                )
+                arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
+                arguments.setdefault("source_artifact_filename", filename)
+                arguments.setdefault("source_artifact_mime_type", mime_type)
         if tool_call.name.startswith("office_") and (
             artifact_id := arguments.get("source_artifact_id")
         ):
-            content, mime_type, filename = await self._load_binary_content_ref(
-                str(artifact_id),
-                session.user_email,
-                scope_task_id=self._content_ref_scope_task_id(tool_call),
-                accessor_conversation_id=session.conversation_id,
-                accessor_agent_id=session.agent_id,
-                accessor_session_id=session.session_id,
-            )
-            arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
-            arguments.setdefault("source_artifact_filename", filename)
-            arguments.setdefault("source_artifact_mime_type", mime_type)
-            arguments.setdefault("source_artifact_size_bytes", len(content))
+            if binary_transfers:
+                arguments["source_artifact_download"] = await self._binary_download_descriptor(
+                    str(artifact_id), session, tool_call
+                )
+            else:
+                content, mime_type, filename = await self._load_binary_content_ref(
+                    str(artifact_id),
+                    session.user_email,
+                    scope_task_id=self._content_ref_scope_task_id(tool_call),
+                    accessor_conversation_id=session.conversation_id,
+                    accessor_agent_id=session.agent_id,
+                    accessor_session_id=session.session_id,
+                )
+                arguments["source_artifact_content_b64"] = base64.b64encode(content).decode("ascii")
+                arguments.setdefault("source_artifact_filename", filename)
+                arguments.setdefault("source_artifact_mime_type", mime_type)
+                arguments.setdefault("source_artifact_size_bytes", len(content))
         if tool_call.name == "document_generate" and (
             artifact_id := arguments.get("source_artifact_id")
         ):
-            arguments["source_artifact_content"] = await self._load_text_content_ref(
-                str(artifact_id),
-                session.user_email,
-                scope_task_id=self._content_ref_scope_task_id(tool_call),
-                accessor_conversation_id=session.conversation_id,
-                accessor_agent_id=session.agent_id,
-                accessor_session_id=session.session_id,
-            )
+            if binary_transfers:
+                arguments["source_artifact_download"] = await self._binary_download_descriptor(
+                    str(artifact_id), session, tool_call
+                )
+            else:
+                arguments["source_artifact_content"] = await self._load_text_content_ref(
+                    str(artifact_id),
+                    session.user_email,
+                    scope_task_id=self._content_ref_scope_task_id(tool_call),
+                    accessor_conversation_id=session.conversation_id,
+                    accessor_agent_id=session.agent_id,
+                    accessor_session_id=session.session_id,
+                )
         if tool_call.name == "browser_upload":
             arguments.pop("source_artifacts", None)
             artifact_ids = arguments.get("source_artifact_ids")
@@ -3036,6 +3577,11 @@ class ToolRouter:
                 total_bytes = 0
                 for artifact_id in artifact_ids:
                     if not isinstance(artifact_id, str) or not artifact_id.strip():
+                        continue
+                    if binary_transfers:
+                        source_artifacts.append(
+                            await self._binary_download_descriptor(artifact_id, session, tool_call)
+                        )
                         continue
                     content, mime_type, filename = await self._load_binary_content_ref(
                         artifact_id,
@@ -3059,7 +3605,9 @@ class ToolRouter:
                             "content_b64": base64.b64encode(content).decode("ascii"),
                         }
                     )
-                arguments["source_artifacts"] = source_artifacts
+                arguments[
+                    "source_artifact_downloads" if binary_transfers else "source_artifacts"
+                ] = source_artifacts
         assets = arguments.get("assets") if tool_call.name == "document_generate" else None
         if isinstance(assets, list):
             resolved_assets: list[dict[str, Any]] = []
@@ -3068,6 +3616,15 @@ class ToolRouter:
                     continue
                 item = dict(raw)
                 if artifact_id := item.get("artifact_id"):
+                    if binary_transfers:
+                        descriptor = await self._binary_download_descriptor(
+                            str(artifact_id), session, tool_call
+                        )
+                        item["artifact_download"] = descriptor
+                        item.setdefault("mime_type", descriptor["mime_type"])
+                        item.setdefault("filename", descriptor["filename"])
+                        resolved_assets.append(item)
+                        continue
                     content, mime_type, filename = await self._load_binary_content_ref(
                         str(artifact_id),
                         session.user_email,
@@ -3676,6 +4233,42 @@ class ToolRouter:
         )
         return str(content.decode("utf-8", errors="replace"))
 
+    async def _binary_download_descriptor(
+        self, artifact_id: str, session: SessionModel, tool_call: ToolCall
+    ) -> dict[str, Any]:
+        """Authorize before exposing a streaming read capability to an executor."""
+        from cognis.transfers.models import DownloadDescriptor
+
+        scope = {
+            "scope_task_id": self._content_ref_scope_task_id(tool_call),
+            "accessor_conversation_id": session.conversation_id,
+            "accessor_agent_id": session.agent_id,
+            "accessor_session_id": session.session_id,
+        }
+        metadata = await self._get_accessible_content_ref_metadata(
+            artifact_id, session.user_email, **scope
+        )
+        url = await self._get_content_ref_public_url(
+            artifact_id, session.user_email, ttl_seconds=1800, **scope
+        )
+        content_hash = None
+        if not is_deliverable_ref(artifact_id):
+            row = await self._get_accessible_artifact_record(
+                artifact_id,
+                session.user_email,
+                conversation_id=session.conversation_id,
+                agent_id=session.agent_id,
+                session_id=session.session_id,
+            )
+            content_hash = row.content_hash
+        return DownloadDescriptor(
+            url=url,
+            filename=metadata["filename"],
+            mime_type=metadata["mime_type"],
+            size_bytes=metadata["size_bytes"],
+            sha256=content_hash,
+        ).model_dump()
+
     async def _load_binary_content_ref(
         self,
         artifact_id: str,
@@ -3888,30 +4481,93 @@ class ToolRouter:
         tool_name: str,
         *,
         arguments: dict[str, Any] | None = None,
+        call_id: str | None = None,
+        write_participant: ArtifactWriteParticipant | None = None,
     ) -> ToolResult:
+        if tool_name == "artifact_publish" and result.metadata:
+            # Result-scoped identity follows the existing publication transaction;
+            # this adds no I/O, retry, lock, or cancellation owner.
+            metadata = dict(result.metadata)
+            metadata.pop("artifact_id", None)
+            result = result.model_copy(update={"metadata": metadata})
         if not result.attachments or self.artifact_store is None or self._session_factory is None:
             return result
         changed = False
+        published_artifact_id: str | None = None
         materialized: list[dict[str, Any]] = []
         for raw in result.attachments:
-            if not isinstance(raw, dict) or "content_b64" not in raw or raw.get("artifact_id"):
+            if isinstance(raw, dict) and "transfer_receipt" in raw:
+                from cognis.core.binary_transfers import BinaryTransferService
+                from cognis.transfers.models import TransferReceipt
+
+                if call_id is None:
+                    raise ValueError("A binary receipt requires its originating call")
+                staged = await BinaryTransferService(
+                    self._session_factory, self.artifact_store
+                ).claim(
+                    TransferReceipt.model_validate(raw["transfer_receipt"]),
+                    owner_email=session.user_email,
+                    session_id=session.session_id,
+                    call_id=call_id,
+                )
+                try:
+                    materialized.append(
+                        await self._publish_artifact_document(
+                            raw,
+                            session,
+                            arguments or {},
+                            staged=staged,
+                            source_tool_call_id=call_id,
+                            write_participant=write_participant,
+                        )
+                        if tool_name == "artifact_publish"
+                        else await self._persist_inline_attachment(
+                            raw, session, tool_name, staged=staged
+                        )
+                    )
+                except DeliverableRevisionError as exc:
+                    payload = exc.to_tool_result()
+                    return ToolResult(output=json.dumps(payload), is_error=True, metadata=payload)
+                if (
+                    tool_name == "artifact_publish"
+                    and not result.is_error
+                    and published_artifact_id is None
+                ):
+                    published_artifact_id = materialized[-1]["artifact_id"]
+                changed = True
+                continue
+            if (
+                not isinstance(raw, dict)
+                or "content_b64" not in raw
+                or (raw.get("artifact_id") and tool_name != "artifact_publish")
+            ):
                 materialized.append(raw)
                 continue
             changed = True
             if tool_name == "artifact_publish":
                 try:
                     materialized.append(
-                        await self._publish_artifact_document(raw, session, arguments or {})
+                        await self._publish_artifact_document(
+                            raw,
+                            session,
+                            arguments or {},
+                            source_tool_call_id=call_id,
+                            write_participant=write_participant,
+                        )
                     )
                 except DeliverableRevisionError as exc:
                     # Rejected publish: nothing was stored (see artifact_revisions).
                     payload = exc.to_tool_result()
                     return ToolResult(output=json.dumps(payload), is_error=True, metadata=payload)
+                if not result.is_error and published_artifact_id is None:
+                    published_artifact_id = materialized[-1]["artifact_id"]
                 continue
             materialized.append(await self._persist_inline_attachment(raw, session, tool_name))
         enriched_output = self._enrich_attachment_output(result.output, materialized)
         attachment_anchors = self._attachment_output_anchors(enriched_output, materialized)
         next_metadata = dict(result.metadata or {})
+        if published_artifact_id is not None:
+            next_metadata["artifact_id"] = published_artifact_id
         if attachment_anchors:
             existing_anchors = next_metadata.get("output_anchors")
             merged_anchors = list(existing_anchors) if isinstance(existing_anchors, list) else []
@@ -3941,6 +4597,11 @@ class ToolRouter:
         raw: dict[str, Any],
         session: SessionModel,
         arguments: dict[str, Any],
+        *,
+        staged: Any = None,
+        source_tool_call_id: str | None = None,
+        write_participant: ArtifactWriteParticipant | None = None,
+        purpose: str = "artifact_publish",
     ) -> dict[str, Any]:
         """Persist an executor-published file as a (revisioned) artifact document."""
 
@@ -3949,11 +4610,21 @@ class ToolRouter:
         if self.artifact_store is None or self._session_factory is None:
             raise ValueError("Artifact support not available")
         content_b64 = raw.get("content_b64")
-        if not isinstance(content_b64, str):
-            raise ValueError("Inline attachment missing content_b64")
-        content = base64.b64decode(content_b64)
-        mime_type = str(raw.get("mime_type") or "application/octet-stream")
-        filename = sanitize_artifact_filename(str(raw.get("filename") or "attachment"))
+        content = None
+        if staged is None:
+            if not isinstance(content_b64, str):
+                raise ValueError("Inline attachment missing content_b64")
+            content = base64.b64decode(content_b64)
+        mime_type = (
+            staged.mime_type
+            if staged is not None
+            else str(raw.get("mime_type") or "application/octet-stream")
+        )
+        filename = (
+            staged.filename
+            if staged is not None
+            else sanitize_artifact_filename(str(raw.get("filename") or "attachment"))
+        )
         kind = _kind_for_mime_type(mime_type)
 
         def _optional(name: str) -> str | None:
@@ -3973,24 +4644,35 @@ class ToolRouter:
             filename=filename,
             mime_type=mime_type,
             kind=kind.value,
-            purpose="artifact_publish",
+            purpose=purpose,
             supersedes=_optional("supersedes"),
             project_id=_optional("project_id"),
+            staged=staged,
+            source_tool_call_id=source_tool_call_id,
+            transaction_participant=write_participant,
         )
         url = await self.artifact_store.async_get_public_url(
             row.namespace, row.artifact_id, filename
+        )
+        comment_link = await publication_comment_link(
+            self._comment_sharing,
+            requested=arguments.get("allow_comments") is True,
+            content_ref=row.artifact_id,
+            user_email=current_user_email.get() or session.user_email,
+            agent_id=session.agent_id,
         )
         return {
             "artifact_id": row.artifact_id,
             "url": url,
             "mime_type": mime_type,
             "filename": filename,
-            "size_bytes": len(content),
+            "size_bytes": row.size_bytes,
             "kind": kind.value,
-            "content_b64": content_b64,
+            **({"content_b64": content_b64} if staged is None else {}),
             "lineage_id": view.lineage_id,
             "revision": view.revision,
             "project_id": view.project_id,
+            **comment_link,
         }
 
     async def _persist_inline_attachment(
@@ -3998,13 +4680,15 @@ class ToolRouter:
         raw: dict[str, Any],
         session: SessionModel,
         tool_name: str,
+        *,
+        staged: Any = None,
     ) -> dict[str, Any]:
         if self.artifact_store is None or self._session_factory is None:
             raise ValueError("Artifact support not available")
         content_b64 = raw.get("content_b64")
-        if not isinstance(content_b64, str):
+        if staged is None and not isinstance(content_b64, str):
             raise ValueError("Inline attachment missing content_b64")
-        content = base64.b64decode(content_b64)
+        content = base64.b64decode(content_b64) if isinstance(content_b64, str) else b""
         mime_type = str(raw.get("mime_type") or "application/octet-stream")
         filename = sanitize_artifact_filename(str(raw.get("filename") or "attachment"))
         kind = _kind_for_mime_type(mime_type)
@@ -4017,44 +4701,62 @@ class ToolRouter:
             if published
             else ("documents" if kind is ArtifactKind.PDF else "attachments")
         )
-        await self.artifact_store.async_save(
-            namespace,
-            artifact_id,
-            filename,
-            content,
-            mime_type,
-            owner_email=session.user_email,
-        )
-        async with self._session_factory() as db_session:
-            await create_artifact_record(
-                db_session,
-                artifact_id=artifact_id,
-                namespace=namespace,
-                object_id=artifact_id,
-                filename=filename,
-                owner_email=session.user_email,
-                purpose=tool_name if published else str(raw.get("purpose") or tool_name),
-                kind=kind.value,
-                mime_type=mime_type,
-                size_bytes=len(content),
-                status="attached",
-                expires_at=None,
-                content_hash=hashlib.sha256(content).hexdigest(),
-                conversation_id=session.conversation_id,
-                session_id=session.session_id,
-                owner_agent_id=session.agent_id,
-                message_role="assistant",
+        size_bytes = len(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+        if staged is not None:
+            artifact_id, namespace, filename = staged.artifact_id, staged.namespace, staged.filename
+            mime_type, size_bytes, content_hash = staged.mime_type, staged.size_bytes, staged.sha256
+            kind = _kind_for_mime_type(mime_type)
+        else:
+            await self.artifact_store.async_save(
+                namespace, artifact_id, filename, content, mime_type, owner_email=session.user_email
             )
-            await db_session.commit()
+        async with self._session_factory() as db_session:
+            already_published = False
+            if staged is not None:
+                from cognis.core.binary_transfers import lock_transfer_publication
+                from cognis.core.content_projects import lock_document_scope
+
+                await lock_document_scope(db_session, session.conversation_id)
+                upload = await lock_transfer_publication(
+                    db_session,
+                    staged,
+                    owner_email=session.user_email,
+                    session_id=session.session_id,
+                )
+                already_published = upload.state == "consumed"
+                if not already_published:
+                    upload.state = "consumed"
+            if not already_published:
+                await create_artifact_record(
+                    db_session,
+                    artifact_id=artifact_id,
+                    namespace=namespace,
+                    object_id=artifact_id,
+                    filename=filename,
+                    owner_email=session.user_email,
+                    purpose=tool_name if published else str(raw.get("purpose") or tool_name),
+                    kind=kind.value,
+                    mime_type=mime_type,
+                    size_bytes=size_bytes,
+                    status="attached",
+                    expires_at=None,
+                    content_hash=content_hash,
+                    conversation_id=session.conversation_id,
+                    session_id=session.session_id,
+                    owner_agent_id=session.agent_id,
+                    message_role="assistant",
+                )
+                await db_session.commit()
         url = await self.artifact_store.async_get_public_url(namespace, artifact_id, filename)
         return {
             "artifact_id": artifact_id,
             "url": url,
             "mime_type": mime_type,
             "filename": filename,
-            "size_bytes": len(content),
+            "size_bytes": size_bytes,
             "kind": kind.value,
-            "content_b64": content_b64,
+            **({"content_b64": content_b64} if staged is None else {}),
         }
 
     def _enrich_attachment_output(self, output: str, attachments: list[dict[str, Any]]) -> str:
@@ -4070,7 +4772,7 @@ class ToolRouter:
             "mime_type": primary.get("mime_type"),
             "size_bytes": primary.get("size_bytes"),
         }
-        for revision_key in ("lineage_id", "revision", "project_id"):
+        for revision_key in ("lineage_id", "revision", "project_id", *COMMENT_LINK_FIELDS):
             if primary.get(revision_key) is not None:
                 enriched[revision_key] = primary[revision_key]
         output = self._replace_generic_attachment_guidance(output, primary)
@@ -4250,6 +4952,28 @@ class ToolRouter:
         if isinstance(result, ToolResult):
             return result
         return ToolResult.model_validate(result)
+
+    def finalize_skill_result(
+        self,
+        tool_call: ToolCall,
+        result: ToolResult,
+        messages: list[dict[str, Any]],
+    ) -> ToolResult:
+        """Deduplicate a skill payload before rendering its settled tool result."""
+        from cognis.core.skill_context import deduplicate_skill_instructions
+
+        if result.is_error:
+            return result
+        assert result.metadata is not None
+        raw_result = result.model_copy(update={"output": result.metadata["_raw_output"]})
+        updated = deduplicate_skill_instructions(raw_result, messages)
+        return self._sanitize_result(
+            tool_call.name,
+            updated,
+            50_000,
+            call_id=tool_call.call_id,
+            runtime_metadata=tool_call.runtime_metadata,
+        )
 
     def _sanitize_result(
         self,

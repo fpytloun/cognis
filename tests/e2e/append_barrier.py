@@ -8,6 +8,7 @@ import asyncio
 import socket
 import threading
 from contextlib import asynccontextmanager
+from time import perf_counter
 from urllib.parse import urlsplit
 
 import httpx
@@ -42,6 +43,8 @@ class AppendBarrierProxy:
         )
         self.target: tuple[str, str] | None = None
         self.barrier: RequestBarrier | None = None
+        self._request_metadata_lock = threading.Lock()
+        self._request_metadata: list[dict[str, object]] = []
 
         @asynccontextmanager
         async def lifespan(_app):
@@ -72,6 +75,14 @@ class AppendBarrierProxy:
         if self.barrier:
             self.barrier.cancel()
         await self.client.aclose()
+
+    def snapshot_request_metadata(self) -> list[dict[str, object]]:
+        with self._request_metadata_lock:
+            return [dict(item) for item in self._request_metadata]
+
+    def _record_request_metadata(self, metadata: dict[str, object]) -> None:
+        with self._request_metadata_lock:
+            self._request_metadata.append(metadata)
 
     async def forward(self, request: Request) -> Response:
         if request.client is None or request.client.host != "127.0.0.1":
@@ -104,7 +115,45 @@ class AppendBarrierProxy:
         path = request.url.path
         if request.url.query:
             path += "?" + request.url.query
-        response = await self.client.request(request.method, path, headers=headers, content=raw)
+        target = self.client.base_url
+        if request.url.path == "/health":
+            operation = "health"
+        elif request.url.path.endswith("/events"):
+            operation = "record_events" if request.method == "POST" else "read_events"
+        else:
+            operation = "other"
+        started = perf_counter()
+        try:
+            response = await self.client.request(
+                request.method,
+                path,
+                headers=headers,
+                content=raw,
+            )
+        except Exception as exc:
+            self._record_request_metadata(
+                {
+                    "operation": operation,
+                    "method": request.method,
+                    "scheme": target.scheme,
+                    "host": target.host,
+                    "port": target.port,
+                    "error_type": type(exc).__name__,
+                    "duration_ms": round((perf_counter() - started) * 1000, 1),
+                }
+            )
+            raise
+        self._record_request_metadata(
+            {
+                "operation": operation,
+                "method": request.method,
+                "scheme": target.scheme,
+                "host": target.host,
+                "port": target.port,
+                "status_code": response.status_code,
+                "duration_ms": round((perf_counter() - started) * 1000, 1),
+            }
+        )
         result = Response(content=response.content, status_code=response.status_code)
         result.raw_headers = [
             (k, v)
@@ -183,6 +232,9 @@ class AppendProxyServer:
 
     def release(self) -> None:
         self._call(self.proxy.barrier.release)
+
+    def request_metadata(self) -> list[dict[str, object]]:
+        return self._call(self.proxy.snapshot_request_metadata)
 
     def cancel(self) -> None:
         def cancel():

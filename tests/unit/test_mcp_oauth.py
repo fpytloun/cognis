@@ -1207,7 +1207,7 @@ async def test_start_authorization_uses_executor_loopback_redirect_uri(
         return server
 
     async def fake_get_executor_row(*args, **kwargs):
-        return SimpleNamespace(executor_id="exec-1", name="Fixture Mac")
+        return SimpleNamespace(executor_id="exec-1", name="Sample laptop")
 
     async def fake_create_transaction(session, **kwargs):
         row = SimpleNamespace(notification_id=None, **kwargs)
@@ -1252,7 +1252,7 @@ async def test_start_authorization_uses_executor_loopback_redirect_uri(
     assert query["redirect_uri"] == ["http://127.0.0.1:4567/oauth/callback"]
     assert result.callback_mode == "executor_loopback"
     assert result.oauth_executor_id == "exec-1"
-    assert result.oauth_executor_name == "Fixture Mac"
+    assert result.oauth_executor_name == "Sample laptop"
     assert result.redirect_uri == "http://127.0.0.1:4567/oauth/callback"
     assert started_states == [query["state"][0]]
     assert transaction_rows[0].redirect_uri == "http://127.0.0.1:4567/oauth/callback"
@@ -3432,9 +3432,25 @@ async def test_runtime_mcp_resolution_passes_workflow_step_context(
     monkeypatch.setattr("cognis.store.queries.get_mcp_server", fake_get_mcp_server)
     monkeypatch.setattr("cognis.store.queries.get_setting_value", fake_get_setting_value)
 
+    from contextlib import asynccontextmanager
+
+    resolver_closed = False
+
+    @asynccontextmanager
+    async def resolver_sessions():
+        nonlocal resolver_closed
+        async with _MemorySessionFactory(session)() as opened:
+            yield opened
+        resolver_closed = True
+
+    async def authorize(**kwargs):
+        assert resolver_closed, "OAuth I/O must not retain the resolver database session"
+        return oauth_service.inject_authorization_header.return_value
+
+    oauth_service.inject_authorization_header.side_effect = authorize
     servers = await _resolve_executor_mcp_servers(
         {"config": {"mcp_server_ids": ["mcp-1"]}, "executor_owner_email": "owner@example.com"},
-        _MemorySessionFactory(session),
+        resolver_sessions,
         providers=SimpleNamespace(mcp_oauth_service=oauth_service),
         user_email="alice@example.com",
         conversation_id="conv-1",
@@ -3545,7 +3561,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _Executor:
-        executor_id = "fixture-mac"
+        executor_id = "sample-laptop"
         desired_config_version = 4
         applied_config_version = 4
 
@@ -3629,10 +3645,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         reason="test",
     )
 
-    assert runtime_updates == [("fixture-mac", "reconfiguring")]
+    assert runtime_updates == [("sample-laptop", "reconfiguring")]
     assert session.committed is True
-    assert scheduled == ["fixture-mac"]
-    assert result == ["fixture-mac"]
+    assert scheduled == ["sample-laptop"]
+    assert result == ["sample-laptop"]
 
     desired_before_refresh = executor.desired_config_version
     result = await schedule_mcp_server_executor_reconfigure_for_app(
@@ -3641,10 +3657,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         reason="mcp_oauth_refresh_succeeded",
     )
 
-    assert result == ["fixture-mac"]
+    assert result == ["sample-laptop"]
     assert executor.desired_config_version == desired_before_refresh
-    assert runtime_updates == [("fixture-mac", "reconfiguring")]
-    assert credential_reloads == [("fixture-mac", "mcp-1")]
+    assert runtime_updates == [("sample-laptop", "reconfiguring")]
+    assert credential_reloads == [("sample-laptop", "mcp-1")]
 
     runtime_updates.clear()
     scheduled.clear()
@@ -3674,10 +3690,10 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         terminal_cleanup_transaction_id="txn-1",
     )
 
-    assert result == ["fixture-mac"]
+    assert result == ["sample-laptop"]
     assert repeated == []
-    assert runtime_updates == [("fixture-mac", "reconfiguring")]
-    assert scheduled == ["fixture-mac"]
+    assert runtime_updates == [("sample-laptop", "reconfiguring")]
+    assert scheduled == ["sample-laptop"]
     assert cleanup_transaction.terminal_reconfigure_applied_at is not None
     assert cleanup_transaction.terminal_reconfigure_completed_at is not None
 
@@ -3706,7 +3722,7 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
     assert cleanup_transaction.terminal_reconfigure_applied_at is not None
     assert cleanup_transaction.terminal_reconfigure_completed_at is None
     assert executor.desired_config_version == 5
-    assert runtime_updates == [("fixture-mac", "reconfiguring")]
+    assert runtime_updates == [("sample-laptop", "reconfiguring")]
 
     monkeypatch.setattr(
         "cognis.api.mcp_reconfigure.schedule_executor_reconfigure",
@@ -3742,12 +3758,12 @@ async def test_mcp_server_reconfigure_helper_schedules_assigned_executor(
         terminal_cleanup_transaction_id="txn-1",
     )
 
-    assert recovered == ["fixture-mac"]
-    assert late_recovery == ["fixture-mac"]
+    assert recovered == ["sample-laptop"]
+    assert late_recovery == ["sample-laptop"]
     assert completed == []
     assert repeated == []
-    assert runtime_updates == [("fixture-mac", "reconfiguring")]
-    assert scheduled == ["fixture-mac", "fixture-mac"]
+    assert runtime_updates == [("sample-laptop", "reconfiguring")]
+    assert scheduled == ["sample-laptop", "sample-laptop"]
     assert cleanup_transaction.terminal_reconfigure_completed_at is not None
 
 
@@ -3775,7 +3791,7 @@ async def test_oauth_completion_schedules_reconfigure_and_emits_status(
 
     async def fake_schedule(_app: object, **kwargs: object) -> list[str]:
         scheduled.append(kwargs)
-        return ["fixture-mac"]
+        return ["sample-laptop"]
 
     monkeypatch.setattr(
         "cognis.api.routes.mcp_oauth.get_mcp_oauth_transaction", fake_get_transaction

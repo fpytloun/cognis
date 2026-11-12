@@ -237,6 +237,7 @@ async def test_wired_managed_channel_lifecycle(
     build_registry = app_module.build_provider_registry
     llm = _ScriptedLLM()
     llm.set_artifact_store = lambda store: None
+    llm.set_reauthorization_observer = lambda observer: None
     llm.close = AsyncMock()
     llm.aclose = AsyncMock()
     llm.resolve_model = AsyncMock(return_value="test-model")
@@ -278,6 +279,9 @@ async def test_wired_managed_channel_lifecycle(
     guardrails.close = AsyncMock()
     guardrails.set_status = AsyncMock()
     guardrails.update_session = AsyncMock()
+    guardrails.update_session_policy = AsyncMock(
+        side_effect=lambda _session_id, **configuration: configuration["policy"]
+    )
     memory = AsyncMock()
     memory.health.return_value = SimpleNamespace(status="healthy")
     transport_started = asyncio.Event()

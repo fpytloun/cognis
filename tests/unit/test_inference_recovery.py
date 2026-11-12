@@ -7,7 +7,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from cognis.providers.llm.availability import InferenceAvailability
-from cognis.providers.llm.errors import LLMStreamProviderError, classify_llm_exception
+from cognis.providers.llm.errors import (
+    LLMStreamProviderError,
+    ProviderReauthorizationRequired,
+    classify_llm_exception,
+)
 from cognis.providers.llm.recovery import (
     InferenceCandidate,
     InferencePlan,
@@ -386,6 +390,36 @@ async def test_non_retryable_error_never_falls_back():
             )
         )
     assert calls == ["provider-0"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("targets", [1, 2])
+async def test_rejected_credentials_skip_same_target_retries(recovery_clock, targets):
+    now, sleeps = recovery_clock
+    calls = []
+
+    async def attempt(candidate, budget):
+        calls.append(candidate.target.provider_id)
+        if candidate.target.provider_id == "provider-0":
+            raise ProviderReauthorizationRequired(provider_id="provider-0", provider_label="Claude")
+        yield {"choices": [{"delta": {"content": "fallback"}}]}
+
+    stream = InferenceRecovery(InferenceAvailability()).stream(
+        plan(targets=targets, retries=3), attempt, deadline=now[0] + 60
+    )
+    if targets == 2:
+        chunks = await collect(stream)
+        assert chunks[-1]["choices"][0]["delta"]["content"] == "fallback"
+        assert calls == ["provider-0", "provider-1"]
+    else:
+        with pytest.raises(LLMStreamProviderError) as failure:
+            await collect(stream)
+        payload = classify_llm_exception(failure.value)
+        assert payload["category"] == "authentication"
+        assert payload["code"] == "reauthorization_required"
+        assert payload["message"].startswith("Claude sign-in expired or was revoked.")
+        assert calls == ["provider-0"]
+    assert sleeps == []
 
 
 @pytest.mark.asyncio

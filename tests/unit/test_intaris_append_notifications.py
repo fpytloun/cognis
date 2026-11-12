@@ -7,6 +7,7 @@ import httpx
 import pytest
 
 from cognis.models.session import SessionEvent
+from cognis.providers.guardrails.errors import IntarisTransportError
 from cognis.providers.guardrails.events import (
     MAX_EVENT_NOTIFICATION_ID_LENGTH,
     EventAppendNotification,
@@ -428,3 +429,44 @@ async def test_notification_logging_does_not_leak_payload_or_identity(
         "Bearer",
     ):
         assert secret not in logs
+
+
+@pytest.mark.asyncio
+async def test_connection_failure_logs_only_operation_and_target_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    provider = IntarisProvider("http://127.0.0.1:49123", _AuthProvider())
+    request = httpx.Request(
+        "POST",
+        "http://127.0.0.1:49123/api/v1/session/private-session/events",
+        content=b"private-content",
+    )
+
+    async def fail() -> None:
+        raise httpx.ConnectError("private-content", request=request)
+
+    try:
+        with (
+            caplog.at_level("WARNING"),
+            pytest.raises(IntarisTransportError),
+        ):
+            await provider._call_with_retry(
+                fail,
+                max_retries=0,
+                operation="intaris record_events",
+            )
+    finally:
+        await provider.client.aclose()
+
+    record = next(
+        record for record in caplog.records if record.message == "intaris: connection failed"
+    )
+    assert record.extra_data == {
+        "operation": "record_events",
+        "scheme": "http",
+        "host": "127.0.0.1",
+        "port": 49123,
+        "error_type": "ConnectError",
+    }
+    for secret in ("private-session", "private-content", "Bearer", "/api/v1/session/"):
+        assert secret not in caplog.text

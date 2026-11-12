@@ -135,6 +135,7 @@ def _bind_ref(
         ordinal=ordinal,
         status=session_row.status,
         completion_reason=session_row.completion_reason,
+        previous_session_id=session_row.previous_session_id,
         reader=reader,
         authority_token=authority_token,
     )

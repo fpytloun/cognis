@@ -202,6 +202,7 @@ def test_management_rejects_new_or_changed_unavailable_backend_configuration() -
         },
     ) == {
         **current,
+        "analytics_enabled": True,
         "intaris_evaluation": "balanced",
         "approval_mode": "ask",
         "minimum_outcome": None,

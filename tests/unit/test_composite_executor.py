@@ -28,6 +28,8 @@ def _make_mock_provider(executor_type: str = "in_process") -> MagicMock:
     provider.list_active = AsyncMock(return_value=[])
     provider.cleanup = AsyncMock()
     provider.health = AsyncMock(return_value=MagicMock(status="healthy", details={}))
+    provider.terminate_program_scope = AsyncMock()
+    provider.has_program_runtime = MagicMock(return_value=False)
     return provider
 
 
@@ -76,6 +78,44 @@ async def test_routes_subprocess_spawn() -> None:
 
     sp.spawn.assert_called_once_with(config)
     ip.spawn.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_program_scope_covers_active_and_pinned_executors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cognis.providers.executor.composite as composite_module
+
+    monkeypatch.setattr(composite_module, "is_executor_package_available", lambda: True)
+    ip = _make_mock_provider("in_process")
+    ws = _make_mock_provider("websocket")
+    sp = _make_mock_provider("subprocess")
+    local_handle = ExecutorHandle(executor_id="local-exec", executor_type="in_process")
+    remote_handle = ExecutorHandle(executor_id="remote-exec", executor_type="websocket")
+    ip.list_active = AsyncMock(return_value=[local_handle])
+    ws.list_active = AsyncMock(return_value=[remote_handle])
+    ws.notify_browser_session_terminal = AsyncMock()
+
+    composite = CompositeExecutorProvider(ip, ws, sp)
+    composite._handle_types.update(
+        {"local-exec": "in_process", "remote-exec": "websocket", "pinned-exec": "websocket"}
+    )
+    await composite.terminate_program_scope("conversation-7", executor_ids=["pinned-exec"])
+
+    ip.terminate_program_scope.assert_awaited_once_with(
+        "conversation-7",
+        executor_ids=["pinned-exec"],
+    )
+    ip.get_executor.assert_not_awaited()
+    assert ws.notify_browser_session_terminal.await_args_list[0].args == (
+        ["pinned-exec"],
+        {
+            "execution_scope_id": "conversation-7",
+            "session_id": "conversation-7",
+            "conversation_id": "conversation-7",
+        },
+    )
+    assert ws.notify_browser_session_terminal.await_args_list[1].args[0] == ["remote-exec"]
 
 
 @pytest.mark.asyncio

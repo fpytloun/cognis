@@ -140,6 +140,7 @@ def _setup():
             tool_registry=registry,
             executor_environment=None,
             executor_pool=None,
+            refresh_executor_pool=None,
             active_executor_id=None,
             cleanup=cleanup,
         )
@@ -158,10 +159,33 @@ def _setup():
 
 
 @pytest.mark.asyncio
-async def test_handoff_full_preparation_retains_schemas_and_persists_only_lifecycle():
+@pytest.mark.parametrize(
+    "focus",
+    [
+        pytest.param(
+            "Read-only lookup: find the function that assembles agent briefs in "
+            "cognis/core/orchestration_policy.py. Return its name and line range.",
+            id="lookup",
+        ),
+        pytest.param(
+            "Implement readable agent briefs in an isolated worktree. Preserve context "
+            "isolation and permissions. Verify assembled prompts and focused regressions; "
+            "return the change and local commit. Do not push, merge, or deploy.",
+            id="implementation",
+        ),
+        pytest.param(
+            "Investigate why handoffs lose spaces. One observed model response already "
+            "contained the unreadable arguments; other cases remain unexplained.\n\n"
+            "Read-only. Return evidence that distinguishes hypotheses and what remains "
+            "unknown. Do not implement a fix.",
+            id="investigation",
+        ),
+    ],
+)
+async def test_handoff_full_preparation_retains_schemas_and_persists_only_lifecycle(focus):
     f = _setup()
     original = copy.deepcopy(f.snapshot)
-    text = await f.service.generate(f.conversation, f.session, f.agent, focus="connection failure")
+    text = await f.service.generate(f.conversation, f.session, f.agent, focus=focus)
     args, kwargs = f.llm.generate.call_args
     assert text.startswith("# Handoff")
     assert kwargs["model"] == "handoff-model"
@@ -169,8 +193,14 @@ async def test_handoff_full_preparation_retains_schemas_and_persists_only_lifecy
     assert kwargs["tool_choice"] == "none"
     assert any(schema.get("function", {}).get("name") == "read" for schema in kwargs["tools"])
     assert "Stable identity." in args[0][0]["content"]
-    assert "connection failure" in str(args[0])
+    assert any(focus in (message.get("content") or "") for message in args[0])
     assert "Pending calls" in str(args[0])
+    assert "A simple question needs no report template" in str(args[0])
+    assert "unverified hypothesis into prescribed steps" in str(args[0])
+    assert "leaving room to choose the approach" in str(args[0])
+    assert "A handoff grants no" in str(args[0])
+    assert "new permissions or access" in str(args[0])
+    assert "Begin with a clear title" not in str(args[0])
     assert f.snapshot == original
     f.runtime_factory.assert_awaited_once_with(
         f.agent,

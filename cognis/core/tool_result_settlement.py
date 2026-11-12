@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,9 +14,84 @@ from cognis.models.session import (
     SessionEvent,
     next_event_page_after_seq,
 )
+from cognis.models.tool import ToolCall, ToolResult
+from cognis.providers.executor.delivery import AmbiguousToolOutcome
 
 _READ_PAGE_SIZE = 500
 _TOOL_CALL_REPAIR_READ_DELAYS = (0.0, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 3.0)
+
+
+def uncertain_executor_tool_result(
+    tool_call: ToolCall,
+    *,
+    canonical_name: str,
+    argument_fingerprint: str,
+    executor_id: str | None,
+    reason: str,
+    original_result: ToolResult,
+) -> ToolResult:
+    """Expose unknown effects for agent reconciliation without authorizing replay."""
+
+    metadata = dict(original_result.metadata or {})
+    ambiguity = AmbiguousToolOutcome(
+        call_id=tool_call.call_id,
+        tool_name=canonical_name,
+        argument_fingerprint=argument_fingerprint,
+        executor_id=executor_id,
+        generation=metadata.get("generation")
+        if isinstance(metadata.get("generation"), int)
+        else None,
+        epoch=metadata.get("epoch") if isinstance(metadata.get("epoch"), int) else None,
+    ).detail()
+    transport = metadata.get("transport")
+    if isinstance(transport, dict):
+        ambiguity["transport"] = {
+            key: transport[key]
+            for key in (
+                "route",
+                "delivery_state",
+                "close_code",
+                "error_type",
+                "executor_instance_id",
+            )
+            if key in transport
+        }
+    ambiguity["reconcile_outcome"] = reason
+    metadata.update(
+        {
+            "code": "tool_outcome_ambiguous",
+            "ambiguity": ambiguity,
+            "retryable": False,
+            "uncertain": True,
+        }
+    )
+    return ToolResult(
+        output=json.dumps(
+            {
+                "status": "outcome_unknown",
+                "message": (
+                    f"Outcome of tool '{canonical_name}' is unknown. "
+                    "The tool was not replayed because it may have performed side effects."
+                ),
+                "call_id": tool_call.call_id,
+                "executor_id": executor_id,
+                "safe_to_retry": False,
+                "reconciliation": (
+                    "Inspect the affected files or external system state on the same executor "
+                    "using read-only tools before issuing another mutation. "
+                    "Compare the observed state with the original tool arguments. "
+                    "If the intended change is already present, continue without repeating it. "
+                    "If it is absent or partial, make only the verified remaining change. "
+                    "If the outcome cannot be established safely, ask for help."
+                ),
+                "ambiguity": ambiguity,
+            },
+            ensure_ascii=False,
+        ),
+        is_error=True,
+        duration_ms=original_result.duration_ms,
+        metadata=metadata,
+    )
 
 
 class CanonicalToolHistoryError(RuntimeError):

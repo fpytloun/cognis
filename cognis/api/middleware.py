@@ -446,6 +446,13 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
         inference = request.url.path.startswith("/v1/")
         if not request.url.path.startswith("/api/") and not inference:
             return await call_next(request)
+        if request.url.path.startswith("/api/v1/public/feedback/"):
+            if (
+                request.scope.get("raw_path", b"").decode("ascii", errors="replace")
+                != request.url.path
+            ):
+                return JSONResponse(status_code=404, content={"detail": "Not found"})
+            return await call_next(request)
         if (request.method.upper(), request.url.path) in PUBLIC_ROUTES:
             return await call_next(request)
         if (
@@ -484,6 +491,19 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path == "/api/v1/videos/transfer" and request.method.upper() == "PUT":
             # Independently authenticated by an expiring, exact-job transfer capability.
+            return await call_next(request)
+        if (
+            (request.method.upper() == "POST" and request.url.path == "/api/v1/transfers")
+            or (
+                request.method.upper() == "GET"
+                and re.fullmatch(r"/api/v1/transfers/[a-f0-9]{32}", request.url.path)
+            )
+            or (
+                request.method.upper() == "PUT"
+                and re.fullmatch(r"/api/v1/transfers/[a-f0-9]{32}/content", request.url.path)
+            )
+        ):
+            # Exact routes independently validate a revocable call-scoped capability.
             return await call_next(request)
         if request.method.upper() == "GET" and request.url.path.startswith(
             "/api/v1/artifacts/content/"
@@ -543,6 +563,9 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                     )
                     request.state.claims = companion_claims
                     request.state.inference_client_id = companion.service
+                    from cognis.api.inference_usage import bind_authenticated_inference
+
+                    bind_authenticated_inference(request)
                     return await call_next(request)
 
         if authorization and authorization.startswith("Bearer "):
@@ -571,6 +594,9 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             request.state.user = user
             request.state.claims = claims
             request.state.inference_client_id = "user_jwt"
+            from cognis.api.inference_usage import bind_authenticated_inference
+
+            bind_authenticated_inference(request)
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
                 user_key=user.email,
                 path=request.url.path,
@@ -684,6 +710,10 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                     )
             request.state.api_key_scopes = scopes
             request.state.inference_client_id = identity.key_id
+            request.state.api_key_id = identity.key_id
+            from cognis.api.inference_usage import bind_authenticated_inference
+
+            bind_authenticated_inference(request)
             if scopes.get("inference_only") is True and not inference:
                 return JSONResponse(
                     status_code=403, content={"error": {"message": "Inference-only API key"}}
@@ -756,6 +786,10 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
                 auth_type="session",
             )
             request.state.browser_session_id = browser_session.session_id
+            request.state.inference_client_id = "browser_session"
+            from cognis.api.inference_usage import bind_authenticated_inference
+
+            bind_authenticated_inference(request)
             if api_rate_limiter is not None and not await api_rate_limiter.allow(
                 user_key=user_row.email,
                 path=request.url.path,

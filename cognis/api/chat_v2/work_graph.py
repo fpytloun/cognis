@@ -524,10 +524,13 @@ def canonical_workstream_refs(
                 row.session_id,
                 (None, "root"),
             )
-            edge = canonical_work_structural_edge(
-                edge,
-                (parent_session_id, edge_kind),
-            )
+            # Internal physical edges disappear when their sessions collapse
+            # into one workstream; they must not outrank its external parent.
+            if group_key_by_session.get(parent_session_id or "") != logical_key:
+                edge = canonical_work_structural_edge(
+                    edge,
+                    (parent_session_id, edge_kind),
+                )
             edge_step = step_for_session.get(row.session_id)
             if edge_step is not None:
                 edge_task = tasks.get(edge_step.task_id)

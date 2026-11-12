@@ -138,6 +138,128 @@ async def gate_stack(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_persisted_unsupported_gate_action_pauses_without_advancing(gate_stack):
+    stack = gate_stack
+    state = WorkflowState(status="running", current_step_index=0)
+    async with stack.factory() as db:
+        row = await db.get(Task, stack.task_id)
+        row.status = "running"
+        row.workflow_state = state.model_dump(mode="json")
+        await db.commit()
+
+    workflow = Workflow(
+        workflow_id="wf:legacy-gate",
+        name="Legacy gate",
+        steps=[
+            StepDefinition(
+                name="approve",
+                type="gate",
+                gate=GateConfig(
+                    message="Approve?",
+                    options=[GateOption(label="Reject", action="reject")],
+                ),
+            ),
+            StepDefinition(name="after", type="run"),
+        ],
+    )
+    result = await stack.engine.execute_workflow(await stack.load(), workflow)
+    assert result.status == "paused"
+    assert result.workflow_state.current_step_index == 0
+    assert "reconcile" in result.result_summary.lower()
+    stored = await stack.load()
+    assert stored.status == "paused"
+    assert stored.workflow_state.current_step_index == 0
+
+
+@pytest.mark.asyncio
+async def test_derived_gate_name_collision_cannot_authorize_forward_revision(gate_stack):
+    stack = gate_stack
+    stack.workflow.steps.extend(
+        [
+            StepDefinition(name="after", type="run"),
+            StepDefinition(
+                name="execute_outcome_gate",
+                type="gate",
+                gate=GateConfig(message="Later approval"),
+            ),
+        ]
+    )
+    async with stack.factory() as db:
+        notification = await db.get(NotificationRow, "gate_recovery")
+        notification.status = "resolved"
+        notification.resolution = {"decision": "revise(after)"}
+        row = await db.get(Task, stack.task_id)
+        state = dict(row.workflow_state)
+        payload = dict(state["pending_pause_payload"])
+        payload["gate_definition"] = {
+            "message": "Review",
+            "options": [{"label": "Revise later", "action": "revise(after)"}],
+        }
+        state["pending_pause_payload"] = payload
+        row.workflow_state = state
+        row.status = "running"
+        await db.commit()
+
+    result = await stack.engine.execute_workflow(await stack.load(), stack.workflow)
+    assert result.status == "paused"
+    assert result.workflow_state.current_step_index == 0
+    assert "reconcile" in result.result_summary.lower()
+    assert (await stack.load()).status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_saved_unsupported_gate_decision_requires_reconciliation(gate_stack):
+    stack = gate_stack
+    async with stack.factory() as db:
+        notification = await db.get(NotificationRow, "gate_recovery")
+        notification.status = "resolved"
+        notification.resolution = {"decision": "reject"}
+        row = await db.get(Task, stack.task_id)
+        row.status = "running"
+        await db.commit()
+
+    result = await stack.engine.execute_workflow(await stack.load(), stack.workflow)
+    assert result.status == "paused"
+    assert result.workflow_state.current_step_index == 0
+    assert "reconcile" in result.result_summary.lower()
+    stored = await stack.load()
+    assert stored.status == "paused"
+    assert stored.workflow_state.current_step_index == 0
+
+
+@pytest.mark.asyncio
+async def test_saved_derived_gate_with_unsupported_option_requires_reconciliation(gate_stack):
+    stack = gate_stack
+    async with stack.factory() as db:
+        row = await db.get(Task, stack.task_id)
+        state = dict(row.workflow_state)
+        payload = dict(state["pending_pause_payload"])
+        payload["gate_definition"] = {
+            "message": "Review",
+            "options": [
+                {"label": "Reject", "action": "reject"},
+                {"label": "Continue", "action": "continue"},
+            ],
+        }
+        state["pending_pause_payload"] = payload
+        row.workflow_state = state
+        await db.commit()
+    assert await stack.service.resolve("gate_recovery", "continue", user_email="user@test.com")
+    async with stack.factory() as db:
+        row = await db.get(Task, stack.task_id)
+        row.status = "running"
+        await db.commit()
+
+    result = await stack.engine.execute_workflow(await stack.load(), stack.workflow)
+    assert result.status == "paused"
+    assert result.workflow_state.current_step_index == 0
+    assert "reconcile" in result.result_summary.lower()
+    stored = await stack.load()
+    assert stored.status == "paused"
+    assert stored.workflow_state.current_step_index == 0
+
+
+@pytest.mark.asyncio
 async def test_recovered_outcome_gate_never_reenters_completed_step(gate_stack):
     stack = gate_stack
     task = await stack.load()
@@ -460,7 +582,9 @@ async def test_explicit_gate_recovery_does_not_reevaluate_conditions(gate_stack)
     assert await stack.service.resolve(
         "gate_recovery", "revise(execute)", user_email="user@test.com"
     )
-    result = await stack.engine._handle_gate_step(task, step, task.workflow_state, stack.workflow)
+    result = await stack.engine._handle_gate_step(
+        task, step, task.workflow_state, stack.workflow, derived=True
+    )
     assert result == "revise(execute)"
     assert (await stack.load()).workflow_state.pending_pause_type == "gate"
 

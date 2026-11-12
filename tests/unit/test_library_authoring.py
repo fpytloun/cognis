@@ -186,7 +186,9 @@ async def test_upload_durable_renamed_and_shared(authoring_app):
 
 
 @pytest.mark.parametrize("kind", ["artifact", "deliverable"])
-async def test_public_view_download_and_expiration_options(authoring_app, kind):
+async def test_public_view_download_and_expiration_options(
+    authoring_app, kind, standalone_ui_build
+):
     app, client = authoring_app
     owner = {"x-library-user": OWNER}
     ref = (
@@ -227,3 +229,38 @@ def test_json_public_preview_uses_shared_json_renderer():
     )
     assert payload["content"] == '{"enabled":true}'
     assert payload["rich_payload"]["blocks"][0]["language"] == "json"
+
+
+@pytest.mark.parametrize("mode", ["view", "download"])
+async def test_artifact_public_link_follows_the_latest_revision(authoring_app, mode):
+    """A shared link keeps serving the document as it is revised; tampering fails closed."""
+    _, client = authoring_app
+    owner = {"x-library-user": OWNER}
+    first = (
+        await _create(client, filename="notes.txt", mime_type="text/plain", content="one")
+    ).json()
+    created = await client.post(
+        f"/api/v1/library/items/artifact/{first['id']}/public-link",
+        headers=owner,
+        json={"mode": mode, "ttl_seconds": 600},
+    )
+    assert created.status_code == 200, created.text
+    link = urlsplit(created.json()["url"])
+    assert link.path.startswith("/api/v1/artifacts/latest/")
+    url = f"{link.path}?{link.query}"
+
+    revised = await client.post(
+        f"/api/v1/library/artifacts/{first['id']}/revisions",
+        headers=owner,
+        json={"filename": "notes.txt", "mime_type": "text/plain", "content": "two"},
+    )
+    assert revised.status_code == 200, revised.text
+    opened = await client.get(url + ("&raw=1" if mode == "view" else ""))
+    assert opened.status_code == 200, opened.text
+    assert opened.text == "two"
+
+    # A forged signature, another mode, or another document never verifies.
+    assert (await client.get(url.replace("sig=", "sig=0"))).status_code == 403
+    other_mode = "download" if mode == "view" else "view"
+    assert (await client.get(url.replace(f"/{mode}?", f"/{other_mode}?"))).status_code == 403
+    assert (await client.get(url.replace(first["id"], revised.json()["id"]))).status_code == 403

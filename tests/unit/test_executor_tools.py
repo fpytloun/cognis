@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
+import os
+import signal
+import sys
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -2067,6 +2071,56 @@ class TestApplyPatchTool:
 
         assert result.is_error
         assert "rename/add/delete operations are not supported" in result.output
+
+
+@pytest.mark.asyncio()
+@pytest.mark.parametrize("tool", ["glob", "grep"])
+async def test_cancelled_search_reaps_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tool: str
+) -> None:
+    from cognis.tools.executor import search as search_module
+
+    pid_file = tmp_path / "search.pid"
+    create_subprocess = asyncio.create_subprocess_exec
+    processes: list[asyncio.subprocess.Process] = []
+
+    async def start_search(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        process = await create_subprocess(
+            sys.executable,
+            "-c",
+            "import os, signal, time; from pathlib import Path; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"Path({str(pid_file)!r}).write_text(str(os.getpid())); time.sleep(60)",
+            **kwargs,
+        )
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(search_module, "_FD_PATH", sys.executable)
+    monkeypatch.setattr(search_module, "_RG_PATH", sys.executable)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", start_search)
+    handler = handle_glob if tool == "glob" else handle_grep
+    task = asyncio.create_task(
+        handler({"pattern": "needle", "path": str(tmp_path)}, _DUMMY_CONTEXT)
+    )
+    try:
+        async with asyncio.timeout(5):
+            while not pid_file.exists():
+                await asyncio.sleep(0.01)
+        pid = int(pid_file.read_text())
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        for process in processes:
+            if process.returncode is None:
+                process.send_signal(signal.SIGKILL)
+            await process.communicate()
 
 
 class TestGlobTool:

@@ -34,7 +34,9 @@ def test_system_implement_agent_has_expected_tools_and_constraints() -> None:
         "list_directory",
         "bash",
     ]
-    assert skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
+    assert skills == {
+        "items": [{"skill_id": "cognis-coding", "enabled": True, "auto_load_instructions": True}]
+    }
     assert "Make the smallest correct change" in agent.system_prompt
     assert "one bounded implementation scope" in agent.system_prompt
     assert "granular todos for implementation" in agent.system_prompt
@@ -60,7 +62,8 @@ def test_system_research_agent_has_expanded_web_tools() -> None:
     assert "Separate repo-local findings from external findings" in agent.system_prompt
     assert "web_research" in agent.system_prompt
     assert "Adapt depth to the request" in agent.system_prompt
-    assert "Relevant media, diagrams, or artifacts" in agent.system_prompt
+    assert "Include media or artifacts when" in agent.system_prompt
+    assert "return usable artifact IDs\n  or source URLs and provenance" in agent.system_prompt
 
 
 def test_system_explore_agent_uses_real_listing_tool() -> None:
@@ -68,6 +71,22 @@ def test_system_explore_agent_uses_real_listing_tool() -> None:
     tools = agent.tools or {}
 
     assert tools.get("builtin_tools") == ["read", "grep", "glob", "lsp", "list_directory", "bash"]
+
+
+def test_specialist_outputs_keep_role_evidence_without_generic_report_forms() -> None:
+    explore = SYSTEM_AGENTS["system:explore"].system_prompt
+    research = SYSTEM_AGENTS["system:research"].system_prompt
+    implement = SYSTEM_AGENTS["system:implement"].system_prompt
+    assert "Answer the caller's question with source references" in explore
+    assert "only when they help explain the answer" in explore
+    assert "Cite source URLs" in research
+    assert "scale the structure to the request" in research
+    assert "modified file references, checks and outcomes" in implement
+    assert "Scale the structure to the assignment" in implement
+    for prompt in (explore, research, implement):
+        assert "Return a structured summary" not in prompt
+        assert "Return structured research findings" not in prompt
+        assert "Return:\n- What changed" not in prompt
 
 
 def test_system_explore_agent_defines_general_read_only_evidence_role() -> None:
@@ -121,7 +140,9 @@ def test_system_review_agents_use_pragmatic_prompts() -> None:
     assert "OVERENGINEERING" in architect.system_prompt
 
     assert review.description == "Findings-first code review for defects and regressions"
-    assert review.skills == {"items": [{"skill_id": "cognis-coding", "enabled": True}]}
+    assert review.skills == {
+        "items": [{"skill_id": "cognis-coding", "enabled": True, "auto_load_instructions": True}]
+    }
     assert "Primary focus: real bugs, regressions, security issues" in review.system_prompt
     assert "Do not nitpick style or architecture" in review.system_prompt
     assert "locked to the approved review scope" in review.system_prompt

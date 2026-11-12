@@ -2736,6 +2736,8 @@ async def _hydrate_file_items(
     record_ids = [record.work_record_id for record in records]
     if not record_ids:
         return items
+    from cognis.api.chat_v2.feedback_evidence import bind_feedback_diff
+
     rows = (
         await db.scalars(
             select(WorkRecordFileRow)
@@ -2746,6 +2748,18 @@ async def _hydrate_file_items(
             )
         )
     ).all()
+    activity_scopes: dict[str, str] = {}
+    if rows:
+        activity_scopes = {
+            str(row[0]): str(row[1])
+            for row in (
+                await db.execute(
+                    select(Session.session_id, Session.activity_scope_id).where(
+                        Session.session_id.in_({record.source_session_id for record in records})
+                    )
+                )
+            ).all()
+        }
     by_record: dict[str, list[WorkRecordFileRow]] = {}
     for row in rows:
         by_record.setdefault(row.work_record_id, []).append(row)
@@ -2761,6 +2775,21 @@ async def _hydrate_file_items(
                 parent_diffs[row.file_ordinal] if row.file_ordinal < len(parent_diffs) else None
             )
             if parent is not None:
+                source = next(
+                    (
+                        ref
+                        for ref in item.source_refs
+                        if ref.session_id == record.source_session_id and ref.seq == row.source_seq
+                    ),
+                    None,
+                )
+                parent = bind_feedback_diff(
+                    parent,
+                    activity_scope_id=activity_scopes.get(record.source_session_id),
+                    source=source,
+                    source_item_id=record.source_item_id,
+                    file_ordinal=row.file_ordinal,
+                )
                 file_diffs.append(
                     parent.model_copy(
                         update={

@@ -1,0 +1,47 @@
+services:
+  qdrant:
+    ports: !override
+      - "127.0.0.1:${QDRANT_PORT}:6333"
+  mnemory:
+    ports: !override
+      - "127.0.0.1:${MNEMORY_PORT}:8050"
+      - "127.0.0.1:${MNEMORY_MGMT_PORT}:9090"
+  intaris:
+    ports: !override
+      - "127.0.0.1:${INTARIS_PORT}:8060"
+  cognis:
+    ports: !override
+      - "127.0.0.1:${COGNIS_PORT}:8080"
+  mock-llm:
+    ports: !override
+      - "127.0.0.1:${MOCK_LLM_PORT}:8090"
+  cognis-executor:
+    volumes: !override
+      - cognis-executor-home:/home/cognis
+      - ${SHOWCASE_TOKEN_DIR}:/run/cognis-local:ro
+  showcase-seed:
+    extends:
+      file: compose.local.yml
+      service: seed
+    image: ${COGNIS_IMAGE}
+    profiles: ["showcase"]
+    depends_on:
+      cognis:
+        condition: service_healthy
+      intaris:
+        condition: service_started
+    environment:
+      COGNIS_DATA_DIR: /data
+      COGNIS_INTARIS_URL: http://intaris:8060
+      COGNIS_MNEMORY_URL: http://mnemory:8050
+      COGNIS_LOCAL_LLM_BASE_URL: http://mock-llm:8090/v1
+      COGNIS_LOCAL_LLM_API_KEY: mock-key
+      COGNIS_LOCAL_CHAT_MODEL: mock-model
+      COGNIS_LOCAL_ADMIN_NAME: Mara Vale
+      COGNIS_LOCAL_SEED_SAMPLE_CONVERSATION: "false"
+    volumes: !override
+      - cognis-local-data:/data
+      - ${SHOWCASE_TOKEN_DIR}:/run/cognis-local
+      - ./tests/e2e/showcase:/showcase:ro
+      - ${SHOWCASE_RUNTIME_DIR}:/showcase-runtime
+    command: ["sh", "-c", "python /app/scripts/local_compose_seed.py && python /showcase/seed.py"]

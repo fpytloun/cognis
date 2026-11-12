@@ -21,6 +21,7 @@ from cognis.api.models import (
 )
 from cognis.core.notifications import NotificationType, safe_display_arguments
 from cognis.core.question_sets import normalize_questions
+from cognis.models.workflow import effective_gate_options
 from cognis.store.models import NotificationRow
 
 _VISIBLE_STATUSES = ("pending", "resolving")
@@ -85,6 +86,17 @@ def _kind(row: NotificationRow) -> AttentionActionKind:
     return "unsupported"
 
 
+def _action_payload(row: NotificationRow) -> dict[str, object]:
+    payload = row.payload if isinstance(row.payload, dict) else {}
+    if (
+        row.notification_type == NotificationType.GATE
+        and row.task_id
+        and isinstance(payload.get("options"), list)
+    ):
+        return {**payload, "options": effective_gate_options(payload.get("options"))}
+    return payload
+
+
 def _title(kind: str) -> str:
     return {
         "escalation": "Tool approval required",
@@ -127,7 +139,7 @@ def project_attention_summary(
     expires_at = attention_action_expires_at(row)
     kind = _kind(row)
     expired = row.status in _VISIBLE_STATUSES and expires_at is not None and current >= expires_at
-    has_action_form = _has_action_form(kind, row.payload if isinstance(row.payload, dict) else {})
+    has_action_form = _has_action_form(kind, _action_payload(row))
     if row.status == "resolved":
         availability: AttentionActionAvailability = "resolved"
     elif expired:
@@ -250,7 +262,7 @@ def project_attention_detail(
     """Project an owner-authorized, allowlisted action detail."""
 
     summary = project_attention_summary(row, can_mutate=can_mutate, now=now)
-    payload = row.payload if isinstance(row.payload, dict) else {}
+    payload = _action_payload(row)
     kind = summary.kind
     display = AttentionActionDisplay()
     actions: list[AttentionActionChoice] = []

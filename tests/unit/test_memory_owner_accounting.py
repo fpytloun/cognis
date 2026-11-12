@@ -133,7 +133,9 @@ async def test_global_cutoffs_are_enforced_deterministically(monkeypatch, limit)
     monkeypatch.setattr(asyncio, "sleep", sleep)
     result = (await cache.resource_owner_accounting())["accounting"]
     assert result["stopped_reason"] == limit
-    measured = sum(field["roots_measured"] for field in result["fields"].values())
+    measured = sum(field["roots_measured"] for field in result["fields"].values()) + len(
+        result["cache_roots"]
+    )
     assert measured == (2 if limit == "work" else 1)
 
 
@@ -147,11 +149,25 @@ async def test_graph_is_released_before_yield_not_only_at_completion(monkeypatch
     reference = weakref.ref(payload)
     del payload, state
     entered, release = asyncio.Event(), asyncio.Event()
+    original_sleep = asyncio.sleep
+    original_measure = resource_attribution.measure_owned_objects
+    measured_events = False
+
+    def measure(roots, **kwargs):
+        nonlocal measured_events
+        value = next(iter(roots))
+        if isinstance(value, list) and value and isinstance(value[0], Payload):
+            measured_events = True
+        return original_measure(roots, **kwargs)
 
     async def pause(delay):
-        entered.set()
-        await release.wait()
+        if measured_events:
+            entered.set()
+            await release.wait()
+        else:
+            await original_sleep(delay)
 
+    monkeypatch.setattr(resource_attribution, "measure_owned_objects", measure)
     monkeypatch.setattr(asyncio, "sleep", pause)
     capture = asyncio.create_task(cache.resource_owner_accounting())
     await entered.wait()
@@ -160,3 +176,86 @@ async def test_graph_is_released_before_yield_not_only_at_completion(monkeypatch
     assert reference() is None
     release.set()
     await capture
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial_sessions", [0, 1])
+async def test_population_growth_during_yield_invalidates_complete_coverage(initial_sessions):
+    cache = SessionCache(Mock())
+    for index in range(initial_sessions):
+        cache._entries[str(index)] = CachedSessionState(
+            session_id=str(index), intaris_session_id=str(index)
+        )
+    task = asyncio.create_task(cache.resource_owner_accounting())
+    await asyncio.sleep(0)
+    cache._entries["new"] = CachedSessionState(session_id="new", intaris_session_id="new")
+    result = await task
+    assert result["sessions"] == initial_sessions + 1
+    assert result["accounting"]["population_changed"]
+    assert not result["accounting"]["coverage_complete"]
+
+
+@pytest.mark.asyncio
+async def test_same_size_population_replacement_invalidates_complete_coverage():
+    cache = SessionCache(Mock())
+    cache._entries["old"] = CachedSessionState(session_id="old", intaris_session_id="old")
+    task = asyncio.create_task(cache.resource_owner_accounting())
+    await asyncio.sleep(0)
+    cache._entries.pop("old")
+    cache._entries["new"] = CachedSessionState(session_id="new", intaris_session_id="new")
+    result = await task
+    assert result["sessions"] == 1
+    assert result["accounting"]["population_changed"]
+    assert not result["accounting"]["coverage_complete"]
+
+
+@pytest.mark.asyncio
+async def test_rotation_eventually_visits_sessions_beyond_selection_cap(monkeypatch):
+    cache = SessionCache(Mock())
+    identifiers = {}
+    for index in range(70):
+        state = CachedSessionState(session_id=str(index), intaris_session_id=str(index))
+        cache._entries[state.session_id] = state
+        identifiers[id(state.events)] = index
+    clock = [0.0]
+    seen = set()
+    monkeypatch.setattr(session_cache, "monotonic", lambda: clock[0])
+
+    def measure(roots, **kwargs):
+        value = next(iter(roots))
+        if id(value) in identifiers:
+            seen.add(identifiers[id(value)])
+        clock[0] += 0.002
+        return {
+            "estimated_bytes": 1,
+            "visited_objects": 1,
+            "shallow_only_objects": 0,
+            "truncated": False,
+        }
+
+    monkeypatch.setattr(resource_attribution, "measure_owned_objects", measure)
+    original_order = list(cache._entries)
+    for _ in range(26):
+        result = (await cache.resource_owner_accounting())["accounting"]
+        assert result["visited_sessions"] < result["selected_sessions"]
+        assert not result["coverage_complete"]
+        assert result["root_visits"] < result["expected_root_visits"]
+    assert seen == set(range(70))
+    assert list(cache._entries) == original_order
+
+
+@pytest.mark.asyncio
+async def test_opaque_and_truncated_roots_are_not_reported_as_complete():
+    cache = SessionCache(Mock())
+    state = CachedSessionState(session_id="private", intaris_session_id="private")
+    state.projection_decisions = {"private-call": [{"payload": Payload()}]}
+    state.project_metadata_contexts = {"private-project": Payload()}
+    cache._entries[state.session_id] = state
+    result = (await cache.resource_owner_accounting())["accounting"]
+    assert result["visited_sessions"] == 1
+    assert result["fully_measured_sessions"] == 0
+    assert not result["coverage_complete"]
+    assert result["truncated_roots_are_lower_bounds"]
+    assert result["fields"]["projection_decisions"]["shallow_only_objects"] > 0
+    assert result["fields"]["project_metadata_contexts"]["shallow_only_objects"] > 0
+    assert "private" not in json.dumps(result)

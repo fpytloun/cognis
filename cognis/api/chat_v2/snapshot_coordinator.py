@@ -11,6 +11,7 @@ from cognis.api.chat_v2.background_event_reads import (
     AdmittedSessionEventStore,
     BackgroundEventReadAdmission,
 )
+from cognis.api.chat_v2.deliverables import hydrate_history_page
 from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
 from cognis.api.chat_v2.event_store_refs import session_read_refs
 from cognis.api.chat_v2.schemas import (
@@ -27,6 +28,7 @@ from cognis.api.chat_v2.snapshot_metrics import (
     WarmFailureReason,
 )
 from cognis.api.chat_v2.sync import (
+    SNAPSHOT_WINDOW_EVENT_LIMIT,
     ConversationSessionRef,
     EventPostProcessor,
     RuntimeOverlayInput,
@@ -186,14 +188,20 @@ async def _hydrate_runtime_input(
         return runtime_input
     volatile_items = {item.id: item for item in runtime_input.volatile_items}
     volatile_items.update({item.id: item for item in envelope.volatile_items})
+    active_turn = envelope.active_turn.model_dump(mode="json") if envelope.active_turn else None
+    if (
+        active_turn
+        and runtime_input.active_turn
+        and active_turn["turn_id"] == runtime_input.active_turn.get("turn_id")
+        and runtime_input.active_turn.get("primary_client_message_id")
+    ):
+        active_turn["primary_client_message_id"] = runtime_input.active_turn[
+            "primary_client_message_id"
+        ]
     return runtime_input.model_copy(
         update={
             "authority": envelope.authority or authority,
-            "active_turn": (
-                envelope.active_turn.model_dump(mode="json")
-                if envelope.active_turn is not None
-                else None
-            ),
+            "active_turn": active_turn,
             "volatile_items": list(volatile_items.values()),
             "volatile_items_complete": envelope.volatile_items_complete,
         }
@@ -307,6 +315,8 @@ async def _build_chat_snapshot_coordinated(
     *,
     _lineage_retry: bool = False,
     request_trace: SnapshotRequestTrace | None = None,
+    initial_read_window: int | None = None,
+    prepare_history: bool = True,
 ) -> tuple[ChatSnapshot, SnapshotRequestTier]:
     cache = getattr(app.state, "shared_chat_snapshot_cache", None)
     tokens = [ref.authority_token for ref in context.session_refs]
@@ -315,11 +325,15 @@ async def _build_chat_snapshot_coordinated(
     async def build() -> ChatSnapshot:
         nonlocal built
         built = True
-        return await _build_immutable_snapshot(context)
+        return await _build_immutable_snapshot(context, initial_read_window=initial_read_window)
 
     started = time.perf_counter()
     try:
-        if cache is None or any(token is None for token in tokens):
+        if (
+            initial_read_window is not None
+            or cache is None
+            or any(token is None for token in tokens)
+        ):
             if request_trace is not None:
                 request_trace.select("bypass")
             base = await build()
@@ -363,17 +377,23 @@ async def _build_chat_snapshot_coordinated(
                     fresh,
                     _lineage_retry=True,
                     request_trace=request_trace,
+                    initial_read_window=initial_read_window,
+                    prepare_history=prepare_history,
                 )
-            base = await _build_immutable_snapshot(fresh)
+            base = await _build_immutable_snapshot(fresh, initial_read_window=initial_read_window)
         context = fresh
 
-    return await _apply_mutable_snapshot_overlay(app, base, context), tier
+    return await _apply_mutable_snapshot_overlay(
+        app, base, context, prepare_history=prepare_history
+    ), tier
 
 
 async def _apply_mutable_snapshot_overlay(
     app: Any,
     base: ChatSnapshot,
     context: ConversationSnapshotContext,
+    *,
+    prepare_history: bool = True,
 ) -> ChatSnapshot:
     """Apply authorized mutable state and request-time attachment hydration."""
 
@@ -386,7 +406,11 @@ async def _apply_mutable_snapshot_overlay(
     overlaid = base.model_copy(
         update={
             "scope": context.scope,
-            "conversation": context.conversation,
+            "conversation": (
+                context.conversation.model_copy(update={"last_read_at": None})
+                if context.shared_reader and context.conversation is not None
+                else context.conversation
+            ),
             "queue": queue,
             "state": state,
             "runtime": _runtime_overlay(runtime_input, generated_at=now),
@@ -396,13 +420,33 @@ async def _apply_mutable_snapshot_overlay(
     )
     started = time.perf_counter()
     try:
-        return await _hydrate_snapshot_attachments(
+        overlaid = await _hydrate_snapshot_attachments(
             app,
             overlaid,
             owner_email=context.owner_email,
             conversation_id=context.conversation_id,
             session_refs=context.session_refs,
         )
+        if prepare_history and not context.shared_reader:
+
+            async def read_page(limit: int) -> ChatSnapshot:
+                candidate, _tier = await _build_chat_snapshot_coordinated(
+                    app,
+                    context,
+                    initial_read_window=limit,
+                    prepare_history=False,
+                )
+                return candidate
+
+            overlaid = await hydrate_history_page(
+                app,
+                overlaid,
+                caller_email=context.owner_email,
+                conversation_id=context.conversation_id,
+                limit=SNAPSHOT_WINDOW_EVENT_LIMIT,
+                read_page=read_page,
+            )
+        return overlaid
     finally:
         SNAPSHOT_CACHE_METRICS.request_stage("attachments", time.perf_counter() - started)
 
@@ -488,6 +532,8 @@ def _conversation_authority_token(
 
 async def _build_immutable_snapshot(
     context: ConversationSnapshotContext,
+    *,
+    initial_read_window: int | None = None,
 ) -> ChatSnapshot:
     snapshot = await build_chat_snapshot(
         scope=context.scope,
@@ -501,6 +547,8 @@ async def _build_immutable_snapshot(
         event_post_processor=None,
         event_post_processor_cache_key=None,
         session_cache=context.session_cache,
+        initial_read_window=initial_read_window,
+        strict_pairing=True,
     )
     return snapshot.model_copy(update={"activity_overview": None})
 

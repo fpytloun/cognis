@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -93,8 +92,8 @@ def test_run_once_prunes_expired_tts_cache_and_artifacts(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         artifact_id = "tts_expired_unit_test_id"
-        asyncio.run(
-            _seed_tts_artifact(
+        client.portal.call(
+            lambda: _seed_tts_artifact(
                 client,
                 message_id="msg_expired",
                 voice="nova",
@@ -105,7 +104,7 @@ def test_run_once_prunes_expired_tts_cache_and_artifacts(
         )
 
         service = _build_service(client)
-        asyncio.run(service.run_once())
+        client.portal.call(service.run_once)
 
         async def _verify_gone() -> tuple[Any, Any, bool]:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -118,7 +117,7 @@ def test_run_once_prunes_expired_tts_cache_and_artifacts(
             )
             return cache_row, artifact_row, exists
 
-        cache_row, artifact_row, blob_exists = asyncio.run(_verify_gone())
+        cache_row, artifact_row, blob_exists = client.portal.call(_verify_gone)
         assert cache_row is None, "tts_cache row should be pruned"
         assert artifact_row is None, "artifacts row should be pruned"
         assert blob_exists is False, "artifact bytes should be gone"
@@ -129,8 +128,8 @@ def test_run_once_keeps_recent_tts_cache_rows(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         artifact_id = "tts_fresh_unit_test_id"
-        asyncio.run(
-            _seed_tts_artifact(
+        client.portal.call(
+            lambda: _seed_tts_artifact(
                 client,
                 message_id="msg_fresh",
                 voice="alloy",
@@ -141,7 +140,7 @@ def test_run_once_keeps_recent_tts_cache_rows(
         )
 
         service = _build_service(client)
-        asyncio.run(service.run_once())
+        client.portal.call(service.run_once)
 
         async def _verify_kept() -> Any:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -149,15 +148,15 @@ def test_run_once_keeps_recent_tts_cache_rows(
                     session, message_id="msg_fresh", voice="alloy", model="tts-1"
                 )
 
-        cache_row = asyncio.run(_verify_kept())
+        cache_row = client.portal.call(_verify_kept)
         assert cache_row is not None, "fresh tts_cache row must not be pruned"
 
 
 def test_run_once_uses_setting_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         artifact_id = "tts_override_unit_test_id"
-        asyncio.run(
-            _seed_tts_artifact(
+        client.portal.call(
+            lambda: _seed_tts_artifact(
                 client,
                 message_id="msg_override",
                 voice="echo",
@@ -173,10 +172,10 @@ def test_run_once_uses_setting_override(monkeypatch: pytest.MonkeyPatch, tmp_pat
                 await upsert_setting(session, key="tts.cache_ttl_days", value=1, category="tts")
                 await session.commit()
 
-        asyncio.run(_set_override())
+        client.portal.call(_set_override)
 
         service = _build_service(client)
-        asyncio.run(service.run_once())
+        client.portal.call(service.run_once)
 
         async def _verify_pruned() -> Any:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -184,7 +183,7 @@ def test_run_once_uses_setting_override(monkeypatch: pytest.MonkeyPatch, tmp_pat
                     session, message_id="msg_override", voice="echo", model="tts-1"
                 )
 
-        assert asyncio.run(_verify_pruned()) is None
+        assert client.portal.call(_verify_pruned) is None
 
 
 def test_run_once_handles_missing_storage_gracefully(
@@ -194,8 +193,8 @@ def test_run_once_handles_missing_storage_gracefully(
     proceeds and removes the metadata rows without raising."""
     with _create_test_client(monkeypatch, tmp_path) as client:
         artifact_id = "tts_missing_blob_unit_test_id"
-        asyncio.run(
-            _seed_tts_artifact(
+        client.portal.call(
+            lambda: _seed_tts_artifact(
                 client,
                 message_id="msg_missing_blob",
                 voice="alloy",
@@ -206,15 +205,11 @@ def test_run_once_handles_missing_storage_gracefully(
         )
 
         # Wipe the blob ahead of time.
-        asyncio.run(
-            client.app.state.artifact_store.async_delete_object(  # type: ignore[attr-defined]
-                "tts", artifact_id
-            )
-        )
+        client.portal.call(client.app.state.artifact_store.async_delete_object, "tts", artifact_id)
 
         service = _build_service(client)
         # Must not raise.
-        asyncio.run(service.run_once())
+        client.portal.call(service.run_once)
 
         async def _verify() -> Any:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -225,4 +220,4 @@ def test_run_once_handles_missing_storage_gracefully(
                     model="tts-1",
                 )
 
-        assert asyncio.run(_verify()) is None
+        assert client.portal.call(_verify) is None

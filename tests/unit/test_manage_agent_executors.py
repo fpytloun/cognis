@@ -38,8 +38,8 @@ from cognis.tools.native_validation import NativeValidationContext
 OWNER = "owner@example.com"
 GUEST = "guest@example.com"
 EXECUTION = {
-    "workflow_selection_mode": "automatic",
-    "available_workflow_ids": ["keep-workflow"],
+    "default_chat_mode": "plan",
+    "step_agent_overrides": {"review": "reviewer"},
     "additional_executors": [{"executor_id": "auxiliary", "description": "Keep"}],
 }
 

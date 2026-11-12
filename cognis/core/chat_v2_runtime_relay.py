@@ -39,6 +39,8 @@ logger = get_logger(__name__)
 RELAY_CHANNEL = "cognis:chat-v2-runtime:v1"
 MAX_PAYLOAD_BYTES = 512 * 1024
 MAX_RAW_PAYLOAD_BYTES = 2 * 1024 * 1024
+# Leave room for receipts merged when queued updates coalesce.
+RUNTIME_PROJECTION_BYTES = MAX_PAYLOAD_BYTES - 64 * 1024
 COMPRESSION_LEVEL = 1
 CODEC_WORKERS = 2
 CODEC_MAX_PENDING = 4
@@ -294,6 +296,40 @@ class ChatV2RuntimeRelayEnvelope(StrictModel):
             raise ValueError("relay envelope exceeds 2MiB raw limit")
         return payload
 
+    def bounded_overlay(self) -> ChatV2RuntimeRelayEnvelope:
+        """Select whole items that fit, retaining control metadata and authority.
+
+        The producer retains its full source generation. Omitted items require
+        canonical reconciliation; partial delivery must never imply removals.
+        """
+        empty = self.model_copy(update={"volatile_items": [], "volatile_items_complete": False})
+        available = RUNTIME_PROJECTION_BYTES - len(empty.model_dump_json().encode())
+        selected: set[int] = set()
+        # Prefer current work, then recent settled phases; preserve source order.
+        prioritized = sorted(
+            range(len(self.volatile_items)),
+            key=lambda index: (
+                self.volatile_items[index].status
+                not in {"complete", "completed", "failed", "cancelled", "compacted"},
+                index,
+            ),
+            reverse=True,
+        )
+        for index in prioritized:
+            size = len(self.volatile_items[index].model_dump_json().encode()) + 1
+            if size <= available:
+                selected.add(index)
+                available -= size
+        if len(selected) == len(self.volatile_items):
+            return self
+        return empty.model_copy(
+            update={
+                "volatile_items": [
+                    item for index, item in enumerate(self.volatile_items) if index in selected
+                ]
+            }
+        )
+
     @classmethod
     def decode(cls, payload: bytes) -> ChatV2RuntimeRelayEnvelope:
         if len(payload) > MAX_PAYLOAD_BYTES:
@@ -543,7 +579,9 @@ class _BoundedRelayQueue:
             context_usage["__boundary_receipts"] = [
                 receipt.model_dump(mode="json") for receipt in deduplicated.values()
             ]
-            envelope = item.envelope.model_copy(update={"context_usage": context_usage})
+            envelope = item.envelope.model_copy(
+                update={"context_usage": context_usage}
+            ).bounded_overlay()
             item = _QueuedEnvelope(
                 envelope=envelope,
                 payload=envelope.raw_encoded(),

@@ -357,7 +357,7 @@ async def test_systemone_attempt_uses_resolved_protocol(model, mode, allowed):
     from cognis.providers.llm.service import LLMService
     from cognis.providers.llm.systemone import SystemOneRequest
 
-    service = LLMService(None)
+    service = LLMService(None, usage_capture=None)
     row = LLMProvider(provider_id="typed-router", config={"preset": "openrouter"})
     service._resolve_model_target = AsyncMock(return_value=(model, row))
     service.get_model_info = AsyncMock(return_value=ModelInfo(model_id=model, model_mode=mode))
@@ -463,7 +463,7 @@ async def test_compatible_openrouter_typed_dispatch_on_both_runtimes(respx_mock,
         "answers": {"valid": {"type": "noul", "noul": 0.9}},
     }
     route = respx_mock.post(f"{base_url}/systemone").respond(200, json=upstream)
-    service = LLMService(None)
+    service = LLMService(None, usage_capture=None)
     row = LLMProvider(
         provider_id="compatible-router",
         location=runtime,
@@ -480,6 +480,10 @@ async def test_compatible_openrouter_typed_dispatch_on_both_runtimes(respx_mock,
     if runtime == "executor":
 
         async def executor(model, messages, provider, *, request_kwargs, acting_user_email):
+            from cognis.providers.llm.usage_binding import take_binding
+
+            request_kwargs = dict(request_kwargs)
+            take_binding(request_kwargs, model=model)
             assert request_kwargs["preset"] == "openrouter"
             return await LiteLLMExecutorBackend().generate(
                 CognisInferenceRequest(

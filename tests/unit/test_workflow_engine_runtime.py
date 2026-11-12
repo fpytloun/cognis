@@ -15,7 +15,7 @@ from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause, S
 from cognis.core.runtime import TransientExecutorUnavailable
 from cognis.core.session_cache import CachedEvent
 from cognis.core.workflow_engine import WorkflowEngine, _resolve_task_execution_paths
-from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
+from cognis.core.workflow_registry import GENERAL_TASK_WORKFLOW, SOFTWARE_DEVELOPMENT_WORKFLOW
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext
 from cognis.models.task import TaskModel, TaskStatus
@@ -37,6 +37,29 @@ from cognis.runtime_context import (
     current_agent_owner_email,
     current_runtime_access_context,
 )
+from cognis.store.models import Session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_status", ["failed", "success", "rejected"])
+async def test_general_task_outcome_routing_in_autonomous_mode(outcome_status: str) -> None:
+    engine = _build_engine()
+    task = TaskModel(
+        task_id="task-1",
+        title="Verify task",
+        created_by="user@example.com",
+        agent_id="agent-1",
+        interaction_mode_override="none",
+    )
+    state = WorkflowState()
+    output = StepOutput(
+        summary="Verification result",
+        outcome=StepOutcome(status=outcome_status, reason="Verification result"),
+    )
+    result = await engine._handle_step_outcome(
+        task, GENERAL_TASK_WORKFLOW.steps[0], output, state, GENERAL_TASK_WORKFLOW
+    )
+    assert result == ("failed" if outcome_status == "failed" else "continue")
 
 
 class _SessionFactory:
@@ -81,7 +104,7 @@ def _build_engine() -> WorkflowEngine:
         del args, kwargs
         return None
 
-    return WorkflowEngine(
+    engine = WorkflowEngine(
         session_factory=_SessionFactory(),
         providers=SimpleNamespace(llm=None),
         agent_loop=SimpleNamespace(),
@@ -93,6 +116,8 @@ def _build_engine() -> WorkflowEngine:
         event_bus=_EventBus(),
         pause_waiter=PauseWaiter(),
     )
+    engine._deliver_task_result_inbox = AsyncMock()
+    return engine
 
 
 @pytest.mark.asyncio
@@ -158,6 +183,7 @@ async def test_task_control_direct_turn_admits_and_executes_with_injected_sessio
         executor_connection=SimpleNamespace(),
         executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
         executor_pool=None,
+        refresh_executor_pool=None,
         active_executor_id="executor-1",
         runtime_info={},
         cleanup=AsyncMock(),
@@ -608,8 +634,10 @@ def test_required_deliverable_backstop_rejects_alternate_step_exit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_software_development_post_review_gate_pauses_for_should_fix(
+@pytest.mark.parametrize("must_fix_count", [0, 1])
+async def test_software_development_post_review_gate_only_blocks_required_findings(
     monkeypatch: pytest.MonkeyPatch,
+    must_fix_count: int,
 ) -> None:
     engine = _build_engine()
     notifications = _NotificationService()
@@ -629,10 +657,10 @@ async def test_software_development_post_review_gate_pauses_for_should_fix(
             "code_review": {
                 "summary": "reviewed with non-blocking follow-up",
                 "metadata": {
-                    "verdict": "approve",
+                    "decision": "approved",
                     "required_scope_complete": True,
                     "missing_scope_count": 0,
-                    "must_fix_count": 0,
+                    "must_fix_count": must_fix_count,
                     "should_fix_count": 1,
                 },
             },
@@ -658,13 +686,16 @@ async def test_software_development_post_review_gate_pauses_for_should_fix(
             await asyncio.sleep(0.01)
         engine._pause_waiter.resolve(pause_id, PauseResolution(decision="continue"))
 
-    asyncio.create_task(_resolve_soon())
+    resolver = asyncio.create_task(_resolve_soon()) if must_fix_count else None
     result = await engine._handle_gate_step(task, gate_step, state, SOFTWARE_DEVELOPMENT_WORKFLOW)
+    if resolver is not None:
+        await resolver
 
     assert result == "continue"
-    assert "paused" in persisted_statuses
-    assert notifications.created
-    assert notifications.created[0]["step_name"] == "post_review_gate"
+    assert ("paused" in persisted_statuses) == bool(must_fix_count)
+    assert bool(notifications.created) == bool(must_fix_count)
+    if must_fix_count:
+        assert notifications.created[0]["step_name"] == "post_review_gate"
 
 
 @pytest.mark.asyncio
@@ -687,9 +718,9 @@ async def test_post_review_gate_revise_sets_revision_context(
             "code_review": {
                 "summary": "reviewed with missing UI",
                 "metadata": {
-                    "verdict": "approve",
-                    "required_scope_complete": True,
-                    "missing_scope_count": 0,
+                    "decision": "revise",
+                    "required_scope_complete": False,
+                    "missing_scope_count": 1,
                     "must_fix_count": 0,
                     "should_fix_count": 1,
                 },
@@ -725,7 +756,7 @@ async def test_post_review_gate_revise_sets_revision_context(
     assert result == "revise(implement)"
     assert state.last_revision_context is not None
     assert "post_review_gate" in state.last_revision_context
-    assert "unresolved scope or review findings" in state.last_revision_context
+    assert "Required scope or blocking review findings" in state.last_revision_context
     assert "should_fix_count" in state.last_revision_context
     assert "Fix the missing UI test before commit." in state.last_revision_context
 
@@ -953,6 +984,7 @@ async def test_handle_gate_step_uses_resolved_notification_after_restart(
             options=[GateOption(label="Continue", action="continue")],
         ),
     )
+    workflow.steps = [step_def]
     persisted: list[str | None] = []
 
     async def _persist(*args: object, **kwargs: object) -> None:
@@ -1124,11 +1156,13 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
             intaris_session_id="sess-1",
         )
 
-    async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
+    async def _get_session_row(*args: object, **kwargs: object) -> Session:
         del args, kwargs
-        return SimpleNamespace(
+        return Session(
             session_id="sess-1",
             conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
             status="completed",
             intaris_session_id="sess-1",
         )
@@ -1196,7 +1230,7 @@ async def test_reuse_or_create_step_session_resumes_completed_step_context(
     assert query_kwargs == {
         "attempt_number": 3,
         "current_revision_only": True,
-        "eligible_statuses": {"approved", "rejected", "failed", "running", "paused"},
+        "eligible_statuses": {"approved", "rejected", "failed", "running", "paused", "pending"},
     }
 
 
@@ -1215,11 +1249,13 @@ async def test_reuse_or_create_step_session_reports_unseeded_resume_when_fork_fa
             intaris_session_id="sess-1",
         )
 
-    async def _get_session_row(*args: object, **kwargs: object) -> SimpleNamespace:
+    async def _get_session_row(*args: object, **kwargs: object) -> Session:
         del args, kwargs
-        return SimpleNamespace(
+        return Session(
             session_id="sess-1",
             conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
             status="completed",
             intaris_session_id="sess-1",
         )
@@ -2028,6 +2064,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
         user_email="user@example.com",
         parent_session_id=None,
         delegation_mode="primary",
+        status="active",
     )
     updated_statuses: list[tuple[str, str]] = []
 
@@ -2061,6 +2098,7 @@ async def test_execute_run_step_marks_step_run_failed_when_agent_loop_raises(
             rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=None,
+            refresh_executor_pool=None,
             runtime_info=None,
             cleanup=lambda: asyncio.sleep(0),
         )
@@ -2141,6 +2179,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
         user_email="user@example.com",
         parent_session_id=None,
         delegation_mode="primary",
+        status="active",
     )
     refreshed: list[tuple[str | None, str | None]] = []
     observed: dict[str, object] = {}
@@ -2171,6 +2210,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
             rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user/src/cognis"),
+            refresh_executor_pool=None,
             runtime_info=None,
             cleanup=lambda: asyncio.sleep(0),
         )
@@ -2182,6 +2222,7 @@ async def test_execute_run_step_refreshes_intaris_policy_with_executor_cwd(
                 step_run_id="sr-resumed",
                 session_id="sess-1",
                 intaris_session_id="sess-1",
+                status="failed",
                 runtime_info={},
                 todos=[],
             )
@@ -2280,6 +2321,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         user_email="user@example.com",
         parent_session_id=None,
         delegation_mode="primary",
+        status="active",
     )
     primary_agent = AgentDefinition(
         agent_id="agent-b",
@@ -2313,6 +2355,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
             rebuild_tool_registry=None,
             executor_connection=None,
             executor_environment=SimpleNamespace(home="/home/user", cwd="/home/user"),
+            refresh_executor_pool=None,
             runtime_info=None,
             cleanup=lambda: asyncio.sleep(0),
         )
@@ -2377,7 +2420,7 @@ async def test_execute_run_step_scopes_runtime_context_to_executor_agent(
         "runtime_access_agent_id": "agent-b",
         "runtime_access_agent_type": "primary",
         "orchestration_mode": "none",
-        "has_boundary_consumer": False,
+        "has_boundary_consumer": True,
     }
 
 

@@ -13,6 +13,8 @@ def internal_hook_conversation_clause() -> ColumnElement[bool]:
     """Classify by persisted owner/agent/run linkage, never by title or ID prefix."""
     return exists(
         select(AgentHookRunRow.run_id).where(
+            # Let the child index exclude inline history before JSON filtering.
+            AgentHookRunRow.child_conversation_id.is_not(None),
             AgentHookRunRow.child_conversation_id == Conversation.conversation_id,
             AgentHookRunRow.conversation_id != Conversation.conversation_id,
             AgentHookRunRow.owner_email == Conversation.user_email,

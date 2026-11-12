@@ -210,6 +210,7 @@ def is_retryable_error(exc: Exception) -> bool:
         "attachment_input",
         "content_policy",
         "protocol",
+        "authentication",
     }:
         return False
 

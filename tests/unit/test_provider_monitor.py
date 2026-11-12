@@ -12,7 +12,7 @@ import pytest_asyncio
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from pydantic import ValidationError
-from sqlalchemy import inspect
+from sqlalchemy import inspect, select
 from sqlalchemy import schema as sa_schema
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -20,9 +20,16 @@ from cognis.api.dashboard_issues import collect_dashboard_issues
 from cognis.api.models import LLMProviderRequest, LLMProviderUpdateRequest
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.provider_monitor import ProviderMonitor
+from cognis.providers.llm.errors import ProviderReauthorizationRequired
 from cognis.providers.llm.monitoring import MonitoringOptions, probe_connectivity, usage_severity
 from cognis.store.database import create_session_factory
-from cognis.store.models import Base, LLMProvider, ProviderMonitorSnapshot
+from cognis.store.models import (
+    Base,
+    InboxNotificationRow,
+    LLMProvider,
+    ProviderMonitorSnapshot,
+    User,
+)
 
 
 @pytest_asyncio.fixture(params=["sqlite", "postgres"])
@@ -55,9 +62,17 @@ async def factory(request, tmp_path):
 
 
 async def seed(
-    sessions, *, enabled=True, status="active", provider_id="claude", owner="owner@cognis.test"
+    sessions,
+    *,
+    enabled=True,
+    status="active",
+    provider_id="claude",
+    owner="owner@cognis.test",
+    preset="anthropic",
 ):
     async with sessions() as session:
+        if owner != "system@cognis.local" and await session.get(User, owner) is None:
+            session.add(User(email=owner, role="user", is_active=True))
         session.add(
             LLMProvider(
                 provider_id=provider_id,
@@ -66,7 +81,7 @@ async def seed(
                 location="controller",
                 owner_email=owner,
                 status=status,
-                config={"preset": "anthropic", "monitoring": {"enabled": enabled}},
+                config={"preset": preset, "monitoring": {"enabled": enabled}},
             )
         )
         await session.commit()
@@ -99,6 +114,50 @@ class Source:
 
     async def check_provider_connectivity(self, provider):
         pytest.fail("Subscription usage check must not make a second connectivity request")
+
+
+@pytest.mark.asyncio
+async def test_monitor_elevenlabs_quota_persists_then_clears_revoked_access(factory):
+    from unittest.mock import AsyncMock
+
+    from cognis.providers.llm.elevenlabs_usage import (
+        normalize_subscription_usage,
+        unavailable_usage,
+    )
+
+    sessions, _ = factory
+    source = Source()
+    reset_at = datetime.now(UTC) + timedelta(days=1)
+    source.get_provider_usage = AsyncMock(
+        return_value=normalize_subscription_usage(
+            {
+                "tier": "free",
+                "character_count": 8000,
+                "character_limit": 10000,
+                "next_character_count_reset_unix": int(reset_at.timestamp()),
+            }
+        )
+    )
+    source.check_provider_connectivity = AsyncMock(
+        return_value={"status": "healthy", "detail": "Available"}
+    )
+    await seed(sessions, provider_id="elevenlabs", preset="elevenlabs")
+    monitor = ProviderMonitor(sessions, source)
+    first = await monitor.get("elevenlabs", force=True)
+    assert first.health_status == "healthy" and first.usage.ok
+    source.check_provider_connectivity.assert_not_awaited()
+    async with sessions() as session:
+        saved = await session.get(ProviderMonitorSnapshot, "elevenlabs")
+        window = saved.usage["additional_rate_limits"][0]["primary"]
+        assert (window["limit"], window["remaining"]) == (10000, 2000)
+    source.get_provider_usage.return_value = unavailable_usage(
+        "Subscription quota access is denied for this API key"
+    )
+    refreshed = await monitor.get("elevenlabs", force=True)
+    assert refreshed.health_status == "healthy"
+    assert not refreshed.usage.ok
+    assert refreshed.usage.additional_rate_limits == []
+    source.check_provider_connectivity.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -244,6 +303,126 @@ async def test_visibility_and_dashboard_issue_recovery(factory):
     await monitor.get("claude", force=True)
     async with sessions() as db:
         assert not (await collect_dashboard_issues(db, user_email="owner@cognis.test")).issues
+
+
+class RecordingInbox:
+    def __init__(self):
+        self.published = []
+
+    async def publish(self, row):
+        self.published.append(row.notification_id)
+
+
+async def inbox_rows(sessions):
+    async with sessions() as db:
+        return list(
+            (
+                await db.scalars(
+                    select(InboxNotificationRow).order_by(InboxNotificationRow.user_email)
+                )
+            ).all()
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejected_credentials_alert_once_until_reauthorized(factory):
+    sessions, _ = factory
+    await seed(sessions)
+    source = Source()
+    inbox = RecordingInbox()
+    monitor = ProviderMonitor(sessions, source, inbox=inbox)
+    await monitor.get("claude")
+
+    async def rejected(provider_id):
+        source.calls += 1
+        raise ProviderReauthorizationRequired(provider_id=provider_id, provider_label="Claude")
+
+    healthy_usage = source.get_provider_usage
+    source.get_provider_usage = rejected
+    failed = await monitor.get("claude", force=True)
+    assert failed.error == "Reauthorization required"
+    assert failed.health_status == "error"
+    assert failed.health_detail == (
+        "Claude sign-in expired or was revoked. Reauthorize the provider in Settings > Providers."
+    )
+    async with sessions() as db:
+        issues = (await collect_dashboard_issues(db, user_email="owner@cognis.test")).issues
+    assert [(item.kind, item.severity, item.title, item.action_label) for item in issues] == [
+        ("provider_auth", "critical", "claude needs reauthorization", "Reauthorize")
+    ]
+    assert issues[0].action_url == "/settings?tab=providers&provider=claude"
+    rows = await inbox_rows(sessions)
+    assert [(row.user_email, row.kind, row.href) for row in rows] == [
+        (
+            "owner@cognis.test",
+            "provider.reauthorization_required",
+            "/settings?tab=providers&provider=claude",
+        )
+    ]
+    assert inbox.published == [rows[0].notification_id]
+
+    # Repeated failures keep the alert without notifying again.
+    await monitor.get("claude", force=True)
+    assert len(await inbox_rows(sessions)) == 1
+
+    source.get_provider_usage = healthy_usage
+    source.used = 5
+    recovered = await monitor.get("claude", force=True)
+    assert recovered.error is None and recovered.health_status == "healthy"
+    async with sessions() as db:
+        assert not (await collect_dashboard_issues(db, user_email="owner@cognis.test")).issues
+
+
+@pytest.mark.asyncio
+async def test_shared_provider_reauthorization_notifies_active_admins(factory):
+    sessions, _ = factory
+    await seed(sessions, owner="system@cognis.local")
+    async with sessions() as db:
+        db.add_all(
+            [
+                User(email="admin@cognis.test", role="admin", is_active=True),
+                User(email="former-admin@cognis.test", role="admin", is_active=False),
+                User(email="user@cognis.test", role="user", is_active=True),
+            ]
+        )
+        await db.commit()
+    source = Source()
+
+    async def rejected(provider_id):
+        raise ProviderReauthorizationRequired(provider_id=provider_id)
+
+    source.get_provider_usage = rejected
+    await ProviderMonitor(sessions, source).get("claude", force=True)
+    assert [row.user_email for row in await inbox_rows(sessions)] == ["admin@cognis.test"]
+
+
+@pytest.mark.asyncio
+async def test_inference_rejection_report_publishes_without_waiting_for_schedule(factory):
+    sessions, _ = factory
+    await seed(sessions)
+    source = Source()
+    monitor = ProviderMonitor(sessions, source)
+    await monitor.get("claude")
+
+    async def rejected(provider_id):
+        source.calls += 1
+        raise ProviderReauthorizationRequired(provider_id=provider_id)
+
+    source.get_provider_usage = rejected
+    monitor.report_reauthorization_required("claude")
+    monitor.report_reauthorization_required("claude")
+    await asyncio.gather(*monitor._reauthorization_checks.values())
+    await asyncio.sleep(0)  # let done callbacks release the per-provider slot
+    assert not monitor._reauthorization_checks
+    assert source.calls == 2  # one initial success, one coalesced check
+    async with sessions() as db:
+        snapshot = await db.get(ProviderMonitorSnapshot, "claude")
+        assert snapshot.error == "Reauthorization required"
+    # An already published rejection needs no further upstream check.
+    monitor.report_reauthorization_required("claude")
+    await asyncio.gather(*monitor._reauthorization_checks.values())
+    assert source.calls == 2
+    await monitor.stop()
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -117,6 +118,7 @@ def _ctx(pool: ExecutorPool, *, active_executor_id: str | None = None) -> Any:
     )
     ctx = MagicMock()
     ctx.executor_pool = pool
+    ctx.refresh_executor_pool = None
     ctx.executor_connection = MagicMock(name="active_connection")
     ctx.active_executor_id = active_executor_id or (
         pool.primary[0].executor_id if pool.primary else None
@@ -135,6 +137,90 @@ def _toolcall(name: str, arguments: dict[str, Any]) -> Any:
     from cognis.models.tool import ToolCall
 
     return ToolCall(call_id="call-1", name=name, arguments=arguments)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_target", [False, True])
+async def test_recovered_executor_is_usable_in_retained_context(
+    loop_with_pool, explicit_target: bool
+) -> None:
+    from cognis.models.tool import ToolResult
+
+    active = _target("exec-active", usable=explicit_target)
+    additional = replace(_target("exec-recovered", usable=False), is_primary=False)
+    pool = ExecutorPool(primary=[active], additional=[additional])
+    refreshed = ExecutorPool(
+        primary=[replace(active, state=ExecutorAvailability.USABLE)],
+        additional=[replace(additional, state=ExecutorAvailability.USABLE)],
+    )
+    ctx = _ctx(pool, active_executor_id=active.executor_id)
+    ctx.refresh_executor_pool = AsyncMock(return_value=refreshed)
+    connection = MagicMock(name="reconnected")
+    loop_with_pool.providers.executor.websocket.get_ready_connection.return_value = connection
+    loop_with_pool.providers.executor.websocket.get_handle_metadata.return_value = {}
+    loop_with_pool.tool_router.execute = AsyncMock(return_value=ToolResult(output="ok"))
+    loop_with_pool._get_tool_registry = lambda c: c.tool_registry
+    loop_with_pool._tool_runtime_metadata = lambda c: {}
+    loop_with_pool._get_executor = lambda c: c.executor_connection
+    arguments = {"command": "pwd"}
+    if explicit_target:
+        arguments["target_executor"] = additional.executor_id
+
+    result = await loop_with_pool._execute_regular_tool(ctx, _toolcall("bash", arguments))
+
+    assert not result.is_error
+    ctx.refresh_executor_pool.assert_awaited_once_with(pool)
+    assert ctx.executor_pool is refreshed
+    assert ctx.active_executor_id == active.executor_id
+    loop_with_pool.tool_router.execute.assert_awaited_once()
+    assert loop_with_pool.tool_router.execute.await_args.args[4] is connection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_target", [False, True])
+@pytest.mark.parametrize(
+    "state",
+    [
+        ExecutorAvailability.OFFLINE,
+        ExecutorAvailability.BLOCKED,
+        ExecutorAvailability.RECONFIGURING,
+        ExecutorAvailability.POLICY_DENIED,
+    ],
+)
+async def test_changed_eligibility_blocks_dispatch_despite_live_connection(
+    loop_with_pool, explicit_target: bool, state: ExecutorAvailability
+) -> None:
+    target = _target("exec-active")
+    pool = ExecutorPool(primary=[target])
+    ctx = _ctx(pool, active_executor_id=target.executor_id)
+    ctx.refresh_executor_pool = AsyncMock(
+        return_value=ExecutorPool(primary=[replace(target, state=state)])
+    )
+    loop_with_pool.tool_router.execute = AsyncMock()
+    arguments = {"command": "pwd"}
+    if explicit_target:
+        arguments["target_executor"] = target.executor_id
+
+    result = await loop_with_pool._execute_regular_tool(ctx, _toolcall("bash", arguments))
+
+    assert result.is_error
+    assert f"state: {state.value}" in result.output
+    loop_with_pool.tool_router.execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_eligibility_refresh_failure_does_not_reuse_stale_positive(loop_with_pool) -> None:
+    pool = ExecutorPool(primary=[_target("exec-active")])
+    ctx = _ctx(pool)
+    ctx.refresh_executor_pool = AsyncMock(side_effect=RuntimeError("eligibility read failed"))
+    loop_with_pool.tool_router.execute = AsyncMock()
+
+    result = await loop_with_pool._execute_regular_tool(ctx, _toolcall("bash", {"command": "pwd"}))
+
+    assert result.is_error
+    assert result.metadata["code"] == "executor_eligibility_unavailable"
+    assert ctx.executor_pool.primary[0].state is ExecutorAvailability.UNKNOWN
+    loop_with_pool.tool_router.execute.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -675,8 +761,8 @@ def _prepare_reconcile_loop(loop_with_pool, ctx, *, stale_instance: str) -> Any:
     loop_with_pool._get_executor = lambda c: c.executor_connection
 
     # Recovered results must cross the normal post-execution/trust boundary.
-    async def _finalize(*, result, tool_call, registered_tool, session, agent):
-        del tool_call, registered_tool, session, agent
+    async def _finalize(*, result, tool_call, registered_tool, session, agent, turn_id=None):
+        del tool_call, registered_tool, session, agent, turn_id
         return result
 
     loop_with_pool.tool_router.finalize_recovered_executor_result = AsyncMock(side_effect=_finalize)

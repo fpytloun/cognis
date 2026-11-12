@@ -20,6 +20,8 @@ import httpx
 
 from cognis import json_codec as json
 from cognis.ownership import SYSTEM_USER_EMAIL
+from cognis.providers.llm.errors import ProviderReauthorizationRequired
+from cognis.providers.llm.oauth_reauthorization import OAUTH_REFRESH_REJECTED_STATUSES
 
 ANTHROPIC_SUBSCRIPTION_SECRET_PREFIX = "llm_oauth_anthropic"
 ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
@@ -47,7 +49,7 @@ CLAUDE_CODE_IDENTITY_BRIDGE = "The operative agent identity follows."
 # Anthropic rejects a request outright when the reported client version is
 # older than the model requires. `test_integration.py` asserts both modules
 # produce the same user agent, so a partial bump fails the suite.
-CLAUDE_CODE_VERSION = "2.1.293"
+CLAUDE_CODE_VERSION = "2.1.321"
 CLAUDE_CODE_ENTRYPOINT = "sdk-cli"
 CLAUDE_CODE_USER_AGENT = f"claude-cli/{CLAUDE_CODE_VERSION} (external, cli)"
 CCH_SALT = "59cf53e54c78"
@@ -196,7 +198,16 @@ async def exchange_authorization_code(
     return _auth_record_from_token_response(data, require_refresh_token=True)
 
 
-async def refresh_authorized_record(auth_record: dict[str, str]) -> dict[str, Any]:
+async def refresh_authorized_record(
+    auth_record: dict[str, str], *, provider_id: str, provider_label: str | None = None
+) -> dict[str, Any]:
+    """Refresh the access token.
+
+    Raises ``ProviderReauthorizationRequired`` when the token endpoint rejects
+    the refresh grant. Other failures raise ``httpx.HTTPStatusError`` and keep
+    their status-based transient classification.
+    """
+
     refresh_token = auth_record["refresh_token"]
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
@@ -212,8 +223,11 @@ async def refresh_authorized_record(auth_record: dict[str, str]) -> dict[str, An
                 "refresh_token": refresh_token,
             },
         )
-    if response.status_code >= 400:
-        raise RuntimeError("Claude subscription OAuth expired; re-authorize the provider")
+    if response.status_code in OAUTH_REFRESH_REJECTED_STATUSES:
+        raise ProviderReauthorizationRequired(
+            provider_id=provider_id, provider_label=provider_label
+        )
+    response.raise_for_status()
     data = response.json()
     refreshed = _auth_record_from_token_response(data, require_refresh_token=False)
     if "refresh_token" not in refreshed:
@@ -269,6 +283,18 @@ def bundled_anthropic_model_entries() -> list[dict[str, Any]]:
             "input_cost_per_mtok": 10.0,
             "output_cost_per_mtok": 50.0,
             "tier": "limited",
+        },
+        {
+            **common,
+            "model_id": "claude-fable-5-2",
+            "name": "Claude Fable 5.2",
+            "display_name": "Claude Fable 5.2",
+            "context_window": 1_000_000,
+            "max_context_window": 1_000_000,
+            "max_input_tokens": 872_000,
+            "max_output_tokens": 128_000,
+            "input_cost_per_mtok": 8.0,
+            "output_cost_per_mtok": 40.0,
         },
         {
             **common,

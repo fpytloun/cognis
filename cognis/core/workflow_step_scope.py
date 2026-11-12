@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from cognis.core.program_guidance import PYTHON_EXECUTE_TOOL_NAME
 from cognis.models.task import TaskModel
 from cognis.models.tool import ToolCall
 from cognis.models.workflow import StepDefinition, Workflow, WorkflowState
@@ -175,14 +176,30 @@ class WorkflowStepScope:
     ) -> WorkflowStepScope:
         """Bind only a stored, pinned step, not task prose or remote outputs."""
         definition = state.effective_workflow_definition
-        if definition is None or step.tool_call is None:
+        if definition is None:
+            raise WorkflowStepDeclarationError("workflow_step.definition_unverified")
+        if step.type == "tool_call" and step.tool_call is not None:
+            tool = step.tool_call.tool
+            step_contract = {"tool": step.tool_call.tool, "args": step.tool_call.args}
+        elif step.type == "program" and step.program is not None:
+            tool = PYTHON_EXECUTE_TOOL_NAME
+            step_contract = {
+                "type": "program",
+                "program": step.program.model_dump(mode="json", exclude_none=True),
+            }
+        else:
             raise WorkflowStepDeclarationError("workflow_step.definition_unverified")
         pinned = Workflow.model_validate(definition)
         candidates = [item for item in pinned.steps if item.name == step.name]
         if (
             pinned.workflow_id != workflow.workflow_id
             or len(candidates) != 1
-            or candidates[0].tool_call != step.tool_call
+            or candidates[0].type != step.type
+            or (
+                candidates[0].tool_call != step.tool_call
+                if step.type == "tool_call"
+                else candidates[0].program != step.program
+            )
         ):
             raise WorkflowStepDeclarationError("workflow_step.definition_unverified")
         return cls(
@@ -193,14 +210,12 @@ class WorkflowStepScope:
             step_run_id=step_run_id,
             logical_call_id=logical_call_id,
             workflow_definition_digest=canonical_digest(definition),
-            step_definition_digest=canonical_digest(
-                {"tool": step.tool_call.tool, "args": step.tool_call.args}
-            ),
+            step_definition_digest=canonical_digest(step_contract),
             rendered_args_digest=canonical_digest(rendered_args),
             routed_args_digest=canonical_digest(
                 {key: value for key, value in rendered_args.items() if key != "target_executor"}
             ),
-            tool=step.tool_call.tool,
+            tool=tool,
             authorized_by=(
                 "owner_configured"
                 if task.creation_origin == "owner_configured" and not task.created_by_agent_id

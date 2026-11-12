@@ -1,6 +1,11 @@
 {
   "repo": null,
-  "provenance_note": "Historical reference measurements are unchanged; the author-local path is omitted. This is not a measurement of the public release candidate.",
+  "provenance": {
+    "kind": "historical_measurements",
+    "original_checkout_omitted": true,
+    "release_qualification": false,
+    "limitations": "Historical measurements from an unspecified private checkout. They have not been revalidated for this release or for reconstructed public scenarios."
+  },
   "rows": [
     {
       "task": "def:PreparedClient",

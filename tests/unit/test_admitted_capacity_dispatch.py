@@ -49,7 +49,7 @@ async def test_admitted_capacity_dispatch(failures, state):
         return ToolResult(output="completed")
 
     executor = AsyncMock()
-    executor.executor_id = "fixture-executor"
+    executor.executor_id = "sample-desktop"
     executor.tool_execute.side_effect = dispatch
     router = ToolRouter(guardrails)
     call = ToolCall(
@@ -95,7 +95,7 @@ async def test_capacity_retry_preserves_callbacks_and_stops_at_lost_fence():
     async def dispatch(call, **kwargs):
         assert kwargs["before_send"] is before_send
         assert kwargs["on_sent"] is on_sent
-        await kwargs["before_send"]("fixture-executor", None)
+        await kwargs["before_send"]("sample-desktop", None)
         raise ExecutorDeliveryError("capacity", "not_sent", code="executor_bridge_capacity")
 
     executor = SimpleNamespace(tool_execute=AsyncMock(side_effect=dispatch))

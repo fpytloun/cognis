@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
-from typing import Any
+import uuid
+from collections.abc import Awaitable, Callable
 
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.project_access import agent_usable_in_project, can_read_task
+from cognis.core.channel_delivery_targets import preferred_channel_target
+from cognis.core.followups import TaskResultFollowUp
+from cognis.core.project_access import (
+    agent_usable_in_project,
+    can_read_task,
+    resolve_project_role_by_id,
+    role_satisfies,
+)
+from cognis.core.task_outcomes import task_outcome_key
 from cognis.models.task import TaskModel
 from cognis.store.models import ChannelDeliveryOutboxRow, Task
-from cognis.store.project_queries import get_project_agent
 from cognis.store.queries import (
+    create_conversation,
     get_agent,
+    get_channel_delivery_outbox,
     get_conversation,
     get_conversation_channel_route,
-    get_latest_active_conversation_for_channel_account,
     get_preferred_channel_account_for_agent,
     get_project,
     get_task,
@@ -47,22 +59,19 @@ async def project_result_recipient_allowed(
         return False
     if not await can_read_task(session, row, user_email):
         return False
-    agent = await get_agent(session, row.agent_id)
-    if agent is None:
+    project, access = await resolve_project_role_by_id(session, row.project_id, user_email)
+    if project is None or project.status != "active" or not role_satisfies(access.role, "use"):
         return False
-    if await agent_usable_in_project(
+    agent = await get_agent(session, row.agent_id)
+    if agent is None or agent.status != "active":
+        return False
+    return await agent_usable_in_project(
         session, agent=agent, user_email=user_email, project_id=row.project_id
-    ):
-        return True
-    # Receiving an informational result does not require permission to run the agent.
-    return (
-        row.project_id is not None
-        and await get_project_agent(session, row.project_id, row.agent_id) is not None
     )
 
 
-async def preferred_project_result_targets(session: AsyncSession, task: TaskModel) -> list[str]:
-    """Resolve each eligible non-owner's own active preferred-channel conversation."""
+async def project_result_recipients(session: AsyncSession, task: TaskModel) -> list[str]:
+    """Resolve current project readers who may also run the task's agent."""
     row = await get_task(session, task.task_id)
     if row is None or not row.project_id or not project_result_is_shareable(row):
         return []
@@ -78,62 +87,137 @@ async def preferred_project_result_targets(session: AsyncSession, task: TaskMode
         and grant.grantee_user_email is not None
     )
     recipients.discard(task.created_by)
-    targets: list[str] = []
+    allowed: list[str] = []
     for user_email in sorted(recipients):
-        if not await project_result_recipient_allowed(session, task.task_id, user_email):
-            continue
-        target = await preferred_channel_target(
-            session, user_email=user_email, agent_id=task.agent_id
-        )
-        if target is not None:
-            targets.append(target)
-    return targets
+        if await project_result_recipient_allowed(session, task.task_id, user_email):
+            allowed.append(user_email)
+    return allowed
 
 
-async def preferred_channel_target(
-    session: AsyncSession, *, user_email: str, agent_id: str
+async def project_result_execution_target(
+    session: AsyncSession, *, task: TaskModel, conversation_id: str
 ) -> str | None:
-    """Resolve an active conversation belonging to this user and preferred account."""
-    account = await get_preferred_channel_account_for_agent(
-        session, user_email=user_email, agent_id=agent_id
-    )
-    if account is None:
+    """Keep project-derived execution in a private recipient-owned project chat.
+
+    The deterministic conversation identity is metadata-only and converges through
+    its primary key. It never reassigns a main chat or expands an agent grant.
+    """
+    conversation = await get_conversation(session, conversation_id)
+    if conversation is None or not await project_result_recipient_allowed(
+        session, task.task_id, conversation.user_email
+    ):
         return None
-    conversation = (
-        await get_conversation(session, account.default_conversation_id)
-        if account.default_conversation_id
-        else None
+    agent = await get_agent(session, task.agent_id)
+    if agent is None or conversation.agent_id != task.agent_id:
+        return None
+    if await agent_usable_in_project(
+        session,
+        agent=agent,
+        user_email=conversation.user_email,
+        project_id=conversation.project_id,
+    ):
+        return conversation_id
+    identity = f"project_task_results:{task.project_id}:{conversation_id}"
+    target_id = f"conv_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
+    target = await get_conversation(session, target_id)
+    if target is None:
+        try:
+            async with session.begin_nested():
+                target = await create_conversation(
+                    session,
+                    conversation_id=target_id,
+                    user_email=conversation.user_email,
+                    agent_id=task.agent_id,
+                    context_type="web" if conversation.context_type == "web" else "chat",
+                    context_ref=identity,
+                    context_data={
+                        **(conversation.context_data or {}),
+                        "kind": "project_task_results",
+                        "source_conversation_id": conversation_id,
+                    },
+                    project_id=task.project_id,
+                    visibility="private",
+                    title="Project task results",
+                )
+        except IntegrityError:
+            target = await get_conversation(session, target_id)
+    if (
+        target is None
+        or target.status != "active"
+        or target.user_email != conversation.user_email
+        or target.agent_id != task.agent_id
+        or target.project_id != task.project_id
+    ):
+        return None
+    return target.conversation_id
+
+
+async def project_result_target_allowed(
+    session: AsyncSession,
+    task_id: str,
+    conversation_id: str,
+    *,
+    require_execution: bool = False,
+) -> bool:
+    """Recheck success, visibility, recipient permission, and preferred destination."""
+    task = await get_task(session, task_id)
+    conversation = await get_conversation(session, conversation_id)
+    if (
+        task is None
+        or conversation is None
+        or conversation.status != "active"
+        or conversation.agent_id != task.agent_id
+        or not await project_result_recipient_allowed(session, task_id, conversation.user_email)
+    ):
+        return False
+    preferred = await preferred_channel_target(
+        session, user_email=conversation.user_email, agent_id=task.agent_id
     )
-    candidates = [conversation]
-    candidates.append(
-        await get_latest_active_conversation_for_channel_account(
-            session,
-            user_email=user_email,
-            agent_id=agent_id,
-            account_id=account.account_id,
-            prefer_unthreaded=True,
-        )
-    )
-    for candidate in candidates:
+    if preferred != conversation_id:
+        context = conversation.context_data or {}
         if (
-            candidate is None
-            or candidate.status != "active"
-            or candidate.user_email != user_email
-            or candidate.agent_id != agent_id
+            preferred is None
+            or context.get("kind") != "project_task_results"
+            or context.get("source_conversation_id") != preferred
+            or conversation.project_id != task.project_id
         ):
-            continue
-        route = await get_conversation_channel_route(session, candidate.conversation_id)
-        if route is not None and route[1] == account.account_id and route[4] == user_email:
-            return candidate.conversation_id
-    return None
+            return False
+        if await get_conversation_channel_route(
+            session, preferred
+        ) != await get_conversation_channel_route(session, conversation_id):
+            return False
+    if require_execution:
+        agent = await get_agent(session, task.agent_id)
+        if agent is None or not await agent_usable_in_project(
+            session,
+            agent=agent,
+            user_email=conversation.user_email,
+            project_id=conversation.project_id,
+        ):
+            return False
+    return True
 
 
 async def project_result_route_allowed(
     session: AsyncSession, row: ChannelDeliveryOutboxRow
 ) -> bool:
     """Fence delayed delivery against revoked access and changed channel routes."""
-    if not row.source_id or not await project_result_recipient_allowed(
-        session, row.source_id, row.user_email
+    if row.source_type == "project_task_result_reply":
+        parent_id, separator, turn_id = (row.source_id or "").partition(":")
+        if not separator or not turn_id:
+            return False
+        parent = await get_channel_delivery_outbox(session, parent_id)
+        return (
+            parent is not None
+            and parent.source_type == "project_task_result_follow_up"
+            and row.conversation_id == parent.conversation_id
+            and row.user_email == parent.user_email
+            and (row.channel_type, row.account_id, row.chat_id, row.thread_id)
+            == (parent.channel_type, parent.account_id, parent.chat_id, parent.thread_id)
+            and await project_result_route_allowed(session, parent)
+        )
+    if not row.source_id or not await project_result_target_allowed(
+        session, row.source_id, row.conversation_id
     ):
         return False
     task = await get_task(session, row.source_id)
@@ -146,6 +230,23 @@ async def project_result_route_allowed(
         or conversation.agent_id != task.agent_id
     ):
         return False
+    if row.source_type == "project_task_result":
+        identities = (task_outcome_key(task), task.task_id)
+        allowed_ids = {
+            "cdel_"
+            + hashlib.sha256(
+                f"project_task_result:{occurrence}:{row.user_email}".encode()
+            ).hexdigest()[:20]
+            for occurrence in identities
+        }
+        # Already-persisted informational deliveries from before outcome keys
+        # retain their original identity until their durable retry completes.
+        if row.delivery_id not in allowed_ids:
+            return False
+    elif row.source_type == "project_task_result_follow_up":
+        identity = f"task_follow_up:{task_outcome_key(task)}:{row.conversation_id}"
+        if row.delivery_id != f"cdel_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}":
+            return False
     account = await get_preferred_channel_account_for_agent(
         session, user_email=row.user_email, agent_id=task.agent_id
     )
@@ -154,22 +255,61 @@ async def project_result_route_allowed(
         account is not None
         and account.account_id == row.account_id
         and route == (row.channel_type, row.account_id, row.chat_id, row.thread_id, row.user_email)
-        and await preferred_channel_target(
-            session, user_email=row.user_email, agent_id=task.agent_id
+    )
+
+
+async def project_result_follow_up_allowed(
+    session: AsyncSession, follow_up: TaskResultFollowUp, conversation_id: str
+) -> bool:
+    """Re-authorize a durable recipient turn, including its terminal occurrence."""
+    task = await get_task(session, follow_up.task_id)
+    return (
+        task is not None
+        and follow_up.outcome_key == task_outcome_key(task)
+        and await project_result_target_allowed(
+            session, follow_up.task_id, conversation_id, require_execution=True
         )
-        == row.conversation_id
+    )
+
+
+async def project_result_direct_turn_allowed(
+    session: AsyncSession, row: ChannelDeliveryOutboxRow
+) -> bool:
+    """Keep an adopted fenced terminal under its originating recipient grant."""
+    if not row.direct_turn_request_id:
+        return True
+    from cognis.store.models import DirectTurnRequestRow
+
+    request = await session.scalar(
+        select(DirectTurnRequestRow).where(
+            DirectTurnRequestRow.request_id == row.direct_turn_request_id
+        )
+    )
+    if request is None:
+        return False
+    metadata = (request.payload or {}).get("metadata", {})
+    payload = metadata.get("follow_up") if isinstance(metadata, dict) else None
+    if not isinstance(payload, dict) or not payload.get("project_result"):
+        return True
+    follow_up = TaskResultFollowUp.model_validate(payload)
+    route = await get_conversation_channel_route(session, row.conversation_id)
+    return (
+        row.user_email == request.user_id
+        and row.conversation_id == request.conversation_id
+        and route is not None
+        and route[:4] == (row.channel_type, row.account_id, row.chat_id, row.thread_id)
+        and await project_result_follow_up_allowed(session, follow_up, row.conversation_id)
     )
 
 
 async def fan_out_project_result(
     task: TaskModel,
     session_factory: async_sessionmaker[AsyncSession],
-    channel_delivery: Any,
+    deliver_result: Callable[[str], Awaitable[None]],
 ) -> None:
-    """Distribute the final result without invoking recipient agents or task controls."""
+    """Isolate each eligible recipient's outcome from the owner's delivery."""
     if (
-        channel_delivery is None
-        or not task.project_id
+        not task.project_id
         or task.status != "completed"
         or task.delivery.mode != "preferred_channel"
         or task.applied_completion_mode == "silent"
@@ -177,31 +317,19 @@ async def fan_out_project_result(
         return
     try:
         async with session_factory() as session:
-            targets = await preferred_project_result_targets(session, task)
+            recipients = await project_result_recipients(session, task)
     except Exception:
         logger.warning(
             "Project result recipient resolution failed",
             extra={"extra_data": {"task_id": task.task_id}},
         )
         return
-    data = task.result_data or {}
-    content = data.get("final_channel_content")
-    if not isinstance(content, str) or not content.strip():
-        content = data.get("final_content") if data.get("final_format") != "html" else None
-    if not isinstance(content, str) or not content.strip():
-        content = task.result_summary or ""
-    message = f'Task "{task.title}" completed.\n\n{content}'.strip()
-    for conversation_id in targets:
+    for user_email in recipients:
         try:
-            await channel_delivery.deliver_task_to_conversation(
-                conversation_id,
-                task_id=task.task_id,
-                content=message,
-                project_result=True,
-            )
+            await deliver_result(user_email)
         except Exception:
             # A recipient's unavailable route must not break the owner's delivery.
             logger.warning(
                 "Project result recipient delivery failed",
-                extra={"extra_data": {"task_id": task.task_id, "conversation_id": conversation_id}},
+                extra={"extra_data": {"task_id": task.task_id}},
             )

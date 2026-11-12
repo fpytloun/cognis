@@ -274,7 +274,7 @@ def test_send_one_clears_last_error_after_success(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = {
             "Authorization": f"Bearer {client.app.state.auth_provider.sign_access_token('user@example.com', 'User', 'user')}"
         }
@@ -296,7 +296,7 @@ def test_send_one_clears_last_error_after_success(
                 row.last_error = "previous failure"
                 await session.commit()
 
-        asyncio.run(_set_error())
+        client.portal.call(_set_error)
         monkeypatch.setattr(  # type: ignore[attr-defined]
             client.app.state.web_push_service,
             "_send_sync",
@@ -333,7 +333,7 @@ def test_gone_endpoint_is_not_silently_re_enabled(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = {
             "Authorization": f"Bearer {client.app.state.auth_provider.sign_access_token('user@example.com', 'User', 'user')}"
         }
@@ -509,10 +509,10 @@ def test_agent_notifications_use_agent_branding_and_system_alerts_do_not(
     monkeypatch: object,
 ) -> None:
     agent = SimpleNamespace(
-        display_name="Riker",
-        name="riker",
+        display_name="Atlas",
+        name="atlas",
         avatar_image_id=None,
-        avatar_url="/avatars/riker.png",
+        avatar_url="/avatars/atlas.png",
         owner_email="user@example.com",
     )
     service = _branding_service(monkeypatch, agent)
@@ -526,8 +526,8 @@ def test_agent_notifications_use_agent_branding_and_system_alerts_do_not(
         )
     )
     assert reply is not None
-    assert reply["title"] == "Riker"
-    assert reply["icon"] == "/avatars/riker.png"
+    assert reply["title"] == "Atlas"
+    assert reply["icon"] == "/avatars/atlas.png"
 
     schedule = asyncio.run(
         service._event_payload(  # type: ignore[attr-defined]
@@ -546,7 +546,7 @@ def test_agent_notifications_use_agent_branding_and_system_alerts_do_not(
     assert schedule["title"] == "Cognis"
     assert "icon" not in schedule
     assert schedule["body"] == (
-        'Schedule "Daily check" (Riker) was disabled after repeated failures.'
+        'Schedule "Daily check" (Atlas) was disabled after repeated failures.'
     )
 
 

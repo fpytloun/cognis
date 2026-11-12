@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cognis.store.models import Agent, ArtifactGrantRow, ArtifactRecordRow, DeliverableRow
+from cognis.store.models import ArtifactGrantRow, ArtifactRecordRow, DeliverableRow
 
 
 async def grant_referenced_inputs(
@@ -76,32 +78,79 @@ async def set_artifact_share(
     content_ref: str,
     grantee_agent_id: str,
     revoke: bool = False,
+    permission: str = "read",
 ) -> None:
     """Grant/revoke read access as the owning agent or authenticated human owner."""
-    row: DeliverableRow | ArtifactRecordRow | None
-    if content_ref.startswith("dlv_"):
-        row = await session.get(DeliverableRow, content_ref)
-    else:
-        row = await session.get(ArtifactRecordRow, content_ref)
-    grantee = await session.get(Agent, grantee_agent_id)
-    if (
-        row is None
-        or row.owner_email != owner_email
-        or (owner_agent_id is not None and row.owner_agent_id != owner_agent_id)
-        or grantee is None
-        or grantee.owner_email != owner_email
-        or grantee.status != "active"
-        or grantee_agent_id.startswith("system:")
-        or row.status == "deleted"
-    ):
-        raise ValueError("Content reference or recipient is unavailable.")
-    key = dict(
+    await manage_document_shares(
+        session,
         owner_email=owner_email,
+        owner_agent_id=owner_agent_id,
         content_ref=content_ref,
+        action="revoke" if revoke else "grant",
         agent_id=grantee_agent_id,
-        source="explicit",
+        permission=permission,
     )
-    if revoke:
-        await session.execute(sa.delete(ArtifactGrantRow).filter_by(**key))
-    elif await session.get(ArtifactGrantRow, key) is None:
-        await session.merge(ArtifactGrantRow(**key))
+
+
+async def manage_document_shares(
+    session: AsyncSession,
+    *,
+    owner_email: str,
+    owner_agent_id: str | None,
+    content_ref: str,
+    action: str,
+    agent_id: str | None = None,
+    agent_ids: list[str] | None = None,
+    write_agent_ids: list[str] | None = None,
+    permission: str = "read",
+) -> dict[str, Any]:
+    """Use Library lineage sharing; the caller transaction owns commit/cancellation.
+
+    Lineage locks serialize grant replacement with revisions. No ownership or
+    document ownership changes, external I/O, or automatic retries are involved.
+    """
+    from cognis.core.document_sharing import (
+        AgentSharesRequest,
+        document_access,
+        owned_document,
+        replace_explicit_shares,
+        validate_recipients,
+    )
+
+    if action not in {"get", "set", "grant", "revoke"}:
+        raise ValueError("Unknown sharing action.")
+    if permission not in {"read", "write"}:
+        raise ValueError("permission must be read or write")
+    kind = "deliverable" if content_ref.startswith("dlv_") else "artifact"
+    try:
+        row = await owned_document(session, kind, content_ref, owner_email, lock=action != "get")
+    except LookupError as exc:
+        raise ValueError("Content reference or recipient is unavailable.") from exc
+    if owner_agent_id is not None and row.owner_agent_id != owner_agent_id:
+        raise ValueError("Content reference or recipient is unavailable.")
+    access = await document_access(session, row, owner_email)
+    if action == "get":
+        return access.model_dump(mode="json")
+    if action == "set":
+        if agent_ids is None:
+            raise ValueError("agent_ids is required")
+        selected = AgentSharesRequest(agent_ids=agent_ids).agent_ids
+        writers = write_agent_ids or []
+    else:
+        if not agent_id:
+            raise ValueError("agent_id is required")
+        await validate_recipients(session, owner_email, [agent_id])
+        selected = [agent.agent_id for agent in access.agents if agent.explicit]
+        writers = [
+            agent.agent_id for agent in access.agents if agent.explicit_permission == "write"
+        ]
+        writers = [recipient for recipient in writers if recipient != agent_id]
+        if action == "grant":
+            selected = list(dict.fromkeys([*selected, agent_id]))
+            if permission == "write":
+                writers.append(agent_id)
+        else:
+            selected = [recipient for recipient in selected if recipient != agent_id]
+    return (await replace_explicit_shares(session, row, owner_email, selected, writers)).model_dump(
+        mode="json"
+    )

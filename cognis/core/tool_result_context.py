@@ -9,6 +9,8 @@ from cognis.core.attachment_utils import attachment_note
 from cognis.core.message_markers import AUDIT_METADATA, AUDIT_ROLE, AUDIT_SOURCE
 from cognis.models.session import SessionEvent
 
+COMPACT_ATTACHMENT_RENDERING_POLICY_VERSION = 2
+
 
 @dataclass(frozen=True)
 class SkillActivationResult:
@@ -96,6 +98,13 @@ def format_tool_attachment_context(
     message: dict[str, Any] = {
         "_tool_attachment_context": True,
         "_tool_call_id": call_id,
+        "_tool_attachment_artifact_ids": sorted(
+            {
+                ref["artifact_id"]
+                for ref in attachments
+                if isinstance(ref.get("artifact_id"), str) and ref["artifact_id"]
+            }
+        ),
     }
     if blocks:
         content: list[dict[str, Any]] = [

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import uuid
 
+import aiosqlite
 import pytest
 import pytest_asyncio
 from sqlalchemy import Column, Integer, MetaData, Table, insert, select, text, update
@@ -13,6 +15,43 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from cognis.core.shutdown import ShutdownCallbacks, ShutdownCoordinator
 from cognis.store.database import create_engine, create_session_factory
+
+
+@pytest.mark.asyncio
+async def test_sqlite_concurrent_close_settles_after_queued_query() -> None:
+    connection = await aiosqlite.connect(":memory:")
+    entered, release = threading.Event(), threading.Event()
+
+    def hold() -> int:
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Query gate was not released")
+        return 1
+
+    await connection.create_function("hold", 0, hold)
+    query = asyncio.create_task(connection.execute("select hold()"))
+    closing: list[asyncio.Task[None]] = []
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        closing = [
+            asyncio.create_task(connection.close()),
+            asyncio.create_task(connection.close()),
+        ]
+        # Both close requests reach the queue while the worker remains gated.
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.wait_for(query, 2)
+        _, pending = await asyncio.wait(closing, timeout=2)
+        assert not pending, "Concurrent connection cleanup did not settle"
+        for task in closing:
+            assert task.result() is None
+    finally:
+        release.set()
+        for task in [query, *closing]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(query, *closing, return_exceptions=True)
+        await connection.close()
 
 
 @pytest_asyncio.fixture(

@@ -25,6 +25,7 @@ def _file_fact() -> SimpleNamespace:
         generated=False,
         truncated=False,
         preview_omitted=True,
+        source_seq=1,
     )
 
 
@@ -33,6 +34,7 @@ async def test_hydrate_file_items_restores_file_history_identity() -> None:
     fact = _file_fact()
     db = AsyncMock()
     db.scalars.return_value = SimpleNamespace(all=lambda: [fact])
+    db.execute.return_value = SimpleNamespace(all=lambda: [])
     item = ToolCallTimelineItem(
         id="tool:call-1",
         call_id="call-1",
@@ -50,7 +52,13 @@ async def test_hydrate_file_items_restores_file_history_identity() -> None:
 
     hydrated = await _hydrate_file_items(
         db,
-        records=[SimpleNamespace(work_record_id="record-1")],
+        records=[
+            SimpleNamespace(
+                work_record_id="record-1",
+                source_session_id="session-1",
+                source_item_id="tool:call-1",
+            )
+        ],
         items=[item],
     )
 

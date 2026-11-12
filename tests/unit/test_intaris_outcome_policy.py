@@ -94,10 +94,22 @@ async def test_create_verifies_stored_maximum_not_intention_ack(
         requests.append(request.method)
         if request.method == "POST":
             assert request.url.path == "/api/v1/intention"
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "analytics_enabled": True,
+                    "guardrails_enabled": True,
+                },
+            )
         assert request.url.path == "/api/v1/session/session-1"
         return httpx.Response(
-            200, json={"policy": {"maximum_outcome": stored_maximum} if stored_maximum else {}}
+            200,
+            json={
+                "policy": {"maximum_outcome": stored_maximum} if stored_maximum else {},
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            },
         )
 
     provider = IntarisProvider(
@@ -142,8 +154,24 @@ async def test_hybrid_create_reads_persisted_minimum_missing_from_compact_ack(mi
     def respond(request):
         requests.append(request.method)
         if request.method == "POST":
-            return httpx.Response(200, json={"ok": True, "active_policy": active})
-        return httpx.Response(200, json={"policy": policy, "active_policy": active})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "active_policy": active,
+                    "analytics_enabled": True,
+                    "guardrails_enabled": True,
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "policy": policy,
+                "active_policy": active,
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            },
+        )
 
     provider = IntarisProvider(
         "http://intaris.test",
@@ -170,14 +198,26 @@ async def test_nested_creation_and_refresh_accept_canonical_changed_parent_mode(
     canonical = {"evaluation_policy_version": version}
     if version == "hybrid_v1":
         canonical["profile"] = canonical_mode
-    stored = {"policy": canonical, "parent_session_id": "nested-parent"}
+    stored = {
+        "policy": canonical,
+        "parent_session_id": "nested-parent",
+        "analytics_enabled": True,
+        "guardrails_enabled": True,
+    }
     if version == "hybrid_v1":
         stored["active_policy"] = canonical
 
     def respond(request):
         calls.append(request.method)
         if request.method == "POST":
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "analytics_enabled": True,
+                    "guardrails_enabled": True,
+                },
+            )
         return httpx.Response(200, json=stored)
 
     provider = IntarisProvider(

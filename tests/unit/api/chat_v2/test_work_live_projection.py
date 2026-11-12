@@ -127,9 +127,69 @@ async def test_activity_overview_retries_when_lifecycle_changes_after_graph_read
         await resolver.stop()
         await engine.dispose()
 
-    assert calls == 2
+    assert calls == 1
     node = next(item for item in overview.workstreams if item.session_id == "session")
     assert node.execution_state == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["graph", "projection"])
+async def test_activity_overview_uses_consistent_snapshot_under_continuous_churn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    engine, factory, request, context = await _database(tmp_path)
+    resolver = request.app.state.work_graph_resolver
+    revisions: list[int] = []
+
+    async def write_change() -> None:
+        async with factory() as writer:
+            session = await writer.get(Session, "session")
+            assert session is not None
+            session.status = "completed" if not revisions else "active"
+            await writer.commit()
+            revisions.append(await read_live_work_revision(writer, "owner@example.com"))
+
+    if boundary == "graph":
+        resolve_shared = resolver.resolve
+        resolve_snapshot = routes.resolve_authorized_work_graph
+
+        async def shared_with_change(**kwargs):
+            graph = await resolve_shared(**kwargs)
+            await write_change()
+            return graph
+
+        async def snapshot_with_change(*args, **kwargs):
+            graph = await resolve_snapshot(*args, **kwargs)
+            await write_change()
+            return graph
+
+        monkeypatch.setattr(resolver, "resolve", shared_with_change)
+        monkeypatch.setattr(routes, "resolve_authorized_work_graph", snapshot_with_change)
+    else:
+        read_overview = routes.read_activity_overview
+
+        async def project_with_change(*args, **kwargs):
+            overview = await read_overview(*args, **kwargs)
+            await write_change()
+            return overview
+
+        monkeypatch.setattr(routes, "read_activity_overview", project_with_change)
+    try:
+        overview = await routes._build_activity_overview(request, context)
+        assert len(revisions) == 2
+        assert overview.work_revision == revisions[0]
+        assert overview.work_revision < revisions[1]
+        node = next(item for item in overview.workstreams if item.session_id == "session")
+        assert node.execution_state == "completed"
+        async with factory() as db:
+            session = await db.get(Session, "session")
+            assert session is not None
+            assert session.status == "active"
+    finally:
+        await resolver.stop()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

@@ -174,6 +174,13 @@ def normalize_session_events(
 def _should_skip_event(raw_event: RawSessionEvent, *, visible_lanes: frozenset[str | None]) -> bool:
     if raw_event.type in IGNORED_EVENT_TYPES:
         return True
+    # Human answers remain in model/intention history; the resolved interaction
+    # owns their chat presentation. Source matching also repairs persisted history.
+    if raw_event.data.get("source") == "question_answer" and (
+        raw_event.type == "user_message"
+        or (raw_event.type == "message" and raw_event.data.get("role") == "user")
+    ):
+        return True
     # Question JSON is recorded for intention analysis, not as an assistant reply.
     # Match its source so persisted history is fixed without hiding ordinary JSON.
     if raw_event.data.get("source") == "question_context" and (
@@ -187,6 +194,12 @@ def _should_skip_event(raw_event: RawSessionEvent, *, visible_lanes: frozenset[s
         return True
     if raw_event.type == "lifecycle":
         lifecycle_event = str(raw_event.data.get("event") or raw_event.data.get("type") or "")
+        if (
+            lifecycle_event == "conversation_recap"
+            and raw_event.data.get("compaction_tail") is True
+        ):
+            # Older rotations copied historical recaps as apparently new cards.
+            return True
         if lifecycle_event not in VISIBLE_LIFECYCLE_EVENTS:
             return True
         if lifecycle_event == "system_notice" and is_transient_compaction_start_notice(

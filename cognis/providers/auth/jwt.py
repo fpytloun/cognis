@@ -47,12 +47,14 @@ class JWTAuthProvider:
         self._public_key = public_key_path.read_text(encoding="utf-8")
         self._kid = hashlib.sha256(self._public_key.encode()).hexdigest()[:16]
 
-    def _sign(self, claims: dict[str, Any], expires_in: int | None) -> str:
+    def _sign(
+        self, claims: dict[str, Any], expires_in: int | None, *, issued_at_backdate: int = 0
+    ) -> str:
         now = datetime.now(UTC)
         payload = {
             **claims,
             "iss": "cognis",
-            "iat": int(now.timestamp()),
+            "iat": int(now.timestamp()) - issued_at_backdate,
             "jti": uuid.uuid4().hex,
         }
         if expires_in is not None:
@@ -100,7 +102,9 @@ class JWTAuthProvider:
         }
         if agent_owner_email and agent_owner_email != subject:
             payload["aow"] = agent_owner_email
-        return self._sign(payload, self.token_ttl_seconds)
+        # Service peers may be a fraction of a second behind the issuer. Only
+        # backdate issuance; expiry still uses actual time and the configured TTL.
+        return self._sign(payload, self.token_ttl_seconds, issued_at_backdate=1)
 
     def sign_workflow_step_jwt(
         self,

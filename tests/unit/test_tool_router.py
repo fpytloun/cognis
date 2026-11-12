@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import socket
+import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -18,11 +19,12 @@ from cognis.core.tool_router import (
     ToolRoute,
     ToolRouter,
     _extract_output_anchor_names,
+    _ProgramExecutionDeadline,
     caller_assignable_tools,
 )
 from cognis.executor.tool_definitions_runtime import BASH_TOOL
 from cognis.mcp_runtime import MCPClientError
-from cognis.models.agent import AgentDefinition, AgentPermissions
+from cognis.models.agent import AgentCapabilities, AgentDefinition, AgentPermissions
 from cognis.models.credential import CredentialAccessError, CredentialRecord
 from cognis.models.session import SessionModel
 from cognis.models.tool import (
@@ -45,6 +47,62 @@ from cognis.tools.builtin.system_management import system_management_tools
 from cognis.tools.registry import RegisteredTool, ToolExecutionContext, ToolRegistry
 
 pytest_plugins = ("tests.unit.test_task_continuation_tools",)
+
+
+@pytest.mark.asyncio
+async def test_program_execution_deadline_pauses_active_budget_for_approval() -> None:
+    router = ToolRouter(guardrails=None)
+    program_id = uuid.uuid4().hex
+    deadline = _ProgramExecutionDeadline(active_remaining=0.08)
+    router._program_execution_deadlines[program_id] = deadline
+    completed = asyncio.Event()
+
+    async def wait_for_completion() -> str:
+        await completed.wait()
+        return "completed"
+
+    execution = asyncio.create_task(
+        router._wait_for_program_execution(wait_for_completion(), deadline)
+    )
+    await asyncio.sleep(0.04)
+    router.update_program_approval_status(program_id, "awaiting_approval", 1.0, sequence=1)
+    await asyncio.sleep(0.06)
+    router.update_program_approval_status(program_id, "awaiting_approval", 1.0, sequence=2)
+    router.update_program_approval_status(program_id, "running", sequence=1)
+    await asyncio.sleep(0.08)
+    assert not execution.done()
+
+    router.update_program_approval_status(program_id, "running", sequence=2)
+    completed.set()
+    assert await execution == "completed"
+    router._program_execution_deadlines.pop(program_id)
+
+
+@pytest.mark.asyncio
+async def test_program_execution_deadline_keeps_approval_timeout_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tool_router_module, "PROGRAM_APPROVAL_RESULT_GRACE_SECONDS", 0.0)
+    router = ToolRouter(guardrails=None)
+    program_id = uuid.uuid4().hex
+    deadline = _ProgramExecutionDeadline(active_remaining=1.0)
+    router._program_execution_deadlines[program_id] = deadline
+    cancelled = asyncio.Event()
+
+    async def wait_forever() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    execution = asyncio.create_task(router._wait_for_program_execution(wait_forever(), deadline))
+    await asyncio.sleep(0)
+    router.update_program_approval_status(program_id, "awaiting_approval", 0.05, sequence=1)
+
+    with pytest.raises(TimeoutError, match="approval deadline"):
+        await execution
+    assert cancelled.is_set()
+    router._program_execution_deadlines.pop(program_id)
 
 
 @pytest.fixture(autouse=True)
@@ -133,6 +191,7 @@ def test_caller_assignable_tools_excludes_permission_denied_registry_tools() -> 
 class _Guardrails:
     def __init__(self) -> None:
         self.evaluate_calls = 0
+        self.decision = "approve"
         self.mcp_calls = 0
         self.last_mcp_call: tuple[str, str] | None = None
         self.last_mcp_arguments: dict | None = None
@@ -149,7 +208,7 @@ class _Guardrails:
             "Evaluation",
             (),
             {
-                "decision": "approve",
+                "decision": self.decision,
                 "reasoning": None,
                 "risk": None,
                 "path": None,
@@ -746,6 +805,53 @@ def _session() -> SessionModel:
 
 
 @pytest.mark.asyncio
+async def test_program_child_memory_mutation_obeys_intaris_escalation() -> None:
+    guardrails = _Guardrails()
+    guardrails.evaluate = AsyncMock(
+        return_value=SimpleNamespace(
+            decision="escalate",
+            reasoning="A user approval is required for this memory write.",
+            risk="medium",
+            path="agent",
+            latency_ms=1,
+            call_id=uuid.uuid4().hex,
+            session_status="active",
+            status_reason=None,
+        )
+    )
+    router = ToolRouter(guardrails=guardrails, non_bypassable_patterns=[])
+    registry = _registry()
+    agent = _agent({"*": Permission.EVALUATE}).model_copy(
+        update={
+            "capabilities": AgentCapabilities(
+                memory_backend="mnemory",
+                guardrails_backend="intaris",
+                minimum_outcome="escalate",
+            )
+        }
+    )
+    call = ToolCall(
+        call_id=uuid.uuid4().hex,
+        name="memory_add",
+        arguments={"content": "One approved nested memory write."},
+        runtime_metadata={
+            "_program_caller": {
+                "program_id": uuid.uuid4().hex,
+                "parent_call_id": uuid.uuid4().hex,
+            },
+            "memory_policy_enabled": True,
+        },
+    )
+
+    result = await router.execute(call, _session(), agent, registry, _Executor())
+
+    guardrails.evaluate.assert_awaited_once()
+    assert result.is_error is True
+    assert result.metadata is not None
+    assert result.metadata["evaluation"]["decision"] == "escalate"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("permission", [Permission.ALLOW, Permission.DENY])
 async def test_self_mutation_floor_preserves_policy(permission: Permission) -> None:
     guardrails = _Guardrails()
@@ -892,10 +998,12 @@ async def _execute_controller_auth_failure(
             read_only=read_only,
         )
     )
-    result = await router._execute_controller_oauth_mcp_if_applicable(
+    result = await router._prepare_http_mcp_dispatch(
         ToolCall(call_id="call_1", name="mcp_mfg_portal__tool", arguments={}),
         registered_tool=registered_tool,
         session=_session(),
+        agent=_agent(),
+        executor_id="remote-exec",
     )
     assert result is not None
     return result, oauth_service, tool_calls
@@ -1068,10 +1176,12 @@ async def test_controller_executes_oauth_http_mcp_per_call(monkeypatch: pytest.M
         )
     )
 
-    result = await router._execute_controller_oauth_mcp_if_applicable(
+    result = await router._prepare_http_mcp_dispatch(
         ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={"x": 1}),
         registered_tool=registered_tool,
         session=_session(),
+        agent=_agent(),
+        executor_id="remote-exec",
     )
 
     assert result is not None
@@ -1149,10 +1259,12 @@ async def test_controller_oauth_mcp_returns_auth_required(monkeypatch: pytest.Mo
         )
     )
 
-    result = await router._execute_controller_oauth_mcp_if_applicable(
+    result = await router._prepare_http_mcp_dispatch(
         ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={}),
         registered_tool=registered_tool,
         session=_session(),
+        agent=_agent(),
+        executor_id="remote-exec",
     )
 
     assert result is not None
@@ -1237,10 +1349,12 @@ async def test_controller_oauth_mcp_returns_setup_failure_when_auth_url_missing(
         )
     )
 
-    result = await router._execute_controller_oauth_mcp_if_applicable(
+    result = await router._prepare_http_mcp_dispatch(
         ToolCall(call_id="call_1", name="mcp_mfg_portal__whoami", arguments={}),
         registered_tool=registered_tool,
         session=_session(),
+        agent=_agent(),
+        executor_id="remote-exec",
     )
 
     assert result is not None
@@ -2989,8 +3103,22 @@ async def test_tool_router_persist_browser_auth_state_rejects_existing_ungranted
 
 
 @pytest.mark.asyncio
-async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None:
+@pytest.mark.parametrize(
+    ("program_call", "approval_resume", "decision"),
+    [
+        (False, False, "approve"),
+        (True, False, "approve"),
+        (True, True, "approve"),
+        (True, True, "deny"),
+    ],
+)
+async def test_tool_router_projects_browser_eval_args_before_guardrails(
+    program_call: bool,
+    approval_resume: bool,
+    decision: str,
+) -> None:
     guardrails = _Guardrails()
+    guardrails.decision = decision
     router = ToolRouter(
         guardrails=guardrails,
         non_bypassable_patterns=[],
@@ -3010,6 +3138,14 @@ async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None
         )
     )
     executor = _CapturingExecutor()
+    runtime_metadata: dict[str, object] = {}
+    if program_call:
+        runtime_metadata["_program_caller"] = {
+            "program_id": uuid.uuid4().hex,
+            "parent_call_id": uuid.uuid4().hex,
+        }
+    if approval_resume:
+        runtime_metadata["approval_call_id"] = uuid.uuid4().hex
 
     result = await router.execute(
         ToolCall(
@@ -3020,6 +3156,7 @@ async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None
                 "script": "(code) => code",
                 "args": [{"value_ref": "$credential:reddit_mfa.otp"}],
             },
+            runtime_metadata=runtime_metadata,
         ),
         _session(),
         _agent(),
@@ -3027,10 +3164,16 @@ async def test_tool_router_resolves_browser_eval_args_after_guardrails() -> None
         executor,
     )
 
-    assert result.is_error is False
+    assert result.is_error is (decision == "deny")
     assert guardrails.last_evaluate_call is not None
     assert guardrails.last_evaluate_call[2]["args"] == ["<resolved-at-execution>"]
-    assert executor.tool_calls[0].arguments["args"] == ["123456"]
+    assert guardrails.last_evaluate_call[3].get("approval_call_id") == (
+        runtime_metadata.get("approval_call_id")
+    )
+    if decision == "approve":
+        assert executor.tool_calls[0].arguments["args"] == ["123456"]
+    else:
+        assert executor.tool_calls == []
 
 
 @pytest.mark.asyncio
@@ -3694,12 +3837,13 @@ async def test_artifact_read_materializes_tool_artifact_ref(
     async def session_factory() -> object:
         yield _Session()
 
-    row = SimpleNamespace(
+    row = ArtifactRecordRow(
         artifact_id="att_1",
         namespace="attachments",
         object_id="att_1",
         filename="product.svg",
         owner_email="user@example.com",
+        owner_agent_id=None,
         conversation_id="call-web",
         session_id="media:1",
         message_role="assistant",
@@ -3885,12 +4029,13 @@ async def test_artifact_read_resolves_binary_tool_artifact_to_persisted_attachme
     async def session_factory() -> object:
         yield _Session()
 
-    row = SimpleNamespace(
+    row = ArtifactRecordRow(
         artifact_id="att_1",
         namespace="attachments",
         object_id="att_1",
         filename="a.png",
         owner_email="user@example.com",
+        owner_agent_id=None,
         conversation_id="conv-a",
         session_id="session-a",
         message_role="assistant",
@@ -4767,12 +4912,13 @@ async def test_tool_router_handles_artifact_get_metadata(
     monkeypatch.setattr(
         "cognis.tools.builtin.artifact_tools.get_artifact_record",
         AsyncMock(
-            return_value=SimpleNamespace(
+            return_value=ArtifactRecordRow(
                 artifact_id="doc_4",
                 namespace="documents",
                 object_id="doc_4",
                 filename="summary.pdf",
                 owner_email="user@example.com",
+                owner_agent_id=None,
                 conversation_id="conv-3",
                 session_id="sess-3",
                 message_role="assistant",

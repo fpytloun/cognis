@@ -9,6 +9,7 @@ from typing import Any
 
 from cognis.core.cpu_offload import run_cpu_bound
 from cognis.core.executor_connection_ownership import ExecutorConnectionOwner
+from cognis.core.mcp_credentials import executor_supports_mcp_credentials
 from cognis.core.mcp_oauth import MCPOAuthError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
@@ -138,6 +139,9 @@ def schedule_executor_mcp_retries(
                         runtime_metadata.pop("observed_capabilities_state", None)
                     capabilities = ExecutorCapabilities.model_validate(
                         (row.runtime_metadata or {}).get("capabilities") or {}
+                    )
+                    capabilities.mcp_credential_bindings = executor_supports_mcp_credentials(
+                        getattr(connection, "capabilities", None)
                     )
                     capabilities.tools = [str(tool["name"]) for tool in observed_tools]
                     runtime_metadata["capabilities"] = capabilities.model_dump(mode="json")
@@ -460,6 +464,19 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     runtime_metadata,
                 )
                 capabilities = ExecutorCapabilities(
+                    durable_tool_receipts=getattr(
+                        getattr(current_conn, "capabilities", None), "durable_tool_receipts", False
+                    )
+                    is True,
+                    mcp_credential_bindings=executor_supports_mcp_credentials(
+                        getattr(current_conn, "capabilities", None)
+                    ),
+                    binary_transfers=(
+                        getattr(
+                            getattr(current_conn, "capabilities", None), "binary_transfers", False
+                        )
+                        is True
+                    ),
                     tools=observed_tool_names,
                     inference=local_inference_enabled,
                     local_inference=local_inference_enabled,
@@ -485,7 +502,7 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                     )
                     if persisted is None:
                         return False
-                app.state.providers.executor.websocket.mark_ready(
+                marked_ready = app.state.providers.executor.websocket.mark_ready(
                     executor_id,
                     capabilities,
                     metadata=_executor_connection_metadata(
@@ -496,7 +513,11 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                         owner_email=row.owner_email,
                         runtime_metadata=runtime_metadata,
                     ),
+                    expected_connection=current_conn,
                 )
+                if marked_ready is False:
+                    connection = None
+                    continue
                 _logger.info(
                     "executor_runtime: executor %s already at desired v%d (%s), no reconfigure needed",
                     executor_id,
@@ -625,6 +646,23 @@ async def reconcile_executor(app: Any, executor_id: str, *, connection: Any | No
                 runtime_metadata.pop("observed_capabilities", None)
                 runtime_metadata["observed_capabilities_state"] = "unknown"
             capabilities = ExecutorCapabilities(
+                durable_tool_receipts=getattr(
+                    getattr(current_conn, "capabilities", None), "durable_tool_receipts", False
+                )
+                is True,
+                mcp_credential_bindings=(
+                    caps_raw.get("mcp_credential_bindings") is True
+                    and executor_supports_mcp_credentials(
+                        getattr(current_conn, "capabilities", None)
+                    )
+                ),
+                binary_transfers=(
+                    caps_raw.get("binary_transfers") is True
+                    and getattr(
+                        getattr(current_conn, "capabilities", None), "binary_transfers", False
+                    )
+                    is True
+                ),
                 tools=list(caps_raw.get("tools") or []),
                 inference=bool(caps_raw.get("inference", False)),
                 local_inference=caps_raw.get("local_inference") is True,

@@ -12,11 +12,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -27,6 +26,8 @@ import pytest
 
 from cognis.bootstrap import ensure_data_dir, ensure_jwt_keypair, ensure_secrets_key
 from cognis.config import load_config
+from tests.e2e.subprocess_env import ServiceProcess, StackResources, isolated_subprocess_env
+from tests.e2e.usage_checkpoint.inputs import LaunchInputs, WorkerInputs, declared_launch
 
 E2E_AGENT_ID = "e2e-test-agent"
 E2E_PROVIDER_ID = "e2e-mock-llm"
@@ -86,23 +87,18 @@ def _start_proc(
     *,
     label: str,
     log_dir: Path,
-) -> subprocess.Popen:
-    base = dict(os.environ)
-    for key in (
-        "COGNIS_DATA_DIR",
-        "COGNIS_PORT",
-        "COGNIS_HOST",
-        "DATABASE_URL",
-        "COGNIS_MNEMORY_URL",
-        "COGNIS_INTARIS_URL",
-        "COGNIS_INITIAL_ADMIN_EMAIL",
-        "COGNIS_INITIAL_ADMIN_PASSWORD",
-        "COGNIS_LOG_FORMAT",
-        "COGNIS_LOG_LEVEL",
-        "COGNIS_E2E_MODE",
-    ):
-        base.pop(key, None)
-    base.update(env)
+    inputs: WorkerInputs | None = None,
+) -> ServiceProcess:
+    if inputs is not None:
+        inputs.before_start()
+        if label in {"mnemory", "intaris"}:
+            tool = next(
+                tool for tool in inputs.launch.spec.companions.installed if tool.name == label
+            )
+            command = [tool.entrypoint.path, *command[2:]]
+    base = isolated_subprocess_env(
+        os.environ, env, declared=inputs.environment(label) if inputs else None
+    )
     log_path = log_dir / f"{label}.log"
     log_handle = open(log_path, "w")  # noqa: SIM115
     # Opt-in compatibility qualification can run an immutable older controller
@@ -110,34 +106,33 @@ def _start_proc(
     controller_project = (
         os.environ.get("COGNIS_E2E_CONTROLLER_PROJECT") if label == "cognis" else None
     )
-    proc = subprocess.Popen(
-        command,
-        env=base,
-        cwd=controller_project,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
-    proc._log_handle = log_handle  # type: ignore[attr-defined]
-    return proc
-
-
-def _stop_proc(proc: subprocess.Popen, label: str) -> None:
-    log_handle = getattr(proc, "_log_handle", None)
-    if proc.poll() is not None:
-        if log_handle:
-            log_handle.close()
-        return
-    proc.send_signal(signal.SIGTERM)
     try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
-    if log_handle:
+        if (
+            inputs is not None
+            and controller_project
+            and Path(controller_project).resolve() != Path(__file__).resolve().parents[2]
+        ):
+            raise ValueError("Usage inputs cannot select another controller workspace")
+        proc = subprocess.Popen(
+            command,
+            env=base,
+            cwd=controller_project,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
+    except BaseException:
         log_handle.close()
+        raise
+    if inputs is not None:
+        inputs.register_child(proc)
+    return ServiceProcess(proc, log_handle)
 
 
-def _dump_log(label: str, proc: subprocess.Popen, log_dir: Path) -> None:
+def _stop_proc(proc: ServiceProcess, label: str) -> None:
+    proc.stop()
+
+
+def _dump_log(label: str, proc: ServiceProcess, log_dir: Path) -> None:
     log_path = log_dir / f"{label}.log"
     print(f"\n=== {label} (pid={proc.pid}, poll={proc.poll()}) ===")
     if log_path.exists():
@@ -154,13 +149,18 @@ class E2EStack:
     cognis_url: str
     ws_url: str
     mock_llm_url: str
+    mnemory_url: str
+    intaris_upstream_url: str
     admin_email: str
     admin_password: str
     admin_token: str
+    mnemory_health_token: str
     e2e_agent_id: str
     e2e_conversation_id: str | None
     http: httpx.Client
+    intaris_process: subprocess.Popen[Any]
     append_proxy: Any = None
+    log_dir: Path | None = None
 
     def admin_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.admin_token}"}
@@ -179,14 +179,56 @@ class E2EStack:
 # ---------------------------------------------------------------------------
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Launch identity is separate from the immutable prepare-time declaration."""
+    parser.addoption("--usage-input-spec", default=None)
+    parser.addoption("--usage-input-sha256", default=None)
+    parser.addoption("--usage-input-test-data-dir", default=None)
+
+
+@pytest.fixture(scope="session")
+def usage_launch(request: pytest.FixtureRequest) -> LaunchInputs | None:
+    """Reject missing declared inputs before any stack service can start."""
+    enabled = os.environ.get("COGNIS_USAGE_CHECKPOINT") == "1"
+    controller_project = os.environ.get("COGNIS_E2E_CONTROLLER_PROJECT")
+    if (
+        enabled
+        and controller_project
+        and Path(controller_project).resolve() != Path(__file__).resolve().parents[2]
+    ):
+        raise ValueError("Usage inputs cannot select another controller workspace")
+    launch = declared_launch(
+        enabled=enabled,
+        spec_path=request.config.getoption("--usage-input-spec"),
+        spec_sha256=request.config.getoption("--usage-input-sha256"),
+    )
+    if launch is not None and (
+        launch.spec.companions.data_root != "/work/data"
+        or launch.spec.companions.cache.path != "/work/data/new-cache"
+        or launch.spec.companions.tools.path != "/work/data/tools"
+    ):
+        raise ValueError(
+            "Usage qualification requires fresh /work/data/new-cache and /work/data/tools"
+        )
+    return launch
+
+
 @pytest.fixture(scope="session")
 def e2e_stack(
     tmp_path_factory: pytest.TempPathFactory,
     request: pytest.FixtureRequest,
+    usage_launch: LaunchInputs | None,
 ) -> Iterator[E2EStack]:
     """Start the full e2e stack: Cognis + Mnemory + Intaris + mock-llm."""
     dict(os.environ)
     base_dir = tmp_path_factory.mktemp("e2e")
+    inputs = usage_launch.stage(base_dir) if usage_launch is not None else None
+    if inputs is not None:
+        request.addfinalizer(inputs.close_if_unused)
+    resources = StackResources(inputs=inputs)
+    request.addfinalizer(resources.close)
+    procs = resources.processes
+    clients = resources.clients
     log_dir = base_dir / "logs"
     log_dir.mkdir()
 
@@ -201,7 +243,10 @@ def e2e_stack(
     intaris_url = f"http://127.0.0.1:{intaris_port}"
     from tests.e2e.append_barrier import AppendProxyServer
 
+    if inputs is not None:
+        inputs.before_start()
     append_proxy = AppendProxyServer(intaris_url)
+    resources.append_proxy = append_proxy
     mock_llm_url = f"http://127.0.0.1:{mock_llm_port}"
     ws_url = f"ws://127.0.0.1:{cognis_port}/api/ws"
 
@@ -211,6 +256,8 @@ def e2e_stack(
     uvx_path = shutil.which("uvx")
     uv_path = shutil.which("uv")
     if uvx_path is None or uv_path is None:
+        if inputs is not None:
+            raise RuntimeError("Declared usage requires admitted uvx/uv on PATH")
         pytest.skip("uvx/uv not found on PATH")
 
     # Bootstrap Cognis keys before starting anything
@@ -246,20 +293,6 @@ def e2e_stack(
     ensure_secrets_key(bootstrap_config)
     public_key_path = str(cognis_dir / "keys" / "public.pem")
 
-    procs: list[tuple[str, subprocess.Popen]] = []
-    clients: list[httpx.Client] = []
-
-    def cleanup() -> None:
-        try:
-            append_proxy.close()
-        finally:
-            for client in clients:
-                client.close()
-            for label, proc in reversed(procs):
-                _stop_proc(proc, label)
-
-    request.addfinalizer(cleanup)
-
     try:
         # Start mock-llm
         mock_llm_proc = _start_proc(
@@ -282,6 +315,7 @@ def e2e_stack(
             },
             label="mock-llm",
             log_dir=log_dir,
+            inputs=inputs,
         )
         procs.append(("mock-llm", mock_llm_proc))
 
@@ -303,28 +337,38 @@ def e2e_stack(
             },
             label="mnemory",
             log_dir=log_dir,
+            inputs=inputs,
         )
         procs.append(("mnemory", mnemory_proc))
 
         # Start Intaris
         intaris_dir = base_dir / "intaris"
         intaris_dir.mkdir()
+        intaris_env = {
+            "DATA_DIR": str(intaris_dir),
+            "INTARIS_HOST": "127.0.0.1",
+            "INTARIS_PORT": str(intaris_port),
+            "METRICS_HOST": "127.0.0.1",
+            "METRICS_PORT": str(intaris_metrics_port),
+            "INTARIS_JWT_PUBLIC_KEY": public_key_path,
+            "LLM_API_KEY": "mock-key",
+            "LLM_BASE_URL": f"{mock_llm_url}/v1",
+            "ANALYSIS_ENABLED": "false",
+            "LOG_LEVEL": "warning",
+        }
+        # Opt-in only: the PTC qualification agent uses Intaris's ordinary
+        # fail-closed evaluator, with a named deterministic test model. The
+        # existing capability-off E2E agent and other runs keep their defaults.
+        policy_model = os.environ.get("COGNIS_E2E_INTARIS_POLICY_MODEL")
+        if policy_model:
+            intaris_env["LLM_MODEL"] = policy_model
+            intaris_env["JUDGE_LLM_MODEL"] = policy_model
         intaris_proc = _start_proc(
             [uvx_path, "intaris"],
-            {
-                "DATA_DIR": str(intaris_dir),
-                "INTARIS_HOST": "127.0.0.1",
-                "INTARIS_PORT": str(intaris_port),
-                "METRICS_HOST": "127.0.0.1",
-                "METRICS_PORT": str(intaris_metrics_port),
-                "INTARIS_JWT_PUBLIC_KEY": public_key_path,
-                "LLM_API_KEY": "mock-key",
-                "LLM_BASE_URL": f"{mock_llm_url}/v1",
-                "ANALYSIS_ENABLED": "false",
-                "LOG_LEVEL": "warning",
-            },
+            intaris_env,
             label="intaris",
             log_dir=log_dir,
+            inputs=inputs,
         )
         procs.append(("intaris", intaris_proc))
 
@@ -338,24 +382,35 @@ def e2e_stack(
             bootstrap_config.jwt_private_key_path,
             bootstrap_config.jwt_public_key_path,
         )
+        mnemory_health_token = health_signer.sign_service_jwt(
+            subject=admin_email,
+            agent_id=E2E_AGENT_ID,
+            audience=["mnemory"],
+        )
         _wait_healthy(
             mnemory_url,
             timeout=120,
-            headers={
-                "Authorization": "Bearer "
-                + health_signer.sign_service_jwt(
-                    subject=admin_email,
-                    agent_id=E2E_AGENT_ID,
-                    audience=["mnemory"],
-                )
-            },
+            headers={"Authorization": f"Bearer {mnemory_health_token}"},
         )
         _wait_healthy(intaris_url, timeout=120)
         append_proxy.start()
 
         # Start Cognis
+        controller_command = [uv_path, "run"]
+        if policy_model == "ptc-policy-model":
+            # The base controller test environment intentionally omits local
+            # executor support. This opt-in acceptance process loads the real
+            # workspace package; the test agent still separately opts into
+            # Python through its executor's program_runtime.host_enabled flag.
+            controller_command.extend(
+                [
+                    "--with-editable",
+                    str(Path(__file__).parents[2] / "packages" / "executor"),
+                ]
+            )
+        controller_command.extend(["cognis-controller", "serve"])
         cognis_proc = _start_proc(
-            [uv_path, "run", "cognis-controller", "serve"],
+            controller_command,
             {
                 "COGNIS_DATA_DIR": str(cognis_dir),
                 "DATABASE_URL": database_url,
@@ -375,6 +430,7 @@ def e2e_stack(
             },
             label="cognis",
             log_dir=log_dir,
+            inputs=inputs,
         )
         procs.append(("cognis", cognis_proc))
 
@@ -409,13 +465,18 @@ def e2e_stack(
         cognis_url=cognis_url,
         ws_url=ws_url,
         mock_llm_url=mock_llm_url,
+        mnemory_url=mnemory_url,
+        intaris_upstream_url=intaris_url,
         admin_email=admin_email,
         admin_password=admin_password,
         admin_token=admin_token,
+        mnemory_health_token=mnemory_health_token,
         e2e_agent_id=E2E_AGENT_ID,
         e2e_conversation_id=e2e_conversation_id,
         http=http,
+        intaris_process=intaris_proc.process,
         append_proxy=append_proxy,
+        log_dir=log_dir,
     )
 
     yield stack
@@ -600,6 +661,7 @@ def capture_ws_events(
     timeout: float = 90,
     post_completion_window: float = 3.0,
     capture_reconnect_snapshot: bool = True,
+    approval_poller: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Send a message via WebSocket and collect all events.
 
@@ -693,6 +755,8 @@ def capture_ws_events(
                     # Continue for post_completion_window to capture trailing events
 
             except TimeoutError:
+                if approval_poller is not None:
+                    approval_poller()
                 if message_complete_at is not None:
                     continue
                 response = stack.get(f"/api/v1/chat/v2/conversations/{conversation_id}/snapshot")

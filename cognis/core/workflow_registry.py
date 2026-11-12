@@ -116,16 +116,29 @@ GENERAL_TASK_WORKFLOW = Workflow(
                         type="string",
                         required=True,
                         enum=["completed", "blocked"],
+                        description=(
+                            "completed means requested work and verification are complete, "
+                            "including verified no-op or a completed review rejecting work. "
+                            "blocked requires outcome.status=failed with blocker and next action."
+                        ),
                     ),
                     StepCompletionMetadataField(
                         name="verification",
                         type="object",
                         required=True,
+                        description=(
+                            "For completed, an object with checks_run, results and checks_not_run "
+                            "arrays of nonblank strings. results must be nonempty. Empty check "
+                            "arrays explicitly mean none; explain required checks not run."
+                        ),
                     ),
                 ]
             ),
             completion=CompletionConfig(evaluate=False),
-            outcome_routes=[OutcomeRoute(status="failed", action="gate")],
+            outcome_routes=[
+                OutcomeRoute(status="failed", action="gate"),
+                OutcomeRoute(status="rejected", action="continue"),
+            ],
             require_deliverable=True,
         ),
     ],
@@ -649,8 +662,9 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
             type="gate",
             gate=GateConfig(
                 message=(
-                    "Code review reported unresolved scope or review findings. "
-                    "Revise implementation, continue explicitly, or cancel."
+                    "Required scope or blocking review findings remain unresolved. "
+                    "Revise, explicitly accept the remaining risk where authorized, or cancel. "
+                    "Advisory findings alone do not block completion."
                 ),
                 input=["plan", "implement", "code_review"],
                 options=[
@@ -664,8 +678,7 @@ SOFTWARE_DEVELOPMENT_WORKFLOW = Workflow(
                             "metadata.code_review.decision != 'approved' or "
                             "metadata.code_review.required_scope_complete == false or "
                             "metadata.code_review.missing_scope_count > 0 or "
-                            "metadata.code_review.must_fix_count > 0 or "
-                            "metadata.code_review.should_fix_count > 0"
+                            "metadata.code_review.must_fix_count > 0"
                         )
                     }
                 ],
@@ -1086,6 +1099,20 @@ class WorkflowRegistry:
 # ---------------------------------------------------------------------------
 
 
+def validate_gate_action(action: str, *, step_names: list[str], gate_index: int) -> None:
+    """Validate an explicit gate action and its revision target."""
+    if action in {"continue", "cancel", "fail"}:
+        return
+    if action.startswith("revise(") and action.endswith(")"):
+        target = action[7:-1]
+    elif action.startswith("revise:"):
+        target = action[7:]
+    else:
+        raise ValueError(f"Unsupported gate action: {action!r}")
+    if target not in step_names or step_names.index(target) >= gate_index:
+        raise ValueError(f"Gate revision target must be an earlier step: {target!r}")
+
+
 def _validate_workflow(workflow: Workflow) -> None:
     """Validate workflow definition: step references, input sources, and routing targets."""
     seen_names: set[str] = set()
@@ -1198,6 +1225,9 @@ def _validate_workflow(workflow: Workflow) -> None:
         # Validate gate steps have gate config
         if step.type == "gate" and step.gate is None:
             raise ValueError(f"Gate step {step.name!r} must have gate configuration")
+        if step.type == "gate" and step.gate is not None:
+            for option in step.gate.options:
+                validate_gate_action(option.action, step_names=step_names, gate_index=i)
 
         deterministic_targets = [step.next]
         if step.condition is not None:

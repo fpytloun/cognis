@@ -17,6 +17,7 @@ from pathlib import PurePath, PurePosixPath, PureWindowsPath
 from typing import Any, Literal
 
 from cognis import json_codec as json
+from cognis.api.chat_v2.feedback_evidence import preserve_feedback_diff
 from cognis.api.chat_v2.schemas import (
     ActivityOverviewDetail,
     ArtifactTimelineItem,
@@ -333,6 +334,8 @@ def build_work_projection(
             )
             deliverable = WorkDeliverable(
                 deliverable_id=item.deliverable_id,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
                 lineage_id=item.lineage_id,
                 revision=item.revision,
                 sort_key=item.sort_key,
@@ -375,6 +378,8 @@ def build_work_projection(
             title, _ = budget.take_text(item.title, _MAX_ARGUMENT_TEXT)
             artifact = WorkArtifact(
                 artifact_id=item.artifact_id,
+                created_at=item.created_at,
+                updated_at=item.updated_at,
                 sort_key=item.sort_key,
                 filename=PurePath(_safe_path(item.filename, roots).display).name,
                 mime_type=item.mime_type,
@@ -413,6 +418,15 @@ def build_work_projection(
         if item.file_diffs:
             if not cached_current_files and not _is_completed_file_mutation(item, definition):
                 continue
+            if cached_current_files:
+                item = item.model_copy(
+                    update={
+                        "file_diffs": [
+                            diff.model_copy(update={"feedback_source": None})
+                            for diff in item.file_diffs
+                        ],
+                    }
+                )
             event = _mutation_event(
                 item,
                 definition,
@@ -797,31 +811,34 @@ def _bounded_diffs(
         if content_truncated:
             text += "\n… diff content truncated …"
         bounded.append(
-            FileDiffRef(
-                path=safe_path.display,
-                occurred_at=diff.occurred_at,
-                path_id=diff.path_id or safe_path.path_id,
-                path_generation_id=diff.path_generation_id,
-                source_item_id=diff.source_item_id,
-                relative_path=safe_path.relative_path,
-                root_label=safe_path.root_label,
-                root_name=safe_path.root_name,
-                root_id=safe_path.root_id,
-                additions=additions,
-                deletions=deletions,
-                diff=text,
-                status=diff.status,
-                old_path=_safe_path(diff.old_path, roots).display if diff.old_path else None,
-                binary=diff.binary,
-                generated=diff.generated,
-                truncated=diff.truncated,
-                preview_omitted=diff.preview_omitted,
-                preview_omission_reason=(
-                    "projection_budget"
-                    if content_truncated and not diff.preview_omitted
-                    else diff.preview_omission_reason
+            preserve_feedback_diff(
+                diff,
+                FileDiffRef(
+                    path=safe_path.display,
+                    occurred_at=diff.occurred_at,
+                    path_id=diff.path_id or safe_path.path_id,
+                    path_generation_id=diff.path_generation_id,
+                    source_item_id=diff.source_item_id,
+                    relative_path=safe_path.relative_path,
+                    root_label=safe_path.root_label,
+                    root_name=safe_path.root_name,
+                    root_id=safe_path.root_id,
+                    additions=additions,
+                    deletions=deletions,
+                    diff=text,
+                    status=diff.status,
+                    old_path=_safe_path(diff.old_path, roots).display if diff.old_path else None,
+                    binary=diff.binary,
+                    generated=diff.generated,
+                    truncated=diff.truncated,
+                    preview_omitted=diff.preview_omitted,
+                    preview_omission_reason=(
+                        "projection_budget"
+                        if content_truncated and not diff.preview_omitted
+                        else diff.preview_omission_reason
+                    ),
+                    content_truncated=diff.content_truncated or content_truncated,
                 ),
-                content_truncated=content_truncated,
             )
         )
     return bounded, any(diff.content_truncated for diff in bounded)

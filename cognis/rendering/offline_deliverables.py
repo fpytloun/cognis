@@ -12,7 +12,9 @@ from cognis.rendering.rich_visuals import MediaReference
 from cognis.ui_assets import resolve_standalone_manifest
 
 
-def render_offline_html(row: Any, *, payload: dict[str, Any], media_resolver: Any) -> str:
+def render_offline_html(
+    row: Any, *, payload: dict[str, Any], media_resolver: Any, theme_family: str | None = None
+) -> str:
     """Embed the offline browser bundle and authorized media without network URLs."""
 
     manifest = resolve_standalone_manifest(offline=True)
@@ -42,6 +44,7 @@ def render_offline_html(row: Any, *, payload: dict[str, Any], media_resolver: An
                 "title": title,
                 "payload": payload,
                 "media": media,
+                "themeFamily": theme_family,
             },
             ensure_ascii=False,
             separators=(",", ":"),

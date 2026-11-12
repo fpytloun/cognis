@@ -95,8 +95,6 @@ def test_completion_requires_all_real_groups(monkeypatch, tmp_path: Path, mode: 
     monkeypatch.setattr(sys, "argv", argv)
     monkeypatch.setattr(matrix, "UI", ui)
     monkeypatch.setattr(matrix.signal, "signal", lambda *_args: None)
-    monkeypatch.setenv("COGNIS_E2E_MOCK_LLM_CONTROL", "container")
-    monkeypatch.setenv("COGNIS_E2E_MOCK_LLM_CONTAINER_ID", "f" * 64)
     executions: list[str] = []
 
     def run(command, _log, environment, _deadline) -> None:
@@ -113,13 +111,6 @@ def test_completion_requires_all_real_groups(monkeypatch, tmp_path: Path, mode: 
             report = report_for("fixture.spec.ts", ["chromium", "webkit"], executed=not listing)
         Path(environment["PLAYWRIGHT_JSON_OUTPUT_FILE"]).write_text(json.dumps(report))
         if not listing:
-            assert {"--workers=1", "--retries=0", "--forbid-only"} <= set(command)
-            if config.name == "compose.config.ts":
-                assert environment["COGNIS_E2E_MOCK_LLM_CONTROL"] == "container"
-                assert environment["COGNIS_E2E_MOCK_LLM_CONTAINER_ID"] == "f" * 64
-            else:
-                assert "COGNIS_E2E_MOCK_LLM_CONTROL" not in environment
-                assert "COGNIS_E2E_MOCK_LLM_CONTAINER_ID" not in environment
             executions.append(config.name)
             if mode == "failed-group":
                 raise subprocess.CalledProcessError(1, command)

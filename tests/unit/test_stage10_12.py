@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,7 +47,7 @@ def test_change_password_and_api_key_last_used(monkeypatch: object, tmp_path: Pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         headers = _auth_headers(app, email="admin@example.com", role="admin")
         change = client.post(
@@ -105,7 +104,7 @@ def test_expired_api_key_is_rejected(monkeypatch: object, tmp_path: Path) -> Non
                 await session.commit()
             return api_key
 
-        api_key = asyncio.run(_seed())
+        api_key = client.portal.call(_seed)
     response = client.get("/api/auth/me", headers={"X-API-Key": api_key})
     assert response.status_code == 401
 
@@ -114,7 +113,7 @@ def test_api_key_cannot_manage_api_keys(monkeypatch: object, tmp_path: Path) -> 
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        async def _seed() -> str:
+        async def _seed() -> None:
             async with app.state.session_factory() as session:
                 await create_user(
                     session,
@@ -124,18 +123,18 @@ def test_api_key_cannot_manage_api_keys(monkeypatch: object, tmp_path: Path) -> 
                     role="user",
                 )
                 await session.commit()
-            login = client.post(
-                "/api/auth/login",
-                json={"email": "user@example.com", "password": "password123"},
-            )
-            assert login.status_code == 200
-            created = client.post(
-                "/api/v1/auth/api-keys",
-                json={"name": "primary-key"},
-            )
-            return created.json()["api_key"]
 
-        api_key = asyncio.run(_seed())
+        client.portal.call(_seed)
+        login = client.post(
+            "/api/auth/login",
+            json={"email": "user@example.com", "password": "password123"},
+        )
+        assert login.status_code == 200
+        created = client.post(
+            "/api/v1/auth/api-keys",
+            json={"name": "primary-key"},
+        )
+        api_key = created.json()["api_key"]
         response = client.post(
             "/api/v1/auth/api-keys",
             headers={"X-API-Key": api_key},
@@ -159,7 +158,7 @@ def test_diagnostics_requires_admin(monkeypatch: object, tmp_path: Path) -> None
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/system/diagnostics",
             headers=_auth_headers(app, email="user@example.com"),
@@ -201,7 +200,7 @@ def test_admin_diagnostics_returns_readiness_summary(monkeypatch: object, tmp_pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/system/diagnostics",
             headers=_auth_headers(app, email="admin@example.com", role="admin"),
@@ -237,11 +236,12 @@ def test_provider_test_endpoint_enforces_cooldown(monkeypatch: object, tmp_path:
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         async def _fake_test_provider(
-            provider_id: str, timeout_seconds: int = 15
+            provider_id: str, timeout_seconds: int = 15, *, acting_user_email: str
         ) -> dict[str, object]:
+            assert acting_user_email == "admin@example.com"
             return {
                 "ok": True,
                 "model_resolved": "gpt-4o-mini",
@@ -297,7 +297,7 @@ def test_mcp_routes_use_executor_discovery(monkeypatch: object, tmp_path: Path) 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         class _FakeConnection:
             async def list_tools(self) -> list[ToolDefinition]:

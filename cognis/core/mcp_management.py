@@ -9,7 +9,9 @@ from typing import Any
 
 from sqlalchemy import delete, select, update
 
+from cognis.core.mcp_credentials import resolve_mcp_credential
 from cognis.core.mcp_oauth import MCPOAuthError
+from cognis.models.credential import CredentialAccessError
 from cognis.models.tool import MCP_SERVER_IDS_KEY, MCPServerConfig, effective_mcp_auth_config
 from cognis.ownership import is_shared_owner_email
 from cognis.store.models import ExecutorRow, MCPServerRow, executor_observed_tools_deferred
@@ -35,6 +37,8 @@ OAuthDisconnectCallback = Callable[[str, str], Awaitable[dict[str, Any]]]
 @dataclass(slots=True)
 class MCPManagementDependencies:
     session_factory: Any
+    credentials: Any | None = None
+    caller_agent_id: str | None = None
     oauth_service: Any | None = None
     reconfigure_server: ReconfigureCallback | None = None
     reconfigure_executor: ReconfigureCallback | None = None
@@ -178,6 +182,7 @@ async def handle_mcp_management_action(
             config = MCPServerConfig.model_validate(candidate)
         except ValueError as exc:
             raise MCPManagementError(str(exc)) from exc
+        await _validate_binding(deps, actor_email, config)
         async with deps.session_factory() as session:
             row = await create_mcp_server(
                 session,
@@ -257,9 +262,10 @@ async def handle_mcp_management_action(
             )
         }
         try:
-            MCPServerConfig.model_validate(merged)
+            config = MCPServerConfig.model_validate(merged)
         except ValueError as exc:
             raise MCPManagementError(str(exc)) from exc
+        await _validate_binding(deps, actor_email, config)
         revision = _parse_revision(str(expected))
         async with deps.session_factory() as session:
             result = await session.execute(
@@ -448,6 +454,35 @@ async def handle_mcp_management_action(
             raise MCPManagementError("MCP server not found")
         return payload
     raise MCPManagementError(f"Unknown action: {action}")
+
+
+async def _validate_binding(
+    deps: MCPManagementDependencies, actor: str, config: MCPServerConfig
+) -> None:
+    auth = effective_mcp_auth_config(config.auth_config, config.headers)
+    if auth.type != "credential_bearer":
+        return
+    if not deps.caller_agent_id:
+        raise MCPManagementError("Credential binding requires an authorized agent context.")
+    try:
+        # Configuration authority does not change the binding's runtime consumer.
+        # Both principals need their own current, same-owner credential grant.
+        await resolve_mcp_credential(
+            session_factory=deps.session_factory,
+            credentials=deps.credentials,
+            owner_email=actor,
+            auth=auth.model_copy(update={"credential_agent_id": deps.caller_agent_id}),
+            caller_agent_id=deps.caller_agent_id,
+        )
+        if auth.credential_agent_id != deps.caller_agent_id:
+            await resolve_mcp_credential(
+                session_factory=deps.session_factory,
+                credentials=deps.credentials,
+                owner_email=actor,
+                auth=auth,
+            )
+    except CredentialAccessError as exc:
+        raise MCPManagementError(f"MCP credential binding rejected ({exc.code}).") from exc
 
 
 def _parse_revision(value: str) -> datetime:

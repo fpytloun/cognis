@@ -447,6 +447,39 @@ def test_compose_workflow_plan_requests_provider_json_mode_once() -> None:
     assert len(llm.calls) == 1
     assert "max_tokens" not in llm.calls[0]
     assert "response_format" in llm.calls[0]
+    assert "Do not create program steps" in str(llm.calls[0]["messages"][-1]["content"])
+
+
+def test_compose_workflow_plan_adds_candidate_guidance_when_ptc_is_enabled() -> None:
+    llm = _FallbackLLM(
+        {
+            "action": "reuse_existing",
+            "workflow_id": "system:software-development",
+            "rationale": "Existing workflow already fits.",
+            "title": "Implement change",
+            "expected_output": "Completed implementation",
+        }
+    )
+
+    asyncio.run(
+        compose_workflow_plan(
+            llm=llm,
+            intent="Implement the requested feature",
+            context="User requested a workflow.",
+            available_workflows=[],
+            template_hints=[],
+            base_workflow=None,
+            skill_materials=[],
+            persist=False,
+            schedule_requested=False,
+            allow_program_steps=True,
+            timeout_seconds=6.0,
+        )
+    )
+
+    prompt = str(llm.calls[0]["messages"][-1]["content"])
+    assert "program step may be proposed only as an untrusted candidate" in prompt
+    assert "Program workflow steps" in prompt
 
 
 def test_validate_composed_workflow_normalizes_missing_step_profiles_from_skill_materials() -> None:

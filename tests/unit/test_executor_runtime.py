@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -17,6 +17,7 @@ from cognis.models.executor_inference import (
     resolve_executor_local_inference_config,
 )
 from cognis.models.runtime_capabilities import RuntimeCapabilityReport
+from cognis.models.tool import ExecutorCapabilities
 
 
 def test_fast_path_local_inference_requires_matching_generation_flags_and_endpoint() -> None:
@@ -525,6 +526,165 @@ async def test_legacy_applied_generation_fast_path_persists_desired_floor(
     assert persisted.await_args.kwargs["applied_config_version"] == 1
     assert "observed_tools" not in persisted.await_args.kwargs
     assert executor_reads == [{"defer_observed_tools": True}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fast_path", [False, True])
+@pytest.mark.parametrize("negotiated", [False, True])
+@pytest.mark.parametrize("configured", [False, True])
+async def test_reconcile_preserves_negotiated_protocol_capabilities(
+    monkeypatch: pytest.MonkeyPatch,
+    fast_path: bool,
+    negotiated: bool,
+    configured: bool,
+) -> None:
+    row = _executor_row(
+        applied_config_version=2 if fast_path else 1,
+        runtime_state="active",
+        runtime_metadata={
+            "capabilities": {
+                "tools": ["read"],
+                "binary_transfers": not negotiated,
+                "mcp_credential_bindings": not negotiated,
+            }
+        },
+    )
+    connection = SimpleNamespace(
+        connected=True,
+        capabilities=ExecutorCapabilities(
+            binary_transfers=negotiated, mcp_credential_bindings=negotiated
+        ),
+        rpc_call=AsyncMock(
+            return_value={
+                "applied_version": 2,
+                "runtime_state": "active",
+                "capabilities": {
+                    "tools": ["read"],
+                    "binary_transfers": configured,
+                    "mcp_credential_bindings": configured,
+                },
+                "observed_tools": [{"name": "read"}],
+            }
+        ),
+    )
+    app = _app_with_ws_connection(connection)
+    app.state.executor_connection_ownership = object()
+    ready = Mock(return_value=True)
+    app.state.providers.executor.websocket.mark_ready = ready
+    persisted = AsyncMock(return_value=row)
+    monkeypatch.setattr(executor_runtime, "get_executor_row", AsyncMock(return_value=row))
+    monkeypatch.setattr(executor_runtime, "_persist_runtime_state", persisted)
+    monkeypatch.setattr(
+        executor_runtime, "_connection_ownership_is_current", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        executor_runtime, "_build_configure_payload", AsyncMock(return_value=({}, {}))
+    )
+    monkeypatch.setattr(
+        executor_runtime, "_invalidate_mcp_oauth_tokens_for_runtime_failures", AsyncMock()
+    )
+
+    assert await executor_runtime.reconcile_executor(app, "remote-1") is True
+
+    expected = negotiated and (fast_path or configured)
+    capabilities = ready.call_args.args[1]
+    assert capabilities.binary_transfers is expected
+    assert capabilities.mcp_credential_bindings is expected
+    assert (
+        persisted.await_args.kwargs["runtime_metadata"]["capabilities"]["binary_transfers"]
+        is expected
+    )
+    assert (
+        persisted.await_args.kwargs["runtime_metadata"]["capabilities"]["mcp_credential_bindings"]
+        is expected
+    )
+    if fast_path:
+        connection.rpc_call.assert_not_awaited()
+    else:
+        connection.rpc_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fast_resume_cannot_promote_replacement_executor_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cognis.api import executor_ws
+
+    row = _executor_row(desired_config_version=2, applied_config_version=2, runtime_state="active")
+    supported = SimpleNamespace(
+        connected=True,
+        owner_email=row.owner_email,
+        capabilities=ExecutorCapabilities(mcp_credential_bindings=True),
+        metadata={"configured": True, "config_version": 2},
+    )
+    replacement = SimpleNamespace(
+        connected=True,
+        owner_email=row.owner_email,
+        capabilities=ExecutorCapabilities(),
+        metadata={"configured": True, "config_version": 2},
+    )
+    current = supported
+    app = _app_with_ws_connection()
+    app.state.executor_connection_ownership = object()
+    websocket = app.state.providers.executor.websocket
+    websocket.get_connection = lambda _: current
+    marked = []
+
+    def mark_ready(executor_id, capabilities, *, metadata, expected_connection):
+        marked.append(expected_connection)
+        if expected_connection is not current:
+            return False
+        current.capabilities = capabilities
+        return True
+
+    async def persist(*_args, **kwargs):
+        nonlocal current
+        if current is supported:
+            current = replacement
+        return row
+
+    websocket.mark_ready = mark_ready
+    monkeypatch.setattr(executor_runtime, "get_executor_row", AsyncMock(return_value=row))
+    monkeypatch.setattr(executor_runtime, "_persist_runtime_state", persist)
+    monkeypatch.setattr(
+        executor_runtime, "_connection_ownership_is_current", AsyncMock(return_value=True)
+    )
+    assert await executor_runtime.reconcile_executor(app, row.executor_id, connection=supported)
+    assert marked == [supported, replacement]
+    assert replacement.capabilities.mcp_credential_bindings is False
+
+    providers = app.state.providers
+    providers._session_factory = app.state.session_factory
+    providers.credentials = SimpleNamespace(resolve_ref=AsyncMock())
+    monkeypatch.setattr(executor_ws, "get_setting_value", AsyncMock(return_value=15))
+    monkeypatch.setattr(
+        executor_ws,
+        "get_mcp_server",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                server_id="mcp_music",
+                name="Music",
+                status="active",
+                owner_email=row.owner_email,
+                transport="streamable_http",
+                url="https://music.test/mcp",
+                command=None,
+                env={},
+                args=[],
+                headers={},
+                auth_config={
+                    "type": "credential_bearer",
+                    "credential_ref": "$credential:music-token.token",
+                    "credential_agent_id": "music-agent",
+                },
+            )
+        ),
+    )
+    row.config = {"mcp_server_ids": ["mcp_music"]}
+    servers, _, metadata = await executor_ws._resolve_executor_mcp_payload(row, providers)
+    assert not servers
+    providers.credentials.resolve_ref.assert_not_awaited()
+    assert metadata["mcp_servers"][0]["error_class"] == "mcp_credential_executor_upgrade_required"
 
 
 @pytest.mark.asyncio

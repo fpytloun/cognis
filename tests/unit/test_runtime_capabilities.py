@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from cognis.api import executor_ws
-from cognis.core.executor_management import _executor_to_response
+from cognis.core import executor_management
 from cognis.executor.runner import ExecutorRunner
 from cognis.executor.runtime_capability_probe import collect_runtime_capabilities
 from cognis.models.runtime_capabilities import (
@@ -19,6 +20,12 @@ from cognis.models.runtime_capabilities import (
 )
 from cognis.tools.executor.browser.handlers import build_manager_from_config
 from cognis.tools.executor.browser.manager import BrowserManager
+
+
+@pytest.fixture(autouse=True)
+def _isolated_browser_profiles(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep default-profile checks away from the executor's live browser data."""
+    monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))
 
 
 def test_report_is_bounded_and_unknown_schema_is_non_fatal() -> None:
@@ -169,7 +176,7 @@ def test_api_response_has_observed_tools_and_typed_capabilities() -> None:
         created_at=None,
         updated_at=None,
     )
-    response = _executor_to_response(row)
+    response = executor_management._executor_to_response(row)
     assert response.observed_tools == [{"name": "read"}]
     assert isinstance(response.observed_capabilities, RuntimeCapabilityReport)
 
@@ -214,7 +221,7 @@ async def test_runner_configure_and_ready_payloads_include_capabilities() -> Non
         async def send(self, raw: str) -> None:
             self.sent.append(json.loads(raw))
 
-    from cognis.models.tool import ExecutorConfig
+    from cognis.models.tool import MCP_CREDENTIAL_BINDING_PROTOCOL, ExecutorConfig
 
     runner = ExecutorRunner(ExecutorConfig(executor_id="executor-1", controller_token="token"))
     ws = WebSocket()
@@ -224,7 +231,9 @@ async def test_runner_configure_and_ready_payloads_include_capabilities() -> Non
         {"enabled_tools": ["read"], "enabled_tool_groups": [], "config": {}},
     )
     configure_result = ws.sent[-1]["result"]
+    assert configure_result["capabilities"]["mcp_credential_bindings"] is True
     assert configure_result["observed_capabilities"]["schema_version"] == CAPABILITY_SCHEMA_VERSION
     assert "observed_capabilities" in configure_result["runtime_metadata"]
     ready = runner._build_ready_params(None)  # noqa: SLF001
+    assert ready["mcp_credential_binding_protocol"] == MCP_CREDENTIAL_BINDING_PROTOCOL
     assert ready["observed_capabilities"]["schema_version"] == CAPABILITY_SCHEMA_VERSION

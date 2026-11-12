@@ -29,6 +29,7 @@ from cognis.api.chat_v2.event_store import (
     SessionWatermark,
 )
 from cognis.api.chat_v2.item_keys import KIND_RANK, runtime_timeline_sort_key
+from cognis.api.chat_v2.message_metadata import project_message_metadata
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
 from cognis.api.chat_v2.schemas import (
@@ -55,18 +56,20 @@ from cognis.api.chat_v2.schemas import (
     UpsertTimelineItemOp,
 )
 from cognis.api.chat_v2.sync_metrics import SNAPSHOT_SYNC_METRICS
+from cognis.api.datetimes import utc_datetime
 from cognis.models.config import GenerationPerformanceSnapshot
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 2
-# v9: coalesce handoff lifecycle events by request identity.
-PROJECTION_VERSION = "chat-v2-projection-v9"
+# v12: recover compaction seeds outside partial replay windows.
+PROJECTION_VERSION = "chat-v2-projection-v12"
 _projection_version = PROJECTION_VERSION
 SNAPSHOT_SESSION_EVENT_LIMIT = 5_000
 SNAPSHOT_WINDOW_EVENT_LIMIT = 800
 SNAPSHOT_INITIAL_SESSION_FANOUT = 1
 SNAPSHOT_MAX_SESSION_FANOUT = 8
+COMPACTION_SEED_WINDOW = 32
 _SNAPSHOT_PROJECTION_CACHE_MAX_CONVERSATIONS = 32
 
 # Process-scoped runtime epoch component. The runtime revision counter used for
@@ -129,6 +132,7 @@ class ConversationSessionRef(StrictModel):
     ordinal: int = Field(ge=0)
     status: str | None = None
     completion_reason: str | None = None
+    previous_session_id: str | None = None
     reader: Any | None = Field(default=None, exclude=True, repr=False)
     authority_token: str | None = Field(default=None, exclude=True, repr=False)
 
@@ -159,6 +163,7 @@ _SnapshotProjectionKey = tuple[
     tuple[tuple[str, str, int], ...],
     int,
     str,
+    bool,
 ]
 _SNAPSHOT_PROJECTION_CACHE: OrderedDict[
     _SnapshotProjectionKey,
@@ -194,6 +199,7 @@ async def build_chat_snapshot(
     event_post_processor_cache_key: str | None = None,
     session_cache: Any = None,
     initial_read_window: int | None = None,
+    strict_pairing: bool = False,
     now: datetime | None = None,
 ) -> ChatSnapshot:
     """Build an authoritative Chat v2 snapshot from current session events."""
@@ -222,6 +228,7 @@ async def build_chat_snapshot(
         watermarks=watermarks,
         limit=read_window,
         event_post_processor_cache_key=processor_cache_key,
+        strict_pairing=strict_pairing,
     )
     cached_projection = (
         _snapshot_projection_cache_get(cache_key)
@@ -251,6 +258,7 @@ async def build_chat_snapshot(
             session_refs=session_refs,
             event_store=event_store,
             session_cache=session_cache,
+            strict=strict_pairing,
         )
         SNAPSHOT_SYNC_METRICS.observe_stage("pairing", time.perf_counter() - stage_started)
         stage_started = time.perf_counter()
@@ -424,6 +432,7 @@ async def build_timeline_backfill_response(
     limit: int = BACKFILL_DEFAULT_LIMIT,
     event_post_processor: EventPostProcessor | None = None,
     session_cache: Any = None,
+    strict_pairing: bool = False,
     now: datetime | None = None,
 ) -> TimelineBackfillResponse:
     """Build an older timeline page.
@@ -453,6 +462,7 @@ async def build_timeline_backfill_response(
         session_refs=session_refs,
         event_store=event_store,
         session_cache=session_cache,
+        strict=strict_pairing,
     )
     page = _project_window(hydrated_events)
     page_items = page.items
@@ -641,6 +651,11 @@ async def runtime_input_from_scheduler(
             "started_at": running.get("started_at"),
             "updated_at": running.get("updated_at"),
             **(
+                {"primary_client_message_id": running["primary_client_message_id"]}
+                if running.get("primary_client_message_id")
+                else {}
+            ),
+            **(
                 {
                     "retry_at": running.get("retry_at"),
                     "retry_reason": running.get("retry_reason"),
@@ -672,6 +687,7 @@ async def runtime_input_from_scheduler(
                     content=str(pending_user_message.get("content") or ""),
                     message_id=message_id,
                     client_message_id=client_message_id,
+                    message_metadata=project_message_metadata(pending_user_message),
                     turn_id=_str_or_none(pending_user_message.get("turn_id")),
                     attachments=list(pending_user_message.get("attachments") or []),
                     created_at=_str_or_none(pending_user_message.get("created_at")),
@@ -1221,6 +1237,7 @@ def _snapshot_projection_cache_key(
     watermarks: dict[tuple[str, str], int],
     limit: int,
     event_post_processor_cache_key: str,
+    strict_pairing: bool = False,
 ) -> _SnapshotProjectionKey:
     lineage = tuple(
         (ref.store, ref.event_store_session_id, ref.ordinal, ref.authority_token)
@@ -1236,6 +1253,7 @@ def _snapshot_projection_cache_key(
         watermark_items,
         limit,
         event_post_processor_cache_key,
+        strict_pairing,
     )
 
 
@@ -1326,6 +1344,72 @@ def _pairing_call_id(event: RawSessionEvent) -> str | None:
     return text or None
 
 
+async def _hydrate_compaction_seeds(
+    raw_events: list[RawSessionEvent],
+    *,
+    session_refs: Sequence[ConversationSessionRef],
+    event_store: SessionEventStore,
+) -> list[RawSessionEvent]:
+    """Keep a rotated session's completion seed in partial replay windows."""
+
+    first_seqs: dict[tuple[str, str], int] = {}
+    seeded: set[tuple[str, str]] = set()
+    for event in raw_events:
+        key = (event.store_id, event.session_id)
+        first_seqs[key] = min(first_seqs.get(key, event.seq), event.seq)
+        if event.type == "compaction_summary" and event.data.get("compaction_tail") is not True:
+            seeded.add(key)
+
+    async def _read_seed(ref: ConversationSessionRef) -> list[RawSessionEvent]:
+        key = (ref.store, ref.event_store_session_id)
+        first_seq = first_seqs[key]
+        # Rotation writes the summary immediately after its lifecycle seed,
+        # before copying the potentially very large retained tail. Never scan
+        # arbitrary history or move paging frontiers to this injected context.
+        after_seq = 0
+        remaining = COMPACTION_SEED_WINDOW
+        while remaining > 0 and after_seq < first_seq - 1:
+            page = await _read_session_events(
+                ref=ref,
+                event_store=event_store,
+                after_seq=after_seq,
+                limit=min(remaining, first_seq - after_seq - 1),
+            )
+            seeds = [
+                event
+                for event in page.events
+                if event.seq < first_seq
+                and event.type == "compaction_summary"
+                and event.data.get("marker_role") == "context_seed"
+                and event.data.get("compaction_tail") is not True
+            ]
+            if seeds:
+                return _tag_events(seeds, ref)
+            next_seq = max((event.seq for event in page.events), default=after_seq)
+            if next_seq <= after_seq or not page.has_more_after:
+                break
+            after_seq = next_seq
+            remaining -= len(page.events)
+        return []
+
+    refs = [
+        ref
+        for ref in session_refs
+        if ref.previous_session_id is not None
+        and (key := (ref.store, ref.event_store_session_id)) in first_seqs
+        and first_seqs[key] > 1
+        and key not in seeded
+    ]
+    seeds: list[RawSessionEvent] = []
+    for offset in range(0, len(refs), SNAPSHOT_MAX_SESSION_FANOUT):
+        groups = await asyncio.gather(
+            *[_read_seed(ref) for ref in refs[offset : offset + SNAPSHOT_MAX_SESSION_FANOUT]]
+        )
+        for group in groups:
+            seeds.extend(group)
+    return _sort_raw_events([*seeds, *raw_events]) if seeds else raw_events
+
+
 async def _hydrate_window_pairings(
     raw_events: list[RawSessionEvent],
     *,
@@ -1333,8 +1417,9 @@ async def _hydrate_window_pairings(
     event_store: SessionEventStore,
     lookback_limit: int = PAIRING_HYDRATION_LOOKBACK_LIMIT,
     session_cache: Any = None,
+    strict: bool = False,
 ) -> list[RawSessionEvent]:
-    """Backfill paired tool calls and assistant continuation segments.
+    """Backfill paired tool calls and same-turn assistant message revisions.
 
     Tool events are flushed incrementally per boundary, so a sync window can
     contain a ``tool_result``/``delegation``/``evaluation`` event whose
@@ -1348,6 +1433,11 @@ async def _hydrate_window_pairings(
 
     if not raw_events:
         return list(raw_events)
+    raw_events = await _hydrate_compaction_seeds(
+        raw_events,
+        session_refs=session_refs,
+        event_store=event_store,
+    )
     in_window_call_ids = {
         str(event.data.get("call_id") or "").strip()
         for event in raw_events
@@ -1356,6 +1446,7 @@ async def _hydrate_window_pairings(
     orphan_call_ids: dict[tuple[str, str], set[str]] = {}
     orphan_phases: dict[tuple[str, str], set[tuple[str, int]]] = {}
     seen_phases: set[tuple[str, str, str, int]] = set()
+    first_phase_seqs: dict[tuple[str, str, str, int], int] = {}
     phase_boundaries: dict[tuple[str, str], int] = {}
     in_window_positions = {(event.store_id, event.session_id, event.seq) for event in raw_events}
     min_referencing_seq: dict[tuple[str, str], int] = {}
@@ -1364,9 +1455,9 @@ async def _hydrate_window_pairings(
         key = (event.store_id, event.session_id)
         if phase is not None and (*key, *phase) not in seen_phases:
             seen_phases.add((*key, *phase))
-            if event.data.get("content_is_delta") is True:
-                orphan_phases.setdefault(key, set()).add(phase)
-                phase_boundaries[key] = max(phase_boundaries.get(key, event.seq), event.seq)
+            first_phase_seqs[(*key, *phase)] = event.seq
+            orphan_phases.setdefault(key, set()).add(phase)
+            phase_boundaries[key] = max(phase_boundaries.get(key, event.seq), event.seq)
         call_id = _pairing_call_id(event)
         if not call_id or call_id in in_window_call_ids:
             continue
@@ -1401,6 +1492,11 @@ async def _hydrate_window_pairings(
                     session_cache=session_cache,
                 )
             except Exception:
+                if strict:
+                    raise ChatV2SyncError(
+                        "event_store_paging_failed",
+                        "Required history pairing could not be loaded",
+                    ) from None
                 logger.warning(
                     "chat_v2: pairing hydration read failed",
                     extra={"extra_data": {"session_id": ref.session_id}},
@@ -1412,11 +1508,20 @@ async def _hydrate_window_pairings(
                 if candidate.seq >= boundary_seq:
                     continue
                 phase = _continuation_phase_key(candidate)
-                if phase in remaining_phases:
-                    if (key[0], key[1], candidate.seq) not in in_window_positions:
-                        resolved.extend(_tag_events([candidate], ref))
-                    if candidate.data.get("content_is_delta") is not True:
-                        completed_phases.add(phase)
+                if (
+                    phase in remaining_phases
+                    and (key[0], key[1], candidate.seq) not in in_window_positions
+                ):
+                    resolved.extend(_tag_events([candidate], ref))
+                # Full-text replacements can still inherit earlier attachments.
+                # Read only within their originating turn, not the whole session.
+                if candidate.type == "user_message" or phase is not None:
+                    completed_phases.update(
+                        pending
+                        for pending in remaining_phases
+                        if candidate.seq < first_phase_seqs[(*key, *pending)]
+                        and (phase is None or pending[0] != phase[0])
+                    )
                 if candidate.type == "tool_call":
                     candidate_call_id = str(candidate.data.get("call_id") or "").strip()
                     if candidate_call_id in remaining:
@@ -1675,7 +1780,7 @@ def _empty_state(now: datetime) -> ConversationStateView:
 
 def _iso_or_none(value: Any) -> str | None:
     if isinstance(value, datetime):
-        return value.isoformat()
+        return utc_datetime(value).isoformat()
     return value if isinstance(value, str) and value else None
 
 

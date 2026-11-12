@@ -1,7 +1,8 @@
-"""Display-only conversation identity, independent from permission to use an agent."""
+"""Caller-specific conversation display metadata, never permission to use an agent."""
 
 from __future__ import annotations
 
+from datetime import UTC
 from urllib.parse import quote
 
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cognis.api.models import ConversationResponse
 from cognis.core.project_access import resolve_agent_use_grant, resolve_project_role
 from cognis.core.project_identity import project_color
+from cognis.store.conversation_reads import list_conversation_read_markers
 from cognis.store.models import Agent
 from cognis.store.queries import get_project
 
@@ -34,7 +36,19 @@ async def enrich_conversation_identity(
         if items
         else {}
     )
+    shared_reads = await list_conversation_read_markers(
+        session,
+        user_email,
+        [item.conversation_id for item in items if item.is_readonly_for_caller],
+    )
     for item in items:
+        if item.is_readonly_for_caller:
+            read_at = shared_reads.get(item.conversation_id)
+            item.last_read_at = read_at
+            message_at = item.last_message_at
+            if message_at is not None and message_at.tzinfo is None:
+                message_at = message_at.replace(tzinfo=UTC)
+            item.has_unread = message_at is not None and (read_at is None or message_at > read_at)
         if item.project_id:
             project = await get_project(session, item.project_id)
             if project and (await resolve_project_role(session, project, user_email)).role:

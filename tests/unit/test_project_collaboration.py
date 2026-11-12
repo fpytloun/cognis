@@ -21,10 +21,12 @@ from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.bootstrap import run_schema_bootstrap
 from cognis.core.agent_management import TOOL_GROUP_DEFINITIONS
 from cognis.core.project_access import (
+    ManagedProjectError,
     ProjectAssignmentError,
     append_project_instructions,
     can_read_conversation,
     change_conversation_project,
+    managed_conversation_project_id,
     normalize_project_role,
     project_assignment_refusal,
     resolve_agent_use_grant,
@@ -52,6 +54,7 @@ from cognis.store.queries import (
     create_step_run,
     create_task,
     create_user,
+    get_agent,
     get_conversation,
 )
 from cognis.tools.builtin.image import handle_image_tool
@@ -527,6 +530,89 @@ def test_project_conversation_activity_is_only_queried_for_author(
         scheduler.durable_running_turn_states.assert_not_called()
 
 
+def test_project_conversation_attention_matches_normal_dashboard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cognis.store.models import NotificationRow
+
+    with _client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as session:
+                await _seed_home(session)
+                session.add(
+                    NotificationRow(
+                        notification_id="question-project",
+                        conversation_id="conv_shared",
+                        user_email=OWNER,
+                        notification_type="step_question",
+                        status="pending",
+                        payload={
+                            "question": "Choose a rollout mode.",
+                            "questions": [
+                                {
+                                    "id": "rollout",
+                                    "question": "Choose a rollout mode.",
+                                    "allow_custom": True,
+                                }
+                            ],
+                        },
+                    )
+                )
+                await session.commit()
+
+        client.portal.call(seed)
+        headers = _headers(client.app, OWNER)
+
+        def shared(items: list[dict[str, Any]]) -> dict[str, Any]:
+            return next(item for item in items if item["conversation_id"] == "conv_shared")
+
+        project = shared(
+            client.get("/api/v1/projects/proj_home/conversations/page", headers=headers).json()[
+                "items"
+            ]
+        )
+        response = client.get(
+            "/api/v1/conversations",
+            headers=headers,
+            params={"project_id": "proj_home", "include_attention_actions": True},
+        )
+        assert response.status_code == 200, response.text
+        normal = shared(response.json()["items"])
+        assert project["pending_notification_types"] == ["step_question"]
+        assert project["pending_notification_types"] == normal["pending_notification_types"]
+        assert project["attention_actions"] == normal["attention_actions"]
+        assert len(project["attention_actions"]) == 1
+        assert project["attention_actions"][0]["can_resolve"]
+        assert not project["has_active_turn"]
+
+        readonly = shared(
+            client.get(
+                "/api/v1/projects/proj_home/conversations/page",
+                headers=_headers(client.app, WIFE),
+            ).json()["items"]
+        )
+        assert readonly["pending_notification_types"] == []
+        assert readonly["attention_actions"] == []
+        assert readonly["is_readonly_for_caller"]
+
+        async def resolve() -> None:
+            async with client.app.state.session_factory() as session:
+                row = await session.get(NotificationRow, "question-project")
+                assert row is not None
+                row.status = "resolved"
+                await session.commit()
+
+        client.portal.call(resolve)
+        resolved = shared(
+            client.get("/api/v1/projects/proj_home/conversations/page", headers=headers).json()[
+                "items"
+            ]
+        )
+        assert resolved["pending_notification_types"] == []
+        assert resolved["attention_actions"] == []
+
+
 def test_project_conversation_pages_filter_work_before_pagination(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -759,7 +845,8 @@ def test_shared_chat_discovery_identity_and_revocation(
         assert private_agent_chat["active_executor_id"] is None
         assert private_agent_chat["starred_at"] is None
         assert private_agent_chat["last_read_at"] is None
-        assert not private_agent_chat["has_unread"]
+        # The author's acknowledgement must not clear this reader's unread marker.
+        assert private_agent_chat["has_unread"]
         assert client.get("/api/v1/agents/private-bot", headers=headers).status_code == 403
         avatar = private_agent_chat["agent_avatar_url"]
         assert client.get(avatar, headers=headers).status_code == 200
@@ -907,6 +994,118 @@ def test_project_activity_order_respects_visible_conversations_tasks_and_deliver
 
         client.portal.call(add_document)
         assert order() == ["proj_home", "proj_personal"]
+
+
+def test_shared_read_markers_are_personal_and_clear_after_viewing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from cognis.store.models import ConversationReadState
+
+    with _client(monkeypatch, tmp_path) as client:
+        app = client.app
+        source_message_at = datetime(2026, 1, 2, tzinfo=UTC)
+        author_read_at = source_message_at + timedelta(days=1)
+
+        async def seed() -> None:
+            async with app.state.session_factory() as session:
+                await _seed_home(session)
+                row = await get_conversation(session, "conv_shared")
+                row.created_at = source_message_at - timedelta(days=1)
+                row.last_message_at = source_message_at
+                row.last_read_at = author_read_at
+                await session.commit()
+
+        client.portal.call(seed)
+        wife = _headers(app, WIFE)
+        viewer = _headers(app, VIEWER)
+        owner = _headers(app, OWNER)
+
+        def detail(headers: dict[str, str]) -> dict[str, Any]:
+            response = client.get(
+                "/api/v1/conversations/conv_shared?include_state=false",
+                headers=headers,
+            )
+            assert response.status_code == 200, response.text
+            return response.json()
+
+        assert not detail(owner)["has_unread"]
+        assert detail(wife)["can_continue"]
+        assert not detail(viewer)["can_continue"]
+        assert client.post(
+            "/api/v1/conversations/conv_shared/opened",
+            headers=wife,
+        ).json()["can_continue"]
+        for headers in (wife, viewer):
+            assert detail(headers)["has_unread"]
+            assert detail(headers)["last_read_at"] is None
+
+        sent = AsyncMock()
+        monkeypatch.setattr(app.state.ws_manager, "send_to_user", sent)
+        response = client.post(
+            "/api/v1/conversations/conv_shared/read",
+            headers=wife,
+            json={"user_email": OWNER},
+        )
+        assert response.status_code == 200, response.text
+        assert not detail(wife)["has_unread"]
+        assert detail(viewer)["has_unread"]
+        updates = [
+            call.args
+            for call in sent.await_args_list
+            if call.args[1].get("type") == "conversation_updated"
+        ]
+        assert len(updates) == 1 and updates[0][0] == WIFE
+        assert updates[0][1]["has_unread"] is False
+        personal_read_at = detail(wife)["last_read_at"]
+        for payload in (detail(wife), updates[0][1]):
+            for field in ("last_read_at", "last_message_at"):
+                assert datetime.fromisoformat(payload[field]).utcoffset() == timedelta(0)
+
+        for path in (
+            "/api/v1/conversations?include_shared=true",
+            "/api/v1/projects/proj_home/conversations/page",
+        ):
+            result = client.get(path, headers=wife)
+            assert result.status_code == 200, result.text
+            shared = next(
+                row for row in result.json()["items"] if row["conversation_id"] == "conv_shared"
+            )
+            assert shared["last_read_at"] == personal_read_at
+            assert not shared["has_unread"]
+
+        assert (
+            client.post("/api/v1/conversations/conv_shared/read", headers=viewer).status_code == 200
+        )
+        assert not detail(viewer)["has_unread"]
+        for headers, target in (
+            (wife, "conv_private"),
+            (_headers(app, OUTSIDER), "conv_shared"),
+            (_headers(app, OUTSIDER, "admin"), "conv_shared"),
+        ):
+            assert (
+                client.post(f"/api/v1/conversations/{target}/read", headers=headers).status_code
+                == 403
+            )
+
+        async def next_message() -> None:
+            async with app.state.session_factory() as session:
+                row = await get_conversation(session, "conv_shared")
+                assert row.last_read_at.replace(tzinfo=UTC) == author_read_at
+                markers = list((await session.scalars(select(ConversationReadState))).all())
+                assert {marker.user_email for marker in markers} == {WIFE, VIEWER}
+                row.last_message_at = max(
+                    marker.last_read_at.replace(tzinfo=UTC) for marker in markers
+                ) + timedelta(seconds=1)
+                await session.commit()
+
+        client.portal.call(next_message)
+        assert detail(wife)["has_unread"]
+        assert detail(viewer)["has_unread"]
 
 
 def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> TestClient:
@@ -1862,6 +2061,46 @@ def test_long_lived_chat_derives_agent_default_project(tmp_path: Path) -> None:
                 )
                 is None
             )
+
+    _with_db(tmp_path, body)
+
+
+def test_managed_conversation_project_resolution(tmp_path: Path) -> None:
+    async def body(factory: Any) -> None:
+        async with factory() as session:
+            butler = await get_agent(session, "butler")
+            wife_agent = await get_agent(session, "wife-agent")
+
+            async def resolve(**kwargs: Any) -> str | None:
+                return await managed_conversation_project_id(
+                    session,
+                    **{
+                        "requested_project_id": None,
+                        "controller_project_id": None,
+                        "target_agent": butler,
+                        "user_email": OWNER,
+                        **kwargs,
+                    },
+                )
+
+            # A controller without a project hands the work to the target's default project.
+            assert await resolve() == "proj_home"
+            # The controlling conversation's project wins over the target default.
+            assert await resolve(controller_project_id="proj_work") == "proj_work"
+            # An explicit project wins over both.
+            assert (
+                await resolve(requested_project_id="proj_work", controller_project_id="proj_home")
+                == "proj_work"
+            )
+            with pytest.raises(ManagedProjectError):
+                await resolve(requested_project_id="proj_missing")
+            # The user must be able to use the explicit project.
+            with pytest.raises(ManagedProjectError):
+                await resolve(
+                    requested_project_id="proj_work", target_agent=wife_agent, user_email=WIFE
+                )
+            # A default project the user cannot use is not applied.
+            assert await resolve(user_email=OUTSIDER) is None
 
     _with_db(tmp_path, body)
 

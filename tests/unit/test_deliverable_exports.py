@@ -70,6 +70,7 @@ def _share_token(url: str) -> str:
 def _row(**overrides: object) -> SimpleNamespace:
     values = {
         "deliverable_id": "dlv_render",
+        "owner_email": None,
         "version": 1,
         "format": "rich",
         "title": "Rich report",
@@ -174,6 +175,39 @@ def test_standalone_resolves_mermaid_and_source_list_compatibility_aliases() -> 
     assert source is not None
     assert source.get("href") == "https://doi.org/10.1371/journal.pgen.0010003"
     assert "Source 1" not in rendered
+
+
+@pytest.mark.parametrize("split_blocks", [False, True])
+def test_markdown_outline_keeps_siblings_and_children_in_export(split_blocks: bool) -> None:
+    headings = ["## Overview", "### Verification", "#### Browser checks", "## Rollout"]
+    blocks = (
+        [{"type": "markdown", "content": heading} for heading in headings]
+        if split_blocks
+        else [{"type": "markdown", "content": "\n\n".join(headings)}]
+    )
+    rendered = render_standalone_html(
+        _row(rich_payload={"metadata": {"toc": True}, "blocks": blocks})
+    )
+    soup = BeautifulSoup(rendered, "html.parser")
+    roots = soup.select(".document-toc > nav > ol > li > a")
+    assert [root.get_text(strip=True) for root in roots] == ["Overview", "Rollout"]
+    assert (
+        soup.select_one(".document-toc > nav > ol > li > ol > li > a").get_text(strip=True)
+        == "Verification"
+    )
+    assert (
+        soup.select_one(".document-toc > nav > ol > li > ol > li > ol > li > a").get_text(
+            strip=True
+        )
+        == "Browser checks"
+    )
+    for anchor, level in [
+        ("overview", 2),
+        ("verification", 3),
+        ("browser-checks", 4),
+        ("rollout", 2),
+    ]:
+        assert soup.find(f"h{level}", id=anchor) is not None
 
 
 def test_publication_toc_policy_overrides_depth_and_duplicate_heading_ids() -> None:
@@ -580,8 +614,8 @@ def test_pulse_presentation_suppresses_toc_and_numbering_with_editorial_chrome()
         },
         {
             "type": "figure",
-            "caption": "Lovosice morning window.",
-            "alt": "Lovosice horizon",
+            "caption": "DemoTown morning window.",
+            "alt": "DemoTown horizon",
             "source": "Fixture source",
             "source_url": "https://example.org/source",
             "timestamp": "07:00 CEST",
@@ -622,7 +656,7 @@ def test_pulse_presentation_suppresses_toc_and_numbering_with_editorial_chrome()
     assert 'aria-label="Table of contents"' not in rendered
     assert "Figure 1." not in rendered
     assert "Table 1." not in rendered
-    assert "Lovosice morning window." in rendered
+    assert "DemoTown morning window." in rendered
     assert "Fixture source" in rendered
     assert 'class="block block-day-agenda"' in rendered
     assert 'datetime="2026-07-12T07:10:00+02:00"' in rendered
@@ -1063,7 +1097,7 @@ def test_publication_toc_excludes_item_backed_content_and_normalizes_markdown_le
     assert "Collapsed answer" not in toc_text
     assert "Gallery image" not in toc_text
     assert soup.select_one("h2#primary-markdown").get_text(strip=True) == "Primary Markdown"
-    assert soup.select_one("h2#tertiary-markdown").get_text(strip=True) == "Tertiary Markdown"
+    assert soup.select_one("h4#tertiary-markdown").get_text(strip=True) == "Tertiary Markdown"
     assert soup.select_one("h3#nested-markdown").get_text(strip=True) == "Nested Markdown"
     summary = soup.select_one("section.block-markdown > h2#summary")
     assert summary is not None
@@ -3135,6 +3169,81 @@ async def test_authenticated_view_authz_and_cache(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("family", ["gruvbox", "paper", "porcelain", "classic", "unknown"])
+async def test_publication_theme_family_in_public_view_and_download(
+    task_continuation_db: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, family: str
+) -> None:
+    from cognis import json_codec
+    from cognis.rendering import deliverables as rendering
+    from cognis.store.queries import upsert_user_ui_state
+
+    async with task_continuation_db() as session:
+        await upsert_user_ui_state(
+            session,
+            "owner@example.com",
+            "ui.preferences",
+            {"display": {"theme_family": family, "theme": "dark", "language": "cs"}},
+        )
+        await session.commit()
+    manifest = StandaloneAssetManifest(tmp_path, "renderer.js", ("renderer.css",))
+    monkeypatch.setattr(deliverable_routes, "_standalone_assets_available", lambda _: True)
+    monkeypatch.setattr(rendering, "resolve_standalone_manifest", lambda: manifest)
+
+    def publication(response: Any) -> dict[str, Any]:
+        assert response.status_code == 200
+        soup = BeautifulSoup(response.text, "html.parser")
+        return json_codec.loads(soup.select_one("#cognis-deliverable-payload").text)
+
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        token = _share_token(client.post("/api/v1/deliverables/dlv_rich/share-link").json()["url"])
+        private = publication(client.get("/api/v1/deliverables/dlv_rich/view"))
+        download = publication(client.get("/api/v1/deliverables/dlv_rich/download.html"))
+    # Real anonymous middleware: the owner's palette, never their private settings.
+    with _middleware_client(task_continuation_db) as client:
+        public = publication(client.get(f"/api/v1/deliverables/share/{token}/view"))
+        public_download = publication(
+            client.get(f"/api/v1/deliverables/share/{token}/download.html")
+        )
+    expected = "classic" if family == "unknown" else family
+    for data in (private, public, download, public_download):
+        assert data["themeFamily"] == expected
+        assert "theme" not in data and "display" not in data and "language" not in data
+
+
+@pytest.mark.asyncio
+async def test_shared_download_keeps_owner_family_even_with_unrelated_request_user(
+    task_continuation_db: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cognis import json_codec
+    from cognis.store.queries import upsert_user_ui_state
+
+    async with task_continuation_db() as session:
+        for email, family in [("owner@example.com", "gruvbox"), ("other@example.com", "paper")]:
+            await upsert_user_ui_state(
+                session, email, "ui.preferences", {"display": {"theme_family": family}}
+            )
+        await session.commit()
+    with _client(task_continuation_db, monkeypatch, email="owner@example.com") as client:
+        token = _share_token(client.post("/api/v1/deliverables/dlv_rich/share-link").json()["url"])
+    async with task_continuation_db() as session:
+        await upsert_user_ui_state(
+            session,
+            "owner@example.com",
+            "ui.preferences",
+            {"display": {"theme_family": "porcelain"}},
+        )
+        await session.commit()
+    with _client(task_continuation_db, monkeypatch, email="other@example.com") as client:
+        response = client.get(f"/api/v1/deliverables/share/{token}/download.html")
+    assert response.status_code == 200
+    soup = BeautifulSoup(response.text, "html.parser")
+    assert (
+        json_codec.loads(soup.select_one("#cognis-deliverable-payload").text)["themeFamily"]
+        == "porcelain"
+    )
+
+
+@pytest.mark.asyncio
 async def test_single_html_fails_explicitly_without_offline_bundle(
     task_continuation_db: object, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4570,7 +4679,7 @@ async def test_pulse_compact_references_and_agenda_location_fit_two_pages() -> N
                                 "title": "Errands",
                                 "start": "2026-07-14T10:30:00+02:00",
                                 "end": "2026-07-14T11:15:00+02:00",
-                                "location": "Lovosice",
+                                "location": "Demotown",
                             }
                         ],
                     },
@@ -4596,13 +4705,13 @@ async def test_pulse_compact_references_and_agenda_location_fit_two_pages() -> N
     assert bibliography is not None
     assert "bibliography-compact" in bibliography.get("class", [])
     assert "bibliography-dedicated" not in bibliography.get("class", [])
-    assert 'class="agenda-location"> · Lovosice</span>' in rendered
+    assert 'class="agenda-location"> · Demotown</span>' in rendered
 
     reader = PdfReader(BytesIO((await render_pdf_bytes(rendered)).content))
     text = "\n".join(page.extract_text() or "" for page in reader.pages)
     assert len(reader.pages) <= 2
-    assert "Errands · Lovosice" in text
-    assert "ErrandsLovosice" not in text
+    assert "Errands · Demotown" in text
+    assert "ErrandsDemotown" not in text
 
 
 def _canonical_chart(**overrides: Any) -> dict[str, Any]:

@@ -7,7 +7,30 @@ import httpx
 import pytest
 
 from cognis.models.session import SessionEvent
+from cognis.providers.guardrails.event_keys import EventIdempotencyKeyError
 from cognis.providers.guardrails.intaris import IntarisProvider
+
+
+@pytest.mark.asyncio
+async def test_invalid_event_key_is_rejected_before_network_delivery(monkeypatch):
+    provider = IntarisProvider("http://localhost:8060", Mock())
+    calls = []
+
+    async def post(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("invalid keys must not reach the receiver")
+
+    monkeypatch.setattr(provider.client, "post", post)
+    try:
+        with pytest.raises(EventIdempotencyKeyError):
+            await provider.record_events(
+                "ingestion-session",
+                [SessionEvent(type="assistant_message", data={})],
+                idempotency_key="cancelled-active-stream:ingestion-session:turn-checkpoint",
+            )
+        assert calls == []
+    finally:
+        await provider.client.aclose()
 
 
 @pytest.mark.parametrize(

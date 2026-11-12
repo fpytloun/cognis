@@ -27,9 +27,9 @@ def test_empty_existing_seeds_accumulator() -> None:
 
 
 def test_longer_nested_value_is_not_a_corrected_top_level_replay() -> None:
-    prefix = '{"action":"settings_update","agent_id":"sample_agent","settings":'
+    prefix = '{"action":"settings_update","agent_id":"sample-agent","settings":'
     nested = (
-        '{"executor_id":"sample_executor","memory_backend":"mnemory",'
+        '{"executor_id":"fixture-executor","memory_backend":"mnemory",'
         '"memory_backend_options":{"mode":"full_auto"}}'
     )
     assert len(nested) > len(prefix)

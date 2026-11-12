@@ -15,6 +15,17 @@ from cognis.models.tool import Permission
 
 logger = get_logger(__name__)
 
+
+def strip_retired_execution_settings(
+    execution: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Discard retired workflow-selection keys from persisted agent settings."""
+    if execution is None:
+        return None
+    retired = {"available_workflow_ids", "default_workflow_id", "workflow_selection_mode"}
+    return {key: value for key, value in execution.items() if key not in retired}
+
+
 # Guardrails backends do not yet expose provider-owned options.
 _KNOWN_GUARDRAILS_BACKENDS = {"intaris", "none"}
 
@@ -43,6 +54,7 @@ class AgentCapabilities(BaseModel):
     memory_backend: str = "mnemory"
     memory_backend_options: dict[str, Any] = Field(default_factory=dict)
     guardrails_backend: str = "intaris"
+    analytics_enabled: bool = Field(default=True, strict=True)
     intaris_evaluation: IntarisEvaluation = DEFAULT_INTARIS_EVALUATION
     minimum_outcome: Literal["deny", "escalate", "approve"] | None = None
     maximum_outcome: Literal["deny", "escalate", "approve"] | None = None
@@ -116,6 +128,23 @@ class AgentCapabilities(BaseModel):
         return self.guardrails_backend != "none"
 
 
+class AutoProfileSelectionSettings(BaseModel):
+    """Conservative startup routing settings stored in agent execution JSON."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    enabled: bool = Field(default=True, strict=True)
+    min_confidence: float = Field(default=0.55, ge=0.5, le=1.0, strict=True)
+
+
+def auto_profile_selection_settings(
+    execution: dict[str, Any] | None,
+) -> AutoProfileSelectionSettings:
+    """Resolve and validate the optional per-agent startup routing settings."""
+    value = (execution or {}).get("auto_profile_selection")
+    return AutoProfileSelectionSettings.model_validate({} if value is None else value)
+
+
 class AgentDefinition(BaseModel):
     """Agent definition as stored in the database."""
 
@@ -143,6 +172,15 @@ class AgentDefinition(BaseModel):
     agent_profiles: dict[str, AgentRuntimeProfile] = Field(default_factory=dict)
     default_agent_profile_id: str | None = None
     execution: dict[str, Any] | None = None
+
+    @field_validator("execution")
+    @classmethod
+    def _validate_auto_profile_selection(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        auto_profile_selection_settings(value)
+        return value
+
     avatar_url: str | None = None  # deprecated — computed from avatar_image_id
     avatar_image_id: str | None = None
     # Type system
@@ -165,6 +203,13 @@ class AgentDefinition(BaseModel):
     status: str = "active"
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @field_validator("execution")
+    @classmethod
+    def _strip_retired_execution_settings(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        return strip_retired_execution_settings(value)
 
     @field_validator("agent_profiles", mode="before")
     @classmethod
@@ -337,6 +382,10 @@ class AgentLLMConfig(BaseModel):
     fast_mode: bool | None = None
     model_routing: dict[str, str] | None = None
     voice: str | None = None  # Per-agent TTS voice override
+    voices: dict[str, str] = Field(default_factory=dict)
+    tts_provider_id: str | None = None
+    tts_model: str | None = None
+    tts_voice: str | None = None
 
     @field_validator("reasoning_effort")
     @classmethod

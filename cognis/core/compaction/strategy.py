@@ -130,11 +130,11 @@ def _split_events(
 
     A turn is delimited by user messages, but system-started continuations can
     extend one user turn far beyond the tail budget. In that case the cut falls
-    inside the latest turn at a tool-cycle boundary. The latest turn's
-    admission anchors (its user messages and retry admission notices) are then
-    pinned at the front of the preserved tail: they remain verbatim, keep their
-    relative order, and are excluded from ``older`` so continuation validation
-    still finds the active instruction after rotation.
+    inside the latest turn at a tool-cycle boundary. Admission anchors for the
+    executions represented in the tail are pinned before it, including retry
+    source admissions. They remain verbatim, keep their relative order, and are
+    excluded from ``older`` so continuation validation still finds the active
+    instruction after rotation, even after later question answers.
     """
     user_event_indices = [
         index for index, event in enumerate(events) if event.type == "user_message"
@@ -157,7 +157,7 @@ def _split_events(
             model=model,
         )
         if intra_turn_cut is not None:
-            return _pin_latest_turn_admission(events, intra_turn_cut, latest_turn_start)
+            return _pin_tail_admissions(events, intra_turn_cut, latest_turn_start)
         keep_from = _token_budgeted_tail_start(
             events,
             user_event_indices,
@@ -168,7 +168,7 @@ def _split_events(
         )
         if keep_from is not None:
             keep_from = _snap_keep_from_to_cycle_boundary(events, keep_from)
-            return _pin_latest_turn_admission(events, keep_from, latest_turn_start)
+            return _pin_tail_admissions(events, keep_from, latest_turn_start)
 
     if len(user_event_indices) <= max_preserved_turns:
         preserve_events = min(
@@ -179,9 +179,9 @@ def _split_events(
             return [], list(events)
         keep_from = len(events) - preserve_events
         keep_from = _snap_keep_from_to_cycle_boundary(events, keep_from)
-        return _pin_latest_turn_admission(events, keep_from, latest_turn_start)
+        return _pin_tail_admissions(events, keep_from, latest_turn_start)
     keep_from = user_event_indices[-max_preserved_turns]
-    return list(events[:keep_from]), list(events[keep_from:])
+    return _pin_tail_admissions(events, keep_from, latest_turn_start)
 
 
 def _is_turn_admission_event(event: Any) -> bool:
@@ -189,18 +189,37 @@ def _is_turn_admission_event(event: Any) -> bool:
     return getattr(event, "type", None) == "user_message" or is_retry_admission_notice(event)
 
 
-def _pin_latest_turn_admission(
+def _pin_tail_admissions(
     events: list[Any],
     keep_from: int,
     latest_turn_start: int | None,
 ) -> tuple[list[Any], list[Any]]:
-    if latest_turn_start is None or keep_from <= latest_turn_start:
-        return list(events[:keep_from]), list(events[keep_from:])
-    pinned = [
-        event for event in events[latest_turn_start:keep_from] if _is_turn_admission_event(event)
-    ]
-    pinned_ids = {id(event) for event in pinned}
-    older = [event for event in events[:keep_from] if id(event) not in pinned_ids]
+    """Keep admission dependencies for executions represented by the retained tail."""
+    required_turns = {
+        turn_id
+        for event in events[keep_from:]
+        if isinstance(turn_id := event.data.get("turn_id"), str) and turn_id
+    }
+    pinned_indices: set[int] = set()
+    # Backward traversal follows retained retry notices to their earlier source
+    # admissions. Later question answers do not replace execution admission.
+    for index in range(len(events) - 1, -1, -1):
+        event = events[index]
+        if not _is_turn_admission_event(event):
+            continue
+        if index < keep_from:
+            in_latest_turn = latest_turn_start is not None and index >= latest_turn_start
+            turn_id = event.data.get("turn_id")
+            if not in_latest_turn and (
+                not isinstance(turn_id, str) or turn_id not in required_turns
+            ):
+                continue
+            pinned_indices.add(index)
+        source_turn = event.data.get("retry_source_turn_id")
+        if isinstance(source_turn, str) and source_turn:
+            required_turns.add(source_turn)
+    pinned = [event for index, event in enumerate(events[:keep_from]) if index in pinned_indices]
+    older = [event for index, event in enumerate(events[:keep_from]) if index not in pinned_indices]
     return older, pinned + list(events[keep_from:])
 
 
@@ -240,7 +259,8 @@ def _oversized_latest_turn_cut(
     when the whole latest turn fits (normal turn-boundary splitting applies) or
     when no cycle boundary leaves anything to summarize.
     """
-    anchors = [event for event in events[latest_turn_start:] if _is_turn_admission_event(event)]
+    _, latest_events = _pin_tail_admissions(events, latest_turn_start, latest_turn_start)
+    anchors = [event for event in latest_events if _is_turn_admission_event(event)]
     try:
         budget = tail_token_budget - int(
             count_tokens_fn(format_events_for_compaction(anchors), model)
@@ -352,6 +372,7 @@ def _token_budgeted_tail_start(
         user_turn_count = sum(1 for event in candidate if event.type == "user_message")
         if user_turn_count > max_preserved_turns:
             break
+        _, candidate = _pin_tail_admissions(events, boundary_index, boundary_index)
         try:
             candidate_tokens = int(count_tokens_fn(format_events_for_compaction(candidate), model))
         except Exception:
@@ -812,6 +833,8 @@ class CompactionStrategy:
                     model=resolved_model if use_same_session_model else None,
                     task_type="compaction",
                     cognis_session_id=session.session_id,
+                    cognis_conversation_id=session.conversation_id,
+                    cognis_agent_id=session.agent_id,
                     acting_user_email=session.user_email,
                     provider_id=model_context.provider_id
                     if use_same_session_model and model_context is not None

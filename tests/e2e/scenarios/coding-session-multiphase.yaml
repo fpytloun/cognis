@@ -3,7 +3,7 @@ description: |
   Real-world coding session pattern: agent reads context, writes changes,
   then emits multiple assistant phases separated by tool calls.
 
-  Synthetic reconstruction of a production-inspired interaction pattern:
+  Inspired by production sessions (sess_9da525a9):
     Turn 0 (LLM call 1): tool calls to gather context and write changes
     Turn 1 (LLM call 2): assistant summary of work done (phase 0)
     Turn 2 (LLM call 3): final assistant message with next steps (phase 1)

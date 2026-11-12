@@ -329,7 +329,7 @@ async def test_canonical_signal_recipient_does_not_require_local_adapter(tmp_pat
             user_email="owner@example.com",
             recipient=ChannelRecipient(
                 channel_type="signal",
-                address="+447700900124",
+                address="+447700900123",
                 address_kind="signal_e164",
                 chat_kind="direct",
                 allow_resolution=True,

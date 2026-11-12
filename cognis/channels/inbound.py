@@ -454,35 +454,9 @@ class InboundPipeline:
             if managed is True:
                 return
             if managed is not None:
-                observer = self._managed_channel_service.observer(
-                    binding_id=managed.binding_id,
-                    binding_version=managed.version,
-                    owner_epoch=managed.owner_epoch,
+                await self._managed_channel_service.submit_participant_admission(
+                    message, managed, sender_label=_sender_label(message)
                 )
-                error = await self._turn_scheduler.submit_turn(
-                    managed.conversation_id,
-                    managed.content,
-                    user_email=managed.user_email,
-                    intention_eligible=False,
-                    attachments=managed.attachments,
-                    user_message_metadata=message_metadata(
-                        ts=message.timestamp,
-                        channel=message.channel_type,
-                        sender=_sender_label(message),
-                        untrusted=True,
-                    ),
-                    contextual_messages=managed.contextual_messages,
-                    turn_observers=(observer,),
-                    client_message_id=managed.message_id,
-                    allow_queue=False,
-                )
-                if error is not None:
-                    await self._managed_channel_service.release_after_failure(
-                        binding_id=managed.binding_id,
-                        admitted_version=managed.version,
-                        admitted_owner_epoch=managed.owner_epoch,
-                        reason=error.message,
-                    )
                 return
 
         capture_allowed = capture_candidate and user_email == config.user_email
@@ -2373,8 +2347,11 @@ class ChannelTurnObserver:
         retry_reason: str | None = None,
         retry_source_turn_id: str | None = None,
         attempt: int | None = None,
+        task_outcome: dict[str, Any] | None = None,
     ) -> None:
         """Forward system messages to the channel."""
+        if kind == "turn_initiated":
+            return
         adapter = self._get_adapter()
         if adapter is None:
             return

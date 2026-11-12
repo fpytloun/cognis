@@ -7,6 +7,7 @@ import base64
 import copy
 import hashlib
 import io
+import logging
 import threading
 import warnings
 from collections import OrderedDict
@@ -19,6 +20,8 @@ from cognis.core.artifact_access import artifact_authorized_for_conversation
 from cognis.models.artifact import ArtifactKind, ArtifactStatus
 from cognis.providers.llm.errors import MidStreamErrorCategory
 from cognis.store.queries import get_artifact_records
+
+logger = logging.getLogger(__name__)
 
 MAX_CODEX_IMAGE_DIMENSION = 2048
 MAX_CODEX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -113,6 +116,7 @@ async def materialize_codex_artifact_images(
     conversation_id: str | None,
     agent_id: str | None,
     session_id: str | None = None,
+    llm_request_id: str | None = None,
     normalization_cache: CodexImageNormalizationCache | None = None,
 ) -> list[dict[str, Any]]:
     """Return a deep copy with authorized artifact images replaced by data URLs."""
@@ -125,9 +129,14 @@ async def materialize_codex_artifact_images(
         raise CodexArtifactError("Cognis image materialization requires conversation identity")
 
     records: dict[str, Any] = {}
+    rejection_categories: dict[str, str] = {}
+    exception_types: dict[str, str] = {}
+    now = datetime.now(UTC)
     async with session_factory() as session:
         for record in await get_artifact_records(session, sorted(artifact_ids)):
-            if await artifact_authorized_for_conversation(
+            if not _record_is_available(record, now=now):
+                rejection_categories[record.artifact_id] = "record_unavailable"
+            elif await artifact_authorized_for_conversation(
                 session,
                 artifact=record,
                 owner_email=owner_email,
@@ -136,6 +145,8 @@ async def materialize_codex_artifact_images(
                 session_id=session_id,
             ):
                 records[record.artifact_id] = record
+            else:
+                rejection_categories[record.artifact_id] = "unauthorized"
 
     data_urls: dict[str, str] = {}
     # Artifacts that cannot be sent, mapped to a short model-facing reason.
@@ -143,18 +154,20 @@ async def materialize_codex_artifact_images(
     # fail a whole request, because the identical retry would fail again.
     undeliverable: dict[str, str] = {}
     encoded_total = 0
-    now = datetime.now(UTC)
     for artifact_id in sorted(artifact_ids):
         selected_record: Any | None = records.get(artifact_id)
         if not _record_is_available(selected_record, now=now):
             undeliverable[artifact_id] = "it is unavailable"
+            rejection_categories.setdefault(artifact_id, "record_missing")
             continue
         assert selected_record is not None
         if selected_record.kind != ArtifactKind.IMAGE:
             undeliverable[artifact_id] = "it is not an image"
+            rejection_categories[artifact_id] = "not_image"
             continue
         if selected_record.size_bytes > MAX_CODEX_IMAGE_BYTES:
             undeliverable[artifact_id] = "it is too large"
+            rejection_categories[artifact_id] = "source_byte_limit"
             continue
         try:
             content, _stored_type = await artifact_store.async_load(
@@ -162,8 +175,10 @@ async def materialize_codex_artifact_images(
                 selected_record.object_id,
                 selected_record.filename,
             )
-        except Exception:
+        except Exception as exc:
             undeliverable[artifact_id] = "it is unavailable"
+            rejection_categories[artifact_id] = "storage_load_failed"
+            exception_types[artifact_id] = type(exc).__name__
             continue
         try:
             if normalization_cache is None:
@@ -179,13 +194,31 @@ async def materialize_codex_artifact_images(
                 )
         except CodexArtifactError as exc:
             undeliverable[artifact_id] = f"safe image normalization failed: {exc}"
+            rejection_categories[artifact_id] = "normalization_failed"
+            exception_types[artifact_id] = type(exc).__name__
             continue
         projected_total = encoded_total + len(data_url) * reference_counts[artifact_id]
         if projected_total > MAX_CODEX_ENCODED_IMAGE_BYTES:
             undeliverable[artifact_id] = "the request image payload limit was reached"
+            rejection_categories[artifact_id] = "request_byte_limit"
             continue
         encoded_total = projected_total
         data_urls[artifact_id] = data_url
+
+    for artifact_id in sorted(undeliverable):
+        logger.warning(
+            "Native image materialization rejected",
+            extra={
+                "extra_data": {
+                    "artifact_id": artifact_id,
+                    "conversation_id": conversation_id,
+                    "session_id": session_id,
+                    "llm_request_id": llm_request_id,
+                    "category": rejection_categories[artifact_id],
+                    "exception_type": exception_types.get(artifact_id),
+                }
+            },
+        )
 
     materialized = copy.deepcopy(messages)
     for message in materialized:

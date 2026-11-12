@@ -15,6 +15,7 @@ from cognis.api.chat_v2.item_keys import (
     encode_timeline_sort_key,
     thinking_item_id,
 )
+from cognis.api.chat_v2.message_metadata import project_message_metadata
 from cognis.api.chat_v2.normalizer import NormalizedChatEvent
 from cognis.api.chat_v2.notice_metadata import notice_metadata
 from cognis.api.chat_v2.schemas import (
@@ -299,6 +300,16 @@ def _project_event(
     if event.kind == "assistant_message":
         item = _message_item(event, role="assistant")
         previous = items_by_id.get(item.id)
+        if isinstance(previous, MessageTimelineItem):
+            # Attachment references belong to the message, not a text segment.
+            # Later empty lists must not erase media committed by an earlier event.
+            attachments = {
+                attachment.artifact_id: attachment for attachment in previous.attachments
+            }
+            attachments.update(
+                {attachment.artifact_id: attachment for attachment in item.attachments}
+            )
+            item.attachments = list(attachments.values())
         if event.data.get("content_is_delta") is True and isinstance(previous, MessageTimelineItem):
             item.content = previous.content + item.content
             item.sort_key = previous.sort_key
@@ -334,6 +345,8 @@ def _project_event(
     if event.kind == "managed_conversation":
         return _managed_conversation_item(event)
     if event.kind == "task":
+        if event.data.get("task_outcome_card") is True:
+            return _task_item(event)
         return HIDDEN_EVENT
     if event.kind == "question_set":
         return _question_set_item(event)
@@ -397,7 +410,9 @@ def _message_item(event: NormalizedChatEvent, *, role: str) -> MessageTimelineIt
         role=role,  # type: ignore[arg-type]
         content=str(content or ""),
         message_id=message_id,
+        task_outcome=data.get("task_outcome"),
         client_message_id=_str_or_none(data.get("client_message_id")),
+        message_metadata=project_message_metadata(data),
         client_txn_id=_str_or_none(data.get("client_txn_id")),
         turn_id=_str_or_none(data.get("turn_id")),
         assistant_phase_index=event.assistant_phase_index,
@@ -476,6 +491,9 @@ def _tool_call_item(
         status=_status(data, default="running"),
         call_id=call_id,
         tool_name=tool_name,
+        parent_call_id=_str_or_none(data.get("parent_call_id")),
+        program_id=_str_or_none(data.get("program_id")),
+        kernel_generation=_str_or_int_or_none(data.get("kernel_generation")),
         display_name=display_name,
         turn_id=_str_or_none(data.get("turn_id")),
         assistant_phase_index=event.assistant_phase_index,
@@ -526,6 +544,21 @@ def _tool_result_item(
             existing_tool.tool_name
             if existing_tool is not None
             else str(data.get("name") or data.get("tool_name") or "tool")
+        ),
+        parent_call_id=(
+            existing_tool.parent_call_id
+            if existing_tool is not None and existing_tool.parent_call_id is not None
+            else _str_or_none(data.get("parent_call_id"))
+        ),
+        program_id=(
+            existing_tool.program_id
+            if existing_tool is not None and existing_tool.program_id is not None
+            else _str_or_none(data.get("program_id"))
+        ),
+        kernel_generation=(
+            existing_tool.kernel_generation
+            if existing_tool is not None and existing_tool.kernel_generation is not None
+            else _str_or_int_or_none(data.get("kernel_generation"))
         ),
         display_name=(
             existing_tool.display_name
@@ -801,7 +834,9 @@ def _task_item(event: NormalizedChatEvent) -> TaskTimelineItem:
     data = event.data
     task_id = str(data.get("task_id") or data.get("id") or _fallback_id(event))
     return TaskTimelineItem(
-        id=f"task:{task_id}",
+        id=f"task:{task_id}:{data['outcome_key']}"
+        if data.get("outcome_key")
+        else f"task:{task_id}",
         sort_key=_sort_key(event),
         source_refs=[event.source_ref],
         created_at=event.timestamp,
@@ -813,6 +848,10 @@ def _task_item(event: NormalizedChatEvent) -> TaskTimelineItem:
         workflow_step=_str_or_none(data.get("workflow_step") or data.get("step_name")),
         result_summary=_str_or_none(data.get("result_summary")),
         deliverable_ids=[str(value) for value in data.get("deliverable_ids") or []],
+        attempt_number=data.get("attempt_number", 1),
+        failure_reason=_str_or_none(data.get("failure_reason")),
+        partial_result=data.get("partial_result"),
+        attachments=_attachments(data.get("attachments")),
     )
 
 
@@ -942,12 +981,14 @@ def _assistant_deliverable_item(event: NormalizedChatEvent) -> AssistantDelivera
     deliverable_id = str(data.get("deliverable_id") or data.get("id") or _fallback_id(event))
     return AssistantDeliverableTimelineItem(
         id=f"assistant-deliverable:{deliverable_id}",
+        turn_id=_str_or_none(data.get("turn_id")),
         sort_key=_sort_key(event),
         source_refs=[event.source_ref],
         created_at=event.timestamp,
         updated_at=event.timestamp,
         status="complete",
         deliverable_id=deliverable_id,
+        task_outcome=data.get("task_outcome"),
         lineage_id=_str_or_none(data.get("lineage_id")),
         revision=_int_or_none(data.get("revision")),
         format=str(data.get("format") or "markdown"),
@@ -1469,5 +1510,13 @@ def _chat_mode(data: dict[str, Any]) -> ChatMode | None:
 
 def _str_or_none(value: Any) -> str | None:
     if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _str_or_int_or_none(value: Any) -> str | int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str | int):
         return value
     return None

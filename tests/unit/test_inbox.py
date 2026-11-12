@@ -17,7 +17,13 @@ from cognis.core.inbox import InboxService, stage_notification
 from cognis.core.web_push import WebPushRuntimeConfig, WebPushService
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, User
-from cognis.store.queries import create_agent, create_knowledgebase, create_project, create_user
+from cognis.store.queries import (
+    create_agent,
+    create_executor,
+    create_knowledgebase,
+    create_project,
+    create_user,
+)
 
 
 @pytest.fixture
@@ -36,6 +42,14 @@ def inbox_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                     owner_email="owner@example.com",
                     name="Shared agent",
                     status="active",
+                    execution={"executor_id": "owner-executor"},
+                )
+                await create_executor(
+                    session,
+                    executor_id="owner-executor",
+                    name="Owner executor",
+                    owner_email="owner@example.com",
+                    executor_type="websocket",
                 )
                 project = await create_project(
                     session, owner_email="owner@example.com", name="Shared project"
@@ -46,7 +60,7 @@ def inbox_client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
                 await session.commit()
                 return agent.agent_id, project.project_id, kb.knowledgebase_id
 
-        ids = asyncio.run(seed())
+        ids = client.portal.call(seed)
         client.app.state.knowledgebase_service.enabled = True
         yield client, ids
 

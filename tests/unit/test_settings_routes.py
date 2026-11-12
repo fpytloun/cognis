@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -131,7 +130,7 @@ def test_validate_llm_provider_payload_rejects_unknown_message_projection_policy
 
 def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         default_response = client.get("/api/v1/user-preferences", headers=headers)
@@ -144,6 +143,7 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
         assert default_response.json()["display"]["conversation_project_badge"] == "name"
         assert default_response.json()["chat"] == {
             "enter_to_send": True,
+            "adapt_tts": False,
             "show_thinking_blocks": False,
             "group_tool_calls": True,
             "keep_assistant_messages_separate": False,
@@ -178,6 +178,7 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
             },
             "chat": {
                 "enter_to_send": False,
+                "adapt_tts": True,
                 "show_thinking_blocks": True,
                 "group_tool_calls": True,
                 "keep_assistant_messages_separate": True,
@@ -193,18 +194,18 @@ def test_user_preferences_default_and_update(monkeypatch: object, tmp_path: Path
         persisted_response = client.get("/api/v1/user-preferences", headers=headers)
         assert persisted_response.status_code == 200
         assert persisted_response.json() == payload
-        enabled_at = asyncio.run(_auto_recap_enabled_at(client.app))
+        enabled_at = client.portal.call(_auto_recap_enabled_at, client.app)
         assert enabled_at is not None
         payload["display"]["theme"] = "light"
         assert (
             client.put("/api/v1/user-preferences", headers=headers, json=payload).status_code == 200
         )
-        assert asyncio.run(_auto_recap_enabled_at(client.app)) == enabled_at
+        assert client.portal.call(_auto_recap_enabled_at, client.app) == enabled_at
 
 
 def test_user_preferences_reject_invalid_language(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.put(
@@ -228,19 +229,18 @@ def test_user_preferences_adds_default_for_legacy_persisted_state(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
-        asyncio.run(
-            _store_user_preferences_state(
-                client.app,
-                {
-                    "display": {"theme": "dark", "language": "en"},
-                    "chat": {
-                        "show_thinking_blocks": True,
-                        "group_tool_calls": True,
-                        "show_internal_tool_calls": False,
-                    },
+        client.portal.call(_seed_user, client.app)
+        client.portal.call(
+            _store_user_preferences_state,
+            client.app,
+            {
+                "display": {"theme": "dark", "language": "en"},
+                "chat": {
+                    "show_thinking_blocks": True,
+                    "group_tool_calls": True,
+                    "show_internal_tool_calls": False,
                 },
-            )
+            },
         )
 
         response = client.get(
@@ -264,7 +264,7 @@ def test_user_theme_families_round_trip_and_reject_unknown(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         payload = client.get("/api/v1/user-preferences", headers=headers).json()
         assert payload["display"]["theme_family"] == "classic"
@@ -295,18 +295,18 @@ def test_user_preferences_normalizes_only_invalid_persisted_family(
             return row.value
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         original = client.get("/api/v1/user-preferences", headers=headers).json()
         original["display"].update(theme_family=family, theme="dark", language="cs-CZ")
         original["chat"].update(enter_to_send=False, auto_recap=False)
         original["notifications"]["include_content"] = False
-        asyncio.run(_store_user_preferences_state(client.app, original))
+        client.portal.call(_store_user_preferences_state, client.app, original)
         expected = {**original, "display": {**original["display"], "theme_family": "classic"}}
         response = client.get("/api/v1/user-preferences", headers=headers)
         assert response.status_code == 200
         assert response.json() == expected
-        assert asyncio.run(read_stored(client.app)) == original
+        assert client.portal.call(read_stored, client.app) == original
         # The PUT path reads previous state too; an unknown stored family must
         # not prevent a validated update or reset unrelated preferences.
         expected["display"]["theme_family"] = "classic"
@@ -314,14 +314,14 @@ def test_user_preferences_normalizes_only_invalid_persisted_family(
             client.put("/api/v1/user-preferences", headers=headers, json=expected).json()
             == expected
         )
-        assert asyncio.run(read_stored(client.app)) == expected
+        assert client.portal.call(read_stored, client.app) == expected
 
 
 def test_user_preferences_legacy_display_preserves_family_only(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         url = "/api/v1/user-preferences"
         legacy = {"display": {"theme": "dark", "language": "cs-CZ"}}
@@ -372,7 +372,7 @@ def test_user_preferences_legacy_display_preserves_family_only(
 
 def test_setting_metadata_live_update_and_reset(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         detail = client.get(
@@ -462,7 +462,7 @@ def test_setting_metadata_live_update_and_reset(monkeypatch: object, tmp_path: P
 
 def test_settings_list_hides_legacy_noop_settings(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         response = client.get("/api/v1/settings", headers=headers)
@@ -486,7 +486,7 @@ def test_setting_update_restores_previous_value_when_live_apply_fails(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
         original_apply = settings_routes.apply_runtime_setting
         attempts = 0
@@ -521,7 +521,7 @@ def test_executor_policy_update_is_non_destructive_and_applies_to_next_runtime(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         async def unexpected_hot_apply(app: object, key: str, value: object) -> None:

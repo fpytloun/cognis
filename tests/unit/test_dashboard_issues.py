@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-import asyncio
+from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from sqlalchemy import event
 
+from cognis.api import dashboard_issues as issues_module
 from cognis.api.app import create_app
 from cognis.api.dashboard_issues import (
     EXECUTOR_OFFLINE_GRACE,
     ISSUE_LIMIT,
     schedule_incident_token,
 )
+from cognis.api.routes import dashboard as dashboard_routes
 from cognis.store.models import MCPOAuthTokenRow, Schedule, Task
 from cognis.store.queries import (
     create_agent,
@@ -200,12 +202,27 @@ def test_dashboard_issues_are_user_scoped_typed_and_bounded(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         statements = 0
+        # The running app also issues background queries (leases, metrics) on the
+        # same engine; count only statements made inside the issue projection.
+        in_projection: ContextVar[bool] = ContextVar("in_projection", default=False)
+
+        async def _counted_projection(*args: object, **kwargs: object) -> object:
+            token = in_projection.set(True)
+            try:
+                return await issues_module.collect_dashboard_issues(*args, **kwargs)
+            finally:
+                in_projection.reset(token)
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            dashboard_routes, "collect_dashboard_issues", _counted_projection
+        )
 
         def _count(*_: object) -> None:
             nonlocal statements
-            statements += 1
+            if in_projection.get():
+                statements += 1
 
         engine = client.app.state.session_factory.kw["bind"].sync_engine
         event.listen(engine, "before_cursor_execute", _count)
@@ -219,9 +236,9 @@ def test_dashboard_issues_are_user_scoped_typed_and_bounded(
 
         assert response.status_code == 200, response.text
         payload = response.json()
-        # Authentication adds one user lookup. The issue projection itself uses
-        # five fixed queries, including shared provider snapshots, independent of resource counts.
-        assert statements == 6
+        # The issue projection uses five fixed queries, including shared provider
+        # snapshots, independent of resource counts.
+        assert statements == 5
         assert payload["generated_at"]
         assert payload["summary"]["total"] == len(payload["issues"])
         assert {
@@ -302,7 +319,7 @@ def test_dashboard_issues_ignore_obsolete_oauth_scopes_and_active_current_token(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         payload = client.get(
             "/api/v1/dashboard/issues",
             headers=_headers(client.app, "owner@example.com"),
@@ -339,7 +356,7 @@ def test_dashboard_issues_healthy_state_is_empty(
                 executor.last_observed_at = datetime.now(UTC)
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/dashboard/issues",
             headers=_headers(client.app, "owner@example.com"),
@@ -428,7 +445,7 @@ def test_dashboard_projects_only_owner_actionable_schedule_failures(
                 foreign.last_run_status = "failed"
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.get(
             "/api/v1/dashboard/issues",
             headers=_headers(client.app, "owner@example.com"),
@@ -477,7 +494,7 @@ def test_dashboard_issues_have_a_fixed_result_cap(
                     executor.runtime_state = "offline"
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         payload = client.get(
             "/api/v1/dashboard/issues",
             headers=_headers(client.app, "owner@example.com"),
@@ -524,7 +541,7 @@ def test_dashboard_issues_suppress_recent_transient_executor_disconnect(
                 expired.last_observed_at = now - EXECUTOR_OFFLINE_GRACE
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         payload = client.get(
             "/api/v1/dashboard/issues",
             headers=_headers(client.app, "owner@example.com"),
@@ -586,7 +603,7 @@ def test_schedule_issue_dismissal_is_incident_scoped_and_survives_reconciliation
                 schedule.consecutive_errors = 1
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _headers(client.app, "owner@example.com")
         issue = client.get("/api/v1/dashboard/issues", headers=headers).json()["issues"][0]
         dismiss_url = "/api/v1/dashboard/issues/schedules/sched-dismiss/dismiss"
@@ -610,7 +627,7 @@ def test_schedule_issue_dismissal_is_incident_scoped_and_survives_reconciliation
         )
         assert client.post(dismiss_url, headers=headers, json=payload).status_code == 200
         assert client.post(dismiss_url, headers=headers, json=payload).status_code == 200
-        asyncio.run(client.app.state.notification_service.reconcile_schedule_actions())
+        client.portal.call(client.app.state.notification_service.reconcile_schedule_actions)
         assert client.get("/api/v1/dashboard/issues", headers=headers).json()["issues"] == []
 
         async def _advance_incident() -> None:
@@ -622,8 +639,8 @@ def test_schedule_issue_dismissal_is_incident_scoped_and_survives_reconciliation
                 schedule.consecutive_errors = 2
                 await session.commit()
 
-        asyncio.run(_advance_incident())
+        client.portal.call(_advance_incident)
         assert client.post(dismiss_url, headers=headers, json=payload).status_code == 409
-        asyncio.run(client.app.state.notification_service.reconcile_schedule_actions())
+        client.portal.call(client.app.state.notification_service.reconcile_schedule_actions)
         reopened = client.get("/api/v1/dashboard/issues", headers=headers).json()["issues"]
         assert [item["resource"]["id"] for item in reopened] == ["sched-dismiss"]

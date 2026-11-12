@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -74,7 +73,7 @@ def test_executor_reconfigure_preserves_settings_and_ownership(
                 row.runtime_state = "degraded"
                 await session.commit()
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         headers = _auth_headers(client.app, email="user@example.com", role=role)
         before = client.get("/api/v1/executors/exec-retry", headers=headers)
         response = client.post("/api/v1/executors/exec-retry/reconfigure", headers=headers)
@@ -133,7 +132,7 @@ def test_executor_update_atomically_bumps_normalized_legacy_generation(
                 assert normalized is True
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.put(
             "/api/v1/executors/exec-1",
@@ -224,7 +223,7 @@ def test_legacy_normalization_and_atomic_bump_are_order_safe(
                 assert row is not None
                 assert row.desired_config_version == 1
 
-        asyncio.run(_exercise_both_orders())
+        client.portal.call(_exercise_both_orders)
 
 
 def test_executor_list_includes_shared_for_regular_users(
@@ -258,7 +257,7 @@ def test_executor_list_includes_shared_for_regular_users(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/executors",
@@ -317,7 +316,7 @@ def test_executor_resource_snapshot_is_typed_fresh_and_owner_scoped(
                 }
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         owner_response = client.get(
             "/api/v1/executors/alice-exec",
@@ -356,7 +355,7 @@ def test_regular_user_cannot_create_shared_or_local_executors(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         local_response = client.post(
             "/api/v1/executors",
@@ -396,7 +395,7 @@ def test_executor_local_inference_config_validation_and_defaults(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(client.app, email="user@example.com")
 
         legacy = client.post(
@@ -510,7 +509,7 @@ def test_regular_user_cannot_mutate_owned_local_executor(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         headers = _auth_headers(client.app, email="user@example.com", role="user")
         update_response = client.put(
@@ -547,7 +546,7 @@ def test_executor_token_generation_rotates_token_version(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         headers = _auth_headers(client.app, email="user@example.com", role="user")
         first = client.post("/api/v1/executors/remote-1/token", headers=headers)
@@ -573,7 +572,7 @@ def test_executor_token_generation_rotates_token_version(
                 assert row is not None
                 return row.token_version
 
-        assert asyncio.run(_load_token_version()) == 2
+        assert client.portal.call(_load_token_version) == 2
 
 
 def test_persistent_token_generation_rejects_non_websocket_executors(
@@ -599,7 +598,7 @@ def test_persistent_token_generation_rejects_non_websocket_executors(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/executors/subprocess-1/token",
@@ -643,7 +642,7 @@ def test_admin_mutations_revoke_current_executor_connection_ownership(
                 for executor_id in ("status-exec", "token-exec", "delete-exec")
             }
 
-        owners = asyncio.run(_seed())
+        owners = client.portal.call(_seed)
         assert all(owner is not None for owner in owners.values())
         headers = _auth_headers(client.app, email="user@example.com")
 
@@ -665,4 +664,4 @@ def test_admin_mutations_revoke_current_executor_connection_ownership(
                 assert owner is not None
                 assert not await ownership.is_current(owner)
 
-        asyncio.run(_assert_fenced())
+        client.portal.call(_assert_fenced)

@@ -6,7 +6,6 @@ import pytest
 from cognis.api.chat_v2.event_store import RawSessionEvent
 from cognis.api.chat_v2.normalizer import normalize_session_events
 from cognis.api.chat_v2.projector import project_timeline
-from cognis.api.chat_v2.schemas import MessageTimelineItem
 from cognis.core.notifications import NotificationService
 from tests.unit.test_notifications import (
     _FakeEventBus,
@@ -25,7 +24,7 @@ async def test_question_answer_reaches_intention_before_resolution(monkeypatch, 
         "questions": [
             {
                 "id": "target",
-                "question": "Which issue replaces PR 12?",
+                "question": "Which sample exhibit replaces exhibit 203?",
                 "allow_custom": True,
             }
         ]
@@ -35,7 +34,7 @@ async def test_question_answer_reaches_intention_before_resolution(monkeypatch, 
             {
                 "question_id": "target",
                 "selected_option_ids": [],
-                "custom_answer": "Use issue https://code.example.test/sample/catalog/issues/34",
+                "custom_answer": "Use sample exhibit https://museum.example.test/exhibits/407",
             }
         ],
         "human_answer": True,
@@ -82,10 +81,11 @@ async def test_question_answer_reaches_intention_before_resolution(monkeypatch, 
     assert provider.report_reasoning.await_count == int(human)
     if human:
         assert [event.type for event in events] == ["assistant_message", "user_message"]
-        assert reply["answers"][0]["custom_answer"] in events[1].data["content"]
-        assert "PR 12" not in events[1].data["content"]
+        assert "407" in events[1].data["content"]
+        assert "203" not in events[1].data["content"]
         assert events[1].data["intention_eligible"]
-        # The guardrail receives question context, but chat replay only shows the answer.
+        # The guardrail receives question context and the answer; chat replay shows
+        # neither, because the resolved interaction card owns their presentation.
         normalized = normalize_session_events(
             [
                 RawSessionEvent(
@@ -98,11 +98,7 @@ async def test_question_answer_reaches_intention_before_resolution(monkeypatch, 
                 for seq, event in enumerate(events, 1)
             ]
         )
-        items = project_timeline(normalized.events).timeline.items
-        assert len(items) == 1
-        assert isinstance(items[0], MessageTimelineItem)
-        assert items[0].role == "user"
-        assert items[0].content == events[1].data["content"]
+        assert project_timeline(normalized.events).timeline.items == []
     assert await service.resolve(
         row.notification_id,
         "continue",

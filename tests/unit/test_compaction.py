@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from cognis.core.compaction import (
@@ -374,6 +376,50 @@ def test_compaction_formats_tool_results_with_recovery_metadata() -> None:
     assert "read_tool_output(call_id='tool-call-1')" in formatted
     assert "search_tool_output(call_id='tool-call-1', pattern='keyword')" in formatted
     assert "truncated for compaction: omitted 500 chars" in formatted
+
+
+def test_compaction_excludes_program_child_events_but_keeps_parent_audit_context() -> None:
+    parent_call_id = uuid.uuid4().hex
+    child_call_id = uuid.uuid4().hex
+    events = [
+        CachedEvent(
+            seq=1,
+            type="tool_call",
+            data={"call_id": parent_call_id, "name": "python_execute", "arguments": {}},
+        ),
+        CachedEvent(
+            seq=2,
+            type="tool_call",
+            data={
+                "call_id": child_call_id,
+                "name": "web_search",
+                "arguments": {"query": "private query"},
+                "caller": {"type": "program", "program_id": parent_call_id},
+            },
+        ),
+        CachedEvent(
+            seq=3,
+            type="tool_result",
+            data={
+                "call_id": child_call_id,
+                "name": "web_search",
+                "result": "nested read result should not enter compaction",
+                "caller": {"type": "program", "program_id": parent_call_id},
+            },
+        ),
+        CachedEvent(
+            seq=4,
+            type="tool_result",
+            data={"call_id": parent_call_id, "name": "python_execute", "result": "done"},
+        ),
+    ]
+
+    formatted = _format_events_for_compaction(events)
+
+    assert "python_execute" in formatted
+    assert child_call_id not in formatted
+    assert "private query" not in formatted
+    assert "nested read result should not enter compaction" not in formatted
 
 
 def test_compaction_formats_tool_call_identifying_args_before_truncation() -> None:
@@ -994,6 +1040,62 @@ def test_pinned_admission_satisfies_continuation_validation_after_rotation() -> 
         rotated_snapshot(unpinned_tail).require_turn(
             "turn-2", user_event=True, profile_switch=False
         )
+
+
+@pytest.mark.parametrize("split_mode", ["tokens", "turn_count"])
+@pytest.mark.parametrize("with_retry", [False, True])
+def test_compaction_keeps_execution_admission_before_later_user_messages(
+    split_mode: str, with_retry: bool
+) -> None:
+    """Question answers and absorbed messages do not replace execution admission."""
+    from cognis.core.session_cache import CanonicalContextSnapshot
+
+    events = _long_single_turn_events(cycles=60, with_retry_notice=with_retry)
+    execution_id = "turn-2" if with_retry else "turn-1"
+    # Match production tool events: they belong to the running execution even
+    # after a question answer or an absorbed user message starts a new chat turn.
+    for event in events[3:]:
+        event.data["turn_id"] = execution_id
+    later_user = CachedEvent(
+        seq=0,
+        type="user_message",
+        data={"source": "question_answer", "content": "Approved"},
+    )
+    if split_mode == "turn_count":
+        later_user.data["turn_id"] = "absorbed-turn"
+        events.append(later_user)
+        events.append(CachedEvent(seq=0, type="assistant_message", data={"turn_id": execution_id}))
+    else:
+        events.insert(30, later_user)
+    for seq, event in enumerate(events, 1):
+        event.seq = seq
+
+    older, preserved = _split_events(
+        events,
+        preserve_turns=1 if split_mode == "turn_count" else 10,
+        tail_token_budget=40_000 if split_mode == "tokens" else None,
+        count_tokens_fn=_char_tokens,
+        model="test-model",
+    )
+    assert older
+    assert any(event.type == "tool_result" for event in older)
+    assert preserved == sorted(preserved, key=lambda event: event.seq)
+    assert len({id(event) for event in [*older, *preserved]}) == len(events)
+    assert len(older) + len(preserved) == len(events)
+    assert later_user in preserved
+    # Cold replay has only the rotated tail, not the original in-memory prompt.
+    snapshot = CanonicalContextSnapshot(
+        events=[
+            CachedEvent(seq=index + 10, type=event.type, data=dict(event.data))
+            for index, event in enumerate(preserved)
+        ],
+        prefix_entries=[],
+        last_compaction_summary="summary",
+        last_event_seq=len(preserved) + 9,
+        last_compaction_seq=9,
+        projection_revision=1,
+    )
+    snapshot.require_turn(execution_id, user_event=True, profile_switch=False)
 
 
 class _CapturingGuardrails(_Guardrails):

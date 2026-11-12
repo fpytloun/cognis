@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -128,7 +127,7 @@ def test_api_rejects_new_local_executor_but_keeps_persisted_row_visible(
                 )
                 await session.commit()
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         token = client.app.state.auth_provider.sign_access_token(
             "admin@example.com",
             "Admin",

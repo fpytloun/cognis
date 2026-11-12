@@ -939,6 +939,51 @@ class TestScheduleToolDefinitionOutput:
             & updated_fields.keys()
         )
 
+    @pytest.mark.parametrize("family", ["auto", "default", "direct"])
+    def test_update_accepts_every_completion_mode_family(
+        self, monkeypatch: Any, family: str
+    ) -> None:
+        row = _schedule_row()
+        updated_fields: dict[str, Any] = {}
+
+        async def fake_get_schedule(_db: object, _schedule_id: str) -> Any:
+            return row
+
+        async def fake_update_schedule(_db: object, _schedule_id: str, **fields: Any) -> Any:
+            updated_fields.update(fields)
+            for key, value in fields.items():
+                setattr(row, key, value)
+            return row
+
+        async def fake_count_active_tasks(_db: object, _schedule_id: str) -> int:
+            return 0
+
+        monkeypatch.setattr(schedule_mod, "get_schedule", fake_get_schedule)
+        monkeypatch.setattr(schedule_mod, "update_schedule", fake_update_schedule)
+        monkeypatch.setattr(
+            schedule_mod,
+            "count_active_tasks_for_schedule",
+            fake_count_active_tasks,
+        )
+
+        result = asyncio.run(
+            schedule_mod.handle_schedule_tool(
+                "manage_schedules",
+                {
+                    "action": "update",
+                    "schedule_id": "sched_1",
+                    "completion_mode_family": family,
+                },
+                session_factory=lambda: _Session(),
+                scheduler=None,
+                user_email="user@example.com",
+                agent_id="agent_1",
+            )
+        )
+
+        assert result.is_error is False
+        assert updated_fields["completion_mode_family"] == family
+
     def test_rescheduling_fired_one_shot_computes_next_fire(self) -> None:
         next_time = datetime(2099, 1, 1, tzinfo=UTC)
         existing = _schedule_row(

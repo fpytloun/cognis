@@ -1,0 +1,74 @@
+id: ptc-live-qualification
+description: |
+  Real PTC qualification through the agent loop, in-process executor, live
+  IPython kernel, nested memory tool router call, and Chat v2 transport.
+  The Intaris evaluator is enabled normally; only its L1 classification model
+  is deterministic and test-only.
+trigger: "scenario:ptc-live-qualification"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_discover_python
+        name: search_tools
+        arguments:
+          query: "Python executor persistent IPython kernel cell execution"
+          category: program
+          limit: 1
+
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_describe_python
+        name: describe_tool
+        arguments:
+          tool: "{{tool_result:ptc_discover_python:tool_id}}"
+
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_cell_1
+        name: call_tool
+        arguments:
+          tool: "{{tool_result:ptc_discover_python:tool_id}}"
+          arguments:
+            description: "PTC-QUALIFY-01: local state and nested read-only lookup"
+            code: |
+              ptc_live_qualification_sentinel = "ptc-live-qualification-v1"
+              nested_result = await cognis.tools.memory_search(
+                  query="ptc-live-qualification-test",
+                  limit=1,
+              )
+              await cognis.emit({
+                  "cell": 1,
+                  "sentinel": ptc_live_qualification_sentinel,
+                  "nested_tool": "memory_search",
+                  "nested_result": nested_result.text[:80],
+              })
+
+  - role: assistant
+    steps:
+      - type: text
+        content: "The first Python cell completed with its nested local memory search."
+
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: ptc_cell_2
+        name: call_tool
+        arguments:
+          tool: "{{tool_result:ptc_discover_python:tool_id}}"
+          arguments:
+            description: "PTC-QUALIFY-02: verify state in the existing kernel"
+            expected_generation: "{{tool_result_number:ptc_cell_1:kernel_generation}}"
+            code: |
+              assert ptc_live_qualification_sentinel == "ptc-live-qualification-v1"
+              await cognis.emit({
+                  "cell": 2,
+                  "persisted_sentinel": ptc_live_qualification_sentinel,
+              })
+
+  - role: assistant
+    steps:
+      - type: text
+        content: "The second Python cell observed the first cell's persisted state."

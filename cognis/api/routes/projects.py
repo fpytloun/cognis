@@ -15,7 +15,7 @@ from cognis.api.common import (
     forbid_mutation_for_viewer,
     require_current_user,
 )
-from cognis.api.conversation_identity import enrich_conversation_identity
+from cognis.api.conversation_summaries import conversation_list_summaries
 from cognis.api.models import (
     ConversationResponse,
     CursorPage,
@@ -39,7 +39,6 @@ from cognis.api.models import (
 )
 from cognis.api.project_pagination import decode_project_cursor, encode_project_cursor
 from cognis.api.serializers import (
-    conversation_to_response,
     project_agent_to_response,
     project_grant_to_response,
     project_source_to_response,
@@ -555,18 +554,13 @@ async def list_project_conversations_route(
         active_turns = {}
         if scheduler is not None and own_ids:
             active_turns = await scheduler.durable_running_turn_states(own_ids, session=session)
-    items = [
-        conversation_to_response(
-            row,
-            viewer_email=user.email,
-            has_active_turn=active_turns.get(row.conversation_id) is not None,
-            active_turn_state=active_turns.get(row.conversation_id),
-        )
-        for row in rows
-    ]
-    async with request.app.state.session_factory() as session:
-        return await enrich_conversation_identity(
-            session, items, user_email=user.email, can_mutate=user.role != "viewer"
+        return await conversation_list_summaries(
+            session,
+            rows,
+            user_email=user.email,
+            can_mutate=user.role != "viewer",
+            active_turn_states=active_turns,
+            include_attention_actions=True,
         )
 
 

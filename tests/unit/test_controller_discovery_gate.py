@@ -26,7 +26,9 @@ from cognis.models.agent import AgentDefinition, AgentPermissions
 from cognis.models.config import ModelInfo
 from cognis.models.tool import NativeToolDefinition, Permission, ToolSource, stable_tool_id
 from cognis.models.workflow import StepDefinition
+from cognis.providers.llm.anthropic.tool_bundle import compile_anthropic_tool_bundle
 from cognis.tools.builtin.tool_search import SEARCH_TOOLS_TOOL, search_inventory
+from cognis.tools.builtin.workflow import workflow_tools
 
 
 def _agent(
@@ -153,3 +155,49 @@ def test_controller_direct_responses_discovery_and_promotion(restriction: str) -
         promoted = expose({match["tool_id"] for match in matches})
         assert stable_tool_id(bash) in promoted.visible_tool_ids
         assert "bash" in {schema.get("function", {}).get("name") for schema in promoted.tools}
+
+
+def test_task_step_registry_question_tools_do_not_duplicate_controller_schemas() -> None:
+    """Registry copies of controller question tools must not reach the native bundle twice."""
+    agent = _agent({"builtin_tools": ["*"]})
+    step = StepDefinition(name="ingest", type="run", prompt="")
+    ctx = StepContext(
+        step_definition=step,
+        session=SimpleNamespace(session_id="collision-test", intaris_session_id="collision-test"),
+        conversation=None,
+        agent=agent,
+        policy=CHAT_POLICY,
+    )
+    loop = object.__new__(AgentLoop)
+    controller = loop._build_controller_tool_exposure(ctx)
+    registry_tools = workflow_tools()
+    inventory = _filter_model_inventory_tools(agent, registry_tools)
+    exposure = prepare_tool_exposure(
+        inventory_tools=inventory,
+        controller_tool_schemas=controller.schemas,
+        model_info=ModelInfo(model_id="claude-opus-5-5", max_tools=128),
+        contract=ToolExposureContract(
+            llm_api=LLMApiMode.CHAT_COMPLETIONS,
+            discovery_mode=ToolDiscoveryMode.CONTROLLER_SEARCH,
+            anthropic_schema_compatible=True,
+        ),
+        promoted_tool_ids={stable_tool_id(tool) for tool in registry_tools},
+        default_visible_tool_ids={stable_tool_id(tool) for tool in registry_tools},
+    )
+    alias_map = {**exposure.alias_map, **controller.alias_map}
+    stable_ids = {
+        name: f"builtin:{alias_map.get(name, name)}"
+        for schema in exposure.tools
+        if isinstance(name := schema.get("function", {}).get("name"), str)
+    }
+
+    bundle = compile_anthropic_tool_bundle(
+        exposure.tools,
+        alias_map=alias_map,
+        stable_id_map=stable_ids,
+        argument_alias_map=dict(exposure.argument_alias_map),
+    )
+
+    canonical = [binding.canonical_name for binding in bundle.bindings]
+    assert canonical.count("answer_question") == 1
+    assert canonical.count("forward_question") == 1

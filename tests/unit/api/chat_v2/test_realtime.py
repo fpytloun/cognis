@@ -11,6 +11,8 @@ from cognis.api.chat_v2.realtime import (
     runtime_overlay_from_items,
     scope_accepts_runtime,
     tool_call_runtime_item,
+    tool_output_runtime_item,
+    tool_result_runtime_item,
 )
 from cognis.api.chat_v2.schemas import TimelineScope
 
@@ -73,6 +75,62 @@ def test_runtime_snapshots_become_strict_volatile_items() -> None:
     assert items[0].status == "running"
     assert items[1].status == "complete"
     assert items[0].source_refs[0].store == "runtime"
+
+
+def test_runtime_call_result_and_output_keep_program_linkage() -> None:
+    call = tool_call_runtime_item(
+        session_id="sess-program",
+        call_id="call-child",
+        tool_name="read",
+        arguments={"file_path": "report.csv"},
+        turn_id="turn-program",
+        assistant_phase_index=1,
+        turn_cycle_index=1,
+        timestamp="2026-01-01T00:00:00Z",
+        parent_call_id="call-program",
+        program_id="program-1",
+        kernel_generation=3,
+    )
+    result = tool_result_runtime_item(
+        session_id="sess-program",
+        call_id="call-child",
+        tool_name="read",
+        result="report contents",
+        is_error=False,
+        duration_ms=12,
+        evaluation=None,
+        attachments=None,
+        file_diffs=None,
+        turn_id="turn-program",
+        assistant_phase_index=1,
+        turn_cycle_index=1,
+        timestamp="2026-01-01T00:00:01Z",
+        parent_call_id="call-program",
+        program_id="program-1",
+        kernel_generation=3,
+    )
+    output = tool_output_runtime_item(
+        {
+            "call_id": "call-child",
+            "tool_name": "read",
+            "session_id": "sess-program",
+            "status": "running",
+            "result": "streamed output",
+            "parent_call_id": "call-program",
+            "program_id": "program-1",
+            "kernel_generation": 3,
+        },
+        local=0,
+    )
+
+    assert call.id == result.id == output.id == "tool:call-child"
+    assert call.sort_key == result.sort_key
+    for item in (call, result, output):
+        assert item is not None
+        assert item.parent_call_id == "call-program"
+        assert item.program_id == "program-1"
+        assert item.kernel_generation == 3
+    assert output.result_preview == "streamed output"
 
 
 def test_runtime_fanout_is_limited_to_the_subscribed_scope() -> None:

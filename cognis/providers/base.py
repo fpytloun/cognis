@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable, Coroutine
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
 from typing import Any, Protocol
 
 from cognis.core.workflow_step_scope import (
@@ -147,7 +147,22 @@ class GuardrailsProvider(Protocol):
         parent_session_id: str | None = None,
         policy: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = True,
     ) -> None: ...
+
+    async def update_session_policy(
+        self,
+        session_id: str,
+        *,
+        agent_id: str,
+        user_id: str | None = None,
+        details: dict[str, Any] | None = None,
+        policy: dict[str, Any] | None = None,
+        agent_owner_email: str | None = None,
+        analytics_enabled: bool | None = None,
+        guardrails_enabled: bool | None = None,
+    ) -> dict[str, Any]: ...
 
     async def evaluate(
         self,
@@ -348,6 +363,12 @@ class LLMProvider(Protocol):
         speed: float = 1.0,
         low_latency: bool = False,
     ) -> TextToSpeechResult: ...
+    def synthesize_stream(
+        self, text: str, *, voice: str, model: str | None = None, **kwargs: Any
+    ) -> AsyncGenerator[dict[str, Any], None]: ...
+    def transcribe_stream(
+        self, audio: AsyncIterator[bytes], *, model: str | None = None, **kwargs: Any
+    ) -> AsyncGenerator[dict[str, Any], None]: ...
     def count_tokens(self, text: str, model: str) -> int: ...
     def count_messages_tokens(self, messages: list[dict[str, Any]], model: str) -> int: ...
     async def list_models(self, acting_user_email: str | None = None) -> list[dict[str, Any]]: ...

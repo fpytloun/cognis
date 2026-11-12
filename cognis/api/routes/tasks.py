@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Query, Request
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
@@ -79,14 +80,20 @@ from cognis.core.project_access import can_read_task
 from cognis.core.question_sets import plain_text_reply_for_questions
 from cognis.core.questions import user_visible_workflow_state
 from cognis.core.session import _to_conversation_model, _to_session_model
+from cognis.core.task_output_presentation import (
+    TaskOutputState,
+    load_task_outputs,
+    resolve_task_outputs,
+)
 from cognis.core.workflow_management import (
     delete_materialized_workflow,
     get_attached_skill_workflow_source,
     materialize_skill_workflow,
 )
 from cognis.models.agent import AgentDefinition
+from cognis.models.deliverable import TaskDeliverableFreshness
 from cognis.models.session import ConversationContext, ConversationLineage, SessionEvent
-from cognis.models.task import TaskDelivery, TaskModel
+from cognis.models.task import TaskDelivery, TaskModel, validate_task_delivery
 from cognis.models.workflow import CompletionDeliveryPolicy, SessionPolicy, WorkflowState
 from cognis.runtime_context import RuntimeAccessContext, scoped_runtime_context
 from cognis.store.deliverable_storage import (
@@ -151,6 +158,7 @@ _DELIVERY_MODES: frozenset[str] = frozenset(
         "latest_active_for_agent",
         "preferred_channel",
         "silent",
+        "in_app_notifications",
     }
 )
 
@@ -509,8 +517,11 @@ def _effective_column_statuses(
     return tuple(item for item in column_statuses if item in requested_statuses)
 
 
-def _step_run_projection_response(row: Any) -> StepRunResponse:
+def _step_run_projection_response(
+    row: Any, freshness: dict[str, TaskDeliverableFreshness] | None = None
+) -> StepRunResponse:
     return StepRunResponse(
+        deliverable_freshness=freshness or {},
         step_run_id=row.step_run_id,
         task_id=row.task_id,
         step_name=row.step_name,
@@ -558,6 +569,8 @@ def _done_group_response(row: Any) -> TaskBoardDoneGroupResponse:
         title=(task.title or task.task_id).strip() or task.task_id,
         latest=_task_board_item_response(task),
         task_count=int(row.task_count or 0),
+        failed_count=int(row.failed_count or 0),
+        cancelled_count=int(row.cancelled_count or 0),
     )
 
 
@@ -633,6 +646,7 @@ def _paginate_step_projection_rows(
     *,
     cursor: str | None,
     limit: int,
+    output_state: TaskOutputState | None = None,
 ) -> CursorPage[StepRunResponse]:
     offset = _decode_offset_cursor(cursor)
     page_rows = rows[offset : offset + limit + 1]
@@ -640,7 +654,12 @@ def _paginate_step_projection_rows(
     items = page_rows[:limit]
     next_cursor = _encode_offset_cursor(offset + limit) if has_more else None
     return CursorPage(
-        items=[_step_run_projection_response(row) for row in items],
+        items=[
+            _step_run_projection_response(
+                row, output_state.step_freshness.get(row.step_run_id) if output_state else None
+            )
+            for row in items
+        ],
         cursor=next_cursor,
         has_more=has_more,
     )
@@ -741,6 +760,13 @@ async def _fetch_done_group_page(
         q=q,
     )
     title_key = func.lower(func.trim(Task.title)).label("group_title_key")
+    group_partition = [
+        func.lower(func.trim(Task.title)),
+        Task.workflow_id,
+        Task.agent_id,
+        Task.source_type,
+        Task.source_ref,
+    ]
     group_columns = [
         title_key,
         Task.workflow_id.label("group_workflow_id"),
@@ -763,6 +789,12 @@ async def _fetch_done_group_page(
                 ]
             )
             .label("task_count"),
+            func.sum(case((Task.status == "failed", 1), else_=0))
+            .over(partition_by=group_partition)
+            .label("failed_count"),
+            func.sum(case((Task.status == "cancelled", 1), else_=0))
+            .over(partition_by=group_partition)
+            .label("cancelled_count"),
             func.row_number()
             .over(
                 partition_by=[
@@ -784,6 +816,8 @@ async def _fetch_done_group_page(
             Task,
             ranked.c.group_title_key,
             ranked.c.task_count,
+            ranked.c.failed_count,
+            ranked.c.cancelled_count,
         )
         .join(ranked, ranked.c.task_id == Task.task_id)
         .where(ranked.c.rank == 1)
@@ -953,11 +987,17 @@ async def _resolve_completion_delivery(
     project_id: str | None,
     completion_mode_family: str | None,
     allow_silent_completion: bool | None,
+    on_finish_instructions: str | None = None,
 ) -> CompletionDeliveryPolicy:
-    if completion_mode_family is not None or allow_silent_completion is not None:
+    if (
+        completion_mode_family is not None
+        or allow_silent_completion is not None
+        or on_finish_instructions is not None
+    ):
         return CompletionDeliveryPolicy(
-            completion_mode_family=completion_mode_family or "default",
+            completion_mode_family=completion_mode_family or "auto",
             allow_silent_completion=bool(allow_silent_completion),
+            on_finish_instructions=on_finish_instructions,
         )
 
     if workflow_id is not None:
@@ -1343,14 +1383,24 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
         created_workflow_id = created_workflow.workflow_id
     queue = request.app.state.task_queue
     delivery = TaskDelivery(mode=delivery_mode, target=payload.delivery_target)
-    completion_delivery = await _resolve_completion_delivery(
-        request,
-        workflow_id=resolved_workflow_id,
-        owner_email=user.email,
-        project_id=project_id,
-        completion_mode_family=payload.completion_mode_family,
-        allow_silent_completion=payload.allow_silent_completion,
-    )
+    try:
+        completion_delivery = await _resolve_completion_delivery(
+            request,
+            workflow_id=resolved_workflow_id,
+            owner_email=user.email,
+            project_id=project_id,
+            completion_mode_family=payload.completion_mode_family,
+            allow_silent_completion=payload.allow_silent_completion,
+            on_finish_instructions=payload.on_finish_instructions,
+        )
+        validate_task_delivery(delivery, completion_delivery)
+    except ValueError as exc:
+        if created_workflow_id is not None:
+            await delete_materialized_workflow(
+                session_factory=request.app.state.session_factory,
+                workflow_id=created_workflow_id,
+            )
+        raise api_exception(400, "validation_error", str(exc)) from exc
     try:
         create_status = payload.status
         if payload.draft is True or payload.start_immediately is False:
@@ -1416,6 +1466,9 @@ async def task_create(request: Request, payload: TaskCreateRequest) -> TaskRespo
 @router.get("/api/v1/tasks/{task_id}", response_model=TaskDetailResponse)
 async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
     task = await _require_task(request, task_id, allow_project_reader=True)
+    final_row = None
+    final_lineage = None
+    deliverable_rows: list[DeliverableRow] = []
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task(session, task_id)
@@ -1439,15 +1492,66 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
                 .scalars()
                 .all()
             )
+            output_state = resolve_task_outputs(task, step_rows, deliverable_rows)
             for deliverable_row in deliverable_rows:
+                assert deliverable_row.step_run_id is not None
                 deliverables_by_step_run.setdefault(deliverable_row.step_run_id, []).append(
-                    deliverable_to_response(deliverable_row, include_rich_payload=False)
+                    deliverable_to_response(
+                        deliverable_row,
+                        include_rich_payload=False,
+                        task_freshness=output_state.freshness[deliverable_row.deliverable_id],
+                    )
                 )
+            # Only the task owner's canonical result is accelerated here.
+            # Project readers retain the published-document access boundary.
+            if require_current_user(request).email == task.created_by:
+                final_id = (task.result_data or {}).get("final_deliverable_id")
+                current_runs = {
+                    row.step_run_id
+                    for row in step_rows
+                    if row.attempt_number == task.attempt_number
+                }
+                final_row = next(
+                    (
+                        row
+                        for row in deliverable_rows
+                        if row.deliverable_id == final_id
+                        and row.step_run_id in current_runs
+                        and row.attempt_number == task.attempt_number
+                        and row.status in {"approved", "delivered"}
+                    ),
+                    None,
+                )
+                if final_row is not None:
+                    final_lineage = await get_deliverable_lineage_summary(session, final_row)
         progress = await build_task_progress_projection(
             session,
             owner_email=task.created_by,
             step_runs=step_rows,
         )
+    final_deliverable = None
+    if (
+        final_row is not None
+        and final_row.content_size is not None
+        and sum(
+            size or 0
+            for size in (final_row.content_size, final_row.rich_size, final_row.outputs_size)
+        )
+        <= 2 * 1024 * 1024
+    ):
+        try:
+            async with asyncio.timeout(1.0):
+                await hydrate_deliverable_payload(final_row, request.app.state.artifact_store)
+                rendered = deliverable_to_response(
+                    final_row,
+                    lineage=final_lineage,
+                    task_freshness=output_state.freshness[final_row.deliverable_id],
+                )
+                if len(rendered.model_dump_json().encode("utf-8")) <= 2 * 1024 * 1024:
+                    final_deliverable = rendered
+        except (TimeoutError, OSError, ValueError, BotoCoreError, ClientError):
+            # Keep task metadata available; the detail loader reports payload errors.
+            pass
     pending_pause = _task_pending_pause(request, task)
     workflow_run = await _build_workflow_run_response(request, task, pending_pause)
     workflow_projection = await build_task_workflow_projection(
@@ -1460,6 +1564,7 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         step_run_to_response(
             row,
             deliverables=deliverables_by_step_run.get(row.step_run_id, []),
+            deliverable_freshness=output_state.step_freshness.get(row.step_run_id),
         )
         for row in step_rows
     ]
@@ -1471,6 +1576,7 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
     for step_run in step_run_responses:
         step_run.accumulated_duration_seconds = accumulated.get(step_run.step_name)
         step_run.latest_attempt_duration_seconds = step_run.duration_seconds
+    output_state = resolve_task_outputs(task, step_rows, deliverable_rows)
     return task_detail_to_response(
         task,
         dependencies=[dependency_to_response(row) for row in dep_rows],
@@ -1479,6 +1585,9 @@ async def task_detail(request: Request, task_id: str) -> TaskDetailResponse:
         workflow_run=workflow_run,
         workflow_projection=workflow_projection,
         progress=progress,
+        final_deliverable=final_deliverable,
+        output_presentation=output_state.output,
+        deliverable_freshness=output_state.freshness,
     )
 
 
@@ -1490,6 +1599,7 @@ async def task_summary(request: Request, task_id: str) -> TaskDetailResponse:
     async with request.app.state.session_factory() as session:
         dep_rows = await get_task_dependencies(session, task_id)
         step_rows = await list_step_runs_for_task_projection(session, task_id)
+        output_state = await load_task_outputs(session, task)
         progress = await build_task_progress_projection(
             session,
             owner_email=task.created_by,
@@ -1507,6 +1617,8 @@ async def task_summary(request: Request, task_id: str) -> TaskDetailResponse:
         task,
         dependencies=[dependency_to_response(row) for row in dep_rows],
         step_runs=[],
+        output_presentation=output_state.output,
+        deliverable_freshness=output_state.freshness,
         pending_pause=pending_pause,
         workflow_run=workflow_run,
         workflow_projection=workflow_projection,
@@ -1611,6 +1723,30 @@ async def task_chat(request: Request, task_id: str) -> TaskChatResponse:
     "/api/v1/tasks/{task_id}/control-chat",
     response_model=TaskControlChatResponse,
 )
+async def task_control_chat_lookup(request: Request, task_id: str) -> TaskControlChatResponse:
+    """Return the task's existing control chat; reading never creates one."""
+
+    task = await _require_task(request, task_id)
+    async with request.app.state.session_factory() as session:
+        row = await get_task(session, task_id)
+        conversation_id = getattr(row, "control_conversation_id", None) if row else None
+        conversation_row = (
+            await get_conversation(session, conversation_id) if conversation_id else None
+        )
+        session_id = conversation_row.active_session_id if conversation_row else None
+    if conversation_row is None or not session_id:
+        raise api_exception(404, "control_chat_not_created", "This task has no control chat yet")
+    return TaskControlChatResponse(
+        task_id=task_id,
+        conversation_id=conversation_row.conversation_id,
+        session_id=session_id,
+        agent_id=task.agent_id,
+        agent_profile_id=task.agent_profile_id,
+        task_status=str(task.status),
+        attempt_number=task.attempt_number,
+    )
+
+
 @router.post(
     "/api/v1/tasks/{task_id}/control-chat",
     response_model=TaskControlChatResponse,
@@ -2005,10 +2141,21 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
         and existing_row.source_ref is not None
     ):
         await _validate_conversation_access(request, existing_row.source_ref)
-    CompletionDeliveryPolicy(
-        completion_mode_family=effective_completion_mode_family,
-        allow_silent_completion=effective_allow_silent_completion,
-    )
+    try:
+        validate_task_delivery(
+            TaskDelivery(mode=effective_delivery_mode, target=effective_delivery_target),
+            CompletionDeliveryPolicy(
+                completion_mode_family=effective_completion_mode_family,
+                allow_silent_completion=effective_allow_silent_completion,
+                on_finish_instructions=(
+                    payload.on_finish_instructions
+                    if "on_finish_instructions" in payload.model_fields_set
+                    else getattr(existing_row, "on_finish_instructions", None)
+                ),
+            ),
+        )
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     try:
         async with request.app.state.session_factory() as session:
             row = await get_task_for_update(session, task_id)
@@ -2038,7 +2185,13 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
             # caller can clear `workflow_id` / `project_id` / `agent_profile_id`.  Pydantic's
             # ``exclude_none`` strips them out, so re-introduce them when the
             # client explicitly sent ``null``.
-            for nullable_field in ("workflow_id", "project_id", "agent_profile_id"):
+            for nullable_field in (
+                "workflow_id",
+                "project_id",
+                "agent_profile_id",
+                "delivery_target",
+                "on_finish_instructions",
+            ):
                 if (
                     nullable_field in payload.model_fields_set
                     and getattr(payload, nullable_field, None) is None
@@ -2056,6 +2209,8 @@ async def task_update(request: Request, task_id: str, payload: TaskUpdateRequest
                 row.completion_mode_family = updates.pop("completion_mode_family")
             if "allow_silent_completion" in updates:
                 row.allow_silent_completion = updates.pop("allow_silent_completion")
+            if "on_finish_instructions" in updates:
+                row.on_finish_instructions = updates.pop("on_finish_instructions")
             if "interaction_mode_override" in updates:
                 row.interaction_mode_override = updates.pop("interaction_mode_override")
             elif (
@@ -2356,13 +2511,16 @@ async def task_step_summaries(
 ) -> CursorPage[StepRunResponse]:
     """Return lightweight step-run projections for the task detail page."""
 
-    await _require_task(request, task_id, allow_project_reader=True)
+    task = await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
         rows = await _list_step_run_projection_rows(session, task_id)
+        output_state = await load_task_outputs(session, task)
     if latest_only:
         rows = _latest_step_projection_rows(rows)
     rows = sorted(rows, key=lambda row: (row.step_name, _step_sort_key(row)))
-    return _paginate_step_projection_rows(rows, cursor=cursor, limit=limit)
+    return _paginate_step_projection_rows(
+        rows, cursor=cursor, limit=limit, output_state=output_state
+    )
 
 
 @router.get(
@@ -2378,27 +2536,41 @@ async def task_step_history_summary(
 ) -> CursorPage[StepRunResponse]:
     """Return lightweight projections for one step's attempt history."""
 
-    await _require_task(request, task_id)
+    task = await _require_task(request, task_id)
     async with request.app.state.session_factory() as session:
         rows = await _list_step_run_projection_rows(session, task_id, step_name=step_name)
+        output_state = await load_task_outputs(session, task)
     rows = sorted(rows, key=_step_sort_key)
-    return _paginate_step_projection_rows(rows, cursor=cursor, limit=limit)
+    return _paginate_step_projection_rows(
+        rows, cursor=cursor, limit=limit, output_state=output_state
+    )
 
 
 @router.get("/api/v1/tasks/{task_id}/steps", response_model=list[StepRunResponse])
 async def task_steps(request: Request, task_id: str) -> list[StepRunResponse]:
     await _require_task(request, task_id, allow_project_reader=True)
     async with request.app.state.session_factory() as session:
+        task_row = await get_task(session, task_id)
+        assert task_row is not None
+        output_state = await load_task_outputs(session, task_row)
         rows = await list_step_runs_for_task(session, task_id)
         deliverables_by_step_run = {
             row.step_run_id: [
-                deliverable_to_response(item, include_rich_payload=False)
+                deliverable_to_response(
+                    item,
+                    include_rich_payload=False,
+                    task_freshness=output_state.freshness.get(item.deliverable_id),
+                )
                 for item in await list_deliverables_for_step_run(session, row.step_run_id)
             ]
             for row in rows
         }
     return [
-        step_run_to_response(row, deliverables=deliverables_by_step_run.get(row.step_run_id, []))
+        step_run_to_response(
+            row,
+            deliverables=deliverables_by_step_run.get(row.step_run_id, []),
+            deliverable_freshness=output_state.step_freshness.get(row.step_run_id),
+        )
         for row in rows
     ]
 
@@ -2411,16 +2583,27 @@ async def task_step_history(
 ) -> list[StepRunResponse]:
     await _require_task(request, task_id)
     async with request.app.state.session_factory() as session:
+        task_row = await get_task(session, task_id)
+        assert task_row is not None
+        output_state = await load_task_outputs(session, task_row)
         rows = await list_step_run_history(session, task_id, step_name)
         deliverables_by_step_run = {
             row.step_run_id: [
-                deliverable_to_response(item, include_rich_payload=False)
+                deliverable_to_response(
+                    item,
+                    include_rich_payload=False,
+                    task_freshness=output_state.freshness.get(item.deliverable_id),
+                )
                 for item in await list_deliverables_for_step_run(session, row.step_run_id)
             ]
             for row in rows
         }
     return [
-        step_run_to_response(row, deliverables=deliverables_by_step_run.get(row.step_run_id, []))
+        step_run_to_response(
+            row,
+            deliverables=deliverables_by_step_run.get(row.step_run_id, []),
+            deliverable_freshness=output_state.step_freshness.get(row.step_run_id),
+        )
         for row in rows
     ]
 
@@ -2433,13 +2616,22 @@ async def step_run_detail(request: Request, step_run_id: str) -> StepRunResponse
         if row is None:
             raise api_exception(404, "not_found", "Step run not found")
         task_row = await get_task(session, row.task_id)
+        if task_row is None or task_row.created_by != user.email:
+            raise api_exception(404, "not_found", "Step run not found")
+        output_state = await load_task_outputs(session, task_row)
         deliverables = [
-            deliverable_to_response(item, include_rich_payload=False)
+            deliverable_to_response(
+                item,
+                include_rich_payload=False,
+                task_freshness=output_state.freshness.get(item.deliverable_id),
+            )
             for item in await list_deliverables_for_step_run(session, row.step_run_id)
         ]
-    if task_row is None or task_row.created_by != user.email:
-        raise api_exception(404, "not_found", "Step run not found")
-    return step_run_to_response(row, deliverables=deliverables)
+    return step_run_to_response(
+        row,
+        deliverables=deliverables,
+        deliverable_freshness=output_state.step_freshness.get(row.step_run_id),
+    )
 
 
 @router.get(
@@ -2456,7 +2648,15 @@ async def step_run_deliverables(request: Request, step_run_id: str) -> list[Deli
         if task_row is None or task_row.created_by != user.email:
             raise api_exception(404, "not_found", "Step run not found")
         rows = await list_deliverables_for_step_run(session, step_run_id)
-    return [deliverable_to_response(row, include_rich_payload=False) for row in rows]
+        output_state = await load_task_outputs(session, task_row)
+    return [
+        deliverable_to_response(
+            row,
+            include_rich_payload=False,
+            task_freshness=output_state.freshness.get(row.deliverable_id),
+        )
+        for row in rows
+    ]
 
 
 @router.get(
@@ -2507,7 +2707,10 @@ async def step_run_deliverable_detail(
                 "The full deliverable payload is unavailable or corrupt",
             )
         lineage = await get_deliverable_lineage_summary(session, row)
-    return deliverable_to_response(row, lineage=lineage)
+        output_state = await load_task_outputs(session, task_row)
+    return deliverable_to_response(
+        row, lineage=lineage, task_freshness=output_state.freshness.get(row.deliverable_id)
+    )
 
 
 @router.get("/api/v1/tasks/{task_id}/workflow-run", response_model=WorkflowRunResponse)
@@ -2936,6 +3139,7 @@ def _row_to_task(row: Any) -> TaskModel:
         completion_delivery=CompletionDeliveryPolicy(
             completion_mode_family=getattr(row, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+            on_finish_instructions=getattr(row, "on_finish_instructions", None),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
         escalation_timeout_seconds=getattr(row, "escalation_timeout_seconds", None),

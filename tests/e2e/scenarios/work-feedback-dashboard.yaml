@@ -1,0 +1,115 @@
+id: work-feedback-dashboard
+description: |
+  Produces a synthetic dashboard through real deliverable authoring, then
+  refreshes the same lineage after a reviewed-feedback turn. This scenario is
+  acceptance content, not a live daily brief or infrastructure report.
+trigger: "scenario:work-feedback-dashboard"
+turns:
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_validate_feedback_dashboard
+        name: validate_tool_call
+        arguments:
+          tool: "builtin:write_deliverable"
+          arguments: &dashboard_first
+            action: rich
+            payload:
+              title: "Daily actions dashboard"
+              blocks:
+                - type: markdown
+                  title: "Review fixture"
+                  content: "Synthetic content for Work Feedback acceptance. No live personal or infrastructure data."
+                - type: markdown
+                  title: "Weather"
+                  content: |
+                    **DemoTown · 11 °C · Partly cloudy**
+
+                    A compact daily forecast. Add an hourly forecast through a
+                    reviewed comment on this section.
+                - type: markdown
+                  title: "Today"
+                  content: |
+                    | Time | Focus |
+                    |---|---|
+                    | 09:00 | Review the dashboard layout |
+                    | 11:30 | Inspect the release checklist |
+                    | 15:00 | Triage staged feedback |
+                - type: markdown
+                  title: "Needs a decision"
+                  content: |
+                    The staging-cluster upgrade is waiting for human review.
+                    Feedback can request a plan, ask a question, or start a
+                    follow-up. A comment is not an approval to change production.
+                - type: markdown
+                  title: "Follow-up work"
+                  content: |
+                    No follow-up has been started. Review selected comments
+                    before sending them to the producer or a new conversation.
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_write_feedback_dashboard
+        name: write_deliverable
+        arguments: *dashboard_first
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["The ", "synthetic ", "dashboard ", "is ", "ready ", "for ", "review."]
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: tool_call
+        call_id: call_validate_feedback_dashboard_revision
+        name: validate_tool_call
+        arguments:
+          tool: "builtin:write_deliverable"
+          arguments: &dashboard_revision
+            action: rich
+            supersedes: "{{tool_result:call_write_feedback_dashboard:deliverable_id}}"
+            payload:
+              title: "Daily actions dashboard"
+              blocks:
+                - type: markdown
+                  title: "Review fixture"
+                  content: "Synthetic content for Work Feedback acceptance. Refreshed after a reviewed-feedback turn."
+                - type: markdown
+                  title: "Weather"
+                  content: |
+                    **DemoTown · 11 °C · Partly cloudy**
+
+                    | Hour | Temperature | Conditions |
+                    |---|---|---|
+                    | 09:00 | 10 °C | Cloudy |
+                    | 12:00 | 13 °C | Partly cloudy |
+                    | 15:00 | 12 °C | Clear |
+                - type: markdown
+                  title: "Today"
+                  content: |
+                    | Time | Focus |
+                    |---|---|
+                    | 09:00 | Review the dashboard layout |
+                    | 11:30 | Inspect the release checklist |
+                    | 15:00 | Triage staged feedback |
+                - type: markdown
+                  title: "Needs a decision"
+                  content: |
+                    Prepare and review a staging-only upgrade plan before
+                    any execution. Production remains unchanged.
+                - type: markdown
+                  title: "Follow-up work"
+                  content: |
+                    The reviewed request has refreshed this dashboard.
+                    Inspect feedback history for the exact submitted entries,
+                    destination, work receipt, and resulting revision.
+        delay_ms: 20
+      - type: tool_call
+        call_id: call_write_feedback_dashboard_revision
+        name: write_deliverable
+        arguments: *dashboard_revision
+        delay_ms: 20
+  - role: assistant
+    steps:
+      - type: text
+        chunks: ["I ", "updated ", "the ", "dashboard ", "with ", "the ", "reviewed ", "request."]
+        delay_ms: 20

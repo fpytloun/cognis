@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+import asyncio
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+
 import pytest
 
 from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
+from cognis.core.task_execution import TaskExecutionFence, TaskExecutionStore
+from cognis.providers.llm.usage_capture import UsageCapture
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Agent, Base, User
 from cognis.store.queries import (
@@ -11,6 +18,63 @@ from cognis.store.queries import (
     create_step_run,
     create_task,
 )
+
+
+@pytest.fixture
+def usage_events():
+    """Task-local accepted observation collection; never used in production."""
+    return []
+
+
+@pytest.fixture
+def usage_capture(usage_events):
+    """Inject a synchronous recording observer into provider tests."""
+
+    class Sink:
+        def try_emit(self, observation):
+            usage_events.append(observation)
+            return True
+
+    return UsageCapture(
+        sink=Sink(),
+        controller_owner_id="controller-unit",
+        coverage_epoch_id="coverage-unit",
+    )
+
+
+@pytest.fixture
+async def claimed_task_execution(
+    task_continuation_db: Any,
+) -> AsyncIterator[tuple[Any, TaskExecutionFence]]:
+    """Provide canonical metadata and a real lease for task dispatch."""
+    factory = task_continuation_db
+    async with factory() as session:
+        session.add(User(email="user@example.com", name="User", role="user"))
+        await session.flush()
+        session.add(Agent(agent_id="agent-1", owner_email="user@example.com", name="Agent"))
+        await session.flush()
+        await create_task(
+            session,
+            task_id="task-scheduled",
+            created_by="user@example.com",
+            agent_id="agent-1",
+            title="Scheduled task",
+            status="ready",
+        )
+        await session.commit()
+    store = TaskExecutionStore(
+        factory,
+        owner_id="controller-dispatch",
+        max_active_global=1,
+        max_active_per_agent=1,
+    )
+    claim = await store.claim_ready()
+    assert claim is not None
+    fence = TaskExecutionFence(store, claim, asyncio.Event())
+    try:
+        yield factory, fence
+    finally:
+        await fence.close()
 
 
 @pytest.fixture
@@ -170,3 +234,28 @@ async def task_continuation_db(tmp_path: object):
         yield factory
     finally:
         await engine.dispose()
+
+
+@pytest.fixture
+def standalone_ui_build(tmp_path, monkeypatch):
+    """Provide a minimal standalone UI build so tests do not depend on ui/standalone-build."""
+    build_dir = tmp_path / "standalone-build"
+    (build_dir / ".vite").mkdir(parents=True)
+    (build_dir / "assets").mkdir()
+    # Vite emits content-hashed names; the asset resolver only serves those.
+    (build_dir / "assets" / "standalone-Test0001.js").write_text("export {};", encoding="utf-8")
+    (build_dir / "assets" / "standalone-Test0001.css").write_text(":root{}", encoding="utf-8")
+    (build_dir / ".vite" / "manifest.json").write_text(
+        json.dumps(
+            {
+                "src/standalone.ts": {
+                    "file": "assets/standalone-Test0001.js",
+                    "isEntry": True,
+                    "css": ["assets/standalone-Test0001.css"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("cognis.ui_assets.resolve_standalone_build_dir", lambda: build_dir)
+    return build_dir

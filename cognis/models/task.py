@@ -51,8 +51,14 @@ class TaskDelivery(BaseModel):
 
     mode: str = "preferred_channel"
     # same_conversation | specific_conversation | latest_active_for_agent
-    # | preferred_channel | silent
+    # | preferred_channel | silent | in_app_notifications
     target: str | None = None
+
+
+def validate_task_delivery(delivery: TaskDelivery, policy: CompletionDeliveryPolicy) -> None:
+    """Validate destination and execution semantics before persistence."""
+    if delivery.mode == "in_app_notifications" and policy.completion_mode_family != "direct":
+        raise ValueError("in_app_notifications requires direct completion delivery")
 
 
 class TaskModel(BaseModel):

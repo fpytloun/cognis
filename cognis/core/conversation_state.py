@@ -23,6 +23,7 @@ from cognis.models.conversation_state import (
     ConversationTaskState,
     ConversationTodoItem,
 )
+from cognis.models.workflow import effective_gate_options
 from cognis.store.models import (
     Conversation,
     ConversationTodo,
@@ -168,6 +169,8 @@ def _pending_summary(row: NotificationRow) -> ConversationPendingSummary:
     payload = row.payload if isinstance(row.payload, dict) else {}
     metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
     options = payload.get("options") if isinstance(payload.get("options"), list) else []
+    if row.notification_type == "gate" and row.task_id and isinstance(payload.get("options"), list):
+        options = effective_gate_options(payload.get("options"))
     questions = payload.get("questions") if isinstance(payload.get("questions"), list) else []
     context = payload.get("context") if isinstance(payload.get("context"), dict) else None
     return ConversationPendingSummary(

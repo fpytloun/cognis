@@ -102,9 +102,21 @@ async def jobs(request: Request, conversation_id: str, before: str | None = None
 
 
 @router.get("/jobs/{job_id}")
-async def get(request: Request, job_id: str, wait_seconds: int = 0) -> Any:
+async def get(
+    request: Request,
+    job_id: str,
+    wait_seconds: int = 0,
+    conversation_id: str | None = None,
+    inspect_provider_error: bool = False,
+) -> dict[str, Any]:
     return await invoke(
-        request.app.state.video_service.get(actor(request), job_id, wait_seconds=wait_seconds)
+        request.app.state.video_service.get(
+            actor(request),
+            job_id,
+            wait_seconds=wait_seconds,
+            conversation_id=conversation_id,
+            inspect_provider_error=inspect_provider_error,
+        )
     )
 
 

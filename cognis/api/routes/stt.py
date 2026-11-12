@@ -24,6 +24,8 @@ from cognis.api.common import (
 )
 from cognis.api.models import SttTranscribeResponse
 from cognis.audio.preprocessing import normalize_audio_mime_type
+from cognis.core.artifact_revisions import ContentActor
+from cognis.core.speech import MAX_AUDIO_BYTES, SpeechService
 from cognis.logging import get_logger
 from cognis.store.queries import get_artifact_record
 
@@ -32,7 +34,7 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/v1/stt", tags=["stt"])
 
 
-_MAX_AUDIO_BYTES = 25 * 1024 * 1024  # 25 MB matches OpenAI's whisper limit
+_MAX_AUDIO_BYTES = MAX_AUDIO_BYTES
 
 
 def _is_audio_mime(mime_type: str | None) -> bool:
@@ -74,7 +76,7 @@ async def transcribe_stt(
     filename: str
 
     if file is not None:
-        audio_bytes = await file.read()
+        audio_bytes = await file.read(_MAX_AUDIO_BYTES + 1)
         if len(audio_bytes) == 0:
             raise api_exception(400, "validation_error", "Empty audio file")
         if len(audio_bytes) > _MAX_AUDIO_BYTES:
@@ -96,12 +98,10 @@ async def transcribe_stt(
             row = await get_artifact_record(session, artifact_id)
         if row is None or row.status == "deleted":
             raise api_exception(404, "not_found", "Artifact not found")
-        if (
-            row.owner_email
-            and row.owner_email != user.email
-            and getattr(user, "role", "") != "admin"
-        ):
+        if row.owner_email != user.email:
             raise api_exception(404, "not_found", "Artifact not found")
+        if row.size_bytes > _MAX_AUDIO_BYTES:
+            raise api_exception(413, "payload_too_large", "Audio exceeds 25MB transcription limit")
         if not _is_audio_mime(row.mime_type):
             raise api_exception(400, "validation_error", "Artifact is not an audio file")
         audio_bytes, content_type = await artifact_store.async_load(
@@ -112,15 +112,19 @@ async def transcribe_stt(
     else:
         raise api_exception(400, "validation_error", "Provide either 'file' or 'artifact_id'")
 
-    llm = request.app.state.providers.llm
+    speech = SpeechService(
+        session_factory=request.app.state.session_factory,
+        artifacts=request.app.state.artifact_store,
+        llm=request.app.state.providers.llm,
+    )
     try:
-        result = await llm.transcribe(
+        result = await speech.transcribe_bytes(
+            ContentActor(user.email, None, None, None, human=True),
             audio_bytes,
             mime_type=mime_type,
             filename=filename,
             language=language,
             prompt=prompt,
-            acting_user_email=user.email,
         )
     except ValueError as exc:
         raise api_exception(400, "validation_error", str(exc)) from exc

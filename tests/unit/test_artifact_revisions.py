@@ -202,6 +202,29 @@ async def test_write_read_revise_and_history(env) -> None:
     assert second["artifact_id"] in ids and first["artifact_id"] not in ids
 
 
+async def test_project_member_cannot_change_other_owners_lineage_or_sharing(env) -> None:
+    factory, store = env
+    _, first = await _write(factory, store, filename="state.json", content="{}", conv="conv_shared")
+    before = await _artifact_count(factory)
+    with pytest.raises(ArtifactRevisionError) as denied:
+        await write_artifact_document(
+            session_factory=factory,
+            artifact_store=store,
+            actor=ContentActor(
+                user_email=WIFE, agent_id=None, conversation_id=None, session_id=None, human=True
+            ),
+            content=b'{"changed": true}',
+            filename="state.json",
+            mime_type="application/json",
+            kind="file",
+            purpose="artifact_write",
+            supersedes=first["artifact_id"],
+            agent_ids=["butler"],
+        )
+    assert denied.value.code == "supersedes_not_found"
+    assert await _artifact_count(factory) == before
+
+
 async def test_stale_update_conflicts_without_partial_state(env, tmp_path) -> None:
     factory, store = env
     _, first = await _write(factory, store, filename="c.json", content="{}")
@@ -241,24 +264,27 @@ async def test_stale_update_conflicts_without_partial_state(env, tmp_path) -> No
 
 
 async def test_concurrent_loser_learns_head(env, monkeypatch) -> None:
-    from cognis.core import artifact_revisions
-
     factory, store = env
     _, first = await _write(factory, store, filename="c.json", content="{}")
-    original = artifact_revisions.lock_artifact_revision_target
-    calls = {"n": 0}
+    original = store.async_save
+    winner = None
 
-    async def racing_lock(session, target_id):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            # Between the pre-check and the commit, another writer wins.
+    async def racing_save(*args, **kwargs):
+        nonlocal winner
+        result = await original(*args, **kwargs)
+        if winner is None:
+            # Storage is outside the metadata transaction.
+            winner = {}
             _, winner = await _write(
-                factory, store, filename="c.json", content='{"w": 1}', supersedes=target_id
+                factory,
+                store,
+                filename="c.json",
+                content='{"w": 1}',
+                supersedes=first["artifact_id"],
             )
-            racing_lock.winner = winner
-        return await original(session, target_id)
+        return result
 
-    monkeypatch.setattr(artifact_revisions, "lock_artifact_revision_target", racing_lock)
+    monkeypatch.setattr(store, "async_save", racing_save)
     with pytest.raises(ArtifactRevisionError) as caught:
         await write_artifact_document(
             session_factory=factory,
@@ -272,7 +298,7 @@ async def test_concurrent_loser_learns_head(env, monkeypatch) -> None:
             supersedes=first["artifact_id"],
         )
     assert caught.value.code == "supersedes_not_latest"
-    assert caught.value.latest_artifact_id == racing_lock.winner["artifact_id"]
+    assert caught.value.latest_artifact_id == winner["artifact_id"]
 
 
 async def test_unassigned_publisher_reuses_own_project_content_across_chats(env) -> None:
@@ -517,8 +543,7 @@ async def test_project_document_access_matrix(env) -> None:
         supersedes=doc["artifact_id"],
     )
     assert by_wife["project_id"] == "proj_home" and by_wife["revision"] == 2
-    # The member's revision is reachable only through the project: the same
-    # assigned agent working in another project can neither read nor revise it.
+    # Stable ownership retains the original owner's cross-chat read access.
     other_project_read = await _tool(
         factory,
         store,
@@ -528,7 +553,7 @@ async def test_project_document_access_matrix(env) -> None:
         agent="butler",
         conv="conv_work",
     )
-    assert other_project_read.is_error
+    assert not other_project_read.is_error
     denied, _ = await _write(
         factory,
         store,

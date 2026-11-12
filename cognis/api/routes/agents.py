@@ -32,6 +32,7 @@ from cognis.api.models import (
     AgentGrantUpdateRequest,
     AgentProjectAssignmentResponse,
     AgentResponse,
+    AgentSkillUsageResponse,
     AgentUpdateRequest,
     CursorPage,
 )
@@ -77,6 +78,7 @@ from cognis.store.queries import (
     update_agent,
     update_agent_grant,
 )
+from cognis.tools.skills import agent_skill_usage_report
 
 logger = get_logger(__name__)
 
@@ -272,6 +274,7 @@ async def agent_list(
     include_hidden: bool = Query(default=False),
     include_system: bool = Query(default=True),
     include_disabled: bool = Query(default=False),
+    include_contacts: bool = Query(default=False),
 ) -> CursorPage[AgentResponse]:
     user = require_current_user(request)
     agents = await request.app.state.agent_registry.list_all(
@@ -283,6 +286,19 @@ async def agent_list(
         include_project_shared=True,
     )
     items = [agent_to_response(agent) for agent in agents]
+    from cognis.api.app_contact_presentation import contact_agent_response
+    from cognis.core.app_contact_access import list_app_contact_agents
+
+    contacts = []
+    if include_contacts and agent_type in {None, "primary"}:
+        async with request.app.state.session_factory() as session:
+            contacts = await list_app_contact_agents(session, user.email)
+    visible_ids = {item.agent_id for item in items}
+    items.extend(
+        contact_agent_response(agent, conversation)
+        for agent, conversation in contacts
+        if agent.agent_id not in visible_ids
+    )
 
     page_items, next_cursor, has_more = paginate_items(
         items,
@@ -335,6 +351,13 @@ async def create_agent_route(request: Request, payload: AgentCreateRequest) -> A
         "status": payload.status,
     }
     definition = _validate_agent_definition_payload(dict(definition_payload))
+    if definition.agent_type == "primary" and definition.status == "active":
+        from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+        try:
+            require_explicit_executor(definition.execution)
+        except ExecutorConfigurationError as exc:
+            raise api_exception(400, "executor_configuration_invalid", str(exc)) from exc
 
     async with request.app.state.session_factory() as session:
         existing = await get_agent(session, agent_id)
@@ -457,6 +480,21 @@ async def agent_projects(request: Request, agent_id: str) -> list[AgentProjectAs
     return items
 
 
+@router.get("/{agent_id}/skill-usage", response_model=list[AgentSkillUsageResponse])
+async def agent_skill_usage(request: Request, agent_id: str) -> list[AgentSkillUsageResponse]:
+    """Skill load counters and advisory curation hints for the agent owner."""
+
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        row = await get_agent(session, agent_id)
+    if row is None:
+        raise api_exception(404, "not_found", "Agent not found")
+    await check_agent_access(request, row, required="edit")
+    async with request.app.state.session_factory() as session:
+        report = await agent_skill_usage_report(session, agent=row, owner_email=user.email)
+    return [AgentSkillUsageResponse.model_validate(item) for item in report]
+
+
 @router.put("/{agent_id}", response_model=AgentResponse)
 async def update_agent_route(
     request: Request,
@@ -489,6 +527,13 @@ async def update_agent_route(
         identity_changed = any(
             field in updates and getattr(row, field) != updates[field] for field in identity_fields
         )
+        if row.agent_type == "primary" and updates.get("status") == "active":
+            from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+            try:
+                require_explicit_executor(updates.get("execution", row.execution))
+            except ExecutorConfigurationError as exc:
+                raise api_exception(400, "executor_configuration_invalid", str(exc)) from exc
         if {
             "agent_profiles",
             "default_agent_profile_id",
@@ -776,6 +821,13 @@ async def activate_agent(request: Request, agent_id: str) -> AgentResponse:
         if row is None:
             raise api_exception(404, "not_found", "Agent not found")
         await check_agent_access(request, row, required="edit")
+        if row.agent_type == "primary":
+            from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+            try:
+                require_explicit_executor(row.execution)
+            except ExecutorConfigurationError as exc:
+                raise api_exception(400, "executor_configuration_invalid", str(exc)) from exc
         await set_agent_status(session, agent_id, "active")
         await session.commit()
         await session.refresh(row)
@@ -1159,6 +1211,13 @@ async def create_agent_share(
         if agent is None:
             raise api_exception(404, "not_found", "Agent not found")
         require_resource_owner(request, agent.owner_email)
+        if payload.executor_scope == "owner_executor":
+            from cognis.core.runtime import ExecutorConfigurationError, require_explicit_executor
+
+            try:
+                require_explicit_executor(agent.execution)
+            except ExecutorConfigurationError as exc:
+                raise api_exception(400, "executor_configuration_invalid", str(exc)) from exc
         if payload.grantee_email == agent.owner_email:
             raise api_exception(
                 400, "validation_error", "Agent owner cannot be granted their own agent"

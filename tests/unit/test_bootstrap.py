@@ -36,6 +36,12 @@ from cognis.store.queries import (
 from cognis.tools.skill_parser import compute_content_hash
 
 
+def _default_instructions(skill_id: str) -> str:
+    default = get_system_skill_default(skill_id)
+    assert default is not None
+    return str(default["instructions"])
+
+
 @pytest.mark.asyncio
 async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_path: Path) -> None:
     monkeypatch.setenv("COGNIS_DATA_DIR", str(tmp_path))  # type: ignore[attr-defined]
@@ -52,6 +58,7 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     async with session_factory() as session:
         settings = await list_settings(session)
         coding_skill = await get_skill(session, "cognis-coding")
+        claude_skill = await get_skill(session, "cognis-claude-code")
         frontend_skill = await get_skill(session, "cognis-frontend-engineering")
         task_skill = await get_skill(session, "cognis-task-manager")
         workflow_skill = await get_skill(session, "cognis-workflow-manager")
@@ -73,6 +80,13 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert pulse_version is not None
     assert coding_skill.auto_load is False
     assert coding_skill.is_system is True
+    assert claude_skill is not None
+    assert claude_skill.name == "Cognis Claude Code"
+    assert claude_skill.is_system is True
+    assert claude_skill.auto_load is False
+    assert claude_skill.current_version_id is not None
+    assert claude_skill.tools == []
+    assert claude_skill.linked_tool_ids == []
     assert frontend_skill.is_system is True
     assert frontend_skill.name == "Cognis Frontend Engineering"
     assert frontend_skill.current_version_id is not None
@@ -85,8 +99,8 @@ async def test_bootstrap_creates_keys_db_and_settings(monkeypatch: object, tmp_p
     assert pulse_version.steps == []
     assert pulse_version.prompt_templates == {}
     assert "describe_tool" in pulse_skill.instructions
-    assert task_skill.instructions.startswith("# Purpose")
-    assert workflow_skill.instructions.startswith("# Purpose")
+    assert task_skill.instructions == _default_instructions("cognis-task-manager")
+    assert workflow_skill.instructions == _default_instructions("cognis-workflow-manager")
     assert task_skill.current_version_id is not None
     assert workflow_skill.current_version_id is not None
     assert coding_skill.current_version_id is not None
@@ -359,7 +373,7 @@ async def test_bootstrap_backfills_existing_legacy_management_skill(tmp_path: Pa
     assert task_skill is not None
     assert task_skill.is_system is True
     assert task_skill.name == "Cognis Task Manager"
-    assert task_skill.instructions.startswith("# Purpose")
+    assert task_skill.instructions == _default_instructions("cognis-task-manager")
     assert task_skill.tags == ["cognis", "management", "tasks"]
     assert task_skill.current_version_id is not None
 
@@ -414,10 +428,6 @@ async def test_system_skill_seed_publishes_changed_builtin_as_current_version(
     assert current.instructions == defaults["instructions"]
     assert current.version_number == old_version.version_number + 1
     if skill_id == "cognis-agent-manager":
-        assert (
-            "Self reads are allowed only within existing owner-authorized" in current.instructions
-        )
-        assert "For self mutations, use `manage_agents`." in current.instructions
         assert "explicit user review" in current.instructions
         assert "Never try to manage yourself" not in current.instructions
 
@@ -711,7 +721,7 @@ async def test_run_schema_bootstrap_upgrades_managed_conversation_lineage(
                 "user_email TEXT, controller_conversation_id TEXT, "
                 "controller_agent_id TEXT, controller_session_id TEXT, "
                 "target_conversation_id TEXT, target_agent_id TEXT, "
-                "target_agent_profile_id TEXT"
+                "target_agent_profile_id TEXT, title TEXT"
                 ")"
             )
         )
@@ -1284,6 +1294,7 @@ async def test_run_schema_bootstrap_applies_artifact_source_identity_094_twice(
                     purpose VARCHAR NOT NULL,
                     conversation_id VARCHAR,
                     session_id VARCHAR,
+                    message_role VARCHAR,
                     updated_at TIMESTAMP
                 )
                 """
@@ -1339,6 +1350,7 @@ async def test_run_schema_bootstrap_completes_partial_artifact_094_without_overw
                     purpose VARCHAR NOT NULL,
                     conversation_id VARCHAR,
                     session_id VARCHAR,
+                    message_role VARCHAR,
                     source_tool_call_id VARCHAR,
                     source_anchor VARCHAR,
                     updated_at TIMESTAMP

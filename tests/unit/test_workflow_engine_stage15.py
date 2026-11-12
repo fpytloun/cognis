@@ -11,6 +11,7 @@ from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
 from cognis.core.events import EventBus, EventType
 from cognis.core.session import SessionManager
 from cognis.core.workflow_engine import WorkflowEngine
+from cognis.models.session import EventAppendResult
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.workflow import CompletionDeliveryPolicy, StepDefinition, Workflow, WorkflowState
 from cognis.store.database import create_engine, create_session_factory
@@ -41,10 +42,10 @@ class _Guardrails:
         events: list[object],
         source: str = "cognis",
         idempotency_key: str | None = None,
-    ) -> object:
+    ) -> EventAppendResult:
         del idempotency_key
         self.recorded.append((session_id, events))
-        return SimpleNamespace(last_seq=1)
+        return EventAppendResult(ok=True, count=len(events), first_seq=1, last_seq=len(events))
 
 
 class _ChannelDelivery:
@@ -71,10 +72,11 @@ class _ChannelDelivery:
         content: str,
         attachments: list[dict[str, object]] | None = None,
         deliverable_id: str | None = None,
+        outcome_key: str | None = None,
     ) -> object:
         from cognis.channels.delivery import ChannelDeliveryStatus
 
-        del task_id, deliverable_id
+        del task_id, deliverable_id, outcome_key
         self.calls.append((conversation_id, content, attachments))
         return ChannelDeliveryStatus.SENT if self.sent else ChannelDeliveryStatus.FAILED
 
@@ -143,6 +145,7 @@ async def test_deliver_task_result_uses_latest_active_conversation_and_publishes
             source_type="api",
             source_ref=None,
             delivery=TaskDelivery(mode="latest_active_for_agent"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="default"),
             workflow_id=None,
             result_summary="Done",
         )
@@ -254,7 +257,7 @@ async def test_deliver_task_result_from_renewed_scope_is_historical_only(
 
     assert guardrails.recorded == []
     assert channel_delivery.calls == []
-    assert seen == []
+    assert seen == [EventType.TASK_COMPLETED]
     async with session_factory() as session:
         outbox_count = (
             await session.execute(select(func.count()).select_from(ChannelDeliveryOutboxRow))
@@ -498,7 +501,10 @@ async def test_deliver_task_result_direct_sends_channel_message_without_follow_u
         )
     )
 
-    assert channel_delivery.calls == [(conversation.conversation_id, "Final direct reply", [])]
+    assert len(channel_delivery.calls) == 1
+    assert channel_delivery.calls[0][0] == conversation.conversation_id
+    assert "Final direct reply" in channel_delivery.calls[0][1]
+    assert "/tasks/task-direct-1" in channel_delivery.calls[0][1]
     assert EventType.FOLLOW_UP_TURN_REQUESTED not in seen
     assert EventType.TASK_COMPLETED in seen
     await engine.dispose()
@@ -578,7 +584,9 @@ async def test_direct_workflow_partial_delivery_stays_on_durable_path_without_fa
     )
     await workflow_engine._deliver_task_result(task)
 
-    assert channel_delivery.calls == [(conversation.conversation_id, "Multipart result", [])]
+    assert len(channel_delivery.calls) == 1
+    assert channel_delivery.calls[0][0] == conversation.conversation_id
+    assert "Multipart result" in channel_delivery.calls[0][1]
     assert guardrails.recorded == []
     assert task.applied_completion_mode == "direct"
     assert task.applied_completion_reason == "Direct channel delivery is pending durable retry."
@@ -768,7 +776,9 @@ async def test_explicit_direct_delivery_overrides_legacy_silent_target_mode(
         )
     )
 
-    assert channel_delivery.calls == [(conversation.conversation_id, "Direct brief", [])]
+    assert len(channel_delivery.calls) == 1
+    assert channel_delivery.calls[0][0] == conversation.conversation_id
+    assert "Direct brief" in channel_delivery.calls[0][1]
     await engine.dispose()
 
 
@@ -915,7 +925,7 @@ async def test_allow_silent_completion_does_not_suppress_failed_task(tmp_path: o
 
     applied_mode, applied_reason = workflow_engine._resolve_applied_completion(task, state)
 
-    assert applied_mode == "default"
+    assert applied_mode == "direct"
     assert applied_reason is None
     await engine.dispose()
 
@@ -1079,7 +1089,7 @@ async def test_deliver_task_result_uses_source_ref_for_specific_conversation(
     follow_up = next(
         event for event in captured if event.type == EventType.FOLLOW_UP_TURN_REQUESTED
     )
-    assert follow_up.data["follow_up"]["mode"] == "notify"
+    assert follow_up.data["follow_up"]["mode"] == "handle"
     await engine.dispose()
 
 
@@ -1213,6 +1223,7 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
             source_type="chat",
             source_ref=conversation.conversation_id,
             delivery=TaskDelivery(mode="same_conversation"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="default"),
             workflow_id=None,
             result_summary="Done",
         )
@@ -1232,15 +1243,9 @@ async def test_deliver_task_result_creates_channel_follow_up_outbox(tmp_path: ob
         assert row.status == "pending"
         assert row.channel_type == "signal"
         assert row.account_id == "acct-1"
-        assert row.fallback_text == (
-            'Task "Background task" completed.\n'
-            "\n"
-            "Summary: Done\n"
-            "\n"
-            "Task ID: task-chan-1\n"
-            "\n"
-            "Open the conversation for details."
-        )
+        assert "Task completed: Background task" in row.fallback_text
+        assert "Done" in row.fallback_text
+        assert "/tasks/task-chan-1" in row.fallback_text
 
     await engine.dispose()
 
@@ -1339,7 +1344,7 @@ async def test_default_scheduled_task_final_content_stays_agent_mediated(
         assert row is not None
         assert row.session_id == root_session.session_id
         assert row.source_type == "task_result_follow_up"
-        assert row.fallback_text.startswith('Task "Background task" completed.')
+        assert row.fallback_text.startswith("Task completed: Background task")
         assert "Bounded deliverable summary" not in row.fallback_text
         assert "FULL DELIVERABLE CONTENT" not in row.fallback_text
 
@@ -1427,15 +1432,10 @@ async def test_deliver_failed_task_channel_fallback_identifies_task(tmp_path: ob
     async with session_factory() as session:
         row = await get_channel_delivery_outbox(session, delivery_id)
         assert row is not None
-        assert row.fallback_text == (
-            'Task "Build and rollout restart Cognis" failed.\n'
-            "\n"
-            "Reason: Failed to resolve step runtime.\n"
-            "\n"
-            "Task ID: task-failed-1\n"
-            "\n"
-            "Open the conversation for details."
-        )
+        assert "Task failed: Build and rollout restart Cognis" in row.fallback_text
+        assert "Failed to resolve step runtime." in row.fallback_text
+        assert "partial" in row.fallback_text
+        assert "/tasks/task-failed-1" in row.fallback_text
 
     await engine.dispose()
 
@@ -1527,6 +1527,7 @@ async def test_preferred_channel_delivery_uses_preferred_account_conversation(
             source_type="api",
             source_ref=None,
             delivery=TaskDelivery(mode="preferred_channel"),
+            completion_delivery=CompletionDeliveryPolicy(completion_mode_family="default"),
             workflow_id=None,
             result_summary="Done",
         )
@@ -1624,9 +1625,9 @@ async def test_preferred_channel_direct_delivery_uses_matrix_main_conversation_n
         )
     )
 
-    assert channel_delivery.calls == [
-        (main_conversation.conversation_id, "Matrix direct result", [])
-    ]
+    assert len(channel_delivery.calls) == 1
+    assert channel_delivery.calls[0][0] == main_conversation.conversation_id
+    assert "Matrix direct result" in channel_delivery.calls[0][1]
     await engine.dispose()
 
 
@@ -1687,7 +1688,7 @@ async def test_preferred_channel_delivery_falls_back_to_agent_direct_chat(
         direct = await get_agent_direct_conversation(session, "user@example.com", "agent-1")
         assert direct is not None
         assert direct.context_type == "web"
-        assert direct.context_data == {"kind": "agent_direct"}
+        assert direct.context_data["kind"] == "agent_direct"
         assert direct.last_message_at is not None
 
     await engine.dispose()

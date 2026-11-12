@@ -93,6 +93,8 @@ class CompositeExecutorProvider:
         provider = self._get_provider(executor_type)
         handle = cast(ExecutorHandle, await provider.spawn(config))
         self._handle_types[handle.executor_id] = executor_type
+        if config.program_runtime_executor_id is not None:
+            self._handle_types.setdefault(config.program_runtime_executor_id, executor_type)
         return handle
 
     async def get_executor(self, handle: ExecutorHandle) -> Any:
@@ -117,6 +119,53 @@ class CompositeExecutorProvider:
         if local_available and self._subprocess is not None:
             results.extend(await self._subprocess.list_active())
         return results
+
+    async def terminate_program_scope(
+        self,
+        scope_id: str,
+        *,
+        executor_ids: list[str] | None = None,
+    ) -> None:
+        """Terminate one conversation-scoped program on active and pinned executors."""
+        if not scope_id:
+            return
+        local_program_cleanup = False
+        local_provider = self._in_process if is_executor_package_available() else None
+        terminate_local = getattr(local_provider, "terminate_program_scope", None)
+        if callable(terminate_local):
+            await terminate_local(scope_id, executor_ids=executor_ids)
+            local_program_cleanup = True
+
+        handles = await self.list_active()
+        by_id = {handle.executor_id: handle for handle in handles}
+        targets = set(by_id)
+        if executor_ids:
+            has_local_runtime = getattr(local_provider, "has_program_runtime", None)
+            targets.update(
+                executor_id
+                for executor_id in executor_ids
+                if self._handle_types.get(executor_id) != "in_process"
+                and not (callable(has_local_runtime) and has_local_runtime(executor_id))
+            )
+        owner = {
+            "execution_scope_id": scope_id,
+            "session_id": scope_id,
+            "conversation_id": scope_id,
+        }
+        for executor_id in sorted(targets):
+            executor_type = self._handle_types.get(executor_id)
+            handle = by_id.get(executor_id)
+            if handle is not None:
+                executor_type = executor_type or handle.executor_type
+            if executor_type == "in_process" and handle is not None:
+                if local_program_cleanup:
+                    continue
+                connection = await self.get_executor(handle)
+                terminate = getattr(connection, "terminate_program_scope", None)
+                if callable(terminate):
+                    await terminate(scope_id)
+            else:
+                await self._websocket.notify_browser_session_terminal([executor_id], owner)
 
     async def cleanup(self) -> None:
         """Clean up all sub-providers."""

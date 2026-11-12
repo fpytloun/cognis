@@ -47,6 +47,7 @@ from cognis.core.task_execution import (
 )
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent
+from cognis.models.workflow import effective_gate_options
 from cognis.providers.guardrails.resolution_errors import ResolutionRejected
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store.models import DirectTurnRequestRow, NotificationRow, Schedule, Task
@@ -1731,7 +1732,7 @@ class NotificationService:
                 is_timeout = user_email is None and resolution_data.get("reason") == "timeout"
                 offered = {
                     str(option.get("action"))
-                    for option in (row.payload or {}).get("options", [])
+                    for option in effective_gate_options((row.payload or {}).get("options"))
                     if isinstance(option, dict)
                 }
                 timeout_action = (row.payload or {}).get("timeout_action")
@@ -3567,6 +3568,13 @@ def _find_direct_turn_owner(
 
 
 def _row_to_notification(row: NotificationRow) -> Notification:
+    payload = row.payload or {}
+    if (
+        row.notification_type == NotificationType.GATE
+        and row.task_id
+        and isinstance(payload.get("options"), list)
+    ):
+        payload = {**payload, "options": effective_gate_options(payload.get("options"))}
     return Notification(
         notification_id=row.notification_id,
         notification_type=row.notification_type,
@@ -3576,7 +3584,7 @@ def _row_to_notification(row: NotificationRow) -> Notification:
         step_name=row.step_name,
         step_run_id=row.step_run_id,
         session_id=row.session_id,
-        payload=row.payload or {},
+        payload=payload,
         status=row.status,
         resolution=row.resolution,
         revision=_notification_revision(row),

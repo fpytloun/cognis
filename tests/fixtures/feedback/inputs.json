@@ -1,0 +1,90 @@
+{
+  "grant": {
+    "capabilities": {
+      "comment": true,
+      "read": true
+    },
+    "expected_version": 0,
+    "principal_email": "reviewer@cognis.test"
+  },
+  "pdf_page_text": {
+    "context": {
+      "kind": "standalone"
+    },
+    "limit": 16384,
+    "scope": {
+      "kind": "pdf_page",
+      "page": 1
+    },
+    "source": {
+      "content_ref": "art_66666666666666666666666666666666",
+      "kind": "document"
+    },
+    "start": 0
+  },
+  "preflight": {
+    "context": {
+      "kind": "standalone"
+    },
+    "destination": {
+      "agent_id": "agent_44444444444444444444444444444444",
+      "kind": "new_followup",
+      "project_id": null,
+      "title": null
+    },
+    "overall_message": "Use the selected feedback.",
+    "reviewed_guest_entry_version_ids": [],
+    "selection": [
+      {
+        "entry_version_id": "fbv_33333333333333333333333333333333",
+        "expected_entry_version": 1
+      }
+    ],
+    "update_mode": "answer_only"
+  },
+  "public_exchange": {
+    "create_guest": true,
+    "display_name": "Guest reviewer",
+    "share_token": "bounded-share-token-from-viewer"
+  },
+  "resolve_document": {
+    "context": {
+      "conversation_id": "conv_22222222222222222222222222222222",
+      "kind": "chat"
+    },
+    "source": {
+      "content_ref": "art_11111111111111111111111111111111",
+      "kind": "document"
+    }
+  },
+  "rich_field_text": {
+    "context": {
+      "kind": "standalone"
+    },
+    "limit": 16384,
+    "scope": {
+      "block_id": "/blocks/0",
+      "field_path": [
+        "body"
+      ],
+      "identity": "revision_local",
+      "item_key": null,
+      "kind": "rich_field"
+    },
+    "source": {
+      "content_ref": "dlv_55555555555555555555555555555555",
+      "kind": "document"
+    },
+    "start": 0
+  },
+  "share": {
+    "allow_comments": true,
+    "discussion": "own_only",
+    "expected_content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "expires_at": "2030-01-01T00:00:00Z",
+    "source": {
+      "content_ref": "dlv_55555555555555555555555555555555",
+      "kind": "document"
+    }
+  }
+}

@@ -170,9 +170,12 @@ from cognis.providers.llm.errors import (
 )
 from cognis.providers.llm.litellm import OpenAIToolSearchFallbackRequired
 from cognis.providers.llm.retry import LLMContextOverflowError
+from cognis.providers.llm.systemone import SystemOneRequest
 from cognis.runtime_context import scoped_runtime_context
 from cognis.store import queries
 from cognis.store.models import Base, ManagedChannelBinding
+from cognis.store.models import Conversation as ConversationRow
+from cognis.store.models import Session as SessionRow
 from cognis.store.queries import (
     create_agent,
     create_conversation,
@@ -198,6 +201,42 @@ class _SessionStub(SimpleNamespace):
     fast_mode_override = None
     runtime_override_revision = 0
     delegation_mode = None
+    delegation_metadata = {}
+    user_email = "user@example.com"
+    agent_id = "agent-1"
+    parent_session_id = None
+    status = "active"
+
+
+async def _seed_child_session(session_factory: Any, session_id: str) -> None:
+    """Persist the delegated child session that runtime metadata is recorded on."""
+    from cognis.store.models import Agent as AgentRow
+    from cognis.store.models import User as UserRow
+
+    async with session_factory() as db:
+        if await db.get(UserRow, "user@example.com") is None:
+            db.add(UserRow(email="user@example.com", name="User", role="user"))
+            await db.flush()
+            db.add(AgentRow(agent_id="agent-1", owner_email="user@example.com", name="Agent"))
+            db.add(
+                ConversationRow(
+                    conversation_id="conv-1",
+                    user_email="user@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                )
+            )
+            await db.flush()
+        db.add(
+            SessionRow(
+                session_id=session_id,
+                conversation_id="conv-1",
+                user_email="user@example.com",
+                agent_id="agent-1",
+                status="active",
+            )
+        )
+        await db.commit()
 
 
 def test_unreadable_tool_repair_uses_valid_continuation_without_redispatch() -> None:
@@ -1810,6 +1849,99 @@ async def test_repeated_cancel_during_handoff_cleanup_releases_session_lock(
         await asyncio.wait_for(task, 2)
     assert not loop.session_is_locked("sess-1")
     await asyncio.wait_for(loop.wait_for_session_unlock("sess-1"), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_run_step_scopes_accounting_and_delegate_inheritance(monkeypatch, cancel):
+    from cognis.providers.llm.usage_attribution import controller_request
+    from cognis.providers.llm.usage_capture import UsageCapture
+    from cognis.providers.llm.usage_scope import current_usage_execution
+
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=SimpleNamespace(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+    parent = StepContext(
+        step_definition=StepDefinition(name="run", type="run", prompt=""),
+        session=_SessionStub(session_id="sess-parent", intaris_session_id="sess-parent"),
+        conversation=SimpleNamespace(conversation_id="conv-usage"),
+        agent=agent,
+        policy=CHAT_POLICY,
+        task_id="task-usage",
+        step_run_id="step-usage",
+    )
+    child = StepContext(
+        step_definition=StepDefinition(name="run", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-child",
+            intaris_session_id="sess-child",
+            parent_session_id="sess-parent",
+            agent_id="agent-child",
+        ),
+        conversation=parent.conversation,
+        agent=agent,
+        policy=CHAT_POLICY,
+    )
+    captured = []
+
+    async def execute(ctx, **kwargs):
+        request = controller_request(
+            UsageCapture(
+                sink=SimpleNamespace(try_emit=lambda _: True),
+                controller_owner_id="controller_usage",
+                coverage_epoch_id="epoch_usage",
+            ),
+            actor=ctx.session.user_email,
+            purpose="chat",
+            model=None,
+            kwargs={"cognis_session_id": ctx.session.session_id},
+        )
+        captured.append(request.attribution.resources)
+        if ctx is parent:
+            await loop.run_step(child)
+            assert current_usage_execution.get().task_id == "task-usage"
+            if cancel:
+                raise asyncio.CancelledError
+        elif ctx.session.parent_session_id:
+            ctx.session.session_id = "sess-child-rotated"
+            rotated = controller_request(
+                request.capture,
+                actor=ctx.session.user_email,
+                purpose="compaction",
+                model=None,
+                kwargs={"cognis_session_id": ctx.session.session_id},
+            )
+            captured.append(rotated.attribution.resources)
+        return StepOutput(summary="done")
+
+    monkeypatch.setattr(loop, "_execute_step", execute)
+    if cancel:
+        with pytest.raises(asyncio.CancelledError):
+            await loop.run_step(parent)
+    else:
+        await loop.run_step(parent)
+    assert current_usage_execution.get() is None
+    assert len(captured) == 3
+    assert all(
+        item.task_id == "task-usage" and item.step_run_id == "step-usage" for item in captured
+    )
+    assert captured[1].session_id == "sess-child"
+    assert captured[1].agent_id == "agent-child"
+    assert captured[2].session_id == "sess-child-rotated"
+    assert child.task_id is None and child.step_run_id is None
+    child.session.parent_session_id = None
+    await loop.run_step(child)
+    assert captured[-1].task_id is None and captured[-1].step_run_id is None
 
 
 @pytest.mark.asyncio
@@ -3606,12 +3738,15 @@ async def test_run_child_session_direct_chat_secondary_uses_secondary_policy(
     assert captured_policies == [SECONDARY_AGENT_DELEGATION_POLICY]
     assert captured_steps[0].step_profile_mode == StepProfileMode.HARD
     assert captured_steps[0].step_profile is not None
-    assert captured_steps[0].step_profile.allow_tool_search is False
+    assert captured_steps[0].step_profile.allow_tool_search is True
     assert captured_steps[0].step_profile.tool_overrides.include == [
         "read",
         "grep",
         "glob",
         "bash",
+        "skill_get",
+        "skill_load",
+        "skill_search",
     ]
 
 
@@ -6017,11 +6152,15 @@ class _RecordedEventsGuardrails(_NoopGuardrails):
 
 
 class _NoopSessionManager:
-    def __init__(self) -> None:
+    def __init__(self, session_factory: Any = None) -> None:
         self.rotations: list[dict[str, object]] = []
         self.execution_rows: dict[str, SimpleNamespace] = {}
+        self._delegate_session_factory = session_factory
 
     def session_factory(self) -> object:
+        if self._delegate_session_factory is not None:
+            return self._delegate_session_factory()
+
         async def scalar(statement: Any) -> SimpleNamespace:
             session_id = statement.compile().params["session_id_1"]
             return self.execution_rows.setdefault(
@@ -6322,6 +6461,63 @@ async def test_agent_conversation_set_profile_reuses_link_and_next_send_uses_pro
     assert [event.data["changed"] for event in audit_events] == [True, False]
     assert audit_events[0].data["previous_agent_profile_id"] == "developer"
     assert audit_events[0].data["agent_profile_id"] == "senior"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ungranted_feedback_packet_rejects_only_the_child_tool_call(
+    tmp_path: Path,
+) -> None:
+    from cognis.core.feedback.primitives import FeedbackError
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'feedback-child.db'}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    controller, target = await _seed_managed_profile_runtime(session_factory)
+    scheduler = _ProfileScheduler()
+    agent_loop = _background_work_agent_loop(session_factory, scheduler)
+
+    class _Agents:
+        async def scope(self, session_id: str, turn_id: str | None) -> object:
+            return SimpleNamespace(session_id=session_id, turn_id=turn_id)
+
+        async def packet(self, scope: object, submission_id: str, manifest_hash: str) -> object:
+            raise FeedbackError(
+                404, "not_found", "Feedback packet is not granted to this execution"
+            )
+
+    agent_loop.configure_feedback_tools(_Agents())  # type: ignore[arg-type]
+    submitted: list[object] = []
+
+    async def _record_submit() -> None:
+        submitted.append(True)
+
+    scheduler.on_submit = _record_submit
+    result = await agent_loop._handle_managed_conversation_tool(
+        ToolCall(
+            call_id="send-foreign-packet",
+            name="agent_conversation_send",
+            arguments={
+                "conversation_id": target.conversation_id,
+                "message": "Work on the comments.",
+                "wait": False,
+                "feedback_submissions": [
+                    {"submission_id": "fbsu_other_chat", "manifest_hash": "a" * 64}
+                ],
+            },
+        ),
+        ctx=_background_work_ctx(
+            controller.conversation_id, context_ref="web:user:user@example.com:default"
+        ),
+    )
+
+    # The model gets a correctable error; the parent turn continues and nothing is sent.
+    assert result.is_error is True
+    payload = json.loads(result.output)
+    assert payload["code"] == "not_found"
+    assert "omit it" in payload["message"]
+    assert submitted == []
     await engine.dispose()
 
 
@@ -8869,6 +9065,17 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
                     SimpleNamespace(
                         conversation_id=conversation.conversation_id,
                         project_id=conversation.project_id,
+                        context=kwargs["context"].model_copy(
+                            update={
+                                "platform_data": {
+                                    **kwargs["context"].platform_data,
+                                    "initial_agent_profile_selection": {
+                                        "mode": "auto",
+                                        "status": "pending",
+                                    },
+                                },
+                            }
+                        ),
                     ),
                     SimpleNamespace(
                         session_id=session.session_id,
@@ -8996,6 +9203,12 @@ async def test_agent_conversation_create_sets_completion_notification_before_sub
         assert link.parent_link_id is None
         assert link.root_link_id == link.link_id
 
+        created = await queries.get_conversation(db_session, "conv-created")
+        assert created.context_data["initial_agent_profile_selection"] == {
+            "mode": "auto",
+            "status": "pending",
+        }
+
     await engine.dispose()
 
 
@@ -9040,6 +9253,7 @@ async def test_agent_conversation_create_defaults_to_wait_from_direct_topic(
                     SimpleNamespace(
                         conversation_id=conversation.conversation_id,
                         project_id=conversation.project_id,
+                        context=kwargs["context"],
                     ),
                     SimpleNamespace(
                         session_id=session.session_id,
@@ -9195,6 +9409,7 @@ async def test_agent_conversation_fork_sets_completion_notification_before_submi
                     SimpleNamespace(
                         conversation_id=conversation.conversation_id,
                         project_id=conversation.project_id,
+                        context=kwargs["context"],
                         title=conversation.title,
                     ),
                     SimpleNamespace(
@@ -10687,6 +10902,7 @@ def test_direct_chat_controller_tools_use_chat_aliases() -> None:
         "payload_artifact",
         "project_id",
         "supersedes",
+        "allow_comments",
     }
     authoritative = next(
         definition for definition in exposure.definitions if definition.name == "write_deliverable"
@@ -13441,9 +13657,40 @@ async def test_explicit_cross_project_path_still_triggers_project_probe() -> Non
 
 
 @pytest.mark.asyncio
-async def test_read_only_tool_continues_after_project_context_load() -> None:
+async def test_read_only_tool_continues_after_project_context_load(tmp_path: Path) -> None:
+    from cognis.executor.call_journal import CallJournal
+
+    journal = CallJournal(tmp_path / "probe-receipts.sqlite3", max_calls=1)
+
+    class JournaledProbeExecutor(_ReadOnlyProjectContextExecutor):
+        async def tool_execute(
+            self, tool_call: ToolCall, timeout_seconds: int | None = None
+        ) -> ToolResult:
+            if tool_call.name != "_project_context_probe":
+                return await super().tool_execute(tool_call, timeout_seconds)
+            await journal.accept(
+                {
+                    "call_id": tool_call.call_id,
+                    "tool_name": tool_call.name,
+                    "arguments": tool_call.arguments,
+                    "runtime_metadata": tool_call.runtime_metadata,
+                },
+                "project-probe-executor",
+            )
+            result = await super().tool_execute(tool_call, timeout_seconds)
+            await journal.complete(tool_call.call_id, result.model_dump())
+            return result
+
+        async def rpc_call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "tool.result_ack"
+            return {
+                "acknowledged": await journal.acknowledge(
+                    params["call_id"], scope=params["scope"], require_scope=True
+                )
+            }
+
     fake_llm = _ReadOnlyProjectContextLLM()
-    probe_executor = _ReadOnlyProjectContextExecutor()
+    probe_executor = JournaledProbeExecutor()
 
     async def execute_tool(tool_call: ToolCall, *args: object, **kwargs: object) -> ToolResult:
         del args, kwargs
@@ -13487,6 +13734,7 @@ async def test_read_only_tool_continues_after_project_context_load() -> None:
             user_email="user@example.com",
             agent_id="agent-1",
         ),
+        turn_id="turn-read-only-project",
         conversation=SimpleNamespace(
             conversation_id="conv-read-only-project",
             context=SimpleNamespace(type="web", ref=None, platform_data={}),
@@ -13513,6 +13761,21 @@ async def test_read_only_tool_continues_after_project_context_load() -> None:
     assert probe_executor.executed_tools == ["list_directory"]
     assert len(probe_executor.probes) == 1
     assert len(fake_llm.calls) == 2
+
+    # A second probe must be admitted through the real bounded journal after
+    # the first result is consumed, without raising its one-call capacity.
+    next_probe = await probe_executor.tool_execute(
+        ToolCall(
+            call_id="next-project-probe",
+            name="_project_context_probe",
+            arguments={"path": "/workspace/other"},
+            runtime_metadata={
+                "session_id": "sess-read-only-project",
+                "turn_id": "turn-read-only-project",
+            },
+        )
+    )
+    assert next_probe.metadata["project_context"]["project_root"] == "/workspace/other"
 
 
 @pytest.mark.asyncio
@@ -15010,7 +15273,16 @@ async def test_direct_turn_absorbs_queued_batch_before_todo_reprompt(boundary: s
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("workflow_policy", [WORKFLOW_POLICY, SECONDARY_POLICY])
+@pytest.mark.parametrize(
+    "workflow_policy",
+    [
+        WORKFLOW_POLICY,
+        SECONDARY_POLICY,
+        DELEGATION_POLICY,
+        SECONDARY_AGENT_DELEGATION_POLICY,
+        DIRECT_CHAT_DELEGATION_POLICY,
+    ],
+)
 async def test_workflow_step_absorbs_boundary_batch_before_step_complete_reprompt(
     workflow_policy: object,
 ) -> None:
@@ -15073,6 +15345,7 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
             intaris_session_id="sess-1",
             user_email="user@example.com",
             agent_id="agent-1",
+            mnemory_session_id=None,
         ),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
@@ -15097,7 +15370,11 @@ async def test_workflow_step_absorbs_boundary_batch_before_step_complete_repromp
     output = await agent_loop.run_step(ctx)
 
     assert output is not None
-    assert isinstance(output.error, str)
+    if workflow_policy in {WORKFLOW_POLICY, SECONDARY_POLICY}:
+        assert isinstance(output.error, str)
+    else:
+        assert output.error is None
+        assert output.summary == "Captured reminder."
     assert "before_first_model_call" in consumed_reasons
     assert "after_assistant_message" in consumed_reasons
     assert len(fake_llm.calls) >= 2
@@ -16151,8 +16428,9 @@ async def test_direct_turn_fence_preserves_executor_dispatch_states() -> None:
 
 @pytest.mark.asyncio
 async def test_scheduled_task_dispatches_executor_tool_with_task_execution_fence(
-    monkeypatch: pytest.MonkeyPatch,
+    claimed_task_execution,
 ) -> None:
+    session_factory, execution_fence = claimed_task_execution
     registry = ToolRegistry()
     registry.register(
         RegisteredTool(
@@ -16168,7 +16446,7 @@ async def test_scheduled_task_dispatches_executor_tool_with_task_execution_fence
     )
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=_ResponsesApiToolCycleLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=session_factory),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
         compaction_strategy=SimpleNamespace(),
@@ -16178,13 +16456,6 @@ async def test_scheduled_task_dispatches_executor_tool_with_task_execution_fence
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
-    execution_fence = TaskExecutionFence(
-        store=SimpleNamespace(),
-        claim=SimpleNamespace(task_id="task-scheduled"),
-        cancel_event=asyncio.Event(),
-    )
-    assert_current = AsyncMock()
-    monkeypatch.setattr(execution_fence, "assert_current", assert_current)
     ctx = StepContext(
         step_definition=StepDefinition(name="collect_brief", type="run", prompt=""),
         session=_SessionStub(
@@ -16227,11 +16498,34 @@ async def test_scheduled_task_dispatches_executor_tool_with_task_execution_fence
 
     assert result.output == "lookup result"
     assert result.is_error is False
-    assert_current.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
-async def test_direct_turn_fence_loss_propagates_before_executor_dispatch() -> None:
+async def test_direct_turn_fence_loss_propagates_before_executor_dispatch(
+    claimed_task_execution,
+) -> None:
+    session_factory, _ = claimed_task_execution
+    async with session_factory() as db:
+        conversation = ConversationRow(
+            conversation_id="conv-direct-turn",
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context_type="web",
+        )
+        db.add(conversation)
+        await db.flush()
+        db.add(
+            SessionRow(
+                session_id="sess-direct-turn",
+                conversation_id=conversation.conversation_id,
+                user_email="user@example.com",
+                agent_id="agent-1",
+                status="active",
+            )
+        )
+        await db.flush()
+        conversation.active_session_id = "sess-direct-turn"
+        await db.commit()
     registry = ToolRegistry()
     registry.register(
         RegisteredTool(
@@ -16247,7 +16541,7 @@ async def test_direct_turn_fence_loss_propagates_before_executor_dispatch() -> N
     )
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=_ResponsesApiToolCycleLLM(), guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=session_factory),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(max_context_tokens=100_000),
         compaction_strategy=SimpleNamespace(),
@@ -16292,7 +16586,9 @@ async def test_direct_turn_fence_loss_propagates_before_executor_dispatch() -> N
         bootstrap_wait_for_intention=False,
         tool_registry=registry,
         executor_connection=SimpleNamespace(),
-        execution_fence=SimpleNamespace(bind_tool_dispatch=bind_tool_dispatch),
+        execution_fence=SimpleNamespace(
+            assert_current=AsyncMock(), bind_tool_dispatch=bind_tool_dispatch
+        ),
     )
 
     with pytest.raises(StaleDirectTurnOwner, match="dtr-test"):
@@ -17856,8 +18152,8 @@ def test_todo_schema_uses_completed_status() -> None:
     assert items["required"] == ["content", "status"]
     description = write_deliverable_tool["function"]["description"]
     assert "durable deliverable" in description
-    assert "intermediate progress" in description.lower()
-    assert "after validation/review" in description
+    assert "after the work is complete" in description.lower()
+    assert "after validation or review" in description
 
 
 def test_step_complete_metadata_array_schema_includes_items() -> None:
@@ -18015,11 +18311,36 @@ async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_e
     surface: str,
     session_id: str,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ) -> None:
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'child.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    child_session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with child_session_factory() as db:
+        await create_user(db, "user@example.com", "Test user", "test-hash")
+        await create_agent(db, agent_id="agent-1", owner_email="user@example.com", name="Agent")
+        conversation = await create_conversation(
+            db, "user@example.com", "agent-1", "web", conversation_id="conv-1"
+        )
+        await create_session(
+            db, conversation.conversation_id, "user@example.com", "agent-1", session_id="parent-1"
+        )
+        child = await create_session(
+            db,
+            conversation.conversation_id,
+            "user@example.com",
+            "agent-1",
+            session_id=session_id,
+            intaris_session_id=session_id,
+            parent_session_id="parent-1",
+        )
+        await db.commit()
+
     llm = _DelegatedForbiddenToolThenTextLLM(tool_name)
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=child_session_factory),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
@@ -18049,15 +18370,8 @@ async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_e
             prompt="Investigate the issue.",
             require_deliverable=False,
         ),
-        session=_SessionStub(
-            session_id=session_id,
-            intaris_session_id=session_id,
-            mnemory_session_id=None,
-            user_email="user@example.com",
-            agent_id="agent-1",
-            parent_session_id="parent-1",
-        ),
-        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        session=child,
+        conversation=conversation,
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
         policy=policy,
         user_message="Investigate the issue.",
@@ -18067,7 +18381,10 @@ async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_e
         controller_tool_surface=surface,
     )
 
-    output = await agent_loop.run_step(ctx)
+    try:
+        output = await agent_loop.run_step(ctx)
+    finally:
+        await engine.dispose()
 
     assert output is not None
     assert output.error is None
@@ -18096,11 +18413,13 @@ async def test_delegated_child_runtime_rejects_parent_owned_tools_without_side_e
 @pytest.mark.asyncio
 async def test_delegated_daily_brief_child_completes_with_assistant_text(
     monkeypatch: pytest.MonkeyPatch,
+    task_continuation_db,
 ) -> None:
+    await _seed_child_session(task_continuation_db, "daily-brief-child")
     llm = _SingleAssistantTextLLM()
     agent_loop = AgentLoop(
         providers=SimpleNamespace(llm=llm, guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=task_continuation_db),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
@@ -18945,13 +19264,15 @@ async def test_write_deliverable_publication_scope_follows_runtime_context(
 @pytest.mark.asyncio
 async def test_secondary_delegation_ignores_parent_deliverable_when_limit_forces_tail_text(
     monkeypatch: pytest.MonkeyPatch,
+    task_continuation_db,
 ) -> None:
+    await _seed_child_session(task_continuation_db, "child-limit")
     agent_loop = AgentLoop(
         providers=SimpleNamespace(
             llm=_DelegationDeliverableThenLimitLLM(),
             guardrails=_NoopGuardrails(),
         ),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=task_continuation_db),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
@@ -20035,6 +20356,8 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
     monkeypatch: pytest.MonkeyPatch,
     inventory_outcome: str,
 ) -> None:
+    from dataclasses import replace
+
     from cognis.core.executor_pool import (
         ExecutorAvailability,
         ExecutorPool,
@@ -20136,8 +20459,19 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
             return len(text)
 
         async def stream_generate(self, messages: list[dict[str, object]], **_: object):
-            del messages
             self.calls += 1
+            if inventory_outcome == "ready" and self.calls <= 2:
+                notices = [
+                    str(message.get("content", ""))
+                    for message in messages
+                    if "Assigned executors" in str(message.get("content", ""))
+                ]
+                assert notices
+                if self.calls == 1:
+                    assert "state=offline" in notices[-1]
+                else:
+                    assert "state=offline" in notices[0]
+                    assert "state=usable" in notices[-1]
             if self.calls == 2 and inventory_outcome == "ready":
                 names = {tool["function"]["name"] for tool in _["tools"]}
                 assert "read" in names
@@ -20334,6 +20668,19 @@ async def test_switch_executor_refreshes_policy_before_same_turn_tool(
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
     )
+
+    if inventory_outcome == "ready":
+        offline_pool = ExecutorPool(
+            primary=[old_target],
+            additional=[replace(new_target, state=ExecutorAvailability.OFFLINE)],
+        )
+        ctx.executor_pool = offline_pool
+
+        async def refresh_pool(_pool: ExecutorPool) -> ExecutorPool:
+            # Recovery happens during inference, after initial context assembly.
+            return executor_pool if agent_loop.providers.llm.calls else offline_pool
+
+        ctx.refresh_executor_pool = refresh_pool
 
     if inventory_outcome == "cancelled":
         with pytest.raises(asyncio.CancelledError):
@@ -20903,22 +21250,17 @@ async def test_skill_load_classifier_activates_only_hidden_tools_for_session() -
         def __init__(self) -> None:
             self.kwargs: list[dict[str, object]] = []
 
-        async def generate(
-            self, messages: list[dict[str, object]], **kwargs: object
-        ) -> dict[str, object]:
-            del messages
+        async def classify(self, request: SystemOneRequest, **kwargs: object) -> dict[str, object]:
             self.kwargs.append(dict(kwargs))
             return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": (
-                                '{"tool_ids": ["builtin:read_tool_output", '
-                                '"mcp:browser:browser_snapshot"]}'
-                            )
-                        }
+                "model": request.model,
+                "answers": {
+                    tool_id: {
+                        "type": "noul",
+                        "noul": float(tool_id == "mcp:browser:browser_snapshot"),
                     }
-                ]
+                    for tool_id in request.questions
+                },
             }
 
         async def get_model_info(self, model: str | None) -> SimpleNamespace:
@@ -21144,18 +21486,15 @@ async def test_skill_load_classifier_chunks_large_hidden_inventory() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
+        async def classify(self, request: SystemOneRequest, **_: object) -> dict[str, object]:
             self.calls += 1
-            content = str(messages[-1].get("content") or "")
-            if "builtin:zzz_target_tool" in content:
-                return {
-                    "choices": [
-                        {"message": {"content": '{"tool_ids": ["builtin:zzz_target_tool"]}'}}
-                    ]
-                }
-            return {"choices": [{"message": {"content": '{"tool_ids": []}'}}]}
+            return {
+                "model": request.model,
+                "answers": {
+                    tool_id: {"type": "noul", "noul": float(tool_id == "builtin:zzz_target_tool")}
+                    for tool_id in request.questions
+                },
+            }
 
         async def get_model_info(self, model: str | None) -> SimpleNamespace:
             del model
@@ -21251,12 +21590,14 @@ async def test_skill_activation_cache_key_changes_when_tags_change() -> None:
         def __init__(self) -> None:
             self.calls = 0
 
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
+        async def classify(self, request: SystemOneRequest, **_: object) -> dict[str, object]:
             self.calls += 1
-            # No activations needed — we're only checking cache behaviour.
-            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+            return {
+                "model": request.model,
+                "answers": {
+                    tool_id: {"type": "noul", "noul": 0.0} for tool_id in request.questions
+                },
+            }
 
     hidden_tool = ToolDefinition(
         name="browser_open",
@@ -21348,12 +21689,14 @@ async def test_skill_activation_classifier_scopes_to_policy_hidden_tools_only() 
         def __init__(self) -> None:
             self.received_candidates: list[str] = []
 
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            user_msg = str(messages[-1].get("content") or "")
-            self.received_candidates.append(user_msg)
-            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+        async def classify(self, request: SystemOneRequest, **_: object) -> dict[str, object]:
+            self.received_candidates.append(str(request.state))
+            return {
+                "model": request.model,
+                "answers": {
+                    tool_id: {"type": "noul", "noul": 0.0} for tool_id in request.questions
+                },
+            }
 
     # visible_tool: policy-visible under system:general-task (system group, READ).
     visible_tool = ToolDefinition(
@@ -21440,11 +21783,14 @@ async def test_skill_activation_classifier_receives_tags_and_referenced_services
         def __init__(self) -> None:
             self.user_prompts: list[str] = []
 
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            self.user_prompts.append(str(messages[-1].get("content") or ""))
-            return {"choices": [{"message": {"content": '{"tool_ids": [], "reasons": {}}'}}]}
+        async def classify(self, request: SystemOneRequest, **_: object) -> dict[str, object]:
+            self.user_prompts.append(str(request.state))
+            return {
+                "model": request.model,
+                "answers": {
+                    tool_id: {"type": "noul", "noul": 0.0} for tool_id in request.questions
+                },
+            }
 
     hidden_tool = ToolDefinition(
         name="browser_open",
@@ -21518,18 +21864,16 @@ async def test_skill_activation_emits_transparency_notice_to_model() -> None:
     after classifier-based activation so the model can self-correct."""
 
     class _ClassifierLLM:
-        async def generate(
-            self, messages: list[dict[str, object]], **_: object
-        ) -> dict[str, object]:
-            del messages
+        async def classify(self, request: SystemOneRequest, **_: object) -> dict[str, object]:
             return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"tool_ids": ["builtin:browser_open"], "reasons": {"builtin:browser_open": "skill tag browser"}}'
-                        }
+                "model": request.model,
+                "answers": {
+                    tool_id: {
+                        "type": "noul",
+                        "noul": float(tool_id == "builtin:browser_open"),
                     }
-                ]
+                    for tool_id in request.questions
+                },
             }
 
     hidden_tool = ToolDefinition(
@@ -21646,10 +21990,10 @@ async def test_step_complete_validation_reprompts_and_accepts_corrected_payload(
     assert "outcome.reason" in second_prompt
 
 
-def _step_complete_test_loop(fake_llm: object) -> AgentLoop:
+def _step_complete_test_loop(fake_llm: object, *, session_factory: Any = None) -> AgentLoop:
     return AgentLoop(
         providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
-        session_manager=_NoopSessionManager(),
+        session_manager=_NoopSessionManager(session_factory=session_factory),
         session_cache=_NoopSessionCache(),
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
@@ -21658,6 +22002,7 @@ def _step_complete_test_loop(fake_llm: object) -> AgentLoop:
         event_bus=_NoopEventBus(),
         session_lock=SessionLock(),
         pause_waiter=PauseWaiter(),
+        session_factory=session_factory,
     )
 
 
@@ -21692,6 +22037,114 @@ def _first_tool_result_payload(fake_llm: _StepCompleteRetryLLM) -> dict[str, obj
     second_prompt = fake_llm.calls[1]
     tool_message = next(message for message in second_prompt if message.get("role") == "tool")
     return json.loads(str(tool_message["content"]))
+
+
+def _general_task_completion_context() -> StepContext:
+    from cognis.core.workflow_registry import GENERAL_TASK_WORKFLOW
+
+    ctx = _step_complete_test_context(
+        GENERAL_TASK_WORKFLOW.steps[0].model_copy(update={"require_deliverable": False})
+    )
+    ctx.workflow_id = "system:general-task"
+    return ctx
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        {"result_status": "blocked", "verification": {}},
+        {"result_status": "completed", "verification": {}},
+        {"result_status": "completed", "verification": {"checks_run": [], "results": []}},
+        {
+            "result_status": "completed",
+            "verification": {"checks_run": [], "results": ["Inspected"], "checks_not_run": [" "]},
+        },
+    ],
+)
+async def test_general_task_rejects_inconsistent_or_unverified_completion(
+    invalid: dict[str, object],
+) -> None:
+    corrected = {
+        "summary": "Blocked: required credentials unavailable; owner must provide access.",
+        "metadata": {"result_status": "blocked", "verification": {}},
+        "outcome": {"status": "failed", "reason": "Missing credentials; provide access."},
+    }
+    fake_llm = _StepCompleteRetryLLM(
+        first_arguments={"summary": "Not verified", "metadata": invalid},
+        second_arguments=corrected,
+    )
+    output = await _step_complete_test_loop(fake_llm).run_step(_general_task_completion_context())
+
+    payload = _first_tool_result_payload(fake_llm)
+    assert payload["reason"] == "invalid_step_complete_metadata"
+    assert output is not None
+    assert output.summary == corrected["summary"]
+    assert output.metadata["result_status"] == "blocked"
+    assert output.outcome.status == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_status", ["success", "rejected"])
+async def test_general_task_accepts_verified_noop_and_review_rejection(outcome_status: str) -> None:
+    arguments = {
+        "summary": "Verified no change." if outcome_status == "success" else "Review complete.",
+        "metadata": {
+            "result_status": "completed",
+            "verification": {
+                "checks_run": ["Compared requested state with current state."],
+                "results": [
+                    "No change needed." if outcome_status == "success" else "Missing feature."
+                ],
+                "checks_not_run": [],
+            },
+        },
+        "outcome": {"status": outcome_status, "reason": "Missing feature."},
+    }
+    ctx = _general_task_completion_context()
+    if outcome_status == "success":
+        ctx.completion_delivery.allow_silent_completion = True
+        arguments["notification"] = {"mode": "silent", "reason": "Verified no change."}
+    output = await _step_complete_test_loop(
+        _StepCompleteRetryLLM(first_arguments=arguments, second_arguments=arguments)
+    ).run_step(ctx)
+
+    assert output is not None
+    assert output.metadata["result_status"] == "completed"
+    assert output.outcome.status == outcome_status
+    if outcome_status == "success":
+        assert output.notification.mode == "silent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workflow_id", ["system:general-task", "custom-review"])
+async def test_completed_failure_is_rejected_only_by_general_task_contract(
+    workflow_id: str,
+) -> None:
+    arguments = {
+        "summary": "Review complete",
+        "metadata": {
+            "result_status": "completed",
+            "verification": {
+                "checks_run": [],
+                "results": ["The reviewed operation failed."],
+                "checks_not_run": [],
+            },
+        },
+        "outcome": {"status": "failed", "reason": "Reviewed operation failed."},
+    }
+    corrected = {**arguments, "outcome": {"status": "success"}}
+    ctx = _general_task_completion_context()
+    ctx.workflow_id = workflow_id
+    fake_llm = _StepCompleteRetryLLM(first_arguments=arguments, second_arguments=corrected)
+    output = await _step_complete_test_loop(fake_llm).run_step(ctx)
+
+    assert output is not None
+    assert output.outcome.status == (
+        "success" if workflow_id == "system:general-task" else "failed"
+    )
+    if workflow_id == "system:general-task":
+        assert _first_tool_result_payload(fake_llm)["reason"] == "invalid_step_complete_metadata"
 
 
 def _lifecycle_strategy_step() -> StepDefinition:
@@ -23337,6 +23790,7 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
             description="Desc",
             expected_output=None,
             status="paused",
+            attempt_number=1,
             priority=0,
             agent_id="agent-1",
             source_type="agent",
@@ -23384,6 +23838,7 @@ async def test_get_task_tool_includes_pending_pause_and_workflow_run(
     )
 
     payload = json.loads(result.output)
+    assert payload["attempt_number"] == 1
     assert payload["pending_pause"]["pause_type"] == "gate"
     assert payload["workflow_run"]["current_step_name"] == "plan"
     assert payload["result_data"] == {"foo": "bar"}
@@ -23411,6 +23866,7 @@ async def test_get_task_tool_allows_bound_secondary_agent_access(
 
     class _TaskSessionManager(_NoopSessionManager):
         def __init__(self) -> None:
+            super().__init__()
             self.session_factory = super().session_factory
 
     agent_loop = AgentLoop(
@@ -23446,6 +23902,7 @@ async def test_get_task_tool_allows_bound_secondary_agent_access(
             description="Desc",
             expected_output=None,
             status="paused",
+            attempt_number=0,
             priority=0,
             agent_id="agent-1",
             source_type="agent",
@@ -23503,6 +23960,7 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
 
     class _TaskSessionManager(_NoopSessionManager):
         def __init__(self) -> None:
+            super().__init__()
             self.session_factory = super().session_factory
 
     agent_loop = AgentLoop(
@@ -23535,6 +23993,7 @@ async def test_get_task_tool_allows_primary_agent_to_access_bound_secondary_task
             description="Desc",
             expected_output=None,
             status="paused",
+            attempt_number=0,
             priority=0,
             created_by="user@example.com",
             agent_id="system:architect",
@@ -23635,6 +24094,7 @@ async def test_get_task_tool_allows_exact_creator_agent_for_delegated_task(
 ) -> None:
     class _TaskSessionManager(_NoopSessionManager):
         def __init__(self) -> None:
+            super().__init__()
             self.session_factory = super().session_factory
 
     agent_loop = AgentLoop(
@@ -23667,6 +24127,7 @@ async def test_get_task_tool_allows_exact_creator_agent_for_delegated_task(
             description="Desc",
             expected_output=None,
             status="paused",
+            attempt_number=0,
             priority=0,
             created_by="user@example.com",
             agent_id="agent-1",
@@ -23727,6 +24188,7 @@ async def test_get_task_tool_still_rejects_unrelated_owner(
 
     class _TaskSessionManager(_NoopSessionManager):
         def __init__(self) -> None:
+            super().__init__()
             self.session_factory = super().session_factory
 
     agent_loop = AgentLoop(
@@ -23790,6 +24252,7 @@ async def test_get_task_tool_rejects_cross_user_task_even_for_system_agent(
 
     class _TaskSessionManager(_NoopSessionManager):
         def __init__(self) -> None:
+            super().__init__()
             self.session_factory = super().session_factory
 
     agent_loop = AgentLoop(
@@ -24158,7 +24621,7 @@ def test_append_assistant_deliverable_event_uses_valid_reference_event_shape() -
         export_metadata={"available": ["copy", "open_full_view"]},
     )
 
-    _append_assistant_deliverable_event(events, deliverable)
+    _append_assistant_deliverable_event(events, deliverable, turn_id="report-turn")
 
     assert len(events) == 1
     event = events[0]
@@ -24167,6 +24630,7 @@ def test_append_assistant_deliverable_event_uses_valid_reference_event_shape() -
     assert "assistant_deliverable" not in INTARIS_APPENDABLE_EVENT_TYPES
     assert event.data == {
         "event": "assistant_deliverable",
+        "turn_id": "report-turn",
         "deliverable_id": "dlv-direct",
         "lineage_id": "dlv-direct",
         "revision": 1,
@@ -24180,6 +24644,7 @@ def test_append_assistant_deliverable_event_uses_valid_reference_event_shape() -
 
 def test_direct_chat_deliverable_event_is_deferred_until_turn_finalization() -> None:
     ctx = _post_deliverable_ctx()
+    ctx.turn_id = "turn-1"
     events: list[SessionEvent] = [
         SessionEvent(
             type="assistant_message",
@@ -24207,6 +24672,7 @@ def test_direct_chat_deliverable_event_is_deferred_until_turn_finalization() -> 
     assert [event.type for event in events] == ["assistant_message", "lifecycle"]
     assert events[-1].data["event"] == "assistant_deliverable"
     assert events[-1].data["deliverable_id"] == "dlv-final"
+    assert events[-1].data["turn_id"] == "turn-1"
     assert ctx.pending_assistant_deliverables == []
 
 
@@ -24265,6 +24731,94 @@ def test_step_deliverable_is_not_queued_as_direct_chat_assistant_deliverable() -
 
     assert events == []
     assert ctx.pending_assistant_deliverables == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_text", ["", "Here is the original report."])
+@pytest.mark.parametrize("format_name", ["markdown", "rich", "html"])
+async def test_direct_turn_forwards_existing_workflow_deliverable(
+    monkeypatch: pytest.MonkeyPatch, final_text: str, format_name: str
+) -> None:
+    deliverable = Deliverable(
+        deliverable_id="dlv_f06aa3d869e24bb5b6a9a8569c331515",
+        step_run_id="source-workflow-step",
+        version=3,
+        revision=3,
+        content="<h1>Canonical report</h1>" if format_name == "html" else "# Canonical report",
+        format=format_name,
+        title="Canonical report",
+        target=None,
+        outputs={"verified": True},
+        rich_payload={"blocks": [{"type": "markdown", "content": "# Canonical report"}]}
+        if format_name == "rich"
+        else None,
+    )
+
+    class _ForwardLLM(_EmptyThenTextDirectLLM):
+        async def stream_generate(self, messages, **kwargs):
+            self.calls.append([dict(message) for message in messages])
+            if len(self.calls) == 1:
+                yield {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "forward-original-report",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "attach_artifact",
+                                            "arguments": json.dumps(
+                                                {"content_ref": deliverable.deliverable_id}
+                                            ),
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ]
+                }
+            else:
+                yield {"choices": [{"delta": {"content": final_text}, "finish_reason": "stop"}]}
+
+    llm = _ForwardLLM()
+    loop = _step_complete_test_loop(llm)
+    # The resolver's existing ownership/project checks are a separate boundary.
+    resolve = AsyncMock(return_value=(None, deliverable))
+    monkeypatch.setattr(loop, "_resolve_attachable_content_ref", resolve)
+    recorded = AsyncMock(wraps=loop.providers.guardrails.record_events)
+    monkeypatch.setattr(loop.providers.guardrails, "record_events", recorded)
+    ctx = _step_complete_test_context(StepDefinition(name="direct", type="run", prompt=""))
+    ctx.policy = CHAT_POLICY
+    ctx.controller_tool_surface = agent_loop_module.CONTROLLER_TOOL_SURFACE_DIRECT_CHAT
+    ctx.system_initiated = True
+    ctx.orchestration_mode = OrchestrationMode.FULL
+
+    output = await loop.run_step(ctx)
+
+    assert output.error is None
+    assert len(llm.calls) == 2
+    assert output.deliverable_id == deliverable.deliverable_id
+    assert output.deliverable_version == 3
+    assert output.deliverable_format == format_name
+    assert output.content == deliverable.content
+    assert output.outputs == {"verified": True}
+    assert deliverable.step_run_id == "source-workflow-step"
+    assert ctx.current_deliverable is None
+    assert ctx.turn_result_deliverable is deliverable
+    resolve.assert_awaited_once_with(ctx, deliverable.deliverable_id)
+    events = [event for call in recorded.await_args_list for event in call.kwargs.get("events", [])]
+    references = [event for event in events if event.data.get("event") == "assistant_deliverable"]
+    assert len(references) == 1
+    assert references[0].data["deliverable_id"] == deliverable.deliverable_id
+    assert references[0].data["revision"] == 3
+    assert "rich_payload" not in references[0].data
+    assert not any(
+        event.type == "tool_call" and event.data.get("name") == "write_deliverable"
+        for event in events
+    )
 
 
 def test_append_tool_events_persist_assistant_phase_from_runtime_metadata() -> None:
@@ -24890,6 +25444,7 @@ async def test_finalize_regular_tool_result_does_not_claim_disabled_store_recove
 @pytest.mark.asyncio
 async def test_finalize_skill_load_emits_persisted_and_live_system_notice() -> None:
     recorded_events: list[SessionEvent] = []
+    router = ToolRouter(guardrails=_NoopGuardrails())
 
     class _SessionCache(_NoopSessionCache):
         async def append_recorded_events(
@@ -24908,7 +25463,7 @@ async def test_finalize_skill_load_emits_persisted_and_live_system_notice() -> N
         session_cache=_SessionCache(),
         context_assembler=_FakeContextAssembler(),
         compaction_strategy=SimpleNamespace(),
-        tool_router=SimpleNamespace(),
+        tool_router=router,
         remember_queue=_NoopRememberQueue(),
         event_bus=event_bus,
         session_lock=SessionLock(),
@@ -24936,15 +25491,19 @@ async def test_finalize_skill_load_emits_persisted_and_live_system_notice() -> N
             arguments={"skill_id": "skill_coding"},
         ),
         tool_id="builtin:skill_load",
-        result=ToolResult(
-            output="Loaded skill instructions.",
-            metadata={
-                "skill_activation": {
-                    "skill_id": "skill_coding",
-                    "name": "Cognis Coding",
+        result=router._sanitize_result(
+            "skill_load",
+            ToolResult(
+                output="Loaded skill instructions.",
+                metadata={
+                    "skill_activation": {
+                        "skill_id": "skill_coding",
+                        "name": "Cognis Coding",
+                    },
+                    "discovered_tool_ids": [],
                 },
-                "discovered_tool_ids": [],
-            },
+            ),
+            50_000,
         ),
         events_to_record=[],
         messages=[],
@@ -25947,7 +26506,7 @@ def test_step_prompt_respects_expected_output_without_allowing_silent_completion
     assert "write_deliverable before finalization" in prompt
 
 
-def test_plan_step_prompt_has_read_only_boundaries() -> None:
+def test_plan_step_prompt_preserves_explicit_read_only_and_deferred_ownership() -> None:
     agent_loop = AgentLoop(
         providers=SimpleNamespace(),
         session_manager=SimpleNamespace(),
@@ -25961,7 +26520,12 @@ def test_plan_step_prompt_has_read_only_boundaries() -> None:
         pause_waiter=PauseWaiter(),
     )
     ctx = StepContext(
-        step_definition=StepDefinition(name="plan", type="run", prompt="Create a plan."),
+        step_definition=StepDefinition(
+            name="plan",
+            type="run",
+            prompt="Create a plan. Read-only; do not modify files.",
+            defer_to=["implement", "commit", "summary"],
+        ),
         session=_SessionStub(session_id="sess-1", user_email="user@example.com"),
         conversation=SimpleNamespace(conversation_id="conv-1"),
         agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
@@ -25973,9 +26537,9 @@ def test_plan_step_prompt_has_read_only_boundaries() -> None:
 
     prompt = agent_loop._build_step_prompt(ctx)
 
-    assert "This step is read-only" in prompt
-    assert "Defer implementation, validation, documentation, commit, and final delivery" in prompt
-    assert "Complete only the active step" in prompt
+    assert "Read-only; do not modify files." in prompt
+    assert "Deferred downstream:\n- implement\n- commit\n- summary" in prompt
+    assert "Complete the active step's objective and explicit responsibilities above" in prompt
 
 
 def test_workflow_step_reminder_overrides_task_and_skill_instructions() -> None:
@@ -26438,6 +27002,172 @@ async def test_parallel_orchestration_batches_do_not_batch_duplicate_managed_cre
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_limit,duplicate", [(None, False), (3, False), (None, True)])
+async def test_delegate_run_after_todo_prefix_fans_out_at_dispatch(
+    tool_limit: int | None,
+    duplicate: bool,
+) -> None:
+    """A settled todo prefix must not turn the following child run into serial joins."""
+    trace: list[str] = []
+    started: set[str] = set()
+    all_started = asyncio.Event()
+    results: list[str] = []
+    active = 0
+    peak_active = 0
+    expected_indices = (
+        list(range(tool_limit)) if tool_limit else [0, 2, 3] if duplicate else list(range(4))
+    )
+    expected_peak = 2 if duplicate else min(3, len(expected_indices))
+
+    class _PrefixDelegationLLM(_SingleTextLLM):
+        async def stream_generate(self, messages, **kwargs):
+            if started:
+                yield {"choices": [{"delta": {"content": "Research completed."}}]}
+                return
+            calls = [
+                ("todo-prefix", "todo_write", {"todos": []}),
+                *[
+                    (
+                        f"delegate-{index}",
+                        "delegate",
+                        {"task": f"Research topic {0 if duplicate and index == 1 else index}"},
+                    )
+                    for index in range(4)
+                ],
+            ]
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": call_id,
+                                    "function": {"name": name, "arguments": json.dumps(arguments)},
+                                }
+                                for index, (call_id, name, arguments) in enumerate(calls)
+                            ],
+                        },
+                    }
+                ],
+            }
+
+    agent_loop = AgentLoop(
+        providers=SimpleNamespace(llm=_PrefixDelegationLLM(), guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+
+    # Hold the first three joins until they have all started; the fourth
+    # must wait for a slot, not for an entire sequential run.
+    async def handle(tc, **kwargs):
+        nonlocal active, peak_active
+        assert trace[0] == "todo-prefix"
+        started.add(tc.call_id)
+        trace.append(tc.call_id)
+        active += 1
+        peak_active = max(peak_active, active)
+        if not (duplicate and tc.call_id == "delegate-0"):
+            cohort_started = started - {"delegate-0"} if duplicate else started
+            if len(cohort_started) >= expected_peak:
+                all_started.set()
+            await asyncio.wait_for(all_started.wait(), 2)
+        await asyncio.sleep(0)
+        active -= 1
+        return ToolResult(output=f"done-{tc.call_id}")
+
+    async def on_result(call_id, tool_name, result, *args):
+        if call_id == "todo-prefix":
+            trace.append(call_id)
+        results.append(call_id)
+
+    agent_loop._handle_orchestration_tool = handle  # type: ignore[assignment]
+    ctx = StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-1",
+            intaris_session_id="sess-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-1", title=None, title_source="unset"),
+        agent=AgentDefinition(
+            agent_id="agent-1",
+            owner_email="user@example.com",
+            name="Agent",
+            execution={"max_tool_calls": tool_limit} if tool_limit is not None else {},
+        ),
+        policy=CHAT_POLICY,
+        controller_tool_surface=CONTROLLER_TOOL_SURFACE_DIRECT_CHAT,
+        user_message="Research four topics.",
+    )
+    ctx._delegate_parallel_max = 3
+
+    output = await asyncio.wait_for(agent_loop.run_step(ctx, on_tool_result=on_result), 10)
+
+    assert output is not None
+    assert started == {f"delegate-{index}" for index in expected_indices}
+    assert peak_active == expected_peak
+    assert [call_id for call_id in results if call_id in started] == [
+        f"delegate-{index}" for index in expected_indices
+    ]
+    assert set(results) == {"todo-prefix", *[f"delegate-{index}" for index in range(4)]}
+
+
+@pytest.mark.asyncio
+async def test_parallel_delegate_slot_rechecks_cancellation_before_start() -> None:
+    """A child waiting for a fanout slot must not be created after cancellation."""
+    from cognis.core.agent_loop import StepInterrupted
+
+    agent_loop = _post_deliverable_loop()
+    ctx = _post_deliverable_ctx()
+    ctx.cancel_event = asyncio.Event()
+    invoked: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def handle(tc, **kwargs):
+        invoked.append(tc.call_id)
+        first_started.set()
+        await release_first.wait()
+        return ToolResult(output="finished first child")
+
+    async def noop_flush(*args, **kwargs):
+        return None
+
+    agent_loop._handle_orchestration_tool = handle  # type: ignore[assignment]
+    agent_loop._flush_events_incremental = noop_flush  # type: ignore[assignment]
+    calls = [
+        (index, ToolCall(call_id=f"delegate-{index}", name="delegate", arguments={}))
+        for index in range(2)
+    ]
+
+    task = asyncio.create_task(
+        agent_loop._execute_parallel_orchestration_run(
+            ctx,
+            calls,
+            events_to_record=[],
+            reason="tool_call:delegate_batch",
+            error_label="delegate",
+            max_concurrency=1,
+        )
+    )
+    await asyncio.wait_for(first_started.wait(), 2)
+    ctx.cancel_event.set()
+    release_first.set()
+    with pytest.raises(StepInterrupted):
+        await asyncio.wait_for(task, 2)
+    assert invoked == ["delegate-0"]
+
+
+@pytest.mark.asyncio
 async def test_parallel_orchestration_batches_stop_after_unbatched_prefix_call() -> None:
     """Later batches must not execute before earlier sequential/controller tools."""
 
@@ -26690,6 +27420,25 @@ class _ReasoningRecordingGuardrails(_RecordingGuardrails):
 
 
 @pytest.mark.asyncio
+async def test_first_turn_intention_is_submitted_without_waiting_for_generation() -> None:
+    guardrails = _ReasoningRecordingGuardrails()
+    loop = _step_complete_test_loop(
+        _StepCompleteRetryLLM(
+            first_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+            second_arguments={"summary": "done", "metadata": {"lifecycle_strategy": {}}},
+        )
+    )
+    loop.providers.guardrails = guardrails
+    ctx = _step_complete_test_context(_lifecycle_strategy_step())
+    ctx.bootstrap_wait_for_intention = True
+    ctx.task_title = "Greeting"
+    ctx.task_description = "Reply to the first greeting."
+    await loop.run_step(ctx)
+    assert len(guardrails.reasoning_reports) == 1
+    assert guardrails.reasoning_reports[0]["wait_for_intention"] is False
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("is_retry", [False, True])
 async def test_workflow_step_reports_full_input_once_as_user_message(is_retry: bool) -> None:
     guardrails = _ReasoningRecordingGuardrails()
@@ -26723,3 +27472,234 @@ async def test_workflow_step_reports_full_input_once_as_user_message(is_retry: b
             "wait_timeout_ms": _BOOTSTRAP_INTENTION_WAIT_MS,
         }
     ]
+
+
+class _AnswerOnceLLM:
+    """Replies with text every cycle and never answers comments."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[dict[str, object]]] = []
+        self.tools: list[list[dict[str, Any]]] = []
+
+    def count_tokens(self, text: str, model: str | None = None) -> int:
+        del model
+        return len(text)
+
+    async def get_model_info(self, model: str | None, **_: object) -> SimpleNamespace:
+        del model
+        return _test_model_info()
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        self.tools.append(list(_.get("tools") or []))
+        yield {"choices": [{"delta": {"content": f"Reply {len(self.calls)}"}}]}
+
+
+class _OpenCommentsAgents:
+    def __init__(self) -> None:
+        self.loads = 0
+
+    async def scope(self, session_id: str, turn_id: str | None) -> object:
+        assert turn_id, "Packet lookup must happen after turn identity is assigned"
+        return SimpleNamespace(session_id=session_id, turn_id=turn_id)
+
+    async def sent_comments(self, scope: object) -> list[object]:
+        return [
+            SimpleNamespace(
+                entry=SimpleNamespace(thread_id="fbt_title", body="Change the title to TAHÁK")
+            )
+        ]
+
+    async def open_comments(self, scope: object) -> list[object]:
+        self.loads += 1
+        return await self.sent_comments(scope)
+
+
+def _comment_turn_context() -> StepContext:
+    return StepContext(
+        step_definition=StepDefinition(name="direct", type="run", prompt=""),
+        session=_SessionStub(
+            session_id="sess-comments",
+            intaris_session_id="sess-comments",
+            mnemory_session_id=None,
+            user_email="user@example.com",
+            agent_id="agent-1",
+        ),
+        conversation=SimpleNamespace(conversation_id="conv-comments"),
+        agent=AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent"),
+        todos=[],
+        policy=CHAT_POLICY,
+        user_message="Fix the title",
+        user_attachments=[],
+        attachment_notice=None,
+        prior_context=None,
+        system_initiated=False,
+        is_retry=False,
+        workflow_state=None,
+        step_run_id=None,
+        executor_environment=None,
+        cancel_event=None,
+        bootstrap_wait_for_intention=False,
+        tool_registry=None,
+        executor_connection=None,
+    )
+
+
+def _comment_turn_loop(fake_llm: object, agents: object) -> AgentLoop:
+    loop = AgentLoop(
+        providers=SimpleNamespace(llm=fake_llm, guardrails=_NoopGuardrails()),
+        session_manager=_NoopSessionManager(),
+        session_cache=_NoopSessionCache(),
+        context_assembler=_FakeContextAssembler(),
+        compaction_strategy=SimpleNamespace(),
+        tool_router=SimpleNamespace(),
+        remember_queue=_NoopRememberQueue(),
+        event_bus=_NoopEventBus(),
+        session_lock=SessionLock(),
+        pause_waiter=PauseWaiter(),
+    )
+    loop.configure_feedback_tools(agents)  # type: ignore[arg-type]
+    return loop
+
+
+@pytest.mark.asyncio
+async def test_unanswered_sent_comments_get_exactly_one_reminder() -> None:
+    fake_llm = _AnswerOnceLLM()
+    agent_loop = _comment_turn_loop(fake_llm, _OpenCommentsAgents())
+    ctx = _comment_turn_context()
+    output = await agent_loop.run_step(ctx)
+
+    assert output is not None and output.error is None
+    # The model ran twice: the original answer and one reminder, never a loop.
+    assert len(fake_llm.calls) == 2
+    reminders = [
+        message
+        for message in fake_llm.calls[1]
+        if message["role"] == "system" and "still unanswered" in str(message["content"])
+    ]
+    assert len(reminders) == 1
+    assert "fbt_title" in str(reminders[0]["content"])
+    assert "comment_reply" in str(reminders[0]["content"])
+    assert ctx.feedback_comment_turn is True
+    exposed = agent_loop._build_controller_tool_exposure(ctx).schemas
+    assert "comment_reply" in {schema["function"]["name"] for schema in exposed}
+    ctx.feedback_comment_turn = False
+    exposed = agent_loop._build_controller_tool_exposure(ctx).schemas
+    assert "comment_reply" not in {schema["function"]["name"] for schema in exposed}
+
+
+class _CommentCallLLM(_AnswerOnceLLM):
+    def __init__(self, name: str, arguments: dict[str, Any]) -> None:
+        super().__init__()
+        self.name, self.arguments = name, arguments
+
+    async def stream_generate(self, messages: list[dict[str, object]], **_: object):
+        self.calls.append([dict(message) for message in messages])
+        self.tools.append(list(_.get("tools") or []))
+        if len(self.calls) == 1:
+            yield {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_comment_answer",
+                                    "type": "function",
+                                    "function": {
+                                        "name": self.name,
+                                        "arguments": json.dumps(self.arguments),
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            }
+        else:
+            yield {"choices": [{"delta": {"content": "Finished"}}]}
+
+
+class _AnswerableCommentsAgents(_OpenCommentsAgents):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handled: list[ToolCall] = []
+
+    async def open_comments(self, scope: object) -> list[object]:
+        return []  # The packet still exists even after the comments are answered.
+
+    async def handle(self, tc: ToolCall, session_id: str, turn_id: str, **_: Any) -> ToolResult:
+        self.handled.append(tc)
+        return ToolResult(call_id=tc.call_id, output="Comment answered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("comment_reply", {"comment_id": "fbt_title", "resolve": True}),
+        ("feedback_submission_read", {"submission_id": "fbsu_title", "manifest_hash": "a" * 64}),
+        (
+            "feedback_submission_record",
+            {
+                "submission_id": "fbsu_title",
+                "manifest_hash": "a" * 64,
+                "action": "disposition",
+                "entry_version_id": "fbv_title",
+                "disposition": "addressed",
+                "reason": "Fixed",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_feedback_tools_are_directly_callable_through_real_turn_dispatch(
+    name: str, arguments: dict[str, Any], wrapped: bool
+) -> None:
+    """Schemas in the actual first model request and dispatch must agree, without discovery."""
+    llm = _CommentCallLLM(
+        "call_tool" if wrapped else name,
+        {"tool": name, "arguments": arguments} if wrapped else arguments,
+    )
+    agents = _AnswerableCommentsAgents()
+    loop = _comment_turn_loop(llm, agents)
+    ctx = _comment_turn_context()
+    # Exercise the production inventory path too, not just a registry-free test double.
+    ctx.tool_registry = ToolRegistry()
+    output = await loop.run_step(ctx)
+    assert output is not None and output.error is None
+    assert [call.name for call in agents.handled] == [name]
+    assert agents.handled[0].arguments == arguments
+    names = {tool["function"]["name"] for tool in llm.tools[0]}
+    assert {"comment_reply", "feedback_submission_read", "feedback_submission_record"} <= names
+    assert any(
+        message.get("role") == "tool" and message.get("content") == "Comment answered"
+        for message in llm.calls[1]
+    )
+    assert len(llm.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_comment_reply_invalid_arguments_never_reach_the_feedback_service() -> None:
+    llm = _CommentCallLLM("comment_reply", {"comment_id": "fbt_title", "resolve": "yes"})
+    agents = _AnswerableCommentsAgents()
+    output = await _comment_turn_loop(llm, agents).run_step(_comment_turn_context())
+    assert output is not None and output.error is None
+    assert agents.handled == []
+    assert any(
+        message.get("role") == "tool" and "argument" in str(message.get("content")).lower()
+        for message in llm.calls[1]
+    )
+
+
+@pytest.mark.asyncio
+async def test_turn_without_sent_comments_does_not_expose_feedback_tools() -> None:
+    agents = _AnswerableCommentsAgents()
+    agents.sent_comments = AsyncMock(return_value=[])  # type: ignore[method-assign]
+    llm = _AnswerOnceLLM()
+    output = await _comment_turn_loop(llm, agents).run_step(_comment_turn_context())
+    assert output is not None and output.error is None
+    names = {tool["function"]["name"] for tool in llm.tools[0]}
+    assert not names & {"comment_reply", "feedback_submission_read", "feedback_submission_record"}
+    assert len(llm.calls) == 1

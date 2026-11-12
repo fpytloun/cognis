@@ -25,8 +25,14 @@ from cognis.models.skill import (
     SkillToolSpec,
 )
 from cognis.models.tool import ToolDefinition, ToolSource, stable_tool_id
-from cognis.store.models import SkillRow, SkillVersionRow
-from cognis.store.queries import list_skill_assets
+from cognis.store.models import Agent, SkillAssetRow, SkillRow, SkillVersionRow
+from cognis.store.queries import list_skill_assets_for_versions, list_skills
+from cognis.store.skill_usage import (
+    list_agent_skill_usage,
+    skill_usage_payload,
+    skill_usage_tracking_started,
+)
+from cognis.tools.builtin.tool_search import bm25_scores, tokenize_search_text
 
 logger = get_logger(__name__)
 
@@ -88,16 +94,19 @@ def load_skill_tool_names(agent: AgentDefinition | None) -> set[str]:
 # ---------------------------------------------------------------------------
 
 
-def extract_agent_skill_refs(agent: AgentDefinition | None) -> list[AgentSkillRef]:
+def extract_agent_skill_refs(agent: AgentDefinition | Agent | None) -> list[AgentSkillRef]:
     """Extract DB skill references from agent configuration.
 
     Supports both new-style refs (skill_id + enabled) and ignores
     legacy inline entries (which have tool_names instead).
     """
-    if agent is None or not isinstance(agent.skills, dict):
-        return []
+    return _skill_refs(agent.skills if agent is not None else None)
 
-    raw_items = agent.skills.get("items")
+
+def _skill_refs(skills: Any) -> list[AgentSkillRef]:
+    if not isinstance(skills, dict):
+        return []
+    raw_items = skills.get("items")
     if not isinstance(raw_items, list):
         return []
 
@@ -122,6 +131,48 @@ def extract_agent_skill_refs(agent: AgentDefinition | None) -> list[AgentSkillRe
     return refs
 
 
+def agent_skill_assignment(
+    agent_skills: dict[str, Any] | None, skill_id: str, *, attach_to_all_agents: bool
+) -> str:
+    """Classify how a skill reaches an agent: global, auto_loaded, attached, or unattached."""
+
+    if attach_to_all_agents and skill_id not in _SCOPED_SYSTEM_SKILL_IDS:
+        return "global"
+    for ref in _skill_refs(agent_skills):
+        if ref.skill_id == skill_id and ref.enabled:
+            return "auto_loaded" if ref.auto_load_instructions else "attached"
+    return "unattached"
+
+
+async def agent_skill_usage_report(
+    session: AsyncSession, *, agent: Agent, owner_email: str, skill_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Return usage and curation suggestions for skills attached to or used by an agent.
+
+    With ``skill_id``, return only that visible skill, even when it is unused.
+    """
+
+    usage = await list_agent_skill_usage(session, agent.agent_id)
+    tracking_started = await skill_usage_tracking_started(session)
+    report: list[dict[str, Any]] = []
+    for row in await list_skills(session, owner_email=owner_email):
+        if not is_agent_assignable_skill(row.skill_id) or skill_id not in {None, row.skill_id}:
+            continue
+        assignment = agent_skill_assignment(
+            agent.skills, row.skill_id, attach_to_all_agents=row.auto_load
+        )
+        if skill_id is None and assignment == "unattached" and row.skill_id not in usage:
+            continue
+        payload = skill_usage_payload(
+            usage.get(row.skill_id),
+            assignment=assignment,
+            agent_updated_at=agent.updated_at,
+            tracking_started=tracking_started,
+        )
+        report.append({"skill_id": row.skill_id, "name": row.name, **payload})
+    return report
+
+
 # ---------------------------------------------------------------------------
 # DB-backed skill resolution
 # ---------------------------------------------------------------------------
@@ -144,12 +195,14 @@ async def resolve_skills_for_agent(
     2. Skills attached to all agents (alphabetical by name)
     3. Other visible skills (alphabetical by name)
 
-    All visible skills remain discoverable via prompt metadata and ``skill_load``.
-    Attached skills are marked so they can be highlighted in the prompt and
-    exposed by default through the deferred tool-loading path.
+    All visible skills remain loadable with ``skill_load``. Only attached
+    skills are advertised in the prompt and exposed by default through the
+    deferred tool-loading path; the rest are found with ``skill_search``.
     """
     import sqlalchemy as sa
     from sqlalchemy import select
+
+    from cognis.core.skill_access import list_readable_skills
 
     # Get agent-specified skill refs
     agent_refs = extract_agent_skill_refs(agent)
@@ -160,14 +213,17 @@ async def resolve_skills_for_agent(
 
     # Fetch all visible skills for this owner
     stmt = select(SkillRow).order_by(SkillRow.name)
-    if owner_email is not None:
-        stmt = stmt.where(
-            sa.or_(SkillRow.owner_email == owner_email, SkillRow.owner_email.is_(None))
-        )
-    result = await session.execute(stmt)
+    if owner_email is not None and agent.owner_email != owner_email:
+        rows = await list_readable_skills(session, actor_email=owner_email, agent_id=agent.agent_id)
+    else:
+        if owner_email is not None:
+            stmt = stmt.where(
+                sa.or_(SkillRow.owner_email == owner_email, SkillRow.owner_email.is_(None))
+            )
+        rows = list((await session.scalars(stmt)).all())
     all_skills = {
         row.skill_id: row
-        for row in result.scalars().all()
+        for row in rows
         if include_scoped_system_skills or is_agent_assignable_skill(row.skill_id)
     }
 
@@ -205,6 +261,16 @@ async def resolve_skills_for_agent(
     # Resolve versions
     resolved: list[ResolvedSkill] = []
     version_snapshot: dict[str, str] = {}
+    version_ids = [row.current_version_id for row in all_skills.values() if row.current_version_id]
+    versions: dict[str, SkillVersionRow] = {}
+    assets_by_version: dict[str, list[SkillAssetRow]] = {}
+    if version_ids:
+        version_result = await session.execute(
+            select(SkillVersionRow).where(SkillVersionRow.version_id.in_(version_ids))
+        )
+        versions = {row.version_id: row for row in version_result.scalars().all()}
+        for asset in await list_skill_assets_for_versions(session, list(versions)):
+            assets_by_version.setdefault(asset.skill_version_id, []).append(asset)
 
     for skill_id in ordered_skill_ids:
         skill_row = all_skills[skill_id]
@@ -214,14 +280,10 @@ async def resolve_skills_for_agent(
         version_id = skill_row.current_version_id
 
         if version_id:
-            # Fetch versioned content
-            ver_result = await session.execute(
-                select(SkillVersionRow).where(SkillVersionRow.version_id == version_id)
-            )
-            version_row = ver_result.scalar_one_or_none()
+            version_row = versions.get(version_id)
             if version_row:
                 tools = _parse_tool_specs_from_version(version_row.tools)
-                asset_rows = await list_skill_assets(session, version_row.version_id)
+                asset_rows = assets_by_version.get(version_row.version_id, [])
                 asset_manifest = (
                     [
                         SkillAssetRef(
@@ -341,53 +403,82 @@ def _parse_asset_manifest(
 # ---------------------------------------------------------------------------
 
 
-def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
-    """Build compact XML metadata for the immutable prompt prefix.
+MAX_SKILL_DESCRIPTION_CHARS = 1024
+_INSTRUCTION_EXCERPT_CHARS = 150
 
-    This is token-efficient: only stable identifiers and summaries are
-    included.  Full instructions are loaded on demand via ``skill_load``.
-    Version ids and content hashes are intentionally excluded to keep
-    the immutable prefix stable for prompt caching.
+
+def skill_selection_description(description: str | None, instructions: str | None) -> str:
+    """Return the bounded text an agent uses to decide whether to load a skill."""
+
+    text = (description or "").strip()
+    if not text and instructions:
+        text = " ".join(instructions[:_INSTRUCTION_EXCERPT_CHARS].split())
+        if len(instructions) > _INSTRUCTION_EXCERPT_CHARS:
+            text += "..."
+    if len(text) > MAX_SKILL_DESCRIPTION_CHARS:
+        text = text[: MAX_SKILL_DESCRIPTION_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def build_available_skills_metadata(resolved: ResolvedSkillSet) -> str:
+    """Build the prompt catalog of skills attached to this agent.
+
+    Only attached skills are listed, with id, name, and description. Skills
+    whose instructions are already auto-loaded are omitted; other visible
+    skills are only counted and reachable through ``skill_search``. Version
+    ids and hashes are excluded to keep the immutable prefix cache-stable.
     """
-    if not resolved.skills:
+    listed = sorted(
+        (skill for skill in resolved.skills if skill.attached and not skill.auto_load_instructions),
+        key=lambda skill: (skill.auto_load, skill.name.lower(), skill.skill_id),
+    )
+    searchable_count = sum(1 for skill in resolved.skills if not skill.attached)
+    if not listed and not searchable_count:
         return ""
 
     lines: list[str] = []
-    ordered_skills = sorted(
-        resolved.skills,
-        key=lambda skill: (
-            0 if skill.attached else 1,
-            0 if skill.auto_load else 1,
-            skill.name.lower(),
-            skill.skill_id,
-        ),
-    )
-    for skill in ordered_skills:
+    for skill in listed:
         lines.append("  <skill>")
-        lines.append(f"    <name>{skill.name}</name>")
         lines.append(f"    <skill_id>{skill.skill_id}</skill_id>")
-        # Use the real skill description so the model can decide which
-        # skills are relevant.  Fall back to a truncated instruction hint
-        # if no description is set.
-        if skill.description:
-            desc = skill.description
-        elif skill.instructions:
-            desc = skill.instructions[:150].replace("\n", " ").strip()
-            if len(skill.instructions) > 150:
-                desc += "..."
-        else:
-            desc = f"Skill {skill.name}. Use skill_load for details."
-        lines.append(f"    <description>{desc}</description>")
-        if skill.attached:
-            lines.append("    <attached>true</attached>")
-        if skill.auto_load_instructions:
-            lines.append("    <loaded>true</loaded>")
-            lines.append("    <auto_load_instructions>true</auto_load_instructions>")
-        if skill.auto_load:
-            lines.append("    <attach_to_all_agents>true</attach_to_all_agents>")
+        lines.append(f"    <name>{skill.name}</name>")
+        description = skill_selection_description(skill.description, skill.instructions)
+        if description:
+            lines.append(f"    <description>{description}</description>")
         lines.append("  </skill>")
-
+    if searchable_count:
+        lines.append(
+            f"  {searchable_count} more skills are available; find them with skill_search."
+        )
     return "<available_skills>\n" + "\n".join(lines) + "\n</available_skills>"
+
+
+def search_skill_rows(rows: list[SkillRow], query: str, *, limit: int = 10) -> list[dict[str, str]]:
+    """Rank visible skills by name, description, and tags for ``skill_search``."""
+
+    normalized_query = query.strip().lower()
+    query_terms = tokenize_search_text(normalized_query)
+    candidates = [row for row in rows if is_agent_assignable_skill(row.skill_id)]
+    if not query_terms or not candidates:
+        return []
+    documents = [
+        f"{row.skill_id} {row.name} {row.description or ''} {' '.join(row.tags or [])}"
+        for row in candidates
+    ]
+    scored: list[tuple[float, SkillRow]] = []
+    for row, score in zip(candidates, bm25_scores(documents, query_terms), strict=True):
+        if normalized_query in row.name.lower() or normalized_query == row.skill_id.lower():
+            score += 50.0
+        if score > 0:
+            scored.append((score, row))
+    scored.sort(key=lambda item: (-item[0], item[1].name.lower(), item[1].skill_id))
+    return [
+        {
+            "skill_id": row.skill_id,
+            "name": row.name,
+            "description": skill_selection_description(row.description, row.instructions),
+        }
+        for _, row in scored[: max(1, min(limit, 20))]
+    ]
 
 
 # ---------------------------------------------------------------------------

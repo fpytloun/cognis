@@ -2,7 +2,7 @@
 
 External LLM/session services are local doubles. StepContext, agent resolution,
 outcome routing, task/step rows and deliverable publication are not mocked.
-The graph is a constructed collector/publisher example, not an operational replay.
+The graph matches the reported v2 handoff; source prompts contain no work data.
 """
 
 import asyncio
@@ -86,11 +86,11 @@ async def test_routed_two_primary_handoff_keeps_collector_internal_and_final_str
         workflow = Workflow.model_validate(
             {
                 "workflow_id": f"wf_{uuid4().hex}",
-                "name": "synthetic-evidence-handoff",
+                "name": "synthetic-catalog-evidence-handoff",
                 "version": 2,
                 "steps": [
                     {
-                        "name": "collect_evidence",
+                        "name": "catalog_evidence",
                         "type": "run",
                         "agent_override": collector_id,
                         "agent_profile_id": "developer",
@@ -122,8 +122,8 @@ async def test_routed_two_primary_handoff_keeps_collector_internal_and_final_str
                                 {"name": "verification", "type": "object", "required": True},
                             ]
                         },
-                        "input": {"type": "last", "source": "collect_evidence"},
-                        "prompt": "Gate partial evidence without changing external records.",
+                        "input": {"type": "last", "source": "catalog_evidence"},
+                        "prompt": "Gate partial coverage. Do not modify catalog entries or attachments.",
                         "completion": {
                             "evaluate": False,
                             "max_attempts": 3,
@@ -157,7 +157,7 @@ async def test_routed_two_primary_handoff_keeps_collector_internal_and_final_str
             attempt_number=attempt,
         )
         async with factory() as db:
-            for agent_id, name in [(collector_id, "Collector"), (final_id, "Publisher")]:
+            for agent_id, name in [(collector_id, "Lumi"), (final_id, "Riker")]:
                 db.add(
                     Agent(
                         agent_id=agent_id,
@@ -335,6 +335,7 @@ async def test_routed_two_primary_handoff_keeps_collector_internal_and_final_str
             return SimpleNamespace(
                 tool_registry=ToolRegistry(),
                 rebuild_tool_registry=None,
+                refresh_executor_pool=None,
                 executor_connection=None,
                 executor_environment=None,
                 runtime_info={},

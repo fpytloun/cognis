@@ -98,7 +98,12 @@ async def _patched_queries(rows: list[FakeExecutorRow]):
     """Patch get_executor_row + list_executors used by resolve_executor_pool."""
 
     async def _list_executors(
-        _session, *, owner_email: str, include_shared: bool, executor_ids=None
+        _session,
+        *,
+        owner_email: str,
+        include_shared: bool,
+        executor_ids=None,
+        defer_observed_tools: bool = False,
     ) -> list[Any]:
         return [row for row in rows if executor_ids is None or row.executor_id in executor_ids]
 

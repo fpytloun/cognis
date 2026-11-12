@@ -6,8 +6,11 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from cognis.api.models import DeliverableResponse
 from cognis.models.artifact import AttachmentRef
 from cognis.models.config import GenerationPerformanceSnapshot
+from cognis.models.deliverable import TaskOutputPresentation
+from cognis.models.feedback import IncludedFeedback, SubmissionReceipt, WorkDiffSourceRef
 
 SchemaVersion = Literal[2]
 ChatMode = Literal["default", "plan", "build"]
@@ -148,6 +151,7 @@ class FileDiffRef(StrictModel):
     deletions: int | None = Field(default=None, ge=0)
     content_truncated: bool = False
     source_workstream: WorkstreamRef | None = None
+    feedback_source: WorkDiffSourceRef | None = None
 
 
 class ThinkingBlock(StrictModel):
@@ -187,12 +191,23 @@ class TimelineItemBase(StrictModel):
     stable: bool = True
 
 
+class TaskOutcomeReference(StrictModel):
+    """The task run that produced a result or initiated handling."""
+
+    task_id: str
+    title: str
+    status: str
+    attempt_number: int = Field(ge=1)
+
+
 class MessageTimelineItem(TimelineItemBase):
     kind: Literal["message"] = "message"
     role: Literal["user", "assistant", "system"]
     content: str
     message_id: str
+    task_outcome: TaskOutcomeReference | None = None
     client_message_id: str | None = None
+    message_metadata: dict[str, Any] | None = None
     client_txn_id: str | None = None
     turn_id: str | None = None
     assistant_phase_index: int | None = Field(default=None, ge=0)
@@ -238,6 +253,11 @@ class ToolCallTimelineItem(TimelineItemBase):
     kind: Literal["tool_call"] = "tool_call"
     call_id: str
     tool_name: str
+    # Frozen linkage from a nested program call to its outer execution. These
+    # fields are presentation metadata only; call IDs and sort keys stay canonical.
+    parent_call_id: str | None = None
+    program_id: str | None = None
+    kernel_generation: str | int | None = None
     display_name: str | None = None
     turn_id: str | None = None
     assistant_phase_index: int | None = Field(default=None, ge=0)
@@ -308,6 +328,10 @@ class TaskTimelineItem(TimelineItemBase):
     status: TimelineItemStatus
     result_summary: str | None = None
     deliverable_ids: list[str] = Field(default_factory=list)
+    attempt_number: int = Field(default=1, ge=1)
+    failure_reason: str | None = None
+    partial_result: TaskOutputPresentation | None = None
+    attachments: list[AttachmentRef] = Field(default_factory=list)
 
 
 class QuestionSetTimelineItem(TimelineItemBase):
@@ -377,6 +401,8 @@ class ArtifactTimelineItem(TimelineItemBase):
 
 class AssistantDeliverableTimelineItem(TimelineItemBase):
     kind: Literal["assistant_deliverable"] = "assistant_deliverable"
+    task_outcome: TaskOutcomeReference | None = None
+    turn_id: str | None = None
     deliverable_id: str
     lineage_id: str | None = None
     revision: int | None = None
@@ -385,6 +411,7 @@ class AssistantDeliverableTimelineItem(TimelineItemBase):
     content: str | None = None
     render_metadata: dict[str, Any] | None = None
     export_metadata: dict[str, Any] | None = None
+    deliverable: DeliverableResponse | None = None
 
 
 class FileDiffTimelineItem(TimelineItemBase):
@@ -516,6 +543,7 @@ class TurnCycleState(StrictModel):
 class TimelineWindow(StrictModel):
     items: list[TimelineItem] = Field(default_factory=list)
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
+    history_window_reduced: bool = False
     has_more_before: bool = False
     before_cursor: str | None = None
 
@@ -531,6 +559,7 @@ class TimelineWindow(StrictModel):
 
 class RuntimeActiveTurn(StrictModel):
     turn_id: str
+    primary_client_message_id: str | None = None
     session_id: str
     status: Literal["starting", "running", "waiting", "cancelling"]
     chat_mode: ChatMode | None = None
@@ -728,6 +757,8 @@ class WorkstreamRef(StrictModel):
 
 class WorkDeliverable(StrictModel):
     deliverable_id: str
+    created_at: str | None = None
+    updated_at: str | None = None
     lineage_id: str | None = None
     revision: int | None = None
     sort_key: str = ""
@@ -819,6 +850,11 @@ class WorkCommandEvent(StrictModel):
 
 class WorkArtifact(StrictModel):
     artifact_id: str
+    lineage_id: str | None = None
+    revision: int | None = None
+    latest_revision: int | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
     sort_key: str = ""
     filename: str
     mime_type: str | None = None
@@ -1056,11 +1092,12 @@ class SendMessageV2Request(StrictModel):
     content: str = Field(default="", max_length=100_000)
     attachments: list[AttachmentRef] = Field(default_factory=list, max_length=20)
     chat_mode: ChatMode | None = None
+    feedback: IncludedFeedback | None = None
 
     @model_validator(mode="after")
     def _validate_content_or_attachment(self) -> SendMessageV2Request:
-        if not self.content.strip() and not self.attachments:
-            raise ValueError("content or attachments are required")
+        if not self.content.strip() and not self.attachments and self.feedback is None:
+            raise ValueError("content, attachments, or feedback are required")
         return self
 
 
@@ -1113,6 +1150,34 @@ class CommandV2Response(StrictModel):
     server_time: str
 
 
+class MessageAdmissionV2Response(StrictModel):
+    """Durable processing metadata for an accepted message, without its content."""
+
+    conversation_id: str
+    client_txn_id: str
+    client_message_id: str
+    turn_id: str
+    status: Literal[
+        "queued",
+        "claimed",
+        "running",
+        "absorbing",
+        "recoverable",
+        "completed",
+        "failed",
+        "cancelled",
+        "absorbed",
+        "ambiguous",
+    ]
+    started: bool
+    admission_order: int = Field(ge=0)
+    before_client_message_id: str | None = None
+    input_persisted: bool = Field(
+        default=False,
+        description="Exact canonical user input confirmed; false means unconfirmed, not absent.",
+    )
+
+
 class SendMessageV2Response(StrictModel):
     status: Literal["accepted", "queued", "duplicate"]
     client_txn_id: str
@@ -1122,6 +1187,7 @@ class SendMessageV2Response(StrictModel):
     queue_id: str | None = None
     cursor: str | None = None
     server_time: str
+    feedback_receipt: SubmissionReceipt | None = None
 
 
 class ControlMutationV2Request(StrictModel):
@@ -1181,6 +1247,7 @@ class TimelineBackfillResponse(StrictModel):
     conversation_id: str | None = None
     items: list[TimelineItem] = Field(default_factory=list)
     cycle_states: list[TurnCycleState] = Field(default_factory=list)
+    history_window_reduced: bool = False
     has_more_before: bool = False
     before_cursor: str | None = None
     server_time: str

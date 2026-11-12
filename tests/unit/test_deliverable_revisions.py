@@ -204,14 +204,33 @@ async def test_step_drafts_inherit_revision_and_target_payload_survives(
     assert (draft_one.lineage_id, draft_one.revision) == (chat.deliverable_id, 2)
 
     async with factory() as session:
-        # Rewriting the same step output is a draft replacement, not revision 3,
-        # whether or not the model repeats the original target.
+        # The same step has no exemption from the explicit head contract.
+        with pytest.raises(DeliverableRevisionError) as missing:
+            await create_deliverable(
+                session,
+                step_run_id="sr-owner",
+                content="without a base revision",
+                artifact_store=factory.artifact_store,
+            )
+        assert missing.value.code == "supersedes_required"
+        assert missing.value.latest_deliverable_id == draft_one.deliverable_id
+        with pytest.raises(DeliverableRevisionError) as stale:
+            await create_deliverable(
+                session,
+                step_run_id="sr-owner",
+                content="stale",
+                artifact_store=factory.artifact_store,
+                supersedes_deliverable_id=chat.deliverable_id,
+            )
+        assert stale.value.latest_deliverable_id == draft_one.deliverable_id
+        await session.rollback()
+    async with factory() as session:
         draft_two = await create_deliverable(
             session,
             step_run_id="sr-owner",
             content="step revision final",
             artifact_store=factory.artifact_store,
-            supersedes_deliverable_id=chat.deliverable_id,
+            supersedes_deliverable_id=draft_one.deliverable_id,
         )
         draft_three = await create_deliverable(
             session,
@@ -222,19 +241,19 @@ async def test_step_drafts_inherit_revision_and_target_payload_survives(
         )
         await session.commit()
 
-    assert (draft_two.revision, draft_three.revision) == (2, 2)
+    assert (draft_two.revision, draft_three.revision) == (3, 4)
     assert draft_three.lineage_id == chat.deliverable_id
-    assert draft_three.supersedes_deliverable_id == chat.deliverable_id
+    assert draft_three.supersedes_deliverable_id == draft_two.deliverable_id
     async with factory() as session:
         replaced = await get_deliverable(session, draft_one.deliverable_id)
         original = await get_deliverable(session, chat.deliverable_id)
-        assert replaced is not None and replaced.status == "superseded"
+        assert replaced is not None and replaced.status == "buffered"
         assert original is not None and original.status == "buffered"
         await hydrate_deliverable_payload(original, factory.artifact_store)
         assert original.content == "chat original"
         summary = await get_deliverable_lineage_summary(session, original)
     assert summary.latest_deliverable_id == draft_three.deliverable_id
-    assert summary.revision_count == 2
+    assert summary.revision_count == 4
 
 
 async def test_step_draft_without_supersedes_starts_and_keeps_own_lineage(
@@ -718,3 +737,34 @@ async def test_rejected_intermediate_revision_does_not_reopen_older_revision(
         await _write_chat(factory, content="fork", supersedes=first.deliverable_id)
     assert caught.value.code == "supersedes_not_latest"
     assert caught.value.latest_deliverable_id == third.deliverable_id
+
+
+async def test_public_link_always_serves_the_latest_revision(
+    task_continuation_db, monkeypatch
+) -> None:
+    """Outside viewers never see an older revision, even through a link made from one."""
+    from cognis.core import deliverable_links
+
+    factory = task_continuation_db
+    await _chat_conversation(factory)
+    first = await _write_chat(factory, content="# Outdated body")
+    share = deliverable_links.signed_deliverable_view_link(
+        factory.artifact_store, first.deliverable_id, base_url="http://testserver", ttl_seconds=60
+    )
+    token = share.url.rstrip("/").split("/")[-1]
+    second = await _write_chat(factory, content="# Current body", supersedes=first.deliverable_id)
+
+    with _client(factory, monkeypatch, email="stranger@example.com") as client:
+        markdown = client.get(f"/api/v1/deliverables/share/{token}/download.md")
+    assert markdown.status_code == 200
+    assert "Current body" in markdown.text
+    assert "Outdated body" not in markdown.text
+
+    # A rejected newest revision is not published; the link falls back to the live head.
+    async with factory() as session:
+        await update_deliverable_status(session, second.deliverable_id, status="rejected")
+        await session.commit()
+    with _client(factory, monkeypatch, email="stranger@example.com") as client:
+        markdown = client.get(f"/api/v1/deliverables/share/{token}/download.md")
+    assert markdown.status_code == 200
+    assert "Outdated body" in markdown.text

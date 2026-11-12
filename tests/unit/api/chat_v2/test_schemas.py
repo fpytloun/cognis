@@ -85,7 +85,7 @@ def test_queue_state_requires_count_to_match_messages() -> None:
 
 
 def test_send_request_requires_content_or_attachment() -> None:
-    with pytest.raises(ValidationError, match="content or attachments are required"):
+    with pytest.raises(ValidationError, match="content, attachments, or feedback are required"):
         SendMessageV2Request(
             client_message_id="client-1",
             content="   ",

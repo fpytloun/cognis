@@ -436,7 +436,7 @@ def system_management_tools() -> list[ToolDefinition]:
                 _operation(
                     "create",
                     _CREATE,
-                    "Create an executor configuration; tokens are provisioned through the secure UI.",
+                    "Create an executor configuration; provision_token stores its token securely.",
                     {"payload": _model_schema(ExecutorCreateRequest)},
                     ("payload",),
                 ),
@@ -467,6 +467,17 @@ def system_management_tools() -> list[ToolDefinition]:
                     "Retry runtime initialization without replacing configuration.",
                     _EXECUTOR,
                     ("executor_id",),
+                ),
+                _operation(
+                    "provision_token",
+                    _EXECUTE,
+                    "Rotate a private executor token into an encrypted caller-agent credential; return only its reference. Reuse operation_id to reconcile an uncertain outcome, never rotate blindly.",
+                    {
+                        **_EXECUTOR,
+                        **_EXPECTED,
+                        "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                    },
+                    ("executor_id", "expected_updated_at", "operation_id"),
                 ),
             ],
         ),

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -29,6 +28,7 @@ from cognis.providers.llm.inference_api import (
     InferenceAPIService,
 )
 from cognis.providers.llm.service import LLMService
+from cognis.providers.llm.usage_delivery import UsageDeliveryMiddleware
 from cognis.security import generate_api_key_material
 from cognis.store.models import Base, InferenceCompanion, LLMProvider
 from cognis.store.queries import (
@@ -40,7 +40,7 @@ from cognis.store.queries import (
 
 
 @pytest.fixture
-def gateway(tmp_path: Path):
+def gateway(tmp_path: Path, usage_capture):
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/inference.db")
     factory = async_sessionmaker(engine, expire_on_commit=False)
     private, public = tmp_path / "private.pem", tmp_path / "public.pem"
@@ -101,8 +101,7 @@ def gateway(tmp_path: Path):
             session.add(InferenceCompanion(service="mnemory", token_version=0, enabled=True))
             await session.commit()
 
-    asyncio.run(seed())
-    llm = LLMService(factory)
+    llm = LLMService(factory, usage_capture=usage_capture)
     llm.generate = AsyncMock(
         return_value={
             "choices": [
@@ -138,9 +137,10 @@ def gateway(tmp_path: Path):
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(router)
     app.include_router(settings_router)
-    with TestClient(app) as client:
+    with TestClient(UsageDeliveryMiddleware(app, capture=usage_capture)) as client:
+        client.portal.call(seed)
         yield client, app, auth, factory, llm
-    asyncio.run(engine.dispose())
+        client.portal.call(engine.dispose)
 
 
 def bearer(token: str) -> dict[str, str]:
@@ -575,7 +575,15 @@ def test_systemone_route_save_skips_inherited_thinking_and_rejects_other_roles(
     }
     response = client.put("/api/v1/model-routing", headers=admin, json=payload)
     assert response.status_code == 200, response.text
-    for role in ("default", "companion_lite", "mnemory_extraction"):
+    response = client.put(
+        "/api/v1/model-routing",
+        headers=admin,
+        json={"classifier": {"model": "typed-inference/jev-1.13"}},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["classifier"]["model"] == "typed-inference/jev-1.13"
+    assert "auxiliary_generation" in response.json()
+    for role in ("default", "auxiliary_generation", "companion_lite", "mnemory_extraction"):
         response = client.put(
             "/api/v1/model-routing",
             headers=admin,
@@ -915,7 +923,7 @@ def test_local_network_companion_inference(gateway, monkeypatch, tmp_path):
     }
     if not all(roots.values()):
         pytest.skip("Set COGNIS_E2E_INTARIS_ROOT and COGNIS_E2E_MNEMORY_ROOT for local E2E")
-    client, app, auth, factory, _ = gateway
+    client, app, auth, factory, configured_llm = gateway
     upstream = FastAPI()
     requests = []
 
@@ -1052,7 +1060,7 @@ def test_local_network_companion_inference(gateway, monkeypatch, tmp_path):
             assert not worker.is_alive()
 
     with serve(upstream) as provider_url:
-        llm = LLMService(factory)
+        llm = LLMService(factory, usage_capture=configured_llm.usage_capture)
 
         async def configure_real_provider():
             async with factory() as session:

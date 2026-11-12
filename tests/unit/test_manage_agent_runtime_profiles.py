@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -421,6 +422,22 @@ def test_runtime_profile_delete_migrates_every_live_reference_atomically(
             )
             await session.commit()
 
+        profile_columns = (
+            (Conversation, Conversation.agent_profile_id),
+            (Session, Session.agent_profile_id),
+            (Task, Task.agent_profile_id),
+            (Schedule, Schedule.agent_profile_id),
+            (ChannelAccountRow, ChannelAccountRow.default_agent_profile_id),
+        )
+        async with deps.session_factory() as session:
+            profiles_before = {
+                (model, agent_id): list(
+                    await session.scalars(select(column).where(model.agent_id == agent_id))
+                )
+                for model, column in profile_columns
+                for agent_id in ("target", "other")
+            }
+
         deleted = await _action(
             deps,
             {
@@ -442,13 +459,7 @@ def test_runtime_profile_delete_migrates_every_live_reference_atomically(
         assert "legacy" not in deleted["profiles"]
 
         async with deps.session_factory() as session:
-            for model, profile_column in (
-                (Conversation, Conversation.agent_profile_id),
-                (Session, Session.agent_profile_id),
-                (Task, Task.agent_profile_id),
-                (Schedule, Schedule.agent_profile_id),
-                (ChannelAccountRow, ChannelAccountRow.default_agent_profile_id),
-            ):
+            for model, profile_column in profile_columns:
                 target_values = (
                     (
                         await session.execute(
@@ -463,8 +474,11 @@ def test_runtime_profile_delete_migrates_every_live_reference_atomically(
                     .scalars()
                     .all()
                 )
-                assert target_values == ["final"]
-                assert other_values == ["legacy"]
+                assert Counter(target_values) == Counter(
+                    "final" if value == "legacy" else value
+                    for value in profiles_before[model, "target"]
+                )
+                assert Counter(other_values) == Counter(profiles_before[model, "other"])
             audit = (
                 (
                     await session.execute(
@@ -772,6 +786,11 @@ def test_settings_update_schema_exposes_supported_memory_and_delegation_fields()
     )
     settings_schema = operation.input_schema["properties"]["settings"]
     settings_properties = settings_schema["properties"]
+    assert settings_properties["analytics_enabled"]["type"] == "boolean"
+    auto_selection = settings_properties["auto_profile_selection"]
+    assert auto_selection["properties"]["enabled"]["default"] is True
+    assert auto_selection["properties"]["min_confidence"]["default"] == 0.55
+    assert auto_selection["properties"]["min_confidence"]["minimum"] == 0.5
 
     assert settings_properties["memory_backend"] == {"type": "string"}
     assert settings_properties["memory_backend_options"] == {"type": "object"}
@@ -785,3 +804,111 @@ def test_settings_update_schema_exposes_supported_memory_and_delegation_fields()
     assert delegation["properties"]["primary"]["properties"]["allowed_controller_agent_ids"][
         "type"
     ] == ["array", "null"]
+
+
+@pytest.mark.asyncio
+async def test_analytics_settings_roundtrip_and_validation(tmp_path: Path) -> None:
+    deps, _ = await _deps(tmp_path)
+    initial = await _action(deps, {"action": "settings_get", "agent_id": "target"})
+    assert initial["settings"]["analytics_enabled"] is True
+    for enabled in (False, True):
+        await _action(
+            deps,
+            {
+                "action": "settings_update",
+                "agent_id": "target",
+                "settings": {"analytics_enabled": enabled},
+            },
+        )
+        loaded = await _action(deps, {"action": "settings_get", "agent_id": "target"})
+        assert loaded["settings"]["analytics_enabled"] is enabled
+        async with deps.session_factory() as db:
+            row = await get_agent(db, "target")
+            assert row.capabilities["analytics_enabled"] is enabled
+    with pytest.raises(AgentManagementError):
+        await _action(
+            deps,
+            {
+                "action": "settings_update",
+                "agent_id": "target",
+                "settings": {"analytics_enabled": "false"},
+            },
+        )
+
+
+def test_auto_profile_settings_round_trip_through_agent_crud(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        deps, _ = await _deps(tmp_path)
+        deps.assignable_tools = []
+        created = await _action(
+            deps,
+            {
+                "action": "create",
+                "agent_id": "startup-agent",
+                "name": "Startup agent",
+                "auto_profile_selection": {"enabled": False, "min_confidence": 0.95},
+            },
+        )
+        assert created["agent"]["execution"]["auto_profile_selection"] == {
+            "enabled": False,
+            "min_confidence": 0.95,
+        }
+        await _action(
+            deps,
+            {
+                "action": "update",
+                "agent_id": "startup-agent",
+                "auto_profile_selection": {"enabled": True},
+            },
+        )
+        result = await _action(deps, {"action": "settings_get", "agent_id": "startup-agent"})
+        assert result["settings"]["auto_profile_selection"] == {
+            "enabled": True,
+            "min_confidence": 0.95,
+        }
+        await _action(
+            deps,
+            {
+                "action": "settings_update",
+                "agent_id": "startup-agent",
+                "settings": {"auto_profile_selection": {"min_confidence": 0.9}},
+            },
+        )
+        result = await _action(deps, {"action": "settings_get", "agent_id": "startup-agent"})
+        assert result["settings"]["auto_profile_selection"] == {
+            "enabled": True,
+            "min_confidence": 0.9,
+        }
+        await _action(
+            deps,
+            {
+                "action": "settings_update",
+                "agent_id": "startup-agent",
+                "settings": {"auto_profile_selection": None},
+            },
+        )
+        result = await _action(deps, {"action": "settings_get", "agent_id": "startup-agent"})
+        assert result["settings"]["auto_profile_selection"] == {
+            "enabled": True,
+            "min_confidence": 0.55,
+        }
+        with pytest.raises(ValueError):
+            await _action(
+                deps,
+                {
+                    "action": "settings_update",
+                    "agent_id": "startup-agent",
+                    "settings": {"auto_profile_selection": {"min_confidence": 0.1}},
+                },
+            )
+        with pytest.raises(AgentManagementError):
+            await _action(
+                deps,
+                {
+                    "action": "settings_update",
+                    "agent_id": "other",
+                    "settings": {"auto_profile_selection": {"enabled": False}},
+                },
+            )
+
+    asyncio.run(scenario())

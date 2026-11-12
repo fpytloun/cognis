@@ -853,7 +853,7 @@ class RecapService:
             )
             response = await self._providers.llm.generate(
                 [{"role": "user", "content": prompt}],
-                task_type="classifier",
+                task_type="auxiliary_generation",
                 temperature=0,
                 max_tokens=250,
                 max_retries=1,
@@ -861,6 +861,7 @@ class RecapService:
                 cognis_conversation_id=conversation.conversation_id,
                 cognis_session_id=session.session_id,
                 cognis_agent_id=conversation.agent_id,
+                cognis_project_id=conversation.project_id,
             )
             choice = (response.get("choices") or [{}])[0]
             message = choice.get("message") or {}
@@ -896,7 +897,7 @@ class RecapService:
                                 ),
                             }
                         ],
-                        task_type="classifier",
+                        task_type="auxiliary_generation",
                         temperature=0,
                         max_tokens=250,
                         max_retries=1,
@@ -904,6 +905,7 @@ class RecapService:
                         cognis_conversation_id=conversation.conversation_id,
                         cognis_session_id=session.session_id,
                         cognis_agent_id=conversation.agent_id,
+                        cognis_project_id=conversation.project_id,
                     )
                     recovery_message = (
                         ((recovery_response.get("choices") or [{}])[0]).get("message") or {}

@@ -9,10 +9,6 @@ from collections.abc import Callable
 from typing import Any
 
 from cognis import json_codec as json
-from cognis.core.json_utils import (
-    extract_json_object,
-    extract_text_from_response,
-)
 from cognis.logging import get_logger
 from cognis.models.tool import (
     AUTO_PROFILE_GROUPS,
@@ -30,6 +26,7 @@ from cognis.store.queries import (
     get_tool_classification_rows,
     tool_classification_scope,
 )
+from cognis.tools.decisions import classify_tool_metadata
 
 logger = get_logger(__name__)
 
@@ -704,107 +701,44 @@ async def _classify_with_llm(
     if not uncached:
         return cached_results, rejected
 
-    messages = [
+    tool_states = [
         {
-            "role": "system",
-            "content": (
-                "Classify tools for an agent runtime. Return JSON object with a top-level 'tools' array. "
-                "Each item must include 'tool_id', 'profile_group', 'capabilities', and 'confidence'. "
-                "Capabilities must be a subset of ['read','write','privileged','destructive']. "
-                "Choose profile_group only from: filesystem, shell, web, browser, development, office, personal, communication. "
-                "Never return memory, system, mcp, skill, or general."
-            ),
-        },
-        {
-            "role": "user",
-            "content": json.dumps(
+            "tool_id": tool_id,
+            "name": tool.name,
+            "raw_tool_name": tool.source.raw_tool_name,
+            "description": tool.description,
+            "source_type": tool.source.type,
+            "current_category": tool.category,
+            "read_only": tool.read_only,
+            **(
                 {
-                    "tools": [
-                        {
-                            "tool_id": tool_id,
-                            "name": tool.name,
-                            "raw_tool_name": tool.source.raw_tool_name,
-                            "description": tool.description,
-                            "source_type": tool.source.type,
-                            "current_category": tool.category,
-                            "read_only": tool.read_only,
-                            **(
-                                {
-                                    "previous_rejection": retry_context[tool_id],
-                                    "retry_instruction": (
-                                        "Correct the prior invalid classification. "
-                                        "return your best valid profile_group and capabilities."
-                                    ),
-                                }
-                                if tool_id in retry_context
-                                else {}
-                            ),
-                        }
-                        for tool_id, tool, _cache_key in uncached
-                    ]
-                },
-                ensure_ascii=True,
+                    "previous_rejection": retry_context[tool_id],
+                    "retry_instruction": (
+                        "Correct the prior invalid classification. "
+                        "return your best valid profile_group and capabilities."
+                    ),
+                }
+                if tool_id in retry_context
+                else {}
             ),
-        },
+        }
+        for tool_id, tool, _cache_key in uncached
     ]
     tool_ids = [tool_id for tool_id, _tool, _cache_key in uncached]
     try:
-        response = await llm.generate(
-            messages,
-            task_type="classifier",
-            temperature=0,
-            max_retries=1,
-            response_format={"type": "json_object"},
+        payload = await classify_tool_metadata(
+            llm,
+            tool_states,
             acting_user_email=acting_user_email,
         )
     except Exception as exc:
-        error = _classifier_error("llm_generate_failed", exc)
+        error = _classifier_error("llm_classify_failed", exc)
         logger.warning(
-            "Tool LLM classification generation failed",
+            "Tool typed classification failed",
             extra={
                 "extra_data": {
                     "tool_ids": tool_ids,
-                    "error_kind": "generation",
-                    "error": error,
-                    "acting_user_email_present": acting_user_email is not None,
-                }
-            },
-        )
-        return cached_results, {
-            **rejected,
-            **{tool_id: error for tool_id, _tool, _cache_key in uncached},
-        }
-    try:
-        content = extract_text_from_response(response)
-        if not content.strip():
-            raise ValueError("empty classifier response content")
-    except Exception as exc:
-        error = _classifier_error("llm_response_extract_failed", exc)
-        logger.warning(
-            "Tool LLM classification response extraction failed",
-            extra={
-                "extra_data": {
-                    "tool_ids": tool_ids,
-                    "error_kind": "response_extraction",
-                    "error": error,
-                    "acting_user_email_present": acting_user_email is not None,
-                }
-            },
-        )
-        return cached_results, {
-            **rejected,
-            **{tool_id: error for tool_id, _tool, _cache_key in uncached},
-        }
-    try:
-        payload = extract_json_object(content, label="tool_classifier")
-    except Exception as exc:
-        error = _classifier_error("llm_json_extract_failed", exc)
-        logger.warning(
-            "Tool LLM classification JSON extraction failed",
-            extra={
-                "extra_data": {
-                    "tool_ids": tool_ids,
-                    "error_kind": "json_extraction",
+                    "error_kind": "classification",
                     "error": error,
                     "acting_user_email_present": acting_user_email is not None,
                 }

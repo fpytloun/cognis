@@ -251,9 +251,8 @@ async def test_agent_authored_pulse_v2_accepts_synthetic_collector_replay() -> N
     assert chart["source_ids"] == [weather["sources"][0]["id"]]
     assert chart["observed_at"] == weather["observed_at"]
     serialized = json.dumps(payload)
-    inbox = next(item for item in collectors if item["collector"] == "gmail")
-    for item in inbox["items"]:
-        assert (item["title"] in serialized) is bool(item["metadata"]["actionable"])
+    assert "Demo catalog: review sample access grants" in serialized
+    assert "Demo exhibit announcement" not in serialized
     assert serialized.count("Unavailable") == 1
     quality = rich_render_metadata(payload)["pulse_quality"]
     assert quality["quality_gate_passed"] is True

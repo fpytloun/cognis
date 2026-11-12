@@ -174,15 +174,15 @@ def test_catalog_detail_decode_failure_returns_documented_upstream_error(
 
     transport_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
-        asyncio.run(client.app.state.local_model_catalog.aclose())
+        client.portal.call(_seed, client.app)
+        client.portal.call(client.app.state.local_model_catalog.aclose)
         client.app.state.local_model_catalog = LocalModelCatalog(client=transport_client)
         response = client.get(
             "/api/v1/local-model-catalog/detail",
             params={"repo": "acme/model-GGUF"},
             headers=_auth_headers(client.app, email="owner@example.com"),
         )
-    asyncio.run(transport_client.aclose())
+        client.portal.call(transport_client.aclose)
 
     assert calls == 2
     assert response.status_code == 503
@@ -200,7 +200,7 @@ def test_local_model_crud_rbac_selector_resolution_and_pending_contract(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         owner_headers = _auth_headers(client.app, email="owner@example.com")
         other_headers = _auth_headers(client.app, email="other@example.com")
         viewer_headers = _auth_headers(
@@ -410,7 +410,7 @@ def test_atomic_provider_model_upsert_preserves_fields_and_enforces_rbac(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         owner_headers = _auth_headers(client.app, email="owner@example.com")
         viewer_headers = _auth_headers(
             client.app,
@@ -474,7 +474,7 @@ def test_provider_recommendation_find_or_create_subset_and_legacy_state(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
 
         recommendation = client.post(
@@ -528,7 +528,7 @@ def test_provider_recommendation_find_or_create_subset_and_legacy_state(
                 executor.runtime_state = "reconfiguring"
                 await session.commit()
 
-        asyncio.run(expand_label_selector())
+        client.portal.call(expand_label_selector)
         invalid_reconcile = client.post(
             f"/api/v1/local-model-deployments/{label_deployment.json()['deployment_id']}"
             "/reconciliation-requests",
@@ -608,7 +608,7 @@ def test_provider_recommendation_find_or_create_subset_and_legacy_state(
                 )
                 await session.commit()
 
-        asyncio.run(seed_legacy())
+        client.portal.call(seed_legacy)
         legacy = client.get(
             "/api/v1/local-model-deployments/legacy-needs-provider",
             headers=headers,
@@ -693,7 +693,7 @@ def test_managed_provider_repair_rolls_back_provider_when_attachment_fails(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
 
         async def seed_legacy() -> None:
@@ -715,7 +715,7 @@ def test_managed_provider_repair_rolls_back_provider_when_attachment_fails(
                 )
                 await session.commit()
 
-        asyncio.run(seed_legacy())
+        client.portal.call(seed_legacy)
         original_update = LocalModelDeploymentService.update_deployment
 
         async def fail_attachment(*args: object, **kwargs: object) -> object:
@@ -750,7 +750,7 @@ def test_managed_provider_repair_rolls_back_provider_when_attachment_fails(
                     ).scalar_one()
                 )
 
-        assert asyncio.run(count_created_providers()) == 0
+        assert client.portal.call(count_created_providers) == 0
         deployment = client.get(
             "/api/v1/local-model-deployments/legacy-atomic-repair",
             headers=headers,
@@ -763,7 +763,7 @@ def test_provider_recommendation_uses_effective_local_inference_eligibility(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
 
         # Missing legacy settings retain WS-A's effective enabled defaults after reconnect.
@@ -803,7 +803,7 @@ def test_provider_recommendation_uses_effective_local_inference_eligibility(
                 )
                 await session.commit()
 
-        asyncio.run(disable_management())
+        client.portal.call(disable_management)
         recommendation = client.post(
             "/api/v1/local-model-providers/recommendations",
             headers=headers,
@@ -948,7 +948,7 @@ def test_runtime_operations_require_current_provider_scoped_target(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
 
         async def seed_legacy_target() -> None:
@@ -978,7 +978,7 @@ def test_runtime_operations_require_current_provider_scoped_target(
                 )
                 await session.commit()
 
-        asyncio.run(seed_legacy_target())
+        client.portal.call(seed_legacy_target)
         needs_provider = client.post(
             "/api/v1/executors/owner-gpu/local-model-runtime/operations",
             headers=headers,
@@ -1021,7 +1021,7 @@ def test_runtime_operations_require_current_provider_scoped_target(
                 provider.config = {**provider.config, "executor_id": executor_id}
                 await session.commit()
 
-        asyncio.run(move_provider_scope("owner-cpu"))
+        client.portal.call(move_provider_scope, "owner-cpu")
         outside_provider = client.post(
             "/api/v1/executors/owner-gpu/local-model-runtime/operations",
             headers=headers,
@@ -1036,7 +1036,7 @@ def test_runtime_operations_require_current_provider_scoped_target(
             "local-model deployment target not found"
         )
 
-        asyncio.run(move_provider_scope("owner-gpu"))
+        client.portal.call(move_provider_scope, "owner-gpu")
         valid_deployment = client.post(
             "/api/v1/local-model-deployments",
             headers=headers,
@@ -1065,7 +1065,7 @@ def test_runtime_operation_provider_scope_check_serializes_with_scope_update(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
         deployment = client.post(
             "/api/v1/local-model-deployments",
@@ -1135,7 +1135,7 @@ def test_runtime_operation_provider_scope_check_serializes_with_scope_update(
             release_scope_check.set()
             return await asyncio.gather(operation_task, update_task)
 
-        operation_id, runtime_state = asyncio.run(race())
+        operation_id, runtime_state = client.portal.call(race)
         assert operation_id.startswith("lmo_")
         assert runtime_state in {"stale", "reconfiguring"}
 
@@ -1145,7 +1145,7 @@ def test_catalog_and_fit_plan_api_are_typed_advisory_surfaces(
     tmp_path: Path,
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed(client.app))
+        client.portal.call(_seed, client.app)
         headers = _auth_headers(client.app, email="owner@example.com")
 
         catalog = client.get(

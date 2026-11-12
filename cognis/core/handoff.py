@@ -29,16 +29,15 @@ Scope:
 - Adapt to continuation, delegation, independent review, research, or decision support.
   Do not assume implementation is required.
 
-Content:
-1. Objective and requested outcome.
-2. Essential context, requirements, and constraints.
-3. Current state: completed work, work in progress, and remaining work.
-4. Decisions and rationale; rejected alternatives only when relevant.
-5. Evidence and references needed to continue.
-6. Next steps, acceptance criteria, blockers, and open questions.
+Brief a capable colleague: explain the requested outcome, relevant state, decisions,
+evidence, and real boundaries, including completion checks or blockers when useful.
+For unresolved investigations, preserve the question and known facts rather than
+turning an unverified hypothesis into prescribed steps. For implementation, make
+ownership and expected behavior clear while leaving room to choose the approach.
 
-Use descriptive Markdown headings, omitting empty or unhelpful sections. Begin with
-a clear title. Address the recipient directly, without commentary about generation.
+Use normal sentences and spaces, with short Markdown paragraphs, bullets, or headings
+where helpful. A simple question needs no report template. Remove repetition, not
+meaning. Address the recipient directly, without commentary about generation.
 
 Accuracy:
 - Distinguish verified results, reported results, proposals, assumptions, and questions.
@@ -185,6 +184,7 @@ class HandoffService:
                     tool_registry=runtime.tool_registry,
                     executor_environment=runtime.executor_environment,
                     executor_pool=runtime.executor_pool,
+                    refresh_executor_pool=runtime.refresh_executor_pool,
                     active_executor_id=runtime.active_executor_id,
                     memory_policy=restrict_external_memory_policy(
                         resolve_memory_policy(agent, profile),

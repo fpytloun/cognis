@@ -43,7 +43,9 @@ from cognis.core.managed_conversations import project_managed_conversation_state
 from cognis.core.project_access import normalize_project_role, project_assignment_refusal
 from cognis.core.questions import user_visible_workflow_state
 from cognis.logging import get_logger
+from cognis.models.agent import strip_retired_execution_settings
 from cognis.models.conversation_state import ConversationStateEnvelope
+from cognis.models.deliverable import TaskDeliverableFreshness, TaskOutputPresentation
 from cognis.models.task import TaskModel
 from cognis.models.tool import stable_tool_id
 from cognis.models.workflow import Workflow
@@ -182,6 +184,11 @@ def conversation_to_response(
         managed_agent=(
             {
                 "channel": "agent_work",
+                "kind": (
+                    getattr(managed_link, "kind", None)
+                    or platform_data.get("managed_conversation_kind")
+                    or "agent"
+                ),
                 "link_id": getattr(managed_link, "link_id", None) or platform_data.get("link_id"),
                 "controller_agent_id": platform_data.get("controller_agent_id"),
                 "controller_conversation_id": platform_data.get("controller_conversation_id"),
@@ -257,7 +264,6 @@ def conversation_to_response(
         ):
             setattr(response, field, None)
         response.has_unread = False
-        response.has_active_turn = False
         response.pending_notification_types = []
         response.attention_actions = []
         response.project_assignable = False
@@ -351,7 +357,7 @@ def agent_to_response(row: Any) -> AgentResponse:
         capabilities=capabilities,
         agent_profiles=agent_profiles,
         default_agent_profile_id=getattr(row, "default_agent_profile_id", None),
-        execution=getattr(row, "execution", None),
+        execution=strip_retired_execution_settings(getattr(row, "execution", None)),
         personality_synced=bool(sync_metadata.get("personality_synced", True)),
         personality_sync_error=(
             str(sync_metadata.get("personality_sync_error"))
@@ -562,6 +568,7 @@ def task_to_response(task: TaskModel) -> TaskResponse:
         delivery=task.delivery,
         completion_mode_family=task.completion_delivery.completion_mode_family,
         allow_silent_completion=task.completion_delivery.allow_silent_completion,
+        on_finish_instructions=task.completion_delivery.on_finish_instructions,
         interaction_mode_override=task.interaction_mode_override,
         escalation_timeout_seconds=task.escalation_timeout_seconds,
         session_policy=task.session_policy,
@@ -593,6 +600,9 @@ def task_detail_to_response(
     workflow_run: WorkflowRunResponse | None,
     workflow_projection: TaskWorkflowProjection | None = None,
     progress: TaskProgressProjection | None = None,
+    final_deliverable: DeliverableResponse | None = None,
+    output_presentation: TaskOutputPresentation | None = None,
+    deliverable_freshness: dict[str, TaskDeliverableFreshness] | None = None,
 ) -> TaskDetailResponse:
     return TaskDetailResponse(
         **task_to_response(task).model_dump(exclude={"progress"}),
@@ -602,6 +612,9 @@ def task_detail_to_response(
         workflow_run=workflow_run,
         workflow_projection=workflow_projection,
         progress=progress,
+        final_deliverable=final_deliverable,
+        output_presentation=output_presentation,
+        deliverable_freshness=deliverable_freshness or {},
     )
 
 
@@ -632,6 +645,7 @@ def deliverable_to_response(
     *,
     include_rich_payload: bool = True,
     lineage: Any | None = None,
+    task_freshness: TaskDeliverableFreshness | None = None,
 ) -> DeliverableResponse:
     """Serialize a deliverable row; ``lineage`` adds latest-revision facts."""
 
@@ -639,6 +653,9 @@ def deliverable_to_response(
 
     rich_payload = _coerce_dict_or_none(getattr(row, "rich_payload", None))
     return DeliverableResponse(
+        author_email=getattr(row, "author_email", None),
+        author_agent_id=getattr(row, "author_agent_id", None),
+        task_freshness=task_freshness,
         lineage_id=getattr(row, "lineage_id", None) or row.deliverable_id,
         revision=getattr(row, "revision", None) or 1,
         supersedes_deliverable_id=getattr(row, "supersedes_deliverable_id", None),
@@ -680,9 +697,11 @@ def step_run_to_response(
     *,
     deliverables: list[DeliverableResponse] | None = None,
     accumulated_duration_seconds: float | None = None,
+    deliverable_freshness: dict[str, TaskDeliverableFreshness] | None = None,
 ) -> StepRunResponse:
     duration_seconds = _duration_seconds(row.started_at, row.completed_at)
     return StepRunResponse(
+        deliverable_freshness=deliverable_freshness or {},
         step_run_id=row.step_run_id,
         task_id=row.task_id,
         step_name=row.step_name,

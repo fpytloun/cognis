@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 from cognis.channels.managed import build_managed_channel_developer_instruction
 from cognis.core.agent_loop import AgentLoop, SessionLock
 from cognis.core.agent_profiles import resolve_conversation_agent_profile
-from cognis.core.context import ContextAssembler
+from cognis.core.context import ContextAssembler, events_to_messages
 from cognis.core.session import (
     SessionManager,
     SessionRotationConflictError,
@@ -30,6 +33,7 @@ from cognis.models.session import (
     SessionModel,
     SessionTransition,
 )
+from cognis.providers.llm.responses_bridge import messages_to_responses_input
 from cognis.providers.memory.policy import resolve_memory_policy
 from cognis.runtime_context import current_agent_id, current_agent_owner_email, current_user_email
 from cognis.store.database import create_engine, create_session_factory
@@ -97,6 +101,7 @@ class _Guardrails:
         self.recorded_events: list[tuple[str, list[SessionEvent], str | None]] = []
         self.record_event_contexts: list[tuple[str | None, str | None, str | None]] = []
         self.intentions: dict[str, str] = {}
+        self.flags: dict[str, dict[str, bool]] = {}
 
     async def get_session(
         self,
@@ -109,6 +114,7 @@ class _Guardrails:
         if self.fail:
             raise RuntimeError("intaris unavailable")
         return SimpleNamespace(
+            **self.flags.get(session_id, {"analytics_enabled": True, "guardrails_enabled": True}),
             policy=self.last_policy,
             details=self.last_details,
             intention=self.intentions.get(session_id, "Develop the application"),
@@ -123,6 +129,8 @@ class _Guardrails:
         parent_session_id: str | None = None,
         policy: dict | None = None,
         details: dict | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = True,
     ) -> None:
         if self.fail:
             raise RuntimeError("intaris unavailable")
@@ -130,6 +138,10 @@ class _Guardrails:
         self.last_policy = dict(policy) if policy is not None else None
         self.calls.append((session_id, agent_id, parent_session_id))
         self.intentions[session_id] = intention
+        self.flags[session_id] = {
+            "analytics_enabled": analytics_enabled,
+            "guardrails_enabled": guardrails_enabled,
+        }
 
     async def update_session_status(
         self,
@@ -157,6 +169,8 @@ class _Guardrails:
         details: dict | None = None,
         policy: dict | None = None,
         agent_owner_email: str | None = None,
+        analytics_enabled: bool | None = None,
+        guardrails_enabled: bool | None = None,
     ) -> None:
         del agent_id, user_id, agent_owner_email
         if self.fail:
@@ -164,6 +178,11 @@ class _Guardrails:
         self.last_details = dict(details) if details is not None else None
         self.last_policy = dict(policy) if policy is not None else None
         self.policy_updates.append((session_id, self.last_details, self.last_policy))
+        flags = self.flags.setdefault(session_id, {})
+        if analytics_enabled is not None:
+            flags["analytics_enabled"] = analytics_enabled
+        if guardrails_enabled is not None:
+            flags["guardrails_enabled"] = guardrails_enabled
 
     async def record_events(
         self,
@@ -241,6 +260,8 @@ class _SlowGuardrails(_Guardrails):
         parent_session_id: str | None = None,
         policy: dict | None = None,
         details: dict | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = True,
     ) -> None:
         del intention, user_id, policy, details
         self.calls.append((session_id, agent_id, parent_session_id))
@@ -269,6 +290,8 @@ class _StreamGuardrails(_Guardrails):
         parent_session_id: str | None = None,
         policy: dict | None = None,
         details: dict | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = True,
     ) -> None:
         await super().create_session(
             session_id,
@@ -278,6 +301,8 @@ class _StreamGuardrails(_Guardrails):
             parent_session_id,
             policy,
             details,
+            analytics_enabled,
+            guardrails_enabled,
         )
         self.streams.setdefault(session_id, [])
 
@@ -335,6 +360,8 @@ class _StreamGuardrails(_Guardrails):
     async def get_session(self, session_id: str, **kwargs: object) -> object:
         del session_id
         return SimpleNamespace(
+            analytics_enabled=True,
+            guardrails_enabled=True,
             intention="Resolve the participant request.",
             title="Managed participant",
             updated_at=None,
@@ -495,6 +522,320 @@ async def test_seed_rotated_tail_events_batches_large_event_sets(tmp_path) -> No
     await engine.dispose()
 
 
+def _projection_event(seq: int, *targets: int) -> CachedEvent:
+    return CachedEvent(
+        seq=seq,
+        type="lifecycle",
+        data={
+            "event": "context_projection",
+            "decisions": [
+                *[
+                    {
+                        "event_seq": target,
+                        "operation": "omit_event",
+                        "rendering_policy_version": 1,
+                        "parameters": {"event_seq": target},
+                    }
+                    for target in targets
+                ],
+                {
+                    "call_id": "lookup-product",
+                    "operation": "compact_result",
+                    "rendering_policy_version": 1,
+                    "parameters": {},
+                },
+            ],
+        },
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("compacted", [False, True])
+async def test_image_projection_survives_repeated_rotated_cold_replay(tmp_path, compacted) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _StreamGuardrails()
+    manager = SessionManager(session_factory, providers, SessionCache(providers.guardrails))
+    output = io.BytesIO()
+    Image.new("RGB", (4, 3), "red").save(output, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
+    artifact_id = "att_rotation_image"
+    tail = [
+        CachedEvent(seq=101, type="user_message", data={"content": "Read the screenshot"}),
+        CachedEvent(
+            seq=102,
+            type="tool_call",
+            data={
+                "call_id": "read-image",
+                "name": "artifact_read",
+                "arguments": {"artifact_id": artifact_id},
+            },
+        ),
+        CachedEvent(
+            seq=103,
+            type="tool_result",
+            data={
+                "call_id": "read-image",
+                "name": "artifact_read",
+                "result": "Image prepared, not confirmed delivered.",
+                "tool_attachment_context_version": 1,
+                "tool_attachment_context_refs": [
+                    {
+                        "artifact_id": artifact_id,
+                        "kind": "image",
+                        "filename": "image.png",
+                        "mime_type": "image/png",
+                        "url": image_url,
+                    }
+                ],
+            },
+        ),
+    ]
+    if compacted:
+        tail += [
+            CachedEvent(seq=104, type="assistant_message", data={"content": "I inspected it."}),
+            CachedEvent(
+                seq=105,
+                type="lifecycle",
+                data={
+                    "event": "context_projection",
+                    "decisions": [
+                        {
+                            "call_id": "read-image",
+                            "operation": "compact_attachment",
+                            "rendering_policy_version": 2,
+                            "parameters": {},
+                        }
+                    ],
+                },
+            ),
+        ]
+    for index in range(2):
+        session = SessionModel(
+            session_id=f"image-rotation-{index}",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        for _ in range(2):
+            await manager._seed_rotated_tail_events(
+                session, tail_events=tail, previous_session_id=f"image-rotation-{index - 1}"
+            )
+        entry = await SessionCache(providers.guardrails).refresh(session)
+        messages = events_to_messages(
+            entry.events,
+            model_info=ModelInfo(model_id="gpt-6.1-sol", supports_vision=True),
+            projection_decisions=entry.projection_decisions,
+        )
+        wire = messages_to_responses_input(messages)
+        images = [
+            part["image_url"]
+            for item in wire
+            for part in item.get("content", [])
+            if isinstance(part, dict) and part.get("type") == "input_image"
+        ]
+        assert images == ([] if compacted else [image_url])
+        if compacted:
+            rendered = str(wire)
+            assert f'artifact_read(artifact_id="{artifact_id}")' in rendered
+            assert "read_tool_output" not in rendered
+            assert "does not mean the underlying file is unavailable or deleted" in rendered
+        tail = entry.events
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotated_projection_rebases_only_copied_targets_across_repeated_rotations(
+    tmp_path,
+) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _StreamGuardrails()
+    cache = SessionCache(providers.guardrails)
+    manager = SessionManager(session_factory, providers, cache)
+    tail = [
+        CachedEvent(seq=5517, type="user_message", data={"content": "Check the shared avatar"}),
+        CachedEvent(
+            seq=5518,
+            type="assistant_message",
+            data={"content": "An obsolete routing notice"},
+        ),
+        _projection_event(5522, 9, 5518),
+    ]
+    for index, initial_count in enumerate((8, 3), start=1):
+        session = SessionModel(
+            session_id=f"rotation-{index}",
+            conversation_id="conv-1",
+            user_email="user@example.com",
+            agent_id="agent-1",
+        )
+        await providers.guardrails.record_events(
+            session.session_id,
+            [SessionEvent(type="lifecycle", data={"event": "session_created"})] * initial_count,
+        )
+        for _ in range(2):  # Retrying seeding must not duplicate or renumber decisions.
+            await manager._seed_rotated_tail_events(
+                session, tail_events=tail, previous_session_id=f"rotation-{index - 1}"
+            )
+        warm = await cache.refresh(session)
+        cold = await SessionCache(providers.guardrails).refresh(session)
+        assert warm.projection_decisions == cold.projection_decisions
+        assert set(cold.projection_decisions) == {
+            f"event:{initial_count + 2}",
+            "lookup-product",
+        }
+        messages = events_to_messages(cold.events, projection_decisions=cold.projection_decisions)
+        assert any(
+            message["role"] == "user" and "Check the shared avatar" in message["content"]
+            for message in messages
+        )
+        assert not any(
+            "An obsolete routing notice" in str(message.get("content")) for message in messages
+        )
+        stream = providers.guardrails.streams[session.session_id]
+        assert len(stream) == initial_count + 3
+        tail = [
+            CachedEvent(seq=event["seq"], type=event["type"], data=event["data"])
+            for event in stream[initial_count:]
+        ]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_carried_projection_uses_source_namespace_on_cold_replay(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _StreamGuardrails()
+    session = SessionModel(
+        session_id="legacy-rotation",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    source_events = [
+        CachedEvent(seq=5517, type="user_message", data={"content": "Keep my latest request"}),
+        CachedEvent(
+            seq=5518,
+            type="assistant_message",
+            data={"content": "Obsolete notice"},
+        ),
+        _projection_event(5522, 9, 5518),
+    ]
+    await providers.guardrails.record_events(
+        session.session_id,
+        [SessionEvent(type="lifecycle", data={"event": "session_created"})] * 8
+        + [
+            SessionEvent(
+                type=event.type,
+                data={
+                    **event.data,
+                    "compaction_tail": True,
+                    "source_session_id": "legacy-source",
+                    "source_seq": event.seq,
+                },
+            )
+            for event in source_events
+        ],
+    )
+    entry = await SessionCache(providers.guardrails).refresh(session)
+    assert set(entry.projection_decisions) == {"event:10", "lookup-product"}
+    messages = events_to_messages(entry.events, projection_decisions=entry.projection_decisions)
+    assert any("Keep my latest request" in str(message.get("content")) for message in messages)
+    assert not any("Obsolete notice" in str(message.get("content")) for message in messages)
+
+    # An already affected session can rotate again without carrying the collision.
+    manager = SessionManager(session_factory, providers, SessionCache(providers.guardrails))
+    next_session = session.model_copy(update={"session_id": "legacy-rotation-next"})
+    await manager._seed_rotated_tail_events(
+        next_session, tail_events=entry.events, previous_session_id=session.session_id
+    )
+    next_entry = await SessionCache(providers.guardrails).refresh(next_session)
+    assert set(next_entry.projection_decisions) == {"event:10", "lookup-product"}
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotated_projection_maps_targets_across_append_batches(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _StreamGuardrails()
+    manager = SessionManager(session_factory, providers, SessionCache(providers.guardrails))
+    session = SessionModel(
+        session_id="batched-rotation",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    tail = [
+        CachedEvent(seq=index, type="user_message", data={"content": f"Request {index}"})
+        for index in range(5000, 6001)
+    ] + [_projection_event(6001, 6000)]
+    await manager._seed_rotated_tail_events(
+        session, tail_events=tail, previous_session_id="batched-source"
+    )
+    entry = await SessionCache(providers.guardrails).refresh(session)
+    assert set(entry.projection_decisions) == {"event:1001", "lookup-product"}
+    assert len(providers.guardrails.streams[session.session_id]) == 1002
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rotated_tail_excludes_both_automatic_and_manual_recaps(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(session_factory, providers, _Cache())
+    session = SessionModel(
+        session_id="recap-rotation",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    await manager._seed_rotated_tail_events(
+        session,
+        previous_session_id="recap-source",
+        tail_events=[
+            CachedEvent(seq=1, type="user_message", data={"content": "Continue working"}),
+            *[
+                CachedEvent(
+                    seq=index,
+                    type="lifecycle",
+                    data={"event": "conversation_recap", "auto": auto, "text": "Past work"},
+                )
+                for index, auto in enumerate((True, False), start=2)
+            ],
+        ],
+    )
+    assert [
+        event.type for _, events, _ in providers.guardrails.recorded_events for event in events
+    ] == ["user_message"]
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_failed_tail_append_does_not_publish_projection_rules(tmp_path) -> None:
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    providers.guardrails = _NonAppendingGuardrails()
+    manager = SessionManager(session_factory, providers, _Cache())
+    session = SessionModel(
+        session_id="failed-rotation",
+        conversation_id="conv-1",
+        user_email="user@example.com",
+        agent_id="agent-1",
+    )
+    await manager._seed_rotated_tail_events(
+        session,
+        previous_session_id="failed-source",
+        tail_events=[
+            CachedEvent(seq=100, type="user_message", data={"content": "Keep request"}),
+            _projection_event(101, 100),
+        ],
+    )
+    assert len(providers.guardrails.recorded_events) == 1
+    assert providers.guardrails.recorded_events[0][1][0].type == "user_message"
+    await engine.dispose()
+
+
 async def _session_factory(tmp_path, *, capabilities: dict | None = None) -> object:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'cognis.db'}")
     session_factory = create_session_factory(engine)
@@ -515,6 +856,52 @@ async def _session_factory(tmp_path, *, capabilities: dict | None = None) -> obj
         )
         await session.commit()
     return engine, session_factory
+
+
+@pytest.mark.asyncio
+async def test_reserved_child_reuse_validates_binding_and_commits_participant(tmp_path):
+    from unittest.mock import AsyncMock
+    from uuid import uuid4
+
+    engine, factory = await _session_factory(tmp_path)
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    _, parent = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+        title="Recover child",
+    )
+    providers.guardrails.create_session = AsyncMock(wraps=providers.guardrails.create_session)
+    reserved_id = f"sess_{uuid4().hex}"
+    binding = {"task_call": {"call_id": uuid4().hex, "turn_id": uuid4().hex}}
+
+    async def participant(db, row, created):
+        if not created:
+            row.result_summary = "Participant committed"
+
+    kwargs = dict(
+        mode="sync",
+        task_description="Recover work",
+        agent_id="agent-1",
+        effective_agent_id="agent-1",
+        session_id=reserved_id,
+        delegation_metadata=binding,
+        creation_participant=participant,
+    )
+    first = await manager.create_child_session(parent, **kwargs)
+    second = await manager.create_child_session(parent, **kwargs)
+    assert first.session_id == second.session_id == reserved_id
+    assert providers.guardrails.create_session.await_count == 1
+    async with factory() as db:
+        row = await db.get(Session, reserved_id)
+        assert row.result_summary == "Participant committed"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        await manager.create_child_session(
+            parent, **{**kwargs, "delegation_metadata": {"task_call": {"call_id": uuid4().hex}}}
+        )
+    assert providers.guardrails.create_session.await_count == 1
+    await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1189,6 +1576,115 @@ async def test_evaluation_task_override_survives_child_rotation_and_refresh(tmp_
         await engine.dispose()
 
 
+@pytest.mark.asyncio
+async def test_delegated_policy_inherits_allowances_without_redeclaring_task_grants(
+    tmp_path,
+) -> None:
+    from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_context
+
+    engine, factory = await _session_factory(
+        tmp_path, capabilities={"intaris_evaluation": "balanced"}
+    )
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    token = current_runtime_access_context.set(
+        RuntimeAccessContext(
+            task_id="task-policy",
+            session_policy={"allow_policies": ["Inspect the application source"]},
+        )
+    )
+    try:
+        _, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        )
+        assert providers.guardrails.last_policy["allow_policies"] == [
+            "Inspect the application source"
+        ]
+        # Ambient task policy can differ from the already-activated parent.
+        # Only Intaris's parent policy may grant authority to the child.
+        current_runtime_access_context.set(
+            RuntimeAccessContext(
+                task_id="task-policy",
+                session_policy={
+                    "allow_policies": ["Inspect another repository"],
+                    "deny_policies": ["Do not deploy"],
+                },
+            )
+        )
+        child = await manager.create_child_session(
+            root,
+            mode="delegate",
+            task_description="Review the application change",
+            agent_id="agent-1",
+            effective_agent_id="agent-1",
+        )
+        assert "allow_policies" not in providers.guardrails.last_policy
+        assert providers.guardrails.last_policy["deny_policies"] == ["Do not deploy"]
+        await manager.refresh_intaris_session_policy(child)
+        assert "allow_policies" not in providers.guardrails.last_policy
+        assert providers.guardrails.last_policy["deny_policies"] == ["Do not deploy"]
+        await manager.refresh_intaris_session_policy(root)
+        assert providers.guardrails.last_policy["allow_policies"] == ["Inspect another repository"]
+    finally:
+        current_runtime_access_context.reset(token)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_policy_refresh_reuses_only_identical_acknowledgements_in_one_turn(tmp_path) -> None:
+    from unittest.mock import AsyncMock
+
+    from cognis.core.policy_acknowledgements import isolate_policy_acknowledgements
+    from cognis.runtime_context import current_effective_working_directory
+
+    engine, factory = await _session_factory(
+        tmp_path, capabilities={"intaris_evaluation": "balanced"}
+    )
+    providers = _Providers()
+    manager = SessionManager(factory, providers, _Cache())
+    try:
+        _, root = await manager.create_conversation_with_root_session(
+            user_email="user@example.com",
+            agent_id="agent-1",
+            context=ConversationContext(type="web"),
+        )
+        update = AsyncMock(wraps=providers.guardrails.update_session_policy)
+        providers.guardrails.update_session_policy = update
+
+        async def refresh(workdir: str) -> None:
+            token = current_effective_working_directory.set(workdir)
+            try:
+                await manager.refresh_intaris_session_policy(root)
+            finally:
+                current_effective_working_directory.reset(token)
+
+        @isolate_policy_acknowledgements
+        async def turn() -> None:
+            await refresh("/work")
+            await refresh("/work")
+            assert update.await_count == 1
+            await refresh("/changed")
+            assert update.await_count == 2
+            await refresh("/work")
+            assert update.await_count == 3, "A -> B -> A must restore A in Intaris"
+            update.side_effect = RuntimeError("unavailable")
+            for _ in range(2):
+                with pytest.raises(RuntimeError, match="unavailable"):
+                    await refresh("/failed")
+            assert update.await_count == 5
+            update.side_effect = None
+            await refresh("/work")
+            assert update.await_count == 6, "uncertain failed writes invalidate A"
+
+        await turn()
+        await refresh("/work")
+        assert update.await_count == 7
+    finally:
+        await engine.dispose()
+
+
 _UNATTENDED_JUDGE = {
     "allowed_decisions": ["approve", "deny"],
     "on_uncertain": "deny",
@@ -1526,6 +2022,109 @@ async def test_rotate_session_creates_new_root_and_marks_old_completed(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_rotated_execution_admission_survives_cold_context_assembly(tmp_path) -> None:
+    from cognis.core.compaction.strategy import _split_events
+
+    engine, session_factory = await _session_factory(tmp_path)
+    providers = _StreamProviders()
+    cache = SessionCache(providers.guardrails)
+    manager = SessionManager(session_factory, providers, cache)
+    conversation, root = await manager.create_conversation_with_root_session(
+        user_email="user@example.com",
+        agent_id="agent-1",
+        context=ConversationContext(type="web"),
+    )
+    original_events = [
+        SessionEvent(
+            type="user_message",
+            data={"content": "Complete the implementation.", "turn_id": "original-turn"},
+        ),
+        *[
+            SessionEvent(
+                type="system_message",
+                data={
+                    "event": "system_notice",
+                    "kind": "model_recovery",
+                    "scope": "turn",
+                    "turn_id": turn_id,
+                    "retry_source_turn_id": source_id,
+                    "content": "Continue the interrupted execution.",
+                },
+            )
+            for turn_id, source_id in [
+                ("retry-one", "original-turn"),
+                ("retry-two", "retry-one"),
+            ]
+        ],
+        SessionEvent(
+            type="user_message",
+            data={"source": "question_answer", "content": "Approved."},
+        ),
+        SessionEvent(
+            type="assistant_message",
+            data={"content": "Earlier progress.", "turn_id": "retry-two"},
+        ),
+        SessionEvent(
+            type="user_message",
+            data={"content": "Also verify the result.", "turn_id": "absorbed-turn"},
+        ),
+        SessionEvent(
+            type="assistant_message",
+            data={"content": "Verification in progress.", "turn_id": "retry-two"},
+        ),
+    ]
+    await providers.guardrails.record_events(root.session_id, original_events)
+    source_snapshot = await cache.acquire_context_snapshot(root)
+    older, tail = _split_events(source_snapshot.events, preserve_turns=1)
+    assert any(event.data.get("content") == "Earlier progress." for event in older)
+    successor = await manager.rotate_session(
+        conversation_id=conversation.conversation_id,
+        current_session=root,
+        intention="Continue verification.",
+        compaction_summary="Implementation in progress.",
+        tail_events=tail,
+    )
+    await cache.aclose()
+
+    # A restarted controller has neither the source cache nor the live prompt.
+    cold_cache = SessionCache(providers.guardrails)
+    cold_manager = SessionManager(session_factory, providers, cold_cache)
+    agent = AgentDefinition(
+        agent_id="agent-1",
+        owner_email="user@example.com",
+        name="Agent",
+        llm_config=AgentLLMConfig(model="test-model", max_tokens=128),
+        capabilities=AgentCapabilities(memory_backend="none"),
+    )
+    assembler = ContextAssembler(
+        memory=providers.memory,
+        guardrails=providers.guardrails,
+        llm=_ContextLLM(),
+        session_cache=cold_cache,
+        session_manager=cold_manager,
+        max_context_tokens=4096,
+        compaction_threshold=0.85,
+    )
+    assembled = await assembler.assemble(
+        session=successor,
+        conversation=conversation,
+        agent=agent,
+        user_message="Continue after controller restart.",
+        tool_definitions=[],
+        memory_policy=resolve_memory_policy(
+            agent, resolve_conversation_agent_profile(agent, successor, conversation)
+        ),
+        required_turn_id="retry-two",
+        require_user_event=True,
+    )
+    prompt = "\n".join(str(message.get("content") or "") for message in assembled.messages)
+    assert prompt.count("Complete the implementation.") == 1
+    assert prompt.count("Also verify the result.") == 1
+    await cold_cache.aclose()
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_compaction_intention_lookup_failure_preserves_lane(tmp_path, monkeypatch):
     from unittest.mock import AsyncMock
 
@@ -1577,7 +2176,13 @@ async def test_reset_does_not_inherit_old_intention(tmp_path, monkeypatch):
         context=ConversationContext(type="web"),
         title="Reset",
     )
-    lookup = AsyncMock(side_effect=AssertionError("Must not inherit old task"))
+    lookup = AsyncMock(
+        return_value=SimpleNamespace(
+            intention="Old task must not be inherited",
+            analytics_enabled=False,
+            guardrails_enabled=False,
+        )
+    )
     monkeypatch.setattr(providers.guardrails, "get_session", lookup)
     new = await manager.rotate_session(
         conversation_id=conversation.conversation_id,
@@ -1586,7 +2191,11 @@ async def test_reset_does_not_inherit_old_intention(tmp_path, monkeypatch):
         completion_reason="reset",
         transition=SessionTransition.RESET,
     )
-    lookup.assert_not_awaited()
+    lookup.assert_awaited_once()
+    assert providers.guardrails.flags[new.session_id] == {
+        "analytics_enabled": False,
+        "guardrails_enabled": False,
+    }
     assert providers.guardrails.intentions[new.session_id] == "Start a different task"
     await engine.dispose()
 
@@ -2667,18 +3276,18 @@ def test_intaris_session_policy_includes_additional_executor_paths() -> None:
     from cognis.core.session import _intaris_session_policy
 
     policy = _intaris_session_policy(
-        "/home/bob/src/sample-app",
-        executor_home="/home/bob",
+        "/home/alice/src/sample",
+        executor_home="/home/alice",
         additional_allowed_paths=[
-            "/Users/alice",
-            "/Users/alice/src/sample/config",
+            "/Users/developer",
+            "/Users/developer/src/catalog/config",
             "/var/folders/sample/tmp",
         ],
     )
 
-    assert "/home/bob/*" in policy["allow_paths"]
-    assert "/Users/alice/*" in policy["allow_paths"]
-    assert "/Users/alice/src/sample/config/*" in policy["allow_paths"]
+    assert "/home/alice/*" in policy["allow_paths"]
+    assert "/Users/developer/*" in policy["allow_paths"]
+    assert "/Users/developer/src/catalog/config/*" in policy["allow_paths"]
     assert "/var/folders/sample/tmp/*" in policy["allow_paths"]
 
 

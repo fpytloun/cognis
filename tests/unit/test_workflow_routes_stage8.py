@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,7 +48,7 @@ async def _seed_user(app: object, email: str = "user@example.com", role: str = "
 
 def test_workflow_list_includes_system_workflows(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.get(
             "/api/v1/workflows",
@@ -118,8 +117,8 @@ def test_owner_administrative_reads_do_not_grant_execution(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
-        project_id = asyncio.run(_seed_bound_workflow(client.app))
+        client.portal.call(_seed_user, client.app)
+        project_id = client.portal.call(_seed_bound_workflow, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 200
         listed = client.get("/api/v1/workflows", headers=headers).json()["items"]
@@ -170,7 +169,7 @@ def test_owner_administrative_reads_do_not_grant_execution(
                 )
             }
 
-        asyncio.run(check_native_and_execution())
+        client.portal.call(check_native_and_execution)
 
 
 @pytest.mark.parametrize("permission", [None, "viewer", "use", "manager"])
@@ -179,9 +178,9 @@ def test_non_owner_management_reads_preserve_authorization(
     monkeypatch: object, tmp_path: Path, permission: str | None, role: str
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
-        asyncio.run(_seed_user(client.app, email="other@example.com", role=role))
-        project_id = asyncio.run(_seed_bound_workflow(client.app, permission))
+        client.portal.call(_seed_user, client.app)
+        client.portal.call(lambda: _seed_user(client.app, email="other@example.com", role=role))
+        project_id = client.portal.call(_seed_bound_workflow, client.app, permission)
         headers = _auth_headers(client.app, email="other@example.com", role=role)
         assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 404
         # Existing unbound admin exception is preserved, not extended to bound definitions.
@@ -210,7 +209,7 @@ def test_non_owner_management_reads_preserve_authorization(
                     item["workflow_id"] for item in json.loads(listed.output)["workflows"]
                 }
 
-        asyncio.run(check_native())
+        client.portal.call(check_native)
         scoped = client.get("/api/v1/workflows", headers=headers, params={"project_id": project_id})
         if permission in {"use", "manager"}:
             assert scoped.status_code == 200
@@ -221,9 +220,9 @@ def test_non_owner_management_reads_preserve_authorization(
 
 def test_definition_owner_cannot_override_db_owner(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
-        asyncio.run(_seed_user(client.app, email="other@example.com"))
-        asyncio.run(_seed_bound_workflow(client.app))
+        client.portal.call(_seed_user, client.app)
+        client.portal.call(lambda: _seed_user(client.app, email="other@example.com"))
+        client.portal.call(_seed_bound_workflow, client.app)
 
         async def forge_definition_and_check_native() -> None:
             async with client.app.state.session_factory() as session:
@@ -238,7 +237,7 @@ def test_definition_owner_cannot_override_db_owner(monkeypatch: object, tmp_path
                 item["workflow_id"] for item in json.loads(listed.output)["workflows"]
             }
 
-        asyncio.run(forge_definition_and_check_native())
+        client.portal.call(forge_definition_and_check_native)
         headers = _auth_headers(client.app, email="other@example.com")
         assert client.get("/api/v1/workflows/wf_bound_owner", headers=headers).status_code == 404
         assert "wf_bound_owner" not in {
@@ -249,7 +248,7 @@ def test_definition_owner_cannot_override_db_owner(monkeypatch: object, tmp_path
 
 def test_agent_list_includes_system_agents(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.get(
             "/api/v1/agents",
@@ -265,7 +264,7 @@ def test_agent_list_includes_system_agents(monkeypatch: object, tmp_path: Path) 
 
 def test_workflow_detail_supports_system_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.get(
             "/api/v1/workflows/system:software-development",
@@ -283,7 +282,7 @@ def test_workflow_presentation_create_round_trip_and_explicit_removal(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
         payload = {
             "name": "Phased",
@@ -338,7 +337,7 @@ def test_workflow_presentation_create_round_trip_and_explicit_removal(
 
 def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.post(
             "/api/v1/workflows/system:research/duplicate",
@@ -361,7 +360,7 @@ def test_workflow_duplicate_supports_system_workflow(monkeypatch: object, tmp_pa
 
 def test_workflow_create_accepts_null_workflow_id(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.post(
             "/api/v1/workflows",
@@ -381,8 +380,8 @@ def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="owner@example.com"))
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="owner@example.com"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
 
         async def _seed_workflow() -> None:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -409,7 +408,7 @@ def test_workflow_duplicate_allows_admin_for_user_owned_workflow(
                 )
                 await session.commit()
 
-        asyncio.run(_seed_workflow())
+        client.portal.call(_seed_workflow)
 
         response = client.post(
             "/api/v1/workflows/wf_owner_private/duplicate",
@@ -426,8 +425,8 @@ def test_project_workflow_binding_rejects_other_user_workflow(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="owner@example.com"))
-        asyncio.run(_seed_user(client.app, email="other@example.com"))
+        client.portal.call(lambda: _seed_user(client.app, email="owner@example.com"))
+        client.portal.call(lambda: _seed_user(client.app, email="other@example.com"))
 
         async def _seed_workflow() -> None:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -447,7 +446,7 @@ def test_project_workflow_binding_rejects_other_user_workflow(
                 )
                 await session.commit()
 
-        asyncio.run(_seed_workflow())
+        client.portal.call(_seed_workflow)
         headers = _auth_headers(client.app, email="owner@example.com")
         project = client.post("/api/v1/projects", headers=headers, json={"name": "Project"})
         assert project.status_code == 201
@@ -465,8 +464,8 @@ def test_project_create_rejects_other_user_default_workflow(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="owner@example.com"))
-        asyncio.run(_seed_user(client.app, email="other@example.com"))
+        client.portal.call(lambda: _seed_user(client.app, email="owner@example.com"))
+        client.portal.call(lambda: _seed_user(client.app, email="other@example.com"))
 
         async def _seed_workflow() -> None:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -486,7 +485,7 @@ def test_project_create_rejects_other_user_default_workflow(
                 )
                 await session.commit()
 
-        asyncio.run(_seed_workflow())
+        client.portal.call(_seed_workflow)
         response = client.post(
             "/api/v1/projects",
             headers=_auth_headers(client.app, email="owner@example.com"),

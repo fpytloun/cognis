@@ -120,7 +120,7 @@ def test_handoff_link_requires_created_recipient_and_source_session(
                 await db.commit()
                 return source.conversation_id, recipient.conversation_id, session.session_id
 
-        source_id, recipient_id, session_id = asyncio.run(seed())
+        source_id, recipient_id, session_id = client.portal.call(seed)
         link = AsyncMock()
         app.state.handoff_service = SimpleNamespace(link_recipient=link)
         payload = {
@@ -224,7 +224,7 @@ def test_sidebar_completes_with_snapshot_revision_during_continuous_churn(
                 await session.commit()
                 return row.conversation_id
 
-        conversation_id = asyncio.run(seed())
+        conversation_id = client.portal.call(seed)
         original = conversations_routes._conversation_page_projection
         written_revisions: list[int] = []
 
@@ -450,7 +450,7 @@ def test_sidebar_projects_active_background_command(
                 await session.commit()
                 return conversation.conversation_id, other_conversation.conversation_id
 
-        conversation_id, other_conversation_id = asyncio.run(_seed())
+        conversation_id, other_conversation_id = client.portal.call(_seed)
 
         async def _background_shells(
             request: object, *, user_email: str, require_complete: bool = False
@@ -579,7 +579,7 @@ def test_mark_read_always_emits_authoritative_acknowledgement(
                 await session.commit()
                 return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         response = client.post(f"/api/v1/conversations/{conversation_id}/read", headers=headers)
@@ -600,7 +600,7 @@ def test_mark_read_always_emits_authoritative_acknowledgement(
                 conversation = await get_conversation(session, conversation_id)
                 return conversation.last_read_at if conversation else None
 
-        stored_last_read_at = asyncio.run(_last_read_at())
+        stored_last_read_at = client.portal.call(_last_read_at)
         assert stored_last_read_at is not None
         assert (
             datetime.fromisoformat(payload["last_read_at"]).replace(tzinfo=None)
@@ -630,7 +630,7 @@ def test_create_conversation_emits_sidebar_upsert(monkeypatch: object, tmp_path:
         app = cast(Any, client.app)
         send_sidebar_update = AsyncMock()
         app.state.ws_manager = SimpleNamespace(send_sidebar_update_to_owner=send_sidebar_update)
-        asyncio.run(_seed_user_and_agent(app))
+        client.portal.call(_seed_user_and_agent, app)
         headers = _auth_headers(app, email="user@example.com")
 
         response = client.post(
@@ -745,7 +745,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                 await session.commit()
                 return controller.conversation_id, target.conversation_id, link.link_id
 
-        controller_id, target_id, link_id = asyncio.run(_seed())
+        controller_id, target_id, link_id = client.portal.call(_seed)
         scheduler_durable_running = app.state.turn_scheduler.durable_running_turn_state
         scheduler_durable_running_many = app.state.turn_scheduler.durable_running_turn_states
         target_running = True
@@ -826,7 +826,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                 row.updated_at = datetime.now(UTC)
                 await session.commit()
 
-        asyncio.run(_settle_durable_turn())
+        client.portal.call(_settle_durable_turn)
         target_running = False
         scheduler_delta = client.get(
             "/api/v1/conversations/sidebar",
@@ -863,7 +863,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                 )
                 await session.commit()
 
-        asyncio.run(_leave_stale_running_state())
+        client.portal.call(_leave_stale_running_state)
         app.state.turn_scheduler.durable_running_turn_state = scheduler_durable_running
         app.state.turn_scheduler.durable_running_turn_states = scheduler_durable_running_many
         idle_response = client.get(
@@ -891,7 +891,7 @@ def test_sidebar_projects_open_managed_work_and_active_delegations(
                 )
                 await session.commit()
 
-        asyncio.run(_settle_cancelled_turn())
+        client.portal.call(_settle_cancelled_turn)
         cancelled_response = client.get(
             "/api/v1/conversations/sidebar",
             headers=_auth_headers(app, email="user@example.com"),
@@ -933,7 +933,7 @@ def test_update_conversation_title_star_archive_and_project_emit_sidebar_upserts
                 await session.commit()
                 return conversation.conversation_id, project.project_id
 
-        conversation_id, project_id = asyncio.run(_seed())
+        conversation_id, project_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         mutations = [
@@ -969,6 +969,8 @@ def test_delete_and_purge_conversation_emit_sidebar_removal(
         send_to_user = AsyncMock()
         app.state.ws_manager = SimpleNamespace(send_to_user=send_to_user)
         app.state.providers.guardrails.delete_session = AsyncMock()
+        terminate_program_scope = AsyncMock()
+        app.state.providers.executor.terminate_program_scope = terminate_program_scope
 
         async def _seed() -> tuple[str, str]:
             await _seed_user_and_agent(app)
@@ -990,7 +992,7 @@ def test_delete_and_purge_conversation_emit_sidebar_removal(
                 await session.commit()
                 return soft_deleted.conversation_id, purged.conversation_id
 
-        soft_deleted_id, purged_id = asyncio.run(_seed())
+        soft_deleted_id, purged_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         delete_response = client.delete(f"/api/v1/conversations/{soft_deleted_id}", headers=headers)
@@ -998,6 +1000,10 @@ def test_delete_and_purge_conversation_emit_sidebar_removal(
 
         assert delete_response.status_code == 200
         assert purge_response.status_code == 200
+        assert terminate_program_scope.await_args_list == [
+            call(soft_deleted_id, executor_ids=None),
+            call(purged_id, executor_ids=None),
+        ]
         assert send_to_user.await_args_list == [
             call(
                 "user@example.com",
@@ -1077,7 +1083,7 @@ def test_managed_fork_emits_sidebar_upsert_for_new_conversation(
                 await session.commit()
                 return target.conversation_id
 
-        target_conversation_id = asyncio.run(_seed())
+        target_conversation_id = client.portal.call(_seed)
 
         async def _fork_into_new_conversation(**_kwargs: object) -> tuple[object, object, bool]:
             from cognis.core.session import _to_conversation_model, _to_session_model
@@ -1174,7 +1180,7 @@ def test_conversation_deliverable_detail_is_owner_scoped(
                 await session.commit()
                 return deliverable.deliverable_id
 
-        deliverable_id = asyncio.run(_seed())
+        deliverable_id = client.portal.call(_seed)
 
         owner_response = client.get(
             f"/api/v1/deliverables/{deliverable_id}",
@@ -1255,7 +1261,7 @@ def test_conversation_deliverable_detail_allows_a_managed_descendant_from_its_co
                 await session.commit()
                 return controller.conversation_id, deliverable.deliverable_id
 
-        controller_conversation_id, deliverable_id = asyncio.run(_seed())
+        controller_conversation_id, deliverable_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="owner@example.com")
 
         unscoped_response = client.get(
@@ -1343,7 +1349,7 @@ def test_slash_command_suggestions_route_returns_dispatcher_items(
 
         dispatcher = _Dispatcher()
         app.state.command_dispatcher = dispatcher
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
 
         response = client.get(
             f"/api/v1/conversations/{conversation_id}/slash-command-suggestions",
@@ -1409,7 +1415,7 @@ def test_conversation_detail_can_skip_legacy_state_snapshot(
             "snapshot_for_conversation",
             snapshot_for_conversation,
         )
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
 
         response = client.get(
             f"/api/v1/conversations/{conversation_id}",
@@ -1468,7 +1474,7 @@ def test_conversation_detail_attention_summary_is_opt_in_and_payload_free(
             )
             return conversation.conversation_id
 
-        conversation_id = asyncio.run(_seed())
+        conversation_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
         default_response = client.get(
             f"/api/v1/conversations/{conversation_id}",
@@ -1532,7 +1538,7 @@ def test_conversation_open_can_skip_legacy_state_snapshot(
             "snapshot_for_conversation",
             snapshot_for_conversation,
         )
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/conversations/open",
@@ -1587,7 +1593,7 @@ def test_remember_chat_last_opened_writes_global_key(
                     session, "user@example.com", _CHAT_LAST_OPENED_GLOBAL_STATE_KEY
                 )
 
-        state = asyncio.run(_run())
+        state = client.portal.call(_run)
         assert state is not None
         assert state["conversation_id"] == "conv-123"
         assert state["agent_id"] == "agent-a"
@@ -1647,7 +1653,7 @@ def test_open_conversation_global_key_fallback(
                 await session.commit()
                 return conv.conversation_id, "agent-a"
 
-        conv_id, requesting_agent = asyncio.run(_seed())
+        conv_id, requesting_agent = client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         # Request with agent-a — no agent-a conversations exist, but the global

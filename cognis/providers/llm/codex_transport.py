@@ -11,6 +11,7 @@ import httpx
 from cognis import json_codec as json
 from cognis.providers.llm.codex import CODEX_RESPONSES_URL, CodexAuth
 from cognis.providers.llm.transport import strip_controller_transport_kwargs
+from cognis.providers.llm.usage_binding import take_binding
 
 DEFAULT_CODEX_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=90.0, write=30.0, pool=30.0)
 DEFAULT_CODEX_STREAM_HTTP_TIMEOUT = httpx.Timeout(connect=30.0, read=None, write=30.0, pool=30.0)
@@ -171,12 +172,32 @@ class DirectCodexTransport:
             await client.aclose()
 
     async def responses(self, **kwargs: Any) -> Any:
+        binding = take_binding(kwargs)
         payload, stream = _codex_payload(kwargs)
         headers = _codex_headers(self._auth, kwargs)
         timeout = kwargs.get("timeout") or (
             DEFAULT_CODEX_STREAM_HTTP_TIMEOUT if stream else DEFAULT_CODEX_HTTP_TIMEOUT
         )
         client = self._http_client()
+        if binding is not None:
+            return await binding.call(
+                lambda: self._submit(payload, stream, headers, timeout, client),
+                operation="responses",
+                parameters=payload,
+                streaming=stream,
+                semantic_profile="openai",
+            )
+        return await self._submit(payload, stream, headers, timeout, client)
+
+    async def _submit(
+        self,
+        payload: dict[str, Any],
+        stream: bool,
+        headers: dict[str, str],
+        timeout: Any,
+        client: httpx.AsyncClient,
+    ) -> Any:
+        """Submit once after native payload/header validation."""
         if stream:
             request = client.build_request(
                 "POST",

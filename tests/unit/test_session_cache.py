@@ -31,6 +31,29 @@ from cognis.models.session import (
 )
 
 
+def test_legacy_cached_event_projections_require_canonical_reload() -> None:
+    from cognis.core.session_cache import CachedSessionState
+
+    entry = CachedSessionState(session_id="rotated-session", intaris_session_id="rotated-session")
+    entry.initialized = True
+    entry.projection_decisions = {
+        "event:9": [
+            {
+                "operation": "omit_event",
+                "rendering_policy_version": 1,
+                "parameters": {"event_seq": 9},
+            }
+        ]
+    }
+    encoded = _serialize_entry(entry)
+    assert _deserialize_entry(encoded).canonical_stale is False
+    legacy = json.loads(encoded)
+    legacy.pop("projection_scope_version")
+    assert _deserialize_entry(json.dumps(legacy)).canonical_stale is True
+    legacy["projection_decisions"] = {}
+    assert _deserialize_entry(json.dumps(legacy)).canonical_stale is False
+
+
 @pytest.mark.asyncio
 async def test_projection_decisions_rebuild_from_lifecycle_events_and_survive_cache_encoding() -> (
     None

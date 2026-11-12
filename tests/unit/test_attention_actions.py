@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -247,7 +246,7 @@ def test_attention_detail_enforces_owner_and_resolution_is_idempotent(
                 },
             )
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         owner_headers = _headers(client.app, "owner@example.com")
         other_headers = _headers(client.app, "other@example.com")
 
@@ -326,7 +325,7 @@ def test_stale_revision_and_expiry_return_conflict(
                 payload={"kind": "otp_code", "required_fields": ["code"]},
             )
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         headers = _headers(client.app, "owner@example.com")
 
         expired = client.post(

@@ -38,6 +38,7 @@ def management_dependencies(app: Any) -> service.ExecutorManagementDependencies:
         reconfigure=lambda executor_id: schedule_executor_reconfigure(app, executor_id),
         trigger_reconcile=trigger,
         sign_token=app.state.providers.auth.sign_executor_token,
+        credentials=getattr(app.state.providers, "credentials", None),
     )
 
 

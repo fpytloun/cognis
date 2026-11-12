@@ -39,6 +39,8 @@ Tool-call argument strings may reference an earlier tool result in the same
 conversation with ``{{tool_result:<call_id>:<key>}}``. The placeholder is
 replaced by the first JSON string value of ``key`` in that tool result, which
 lets a scenario reuse server-generated IDs such as a ``dlv_`` deliverable ID.
+Use ``{{tool_result_number:<call_id>:<key>}}`` to reuse an integer result as a
+typed JSON number.
 """
 
 from __future__ import annotations
@@ -197,6 +199,7 @@ def _turn_ends_with_tool_call(turn: dict[str, Any]) -> bool:
 
 
 _TOOL_RESULT_PLACEHOLDER = re.compile(r"\{\{tool_result:([^:}]+):([^}]+)\}\}")
+_TOOL_RESULT_NUMBER_PLACEHOLDER = re.compile(r"\{\{tool_result_number:([^:}]+):([^}]+)\}\}")
 
 
 def _tool_result_text(messages: list[dict[str, Any]], call_id: str) -> str:
@@ -212,7 +215,7 @@ def _tool_result_text(messages: list[dict[str, Any]], call_id: str) -> str:
 
 
 def resolve_argument_placeholders(value: Any, messages: list[dict[str, Any]]) -> Any:
-    """Replace ``{{tool_result:<call_id>:<key>}}`` placeholders in tool arguments."""
+    """Replace typed references to earlier tool results in tool arguments."""
 
     if isinstance(value, dict):
         return {key: resolve_argument_placeholders(item, messages) for key, item in value.items()}
@@ -220,6 +223,13 @@ def resolve_argument_placeholders(value: Any, messages: list[dict[str, Any]]) ->
         return [resolve_argument_placeholders(item, messages) for item in value]
     if not isinstance(value, str):
         return value
+
+    number_match = _TOOL_RESULT_NUMBER_PLACEHOLDER.fullmatch(value)
+    if number_match:
+        text = _tool_result_text(messages, number_match.group(1))
+        key = re.escape(number_match.group(2))
+        found = re.search(rf'\\*"{key}\\*"\s*:\s*(-?\d+)(?=\s*[,}}\]])', text)
+        return int(found.group(1)) if found else value
 
     def substitute(match: re.Match[str]) -> str:
         text = _tool_result_text(messages, match.group(1))

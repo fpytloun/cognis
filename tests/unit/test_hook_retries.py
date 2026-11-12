@@ -15,12 +15,13 @@ from cognis.core.execution_metadata import persist_execution_metadata
 from cognis.core.hook_dispatch import HookDispatchJournal
 from cognis.core.hook_subsessions import internal_execution
 from cognis.core.session import SessionManager
+from cognis.models.agent import AgentRuntimeProfile
 from cognis.store.models import Agent, AgentHookRunRow, Conversation, Session
 from tests.unit.test_agent_hooks import conversation, factory, session  # noqa: F401
 from tests.unit.test_hook_subsessions import queue, setup_runtime
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_failure_is_terminal_and_next_occurrence_can_run(factory):
     service = await setup_runtime(factory)
     first = await queue(service, factory, "completed:first")
@@ -37,7 +38,7 @@ async def test_failure_is_terminal_and_next_occurrence_can_run(factory):
     assert second is not None and second.run_id != first.run_id
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_occurrences_queue_durably_while_one_session_is_running(factory):
     service = await setup_runtime(factory)
     first = await queue(service, factory, "completed:first")
@@ -70,7 +71,7 @@ async def test_occurrences_queue_durably_while_one_session_is_running(factory):
         assert all(row.status == "completed" and row.fork_slot is None for row in rows)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("phase", ["reserved", "executing"])
 async def test_elapsed_original_deadline_fails_without_inference(factory, phase):
     service = await setup_runtime(factory)
@@ -99,7 +100,7 @@ async def test_elapsed_original_deadline_fails_without_inference(factory, phase)
         assert internal_execution(saved)["failure_reason"] == "timeout"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_timeout_cancels_child_once_and_never_retries(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:timeout")
@@ -137,7 +138,57 @@ async def test_timeout_cancels_child_once_and_never_retries(factory):
         assert internal_execution(saved)["deadline_at"] == deadline
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
+@pytest.mark.parametrize("live", [False, True])
+@pytest.mark.parametrize("idle_failure", ["error", "cancellation"])
+async def test_recovery_expires_orphans_before_slow_idle_matching(factory, live, idle_failure):
+    service = await setup_runtime(factory)
+    run = await queue(service, factory, "completed:orphaned-deadline")
+    service.agent_loop.run_internal_child_session.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await service._run(run.run_id)
+    async with factory() as db:
+        saved = await db.get(AgentHookRunRow, run.run_id)
+        execution = internal_execution(saved)
+        deadline = (datetime.now(UTC) - timedelta(hours=10)).isoformat()
+        child_id = execution["session_id"]
+        saved.handoff = {
+            **saved.handoff,
+            "execution": {**execution, "deadline_at": deadline},
+        }
+        await db.commit()
+
+    # Idle evidence can consume the maintenance pass. Recover existing
+    # executions before that external work, including after worker loss.
+    service._started = live
+    service._match_idle = AsyncMock(side_effect=TimeoutError("idle evidence stalled"))
+    try:
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(None) as budget:
+                if idle_failure == "cancellation":
+
+                    async def stalled_idle(**kwargs):
+                        budget.reschedule(asyncio.get_running_loop().time())
+                        await asyncio.Event().wait()
+
+                    service._match_idle = AsyncMock(side_effect=stalled_idle)
+                await service.scan()
+        if service._jobs:
+            await asyncio.gather(*service._jobs.values())
+        async with factory() as db:
+            saved = await db.get(AgentHookRunRow, run.run_id)
+            child = await db.get(Session, child_id)
+            assert saved.status == "failed"
+            assert saved.fork_slot is None
+            assert child.status == "failed"
+            assert internal_execution(saved)["failure_reason"] == "timeout"
+            assert internal_execution(saved)["deadline_at"] == deadline
+        service.agent_loop.run_internal_child_session.assert_awaited_once()
+    finally:
+        await service.stop()
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("phase", ["retry_wait", "blocked", "executing"])
 async def test_legacy_retry_runs_are_retired_without_inference(factory, phase):
     service = await setup_runtime(factory)
@@ -163,7 +214,7 @@ async def test_legacy_retry_runs_are_retired_without_inference(factory, phase):
         assert internal_execution(saved)["phase"] == "terminal"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_execution_lease_prevents_duplicate_workers(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:leased")
@@ -184,7 +235,7 @@ async def test_execution_lease_prevents_duplicate_workers(factory):
     await worker
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("reconciliation_error", [False, True])
 async def test_restart_reconciles_tools_before_same_session_can_continue(
     factory, reconciliation_error
@@ -238,7 +289,7 @@ async def test_restart_reconciles_tools_before_same_session_can_continue(
         )
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_terminal_delivery_failure_releases_slot_and_never_repeats_inference(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:delivery")
@@ -260,7 +311,7 @@ async def test_terminal_delivery_failure_releases_slot_and_never_repeats_inferen
         assert not saved.handoff["settlement_pending"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_crash_after_response_commit_never_reexecutes_completed_session(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:response-crash")
@@ -283,7 +334,7 @@ async def test_crash_after_response_commit_never_reexecutes_completed_session(fa
         assert saved.handoff["published"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("appended", [False, True])
 async def test_crash_during_final_response_append_never_reenters_inference(factory, appended):
     service = await setup_runtime(factory)
@@ -315,7 +366,7 @@ async def test_crash_during_final_response_append_never_reenters_inference(facto
         assert saved.fork_slot is None and saved.handoff["published"]
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_successor_uses_predecessor_response_while_delivery_is_unavailable(factory):
     service = await setup_runtime(factory)
     first = await queue(service, factory, "completed:predecessor")
@@ -344,7 +395,7 @@ async def test_successor_uses_predecessor_response_while_delivery_is_unavailable
         assert "vault/Research.md" in context
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_different_hooks_share_one_conversation_execution_slot(factory):
     from tests.unit.test_agent_hooks import assign
 
@@ -387,7 +438,7 @@ async def test_different_hooks_share_one_conversation_execution_slot(factory):
     assert service.agent_loop.run_internal_child_session.await_count == 2
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_card_follows_source_session_rotation(factory):
     service = await setup_runtime(factory)
     run = await queue(service, factory, "completed:rotation")
@@ -424,9 +475,18 @@ def real_child_manager(service, factory):
     return SessionManager(factory, service.providers, service.session_cache)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_restart_keeps_child_identity_profile_metadata_and_original_deadline(factory):
     service = await setup_runtime(factory)
+    async with factory() as db:
+        agent = await db.get(Agent, "agent-hooks")
+        agent.agent_profiles = {
+            profile_id: AgentRuntimeProfile(
+                profile_id=profile_id, description=profile_id
+            ).model_dump()
+            for profile_id in ("developer", "developer-deep")
+        }
+        await db.commit()
     manager = real_child_manager(service, factory)
     service.session_manager.create_child_session = AsyncMock(
         side_effect=manager.create_child_session
@@ -471,7 +531,7 @@ async def test_restart_keeps_child_identity_profile_metadata_and_original_deadli
         assert child.delegation_metadata["execution_runtime"]["model"] == "gpt-5"
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize("status", ["failed", "completed", "cancelled"])
 async def test_restart_never_reopens_terminal_child(factory, status):
     service = await setup_runtime(factory)
@@ -493,7 +553,7 @@ async def test_restart_never_reopens_terminal_child(factory, status):
         assert child.status == status
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "field,value",
     [

@@ -43,6 +43,7 @@ from cognis.core.trusted_evidence import (
 )
 from cognis.logging import get_logger
 from cognis.models.session import SessionEvent, with_session_events_turn_id
+from cognis.providers.guardrails.event_keys import event_idempotency_key
 from cognis.providers.memory.evidence import (
     EvidenceRememberRequest,
     TrustedEventRejectedError,
@@ -2302,7 +2303,9 @@ class RememberRetryQueue:
                             None,
                         ),
                         source="cognis",
-                        idempotency_key=f"remember-failed:{item.item_id}",
+                        idempotency_key=event_idempotency_key(
+                            session_ref["intaris_session_id"], "remember-failed", str(item.item_id)
+                        ),
                     )
             if self._event_bus is not None:
                 await self._event_bus.publish(

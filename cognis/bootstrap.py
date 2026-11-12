@@ -23,6 +23,8 @@ from cognis.core.system_skills import SYSTEM_SKILL_DEFAULTS, get_system_skill_de
 from cognis.logging import get_logger
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.settings_schema import DEFAULT_SETTINGS
+from cognis.store.audio_schema import ensure_audio_job_plans, ensure_audio_job_warnings
+from cognis.store.binary_transfer_schema import ensure_binary_transfer_schema
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.hook_schema import ensure_hook_activation_boundary, ensure_hook_handoff
 from cognis.store.migrations.compat import normalize_legacy_profile_override_revision
@@ -36,6 +38,7 @@ from cognis.store.queries import (
     set_current_version,
 )
 from cognis.store.schema import validate_schema
+from cognis.store.video_schema import ensure_video_error_message
 from cognis.tools.skill_parser import compute_content_hash
 
 logger = get_logger(__name__)
@@ -158,10 +161,20 @@ def ensure_secrets_key(config: CognisConfig) -> None:
 async def run_schema_bootstrap(engine: AsyncEngine) -> None:
     """Create schema directly for MVP before/alongside Alembic use."""
 
+    from cognis.store.app_channels import ensure_app_channels
+    from cognis.store.app_contact_schema import ensure_app_contact_schema, repair_app_contact_titles
+    from cognis.store.task_outcome_schema import ensure_task_outcome_schema
+    from cognis.store.usage.schema import ensure_usage_schema
+
     is_postgresql = engine.dialect.name == "postgresql"
     async with engine.begin() as conn:
         await conn.run_sync(normalize_legacy_profile_override_revision)
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(ensure_usage_schema)
+        await conn.run_sync(ensure_binary_transfer_schema)
+        await conn.run_sync(ensure_video_error_message)
+        await conn.run_sync(ensure_audio_job_warnings)
+        await conn.run_sync(ensure_audio_job_plans)
         await conn.run_sync(ensure_hook_activation_boundary)
         await conn.run_sync(ensure_hook_handoff)
         await conn.run_sync(_ensure_session_lifecycle_columns)
@@ -193,6 +206,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_skill_system_column)
         await conn.run_sync(_ensure_schedule_extended_columns)
         await conn.run_sync(_ensure_conversation_title_source_column)
+        await conn.run_sync(_ensure_conversation_title_retry_column)
         await conn.run_sync(_ensure_conversation_starred_at_column)
         await conn.run_sync(_ensure_conversation_sidebar_activity_index)
         await conn.run_sync(_ensure_mcp_server_headers_column)
@@ -200,6 +214,7 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_system_override_tables)
         await conn.run_sync(_ensure_task_execution_paths)
         await conn.run_sync(_ensure_task_completion_delivery_columns)
+        await conn.run_sync(ensure_task_outcome_schema)
         await conn.run_sync(_ensure_task_interaction_override_columns)
         await conn.run_sync(_ensure_task_escalation_timeout_column)
         await conn.run_sync(_ensure_task_creator_agent_column)
@@ -273,6 +288,15 @@ async def run_schema_bootstrap(engine: AsyncEngine) -> None:
         await conn.run_sync(_ensure_direct_turn_requests_table)
         await conn.run_sync(_ensure_schedule_fires_table)
         await conn.run_sync(_ensure_channel_recipient_intents_table)
+        await conn.run_sync(ensure_app_channels)
+        await conn.run_sync(ensure_app_contact_schema)
+        await conn.run_sync(repair_app_contact_titles)
+        from cognis.store.feedback_safety_v1 import install_feedback_safety
+
+        await conn.run_sync(install_feedback_safety)
+        from cognis.store.document_sharing_schema import ensure_document_sharing
+
+        await conn.run_sync(ensure_document_sharing)
         if not is_postgresql:
             await conn.run_sync(_ensure_work_load_indexes)
 
@@ -2038,6 +2062,21 @@ def _ensure_conversation_title_source_column(sync_conn: object) -> None:
                 "WHEN title IS NULL OR TRIM(title) = '' THEN 'unset' "
                 "ELSE 'manual' END"
             )
+        )
+
+
+def _ensure_conversation_title_retry_column(sync_conn: object) -> None:
+    """Add content-free title retry metadata without changing existing titles."""
+    inspector = cast(Any, inspect(sync_conn))
+    if "conversations" not in inspector.get_table_names():
+        return
+    columns = {column["name"] for column in inspector.get_columns("conversations")}
+    if "title_generation_retry_at" not in columns:
+        column_type = sa.TIMESTAMP(timezone=True).compile(
+            dialect=cast(Connection, sync_conn).dialect
+        )
+        sync_conn.execute(  # type: ignore[attr-defined]
+            text(f"ALTER TABLE conversations ADD COLUMN title_generation_retry_at {column_type}")
         )
 
 

@@ -5,10 +5,10 @@ acting agent may read or write documents in. A document's project is stored on
 the document itself (shared by every revision of a lineage), so access does not
 depend on the chat or task that happened to produce a revision.
 
-Agent rule: project membership of the human never grants document access to an
-unrelated agent. The acting agent must be assigned to the project and usable by
-the human there, the human needs the role for the operation, and work running
-inside one project's context cannot reach another project's documents.
+Project-wide access requires agent assignment and current human permission.
+Human membership alone never grants access to an unrelated agent. The content
+read policy separately retains directly owned documents and specific descendant
+outputs; descendant reads still respect the acting work's project context.
 """
 
 from __future__ import annotations

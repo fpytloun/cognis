@@ -1,6 +1,9 @@
 """Documented provider wire contracts, tested without billable calls."""
 
+import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -105,11 +108,19 @@ async def test_omni_image_serialization_is_independent_of_veo():
             return httpx.Response(200, content=b"image")
         body = json.loads(request.content)
         assert body["input"][0] == {"type": "image", "mime_type": "image/png", "data": "aW1hZ2U="}
+        assert body["input"][1] == {"type": "text", "text": "Animate"}
+        assert body["response_format"] == {
+            "type": "video",
+            "delivery": "uri",
+            "resolution": "1080p",
+            "aspect_ratio": "16:9",
+        }
+        assert set(body) == {"model", "input", "store", "stream", "response_format"}
         return httpx.Response(200, json={"id": "image-interaction", "status": "in_progress"})
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
-            VideoRequest(prompt="Animate", max_cost_usd=5),
+            VideoRequest(prompt="Animate", max_cost_usd=5, resolution="1080p", aspect_ratio="16:9"),
             [
                 VideoInput(
                     role="reference",
@@ -120,6 +131,298 @@ async def test_omni_image_serialization_is_independent_of_veo():
             ],
         )
         assert result.handle == "image-interaction"
+
+
+def google_error_info(reason, **changes):
+    return {
+        "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+        "domain": "googleapis.com",
+        "reason": reason,
+        **changes,
+    }
+
+
+def google_bad_request(*fields):
+    return {
+        "@type": "type.googleapis.com/google.rpc.BadRequest",
+        "fieldViolations": [
+            {"field": field, "description": "private echoed input"} for field in fields
+        ],
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "details,suffix",
+    [
+        ([google_error_info("API_KEY_INVALID")], ":reason=API_KEY_INVALID"),
+        ([google_error_info("BILLING_DISABLED")], ":reason=BILLING_DISABLED"),
+        ([google_error_info("SERVICE_DISABLED")], ":reason=SERVICE_DISABLED"),
+        ([google_bad_request("response_format.resolution")], ":field=response_format.resolution"),
+        ([google_bad_request("input[0].mime_type")], ":field=input[0].mime_type"),
+        (
+            [
+                google_error_info("API_KEY_INVALID", metadata={"key": "private-key"}),
+                google_bad_request("response_format.aspect_ratio"),
+            ],
+            ":reason=API_KEY_INVALID:field=response_format.aspect_ratio",
+        ),
+    ],
+)
+async def test_google_http_error_preserves_only_recognized_diagnostics(details, suffix, caplog):
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        return httpx.Response(
+            400,
+            headers={"retry-after": "120"},
+            json={
+                "error": {
+                    "status": "INVALID_ARGUMENT",
+                    "message": "private prompt https://private.test/?key=private-key aW1hZ2U=",
+                    "details": details,
+                }
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    error = caught.value
+    assert error.code == str(error) == f"provider_http_400{suffix}"
+    assert error.rejected and error.retry_after == 120
+    assert error.__cause__ is None and error.__context__ is None
+    assert "private" not in repr(error) + caplog.text
+    assert "aW1hZ2U=" not in repr(error) + caplog.text
+    assert calls == ["POST"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not JSON: API_KEY_INVALID response_format.resolution",
+        b"\xff",
+        b"[" * 1100 + b"]" * 1100,
+        b'{"error":{"details":',
+        b"[]",
+        b"null",
+        json.dumps({"error": "private prompt"}).encode(),
+        json.dumps(
+            {"error": {"status": "INVALID_ARGUMENT", "message": "API_KEY_INVALID"}}
+        ).encode(),
+        json.dumps({"error": {"details": {"reason": "API_KEY_INVALID"}}}).encode(),
+        json.dumps(
+            {
+                "error": {
+                    "details": [
+                        None,
+                        "private prompt",
+                        google_error_info(["API_KEY_INVALID"]),
+                        google_error_info({"private": "secret"}),
+                        google_error_info("API_KEY_INVALID\nprivate-key"),
+                        google_error_info("API_KEY_INVALID", domain="private.test"),
+                        google_error_info("API_KEY_INVALID", **{"@type": "private.test/ErrorInfo"}),
+                        google_error_info("UNRECOGNIZED_PRIVATE_REASON"),
+                        google_bad_request(
+                            "response_format.resolution\nprivate-key",
+                            "input[0].text.private_prompt",
+                            "input[99].data",
+                            "https://private.test/?key=private-key",
+                            "aW1hZ2U=",
+                            ["input"],
+                            {"field": "input"},
+                        ),
+                        {
+                            "@type": "type.googleapis.com/google.rpc.BadRequest",
+                            "fieldViolations": "response_format.resolution",
+                        },
+                        {"reason": "API_KEY_INVALID", "field": "response_format.resolution"},
+                    ],
+                    "message": "private prompt API_KEY_INVALID",
+                }
+            }
+        ).encode(),
+        json.dumps(
+            {"error": {"details": [google_error_info("API_KEY_INVALID")], "message": "x" * 16384}}
+        ).encode(),
+    ],
+)
+async def test_unknown_malformed_or_reflected_error_content_stays_generic(body, caplog):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, content=body))
+    ) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    assert str(caught.value) == "provider_http_400"
+    assert caught.value.rejected
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "private" not in repr(caught.value) + caplog.text
+
+
+@pytest.mark.asyncio
+async def test_error_diagnostics_are_deduplicated_and_bounded():
+    details = [
+        google_error_info("SERVICE_DISABLED"),
+        google_error_info("BILLING_DISABLED"),
+        google_error_info("API_KEY_INVALID"),
+        google_error_info("API_KEY_INVALID"),
+        google_bad_request("stream", "store", "input", "model", "input"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, json={"error": {"details": details}})
+        )
+    ) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    assert str(caught.value) == (
+        "provider_http_400:reason=API_KEY_INVALID:reason=BILLING_DISABLED"
+        ":field=input:field=model:field=store"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["veo", "openrouter"])
+async def test_google_error_schema_is_not_assumed_for_other_provider_fields(kind):
+    details = [
+        google_error_info("API_KEY_INVALID"),
+        google_bad_request("response_format.resolution"),
+    ]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, json={"error": {"details": details}})
+        )
+    ) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client, kind).submit(VideoRequest(prompt="Animate", max_cost_usd=5), [])
+    assert str(caught.value) == (
+        "provider_http_400:reason=API_KEY_INVALID" if kind == "veo" else "provider_http_400"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [httpx.ReadError, TimeoutError, asyncio.CancelledError])
+async def test_error_body_failure_preserves_status_but_not_cancellation(failure):
+    class BrokenBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"error":'
+            raise failure("private upstream content")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, stream=BrokenBody()))
+    ) as client:
+        with pytest.raises(
+            asyncio.CancelledError if failure is asyncio.CancelledError else VideoProviderError
+        ) as caught:
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    if failure is not asyncio.CancelledError:
+        assert str(caught.value) == "provider_http_400"
+        assert caught.value.rejected
+        assert caught.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_error_body_read_stops_at_byte_limit_and_closes():
+    class LargeBody(httpx.AsyncByteStream):
+        chunks = 0
+        closed = False
+
+        async def __aiter__(self):
+            for _ in range(100):
+                self.chunks += 1
+                yield b"x" * 1024
+
+        async def aclose(self):
+            self.closed = True
+
+    body = LargeBody()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, stream=body))
+    ) as client:
+        with pytest.raises(VideoProviderError, match="^provider_http_400$"):
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    assert body.chunks == 17 and body.closed
+
+
+@pytest.mark.asyncio
+async def test_slow_error_body_diagnostics_timeout_preserves_rejection(monkeypatch):
+    timeout = asyncio.timeout
+    limits = []
+
+    def short_timeout(seconds):
+        limits.append(seconds)
+        return timeout(0.001)
+
+    class SlowBody(httpx.AsyncByteStream):
+        closed = False
+
+        async def __aiter__(self):
+            await asyncio.Event().wait()
+            yield b"unreachable private content"
+
+        async def aclose(self):
+            self.closed = True
+
+    monkeypatch.setattr("cognis.providers.video.asyncio.timeout", short_timeout)
+    body = SlowBody()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, stream=body))
+    ) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client, "omni", "gemini-omni-1.1-flash").submit(
+                VideoRequest(prompt="Animate", max_cost_usd=5), []
+            )
+    assert caught.value.code == "provider_http_400" and caught.value.rejected
+    assert caught.value.__context__ is None
+    assert limits == [5] and body.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "header,expected", [("30", 30), ("7200", 3600), ("²", 30), ("9" * 5000, 30), ("private", 30)]
+)
+async def test_untrusted_retry_after_cannot_erase_known_rejection(header, expected):
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(400, headers={b"retry-after": header.encode("latin-1")})
+        )
+    ) as client:
+        with pytest.raises(VideoProviderError) as caught:
+            await adapter(client).submit(VideoRequest(prompt="Animate", max_cost_usd=5), [])
+    assert caught.value.code == "provider_http_400" and caught.value.rejected
+    assert caught.value.retry_after == expected
+
+
+@pytest.mark.asyncio
+async def test_executor_rpc_keeps_existing_generic_failure_boundary(monkeypatch):
+    from cognis.executor.runner import ExecutorRunner
+
+    rpc = AsyncMock(
+        side_effect=VideoProviderError("provider_http_400:reason=API_KEY_INVALID", rejected=True)
+    )
+    monkeypatch.setattr("cognis.executor.video.video_rpc", rpc)
+    runner = SimpleNamespace(
+        _inference_handler=object(), _send_rpc_result=AsyncMock(), _send_rpc_error=AsyncMock()
+    )
+    ws = object()
+    await ExecutorRunner._handle_video(runner, ws, "video-error-test", {})
+    rpc.assert_awaited_once()
+    runner._send_rpc_result.assert_not_awaited()
+    runner._send_rpc_error.assert_awaited_once_with(
+        ws, "video-error-test", -32000, "Video operation failed; submission may be uncertain"
+    )
 
 
 @pytest.mark.asyncio

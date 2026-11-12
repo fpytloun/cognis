@@ -13,6 +13,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, model_validator
+from sqlalchemy import select
 
 from cognis.api.common import api_exception, forbid_mutation_for_viewer, require_current_user
 from cognis.api.models import (
@@ -21,8 +22,8 @@ from cognis.api.models import (
     DeliverableRevisionSummary,
 )
 from cognis.api.serializers import deliverable_to_response
+from cognis.api.user_preferences import theme_family_for_user
 from cognis.core.content_refs import (
-    get_accessible_deliverable_ref,
     get_deliverable_ref_unscoped,
     task_for_step_run,
 )
@@ -33,7 +34,7 @@ from cognis.core.deliverable_links import (
     verify_deliverable_share_token,
 )
 from cognis.core.deliverable_media import resolve_deliverable_media
-from cognis.core.project_access import can_project_read_deliverable
+from cognis.core.deliverable_reads import readable_deliverables
 from cognis.rendering.deliverables import (
     HTML_CACHE_FILENAME,
     PDF_CACHE_FILENAME,
@@ -47,14 +48,15 @@ from cognis.rendering.deliverables import (
 from cognis.rendering.offline_deliverables import render_offline_html
 from cognis.rendering.rich_visuals import MediaReference, ResolvedMedia
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
+from cognis.store.document_people import person_may_read_document
+from cognis.store.document_visibility import unmanaged_deliverable_clause
 from cognis.store.models import DELIVERABLE_LIVE_STATUSES, DeliverableRow
 from cognis.store.queries import (
     deliverable_lineage_key,
-    get_accessible_conversation_deliverable,
     get_conversation,
     get_deliverable,
+    get_deliverable_lineage_head,
     get_deliverable_lineage_summary,
-    get_managed_conversation_link_for_target,
     list_deliverable_lineage,
 )
 from cognis.ui_assets import resolve_standalone_asset, resolve_standalone_manifest
@@ -163,6 +165,8 @@ async def deliverable_revisions(
             revisions.append(
                 DeliverableRevisionSummary(
                     deliverable_id=item.deliverable_id,
+                    author_email=item.author_email,
+                    author_agent_id=item.author_agent_id,
                     revision=item.revision or 1,
                     title=item.title,
                     format=item.format,
@@ -189,7 +193,7 @@ async def deliverable_revisions(
 async def _person_may_read_revision(session: Any, row: DeliverableRow, user_email: str) -> bool:
     if (await _deliverable_owner(session, row))[0] == user_email:
         return True
-    return not await _is_managed_deliverable(session, row) and await can_project_read_deliverable(
+    return not await _is_managed_deliverable(session, row) and await person_may_read_document(
         session, row, user_email
     )
 
@@ -231,6 +235,7 @@ async def deliverable_view(
     html_bytes = (
         _try_render_standalone_response(
             row,
+            theme_family=await _publication_theme_family(request, row),
             media_base=f"/api/v1/deliverables/{quote(row.deliverable_id)}/media",
             share_expired=expired_link,
             standalone_url=f"/api/v1/deliverables/{quote(row.deliverable_id)}/view",
@@ -412,6 +417,7 @@ async def public_deliverable_view(request: Request, token: str) -> Response:
     html_bytes = (
         _try_render_standalone_response(
             row,
+            theme_family=await _publication_theme_family(request, row),
             media_base=f"/api/v1/deliverables/share/{quote(token)}/media",
             standalone_url=f"/api/v1/deliverables/share/{quote(token)}/view",
             pdf_url=f"/api/v1/deliverables/share/{quote(token)}/download.pdf",
@@ -517,6 +523,7 @@ async def _single_html_response(
     request: Request, row: DeliverableRow, *, cache_control: str
 ) -> Response:
     media_resolver = await _embedded_media_resolver(request, row, require_all=True)
+    theme_family = await _publication_theme_family(request, row, use_viewer=True)
     format_ = str(row.format).lower()
     payload = (
         row.rich_payload
@@ -526,7 +533,11 @@ async def _single_html_response(
     try:
         document = (
             await asyncio.to_thread(
-                render_offline_html, row, payload=payload, media_resolver=media_resolver
+                render_offline_html,
+                row,
+                payload=payload,
+                media_resolver=media_resolver,
+                theme_family=theme_family,
             )
         ).encode("utf-8")
     except DeliverableRenderError as exc:
@@ -545,6 +556,15 @@ async def _single_html_response(
             ),
         },
     )
+
+
+async def _publication_theme_family(
+    request: Request, row: DeliverableRow, *, use_viewer: bool = False
+) -> str:
+    # Only the family is public. Appearance and all other preferences stay private.
+    viewer_email = getattr(request.state, "deliverable_user_scope", None) if use_viewer else None
+    email = viewer_email or row.owner_email
+    return await theme_family_for_user(request.app.state.session_factory, email)
 
 
 def _markdown_response(row: DeliverableRow, *, cache_control: str) -> Response:
@@ -577,57 +597,54 @@ async def _authorized_deliverable(
     request.state.deliverable_user_scope = user.email
     artifact_store = request.app.state.artifact_store
     async with request.app.state.session_factory() as session:
-        row = await get_accessible_conversation_deliverable(session, deliverable_id, user.email)
-        if row is not None and not await _is_managed_deliverable(session, row):
-            await _hydrate_available_payload(row, artifact_store)
-            return row
-        accessor_agent_id: str | None = None
-        if accessor_conversation_id:
-            accessor = await get_conversation(session, accessor_conversation_id)
-            if accessor is not None and accessor.user_email == user.email:
-                accessor_agent_id = accessor.agent_id
-        ref = None
-        if accessor_conversation_id or allow_unscoped_ref:
-            ref = await get_accessible_deliverable_ref(
-                session,
-                artifact_store,
-                deliverable_id,
-                user.email,
-                accessor_conversation_id=accessor_conversation_id,
-                accessor_agent_id=accessor_agent_id,
-            )
-        if ref is not None:
-            if not accessor_conversation_id and await _is_managed_deliverable(
-                session, ref.deliverable
-            ):
-                raise api_exception(404, "not_found", "Deliverable not found")
-            return ref.deliverable
-        if allow_project_reader:
-            shared = await get_deliverable(session, deliverable_id)
-            if (
-                shared is not None
-                and not await _is_managed_deliverable(session, shared)
-                and await can_project_read_deliverable(session, shared, user.email)
-            ):
-                await _hydrate_available_payload(shared, artifact_store)
-                return shared
-    raise api_exception(404, "not_found", "Deliverable not found")
+        rows = await readable_deliverables(
+            session,
+            [deliverable_id],
+            user.email,
+            accessor_conversation_id=accessor_conversation_id,
+            allow_unscoped_ref=allow_unscoped_ref,
+            allow_project_reader=allow_project_reader,
+        )
+    read = rows.get(deliverable_id)
+    if read is None:
+        raise api_exception(404, "not_found", "Deliverable not found")
+    await _hydrate_available_payload(
+        read.row, artifact_store, hide_missing=read.kind == "reference"
+    )
+    return read.row
 
 
 async def _public_deliverable(request: Request, deliverable_id: str) -> DeliverableRow:
+    """Resolve a public link to the newest live revision of the shared document.
+
+    Links name the revision they were created from, but outside viewers always see the latest
+    version; the head must belong to the same owner and also be publishable.
+    """
     async with request.app.state.session_factory() as session:
         row = await get_deliverable(session, deliverable_id)
         if row is None or await _is_managed_deliverable(session, row):
             raise api_exception(404, "not_found", "Deliverable not found")
+        head = await get_deliverable_lineage_head(session, deliverable_lineage_key(row))
+        if (
+            head is not None
+            and head.deliverable_id != row.deliverable_id
+            and head.owner_email == row.owner_email
+            and not await _is_managed_deliverable(session, head)
+        ):
+            row = head
         await _hydrate_available_payload(row, request.app.state.artifact_store)
         return row
 
 
-async def _hydrate_available_payload(row: DeliverableRow, artifact_store: Any) -> None:
+async def _hydrate_available_payload(
+    row: DeliverableRow, artifact_store: Any, *, hide_missing: bool = False
+) -> None:
     """Translate absent payload storage after access has been authorized."""
     try:
         await hydrate_deliverable_payload(row, artifact_store)
     except FileNotFoundError as exc:
+        if hide_missing:
+            raise api_exception(404, "not_found", "Deliverable not found") from exc
         raise api_exception(
             409, "deliverable_payload_unavailable", "Deliverable payload is unavailable"
         ) from exc
@@ -762,6 +779,7 @@ def _try_render_standalone_response(
     html_url: str = "",
     markdown_url: str = "",
     share_expired: bool = False,
+    theme_family: str | None = None,
 ) -> bytes | None:
     format_ = str(getattr(row, "format", "") or "").lower()
     rich_payload_override = (
@@ -777,6 +795,7 @@ def _try_render_standalone_response(
             markdown_url=markdown_url,
             rich_payload_override=rich_payload_override,
             share_expired=share_expired,
+            theme_family=theme_family,
         )
     except DeliverableRenderError:
         return None
@@ -828,10 +847,7 @@ async def _embedded_media_resolver(
 
 
 async def _is_managed_deliverable(session: Any, row: DeliverableRow) -> bool:
-    conversation_id = row.conversation_id
-    if not conversation_id:
-        return False
-    return (await get_managed_conversation_link_for_target(session, conversation_id)) is not None
+    return bool(await session.scalar(select(~unmanaged_deliverable_clause(row))))
 
 
 async def _cached_html(request: Request, row: DeliverableRow) -> bytes:

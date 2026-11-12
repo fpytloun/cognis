@@ -45,6 +45,18 @@ def test_immutable_prefix_repair_cooldown_allows_zero() -> None:
     validate_setting_value("session.immutable_prefix_repair_cooldown_seconds", 0)
 
 
+def test_usage_analytics_defaults_on_and_requires_restart() -> None:
+    usage = SETTINGS_REGISTRY["usage.enabled"]
+    assert usage.default is True
+    assert usage.value_type == "boolean"
+    assert usage.application_scope == "next_runtime"
+    assert usage.label == "Usage analytics"
+    assert usage.key in exposed_setting_keys()
+    validate_setting_value(usage.key, False)
+    with pytest.raises(ValueError):
+        validate_setting_value(usage.key, "false")
+
+
 def test_new_runtime_defaults_are_registered() -> None:
     assert DEFAULT_SETTINGS["session.step_timeout_seconds"] == ("session", 14400)
     assert DEFAULT_SETTINGS["session.max_tool_calls_per_turn"] == ("session", 500)

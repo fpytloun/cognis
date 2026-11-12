@@ -130,7 +130,6 @@ def test_select_static_tools_honors_disabled_categories_and_tools() -> None:
 
 def test_regular_user_can_create_private_mcp_server(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed_user() -> None:
             async with client.app.state.session_factory() as session:
@@ -143,7 +142,7 @@ def test_regular_user_can_create_private_mcp_server(monkeypatch: object, tmp_pat
                 )
                 await session.commit()
 
-        asyncio.run(_seed_user())
+        client.portal.call(_seed_user)
         response = client.post(
             "/api/v1/mcp-servers",
             headers=_auth_headers(client.app, email="user@example.com", role="user"),
@@ -167,8 +166,6 @@ def test_admin_can_create_and_list_mcp_servers(monkeypatch: object, tmp_path: Pa
     with _create_test_client(monkeypatch, tmp_path) as client:
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
-        import asyncio
-
         async def _seed_user() -> None:
             async with client.app.state.session_factory() as session:
                 await create_user(
@@ -180,7 +177,7 @@ def test_admin_can_create_and_list_mcp_servers(monkeypatch: object, tmp_path: Pa
                 )
                 await session.commit()
 
-        asyncio.run(_seed_user())
+        client.portal.call(_seed_user)
 
         create_response = client.post(
             "/api/v1/mcp-servers",
@@ -208,8 +205,6 @@ def test_admin_can_create_http_mcp_server_with_headers(monkeypatch: object, tmp_
     with _create_test_client(monkeypatch, tmp_path) as client:
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
-        import asyncio
-
         async def _seed_user() -> None:
             async with client.app.state.session_factory() as session:
                 await create_user(
@@ -221,7 +216,7 @@ def test_admin_can_create_http_mcp_server_with_headers(monkeypatch: object, tmp_
                 )
                 await session.commit()
 
-        asyncio.run(_seed_user())
+        client.portal.call(_seed_user)
 
         create_response = client.post(
             "/api/v1/mcp-servers",
@@ -257,7 +252,6 @@ def test_http_mcp_server_rejects_env_payload(monkeypatch: object, tmp_path: Path
 
 def test_mcp_servers_are_user_scoped(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -279,7 +273,7 @@ def test_mcp_servers_are_user_scoped(monkeypatch: object, tmp_path: Path) -> Non
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         alice = client.get(
             "/api/v1/mcp-servers",
@@ -297,7 +291,6 @@ def test_regular_user_can_list_but_not_mutate_shared_mcp_server(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -319,7 +312,7 @@ def test_regular_user_can_list_but_not_mutate_shared_mcp_server(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         headers = _auth_headers(client.app, email="user@example.com", role="user")
         list_response = client.get("/api/v1/mcp-servers", headers=headers)
@@ -340,7 +333,6 @@ def test_effective_tools_preview_respects_executor_owner_scope(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -375,7 +367,7 @@ def test_effective_tools_preview_respects_executor_owner_scope(
                 executor.runtime_state = "active"
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/agents/effective-tools/preview",
@@ -388,11 +380,20 @@ def test_effective_tools_preview_respects_executor_owner_scope(
         assert payload["warnings"]
 
 
+@pytest.mark.parametrize("program_enabled", [False, True])
+@pytest.mark.parametrize("manifest_support", [False, True])
 def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
-    monkeypatch: object, tmp_path: Path
+    monkeypatch: object, tmp_path: Path, program_enabled: bool, manifest_support: bool
 ) -> None:
+    from cognis.core.program_config import PROGRAM_RUNTIME_TOOL_NAMES
+    from cognis.tools.executor.definitions import ALL_EXECUTOR_TOOLS
+
+    program_tools = [
+        tool.model_dump(mode="json")
+        for tool in ALL_EXECUTOR_TOOLS
+        if tool.name in PROGRAM_RUNTIME_TOOL_NAMES
+    ]
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -409,11 +410,16 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
                     name="Alice exec",
                     executor_type="websocket",
                     owner_email="alice@example.com",
+                    config={
+                        MCP_SERVER_IDS_KEY: ["srv_github"],
+                        "program_runtime": {"host_enabled": program_enabled},
+                    },
                 )
                 executor.runtime_state = "active"
+                executor.observed_tools = program_tools if manifest_support else []
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         class _Conn:
             async def list_tools(self) -> list[dict[str, object]]:
@@ -427,7 +433,8 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
                         read_only=True,
                         timeout_seconds=30,
                         non_bypassable=False,
-                    ).model_dump(mode="json")
+                    ).model_dump(mode="json"),
+                    *(program_tools if manifest_support else []),
                 ]
 
         client.app.state.providers.executor.websocket.get_connection = lambda executor_id: (  # type: ignore[method-assign]
@@ -459,6 +466,10 @@ def test_effective_tools_live_state_includes_merged_intaris_tools_for_websocket(
         live_names = {tool["name"] for tool in payload["live_state"]["tools"]}
         assert "read" in live_names
         assert sanitize_mcp_tool_name("github", "search/issues") in live_names
+        configured_names = {tool["name"] for tool in payload["configured_state"]["tools"]}
+        for name in PROGRAM_RUNTIME_TOOL_NAMES:
+            assert (name in live_names) is (program_enabled and manifest_support)
+            assert (name in configured_names) is (program_enabled and manifest_support)
 
 
 def test_effective_tools_preview_discovers_http_mcp_for_in_process_executor(
@@ -466,8 +477,6 @@ def test_effective_tools_preview_discovers_http_mcp_for_in_process_executor(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
@@ -497,7 +506,7 @@ def test_effective_tools_preview_discovers_http_mcp_for_in_process_executor(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         class _FakeClient:
             def __init__(self) -> None:
@@ -542,7 +551,6 @@ def test_effective_tools_live_state_skips_stale_websocket_executor(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -565,7 +573,7 @@ def test_effective_tools_live_state_skips_stale_websocket_executor(
                 executor.applied_config_version = 1
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         class _Conn:
             async def list_tools(self) -> list[dict[str, object]]:
@@ -591,7 +599,6 @@ def test_list_intaris_mcp_tools_returns_normalized_rows(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        import asyncio
 
         async def _seed() -> None:
             async with client.app.state.session_factory() as session:
@@ -604,7 +611,7 @@ def test_list_intaris_mcp_tools_returns_normalized_rows(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         async def _list_mcp_tools() -> list[dict[str, object]]:
             return [
@@ -656,8 +663,6 @@ def test_list_observed_local_mcp_tools_dedupes_and_filters_scope(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
@@ -755,7 +760,7 @@ def test_list_observed_local_mcp_tools_dedupes_and_filters_scope(
                 ]
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/tools/local-mcp/observed",
@@ -801,9 +806,7 @@ def test_delete_referenced_mcp_server_returns_409(monkeypatch: object, tmp_path:
                 await session.commit()
                 return server.server_id
 
-        import asyncio
-
-        server_id = asyncio.run(_seed())
+        server_id = client.portal.call(_seed)
         response = client.delete(
             f"/api/v1/mcp-servers/{server_id}",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
@@ -814,8 +817,6 @@ def test_delete_referenced_mcp_server_returns_409(monkeypatch: object, tmp_path:
 def test_update_mcp_server_revalidates_transport(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         async def _seed() -> str:
             async with app.state.session_factory() as session:
@@ -837,7 +838,7 @@ def test_update_mcp_server_revalidates_transport(monkeypatch: object, tmp_path: 
                 await session.commit()
                 return server.server_id
 
-        server_id = asyncio.run(_seed())
+        server_id = client.portal.call(_seed)
         response = client.put(
             f"/api/v1/mcp-servers/{server_id}",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
@@ -869,8 +870,6 @@ def test_update_mcp_server_schedules_executor_reconfigure(
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
 
-        import asyncio
-
         async def _seed() -> str:
             async with app.state.session_factory() as session:
                 await create_user(
@@ -899,7 +898,7 @@ def test_update_mcp_server_schedules_executor_reconfigure(
                 await session.commit()
                 return server.server_id
 
-        server_id = asyncio.run(_seed())
+        server_id = client.portal.call(_seed)
         response = client.put(
             f"/api/v1/mcp-servers/{server_id}",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
@@ -932,8 +931,6 @@ def test_oauth_disconnect_schedules_executor_reconfigure(
     )
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         async def _seed() -> str:
             async with app.state.session_factory() as session:
@@ -972,7 +969,7 @@ def test_oauth_disconnect_schedules_executor_reconfigure(
                 await session.commit()
                 return server.server_id
 
-        server_id = asyncio.run(_seed())
+        server_id = client.portal.call(_seed)
         response = client.post(
             f"/api/v1/mcp-servers/{server_id}/oauth/disconnect",
             headers=_auth_headers(client.app, email="admin@example.com", role="admin"),
@@ -993,8 +990,6 @@ def test_mcp_reconfigure_helper_bumps_desired_version_each_time(
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
         app.state.providers.executor.websocket.get_connection = lambda _executor_id: None  # type: ignore[method-assign]
-
-        import asyncio
 
         async def _seed() -> tuple[str, str]:
             async with app.state.session_factory() as session:
@@ -1044,7 +1039,7 @@ def test_mcp_reconfigure_helper_bumps_desired_version_each_time(
                 assert row is not None
                 return row.desired_config_version, row.runtime_state
 
-        desired_config_version, runtime_state = asyncio.run(_run())
+        desired_config_version, runtime_state = client.portal.call(_run)
 
         assert desired_config_version == 6
         assert runtime_state == "stale"
@@ -1054,8 +1049,6 @@ def test_mcp_reconfigure_helper_bumps_desired_version_each_time(
 def test_invalid_http_mcp_server_is_flagged_in_list(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-
-        import asyncio
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
@@ -1077,7 +1070,7 @@ def test_invalid_http_mcp_server_is_flagged_in_list(monkeypatch: object, tmp_pat
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/mcp-servers",

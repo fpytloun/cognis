@@ -51,7 +51,7 @@ class _RecoverableScheduler(_RemoteOwnerScheduler):
                 "status": "waiting",
                 "retry_at": "2026-07-28T10:59:00+00:00",
                 "retry_reason": "rate_limit",
-                "provider_id": "anthropic-sample",
+                "provider_id": "anthropic-demo",
                 "model": "claude-fable-5",
             },
             "authority": RuntimeAuthority(

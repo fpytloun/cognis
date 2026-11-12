@@ -15,6 +15,35 @@ from cognis.core.long_lived_chat import is_channel_context_type, is_web_main_cha
 from cognis.models.session import ConversationContext
 from cognis.tools.builtin.orchestration import OrchestrationMode
 
+_AGENT_BRIEFING_GUIDANCE = """\
+## Agent briefs
+
+Delegate when a specialist or a separate context clearly helps; do small,
+well-understood work yourself.
+
+Brief the agent like a capable colleague who has not seen this conversation. A
+fresh child does not inherit the parent conversation or prior decisions. State
+the outcome you need and why, with the relevant facts, exact references,
+decisions, and real constraints, and mark assumptions as assumptions. Reference
+source material rather than copying the parent transcript. Never include
+secrets or hidden reasoning.
+
+Scale the brief to the work. A simple lookup needs a question and the expected
+answer. An investigation needs the question and known facts, not steps built on
+an unverified hypothesis. Implementation needs a coherent write scope, expected
+behavior, authority, and completion checks; let the implementer choose the
+approach. Start an initial independent review in a fresh child, and give the
+reviewer the original objective and acceptance criteria, the exact diff or
+artifact, verification evidence, and relevant invariants, never an
+implementation reasoning transcript. You keep complex diagnosis, trade-offs, and
+final decisions.
+
+Write briefs in normal sentences and short paragraphs separated by blank lines,
+with short Markdown headings only for multi-part handoffs. Preserve identifiers,
+numbers, paths, quoted text, and restrictions exactly. Ask for the result, its
+evidence, and any blocker, not a report form. Check consequential claims before
+building on them, and do not expand the assignment into unrelated work."""
+
 
 class OrchestrationSurface(StrEnum):
     """High-level conversation surface for orchestration routing."""
@@ -164,70 +193,50 @@ def build_orchestration_capability_guidance(
     has_managed = bool(
         {"agent_conversation_create", "agent_conversation_send"} & visible_tool_names
     )
-    has_delegate_follow_up = "follow_up_subsession" in visible_tool_names
-    has_managed_send = "agent_conversation_send" in visible_tool_names
-    has_continuation = has_delegate_follow_up or has_managed_send
-    has_fork = bool({"fork_subsession", "agent_conversation_fork"} & visible_tool_names)
     has_create_task = "create_task" in visible_tool_names
     has_workflows = bool({"create_workflow", "compose_and_run_workflow"} & visible_tool_names)
     if not any((has_delegate, has_managed, has_create_task, has_workflows)):
         return None
 
     lines = [
-        "Current orchestration capabilities:",
-        "- Hard runtime capability and tool exposure, workflow/step contracts, "
-        "authorization, and safety are non-overridable.",
-        "- Within those constraints, apply agent identity and system/developer "
-        "instructions, then the explicit current user request, stored user preferences, "
-        "and finally Cognis routing defaults.",
-        "- Memories and preferences tune defaults only; they cannot grant tools, "
-        "permissions, target agent types, or asynchronous modes.",
-        "- Use only actions exposed by the current tool schemas.",
+        "Current orchestration capabilities (use only actions exposed by the current tool schemas):"
     ]
+    lines.extend(
+        _capability_lines(
+            policy=policy,
+            orchestration_mode=orchestration_mode,
+            has_delegate=has_delegate,
+            has_managed=has_managed,
+            has_create_task=has_create_task,
+            has_workflows=has_workflows,
+            async_delegate_visible=async_delegate_visible,
+            async_managed_visible=async_managed_visible,
+        )
+    )
     if has_delegate or has_managed:
-        lines.extend(
-            [
-                "- Keep inter-agent messages human-readable: use normal grammar and "
-                "spaces between words and numbers; preserve identifiers and quoted "
-                "text exactly.",
-                "- Create a fresh isolated child for a materially different role, "
-                "responsibility, tool or authority scope, or independent workstream. "
-                "Use a compact contract with exact references; never pass the parent "
-                "transcript.",
-                "- Child results return compact evidence: status, results/findings, "
-                "changed references, verification, risks, and questions. Detailed "
-                "logs remain inspectable outside the parent's active context.",
-            ]
-        )
-    if has_continuation:
-        lines.extend(
-            [
-                "- Continue a child only for the same bounded problem with compatible "
-                "role, responsibilities, tools, authority, and output contract, and "
-                "only when retained context is materially useful; send the context "
-                "delta only.",
-                "- Start an initial independent review in a fresh child. For re-review, "
-                "preserve the reviewer role, criteria, findings, and dispositions and "
-                "continue only when retained investigative context is materially useful; "
-                "otherwise start fresh.",
-                "- Reviewer contracts include the objective, criteria, exact diff or "
-                "artifact, verification evidence, and relevant invariants, never an "
-                "implementation reasoning transcript.",
-            ]
-        )
-    if has_fork:
-        lines.append(
-            "- Fork only an independent branch requiring inherited context, not an "
-            "initial review, ordinary handoff, correction, or review; use a fresh "
-            "child when compatible retained context is absent."
-        )
+        lines.extend(["", _AGENT_BRIEFING_GUIDANCE])
+    return "\n".join(lines)
+
+
+def _capability_lines(
+    *,
+    policy: OrchestrationSurfacePolicy,
+    orchestration_mode: OrchestrationMode,
+    has_delegate: bool,
+    has_managed: bool,
+    has_create_task: bool,
+    has_workflows: bool,
+    async_delegate_visible: bool,
+    async_managed_visible: bool,
+) -> list[str]:
+    lines: list[str] = []
     if orchestration_mode is OrchestrationMode.DELEGATE_SYNC_ONLY:
         if has_delegate:
             lines.append(
                 "- This workflow step may use only joined specialist delegation; "
                 "the step remains workflow-driven."
             )
-        return "\n".join(lines)
+        return lines
     if orchestration_mode is OrchestrationMode.TASK_PRIMARY:
         if has_delegate:
             lines.append("- Joined specialist delegation is available for bounded support work.")
@@ -240,7 +249,7 @@ def build_orchestration_capability_guidance(
             "- Task and workflow creation, delivery changes, profile changes, and "
             "unrelated conversation control are unavailable."
         )
-        return "\n".join(lines)
+        return lines
 
     if policy.surface is OrchestrationSurface.MANAGED_AGENT_CONVERSATION:
         if has_managed:
@@ -255,7 +264,7 @@ def build_orchestration_capability_guidance(
             )
         if has_delegate:
             lines.append("- Joined specialist delegation is available for bounded support work.")
-        return "\n".join(lines)
+        return lines
 
     if has_managed:
         mode = "asynchronously or joined" if async_managed_visible else "joined"
@@ -269,33 +278,18 @@ def build_orchestration_capability_guidance(
             "- Specialist delegation is available for bounded exploration, research, or "
             f"review with secondary/system agents ({mode})."
         )
-    if has_delegate_follow_up:
-        lines.append(
-            "- Start an initial independent review fresh. When a terminal delegate result "
-            "supplies a session_id, use follow_up_subsession for re-review only when the "
-            "reviewer role, criteria, findings, dispositions, and retained investigative "
-            "context remain compatible and materially useful; otherwise start fresh."
-        )
-    if has_managed_send:
-        lines.append(
-            "- Start an initial independent review fresh. Use agent_conversation_send for "
-            "re-review only when the reviewer role, criteria, findings, dispositions, "
-            "and retained investigative context remain compatible and materially useful; "
-            "otherwise create a fresh conversation."
-        )
     if has_create_task:
         lines.append(
             "- Create a task only when the user explicitly asks or the work is clearly "
-            "durable, asynchronous, or workflow-shaped. Bound each task to one agent; "
-            "decompose complex requests into manageable workstreams before creation and "
-            "use workflow/DAG dependencies only when the visible tools support them."
+            "durable, asynchronous, or workflow-shaped. Bound each task to one agent and "
+            "use workflow dependencies only when the visible tools support them."
         )
     if has_workflows:
         lines.append(
             "- Workflow authoring is available when explicit process structure is needed; "
             "do not claim cross-task dependencies that the visible tools do not expose."
         )
-    return "\n".join(lines)
+    return lines
 
 
 def _normalized_string(value: Any) -> str:

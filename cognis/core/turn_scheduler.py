@@ -46,6 +46,10 @@ from cognis.audio.transcription import transcribe_audio_bytes
 from cognis.core.agent_direct import is_agent_direct_context
 from cognis.core.agent_registry import SYSTEM_AGENTS
 from cognis.core.artifact_inputs import authorize_outbound_artifact_refs_in_session
+from cognis.core.assistant_stream_checkpoint import (
+    ASSISTANT_OUTPUT_UNPERSISTED_MESSAGE,
+    AssistantStreamCheckpoint,
+)
 from cognis.core.attachment_compat import supports_native_image_input
 from cognis.core.attachment_utils import (
     attachment_placeholder_text,
@@ -89,6 +93,7 @@ from cognis.core.followups import (
     FollowUpRelevanceHint,
     FollowUpRequiredAction,
     FollowUpStatus,
+    TaskResultFollowUp,
     build_automatic_continuation_follow_up,
     build_follow_up_id,
     is_hook_follow_up,
@@ -113,6 +118,7 @@ from cognis.core.observability import (
     reset_attribution,
     set_attribution,
 )
+from cognis.core.policy_acknowledgements import isolate_policy_acknowledgements
 from cognis.core.runtime import ExecutorConfigurationError, TransientExecutorUnavailable
 from cognis.core.runtime_metadata import assistant_message_runtime_metadata
 from cognis.core.session_cache import is_retry_admission_notice
@@ -120,7 +126,7 @@ from cognis.core.session_recovery import (
     SESSION_TRANSIENT_MAX_ATTEMPTS as DIRECT_TURN_TRANSIENT_MAX_ATTEMPTS,
 )
 from cognis.core.session_recovery import step_failure_traits
-from cognis.core.title_policy import can_adopt_intaris_title, sync_intaris_title
+from cognis.core.title_policy import can_generate_title
 from cognis.core.tool_output_presentation import build_transport_tool_output_preview
 from cognis.core.tool_output_spool import ToolOutputSpool, ToolOutputSpoolPage
 from cognis.core.tool_result_settlement import (
@@ -150,11 +156,13 @@ from cognis.core.trusted_evidence import (
     serialize_evidence_admission,
     serialize_evidence_origin,
 )
+from cognis.core.turn_timing import isolate_turn_timing
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import ChannelDeliveryDescriptor
 from cognis.models.executor_calls import normalize_executor_call_snapshot
+from cognis.models.program import ProgramEventMetadata
 from cognis.models.retry import (
     RetryReason,
     normalize_retry_reason,
@@ -172,6 +180,7 @@ from cognis.models.session import (
 )
 from cognis.models.task import TaskDelivery
 from cognis.providers.executor.delivery import AmbiguousToolOutcome
+from cognis.providers.guardrails.event_keys import event_idempotency_key
 from cognis.providers.retry import is_retryable_http_error
 from cognis.runtime_context import (
     current_agent_id,
@@ -232,6 +241,10 @@ _MODEL_ERROR_CATEGORY_MESSAGES = {
     "provider_5xx": "The model provider returned server errors while processing this turn.",
     "connection": "The connection to the model provider failed while processing this turn.",
     "content_policy": "The model provider refused this request under its content policy.",
+    "authentication": (
+        "The model provider sign-in expired or was revoked. Reauthorize the provider in "
+        "Settings > Providers, then send the message again."
+    ),
     "protocol": "The model provider returned a response Cognis could not decode.",
     "idle_timeout_raw": "The model stopped producing output before this turn finished.",
     "idle_timeout_activity": "The model stopped producing output before this turn finished.",
@@ -260,6 +273,8 @@ def _durable_turn_error_message(error: TurnError) -> str:
         return (
             "Executor configuration is missing or invalid. Configure an executor on the agent page."
         )
+    if error.code == "assistant_output_unpersisted":
+        return ASSISTANT_OUTPUT_UNPERSISTED_MESSAGE
     if error.code in _CANCELLED_TURN_ERROR_CODES:
         return "The turn was cancelled."
     if error.code.startswith("provider_"):
@@ -382,7 +397,7 @@ def _effective_user_content(content: str, attachments: list[AttachmentRef]) -> s
 def _should_bootstrap_wait_for_intention(conversation: ConversationModel) -> bool:
     """Return whether the first model turn should wait for Intaris intention bootstrap."""
 
-    if can_adopt_intaris_title(conversation):
+    if can_generate_title(conversation):
         return True
     context = conversation.context
     if context is None:
@@ -531,6 +546,9 @@ class ActiveToolOutputSnapshot:
     call_id: str
     tool_name: str
     turn_id: str | None
+    parent_call_id: str | None = None
+    program_id: str | None = None
+    kernel_generation: int | None = None
     assistant_phase_index: int | None = None
     turn_cycle_index: int = 0
     status: str = "running"
@@ -572,6 +590,9 @@ class ActiveToolOutputSnapshot:
             "call_id": self.call_id,
             "tool_name": self.tool_name,
             "turn_id": self.turn_id,
+            "parent_call_id": self.parent_call_id,
+            "program_id": self.program_id,
+            "kernel_generation": self.kernel_generation,
             "assistant_phase_index": self.assistant_phase_index,
             "assistant_phase_authoritative": self.assistant_phase_index is not None,
             "status": self.status,
@@ -613,6 +634,16 @@ class ActiveToolOutputSnapshot:
                 call_id=str(data["call_id"]),
                 tool_name=str(data.get("tool_name") or "tool"),
                 turn_id=data.get("turn_id") if isinstance(data.get("turn_id"), str) else None,
+                parent_call_id=data.get("parent_call_id")
+                if isinstance(data.get("parent_call_id"), str)
+                else None,
+                program_id=data.get("program_id")
+                if isinstance(data.get("program_id"), str)
+                else None,
+                kernel_generation=data.get("kernel_generation")
+                if isinstance(data.get("kernel_generation"), int)
+                and not isinstance(data.get("kernel_generation"), bool)
+                else None,
                 assistant_phase_index=data.get("assistant_phase_index")
                 if isinstance(data.get("assistant_phase_index"), int)
                 else None,
@@ -660,6 +691,19 @@ class ActiveToolOutputSnapshot:
             )
         except Exception:
             return None
+
+
+def _coerce_program_event_metadata(
+    value: ProgramEventMetadata | dict[str, Any] | None,
+) -> ProgramEventMetadata | None:
+    if isinstance(value, ProgramEventMetadata):
+        return value
+    if not isinstance(value, dict):
+        return None
+    try:
+        return ProgramEventMetadata.model_validate(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _automatic_continuation_queue_fields(follow_up: Any) -> dict[str, str]:
@@ -936,6 +980,7 @@ class TurnObserver(Protocol):
         turn_id: str | None,
         assistant_phase_index: int | None = None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | None = None,
     ) -> None: ...
 
     async def on_tool_progress(
@@ -965,6 +1010,7 @@ class TurnObserver(Protocol):
         presentation: dict[str, Any] | None = None,
         assistant_phase_index: int | None = None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | None = None,
     ) -> None: ...
 
     async def on_tool_output_chunk(
@@ -1023,6 +1069,7 @@ class TurnObserver(Protocol):
         retry_reason: str | None = None,
         retry_source_turn_id: str | None = None,
         attempt: int | None = None,
+        task_outcome: dict[str, Any] | None = None,
     ) -> None: ...
 
     async def on_queued(self, conversation_id: str, queued_count: int) -> None: ...
@@ -1198,6 +1245,7 @@ class TurnScheduler:
         tool_output_spool: ToolOutputSpool | None = None,
         controller_runtime: ControllerRuntime | None = None,
         runtime_mode: str = "simple",
+        initial_profile_selector: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._workflow_engine = workflow_engine
@@ -1205,6 +1253,7 @@ class TurnScheduler:
         self._task_queue = task_queue
         self._session_manager = session_manager
         self._session_cache = session_cache
+        self._initial_profile_selector = initial_profile_selector
         self._redis_service = redis_service
         self._compaction_strategy = compaction_strategy
         self._agent_loop = agent_loop
@@ -1315,6 +1364,21 @@ class TurnScheduler:
         )
         logger.info("turn_scheduler: registered on EventBus")
         logger.info("turn_scheduler: follow-up dedupe backed by durable store when available")
+
+    def resource_owner_counts(self) -> dict[str, int]:
+        """Observe fixed owner cardinalities without task/stream introspection."""
+        return {
+            "active_turns": len(self._active_turns),
+            "turn_controls": len(self._turn_controls),
+            "queued_conversations": len(self._queued_messages),
+            "active_streams": len(self._active_streams),
+            "active_tool_outputs": len(self._active_tool_outputs),
+            "tool_output_l2_entries": len(self._active_tool_output_l2),
+            "turn_waiter_groups": len(self._turn_waiters),
+            "background_tasks": len(self._best_effort_tasks),
+            "tool_call_ledgers": len(self._turn_tool_call_ledgers),
+            "relay_contexts": len(self._relay_generation_contexts),
+        }
 
     def _turn_lock(self, conversation_id: str) -> asyncio.Lock:
         """Return the per-conversation lock protecting active-turn ownership."""
@@ -1812,6 +1876,7 @@ class TurnScheduler:
         turn_id: str | None,
         arguments: dict[str, Any] | None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | None = None,
     ) -> None:
         """Record parent-safe tool arguments on the active-tool snapshot.
 
@@ -1837,12 +1902,25 @@ class TurnScheduler:
                     call_id=call_id,
                     tool_name=tool_name,
                     turn_id=turn_id,
+                    parent_call_id=runtime_metadata.parent_call_id
+                    if runtime_metadata is not None
+                    else None,
+                    program_id=runtime_metadata.program_id
+                    if runtime_metadata is not None
+                    else None,
+                    kernel_generation=runtime_metadata.kernel_generation
+                    if runtime_metadata is not None
+                    else None,
                     assistant_phase_index=self._assistant_phase_for_tool(
                         conversation_id, turn_id, call_id
                     ),
                     turn_cycle_index=effective_turn_cycle_index,
                 )
                 self._active_tool_outputs[key] = snapshot
+            if runtime_metadata is not None:
+                snapshot.parent_call_id = runtime_metadata.parent_call_id
+                snapshot.program_id = runtime_metadata.program_id
+                snapshot.kernel_generation = runtime_metadata.kernel_generation
             snapshot.arguments = dict(arguments)
             snapshot.assistant_phase_index = self._assistant_phase_for_tool(
                 conversation_id, turn_id, call_id
@@ -1920,6 +1998,7 @@ class TurnScheduler:
         is_error: bool,
         metadata: dict[str, Any] | None = None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | None = None,
     ) -> None:
         async with self._active_tool_outputs_lock:
             key = (conversation_id, session_id, call_id)
@@ -1934,12 +2013,25 @@ class TurnScheduler:
                     call_id=call_id,
                     tool_name=tool_name,
                     turn_id=turn_id,
+                    parent_call_id=runtime_metadata.parent_call_id
+                    if runtime_metadata is not None
+                    else None,
+                    program_id=runtime_metadata.program_id
+                    if runtime_metadata is not None
+                    else None,
+                    kernel_generation=runtime_metadata.kernel_generation
+                    if runtime_metadata is not None
+                    else None,
                     assistant_phase_index=self._assistant_phase_for_tool(
                         conversation_id, turn_id, call_id
                     ),
                     turn_cycle_index=effective_turn_cycle_index,
                 )
                 self._active_tool_outputs[key] = snapshot
+            if runtime_metadata is not None:
+                snapshot.parent_call_id = runtime_metadata.parent_call_id
+                snapshot.program_id = runtime_metadata.program_id
+                snapshot.kernel_generation = runtime_metadata.kernel_generation
             meta = metadata or {}
             snapshot.assistant_phase_index = self._assistant_phase_for_tool(
                 conversation_id, turn_id, call_id
@@ -2006,7 +2098,8 @@ class TurnScheduler:
         turn_id: str | None,
         delta: str,
         turn_cycle_index: int | None = None,
-    ) -> tuple[int, int]:
+        owner_control: _TurnControl | None = None,
+    ) -> tuple[int, int] | None:
         """Append a live token to the volatile stream snapshot.
 
         Returns the zero-based chunk index and starting content offset for the
@@ -2015,6 +2108,13 @@ class TurnScheduler:
         """
 
         async with self._active_streams_lock:
+            control = self._turn_controls.get(conversation_id)
+            if owner_control is not None and (
+                control is not owner_control or owner_control.settled
+            ):
+                return None
+            if control is not None and (control.settled or control.turn_id != turn_id):
+                return None
             stream = self._active_streams.get(conversation_id)
             current_phase = (
                 self._assistant_phase_by_turn.get((conversation_id, turn_id), 0)
@@ -2284,7 +2384,8 @@ class TurnScheduler:
         finish_reason: str = "user_cancelled",
         clear_on_success: bool = True,
         stream_snapshot: ActiveStreamState | None = None,
-    ) -> tuple[str | None, int, int | None]:
+        execution_fence: DirectTurnExecutionFence | None = None,
+    ) -> AssistantStreamCheckpoint:
         """Persist already streamed assistant text before its local stream is discarded."""
 
         stream = stream_snapshot
@@ -2297,8 +2398,15 @@ class TurnScheduler:
                     or stream.turn_id != turn_id
                 ):
                     stream = None
+                if stream is not None:
+                    stream = replace(stream)
         if stream is None or not stream.content:
-            return None, 0, None
+            return AssistantStreamCheckpoint("empty")
+        control = self._turn_controls.get(conversation_id)
+        if control is not None and control.turn_id == turn_id:
+            control.settled = True
+        if execution_fence is not None:
+            execution_fence.begin_stream_checkpoint()
 
         event_data = {
             "content": stream.content,
@@ -2320,17 +2428,21 @@ class TurnScheduler:
             event_data["turn_cycle_index"] = stream.turn_cycle_index
         intaris_session_id = session.intaris_session_id or session.session_id
         digest = hashlib.sha256(stream.content.encode("utf-8")).hexdigest()[:16]
-        event_data["message_id"] = (
-            turn_id or message_id
-            if finish_reason == "user_cancelled"
-            else f"{turn_id or message_id}:{finish_reason}"
-        )
+        # All interrupted finishes own the same canonical phase as their live
+        # overlay; the finish reason must not create a second message identity.
+        event_data["message_id"] = turn_id or message_id
         event = SessionEvent(type="assistant_message", data=event_data)
-        idempotency_key = (
-            f"cancelled-active-stream:{intaris_session_id}:"
-            f"{turn_id or message_id}:{finish_reason}:{stream.chunk_count}:{digest}"
-        )
         try:
+            if execution_fence is not None:
+                await execution_fence.assert_current()
+            idempotency_key = event_idempotency_key(
+                intaris_session_id,
+                "cancelled-active-stream",
+                turn_id or message_id,
+                finish_reason,
+                stream.chunk_count,
+                digest,
+            )
             append_result = await self._providers.guardrails.record_events(
                 session_id=intaris_session_id,
                 events=[event],
@@ -2342,16 +2454,16 @@ class TurnScheduler:
             )
             if not append_result.ok:
                 raise RuntimeError("Intaris did not persist cancelled assistant stream")
-            await self._session_cache.append_recorded_events(session, [event], append_result)
-            if clear_on_success:
-                await self._pop_active_stream(
-                    conversation_id=conversation_id,
-                    session_id=session.session_id,
-                    message_id=message_id,
-                    turn_id=turn_id,
-                )
-            return stream.content, append_result.last_seq, stream.turn_cycle_index
-        except Exception:
+        except Exception as exc:
+            if execution_fence is not None:
+                execution_fence.begin_stream_checkpoint()
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            rejected = isinstance(exc, ValueError) or (
+                isinstance(status_code, int)
+                and 400 <= status_code < 500
+                and status_code not in {408, 409, 429}
+            )
             logger.warning(
                 "turn_scheduler: failed to persist cancelled assistant stream",
                 extra={
@@ -2359,11 +2471,94 @@ class TurnScheduler:
                         "conversation_id": conversation_id,
                         "session_id": session.session_id,
                         "turn_id": turn_id,
+                        "error_type": type(exc).__name__,
+                        "status_code": status_code,
                     }
                 },
-                exc_info=True,
             )
-            return None, 0, None
+            return AssistantStreamCheckpoint(
+                "rejected" if rejected else "uncertain",
+                turn_cycle_index=stream.turn_cycle_index,
+                assistant_phase_index=stream.assistant_phase_index,
+                chunk_count=stream.chunk_count,
+            )
+        if execution_fence is not None:
+            execution_fence.confirm_stream_checkpoint()
+        try:
+            await self._session_cache.append_recorded_events(session, [event], append_result)
+        except Exception as exc:
+            logger.warning(
+                "turn_scheduler: streamed output persisted but canonical cache update failed",
+                extra={
+                    "extra_data": {
+                        "session_id": session.session_id,
+                        "error_type": type(exc).__name__,
+                    }
+                },
+            )
+            await self._session_cache.invalidate_canonical(session.session_id)
+        if clear_on_success:
+            await self._pop_active_stream(
+                conversation_id=conversation_id,
+                session_id=session.session_id,
+                message_id=message_id,
+                turn_id=turn_id,
+            )
+        return AssistantStreamCheckpoint(
+            "persisted",
+            content=stream.content,
+            last_seq=append_result.last_seq,
+            turn_cycle_index=stream.turn_cycle_index,
+            assistant_phase_index=stream.assistant_phase_index,
+            chunk_count=stream.chunk_count,
+        )
+
+    async def _checkpoint_stream_before_transition(
+        self,
+        *,
+        conversation_id: str,
+        session: SessionModel,
+        message_id: str,
+        turn_id: str,
+        user_email: str,
+        agent: AgentDefinition,
+        execution_fence: DirectTurnExecutionFence | None,
+        finish_reason: str = "user_cancelled",
+        chat_mode: ChatMode = "default",
+        chat_mode_source: str = "system_default",
+    ) -> AssistantStreamCheckpoint:
+        """Account for streamed text before cancellation, retry, or error cleanup."""
+        checkpoint = await self._persist_cancelled_active_stream(
+            conversation_id=conversation_id,
+            session=session,
+            message_id=message_id,
+            turn_id=turn_id,
+            user_email=user_email,
+            agent=agent,
+            finish_reason=finish_reason,
+            chat_mode=chat_mode,
+            chat_mode_source=chat_mode_source,
+            execution_fence=execution_fence,
+        )
+        if checkpoint.status == "rejected":
+            await self._publish_turn_error(
+                conversation_id,
+                session.session_id,
+                TurnError(
+                    code="assistant_output_unpersisted",
+                    message=ASSISTANT_OUTPUT_UNPERSISTED_MESSAGE,
+                    recoverable=True,
+                    detail=checkpoint.failure_detail(),
+                ),
+                turn_id=turn_id,
+                durable_session=session,
+                durable_agent=agent,
+                durable_user_email=user_email,
+                require_durable=True,
+            )
+            if execution_fence is not None:
+                execution_fence.confirm_stream_checkpoint()
+        return checkpoint
 
     def _tool_runtime_info(self, session_id: str) -> dict[str, Any]:
         reader = getattr(self._session_cache, "get_tool_runtime_info", None)
@@ -2406,6 +2601,13 @@ class TurnScheduler:
         source_title = getattr(follow_up, "task_title", None) or getattr(follow_up, "title", None)
         if source_title:
             data["source_title"] = source_title
+        if isinstance(follow_up, TaskResultFollowUp):
+            data["task_outcome"] = {
+                "task_id": follow_up.task_id,
+                "title": follow_up.task_title,
+                "status": follow_up.status.value,
+                "attempt_number": follow_up.outcome_context.get("attempt_number", 1),
+            }
 
         try:
             event = SessionEvent(type="system_message", data=data)
@@ -2434,6 +2636,7 @@ class TurnScheduler:
                 scope="turn",
                 turn_id=turn_id,
                 turn_observers=turn_observers,
+                task_outcome=data.get("task_outcome"),
             )
         except Exception:
             logger.warning(
@@ -2803,6 +3006,15 @@ class TurnScheduler:
                 "chat_mode_source": chat_mode_source,
             },
         )
+        if error.code == "assistant_output_unpersisted":
+            event.data["output_unpersisted"] = True
+            detail = error.detail or {}
+            if detail.get("checkpoint_status") in {"rejected", "uncertain"}:
+                event.data["checkpoint_status"] = detail["checkpoint_status"]
+            for field_name in ("assistant_phase_index", "turn_cycle_index", "stream_chunk_count"):
+                value = detail.get(field_name)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    event.data[field_name] = value
         intaris_session_id = getattr(session, "intaris_session_id", None) or session.session_id
         append_result = await record_events(
             session_id=intaris_session_id,
@@ -2982,6 +3194,22 @@ class TurnScheduler:
         durable_replacement_admission = (
             _replacement_admission and self._direct_turn_store is not None
         )
+        if follow_up is not None:
+            from cognis.store.models import StepRun
+
+            async with self._session_factory() as db_session:
+                task_step = await db_session.scalar(
+                    select(StepRun.step_run_id)
+                    .where(StepRun.conversation_id == conversation_id)
+                    .limit(1)
+                )
+            if task_step is not None:
+                return TurnError(
+                    code="task_owned_follow_up",
+                    message="Task-step followups must be consumed by their workflow boundary.",
+                    recoverable=True,
+                    turn_id=turn_id,
+                )
         if (
             not self._accepting_turns
             and queued_message_id is None
@@ -2994,6 +3222,24 @@ class TurnScheduler:
                 transient=True,
                 turn_id=turn_id,
             )
+        if isinstance(follow_up, TaskResultFollowUp) and follow_up.project_result:
+            from cognis.core.project_task_delivery import project_result_follow_up_allowed
+
+            async with self._session_factory() as db_session:
+                recipient = await queries.get_conversation(db_session, conversation_id)
+                allowed = (
+                    recipient is not None
+                    and recipient.user_email == user_email
+                    and await project_result_follow_up_allowed(
+                        db_session, follow_up, conversation_id
+                    )
+                )
+            if not allowed:
+                return TurnError(
+                    code="access_denied",
+                    message="The shared task result is no longer available for this recipient.",
+                    recoverable=False,
+                )
         admitted_turn_id = turn_id or self.new_turn_id()
         if intention_eligible is None:
             intention_eligible = not system_initiated
@@ -3458,6 +3704,7 @@ class TurnScheduler:
                 "retry_reason": (normalize_retry_reason(retry_reason).value if is_retry else None),
                 "retry_attempt": max(1, retry_attempt),
                 "absorbable": not is_hook_follow_up(follow_up)
+                and not bool((user_message_metadata or {}).get("feedback"))
                 and all(
                     getattr(observer, "supports_mid_turn_absorb", False)
                     for observer in (turn_observers or ())
@@ -4264,14 +4511,31 @@ class TurnScheduler:
         self,
         *,
         conversation_id: str,
-        session_id: str,
+        session: SessionModel,
         turn_id: str,
-    ) -> None:
-        """Discard only process-local attempt overlays before durable reclaim."""
+        message_id: str,
+        user_email: str,
+        agent: AgentDefinition,
+        execution_fence: DirectTurnExecutionFence | None,
+    ) -> bool:
+        """Commit exposed text before discarding process-local retry overlays."""
+        checkpoint = await self._checkpoint_stream_before_transition(
+            conversation_id=conversation_id,
+            session=session,
+            turn_id=turn_id,
+            message_id=message_id,
+            user_email=user_email,
+            agent=agent,
+            execution_fence=execution_fence,
+            finish_reason="turn_interrupted",
+        )
+        if checkpoint.failed:
+            return False
         await self._reset_active_stream(conversation_id)
         if hasattr(self._session_cache, "clear_active_thinking"):
-            self._session_cache.clear_active_thinking(session_id)
+            self._session_cache.clear_active_thinking(session.session_id)
         self._clear_assistant_phase(conversation_id, turn_id)
+        return True
 
     async def _notify_durable_retry_pending(
         self,
@@ -5538,6 +5802,7 @@ class TurnScheduler:
         if store is None:
             return await self.cancel_active_turns_and_wait(timeout_seconds=timeout_seconds)
         interrupted = 0
+        checkpoint_failures = 0
         tasks: list[asyncio.Task[None]] = []
         async with self._admission_drain_lock:
             active = [
@@ -5553,14 +5818,20 @@ class TurnScheduler:
                     task.cancel()
                     continue
                 async with self._active_streams_lock:
+                    control = self._turn_controls.get(conversation_id)
+                    if control is not None:
+                        control.settled = True
+                    fence.begin_stream_checkpoint()
                     stream = self._active_streams.get(conversation_id)
                     if stream is not None and stream.content:
                         try:
                             runtime = await self._load_conversation_runtime(conversation_id)
                             if runtime is None:
+                                fence.begin_stream_checkpoint()
+                                checkpoint_failures += 1
                                 continue
                             conversation, session, agent, _ = runtime
-                            persisted_content, _, _ = await self._persist_cancelled_active_stream(
+                            checkpoint = await self._persist_cancelled_active_stream(
                                 conversation_id=conversation_id,
                                 session=session,
                                 message_id=stream.message_id,
@@ -5570,78 +5841,63 @@ class TurnScheduler:
                                 finish_reason="controller_interrupted",
                                 clear_on_success=False,
                                 stream_snapshot=stream,
+                                execution_fence=fence,
                             )
-                        except Exception:
-                            persisted_content = None
-                            logger.exception(
+                        except Exception as exc:
+                            checkpoint = AssistantStreamCheckpoint("uncertain")
+                            logger.warning(
                                 "turn_scheduler: failed to checkpoint interrupted assistant stream",
-                                extra={"extra_data": {"conversation_id": conversation_id}},
+                                extra={
+                                    "extra_data": {
+                                        "conversation_id": conversation_id,
+                                        "error_type": type(exc).__name__,
+                                    }
+                                },
                             )
-                        if persisted_content is None:
+                        if checkpoint.failed:
                             # Never release a durable request after discarding visible
                             # output. The controller remains owner and shutdown reports
                             # the turn as abandoned rather than allowing a lossy retry.
+                            fence.begin_stream_checkpoint()
+                            checkpoint_failures += 1
                             continue
-                        append_phase = fence.user_append_phase or "user_append_pending"
-                        recovered = await store.settle_transient_failure(
-                            request_id,
-                            lease=fence.lease,
-                            outcome={
-                                "phase": append_phase,
-                                "user_append_phase": append_phase,
-                                **(
-                                    {"user_append_session_id": fence.user_append_session_id}
-                                    if fence.user_append_session_id
-                                    else {}
-                                ),
-                                "interruption_reason": reason,
-                                "source_phase": fence.last_phase,
-                                "source_metadata": fence.last_metadata or {},
-                            },
-                        )
-                        if (
-                            recovered is None
-                            or recovered.status != DirectTurnStatus.RECOVERABLE.value
-                        ):
-                            continue
-                        self._interrupted_durable_requests.add(request_id)
-                        interrupted += 1
-                        tasks.append(task)
-                        task.cancel()
-                        self._active_streams.pop(conversation_id, None)
+                    # Keep the empty-stream check and cancellation in one publish
+                    # barrier too: a DB await must not expose an uncheckpointed chunk.
+                    append_phase = fence.user_append_phase or "user_append_pending"
+                    fence.begin_stream_checkpoint()
+                    recovered = await store.settle_transient_failure(
+                        request_id,
+                        lease=fence.lease,
+                        outcome={
+                            "phase": append_phase,
+                            "user_append_phase": append_phase,
+                            **(
+                                {"user_append_session_id": fence.user_append_session_id}
+                                if fence.user_append_session_id
+                                else {}
+                            ),
+                            "interruption_reason": reason,
+                            "source_phase": fence.last_phase,
+                            "source_metadata": fence.last_metadata or {},
+                        },
+                    )
+                    if recovered is None or recovered.status != DirectTurnStatus.RECOVERABLE.value:
                         continue
-                append_phase = fence.user_append_phase or "user_append_pending"
-                recovered = await store.settle_transient_failure(
-                    request_id,
-                    lease=fence.lease,
-                    outcome={
-                        "phase": append_phase,
-                        "user_append_phase": append_phase,
-                        **(
-                            {"user_append_session_id": fence.user_append_session_id}
-                            if fence.user_append_session_id
-                            else {}
-                        ),
-                        "interruption_reason": reason,
-                        "source_phase": fence.last_phase,
-                        "source_metadata": fence.last_metadata or {},
-                    },
-                )
-                if recovered is None or recovered.status != DirectTurnStatus.RECOVERABLE.value:
-                    continue
-                self._interrupted_durable_requests.add(request_id)
-                interrupted += 1
-                tasks.append(task)
-                task.cancel()
+                    fence.confirm_stream_checkpoint()
+                    self._interrupted_durable_requests.add(request_id)
+                    interrupted += 1
+                    tasks.append(task)
+                    task.cancel()
+                    self._active_streams.pop(conversation_id, None)
         if tasks:
             _, pending = await asyncio.wait(tasks, timeout=timeout_seconds)
         else:
             pending = set()
         return {
-            "requested": len(tasks),
+            "requested": len(tasks) + checkpoint_failures,
             "interrupted": interrupted,
             "settled": len(tasks) - len(pending),
-            "abandoned": len(pending),
+            "abandoned": len(pending) + checkpoint_failures,
         }
 
     async def cancel_request(self, conversation_id: str, request_id: str) -> bool:
@@ -5985,6 +6241,7 @@ class TurnScheduler:
             "content": str(payload.get("content") or ""),
             "attachments": list(payload.get("attachments") or []),
             "client_message_id": metadata.get("client_message_id"),
+            "message_metadata": metadata.get("user_message_metadata"),
             "created_at": row.created_at.isoformat(),
             "updated_at": row.updated_at.isoformat(),
         }
@@ -6006,8 +6263,12 @@ class TurnScheduler:
         )
         outcome = row.outcome if isinstance(row.outcome, dict) else {}
         retry_target = outcome.get("retry_target")
+        primary_input = TurnScheduler._durable_pending_user_message(row)
         return {
             "turn_id": row.turn_id,
+            "primary_client_message_id": (
+                primary_input.get("client_message_id") if primary_input else None
+            ),
             "session_id": row.session_id or outcome.get("session_id") or "",
             "status": status,
             "chat_mode": local.get("chat_mode") if local else None,
@@ -6625,50 +6886,6 @@ class TurnScheduler:
                 exc_info=True,
             )
             return fallback
-
-    async def _adopt_late_intaris_title(
-        self,
-        conversation: ConversationModel,
-        session: SessionModel,
-    ) -> bool:
-        """Adopt a title that Intaris produced after bootstrap reasoning."""
-
-        intaris_session_id = getattr(session, "intaris_session_id", None) or session.session_id
-        if not intaris_session_id:
-            return False
-        if not hasattr(conversation, "title_source"):
-            return False
-        if not can_adopt_intaris_title(conversation):
-            return False
-
-        try:
-            intaris_session = await self._providers.guardrails.get_session(intaris_session_id)
-            title = intaris_session.title
-            if not title:
-                return False
-            async with self._session_factory() as db_session:
-                changed = await sync_intaris_title(
-                    db_session,
-                    conversation,
-                    title,
-                    updated_at=intaris_session.updated_at,
-                )
-                if changed:
-                    await db_session.commit()
-                return changed
-        except Exception:
-            logger.debug(
-                "turn_scheduler: failed to adopt late Intaris title",
-                extra={
-                    "extra_data": {
-                        "conversation_id": conversation.conversation_id,
-                        "session_id": session.session_id,
-                        "intaris_session_id": intaris_session_id,
-                    }
-                },
-                exc_info=True,
-            )
-            return False
 
     async def _handle_conversation_updated(self, event: Event) -> None:
         """Remember realtime title updates already published via EventBus."""
@@ -7687,6 +7904,43 @@ class TurnScheduler:
             )
             return
         origin_session_id = event.data.get("origin_session_id")
+        from cognis.core.task_followups import task_follow_up_owner
+
+        async with self._session_factory() as db_session:
+            task_owner = await task_follow_up_owner(
+                db_session,
+                conversation_id,
+                origin_session_id if isinstance(origin_session_id, str) else None,
+                event.data.get("origin_turn_id"),
+            )
+            from cognis.store.models import StepRun
+
+            task_step = await db_session.scalar(
+                select(StepRun.step_run_id)
+                .where(StepRun.conversation_id == conversation_id)
+                .limit(1)
+            )
+            if task_owner is not None or task_step is not None:
+                intent = await self._persist_follow_up_intent(
+                    db_session,
+                    conversation_id=conversation_id,
+                    event_payload={
+                        **event.data,
+                        "task_owner": task_owner.payload() if task_owner else None,
+                    },
+                )
+                if intent.status == "pending" and task_owner is not None:
+                    intent.event_payload = {
+                        **intent.event_payload,
+                        "task_owner": task_owner.payload(),
+                    }
+                elif task_owner is None:
+                    intent.last_error = (
+                        "Task followup origin session/turn cannot be proven; "
+                        "direct execution is forbidden."
+                    )
+                await db_session.commit()
+                return
         if isinstance(origin_session_id, str):
             async with self._session_factory() as db_session:
                 is_current = await queries.origin_session_is_in_active_scope(
@@ -8408,6 +8662,8 @@ class TurnScheduler:
     ) -> int:
         """Claim pending or durably stale intents without stealing healthy work."""
 
+        from cognis.store.models import StepRun
+
         recover_questions = getattr(self._notification_service, "recover_questions", None)
         if callable(recover_questions):
             await recover_questions(limit=limit)
@@ -8617,6 +8873,13 @@ class TurnScheduler:
                                     stale_processing,
                                 ),
                                 FollowUpIntentRow.attempt_count < FOLLOW_UP_INTENT_MAX_ATTEMPTS,
+                                # Workflow boundaries own these intents, including
+                                # unprovable task origins. They cannot consume the
+                                # bounded interactive recovery page.
+                                FollowUpIntentRow.event_payload["task_owner"].as_string().is_(None),
+                                ~select(StepRun.step_run_id)
+                                .where(StepRun.conversation_id == FollowUpIntentRow.conversation_id)
+                                .exists(),
                             )
                             .order_by(FollowUpIntentRow.updated_at, FollowUpIntentRow.intent_id)
                             .limit(max(1, limit))
@@ -9756,6 +10019,8 @@ class TurnScheduler:
         # Also cover cancellation before the coroutine ever starts.
         task.add_done_callback(_release_finished_owner)
 
+    @isolate_policy_acknowledgements
+    @isolate_turn_timing
     async def _run_turn(
         self,
         *,
@@ -10013,6 +10278,17 @@ class TurnScheduler:
                     await self._publish_durable_turn_change(marked_running)
                     await execution_fence.checkpoint("model_wait")
 
+            if not system_initiated and self._initial_profile_selector is not None:
+                # The turn already owns admission/cancellation. Resolve startup routing
+                # before any profile-dependent context or inference is prepared.
+                conversation, session, agent = await self._initial_profile_selector.prepare(
+                    conversation,
+                    session,
+                    agent,
+                    content,
+                    assert_current=execution_fence.assert_current if execution_fence else None,
+                )
+
             if attachment_notice:
                 await self._notify_observers_system_message(
                     conversation_id,
@@ -10062,6 +10338,15 @@ class TurnScheduler:
                 )
 
             if system_initiated and follow_up is not None:
+                if isinstance(follow_up, TaskResultFollowUp) and follow_up.project_result:
+                    from cognis.core.project_task_delivery import project_result_follow_up_allowed
+
+                    async with self._session_factory() as db_session:
+                        allowed = await project_result_follow_up_allowed(
+                            db_session, follow_up, conversation_id
+                        )
+                    if not allowed:
+                        raise PermissionError("Shared task result recipient access changed.")
                 await self._persist_follow_up_turn_notice(
                     conversation_id=conversation_id,
                     session=session,
@@ -10369,11 +10654,18 @@ class TurnScheduler:
                     },
                 )
                 if retry_pending:
-                    await self._cleanup_durable_retry_attempt(
+                    checkpointed = await self._cleanup_durable_retry_attempt(
                         conversation_id=conversation_id,
-                        session_id=session.session_id,
+                        session=session,
                         turn_id=turn_id,
+                        message_id=message_id,
+                        user_email=user_email,
+                        agent=agent,
+                        execution_fence=execution_fence,
                     )
+                    if not checkpointed:
+                        durable_retry_pending = False
+                        turn_failure_transient = False
                     return
                 turn_control.settled = True
                 selected_delivery_id = delivery_id or turn_control.absorbed_delivery_id
@@ -10453,7 +10745,6 @@ class TurnScheduler:
                 self._tool_runtime_info(session.session_id),
             )
 
-            await self._adopt_late_intaris_title(conversation, session)
             latest_title = await self._load_visible_conversation_title(
                 conversation_id,
                 conversation.title,
@@ -10572,6 +10863,12 @@ class TurnScheduler:
             )
 
         except asyncio.CancelledError:
+            if execution_fence is not None and execution_fence.stream_checkpoint_pending:
+                # A failed shutdown checkpoint remains a lease-recovery problem,
+                # not an ordinary user cancellation during process teardown.
+                turn_control.settled = True
+                turn_failure_transient = True
+                return
             if await self._has_committed_handoff(durable_request_id):
                 turn_succeeded = True
                 turn_control.settled = True
@@ -10596,8 +10893,12 @@ class TurnScheduler:
                     turn_control.settled = True
                     await self._cleanup_durable_retry_attempt(
                         conversation_id=conversation_id,
-                        session_id=session.session_id,
+                        session=session,
                         turn_id=turn_id,
+                        message_id=message_id,
+                        user_email=user_email,
+                        agent=agent,
+                        execution_fence=execution_fence,
                     )
                     return
             durable_retry_pending = False
@@ -10609,11 +10910,7 @@ class TurnScheduler:
                 turn_control,
                 selected_delivery_id=selected_delivery_id,
             )
-            (
-                partial_content,
-                last_seq,
-                turn_cycle_index,
-            ) = await self._persist_cancelled_active_stream(
+            checkpoint = await self._checkpoint_stream_before_transition(
                 conversation_id=conversation_id,
                 session=session,
                 message_id=message_id,
@@ -10622,7 +10919,13 @@ class TurnScheduler:
                 agent=agent,
                 chat_mode=resolved_chat_mode.mode,
                 chat_mode_source=resolved_chat_mode.source,
+                execution_fence=execution_fence,
             )
+            if checkpoint.failed:
+                return
+            partial_content = checkpoint.content
+            last_seq = checkpoint.last_seq
+            turn_cycle_index = checkpoint.turn_cycle_index
             if durable_request_id is not None and durable_lease is not None:
                 if turn_control.channel_delivery is not None:
                     await self._ensure_channel_source_tracking(
@@ -10758,17 +11061,40 @@ class TurnScheduler:
                     error.transient and durable_request_id is None
                 )
                 if retry_pending:
-                    await self._cleanup_durable_retry_attempt(
+                    checkpointed = await self._cleanup_durable_retry_attempt(
                         conversation_id=conversation_id,
-                        session_id=session.session_id,
+                        session=session,
                         turn_id=turn_id,
+                        message_id=message_id,
+                        user_email=user_email,
+                        agent=agent,
+                        execution_fence=execution_fence,
                     )
+                    if not checkpointed:
+                        durable_retry_pending = False
+                        turn_failure_transient = False
                     return
             except asyncio.CancelledError:
+                if execution_fence is not None and execution_fence.stream_checkpoint_pending:
+                    turn_control.settled = True
+                    return
                 durable_retry_pending = False
                 turn_failure_transient = False
                 cancel_event.set()
                 turn_control.settled = True
+                checkpoint = await self._checkpoint_stream_before_transition(
+                    conversation_id=conversation_id,
+                    session=session,
+                    message_id=message_id,
+                    turn_id=turn_id,
+                    user_email=user_email,
+                    agent=agent,
+                    execution_fence=execution_fence,
+                    chat_mode=resolved_chat_mode.mode,
+                    chat_mode_source=resolved_chat_mode.source,
+                )
+                if checkpoint.failed:
+                    return
                 if durable_request_id is not None and durable_lease is not None:
                     if turn_control.channel_delivery is not None:
                         await self._ensure_channel_source_tracking(
@@ -10862,6 +11188,7 @@ class TurnScheduler:
                 execution_fence is not None
                 and durable_request_id is not None
                 and durable_lease is not None
+                and not execution_fence.stream_checkpoint_pending
             ):
                 settled_status: DirectTurnStatus | None = None
                 with contextlib.suppress(StaleDirectTurnOwner):
@@ -11214,6 +11541,7 @@ class TurnScheduler:
         turn_observers: tuple[TurnObserver, ...] = (),
     ) -> tuple[Any, Any, Any, Any, Any, Any, Any]:
         """Build streaming callbacks that fan out to registered observers."""
+        owner_control = self._turn_controls.get(conversation_id)
 
         async def on_token(delta: str, turn_cycle_index: int | None = None) -> None:
             # Fall back to the last recorded turn cycle (NOT the phase counter)
@@ -11221,18 +11549,20 @@ class TurnScheduler:
             # and cycle once per LLM call, so a phase fallback stamps tokens
             # with a value that collides with a later cycle's tool group and
             # makes the client fold the streamed answer into that activity.
-            effective_turn_cycle_index = self._effective_turn_cycle_for_turn(
-                conversation_id,
-                turn_id,
-                turn_cycle_index,
-            )
-            chunk_index, content_offset = await self._append_active_stream_chunk(
+            position = await self._append_active_stream_chunk(
                 conversation_id=conversation_id,
                 session_id=session_id,
                 message_id=message_id,
                 turn_id=turn_id,
                 delta=delta,
-                turn_cycle_index=effective_turn_cycle_index,
+                turn_cycle_index=turn_cycle_index,
+                owner_control=owner_control,
+            )
+            if position is None:
+                return
+            chunk_index, content_offset = position
+            effective_turn_cycle_index = self._effective_turn_cycle_for_turn(
+                conversation_id, turn_id, turn_cycle_index
             )
             await asyncio.gather(
                 *(
@@ -11332,7 +11662,9 @@ class TurnScheduler:
             call_id: str,
             arguments: dict[str, Any] | None = None,
             turn_cycle_index: int | None = None,
+            runtime_metadata: ProgramEventMetadata | dict[str, Any] | None = None,
         ) -> None:
+            linkage = _coerce_program_event_metadata(runtime_metadata)
             await self._deliver_durable_channel_progress(conversation_id)
             if tool_name == "delegate" and isinstance(arguments, dict):
                 arguments = {
@@ -11366,6 +11698,7 @@ class TurnScheduler:
                 turn_id=turn_id,
                 arguments=arguments,
                 turn_cycle_index=effective_turn_cycle_index,
+                runtime_metadata=linkage,
             )
             await asyncio.gather(
                 *(
@@ -11381,6 +11714,7 @@ class TurnScheduler:
                         turn_id,
                         assistant_phase_index,
                         effective_turn_cycle_index,
+                        linkage,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -11449,7 +11783,9 @@ class TurnScheduler:
             file_diffs: list[dict[str, Any]] | None = None,
             presentation: dict[str, Any] | None = None,
             turn_cycle_index: int | None = None,
+            runtime_metadata: ProgramEventMetadata | dict[str, Any] | None = None,
         ) -> None:
+            linkage = _coerce_program_event_metadata(runtime_metadata)
             metadata = (
                 presentation.get("tool_output_presentation")
                 if isinstance(presentation, dict)
@@ -11467,6 +11803,7 @@ class TurnScheduler:
                 is_error=is_error,
                 metadata=metadata,
                 turn_cycle_index=turn_cycle_index,
+                runtime_metadata=linkage,
             )
             assistant_phase_index = self._assistant_phase_for_tool(
                 conversation_id, turn_id, call_id
@@ -11498,6 +11835,7 @@ class TurnScheduler:
                         presentation,
                         assistant_phase_index,
                         effective_turn_cycle_index,
+                        linkage,
                     )
                     for observer in self._iter_observers(
                         conversation_id, turn_observers=turn_observers
@@ -11629,6 +11967,7 @@ class TurnScheduler:
         retry_reason: str | None = None,
         retry_source_turn_id: str | None = None,
         attempt: int | None = None,
+        task_outcome: dict[str, Any] | None = None,
         turn_observers: list[TurnObserver] | tuple[TurnObserver, ...] | None = None,
     ) -> None:
         """Send a system message to all observers."""
@@ -11644,6 +11983,7 @@ class TurnScheduler:
             retry_reason,
             retry_source_turn_id,
             attempt,
+            task_outcome,
             turn_observers=turn_observers,
         )
 
@@ -11776,6 +12116,7 @@ class TurnScheduler:
             if grace_row is None or grace_row.source_type not in {
                 "follow_up",
                 "task_result_follow_up",
+                "project_task_result_follow_up",
             }:
                 return
             authorized_attachments = await authorize_outbound_artifact_refs_in_session(
@@ -11953,9 +12294,32 @@ class TurnScheduler:
         durable_session: SessionModel | None = None,
         durable_agent: AgentDefinition | None = None,
         durable_user_email: str | None = None,
+        require_durable: bool = False,
     ) -> None:
         """Notify observers and publish lifecycle event."""
         await self._assert_durable_conversation_fence(conversation_id)
+        if (
+            not require_durable
+            and turn_id is not None
+            and durable_session is not None
+            and durable_agent is not None
+            and durable_user_email is not None
+        ):
+            request_id = self._durable_request_by_conversation.get(conversation_id)
+            checkpoint = await self._checkpoint_stream_before_transition(
+                conversation_id=conversation_id,
+                session=durable_session,
+                message_id=turn_id,
+                turn_id=turn_id,
+                user_email=durable_user_email,
+                agent=durable_agent,
+                execution_fence=self._durable_fences.get(request_id or ""),
+                finish_reason="turn_interrupted",
+                chat_mode=chat_mode,
+                chat_mode_source=chat_mode_source,
+            )
+            if checkpoint.failed:
+                return
         if getattr(error, "turn_id", None) is None:
             error.turn_id = turn_id
         if (
@@ -11975,6 +12339,8 @@ class TurnScheduler:
                     chat_mode_source=chat_mode_source,
                 )
             except Exception:
+                if require_durable:
+                    raise
                 logger.exception(
                     "turn_scheduler: failed to persist durable turn error",
                     extra={
@@ -12802,6 +13168,21 @@ async def classify_turn_error(providers: Any, error: Exception) -> TurnError:
             message="No LLM provider is configured. Go to Settings > Providers to add one.",
             recoverable=True,
             detail={"error_detail": safe_detail},
+        )
+
+    from cognis.providers.guardrails.errors import IntarisDependencyError
+
+    if isinstance(error, IntarisDependencyError):
+        return TurnError(
+            code="provider_error:guardrails",
+            message=str(error),
+            recoverable=error.transient,
+            detail={
+                "provider": "intaris",
+                "operation": error.operation,
+                "status_code": error.status_code,
+            },
+            transient=error.transient,
         )
 
     if isinstance(error, httpx.HTTPStatusError):

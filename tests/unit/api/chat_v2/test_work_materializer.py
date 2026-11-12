@@ -128,7 +128,7 @@ def test_work_materializer_counts_header_like_content_inside_hunks() -> None:
 
 
 def test_materializer_version_rebuilds_filtered_work_evidence() -> None:
-    assert WORK_MATERIALIZER_VERSION == "work-v8"
+    assert WORK_MATERIALIZER_VERSION == "work-v9"
 
 
 def test_successful_artifact_publish_becomes_first_class_work_artifact() -> None:
@@ -1144,7 +1144,7 @@ async def test_projection_creation_uses_postgres_transaction_lock() -> None:
 
     statement, params = db.execute.await_args.args
     assert "pg_advisory_xact_lock" in str(statement)
-    assert params == {"key": "cognis-work-projection:session-1:work-v8"}
+    assert params == {"key": f"cognis-work-projection:session-1:{WORK_MATERIALIZER_VERSION}"}
 
 
 def test_target_advance_repairs_stale_caught_up_state_without_breaking_active_lease() -> None:
@@ -2483,6 +2483,166 @@ async def test_projection_counters_use_two_owner_scoped_queries_without_file_joi
     assert " join " not in record_query
     assert "work_record_files.owner_email" in file_query
     assert " join " not in file_query
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("split_batches", [False, True], ids=["replay", "live-append"])
+async def test_assistant_message_attachments_reach_work_artifacts(
+    tmp_path: Path, split_batches: bool
+) -> None:
+    engine, factory = await _database(tmp_path, owners=("alice", "bob"))
+    attachments = [
+        {
+            "artifact_id": f"att_{name}",
+            "kind": "image",
+            "mime_type": "image/png",
+            "filename": f"{name}.png",
+            "size_bytes": 123,
+        }
+        for name in ("desktop", "mobile", "foreign", "deleted")
+    ]
+    events = [
+        _event(
+            "intaris-alice",
+            1,
+            "user_message",
+            {"content": "Input", "attachments": [{**attachments[0], "artifact_id": "att_input"}]},
+        ),
+        _event(
+            "intaris-alice",
+            2,
+            "assistant_message",
+            {"message_id": "screenshots", "content": "Screenshots", "attachments": attachments},
+        ),
+        _event(
+            "intaris-alice",
+            3,
+            "assistant_message",
+            {"message_id": "repeated", "content": "Again", "attachments": attachments[:1]},
+        ),
+        _event(
+            "intaris-alice",
+            4,
+            "assistant_message",
+            {"message_id": "repeated", "content": "Final text", "attachments": []},
+        ),
+        _event(
+            "intaris-alice",
+            5,
+            "tool_result",
+            {
+                "call_id": "publish-desktop",
+                "name": "artifact_publish",
+                "result": "Published",
+                "attachments": attachments[:1],
+            },
+        ),
+    ]
+    materializer = WorkMaterializer(
+        session_factory=factory,
+        event_store=AuthorityStore({"intaris-alice": events}),
+        tool_definitions=lambda: {},
+    )
+    async with factory() as db:
+        if not split_batches:
+            db.add(
+                WorkSessionProjectionRow(
+                    projection_id="completed-v8",
+                    owner_email="alice@example.com",
+                    session_id="session-alice",
+                    source_session_id="intaris-alice",
+                    materializer_version="work-v8",
+                    state="caught_up",
+                    covered_through_seq=len(events),
+                    target_seq=len(events),
+                    artifact_count=0,
+                )
+            )
+        for attachment in attachments:
+            db.add(
+                ArtifactRecordRow(
+                    artifact_id=attachment["artifact_id"],
+                    namespace="test",
+                    object_id=attachment["artifact_id"],
+                    filename=attachment["filename"],
+                    owner_email=(
+                        "bob@example.com"
+                        if attachment["artifact_id"] == "att_foreign"
+                        else "alice@example.com"
+                    ),
+                    mime_type=attachment["mime_type"],
+                    size_bytes=attachment["size_bytes"],
+                    status="attached",
+                    deleted_at=(
+                        datetime.now(UTC) if attachment["artifact_id"] == "att_deleted" else None
+                    ),
+                )
+            )
+        await db.commit()
+    if not split_batches:
+        async with factory() as db:
+            row = await db.get(Session, "session-alice")
+            assert row is not None
+            state = await materializer._ensure_state(db, row, len(events))
+            assert state.covered_through_seq == 0
+            await db.commit()
+        claims = await materializer._claim()
+        assert len(claims) == 1
+        await materializer._repair(claims[0].projection_id)
+    for batch in [[event] for event in events] if split_batches else []:
+        async with factory() as db:
+            row = await db.get(Session, "session-alice")
+            assert row is not None
+            state = await materializer._ensure_state(db, row, len(events))
+            await materializer._materialize_batch(
+                db, row=row, state=state, raw_events=batch, target_seq=len(events)
+            )
+            await db.commit()
+    async with factory() as db:
+        row = await db.get(Session, "session-alice")
+        state = await db.scalar(
+            select(WorkSessionProjectionRow).where(
+                WorkSessionProjectionRow.materializer_version == WORK_MATERIALIZER_VERSION
+            )
+        )
+        assert row is not None and state is not None
+        assert state.state == "caught_up"
+        assert state.artifact_count == 4  # Authorization/deletion filtering happens on reads.
+        records = (await db.scalars(select(WorkRecordRow))).all()
+        assert all(record.entity_id != "att_input" for record in records)
+        assert all(record.record_type != "message" for record in records)
+        scope = TimelineScope(
+            key="session:session-alice", kind="session", session_id=row.session_id
+        )
+        page = await read_work_page(
+            db,
+            owner_email=row.user_email,
+            scope=scope,
+            session_rows=[row],
+            graph_fingerprint="graph",
+            cursor_secret="secret",
+            before=None,
+            limit=100,
+            category="artifacts",
+        )
+        assert len(page.items) == 2
+        assert {
+            item.artifact_id for item in page.items if isinstance(item, ArtifactTimelineItem)
+        } == {"att_desktop", "att_mobile"}
+        mobile = next(
+            item
+            for item in page.items
+            if isinstance(item, ArtifactTimelineItem) and item.artifact_id == "att_mobile"
+        )
+        assert isinstance(mobile, ArtifactTimelineItem)
+        assert (mobile.filename, mobile.mime_type, mobile.size_bytes) == (
+            "mobile.png",
+            "image/png",
+            123,
+        )
+        assert mobile.source_refs[0].session_id == "intaris-alice"
+        assert mobile.source_refs[0].seq == 2
     await engine.dispose()
 
 

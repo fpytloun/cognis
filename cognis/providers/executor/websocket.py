@@ -8,6 +8,7 @@ import inspect
 import os
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -22,6 +23,7 @@ from cognis.core.executor_connection_ownership import (
     EXECUTOR_CONNECTION_LEASE_TTL_SECONDS,
     ExecutorConnectionOwner,
 )
+from cognis.executor_transport import CHUNKED_JSON_PROTOCOL, JSONMessageReceiver, JSONMessageSender
 from cognis.logging import get_logger
 from cognis.models.config import ProviderHealth
 from cognis.models.executor_calls import normalize_executor_call_snapshot
@@ -31,6 +33,7 @@ from cognis.models.local_models import (
     OllamaRuntimeStartRequest,
     OllamaRuntimeStatus,
 )
+from cognis.models.program import ProgramRuntimeBinding
 from cognis.models.tool import (
     ExecutorCapabilities,
     ExecutorConfig,
@@ -43,6 +46,8 @@ from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker, CircuitBreakerError
 from cognis.providers.executor.delivery import DeliveryState, ExecutorDeliveryError
 from cognis.providers.executor.forwarding import ForwardedExecutorConnection
+from cognis.providers.executor.program_rpc import program_rpc_key, program_rpc_key_from_params
+from cognis.providers.executor.shell_status import ShellStatusReads
 from cognis.store.coordination import DatabaseLeaseStore, Lease, database_now_expression
 from cognis.store.models import CoordinationLeaseRow, ExecutorRow, executor_observed_tools_deferred
 from cognis.tools.executor.lsp.runtime import (
@@ -341,12 +346,18 @@ class WebSocketExecutorConnection:
         # Correlation tracking
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._queued_send_ids: set[str] = set()
+        self._shell_status_reads = ShellStatusReads(self._fetch_background_shell_status)
         self._receiver_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
+        self._message_sender = JSONMessageSender(lambda payload: ws.send_text(payload))
+        self._message_receiver = JSONMessageReceiver()
 
         # Heartbeat tracking
         self.last_heartbeat: datetime = datetime.now(UTC)
         self._connected = True
+        self._tool_catalog: list[dict[str, Any]] | None = None
+        self._tool_catalog_epoch = 0
+        self._tool_catalog_lock = asyncio.Lock()
         self._close_code: int | None = None
         self._close_reason: str | None = None
         self._close_error_type: str | None = None
@@ -357,6 +368,11 @@ class WebSocketExecutorConnection:
         self._tool_chunk_callbacks: dict[str, ToolOutputChunkCallback] = {}
         self._tool_progress_tasks: dict[str, set[asyncio.Task[Any]]] = {}
         self._tool_progress_overflowed: set[str] = set()
+        self._program_tool_call_handlers: dict[
+            tuple[str, str, str, str, str],
+            Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+        ] = {}
+        self._program_tool_call_tasks: dict[str, asyncio.Task[Any]] = {}
 
         # Channel adapter notification callbacks (account_id → callback)
         self._channel_message_callbacks: dict[str, Any] = {}
@@ -386,6 +402,61 @@ class WebSocketExecutorConnection:
     def connected(self) -> bool:
         return self._connected
 
+    def negotiate_message_transport(self, offered: Any) -> str | None:
+        """Enable chunking only when the authenticated peer advertises support."""
+        enabled = offered == CHUNKED_JSON_PROTOCOL
+        self._message_sender.enabled = enabled
+        self._message_receiver.enabled = enabled
+        return CHUNKED_JSON_PROTOCOL if enabled else None
+
+    async def _send_rpc_message(self, frame: dict[str, Any]) -> None:
+        if self._message_sender.enabled:
+            await self._message_sender.send(json.dumps(frame))
+        else:
+            # Older deployed executors continue to use their original wire format.
+            await self._ws.send_json(frame)
+
+    async def _answer_program_tool_call(self, request_id: str, params: dict[str, Any]) -> None:
+        """Run reverse RPC outside the receive loop so nested RPC can progress."""
+        task = asyncio.current_task()
+        if task is not None:
+            self._program_tool_call_tasks[request_id] = task
+        key = program_rpc_key_from_params(params)
+        handler = self._program_tool_call_handlers.get(key) if key is not None else None
+        try:
+            if handler is None:
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32090, "message": "Program tool dispatch is unavailable."},
+                }
+            else:
+                try:
+                    result = await handler(params)
+                    response = {"jsonrpc": "2.0", "id": request_id, "result": result}
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _logger.warning(
+                        "executor_ws: program tool dispatch failed",
+                        extra={
+                            "extra_data": {
+                                "executor_id": self.executor_id,
+                                "error_type": type(exc).__name__,
+                            }
+                        },
+                    )
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32090, "message": "Program tool dispatch failed."},
+                    }
+            await self._ensure_current_ownership()
+            await self._send_rpc_message(response)
+        finally:
+            if self._program_tool_call_tasks.get(request_id) is task:
+                self._program_tool_call_tasks.pop(request_id, None)
+
     @property
     def epoch(self) -> int | None:
         return self.connection_owner.epoch if self.connection_owner is not None else None
@@ -407,6 +478,30 @@ class WebSocketExecutorConnection:
                 self._receive_loop(), name=f"executor-rx-{self.executor_id}"
             )
             self._start_ownership_watchdog()
+
+    def register_program_tool_call_handler(
+        self,
+        binding: ProgramRuntimeBinding,
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        """Register one callback bound to an executor and program execution."""
+        if (
+            binding.executor_id != self.executor_id
+            or binding.executor_instance_id != self.executor_instance_id
+        ):
+            raise ValueError("Program callback executor identity does not match this connection.")
+        self._program_tool_call_handlers[program_rpc_key(binding)] = handler
+
+    def unregister_program_tool_call_handler(self, binding: ProgramRuntimeBinding) -> None:
+        """Remove exactly one execution-scoped reverse-RPC callback."""
+        self._program_tool_call_handlers.pop(program_rpc_key(binding), None)
+
+    async def send_program_status(self, params: dict[str, Any]) -> None:
+        """Notify the executor about an ordinary nested approval pause/resume."""
+        await self._ensure_current_ownership()
+        await self._send_rpc_message(
+            {"jsonrpc": "2.0", "method": "program.status", "params": params}
+        )
 
     async def wait_until_closed(self) -> None:
         """Block until the receiver loop finishes (connection closed)."""
@@ -454,6 +549,8 @@ class WebSocketExecutorConnection:
         _retry_attempted: bool = False,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and await the correlated response."""
+        if method in {"executor.configure", "executor.mcp.retry"}:
+            self._invalidate_tool_catalog()
         if not self._connected:
             raise ExecutorDisconnectedError(
                 f"Executor {self.executor_id} is not connected",
@@ -525,10 +622,25 @@ class WebSocketExecutorConnection:
                             executor_id=self.executor_id,
                             retry_after=1.0,
                         )
+                    runtime = params.get("runtime_metadata")
+                    if (
+                        method == "tool.execute"
+                        and isinstance(runtime, dict)
+                        and isinstance(runtime.get("mcp_binding_revision"), dict)
+                        and self.capabilities.mcp_credential_bindings is not True
+                    ):
+                        # Check the physical connection after admission awaits:
+                        # a proxy may now route to an unsupported replacement.
+                        raise ExecutorDeliveryError(
+                            "Executor must be upgraded before using this MCP credential binding.",
+                            DeliveryState.NOT_SENT,
+                            code="mcp_credential_executor_upgrade_required",
+                            executor_id=self.executor_id,
+                        )
                     self._queued_send_ids.discard(request_id)
                     send_attempted = True
                     try:
-                        await self._ws.send_json(request)
+                        await self._send_rpc_message(request)
                     except asyncio.CancelledError:
                         self._connected = False
                         self._fail_submitted_pending(
@@ -579,8 +691,12 @@ class WebSocketExecutorConnection:
                     on_sent=on_sent,
                     stable_call_id=stable_call_id,
                 )
-            if send_attempted and method in {"tool.execute", "llm.complete"}:
-                if submitted:
+            if send_attempted and method in {
+                "tool.execute",
+                "llm.complete",
+                "skill.assets.prepare",
+            }:
+                if submitted and method in {"tool.execute", "llm.complete"}:
                     await self._cancel_physical_call(method, params)
                 raise ExecutorDeliveryError(
                     f"Executor call {method} timed out after send began",
@@ -627,7 +743,11 @@ class WebSocketExecutorConnection:
         except asyncio.CancelledError:
             self._pending.pop(request_id, None)
             if submitted and method in {"tool.execute", "llm.complete"}:
-                await self._cancel_physical_call(method, params)
+                from cognis.providers.executor.delivery import preserve_task_execution_on_interrupt
+
+                preserve = method == "tool.execute" and await preserve_task_execution_on_interrupt()
+                if not preserve:
+                    await self._cancel_physical_call(method, params)
             raise
         except ExecutorRPCError:
             raise
@@ -700,8 +820,11 @@ class WebSocketExecutorConnection:
             return
         with contextlib.suppress(Exception):
             async with asyncio.timeout(_PHYSICAL_CANCEL_SEND_TIMEOUT_SECONDS):
-                async with self._send_lock:
-                    await self._ws.send_json(
+                # The negotiated sender serializes individual wire messages.
+                # Cancellation must not queue behind a whole large RPC transfer.
+                lock = contextlib.nullcontext() if self._message_sender.enabled else self._send_lock
+                async with lock:
+                    await self._send_rpc_message(
                         {
                             "jsonrpc": "2.0",
                             "method": cancel_method,
@@ -731,7 +854,7 @@ class WebSocketExecutorConnection:
         self._pending[request_id] = future
         try:
             async with self._send_lock:
-                await self._ws.send_json(
+                await self._send_rpc_message(
                     {
                         "jsonrpc": "2.0",
                         "method": method,
@@ -743,19 +866,48 @@ class WebSocketExecutorConnection:
         finally:
             self._pending.pop(request_id, None)
 
-    async def list_tools(self) -> list[dict[str, Any]]:
-        """Return tool metadata from the remote executor."""
-        result = await self.rpc_call(
-            "tool.list",
-            {},
-            replay_safe=True,
-        )
-        tools = result.get("tools")
-        if not isinstance(tools, list):
-            return []
-        return [cast(dict[str, Any], tool) for tool in tools if isinstance(tool, dict)]
+    async def list_tools(
+        self,
+        *,
+        timeout: float | None = None,
+        on_sent: Callable[[], Awaitable[None]] | None = None,
+        stable_call_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a physical-connection catalog, never a cached authorization."""
+        async with asyncio.timeout(timeout), self._tool_catalog_lock:
+            await self._ensure_current_ownership()
+            if self._connected and self._tool_catalog is not None:
+                return deepcopy(self._tool_catalog)
+            epoch = self._tool_catalog_epoch
+            result = await self.rpc_call(
+                "tool.list",
+                {},
+                timeout=timeout,
+                on_sent=on_sent,
+                stable_call_id=stable_call_id,
+                replay_safe=True,
+            )
+            tools = result.get("tools")
+            if not isinstance(tools, list):
+                return []
+            catalog = [cast(dict[str, Any], tool) for tool in tools if isinstance(tool, dict)]
+            # Older executors do not advertise invalidations: retain per-call
+            # discovery during rolling upgrades, including a failed refresh.
+            if (
+                result.get("catalog_notifications") is True
+                and epoch == self._tool_catalog_epoch
+                and self._connected
+            ):
+                self._tool_catalog = deepcopy(catalog)
+            return catalog
 
-    async def fetch_tool_result(self, call_id: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    def _invalidate_tool_catalog(self) -> None:
+        self._tool_catalog_epoch += 1
+        self._tool_catalog = None
+
+    async def fetch_tool_result(
+        self, call_id: str, *, timeout: float = 30.0, scope: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Ask this executor for the outcome of a previously accepted tool call.
 
         Returns the executor's report with ``state`` in ``active``,
@@ -766,7 +918,7 @@ class WebSocketExecutorConnection:
 
         result = await self.rpc_call(
             "tool.result_fetch",
-            {"call_id": call_id},
+            {"call_id": call_id, **({"scope": scope} if scope is not None else {})},
             timeout=timeout,
             replay_safe=True,
         )
@@ -920,13 +1072,14 @@ class WebSocketExecutorConnection:
         result = await self.rpc_call("tool.background", {"call_id": call_id}, timeout=timeout)
         return parse_tool_background_rpc_result(result)
 
-    async def cancel_inference(self, request_id: str) -> None:
+    async def cancel_inference(self, request_id: str) -> dict[str, Any] | None:
         try:
-            await self.rpc_call(
+            result = await self.rpc_call(
                 "llm.cancel",
                 {"request_id": request_id},
                 timeout=10.0,
             )
+            return result if isinstance(result, dict) else None
         except Exception:
             _logger.debug(
                 "executor_ws: failed to cancel inference",
@@ -937,6 +1090,8 @@ class WebSocketExecutorConnection:
                     }
                 },
             )
+
+        return None
 
     # ------------------------------------------------------------------
     # LLM inference streaming (via rpc_call, not a protocol method)
@@ -1166,7 +1321,19 @@ class WebSocketExecutorConnection:
         )
 
     async def background_shell_status(self, *, include_completed: bool = False) -> dict[str, Any]:
-        """Fetch background shell status from a remote executor."""
+        """Share concurrent status reads on this connection without caching results."""
+        if not self._connected:
+            raise ExecutorDisconnectedError(
+                f"Executor {self.executor_id} is not connected",
+                DeliveryState.NOT_SENT,
+                code="executor_disconnected",
+                executor_id=self.executor_id,
+                retry_after=1.0,
+            )
+        await self._ensure_current_ownership()
+        return await self._shell_status_reads.read(include_completed=include_completed)
+
+    async def _fetch_background_shell_status(self, include_completed: bool) -> dict[str, Any]:
         from cognis.providers.executor.shell_status import bind_shell_status
 
         result = await self.rpc_call(
@@ -1175,6 +1342,19 @@ class WebSocketExecutorConnection:
             timeout=10.0,
         )
         return bind_shell_status(result, self.executor_id)
+
+    async def file_digests(self, *, paths: list[str]) -> dict[str, Any]:
+        """Read-only SHA-256 of regular files on this executor, without caching."""
+        if not self._connected:
+            raise ExecutorDisconnectedError(
+                f"Executor {self.executor_id} is not connected",
+                DeliveryState.NOT_SENT,
+                code="executor_disconnected",
+                executor_id=self.executor_id,
+                retry_after=1.0,
+            )
+        await self._ensure_current_ownership()
+        return await self.rpc_call("fs.digest", {"paths": list(paths)}, timeout=10.0)
 
     async def oauth_loopback_start(
         self,
@@ -1216,6 +1396,7 @@ class WebSocketExecutorConnection:
                     break
         finally:
             self._connected = False
+            await self._message_receiver.close()
             await self._terminate_pending("Executor disconnected")
 
     async def _receive_frame(self) -> bool:
@@ -1228,7 +1409,8 @@ class WebSocketExecutorConnection:
         try:
             while self._connected:
                 try:
-                    data = await self._ws.receive_json()
+                    async with asyncio.timeout(self._message_receiver.receive_timeout):
+                        data = await self._ws.receive_json()
                 except WebSocketDisconnect as exc:
                     self._close_code = exc.code
                     self._close_reason = str(exc.reason)[:200] if exc.reason else None
@@ -1244,6 +1426,9 @@ class WebSocketExecutorConnection:
                 # takeover may happen after a request was sent but before its
                 # response arrives, so outbound validation alone is not enough.
                 await self._ensure_current_ownership()
+                data = await self._message_receiver.feed(data)
+                if data is None:
+                    continue
                 # A valid frame on this owned physical socket proves that the
                 # transport recovered. Do not leave outbound dispatch blocked by
                 # stale breaker state while the same duplex connection is active.
@@ -1289,7 +1474,9 @@ class WebSocketExecutorConnection:
                 # JSON-RPC notification (has "method" but no "id", or id is
                 # not in pending — treat as notification)
                 method = data.get("method")
-                if method == "executor.heartbeat":
+                if method == "executor.tools_changed":
+                    self._invalidate_tool_catalog()
+                elif method == "executor.heartbeat":
                     self.last_heartbeat = datetime.now(UTC)
                     if self._heartbeat_callback is not None:
                         progress_task = self._track_notification_task(
@@ -1372,16 +1559,32 @@ class WebSocketExecutorConnection:
                             }
                         },
                     )
+                elif method == "program.tool_call":
+                    params = data.get("params", {})
+                    if msg_id is None or not isinstance(params, dict):
+                        continue
+                    self._track_notification_task(
+                        self._answer_program_tool_call(str(msg_id), params),
+                        name=f"executor-program-tool-call-{self.executor_id}",
+                    )
+                elif method == "program.tool_cancel":
+                    params = data.get("params", {})
+                    cancel_request_id = (
+                        params.get("request_id") if isinstance(params, dict) else None
+                    )
+                    task = self._program_tool_call_tasks.get(str(cancel_request_id))
+                    if task is not None and task is not asyncio.current_task():
+                        task.cancel()
                 elif method == "llm.chunk":
                     params = data.get("params", {})
                     if not isinstance(params, dict):
                         params = {}
                     req_id = params.get("request_id")
                     if isinstance(req_id, str) and req_id in self._inference_queues:
-                        request_id = req_id
+                        inference_request_id = req_id
 
                         def enqueue_chunk(
-                            request_id: str = request_id,
+                            request_id: str = inference_request_id,
                             payload: dict[str, Any] = params,
                         ) -> None:
                             self._enqueue_inference_event(request_id, payload)
@@ -1395,11 +1598,11 @@ class WebSocketExecutorConnection:
                         params = {}
                     req_id = params.get("request_id")
                     if isinstance(req_id, str) and req_id in self._inference_queues:
-                        request_id = req_id
+                        inference_request_id = req_id
                         params["done"] = True
 
                         def enqueue_done(
-                            request_id: str = request_id,
+                            request_id: str = inference_request_id,
                             payload: dict[str, Any] = params,
                         ) -> None:
                             self._enqueue_inference_event(request_id, payload, done=True)

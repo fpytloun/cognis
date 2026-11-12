@@ -96,6 +96,8 @@ class ChannelDeliveryStatus(StrEnum):
 
 
 _TASK_FINAL_SOURCE_TYPE = "task_final_result"
+# New outcomes retain their committed context; legacy multipart projections stay unchanged.
+_TASK_OUTCOME_SOURCE_TYPE = "task_outcome"
 _PROJECT_TASK_RESULT_SOURCE_TYPE = "project_task_result"
 _TASK_RESULT_FOLLOW_UP_SOURCE_TYPE = "task_result_follow_up"
 _FOLLOW_UP_RESULT_SOURCE_TYPE = "follow_up_result"
@@ -301,6 +303,7 @@ class ChannelDeliveryService:
         self._retry_wakeup = asyncio.Event()
         self._managed_channel_service: Any | None = None
         self._recipient_resolution_service: Any | None = None
+        self._app_contact_service: Any | None = None
 
         # Subscribe to relevant events
         event_bus.subscribe(EventType.TASK_COMPLETED, self._handle_task_event)
@@ -327,6 +330,10 @@ class ChannelDeliveryService:
         """Attach the singleton explicit-recipient recovery service."""
 
         self._recipient_resolution_service = service
+
+    def set_app_contact_service(self, service: Any) -> None:
+        """Use the native app publisher behind the existing outbox boundary."""
+        self._app_contact_service = service
 
     async def start(self) -> None:
         """Start lightweight in-process retry loop."""
@@ -476,6 +483,7 @@ class ChannelDeliveryService:
         attachments: list[dict[str, Any]] | None = None,
         deliverable_id: str | None = None,
         project_result: bool = False,
+        outcome_key: str | None = None,
     ) -> ChannelDeliveryStatus:
         """Persist and immediately attempt a resumable direct task delivery."""
 
@@ -486,7 +494,11 @@ class ChannelDeliveryService:
         )
 
         source_type = (
-            _PROJECT_TASK_RESULT_SOURCE_TYPE if project_result else _TASK_FINAL_SOURCE_TYPE
+            _PROJECT_TASK_RESULT_SOURCE_TYPE
+            if project_result
+            else _TASK_OUTCOME_SOURCE_TYPE
+            if outcome_key
+            else _TASK_FINAL_SOURCE_TYPE
         )
         async with self._session_factory() as session:
             route = await get_conversation_channel_route(session, conversation_id)
@@ -503,12 +515,13 @@ class ChannelDeliveryService:
                 if not await project_result_recipient_allowed(session, task_id, route[4]):
                     return ChannelDeliveryStatus.FAILED
             identity = route[4] if project_result else conversation_id
-            stable_key = hashlib.sha256(f"{source_type}:{task_id}:{identity}".encode()).hexdigest()[
-                :20
-            ]
+            occurrence = outcome_key or task_id
+            stable_key = hashlib.sha256(
+                f"{source_type}:{occurrence}:{identity}".encode()
+            ).hexdigest()[:20]
             existing = (
                 await get_channel_delivery_outbox(session, f"cdel_{stable_key}")
-                if project_result
+                if project_result or outcome_key
                 else await get_channel_delivery_outbox_for_source(
                     session,
                     conversation_id=conversation_id,
@@ -589,6 +602,7 @@ class ChannelDeliveryService:
         media: list[dict[str, Any]] | None = None,
         deliverable_id: str | None = None,
         start_chunk_index: int = 0,
+        outcome_context: str | None = None,
         expected_projection_digest: str | None = None,
         expected_projected_chunk_count: int | None = None,
         on_chunk_start: ChunkStartCallback | None = None,
@@ -596,7 +610,6 @@ class ChannelDeliveryService:
         delivery_idempotency_key: str | None = None,
         delivery_owner_email: str | None = None,
         delivery_conversation_id: str | None = None,
-        workflow_task_id: str | None = None,
         reject_active_managed_binding: bool = False,
         failure_metadata: dict[str, Any] | None = None,
     ) -> ChannelDeliveryStatus:
@@ -606,6 +619,32 @@ class ChannelDeliveryService:
         nothing was sent, and ``partial`` when some chunks were sent
         before a later chunk failed.
         """
+
+        if channel_type == "web":
+            if self._app_contact_service is None or not delivery_idempotency_key:
+                return ChannelDeliveryStatus.UNAVAILABLE
+            digest = hashlib.sha256(f"app-contact-v1:{content}".encode()).hexdigest()
+            if expected_projection_digest and expected_projection_digest != digest:
+                return ChannelDeliveryStatus.FAILED
+            if start_chunk_index >= 1:
+                return ChannelDeliveryStatus.SENT
+            if on_chunk_start is not None and not await on_chunk_start(0, 1, digest, True):
+                return ChannelDeliveryStatus.FAILED
+            message_id = await self._app_contact_service.deliver(delivery_idempotency_key)
+            if on_chunk_sent is not None and not await on_chunk_sent(
+                1,
+                1,
+                digest,
+                {
+                    "chunk_index": 0,
+                    "content": content,
+                    "sent_at": datetime.now(UTC).isoformat(),
+                    "external_message_id": message_id,
+                    "attachments_delivered": bool(media),
+                },
+            ):
+                return ChannelDeliveryStatus.PARTIAL
+            return ChannelDeliveryStatus.SENT
 
         manager = self._channel_manager_ref()
         if manager is None:
@@ -638,6 +677,12 @@ class ChannelDeliveryService:
             )
             if had_attachment_failures:
                 return ChannelDeliveryStatus.INCOMPLETE
+
+        def projection_digest_for(identity: str) -> str:
+            return hashlib.sha256(
+                f"{channel_type}:{adapter.capabilities.model_dump_json()}:{identity}".encode()
+            ).hexdigest()
+
         deliverable_projection: ChannelProjection | None = None
         if deliverable_id is not None:
             deliverable_projection = await self._deliverable_channel_projection(
@@ -647,9 +692,28 @@ class ChannelDeliveryService:
                 artifact_store=getattr(manager, "_artifact_store", None),
                 owner_email=delivery_owner_email,
                 conversation_id=delivery_conversation_id,
-                workflow_task_id=workflow_task_id,
                 materialize_media=start_chunk_index == 0,
             )
+            # Resume pre-upgrade multipart sends with their already committed projection.
+            # New sends and retries of canonical-only sends never add the outcome wrapper.
+            if (
+                outcome_context
+                and expected_projection_digest
+                and projection_digest_for(deliverable_projection.identity)
+                != expected_projection_digest
+            ):
+                legacy_projection = await self._deliverable_channel_projection(
+                    deliverable_id=deliverable_id,
+                    fallback_text=content,
+                    capabilities=adapter.capabilities,
+                    artifact_store=getattr(manager, "_artifact_store", None),
+                    owner_email=delivery_owner_email,
+                    conversation_id=delivery_conversation_id,
+                    materialize_media=start_chunk_index == 0,
+                    outcome_context=outcome_context,
+                )
+                if projection_digest_for(legacy_projection.identity) == expected_projection_digest:
+                    deliverable_projection = legacy_projection
             if not deliverable_projection.media_complete:
                 return ChannelDeliveryStatus.INCOMPLETE
             outbound_media.extend(deliverable_projection.media)
@@ -668,12 +732,7 @@ class ChannelDeliveryService:
             if deliverable_projection is not None
             else f"text:{hashlib.sha256(content.encode()).hexdigest()}"
         )
-        projection_digest = hashlib.sha256(
-            (
-                f"{channel_type}:{adapter.capabilities.model_dump_json()}:"
-                f"{stable_projection_identity}"
-            ).encode()
-        ).hexdigest()
+        projection_digest = projection_digest_for(stable_projection_identity)
         if (
             expected_projection_digest
             and expected_projection_digest != projection_digest
@@ -1105,6 +1164,7 @@ class ChannelDeliveryService:
         if grace_row is not None and grace_row.source_type not in {
             "follow_up",
             "task_result_follow_up",
+            "project_task_result_follow_up",
         }:
             await self._deliver_outbox(
                 delivery_id=grace_delivery_id,
@@ -1687,7 +1747,11 @@ class ChannelDeliveryService:
             if pending_row is not None:
                 manager = self._channel_manager_ref()
                 owns_account = getattr(manager, "owns_account", None)
-                if callable(owns_account) and not owns_account(pending_row.account_id):
+                if (
+                    pending_row.channel_type != "web"
+                    and callable(owns_account)
+                    and not owns_account(pending_row.account_id)
+                ):
                     return
                 if pending_row.direct_turn_request_id is not None:
                     earlier_progress = await session.scalar(
@@ -1735,11 +1799,34 @@ class ChannelDeliveryService:
             )
             stale_origin = False
             if row is not None and row.source_type in {
+                _PROJECT_TASK_RESULT_SOURCE_TYPE,
+                "project_task_result_follow_up",
+                "project_task_result_reply",
+            }:
+                from cognis.core.project_task_delivery import project_result_route_allowed
+
+                stale_origin = not await project_result_route_allowed(session, row)
+                if stale_origin:
+                    await suppress_channel_delivery_outbox(
+                        session, delivery_ids=[delivery_id], reason=None
+                    )
+            if row is not None and row.direct_turn_request_id:
+                from cognis.core.project_task_delivery import project_result_direct_turn_allowed
+
+                stale_origin = stale_origin or not await project_result_direct_turn_allowed(
+                    session, row
+                )
+                if stale_origin:
+                    await suppress_channel_delivery_outbox(
+                        session, delivery_ids=[delivery_id], reason=None
+                    )
+            if row is not None and row.source_type in {
                 "delegation",
                 "task_gate_follow_up",
                 "task_result_follow_up",
+                "project_task_result_follow_up",
             }:
-                stale_origin = not await origin_session_is_in_active_scope(
+                stale_origin = stale_origin or not await origin_session_is_in_active_scope(
                     session,
                     conversation_id=row.conversation_id,
                     origin_session_id=row.session_id,
@@ -1797,7 +1884,11 @@ class ChannelDeliveryService:
         ) -> bool:
             if lease_lost.is_set():
                 return False
-            if row.source_type == _PROJECT_TASK_RESULT_SOURCE_TYPE:
+            if row.source_type in {
+                _PROJECT_TASK_RESULT_SOURCE_TYPE,
+                "project_task_result_follow_up",
+                "project_task_result_reply",
+            }:
                 from cognis.core.project_task_delivery import project_result_route_allowed
 
                 async with self._session_factory() as session:
@@ -1807,10 +1898,21 @@ class ChannelDeliveryService:
                         )
                         await session.commit()
                         return False
+            if row.direct_turn_request_id:
+                from cognis.core.project_task_delivery import project_result_direct_turn_allowed
+
+                async with self._session_factory() as session:
+                    if not await project_result_direct_turn_allowed(session, row):
+                        await suppress_channel_delivery_outbox(
+                            session, delivery_ids=[delivery_id], reason=None
+                        )
+                        await session.commit()
+                        return False
             if row.source_type in {
                 "delegation",
                 "task_gate_follow_up",
                 "task_result_follow_up",
+                "project_task_result_follow_up",
             }:
                 async with self._session_factory() as session:
                     if not await origin_session_is_in_active_scope(
@@ -1958,6 +2060,12 @@ class ChannelDeliveryService:
                 content=content,
                 media=attachments,
                 deliverable_id=deliverable_id,
+                outcome_context=(
+                    content
+                    if row.source_type
+                    in {_TASK_OUTCOME_SOURCE_TYPE, _PROJECT_TASK_RESULT_SOURCE_TYPE}
+                    else None
+                ),
                 start_chunk_index=int(getattr(row, "completed_chunk_count", 0) or 0),
                 expected_projection_digest=getattr(row, "projection_digest", None),
                 expected_projected_chunk_count=getattr(row, "projected_chunk_count", None),
@@ -1966,12 +2074,6 @@ class ChannelDeliveryService:
                 delivery_idempotency_key=delivery_id,
                 delivery_owner_email=getattr(row, "user_email", None),
                 delivery_conversation_id=row.conversation_id,
-                workflow_task_id=(
-                    row.source_id
-                    if getattr(row, "source_type", None) == _TASK_FINAL_SOURCE_TYPE
-                    and isinstance(getattr(row, "source_id", None), str)
-                    else None
-                ),
                 reject_active_managed_binding=(
                     getattr(row, "source_type", None) == "channel_recipient"
                 ),
@@ -2178,8 +2280,8 @@ class ChannelDeliveryService:
         artifact_store: Any | None,
         owner_email: str | None = None,
         conversation_id: str | None = None,
-        workflow_task_id: str | None = None,
         materialize_media: bool = True,
+        outcome_context: str | None = None,
     ) -> ChannelProjection:
         """Build canonical Markdown deliverable chunks with a full-view link."""
 
@@ -2226,33 +2328,35 @@ class ChannelDeliveryService:
                     item for item in media_manifest if not isinstance(item.get("media_key"), str)
                 ]
                 if canonical:
-                    workflow_media_authorized = False
-                    step_run_id = getattr(row, "step_run_id", None)
-                    if (
-                        row is not None
-                        and isinstance(step_run_id, str)
-                        and workflow_task_id
-                        and owner_email
-                    ):
-                        from cognis.store.queries import get_step_run, get_task
+                    document_media_authorized = False
+                    if row is not None and owner_email and conversation_id:
+                        from cognis.core.content_refs import authorize_deliverable_access
+                        from cognis.store.queries import get_conversation
 
                         async with self._session_factory() as session:
-                            step_run = await get_step_run(session, step_run_id)
-                            task = await get_task(session, workflow_task_id)
-                        workflow_media_authorized = bool(
-                            step_run is not None
-                            and task is not None
-                            and step_run.task_id == workflow_task_id
-                            and task.created_by == owner_email
-                        )
+                            target = await get_conversation(session, conversation_id)
+                            current_document = await get_deliverable(session, deliverable_id)
+                            if (
+                                target is not None
+                                and target.user_email == owner_email
+                                and current_document is not None
+                            ):
+                                document_media_authorized = (
+                                    await authorize_deliverable_access(
+                                        session,
+                                        current_document,
+                                        owner_email,
+                                        accessor_conversation_id=target.conversation_id,
+                                        accessor_agent_id=target.agent_id,
+                                        accessor_session_id=target.active_session_id,
+                                    )
+                                    is not None
+                                )
                     if (
                         artifact_store is None
                         or row is None
                         or not conversation_id
-                        or (
-                            getattr(row, "conversation_id", None) != conversation_id
-                            and not workflow_media_authorized
-                        )
+                        or not document_media_authorized
                     ):
                         media_complete = False
                     else:
@@ -2318,6 +2422,8 @@ class ChannelDeliveryService:
                 full_view_link=link,
                 deliverable_id=deliverable_id,
             )
+        if outcome_context:
+            markdown = f"{outcome_context}\n\n{markdown}"
         chunks = split_message(markdown, capabilities.max_message_length)
         identity = ":".join(
             [
@@ -2328,6 +2434,8 @@ class ChannelDeliveryService:
                 str(getattr(row, "rich_hash", "") or ""),
             ]
         )
+        if outcome_context:
+            identity += f":outcome:{hashlib.sha256(outcome_context.encode()).hexdigest()}"
         return ChannelProjection(
             chunks=chunks,
             identity=identity,

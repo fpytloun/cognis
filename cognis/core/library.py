@@ -42,6 +42,8 @@ class LibraryItem(BaseModel):
     title: str | None = None
     format: str
     owner_email: str | None = None
+    author_email: str | None = None
+    author_agent_id: str | None = None
     agent_id: str | None = None
     agent_name: str | None = None
     project_id: str | None = None
@@ -61,6 +63,8 @@ class LibraryItem(BaseModel):
     origin: Literal["user", "agent", "other"]
     is_readonly: bool = False
     is_favorite: bool = False
+    # Open, visible comments on any revision of the document; owner-only.
+    open_comments: int = 0
 
 
 class LibraryPage(BaseModel):
@@ -142,6 +146,88 @@ def _filtered(user_email: str, filters: LibraryFilters) -> Any:
     return stmt.subquery()
 
 
+async def _attach_open_comments(
+    session: AsyncSession, user_email: str, items: list[LibraryItem]
+) -> None:
+    """Count open comments per owned document in one query, across all its revisions."""
+    counts = await _open_comments_by_lineage(
+        session, user_email, {item.lineage_id or item.id for item in items if not item.is_readonly}
+    )
+    for item in items:
+        if not item.is_readonly:
+            item.open_comments = counts.get(item.lineage_id or item.id, 0)
+
+
+async def _open_comments_by_lineage(
+    session: AsyncSession, user_email: str, lineages: set[str]
+) -> dict[str, int]:
+    from cognis.store.feedback_models import FeedbackSubjectRow, FeedbackThreadRow
+
+    if not lineages:
+        return {}
+    result = await session.execute(
+        sa.select(FeedbackSubjectRow.lineage_id, sa.func.count(FeedbackThreadRow.thread_id))
+        .join(FeedbackThreadRow, FeedbackThreadRow.subject_id == FeedbackSubjectRow.subject_id)
+        .where(
+            FeedbackSubjectRow.owner_email == user_email,
+            FeedbackSubjectRow.lineage_id.in_(lineages),
+            FeedbackThreadRow.state == "open",
+            FeedbackThreadRow.hidden.is_(False),
+        )
+        .group_by(FeedbackSubjectRow.lineage_id)
+    )
+    return {str(lineage): int(count) for lineage, count in result.tuples().all()}
+
+
+async def document_comment_counts(
+    session: AsyncSession, user_email: str, refs: list[str]
+) -> dict[str, int]:
+    """Read owner-only counts for a bounded batch of exact document references.
+
+    Shared, missing and unavailable documents all return zero; neither document
+    existence nor somebody else's private review metadata is disclosed.
+    """
+    from cognis.store.library_queries import discoverable_content_clause
+    from cognis.store.models import ArtifactRecordRow, DeliverableRow
+
+    counts = dict.fromkeys(refs, 0)
+    if not refs:
+        return counts
+    records = (
+        (
+            await session.execute(
+                sa.union_all(
+                    sa.select(
+                        ArtifactRecordRow.artifact_id,
+                        sa.func.coalesce(
+                            ArtifactRecordRow.lineage_id, ArtifactRecordRow.artifact_id
+                        ),
+                    ).where(
+                        ArtifactRecordRow.artifact_id.in_(refs),
+                        ArtifactRecordRow.owner_email == user_email,
+                        discoverable_content_clause(ArtifactRecordRow, exact=True),
+                    ),
+                    sa.select(
+                        DeliverableRow.deliverable_id,
+                        sa.func.coalesce(DeliverableRow.lineage_id, DeliverableRow.deliverable_id),
+                    ).where(
+                        DeliverableRow.deliverable_id.in_(refs),
+                        DeliverableRow.owner_email == user_email,
+                    ),
+                )
+            )
+        )
+        .tuples()
+        .all()
+    )
+    by_lineage = await _open_comments_by_lineage(
+        session, user_email, {str(lineage) for _, lineage in records}
+    )
+    for ref, lineage in records:
+        counts[ref] = by_lineage.get(lineage, 0)
+    return counts
+
+
 async def browse(
     session: AsyncSession,
     user_email: str,
@@ -171,6 +257,7 @@ async def browse(
         LibraryItem(**dict(row), is_readonly=row["owner_email"] != user_email)
         for row in records[:limit]
     ]
+    await _attach_open_comments(session, user_email, items)
     next_cursor = None
     if len(records) > limit and items:
         last = items[-1]
@@ -239,7 +326,7 @@ async def item(
     ref: str,
 ) -> LibraryItem | None:
     """Resolve an exact, independently authorized content reference."""
-    rows = library_items(user_email, kind, exact=True)
+    rows = library_items(user_email, kind, exact=True, ref_id=ref)
     favorite = favorite_expression(user_email, kind, sa.func.coalesce(rows.c.lineage_id, rows.c.id))
     row = (
         (

@@ -21,7 +21,10 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, Literal, cast
 
+from jsonschema import Draft202012Validator, FormatChecker
 from prometheus_client import Counter, Histogram
+from referencing import Registry
+from referencing.exceptions import Unresolvable
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis import json_codec as json
@@ -46,6 +49,7 @@ from cognis.core.executor_recovery import ExecutorRecoveryTimeout
 from cognis.core.followups import FollowUpMetadata, FollowUpPolicy
 from cognis.core.gate_conditions import evaluate_gate_conditions_detailed
 from cognis.core.harness_guards import SameTurnToolCallLedger
+from cognis.core.program_guidance import PYTHON_EXECUTE_TOOL_NAME
 from cognis.core.project_runtime import build_project_context_message
 from cognis.core.runtime import ResolvedStepRuntime, TransientExecutorUnavailable
 from cognis.core.session_fork import fork_session_events
@@ -55,8 +59,12 @@ from cognis.core.task_execution import (
     assert_task_execution_fence,
     current_task_execution_fence,
 )
+from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+from cognis.core.task_tool_recovery import RecoveredTaskTools
+from cognis.core.turn_timing import turn_stage
+from cognis.core.workflow_attachments import project_workflow_attachments
 from cognis.core.workflow_prompt import render_context_comment
-from cognis.core.workflow_registry import WorkflowRegistry
+from cognis.core.workflow_registry import WorkflowRegistry, validate_gate_action
 from cognis.core.workflow_rendering import (
     MAX_CONTEXT_STRING_BYTES,
     MAX_DETERMINISTIC_JUMPS,
@@ -70,21 +78,24 @@ from cognis.models.artifact import AttachmentRef
 from cognis.models.deliverable import Deliverable, DeliverableStatus
 from cognis.models.session import SessionEvent, with_session_events_turn_id
 from cognis.models.task import TaskModel, TaskStatus
-from cognis.models.tool import ToolCall, ToolResult
+from cognis.models.tool import ToolCall, ToolResult, stable_tool_id
 from cognis.models.workflow import (
     CompletionConfig,
     CompletionDeliveryPolicy,
     DeterministicOutputConfig,
+    ProgramStepConfig,
     StepCompletionNotification,
     StepDefinition,
     StepEvaluation,
     StepOutput,
     Workflow,
     WorkflowState,
+    effective_gate_options,
     merge_session_policies,
     resolve_effective_input,
     resolve_source_names,
 )
+from cognis.providers.guardrails.errors import IntarisDependencyError
 from cognis.runtime_context import (
     RuntimeAccessContext,
     current_effective_working_directory,
@@ -96,17 +107,13 @@ from cognis.store.queries import (
     create_step_run,
     defer_running_task,
     fail_running_step_runs_for_task,
-    get_agent_direct_conversation,
     get_conversation,
-    get_conversation_channel_route,
     get_deliverable,
     get_latest_active_conversation_for_agent,
-    get_latest_active_conversation_for_channel_account,
     get_latest_approved_deliverable_for_step_run,
     get_latest_approved_step_run_for_task_step,
     get_latest_rejected_deliverable_for_step_run,
     get_latest_step_run_for_task_step,
-    get_preferred_channel_account_for_agent,
     get_project,
     get_step_run,
     list_pending_context_task_comments,
@@ -202,6 +209,81 @@ def _bounded_utf8(value: str, limit: int) -> str:
     return encoded[: max(0, limit - 3)].decode(errors="ignore") + "..."
 
 
+def _validate_program_json_value(
+    schema: dict[str, Any],
+    value: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    validator = Draft202012Validator(
+        schema,
+        format_checker=FormatChecker(),
+        registry=Registry(),
+    )
+    try:
+        error = next(iter(validator.iter_errors(value)), None)
+    except Unresolvable as exc:
+        raise ValueError(f"{label} failed JSON Schema validation at $ ($ref)") from exc
+    if error is None:
+        return
+    location = ".".join(str(part) for part in error.absolute_path) or "$"
+    raise ValueError(f"{label} failed JSON Schema validation at {location} ({error.validator})")
+
+
+def _program_digest(config: ProgramStepConfig) -> str:
+    from cognis.core.workflow_step_scope import canonical_digest
+
+    return canonical_digest(config.model_dump(mode="json", exclude_none=True))
+
+
+def _validate_program_tool_allowlist(tool_ids: list[str], registry: Any) -> None:
+    from cognis.core.program_plan import program_tool_exclusion_reason
+
+    items = registry.items() if callable(getattr(registry, "items", None)) else None
+    if not isinstance(items, list):
+        raise PermissionError("program tools could not be verified against the active registry")
+    for tool_id in tool_ids:
+        matches = [
+            registered for registered in items if stable_tool_id(registered.definition) == tool_id
+        ]
+        if len(matches) != 1:
+            raise PermissionError(f"program tool {tool_id!r} is not in the active tool registry")
+        definition = matches[0].definition
+        reason = program_tool_exclusion_reason(
+            definition,
+            read_only_required=True,
+            exclude_model_invoking=True,
+            workflow=True,
+        )
+        if reason:
+            if "model-backed" in reason:
+                raise PermissionError(
+                    f"model-backed tool {tool_id!r} is not available to workflow programs"
+                )
+            if "read-only" in reason:
+                raise PermissionError(f"program tool {tool_id!r} is not marked read-only")
+            raise PermissionError(f"program tool {tool_id!r} is unavailable: {reason}")
+
+
+def _validate_program_tool_wrapper(registered: Any) -> None:
+    if registered.definition.read_only is True:
+        raise PermissionError(
+            "python_execute must remain read_only=false so interrupted programs are never replayed"
+        )
+
+
+def _program_result_metadata(envelope: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key in ("status", "kernel_generation", "child_call_references"):
+        value = envelope.get(key)
+        if value is not None:
+            metadata[f"program_{key}"] = value
+    stdout_preview = envelope.get("stdout_preview")
+    if isinstance(stdout_preview, str):
+        metadata["program_stdout_preview"] = _bounded_utf8(stdout_preview, 8 * 1024)
+    return metadata
+
+
 # Prometheus metrics
 WORKFLOWS_TOTAL = Counter(
     "cognis_workflows_total",
@@ -290,9 +372,7 @@ class WorkflowEngine:
         self._shared_executor_connection = shared_executor_connection
         self._notification_service = notification_service
         self._channel_delivery = channel_delivery
-        self._follow_up_policy = FollowUpPolicy(
-            llm=getattr(providers, "llm", None),
-        )
+        self._follow_up_policy = FollowUpPolicy()
 
     async def run_direct_turn(
         self,
@@ -395,14 +475,15 @@ class WorkflowEngine:
             ),
             control_surface="task_control" if control_task_id else None,
         )
-        runtime = await self._resolve_step_runtime(
-            agent=agent,
-            user_email=session.user_email,
-            access_context=access_context,
-            conversation_id=conversation.conversation_id,
-            cancel_event=cancel_event,
-            execution_fence=execution_fence,
-        )
+        with turn_stage("runtime.resolve", session_id=session.session_id):
+            runtime = await self._resolve_step_runtime(
+                agent=agent,
+                user_email=session.user_email,
+                access_context=access_context,
+                conversation_id=conversation.conversation_id,
+                cancel_event=cancel_event,
+                execution_fence=execution_fence,
+            )
 
         from cognis.core.agent_loop import direct_chat_inference_contract
 
@@ -446,9 +527,11 @@ class WorkflowEngine:
             interaction_mode="step_requests",
             tool_registry=runtime.tool_registry,
             rebuild_tool_registry=runtime.rebuild_tool_registry,
+            program_policy=getattr(runtime, "program_policy", None),
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
             executor_pool=getattr(runtime, "executor_pool", None),
+            refresh_executor_pool=runtime.refresh_executor_pool,
             active_executor_id=getattr(runtime, "active_executor_id", None),
             runtime_info=runtime.runtime_info or {},
             workspace_root=current_workspace_root.get(),
@@ -490,7 +573,7 @@ class WorkflowEngine:
                 access_context=access_context,
             ):
                 await self._session_manager.refresh_intaris_session_policy(session)
-                return await self._agent_loop.run_step(
+                output = await self._agent_loop.run_step(
                     ctx,
                     on_token=on_progress,
                     on_thinking=on_thinking,
@@ -500,6 +583,8 @@ class WorkflowEngine:
                     on_tool_output_chunk=on_tool_output_chunk,
                     on_context_usage=on_context_usage,
                 )
+                assert output is None or isinstance(output, StepOutput)
+                return output
         finally:
             await runtime.cleanup()
 
@@ -579,7 +664,7 @@ class WorkflowEngine:
                 state.current_step_status = "running"
                 state.routing_skips.pop(step_def.name, None)
 
-                if step_def.type in {"tool_call", "condition", "complete"}:
+                if step_def.type in {"tool_call", "program", "condition", "complete"}:
                     try:
                         deterministic_result = await _await_with_workflow_budget(
                             self._execute_deterministic_step(
@@ -1129,6 +1214,51 @@ class WorkflowEngine:
                 await db_session.commit()
             await self._persist_task_final(task)
             WORKFLOWS_TOTAL.labels(workflow_name=workflow.name, status="failed").inc()
+        except (TaskRecoveryBlocked, IntarisDependencyError) as exc:
+            # An unresolved effect or permanent dependency denial is neither a
+            # completed step nor permission to replay it. Preserve its source.
+            from cognis.store.models import Task as TaskRow
+            from cognis.store.queries import pause_running_task_for_infrastructure
+
+            state.status = "paused"
+            state.current_step_status = "paused"
+            state.resume_failed_step = True
+            task.status = TaskStatus.PAUSED
+            task.result_summary = str(exc)
+            task.workflow_state = state
+            async with self._session_factory() as db_session:
+                await assert_task_execution_fence(db_session)
+                row = await db_session.get(TaskRow, task.task_id)
+                if row is not None:
+                    row.result_data = {
+                        **(row.result_data or {}),
+                        "recovery_blocked": {
+                            "error_type": type(exc).__name__,
+                            "reason": str(exc),
+                        },
+                    }
+                paused = await pause_running_task_for_infrastructure(
+                    db_session,
+                    task.task_id,
+                    workflow_state=state.model_dump(mode="json"),
+                    result_summary=str(exc),
+                )
+                if not paused:
+                    await db_session.rollback()
+                    raise StaleTaskExecutionOwner(task.task_id) from exc
+                await db_session.commit()
+            await self._event_bus.publish(
+                Event(
+                    type=EventType.TASK_PAUSED,
+                    data={
+                        "task_id": task.task_id,
+                        "task_title": task.title,
+                        "conversation_id": task.source_ref,
+                        "reason": str(exc),
+                    },
+                )
+            )
+            return task
         except StaleTaskExecutionOwner:
             raise
         except Exception as exc:
@@ -1139,6 +1269,7 @@ class WorkflowEngine:
             state.status = "failed"
             task.status = TaskStatus.FAILED
             task.completed_at = datetime.now(UTC)
+            task.result_summary = f"Workflow failed ({type(exc).__name__})."
             if isinstance(exc, ExecutorRecoveryTimeout):
                 task.result_summary = str(exc)
                 task.result_data = dict(exc.detail)
@@ -1258,6 +1389,7 @@ class WorkflowEngine:
                         step_type=step_def.type,
                         status=f"recovered_{recovered.step_run_status}",
                     ).inc()
+                    await self._complete_deterministic_receipts(runtime_info)
                     return recovered
 
             await self._event_bus.publish(
@@ -1413,16 +1545,23 @@ class WorkflowEngine:
                 runtime_info,
                 workflow,
             )
+        if substate == "executing" and runtime_info.get("durable_tool_dispatch") is True:
+            return None
         if substate == "executing" and runtime_info.get("tool_read_only") is not True:
+            message = (
+                "Program execution outcome is ambiguous after restart; the program was not replayed."
+                if runtime_info.get("program_execution") is True
+                else (
+                    "Deterministic tool dispatch outcome is ambiguous after restart; "
+                    "the side-effecting or unknown tool was not replayed."
+                )
+            )
             return await self._fail_deterministic_step(
                 SimpleNamespace(task_id=latest.task_id),
                 step_def,
                 latest.step_run_id,
                 runtime_info,
-                (
-                    "Deterministic tool dispatch outcome is ambiguous after restart; "
-                    "the side-effecting or unknown tool was not replayed."
-                ),
+                message,
             )
         return None
 
@@ -1440,7 +1579,12 @@ class WorkflowEngine:
         if not exhausted and isinstance(target_name, str):
             next_index = self._find_step_index(workflow, target_name)
         return _DeterministicStepResult(
-            output=StepOutput.model_validate(raw_output),
+            output=StepOutput.model_validate(
+                {
+                    **raw_output,
+                    "attachments": project_workflow_attachments(raw_output.get("attachments")),
+                }
+            ),
             step_run_id=step_run_id,
             step_run_status=status,
             next_step_index=next_index if isinstance(next_index, int) else None,
@@ -1646,11 +1790,57 @@ class WorkflowEngine:
         *,
         cancel_event: asyncio.Event | None,
     ) -> _DeterministicStepResult:
-        assert step_def.tool_call is not None
-        config = step_def.tool_call
-        rendered_args = renderer.render_native(config.args, context)
-        if not isinstance(rendered_args, dict):
-            raise ValueError("deterministic tool_call args must render to an object")
+        is_program = step_def.type == "program"
+        recovering_dispatch = (
+            not is_program
+            and runtime_info.get("durable_tool_dispatch") is True
+            and runtime_info.get("deterministic_substate") == "executing"
+        )
+        program_config: ProgramStepConfig | None = None
+        tool_config = None
+        tool_name: str
+        rendered_args: dict[str, Any]
+        audit_template: Any
+        audit_rendered: Any
+        dispatch_timeout: int | None
+        if is_program:
+            assert step_def.program is not None
+            program_config = step_def.program
+            tool_name = PYTHON_EXECUTE_TOOL_NAME
+            rendered_inputs = renderer.render_native(program_config.inputs, context)
+            if not isinstance(rendered_inputs, dict):
+                raise ValueError("program inputs must render to an object")
+            _validate_program_json_value(
+                program_config.input_schema,
+                rendered_inputs,
+                label="program inputs",
+            )
+            rendered_args = {
+                "code": program_config.code,
+                "description": program_config.description,
+                "inputs": rendered_inputs,
+                "expected_generation": None,
+                "output_schema": program_config.output_schema,
+            }
+            if program_config.limits is not None:
+                rendered_args["limits"] = program_config.limits.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
+            audit_template = {"inputs": program_config.inputs}
+            audit_rendered = {"inputs": rendered_inputs}
+            dispatch_timeout = None
+        else:
+            assert step_def.tool_call is not None
+            tool_config = step_def.tool_call
+            tool_name = tool_config.tool
+            rendered_args = renderer.render_native(tool_config.args, context)
+            if not isinstance(rendered_args, dict):
+                raise ValueError("deterministic tool_call args must render to an object")
+            audit_template = tool_config.args
+            audit_rendered = rendered_args
+            dispatch_timeout = tool_config.timeout_seconds
+
         call_identity = self._deterministic_call_identity(
             task,
             step_def,
@@ -1659,14 +1849,27 @@ class WorkflowEngine:
         runtime_info.update(
             {
                 "call_identity": call_identity,
-                "tool_name": config.tool,
+                "tool_name": tool_name,
                 "render": build_render_audit_record(
-                    template=config.args,
-                    rendered=rendered_args,
-                    redact_keys=set(config.redact_args),
+                    template=audit_template,
+                    rendered=audit_rendered,
+                    redact_keys=(
+                        set(tool_config.redact_args) if tool_config is not None else set()
+                    ),
                 ),
             }
         )
+        pinned_program_digest: str | None = None
+        if is_program:
+            assert program_config is not None
+            pinned_program_digest = _program_digest(program_config)
+            runtime_info.update(
+                {
+                    "program_digest": pinned_program_digest,
+                    "program_tool_ids": list(program_config.tools),
+                    "program_execution": True,
+                }
+            )
         await self._persist_deterministic_checkpoint(
             step_run_id,
             runtime_info=runtime_info,
@@ -1713,7 +1916,9 @@ class WorkflowEngine:
                 owner_email=task.created_by,
                 source_agent_id=task.agent_id,
                 target_session_id=session.session_id,
-                text=json.dumps(rendered_args),
+                text=json.dumps(
+                    {"inputs": rendered_args["inputs"]} if is_program else rendered_args
+                ),
             )
             await db_session.commit()
         access_context = RuntimeAccessContext(
@@ -1745,22 +1950,40 @@ class WorkflowEngine:
         )
         try:
             registry = runtime.tool_registry
-            registered = registry.get(config.tool) if registry is not None else None
+            registered = registry.get(tool_name) if registry is not None else None
             if registered is None:
-                raise ValueError(f"deterministic tool_call references unknown tool {config.tool!r}")
+                raise ValueError(f"deterministic step references unknown tool {tool_name!r}")
+            if is_program:
+                _validate_program_tool_wrapper(registered)
             read_only = registered.definition.read_only is True
+            allow_side_effects = (
+                tool_config.allow_side_effects if tool_config is not None else False
+            )
+            if is_program:
+                assert program_config is not None
+                _validate_program_tool_allowlist(program_config.tools, registry)
+                if workflow_step_scope.authorized_by != "owner_configured":
+                    raise PermissionError(
+                        "program execution requires an owner-reviewed pinned workflow"
+                    )
             runtime_info.update(
                 {
                     **(runtime.runtime_info or {}),
                     **profile.audit_metadata(),
                     "tool_read_only": read_only,
-                    "allow_side_effects": config.allow_side_effects,
+                    "durable_tool_dispatch": (
+                        not is_program and current_task_execution_fence() is not None
+                    ),
+                    "allow_side_effects": allow_side_effects,
                     "deterministic_substate": "executing",
                     "session_id": session.session_id,
                     "intaris_session_id": session.intaris_session_id,
                 }
             )
-            if not read_only and not config.allow_side_effects:
+            if is_program:
+                # Executor metadata is untrusted with respect to the workflow source pin.
+                runtime_info["program_digest"] = pinned_program_digest
+            if not is_program and not read_only and not allow_side_effects:
                 raise PermissionError(
                     "deterministic tool_call blocked because the tool is write-capable "
                     "or lacks explicit read-only metadata; set allow_side_effects=true "
@@ -1793,11 +2016,16 @@ class WorkflowEngine:
                 interaction_mode=task.interaction_mode_override or workflow.interaction.mode,
                 session_policy=session_policy,
                 tool_registry=registry,
+                program_policy=getattr(runtime, "program_policy", None),
                 executor_connection=runtime.executor_connection,
                 executor_environment=runtime.executor_environment,
                 executor_pool=getattr(runtime, "executor_pool", None),
+                refresh_executor_pool=runtime.refresh_executor_pool,
                 active_executor_id=getattr(runtime, "active_executor_id", None),
-                runtime_info=runtime.runtime_info or {},
+                runtime_info={
+                    **(runtime.runtime_info or {}),
+                    **({"program_digest": pinned_program_digest} if is_program else {}),
+                },
                 workflow_state=state,
                 workflow_steps=workflow.steps,
                 step_index=state.current_step_index,
@@ -1816,10 +2044,22 @@ class WorkflowEngine:
             )
             tool_call = ToolCall(
                 call_id=call_identity,
-                name=config.tool,
+                name=tool_name,
                 arguments=rendered_args,
                 execution_scope_id=step_run_id,
             )
+            if is_program:
+                audit_rendered_arguments = runtime_info["render"].get("rendered")
+                event_arguments = {
+                    **rendered_args,
+                    "inputs": (
+                        audit_rendered_arguments.get("inputs", "[redacted]")
+                        if isinstance(audit_rendered_arguments, dict)
+                        else "[redacted]"
+                    ),
+                }
+            else:
+                event_arguments = runtime_info["render"].get("rendered", {})
             if workflow_step_scope.authorized_by == "owner_configured" and not runtime_info.get(
                 "step_input_reported"
             ):
@@ -1837,8 +2077,8 @@ class WorkflowEngine:
                     type="tool_call",
                     data={
                         "call_id": call_identity,
-                        "name": config.tool,
-                        "arguments": runtime_info["render"].get("rendered", {}),
+                        "name": tool_name,
+                        "arguments": event_arguments,
                     },
                 ),
             )
@@ -1861,14 +2101,41 @@ class WorkflowEngine:
                     or refreshed_policy.get("evaluation_policy_version") != "hybrid_v1"
                 ):
                     ctx.workflow_step_scope = None
-                dispatch = self._agent_loop.execute_controller_tool(ctx, tool_call)
-                result: ToolResult
-                # An interruption is not a durable tool result: read-only
-                # recovery can replay this call under the same identity.
-                if config.timeout_seconds is not None:
-                    result = await asyncio.wait_for(dispatch, timeout=config.timeout_seconds)
-                else:
-                    result = await dispatch
+                canonical_result_exists = False
+                result = None
+                if recovering_dispatch:
+                    from cognis.core.task_tool_recovery import recover_task_tools
+
+                    fence = current_task_execution_fence()
+                    assert fence is not None
+                    batches = await fence.recovery_batches()
+                    selected = {
+                        key: batch
+                        for key, batch in batches.items()
+                        if any(
+                            entry["call_id"] == call_identity
+                            for entry in batch.get("tool_calls", [])
+                        )
+                    }
+                    if selected:
+                        recovered = await recover_task_tools(
+                            self._agent_loop,
+                            ctx,
+                            selected,
+                            collect_results=True,
+                            complete_descriptors=False,
+                            record_results=False,
+                        )
+                        if call_identity not in recovered.results:
+                            raise RuntimeError("Deterministic execution receipt is not recoverable")
+                        result = recovered.results[call_identity]
+                        canonical_result_exists = call_identity in recovered.canonical_calls
+                if result is None:
+                    dispatch = self._agent_loop.execute_controller_tool(ctx, tool_call)
+                    if dispatch_timeout is not None:
+                        result = await asyncio.wait_for(dispatch, timeout=dispatch_timeout)
+                    else:
+                        result = await dispatch
                 raw_output = (
                     result.metadata.get("_raw_output")
                     if isinstance(result.metadata, dict)
@@ -1879,60 +2146,114 @@ class WorkflowEngine:
                     tool_call,
                     result,
                 )
-                await self._record_deterministic_tool_event(
-                    ctx,
-                    call_identity,
-                    SessionEvent(
-                        type="tool_result",
-                        data={
-                            "call_id": call_identity,
-                            "name": config.tool,
-                            "result": result.output,
-                            "is_error": result.is_error,
-                            "has_full_output": (result.metadata or {}).get(
-                                "has_full_output", False
-                            ),
-                            "recovery_call_id": (result.metadata or {}).get("recovery_call_id"),
-                        },
-                    ),
-                )
+                if not canonical_result_exists:
+                    await self._record_deterministic_tool_event(
+                        ctx,
+                        call_identity,
+                        SessionEvent(
+                            type="tool_result",
+                            data={
+                                "call_id": call_identity,
+                                "name": tool_name,
+                                "result": result.output,
+                                "is_error": result.is_error,
+                                "has_full_output": (result.metadata or {}).get(
+                                    "has_full_output", False
+                                ),
+                                "recovery_call_id": (result.metadata or {}).get("recovery_call_id"),
+                            },
+                        ),
+                    )
+                runtime_info["durable_tool_result_recorded"] = True
 
             result_context = self._deterministic_tool_result_context(
                 result,
                 raw_output=raw_output,
             )
+            if (
+                result.is_error
+                and not is_program
+                and tool_name == "skill_load"
+                and rendered_args.get("require_assets_ready") is True
+            ):
+                # Required runtime failures cannot render successful-path outputs.
+                # Keep the original structured dependency error, not a Jinja undefined.
+                return await self._fail_deterministic_step(
+                    task,
+                    step_def,
+                    step_run_id,
+                    runtime_info,
+                    result.output,
+                    output=StepOutput(
+                        summary="Required skill assets are not ready.",
+                        error=result.output,
+                        metadata={
+                            "deterministic_step": True,
+                            "step_type": step_def.type,
+                            "tool_name": tool_name,
+                            "tool_error": True,
+                            "dependency_error": result_context["metadata"],
+                        },
+                    ),
+                )
             rendered_result_context = {**context, "result": result_context}
-            outputs = (
-                renderer.render_native(config.outputs, rendered_result_context)
-                if config.outputs
-                else self._default_deterministic_tool_outputs(result_context, result)
-            )
-            summary_template = config.summary or (
-                f"Tool '{config.tool}' failed."
-                if result.is_error
-                else f"Tool '{config.tool}' completed."
-            )
+            program_envelope: dict[str, Any] | None = None
+            if is_program:
+                assert program_config is not None
+                if result.is_error:
+                    outputs = {}
+                    summary = f"Program failed: {program_config.description}"
+                else:
+                    value = result_context["value"]
+                    if not isinstance(value, dict):
+                        raise ValueError("python_execute returned no JSON result object")
+                    program_envelope = value
+                    emitted = value.get("result")
+                    if not isinstance(emitted, dict):
+                        raise ValueError("python_execute must return exactly one emitted object")
+                    _validate_program_json_value(
+                        program_config.output_schema,
+                        emitted,
+                        label="program output",
+                    )
+                    outputs = emitted
+                    summary = program_config.description
+            else:
+                assert tool_config is not None
+                outputs = (
+                    renderer.render_native(tool_config.outputs, rendered_result_context)
+                    if tool_config.outputs
+                    else self._default_deterministic_tool_outputs(result_context, result)
+                )
+                summary_template = tool_config.summary or (
+                    f"Tool '{tool_name}' failed."
+                    if result.is_error
+                    else f"Tool '{tool_name}' completed."
+                )
+                summary = renderer.render_text(summary_template, rendered_result_context)
+
+            output_metadata = {
+                "deterministic_step": True,
+                "step_type": step_def.type,
+                "tool_name": tool_name,
+                "call_identity": call_identity,
+                "tool_error": result.is_error,
+                "output_ref": (result.metadata or {}).get("recovery_call_id"),
+                "tool_output_artifact_id": (result.metadata or {}).get("tool_output_artifact_id"),
+                "target_executor_id": (
+                    rendered_args.get("target_executor")
+                    if isinstance(rendered_args.get("target_executor"), str)
+                    else None
+                ),
+            }
+            if is_program and program_envelope is not None:
+                output_metadata.update(_program_result_metadata(program_envelope))
             output = StepOutput(
-                summary=renderer.render_text(summary_template, rendered_result_context),
+                summary=summary,
                 outputs=outputs,
-                metadata={
-                    "deterministic_step": True,
-                    "step_type": step_def.type,
-                    "tool_name": config.tool,
-                    "call_identity": call_identity,
-                    "tool_error": result.is_error,
-                    "output_ref": (result.metadata or {}).get("recovery_call_id"),
-                    "tool_output_artifact_id": (result.metadata or {}).get(
-                        "tool_output_artifact_id"
-                    ),
-                    "target_executor_id": (
-                        rendered_args.get("target_executor")
-                        if isinstance(rendered_args.get("target_executor"), str)
-                        else None
-                    ),
-                },
+                metadata=output_metadata,
                 error=result.output if result.is_error else None,
-                attachments=result.attachments or [],
+                attachments=result_context["attachments"],
             )
             runtime_info.update(
                 {
@@ -1949,7 +2270,7 @@ class WorkflowEngine:
                     ),
                 }
             )
-            if result.is_error and config.fail_on_error:
+            if result.is_error and (is_program or (tool_config and tool_config.fail_on_error)):
                 return await self._fail_deterministic_step(
                     task,
                     step_def,
@@ -1991,22 +2312,30 @@ class WorkflowEngine:
     ) -> None:
         """Report an owner-configured deterministic step as the session user message.
 
-        A tool_call step has no agent input, so its rendered step is the input.
-        It uses the agent-step path: a durable ``user_message`` event, then an
-        Intaris reasoning report resolved from events. The append is idempotent
-        per call identity; the checkpoint flag prevents a second report on retry.
+        Deterministic steps have no agent input, so their reviewed step intent
+        and rendered data are the input. Program source remains in the outer
+        tool-call event and is not duplicated into this user-message projection.
+        The append is idempotent per call identity.
         """
         step_def = ctx.step_definition
-        assert step_def.tool_call is not None
         rendered = (runtime_info.get("render") or {}).get("rendered")
         args_summary = (
             json.dumps(rendered, ensure_ascii=False, sort_keys=True)
             if rendered is not None
             else "arguments too large to summarize"
         )
-        content = (
-            f"Workflow step {step_def.name}: run {step_def.tool_call.tool} with {args_summary}"
-        )[:_INTARIS_SOURCE_MAX_CHARS]
+        if step_def.type == "program":
+            assert step_def.program is not None
+            content = (
+                f"Workflow step {step_def.name}: {step_def.program.description}\n"
+                f"Rendered inputs: {args_summary}"
+            )
+        else:
+            assert step_def.tool_call is not None
+            content = (
+                f"Workflow step {step_def.name}: run {step_def.tool_call.tool} with {args_summary}"
+            )
+        content = content[:_INTARIS_SOURCE_MAX_CHARS]
         await self._record_deterministic_tool_event(
             ctx,
             call_identity,
@@ -2103,6 +2432,23 @@ class WorkflowEngine:
             error_action=action,
         )
 
+    async def _complete_deterministic_receipts(self, runtime_info: dict[str, Any]) -> None:
+        if not runtime_info.get("durable_tool_result_recorded"):
+            return
+        fence = current_task_execution_fence()
+        if fence is None:
+            return
+        session_id = runtime_info.get("intaris_session_id") or runtime_info.get("session_id")
+        turn_id = runtime_info.get("call_identity")
+        if not session_id or not turn_id:
+            return
+        completed = await fence.complete_tool_dispatch(
+            session_id=session_id, turn_id=turn_id, call_ids=[turn_id]
+        )
+        from cognis.core.task_tool_recovery import acknowledge_task_receipts
+
+        await acknowledge_task_receipts(self._agent_loop, completed)
+
     async def _finalize_deterministic_step(
         self,
         task: Any,
@@ -2161,6 +2507,7 @@ class WorkflowEngine:
             )
             await db_session.commit()
 
+        await self._complete_deterministic_receipts(runtime_info)
         await self._event_bus.publish(
             Event(
                 type=EventType.STEP_COMPLETED,
@@ -2250,10 +2597,11 @@ class WorkflowEngine:
                 "content": raw.get("content", ""),
                 "outputs": raw.get("outputs", {}),
                 "metadata": raw.get("metadata", {}),
+                "outcome": raw.get("outcome", {}),
                 "status": "skipped" if raw.get("metadata", {}).get("skipped") else "completed",
                 "error": raw.get("error"),
                 "deliverable_id": raw.get("deliverable_id"),
-                "attachments": raw.get("attachments", []),
+                "attachments": project_workflow_attachments(raw.get("attachments", [])),
             }
         task_vars = (
             task.result_data.get("vars", {})
@@ -2297,6 +2645,7 @@ class WorkflowEngine:
         *,
         raw_output: Any,
     ) -> dict[str, Any]:
+        """Project tool data for templates without model-only instructions or activation state."""
         raw_text = raw_output if isinstance(raw_output, str) else result.output
         value: Any = raw_text
         if len(raw_text.encode()) <= MAX_CONTEXT_STRING_BYTES:
@@ -2309,14 +2658,21 @@ class WorkflowEngine:
         metadata = {
             key: item
             for key, item in (result.metadata or {}).items()
-            if key not in {"_raw_output", "stored_output", "evaluation"}
+            if key
+            not in {
+                "_raw_output",
+                "stored_output",
+                "evaluation",
+                "protected_context",
+                "skill_activation",
+            }
         }
         return {
             "output": _bounded_utf8(result.output, MAX_CONTEXT_STRING_BYTES),
             "value": value,
             "is_error": result.is_error,
             "metadata": metadata,
-            "attachments": result.attachments or [],
+            "attachments": project_workflow_attachments(result.attachments),
         }
 
     @staticmethod
@@ -2419,7 +2775,7 @@ class WorkflowEngine:
                 ],
             ),
         )
-        result = await self._handle_gate_step(task, gate, state, workflow)
+        result = await self._handle_gate_step(task, gate, state, workflow, derived=True)
         return result if result in {"continue", "cancel", "fail"} else "paused"
 
     async def _handle_transient_executor_unavailable(
@@ -2432,13 +2788,14 @@ class WorkflowEngine:
     ) -> bool:
         """Defer a task when its selected executor is temporarily unavailable.
 
-        Returns True when the task was requeued for a later run. Production
-        runtimes normally await readiness before this compatibility path runs.
+        Returns True when durable work was requeued without consuming capacity
+        or quality attempts. Executor pins and incomplete tool calls are kept.
         """
 
         attempt_key = f"transient_executor_unavailable:{step_def.name}"
         deferrals = state.loop_iterations.get(attempt_key, 0) + 1
         state.loop_iterations[attempt_key] = deferrals
+        state.loop_iterations[f"recovery:{step_def.name}"] = 1
         state.current_step_status = None
         state.last_retry_reason = None
         state.last_evaluation_feedback = None
@@ -2656,7 +3013,11 @@ class WorkflowEngine:
                 if isinstance(previous_start_seq, int):
                     step_event_start_seq = previous_start_seq
             update_kwargs: dict[str, Any] = {
-                "status": "running",
+                "status": (
+                    None
+                    if latest_step_run is not None and latest_step_run.status == "running"
+                    else "running"
+                ),
                 "attempt": attempt,
                 "conversation_id": conversation.conversation_id,
                 "session_id": session.session_id,
@@ -2689,8 +3050,15 @@ class WorkflowEngine:
             }
             if latest_step_run is not None:
                 update_kwargs["deliverable_id"] = None
-            await update_step_run(db_session, step_run_id, **update_kwargs)
+            if not await update_step_run(db_session, step_run_id, **update_kwargs):
+                raise StaleTaskExecutionOwner(task.task_id)
             await db_session.commit()
+
+        # Evaluation and continued steps reuse sessions left idle by the prior run.
+        if session.status == "idle":
+            if not await self._session_manager.mark_active(session.session_id):
+                raise RuntimeError("The reused step session is no longer available")
+            session.status = "active"
 
         await self._event_bus.publish(
             Event(
@@ -2945,7 +3313,16 @@ class WorkflowEngine:
         project_context = await self._build_project_context(task)
 
         async def _consume_context_comments(reason: str) -> list[dict[str, Any]]:
+            from cognis.core.task_followups import pending_task_follow_ups
+
             async with self._session_factory() as db_session:
+                follow_ups = await pending_task_follow_ups(
+                    db_session,
+                    task_id=task.task_id,
+                    attempt_number=task.attempt_number,
+                    step_run_id=step_run_id,
+                    consumer_session_id=ctx.session.session_id,
+                )
                 rows = await list_pending_context_task_comments(
                     db_session,
                     task_id=task.task_id,
@@ -2953,7 +3330,7 @@ class WorkflowEngine:
                     attempt_number=task.attempt_number,
                 )
 
-            return [
+            return follow_ups + [
                 {
                     "content": render_context_comment(
                         comment_id=row.comment_id,
@@ -2970,9 +3347,17 @@ class WorkflowEngine:
                     "applied_reason": reason,
                 }
                 for row in rows
+                if agent.agent_type != "secondary"
             ]
 
         async def _ack_context_comment(item: dict[str, Any]) -> None:
+            if item.get("source") == "task_follow_up":
+                from cognis.core.task_followups import acknowledge_task_follow_up
+
+                async with self._session_factory() as db_session:
+                    await acknowledge_task_follow_up(db_session, item)
+                    await db_session.commit()
+                return
             if item.get("source") != "task_context_comment":
                 return
             comment_id = item.get("comment_id")
@@ -3035,9 +3420,11 @@ class WorkflowEngine:
             session_policy=session_policy,
             tool_registry=runtime.tool_registry,
             rebuild_tool_registry=runtime.rebuild_tool_registry,
+            program_policy=getattr(runtime, "program_policy", None),
             executor_connection=runtime.executor_connection,
             executor_environment=runtime.executor_environment,
             executor_pool=getattr(runtime, "executor_pool", None),
+            refresh_executor_pool=runtime.refresh_executor_pool,
             active_executor_id=getattr(runtime, "active_executor_id", None),
             runtime_info={
                 **(runtime.runtime_info or {}),
@@ -3055,12 +3442,8 @@ class WorkflowEngine:
             turn_id=step_run_id,
             todos=persisted_todos,
             execution_fence=current_task_execution_fence(),
-            consume_boundary_batch=(
-                _consume_context_comments if agent.agent_type != "secondary" else None
-            ),
-            on_boundary_persisted=(
-                _ack_context_comment if agent.agent_type != "secondary" else None
-            ),
+            consume_boundary_batch=_consume_context_comments,
+            on_boundary_persisted=_ack_context_comment,
         )
 
         async def on_thinking(
@@ -3110,6 +3493,7 @@ class WorkflowEngine:
                     suffix = f" ({', '.join(details)})" if details else ""
                     await on_progress(f"\n\nPreparing apply_patch input{suffix}…")
 
+        closed_session_recovery = False
         # Run agent loop
         try:
             with scoped_runtime_context(
@@ -3122,12 +3506,31 @@ class WorkflowEngine:
                 access_context=access_context,
             ):
                 await self._session_manager.refresh_intaris_session_policy(session)
-                output = await self._agent_loop.run_step(
-                    ctx,
-                    on_token=on_progress,
-                    on_thinking=on_thinking,
-                    on_tool_progress=on_tool_progress,
+                recovery_fence = current_task_execution_fence()
+                batches = (
+                    await recovery_fence.recovery_batches() if recovery_fence is not None else {}
                 )
+                task.result_data = {**(task.result_data or {}), "execution_recovery": batches}
+                closed_session_recovery = any(
+                    batch.get("tool_calls") for batch in batches.values()
+                ) and not self._is_reusable_step_session_status(session.status)
+                if closed_session_recovery:
+                    recovery = await self._agent_loop.run_step(ctx, settlement_only=True)
+                    if isinstance(recovery, RecoveredTaskTools):
+                        assert recovery.requires_delegation_continuation
+                        continuation = await self._agent_loop.run_step(ctx, recovery_only=True)
+                        if continuation is not None:
+                            raise RuntimeError(
+                                "Delegation recovery did not finish in its original context"
+                            )
+                else:
+                    output = await self._agent_loop.run_step(
+                        ctx,
+                        on_token=on_progress,
+                        on_thinking=on_thinking,
+                        on_tool_progress=on_tool_progress,
+                    )
+                    assert output is None or isinstance(output, StepOutput)
         except StepInterrupted:
             current_status = await self._read_task_status(task.task_id)
             async with self._session_factory() as db_session:
@@ -3141,6 +3544,16 @@ class WorkflowEngine:
                 await db_session.commit()
             raise
         except StaleTaskExecutionOwner:
+            raise
+        except IntarisDependencyError as exc:
+            if exc.transient:
+                raise TransientExecutorUnavailable(str(exc), retry_after_seconds=30) from exc
+            raise
+        except TaskRecoveryBlocked:
+            raise
+        except TransientExecutorUnavailable:
+            # Keep the running step and its execution identity for re-entry.
+            # This is suspension, not a failed or cancelled execution.
             raise
         except Exception:
             async with self._session_factory() as db_session:
@@ -3156,7 +3569,18 @@ class WorkflowEngine:
         finally:
             await runtime.cleanup()
 
+        if closed_session_recovery:
+            return await self._execute_run_step(
+                task,
+                step_def,
+                state,
+                workflow,
+                on_progress=on_progress,
+                cancel_event=cancel_event,
+            )
+
         # Enrich output with session metadata
+        assert output is None or isinstance(output, StepOutput)
         if output is not None:
             output.completed_at = datetime.now(UTC)
             output.session_id = session.session_id
@@ -3470,6 +3894,8 @@ class WorkflowEngine:
         step_def: StepDefinition,
         state: WorkflowState,
         workflow: Workflow,
+        *,
+        derived: bool = False,
     ) -> str:
         """Handle a gate step — pause and wait for caller response."""
         from cognis.models.workflow import GateConfig
@@ -3483,6 +3909,30 @@ class WorkflowEngine:
             # Never reinterpret an unidentified saved approval as a new gate,
             # including autonomous/condition-skipped gates.
             raise StepInterrupted(task.task_id)
+        step_names = [step.name for step in workflow.steps]
+        # Derived outcome/exhaustion gates may revise their originating step.
+        gate_index = state.current_step_index + 1 if derived else step_names.index(step_def.name)
+
+        def validate_action(action: str) -> None:
+            try:
+                validate_gate_action(action, step_names=step_names, gate_index=gate_index)
+            except ValueError as exc:
+                raise TaskRecoveryBlocked(
+                    f"Gate '{step_def.name}' has an unsupported action or target; "
+                    "reconcile the workflow before resuming."
+                ) from exc
+
+        gate = step_def.gate
+        if reuse_pause and isinstance(existing_pause_payload.get("gate_definition"), dict):
+            try:
+                gate = GateConfig.model_validate(existing_pause_payload["gate_definition"])
+            except ValueError as exc:
+                raise TaskRecoveryBlocked(
+                    f"Gate '{step_def.name}' has an invalid saved definition; reconcile it."
+                ) from exc
+        if gate is not None:
+            for option in gate.options:
+                validate_action(option.action)
         if (
             not reuse_pause
             and (task.interaction_mode_override or workflow.interaction.mode) == "none"
@@ -3491,9 +3941,6 @@ class WorkflowEngine:
             GATES_TOTAL.labels(action="auto_continue").inc()
             return "continue"
 
-        gate = step_def.gate
-        if reuse_pause and isinstance(existing_pause_payload.get("gate_definition"), dict):
-            gate = GateConfig.model_validate(existing_pause_payload["gate_definition"])
         if gate is None:
             return "continue"
 
@@ -3607,6 +4054,7 @@ class WorkflowEngine:
             elif existing_notification.status == "resolved":
                 resolution = existing_notification.resolution or {}
                 action = str(resolution.get("decision") or "continue")
+                validate_action(action)
                 instruction = str(
                     resolution.get("note") or resolution.get("feedback") or ""
                 ).strip()
@@ -3645,7 +4093,7 @@ class WorkflowEngine:
         # Pause workflow — write status + workflow_state atomically
         state.status = "paused"
         state.current_step_status = "paused"
-        gate_options = [opt.model_dump(mode="json") for opt in gate.options]
+        gate_options = effective_gate_options([opt.model_dump(mode="json") for opt in gate.options])
         state.pending_pause_type = "gate"
         state.pending_pause_payload = {
             "pause_id": pause_id,
@@ -3827,6 +4275,7 @@ class WorkflowEngine:
                 action = gate.timeout_action
                 instruction = ""
 
+        validate_action(action)
         GATES_TOTAL.labels(action=action).inc()
         gate_evaluation.update({"action_taken": action, "branch": "operator_decision"})
         await _persist_gate_evaluation(gate_evaluation)
@@ -4172,6 +4621,7 @@ class WorkflowEngine:
                 ),
                 state,
                 workflow,
+                derived=True,
             )
             if gate_result == "continue":
                 state.last_evaluation_feedback = None
@@ -4570,6 +5020,7 @@ class WorkflowEngine:
                 ),
                 state,
                 workflow,
+                derived=True,
             )
             if result == "continue":
                 state.last_evaluation_feedback = None
@@ -4604,7 +5055,15 @@ class WorkflowEngine:
         """Resolve delivery target and inject synthetic event."""
         async with self._session_factory() as db_session:
             await assert_task_execution_fence(db_session)
-        applied_mode = task.applied_completion_mode or "default"
+        from cognis.core.task_outcomes import task_outcome_completion_mode
+
+        applied_mode = task_outcome_completion_mode(task)
+        from cognis.core.project_task_delivery import fan_out_project_result
+
+        async def deliver_project_result(user_email: str) -> None:
+            await self._deliver_project_task_result(task, user_email)
+
+        await fan_out_project_result(task, self._session_factory, deliver_project_result)
         if applied_mode == "silent":
             logger.info(
                 "task_delivery: explicit silent completion, skipping outward delivery",
@@ -4618,6 +5077,12 @@ class WorkflowEngine:
             return
 
         delivery_mode = task.delivery.mode
+        if delivery_mode == "in_app_notifications":
+            await self._deliver_task_result_inbox(task)
+            return
+        if delivery_mode == "silent" and applied_mode != "direct":
+            await self._publish_task_terminal_event(task, silent_delivery=True)
+            return
         target_conversation_id = await self._resolve_task_delivery_conversation(task)
 
         if target_conversation_id is None:
@@ -4631,10 +5096,12 @@ class WorkflowEngine:
                     }
                 },
             )
-            await self._publish_task_terminal_event(
-                task,
-                delivery_skipped_reason="no_target_conversation",
-            )
+            if applied_mode == "direct":
+                await self._deliver_task_result_inbox(task)
+            else:
+                await self._publish_task_terminal_event(
+                    task, delivery_skipped_reason="no_target_conversation"
+                )
             return
 
         async with self._session_factory() as db_session:
@@ -4666,6 +5133,14 @@ class WorkflowEngine:
                     conversation_id=scope_conversation_id,
                     origin_session_id=origin_session_id,
                 )
+        if target_conversation is None or target_conversation.user_email != task.created_by:
+            if applied_mode == "direct":
+                await self._deliver_task_result_inbox(task)
+            else:
+                await self._publish_task_terminal_event(
+                    task, delivery_skipped_reason="invalid_recipient"
+                )
+            return
         if not origin_is_current:
             logger.info(
                 "task_delivery: stale activity scope, retaining historical result",
@@ -4676,28 +5151,17 @@ class WorkflowEngine:
                     }
                 },
             )
-            return
-
-        from cognis.core.project_task_delivery import fan_out_project_result
-
-        if (
-            applied_mode == "direct"
-            and target_conversation
-            and target_conversation.context_type != "web"
-        ):
-            await self._deliver_task_result_direct(task, target_conversation_id)
-            await fan_out_project_result(task, self._session_factory, self._channel_delivery)
-            return
-        if applied_mode == "direct":
-            logger.info(
-                "task_delivery: using default web follow-up for direct completion",
-                extra={
-                    "extra_data": {
-                        "task_id": task.task_id,
-                        "target_conversation_id": target_conversation_id,
-                    }
-                },
+            await self._publish_task_terminal_event(
+                task, delivery_skipped_reason="stale_activity_scope"
             )
+            return
+
+        if applied_mode == "direct":
+            if target_conversation and target_conversation.context_type == "web":
+                await self._deliver_task_result_default(task, target_conversation_id, direct=True)
+            else:
+                await self._deliver_task_result_direct(task, target_conversation_id)
+            return
 
         if delivery_mode == "silent":
             logger.info(
@@ -4725,7 +5189,77 @@ class WorkflowEngine:
         )
 
         await self._deliver_task_result_default(task, target_conversation_id)
-        await fan_out_project_result(task, self._session_factory, self._channel_delivery)
+
+    async def _deliver_project_task_result(self, task: TaskModel, user_email: str) -> None:
+        """Deliver one successful shared result under the recipient's own identity."""
+        from cognis.core.artifact_inputs import authorize_outbound_artifact_refs_in_session
+        from cognis.core.project_access import can_project_read_deliverable
+        from cognis.core.project_task_delivery import (
+            project_result_execution_target,
+            project_result_recipient_allowed,
+            project_result_target_allowed,
+        )
+
+        async with self._session_factory() as db:
+            if not await project_result_recipient_allowed(db, task.task_id, user_email):
+                return
+        target_id = await self._resolve_preferred_channel_conversation(task, user_email=user_email)
+        if target_id is None:
+            return
+        from cognis.core.task_outcomes import task_outcome_completion_mode
+
+        direct = task_outcome_completion_mode(task) == "direct"
+        async with self._session_factory() as db:
+            if not direct:
+                target_id = await project_result_execution_target(
+                    db, task=task, conversation_id=target_id
+                )
+                await db.commit()
+            if target_id is None or not await project_result_target_allowed(
+                db, task.task_id, target_id, require_execution=not direct
+            ):
+                return
+            target = await get_conversation(db, target_id)
+            if target is None or target.user_email != user_email:
+                return
+            result_data = dict(task.result_data or {})
+            result_data["attachments"] = await authorize_outbound_artifact_refs_in_session(
+                db,
+                result_data.get("attachments", []),
+                user_email=user_email,
+                conversation_id=target_id,
+            )
+            deliverable_id = result_data.get("final_deliverable_id")
+            if isinstance(deliverable_id, str):
+                deliverable = await get_deliverable(db, deliverable_id)
+                if not await can_project_read_deliverable(db, deliverable, user_email):
+                    result_data.pop("final_deliverable_id", None)
+            needs_session = target.active_session_id is None
+        # Never copy the owner's private control-chat or step-session references.
+        recipient_task = task.model_copy(
+            update={
+                "source_ref": None,
+                "source_session_id": None,
+                "workflow_state": None,
+                "result_data": result_data,
+            }
+        )
+        if target.context_type == "web" and needs_session:
+            await self._session_manager.ensure_root_session(
+                conversation_id=target_id,
+                user_email=user_email,
+                agent_id=task.agent_id,
+                intention="Receive and handle shared project task outcomes.",
+            )
+        if direct and target.context_type != "web":
+            await self._deliver_task_result_direct(recipient_task, target_id, project_result=True)
+        else:
+            await self._deliver_task_result_default(
+                recipient_task, target_id, direct=direct, project_result=True
+            )
+        await self._event_bus.publish(
+            Event(type=EventType.CONVERSATION_UPDATED, data={"conversation_id": target_id})
+        )
 
     async def _publish_task_terminal_event(self, task: TaskModel, **extra_data: object) -> None:
         """Publish the internal terminal task lifecycle event.
@@ -4776,54 +5310,29 @@ class WorkflowEngine:
             return task.source_ref
         return None
 
-    async def _resolve_preferred_channel_conversation(self, task: TaskModel) -> str | None:
-        async with self._session_factory() as db_session:
-            account = await get_preferred_channel_account_for_agent(
-                db_session,
-                user_email=task.created_by,
-                agent_id=task.agent_id,
-            )
-            if account is not None:
-                if account.default_conversation_id:
-                    conversation = await get_conversation(
-                        db_session, account.default_conversation_id
-                    )
-                    route = await get_conversation_channel_route(
-                        db_session, account.default_conversation_id
-                    )
-                    if (
-                        conversation is not None
-                        and conversation.status == "active"
-                        and conversation.user_email == task.created_by
-                        and conversation.agent_id == task.agent_id
-                        and route is not None
-                        and route[1] == account.account_id
-                    ):
-                        return conversation.conversation_id
-                latest = await get_latest_active_conversation_for_channel_account(
-                    db_session,
-                    user_email=task.created_by,
-                    agent_id=task.agent_id,
-                    account_id=account.account_id,
-                    prefer_unthreaded=True,
-                )
-                if latest is not None:
-                    return latest.conversation_id
+    async def _resolve_preferred_channel_conversation(
+        self, task: TaskModel, *, user_email: str | None = None
+    ) -> str | None:
+        from cognis.core.channel_delivery_targets import preferred_channel_target
 
-            direct = await get_agent_direct_conversation(db_session, task.created_by, task.agent_id)
-            if direct is not None:
-                return direct.conversation_id
+        recipient = user_email or task.created_by
+        async with self._session_factory() as db_session:
+            target = await preferred_channel_target(
+                db_session, user_email=recipient, agent_id=task.agent_id
+            )
+            if target is not None:
+                return target
 
         if hasattr(self._session_manager, "get_or_create_agent_direct_conversation"):
             direct_model = await self._session_manager.get_or_create_agent_direct_conversation(
-                user_email=task.created_by,
+                user_email=recipient,
                 agent_id=task.agent_id,
             )
             return str(direct_model.conversation_id)
         return None
 
     async def _deliver_task_result_direct(
-        self, task: TaskModel, target_conversation_id: str
+        self, task: TaskModel, target_conversation_id: str, *, project_result: bool = False
     ) -> None:
         """Deliver the final workflow deliverable directly to the resolved channel."""
 
@@ -4831,7 +5340,7 @@ class WorkflowEngine:
         attachments: list[dict[str, Any]] = []
         final_deliverable_id: str | None = None
         deliverable_already_delivered = False
-        if isinstance(task.result_data, dict):
+        if isinstance(task.result_data, dict) and task.status == TaskStatus.COMPLETED:
             raw_format = task.result_data.get("final_format")
             final_format = raw_format if isinstance(raw_format, str) else None
             raw_deliverable_id = task.result_data.get("final_deliverable_id")
@@ -4857,17 +5366,35 @@ class WorkflowEngine:
         if not final_content and final_deliverable_id is not None:
             final_content = self._build_task_delivery_fallback(task)
 
-        if not final_content:
-            logger.warning(
-                "task_delivery: direct delivery requested but final content missing; falling back",
-                extra={"extra_data": {"task_id": task.task_id}},
+        from cognis.core.task_outcomes import format_task_outcome, task_outcome_key
+
+        final_content = format_task_outcome(
+            task, content=final_content if final_deliverable_id is None else None, channel=True
+        )
+
+        if project_result:
+            from cognis.core.project_task_delivery import project_result_target_allowed
+
+            async with self._session_factory() as db:
+                if not await project_result_target_allowed(
+                    db, task.task_id, target_conversation_id
+                ):
+                    return
+                target = await get_conversation(db, target_conversation_id)
+            if target is None:
+                return
+            if self._channel_delivery is None:
+                await self._deliver_task_result_inbox(task, recipient_email=target.user_email)
+                return
+            await self._channel_delivery.deliver_task_to_conversation(
+                target_conversation_id,
+                task_id=task.task_id,
+                content=final_content,
+                attachments=attachments,
+                deliverable_id=final_deliverable_id,
+                project_result=True,
+                outcome_key=task_outcome_key(task),
             )
-            task.applied_completion_mode = "default"
-            task.applied_completion_reason = (
-                "Direct delivery requested but no final assistant message was available."
-            )
-            await self._update_applied_completion_fields(task)
-            await self._deliver_task_result_default(task, target_conversation_id)
             return
 
         if self._channel_delivery is None:
@@ -4875,12 +5402,11 @@ class WorkflowEngine:
                 "task_delivery: direct delivery unavailable; channel delivery service missing",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
-            task.applied_completion_mode = "default"
             task.applied_completion_reason = (
-                "Direct delivery fell back because channel delivery is unavailable."
+                "Channel delivery unavailable; delivered to the in-app notification inbox."
             )
             await self._update_applied_completion_fields(task)
-            await self._deliver_task_result_default(task, target_conversation_id)
+            await self._deliver_task_result_inbox(task)
             return
 
         async with self._session_factory() as db_session:
@@ -4897,12 +5423,11 @@ class WorkflowEngine:
                     }
                 },
             )
-            task.applied_completion_mode = "default"
             task.applied_completion_reason = (
-                "Direct delivery fell back because no direct-capable channel target was resolved."
+                "No channel route; delivered to the in-app notification inbox."
             )
             await self._update_applied_completion_fields(task)
-            await self._deliver_task_result_default(task, target_conversation_id)
+            await self._deliver_task_result_inbox(task)
             return
 
         if deliverable_already_delivered and final_deliverable_id is not None:
@@ -4928,6 +5453,7 @@ class WorkflowEngine:
             content=final_content,
             attachments=attachments,
             deliverable_id=final_deliverable_id,
+            outcome_key=task_outcome_key(task),
         )
         if delivery_status != ChannelDeliveryStatus.SENT:
             logger.warning(
@@ -4984,6 +5510,15 @@ class WorkflowEngine:
             )
         )
 
+    async def deliver_task_outcome(self, task: TaskModel) -> None:
+        """Route an externally committed terminal outcome after execution cleanup."""
+        task.applied_completion_mode = task.completion_delivery.mode_for_outcome(
+            succeeded=task.status == TaskStatus.COMPLETED
+        )
+        task.applied_completion_reason = None
+        await self._update_applied_completion_fields(task)
+        await self._deliver_task_result(task)
+
     async def _update_applied_completion_fields(self, task: TaskModel) -> None:
         async with self._session_factory() as db_session:
             from cognis.store.queries import get_task
@@ -4995,8 +5530,51 @@ class WorkflowEngine:
             row.applied_completion_reason = task.applied_completion_reason
             await db_session.commit()
 
+    async def _deliver_task_result_inbox(
+        self, task: TaskModel, *, recipient_email: str | None = None
+    ) -> None:
+        """Persist an authorized recipient notification; never admit an agent turn."""
+        from cognis.core.inbox import publish_notification, stage_notification
+        from cognis.core.task_outcomes import (
+            format_task_outcome,
+            task_outcome_key,
+            task_outcome_title,
+        )
+        from cognis.store.models import InboxNotificationRow
+
+        notification_id = f"inbox_task_{task_outcome_key(task)}"
+        if recipient_email is not None:
+            notification_id += f"_{uuid.uuid5(uuid.NAMESPACE_URL, recipient_email).hex}"
+        async with self._session_factory() as db:
+            await assert_task_execution_fence(db)
+            if recipient_email is not None:
+                from cognis.core.project_task_delivery import project_result_recipient_allowed
+
+                if not await project_result_recipient_allowed(db, task.task_id, recipient_email):
+                    return
+            row = await db.get(InboxNotificationRow, notification_id)
+            if row is None:
+                row = stage_notification(
+                    db,
+                    user_email=recipient_email or task.created_by,
+                    kind=f"task.{task.status}",
+                    title=task_outcome_title(task),
+                    body=format_task_outcome(task),
+                    href=f"/tasks/{task.task_id}",
+                )
+                row.notification_id = notification_id
+                await db.commit()
+        await publish_notification(self._event_bus, row)
+        if recipient_email is None:
+            await self._publish_task_terminal_event(task, direct_delivery=True)
+
     async def _deliver_task_result_default(
-        self, task: TaskModel, target_conversation_id: str
+        self,
+        task: TaskModel,
+        target_conversation_id: str,
+        *,
+        direct: bool = False,
+        project_result: bool = False,
     ) -> None:
         """Deliver task results through the normal follow-up flow."""
 
@@ -5006,6 +5584,27 @@ class WorkflowEngine:
             TaskStatus.CANCELLED: "task_cancelled",
         }.get(task.status, "task_status")
 
+        from cognis.core.task_outcomes import (
+            format_task_outcome,
+            task_outcome_context,
+            task_outcome_key,
+            task_outcome_reference,
+        )
+
+        outcome_key = task_outcome_key(task)
+        recipient_email: str | None = None
+        if project_result:
+            from cognis.core.project_task_delivery import project_result_target_allowed
+
+            async with self._session_factory() as db:
+                if not await project_result_target_allowed(
+                    db, task.task_id, target_conversation_id, require_execution=not direct
+                ):
+                    return
+                target = await get_conversation(db, target_conversation_id)
+                if target is None:
+                    return
+                recipient_email = target.user_email
         event = SessionEvent(
             type="lifecycle",
             data={
@@ -5015,23 +5614,95 @@ class WorkflowEngine:
                 "status": task.status,
                 "result_summary": task.result_summary,
                 "attachments": (task.result_data or {}).get("attachments", []),
+                "outcome_context": task_outcome_context(task),
             },
         )
+        events = [event]
+        if direct and task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            from cognis.core.deliverable_presentation import task_result_deliverable_event
+
+            context = task_outcome_context(task)
+            partial_event = None
+            async with self._session_factory() as db:
+                target = await get_conversation(db, target_conversation_id)
+                if target is not None:
+                    partial_event = await task_result_deliverable_event(
+                        db, task, recipient_email=target.user_email, include_partial=True
+                    )
+            event.data.update(
+                {
+                    "task_outcome_card": True,
+                    "outcome_key": outcome_key,
+                    "attempt_number": task.attempt_number,
+                    "workflow_step": context.get("current_step"),
+                    "failure_reason": context.get("last_error")
+                    or context.get("failure_reason")
+                    or context.get("error"),
+                    "deliverable_ids": [partial_event.data["deliverable_id"]]
+                    if partial_event is not None
+                    else [],
+                    "partial_result": partial_event.data.get("task_output")
+                    if partial_event is not None
+                    else None,
+                }
+            )
+        elif direct:
+            from cognis.core.deliverable_presentation import task_result_deliverable_event
+
+            canonical_event = None
+            async with self._session_factory() as db:
+                target = await get_conversation(db, target_conversation_id)
+                if target is not None:
+                    canonical_event = await task_result_deliverable_event(
+                        db, task, recipient_email=target.user_email
+                    )
+            result_data = task.result_data or {}
+            content = result_data.get("final_channel_content") or result_data.get("final_content")
+            if result_data.get("final_format") == "html" or task.status != TaskStatus.COMPLETED:
+                content = None
+            attachments = result_data.get("attachments", [])
+            if canonical_event is None or attachments:
+                events.append(
+                    SessionEvent(
+                        type="assistant_message",
+                        data={
+                            "role": "assistant",
+                            "content": ""
+                            if canonical_event is not None
+                            else format_task_outcome(
+                                task, content=content if isinstance(content, str) else None
+                            ),
+                            "task_id": task.task_id,
+                            "task_outcome": task_outcome_reference(task),
+                            "attachments": attachments,
+                        },
+                    )
+                )
+            if canonical_event is not None:
+                canonical_event.data["task_outcome"] = task_outcome_reference(task)
+                events.append(canonical_event)
 
         # Record to target conversation's active Intaris session.
         # The Intaris provider already retries internally (exponential
         # backoff), so a failure here means retries were exhausted.
         # We do one additional delayed attempt before giving up.
         delivery_session_id: str | None = None
+        recorded = False
         for attempt in range(2):
             try:
                 async with self._session_factory() as db_session:
                     from cognis.store.queries import (
-                        get_conversation,
                         get_latest_active_session_for_conversation,
                         get_session_row,
                     )
 
+                    if project_result and not await project_result_target_allowed(
+                        db_session,
+                        task.task_id,
+                        target_conversation_id,
+                        require_execution=not direct,
+                    ):
+                        return
                     sess = await get_latest_active_session_for_conversation(
                         db_session, target_conversation_id
                     )
@@ -5044,15 +5715,18 @@ class WorkflowEngine:
                         delivery_session_id = sess.session_id
                     intaris_session_id = sess.intaris_session_id if sess else None
                 if intaris_session_id:
-                    await self._providers.guardrails.record_events(
+                    append_result = await self._providers.guardrails.record_events(
                         session_id=intaris_session_id,
-                        events=with_session_events_turn_id([event], None),
+                        events=with_session_events_turn_id(events, None),
                         source="cognis",
                         # Both provider and delivery retries reuse this key after a lost response.
                         idempotency_key=(
-                            f"{intaris_session_id}:task_delivery:{task.task_id}:{task.status}"
+                            f"{intaris_session_id}:task_delivery:{outcome_key}:{direct}"
                         ),
                     )
+                    if direct and not append_result.ok:
+                        raise RuntimeError("Intaris did not persist the direct task outcome")
+                    recorded = True
                 break  # Success
             except Exception:
                 if attempt == 0:
@@ -5067,6 +5741,22 @@ class WorkflowEngine:
                         extra={"extra_data": {"task_id": task.task_id}},
                         exc_info=True,
                     )
+
+        if direct:
+            if not recorded:
+                if project_result:
+                    await self._deliver_task_result_inbox(task, recipient_email=recipient_email)
+                else:
+                    await self._deliver_task_result_inbox(task)
+                return
+            async with self._session_factory() as db:
+                await mark_conversation_unread(db, target_conversation_id)
+                await db.commit()
+            if not project_result:
+                await self._publish_task_terminal_event(
+                    task, conversation_id=target_conversation_id, direct_delivery=True
+                )
+            return
 
         # Publish events for WebSocket delivery and follow-up turn
         async with self._session_factory() as db_session:
@@ -5094,22 +5784,28 @@ class WorkflowEngine:
         try:
             async with self._session_factory() as db_session:
                 from cognis.store.queries import (
-                    create_channel_delivery_outbox,
+                    create_or_get_channel_delivery_outbox,
                     get_conversation_channel_route,
                 )
 
+                await assert_task_execution_fence(db_session)
                 route = await get_conversation_channel_route(db_session, target_conversation_id)
                 if route is not None:
                     channel_type, account_id, chat_id, thread_id, user_email = route
-                    delivery_id = f"cdel_{uuid.uuid4().hex[:12]}"
+                    identity = f"task_follow_up:{outcome_key}:{target_conversation_id}"
+                    delivery_id = f"cdel_{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
                     delivery_fallback_text = self._build_task_delivery_fallback(task)
-                    await create_channel_delivery_outbox(
+                    await create_or_get_channel_delivery_outbox(
                         db_session,
                         delivery_id=delivery_id,
                         user_email=user_email,
                         conversation_id=target_conversation_id,
                         session_id=delivery_session_id,
-                        source_type="task_result_follow_up",
+                        source_type=(
+                            "project_task_result_follow_up"
+                            if project_result
+                            else "task_result_follow_up"
+                        ),
                         source_id=task.task_id,
                         channel_type=channel_type,
                         account_id=account_id,
@@ -5132,20 +5828,21 @@ class WorkflowEngine:
                 exc_info=True,
             )
 
-        await self._event_bus.publish(
-            Event(
-                type=event_type,
-                data={
-                    "task_id": task.task_id,
-                    "task_title": task.title,
-                    "title": task.title,
-                    "conversation_id": target_conversation_id,
-                    "result_summary": task.result_summary,
-                    "attachments": (task.result_data or {}).get("attachments", []),
-                    "channel_follow_up_delivery_id": delivery_id,
-                },
+        if not project_result:
+            await self._event_bus.publish(
+                Event(
+                    type=event_type,
+                    data={
+                        "task_id": task.task_id,
+                        "task_title": task.title,
+                        "title": task.title,
+                        "conversation_id": target_conversation_id,
+                        "result_summary": task.result_summary,
+                        "attachments": (task.result_data or {}).get("attachments", []),
+                        "channel_follow_up_delivery_id": delivery_id,
+                    },
+                )
             )
-        )
 
         # Always request a follow-up turn so the agent can process the
         # result even if Intaris recording failed (degraded mode).
@@ -5158,15 +5855,19 @@ class WorkflowEngine:
             delivery_mode=task.delivery.mode,
             result_summary=task.result_summary,
             description=task.description,
-            session_id=delivery_session_id,
-            session_cache=self._session_cache,
+            outcome_key=outcome_key,
+            on_finish_instructions=task.completion_delivery.on_finish_instructions,
+            outcome_context=task_outcome_context(task),
+            project_result=project_result,
         )
         await self._event_bus.publish(
             Event(
                 type=EventType.FOLLOW_UP_TURN_REQUESTED,
                 data={
                     "conversation_id": target_conversation_id,
-                    "origin_session_id": task.source_session_id,
+                    "origin_session_id": delivery_session_id
+                    if project_result
+                    else task.source_session_id,
                     "follow_up": follow_up.model_dump(mode="json"),
                     "delivery_id": delivery_id,
                     "channel_deliverable": channel_deliverable,
@@ -5745,6 +6446,12 @@ class WorkflowEngine:
         On retry, the spec requires continuing the same Intaris session
         so the agent keeps its prior work and sees evaluation feedback.
         """
+        fence = current_task_execution_fence()
+        pending_recovery = (
+            any(batch.get("tool_calls") for batch in (await fence.recovery_batches()).values())
+            if fence is not None
+            else False
+        )
         try:
             async with self._session_factory() as db_session:
                 prior_run = await get_latest_step_run_for_task_step(
@@ -5753,7 +6460,14 @@ class WorkflowEngine:
                     step_def.name,
                     attempt_number=task.attempt_number,
                     current_revision_only=True,
-                    eligible_statuses={"approved", "rejected", "failed", "running", "paused"},
+                    eligible_statuses={
+                        "approved",
+                        "rejected",
+                        "failed",
+                        "running",
+                        "paused",
+                        "pending",
+                    },
                 )
             if prior_run is not None and prior_run.session_id is not None:
                 # Recover session and conversation from the prior run
@@ -5762,58 +6476,58 @@ class WorkflowEngine:
 
                 async with self._session_factory() as db_session:
                     session_row = await get_session_row(db_session, prior_run.session_id)
-                    if session_row is not None and self._is_reusable_step_session_status(
-                        session_row.status
+                    conv_row = (
+                        await get_conversation(db_session, session_row.conversation_id)
+                        if session_row is not None
+                        else None
+                    )
+                    session = _to_session_model(session_row) if session_row is not None else None
+                    conversation = (
+                        _to_conversation_model(conv_row) if conv_row is not None else None
+                    )
+                if session is not None and conversation is not None:
+                    if self._is_reusable_step_session_status(session.status) or pending_recovery:
+                        return conversation, session, True
+                    with scoped_runtime_context(
+                        access_context=RuntimeAccessContext(
+                            user_email=task.created_by,
+                            agent_id=agent.agent_id,
+                            agent_owner_email=agent.owner_email,
+                            agent_type=agent.agent_type,
+                            session_id=None,
+                            conversation_id=session.conversation_id,
+                            task_id=task.task_id,
+                            step_name=step_def.name,
+                            step_run_id=prior_run.step_run_id,
+                            workflow_step=True,
+                            interaction_mode_override=task.interaction_mode_override,
+                            session_policy=session_policy or {},
+                        )
                     ):
-                        conv_row = await get_conversation(db_session, session_row.conversation_id)
-                        if conv_row is not None:
-                            conversation = _to_conversation_model(conv_row)
-                            session = _to_session_model(session_row)
-                            return conversation, session, True
-                    if session_row is not None:
-                        conv_row = await get_conversation(db_session, session_row.conversation_id)
-                        if conv_row is not None:
-                            conversation = _to_conversation_model(conv_row)
-                            with scoped_runtime_context(
-                                access_context=RuntimeAccessContext(
-                                    user_email=task.created_by,
-                                    agent_id=agent.agent_id,
-                                    agent_owner_email=agent.owner_email,
-                                    agent_type=agent.agent_type,
-                                    session_id=None,
-                                    conversation_id=session_row.conversation_id,
-                                    task_id=task.task_id,
-                                    step_name=step_def.name,
-                                    step_run_id=prior_run.step_run_id,
-                                    workflow_step=True,
-                                    interaction_mode_override=task.interaction_mode_override,
-                                    session_policy=session_policy or {},
-                                )
-                            ):
-                                resumed_session = await self._session_manager.create_root_session(
-                                    conversation_id=session_row.conversation_id,
-                                    user_email=task.created_by,
-                                    agent_id=agent.agent_id,
-                                    agent_profile_id=agent_profile_id,
-                                    intention=(
-                                        f"Task: {task.title} — Step: {step_def.name} — "
-                                        f"{step_def.description or step_def.prompt[:100]}"
-                                    ),
-                                )
-                            seeded_from_prior = await self._fork_session_events(
-                                source_cognis_session_id=prior_run.session_id,
-                                source_intaris_session_id=(
-                                    prior_run.intaris_session_id or session_row.intaris_session_id
-                                ),
-                                target_session=resumed_session,
-                                source_label=f"{step_def.name}:resume",
-                            )
-                            if require_same_conversation and not seeded_from_prior:
-                                raise RuntimeError(
-                                    f"Could not recover continued step session "
-                                    f"for {step_def.name!r}"
-                                )
-                            return conversation, resumed_session, seeded_from_prior
+                        resumed_session = await self._session_manager.create_root_session(
+                            conversation_id=session.conversation_id,
+                            user_email=task.created_by,
+                            agent_id=agent.agent_id,
+                            agent_profile_id=agent_profile_id,
+                            previous_session_id=session.session_id,
+                            intention=(
+                                f"Task: {task.title} — Step: {step_def.name} — "
+                                f"{step_def.description or step_def.prompt[:100]}"
+                            ),
+                        )
+                    seeded_from_prior = await self._fork_session_events(
+                        source_cognis_session_id=prior_run.session_id,
+                        source_intaris_session_id=(
+                            prior_run.intaris_session_id or session.intaris_session_id
+                        ),
+                        target_session=resumed_session,
+                        source_label=f"{step_def.name}:resume",
+                    )
+                    if require_same_conversation and not seeded_from_prior:
+                        raise RuntimeError(
+                            f"Could not recover continued step session for {step_def.name!r}"
+                        )
+                    return conversation, resumed_session, seeded_from_prior
             unstarted_recovery = False
             if require_same_conversation and allow_unstarted_recovery and prior_run is None:
                 async with self._session_factory() as db_session:
@@ -6188,24 +6902,9 @@ class WorkflowEngine:
 
     def _build_task_delivery_fallback(self, task: TaskModel) -> str:
         """Build a bounded channel fallback that identifies the task and status."""
+        from cognis.core.task_outcomes import format_task_outcome
 
-        status_label = {
-            TaskStatus.COMPLETED: "completed",
-            TaskStatus.FAILED: "failed",
-            TaskStatus.CANCELLED: "was cancelled",
-        }.get(task.status, f"changed status to {task.status.value}")
-        title = self._truncate_channel_fallback_field(task.title, max_length=180)
-        lines = [f'Task "{title}" {status_label}.']
-
-        summary = self._truncate_channel_fallback_field(task.result_summary or "", max_length=500)
-        if summary:
-            label = (
-                "Reason" if task.status in {TaskStatus.FAILED, TaskStatus.CANCELLED} else "Summary"
-            )
-            lines.extend(["", f"{label}: {summary}"])
-
-        lines.extend(["", f"Task ID: {task.task_id}", "", "Open the conversation for details."])
-        return "\n".join(lines)
+        return format_task_outcome(task, channel=True)
 
     @staticmethod
     def _truncate_channel_fallback_field(value: str, *, max_length: int) -> str:
@@ -6425,6 +7124,12 @@ class WorkflowEngine:
     def _resolve_applied_completion(
         self, task: TaskModel, state: WorkflowState
     ) -> tuple[str, str | None]:
+        policy = task.completion_delivery or CompletionDeliveryPolicy()
+        if (
+            policy.on_finish_instructions
+            and policy.mode_for_outcome(succeeded=task.status == TaskStatus.COMPLETED) == "default"
+        ):
+            return "default", None
         last_output = self._last_step_output(state)
         final_notification = last_output.notification if last_output is not None else None
         if (
@@ -6440,7 +7145,6 @@ class WorkflowEngine:
         ):
             return "direct", final_notification.reason
 
-        policy = task.completion_delivery or CompletionDeliveryPolicy()
         if (
             task.status == TaskStatus.COMPLETED
             and policy.allow_silent_completion
@@ -6451,17 +7155,7 @@ class WorkflowEngine:
                 "Auto-silent completion: allow_silent_completion=true and no explicit notification override was requested.",
             )
 
-        if task.status == TaskStatus.COMPLETED and policy.completion_mode_family == "direct":
-            if isinstance(task.result_data, dict):
-                final_content = task.result_data.get("final_content")
-                if isinstance(final_content, str) and final_content.strip():
-                    return "direct", None
-            return (
-                "default",
-                "Direct delivery requested but no final assistant message was available.",
-            )
-
-        return "default", None
+        return policy.mode_for_outcome(succeeded=task.status == TaskStatus.COMPLETED), None
 
 
 def _build_exhaustion_gate(step_def: StepDefinition, last_error: str | None = None) -> Any:

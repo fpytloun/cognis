@@ -273,6 +273,7 @@ async def health(request: Request) -> HealthResponse:
     return HealthResponse(
         status=status,
         providers={name: provider.model_dump() for name, provider in providers.items()},
+        usage_analytics_enabled=getattr(request.app.state, "usage_analytics_enabled", True),
         remember_queue={"depth": request.app.state.remember_queue.active_depth},
         trusted_evidence_policy={
             "version": TRUSTED_EVIDENCE_POLICY_VERSION,

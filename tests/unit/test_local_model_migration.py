@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +15,8 @@ from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 from sqlalchemy import BigInteger, create_engine, inspect
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.engine.interfaces import ReflectedColumn
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlalchemy.schema import CreateTable
 
 from cognis.store.migrations.versioning import ALEMBIC_VERSION_NUM_LENGTH
@@ -330,13 +331,10 @@ def test_local_model_byte_counter_downgrade_refuses_oversized_values(
         sync_engine.dispose()
 
 
-def test_local_model_byte_counter_postgresql_type_migration() -> None:
-    database_url = os.getenv("COGNIS_TEST_POSTGRES_URL")
-    if not database_url:
-        pytest.skip(
-            "COGNIS_TEST_POSTGRES_URL is not set; PostgreSQL byte-counter validation unavailable"
-        )
-    engine = create_engine(database_url)
+@pytest.mark.asyncio
+async def test_local_model_byte_counter_postgresql_type_migration(
+    postgres_migration_engine: AsyncEngine,
+) -> None:
     metadata = sa.MetaData()
     operations = sa.Table(
         "local_model_operations",
@@ -362,35 +360,24 @@ def test_local_model_byte_counter_postgresql_type_migration() -> None:
         ),
     )
     module = importlib.import_module(_BYTE_COUNTER_MIGRATION)
-    tables_created = False
-    try:
-        existing_tables = set(inspect(engine).get_table_names())
-        conflicting_tables = {operations.name, targets.name}.intersection(existing_tables)
-        if conflicting_tables:
-            pytest.fail(
-                "COGNIS_TEST_POSTGRES_URL must reference an isolated database without "
-                f"local-model tables; found {sorted(conflicting_tables)}"
-            )
-        metadata.create_all(engine)
-        tables_created = True
-        with engine.begin() as connection:
-            context = MigrationContext.configure(connection)
-            original_op = module.op
-            module.op = Operations(context)
-            try:
-                module.upgrade()
-                module.upgrade()
-            finally:
-                module.op = original_op
-        inspector = inspect(engine)
-        operation_column = inspector.get_columns(operations.name)[0]
-        target_column = inspector.get_columns(targets.name)[0]
-        assert isinstance(operation_column["type"], BigInteger)
-        assert operation_column["nullable"] is False
-        assert operation_column["default"] is not None
-        assert isinstance(target_column["type"], BigInteger)
-        assert target_column["nullable"] is True
-    finally:
-        if tables_created:
-            metadata.drop_all(engine)
-        engine.dispose()
+
+    def upgrade(connection: sa.Connection) -> tuple[ReflectedColumn, ReflectedColumn]:
+        context = MigrationContext.configure(connection)
+        original_op = module.op
+        module.op = Operations(context)
+        try:
+            module.upgrade()
+            module.upgrade()
+        finally:
+            module.op = original_op
+        inspector = inspect(connection)
+        return inspector.get_columns(operations.name)[0], inspector.get_columns(targets.name)[0]
+
+    async with postgres_migration_engine.begin() as connection:
+        await connection.run_sync(metadata.create_all)
+        operation_column, target_column = await connection.run_sync(upgrade)
+    assert isinstance(operation_column["type"], BigInteger)
+    assert operation_column["nullable"] is False
+    assert operation_column["default"] is not None
+    assert isinstance(target_column["type"], BigInteger)
+    assert target_column["nullable"] is True

@@ -55,7 +55,7 @@ def test_settings_update_rejects_unknown_key(monkeypatch: object, tmp_path: Path
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         response = client.put(
             "/api/v1/settings/unknown.key",
             headers=_auth_headers(app, email="admin@example.com", role="admin"),
@@ -78,7 +78,7 @@ def test_app_startup_registers_required_state_services(monkeypatch: object, tmp_
 def test_workflow_create_rejects_empty_steps(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        asyncio.run(_seed_user(app, "user@example.com"))
+        client.portal.call(_seed_user, app, "user@example.com")
 
         response = client.post(
             "/api/v1/workflows",
@@ -93,7 +93,7 @@ def test_workflow_create_rejects_missing_input_reference(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        asyncio.run(_seed_user(app, "user@example.com"))
+        client.portal.call(_seed_user, app, "user@example.com")
 
         response = client.post(
             "/api/v1/workflows",
@@ -113,7 +113,7 @@ def test_agent_create_surfaces_personality_sync_failure(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        asyncio.run(_seed_user(app, "user@example.com"))
+        client.portal.call(_seed_user, app, "user@example.com")
 
         async def _fail_bootstrap(_: object) -> None:
             raise RuntimeError("mnemory unavailable")
@@ -152,7 +152,7 @@ def test_agent_sync_endpoint_persists_sync_error(monkeypatch: object, tmp_path: 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         async def _fail_bootstrap(
             _: object,
@@ -183,7 +183,7 @@ def test_agent_update_resyncs_personality_when_identity_changes(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        asyncio.run(_seed_user(app, "user@example.com"))
+        client.portal.call(_seed_user, app, "user@example.com")
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
@@ -198,7 +198,7 @@ def test_agent_update_resyncs_personality_when_identity_changes(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         bootstrapped: list[tuple[AgentDefinition, str | None]] = []
 
         async def _capture_bootstrap(
@@ -235,7 +235,7 @@ def test_agent_update_allows_clearing_nullable_identity_fields(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        asyncio.run(_seed_user(app, "user@example.com"))
+        client.portal.call(_seed_user, app, "user@example.com")
 
         async def _seed() -> None:
             async with app.state.session_factory() as session:
@@ -251,7 +251,7 @@ def test_agent_update_allows_clearing_nullable_identity_fields(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         bootstrapped: list[tuple[AgentDefinition, str | None]] = []
 
         async def _capture_bootstrap(
@@ -285,7 +285,7 @@ def test_conversation_purge_reports_unsupported_intaris_cascade(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        conversation_id = asyncio.run(_seed_conversation(app, "user@example.com", "agent-1"))
+        conversation_id = client.portal.call(_seed_conversation, app, "user@example.com", "agent-1")
 
         response = client.delete(
             f"/api/v1/conversations/{conversation_id}/purge",
@@ -300,7 +300,7 @@ def test_conversation_purge_calls_intaris_delete_session_when_supported(
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
         app = client.app
-        conversation_id = asyncio.run(_seed_conversation(app, "user@example.com", "agent-1"))
+        conversation_id = client.portal.call(_seed_conversation, app, "user@example.com", "agent-1")
         deleted: list[str] = []
 
         async def _delete_session(session_id: str) -> None:

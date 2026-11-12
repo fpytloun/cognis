@@ -57,7 +57,7 @@ def test_legacy_access_token_only_matches_initial_auth_version(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         legacy_token = app.state.auth_provider._sign(
             {
                 "sub": "legacy@example.com",
@@ -78,7 +78,7 @@ def test_legacy_access_token_only_matches_initial_auth_version(
                 user.auth_version += 1
                 await session.commit()
 
-        asyncio.run(_increment())
+        client.portal.call(_increment)
         assert client.get("/api/auth/me", headers=headers).status_code == 401
 
 
@@ -119,7 +119,7 @@ def test_profiling_uses_real_admin_api_key_auth(
                 await session.commit()
             return key
 
-        key = asyncio.run(seed())
+        key = client.portal.call(seed)
         response = client.get("/api/v1/system/profiling", headers={"X-API-Key": key})
         assert response.status_code == expected
 
@@ -176,7 +176,7 @@ def test_deliverable_private_and_signed_short_links_follow_real_auth_middleware(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         private_path = "/api/v1/deliverables/dlv_middleware_auth/view"
         assert client.get(private_path).status_code == 401
         headers = _auth_headers(app, email="owner@example.com")
@@ -258,7 +258,7 @@ def test_middleware_uses_current_user_role_and_name(monkeypatch: object, tmp_pat
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         token = app.state.auth_provider.sign_access_token(
             "user@example.com", "Forged Name", "admin"
         )
@@ -299,7 +299,7 @@ def test_middleware_authenticates_browser_session_cookie(
                 await session.commit()
                 return raw_token
 
-        raw_token = asyncio.run(_seed())
+        raw_token = client.portal.call(_seed)
         client.cookies.set("cognis_session", raw_token)
         response = client.get("/api/auth/me")
         assert response.status_code == 200
@@ -321,7 +321,7 @@ def test_middleware_rate_limits_jwt_requests(monkeypatch: object, tmp_path: Path
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         app.state.api_rate_limiter.update_limits(
             read_requests_per_minute=1, write_requests_per_minute=1
         )
@@ -355,7 +355,7 @@ def test_middleware_rate_limits_api_key_requests(monkeypatch: object, tmp_path: 
                 await session.commit()
             return api_key
 
-        api_key = asyncio.run(_seed())
+        api_key = client.portal.call(_seed)
         app.state.api_rate_limiter.update_limits(
             read_requests_per_minute=1, write_requests_per_minute=1
         )
@@ -381,7 +381,7 @@ def test_middleware_rate_limit_applies_across_different_read_routes(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         app.state.api_rate_limiter.update_limits(
             read_requests_per_minute=1, write_requests_per_minute=1
         )
@@ -415,7 +415,7 @@ def test_middleware_rate_limit_applies_across_different_write_routes(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         app.state.api_rate_limiter.update_limits(
             read_requests_per_minute=5, write_requests_per_minute=1
         )
@@ -460,7 +460,7 @@ def test_client_performance_endpoint_uses_authenticated_write_rate_limit(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         app.state.api_rate_limiter.update_limits(
             read_requests_per_minute=5,
             write_requests_per_minute=1,
@@ -528,16 +528,16 @@ def test_api_key_cache_debounces_touch_and_invalidates_on_delete(
                 assert await delete_api_key(session, key_id, "user@example.com")
                 await session.commit()
 
-        key_id, api_key = asyncio.run(_seed())
+        key_id, api_key = client.portal.call(_seed)
 
         assert client.get("/api/auth/me", headers={"X-API-Key": api_key}).status_code == 200
-        first_last_used = asyncio.run(_last_used_at(key_id))
+        first_last_used = client.portal.call(_last_used_at, key_id)
         assert first_last_used is not None
 
         assert client.get("/api/auth/me", headers={"X-API-Key": api_key}).status_code == 200
-        assert asyncio.run(_last_used_at(key_id)) == first_last_used
+        assert client.portal.call(_last_used_at, key_id) == first_last_used
 
-        asyncio.run(_delete(key_id))
+        client.portal.call(_delete, key_id)
         response = client.get("/api/auth/me", headers={"X-API-Key": api_key})
         assert response.status_code == 401
 
@@ -562,11 +562,11 @@ def test_jwt_active_user_cache_invalidates_on_disable(monkeypatch: object, tmp_p
                 assert await disable_user(session, "user@example.com", disabled_by="admin")
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
 
         assert client.get("/api/auth/me", headers=headers).status_code == 200
-        asyncio.run(_disable())
+        client.portal.call(_disable)
         response = client.get("/api/auth/me", headers=headers)
         assert response.status_code == 403
 

@@ -1,0 +1,43 @@
+import { defineConfig, devices } from '../../../ui/node_modules/@playwright/test';
+
+export default defineConfig({
+  testDir: '.',
+  testMatch: ['capture.spec.ts', 'sweep.spec.ts'],
+  timeout: 240_000,
+  expect: { timeout: 20_000 },
+  workers: 1,
+  retries: 0,
+  reporter: 'list',
+  use: {
+    actionTimeout: 20_000,
+    viewport: { width: 1280, height: 800 },
+    deviceScaleFactor: 2,
+    colorScheme: 'light',
+    contextOptions: { reducedMotion: 'reduce' },
+    serviceWorkers: 'block',
+    trace: 'off',
+    video: 'off',
+    screenshot: 'off',
+  },
+  projects: [
+    { name: 'task-outcomes', testMatch: 'task-outcomes.spec.ts' },
+    { name: 'task-interactions', testMatch: 'interactions.spec.ts' },
+    { name: 'comparison', grep: /theme comparison$/ },
+    { name: 'feature', grep: /feature capture$/ },
+    { name: 'desktop-docs', grep: /desktop documentation$/ },
+    { name: 'tools-docs', grep: /tools documentation$/ },
+    { name: 'executor-docs', grep: /executor documentation$/ },
+    { name: 'task-docs', grep: /task documentation$/ },
+    { name: 'command-docs', grep: /command documentation$/ },
+    { name: 'overview-docs', grep: /overview documentation$/ },
+    { name: 'windows-docs', grep: /windows documentation$/ },
+    { name: 'research-docs', grep: /research documentation$/ },
+    { name: 'active-docs', grep: /active documentation$/ },
+    { name: 'ongoing-docs', grep: /ongoing documentation$/ },
+    { name: 'mobile-docs', grep: /mobile documentation$/ },
+    { name: 'hero-docs', grep: /hero documentation$/ },
+    // UI sweep: the same views at desktop and phone size, one test per batch.
+    { name: 'sweep-desktop', grep: /UI sweep /, use: { viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 } },
+    { name: 'sweep-phone', grep: /UI sweep /, use: { ...devices['iPhone 13'], defaultBrowserType: undefined, deviceScaleFactor: 2 } },
+  ],
+});

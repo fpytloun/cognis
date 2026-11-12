@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from typing import Any
@@ -186,17 +187,31 @@ async def hydrate_deliverable_payload(row: Any, artifact_store: Any) -> Any:
     if not isinstance(object_id, str) or not object_id:
         raise FileNotFoundError("deliverable storage object id missing")
 
-    content_key = getattr(row, "content_key", None) or DELIVERABLE_CONTENT_FILENAME
-    content_bytes, _content_type = await artifact_store.async_load(
-        namespace, object_id, content_key
-    )
+    keys = {"content": getattr(row, "content_key", None) or DELIVERABLE_CONTENT_FILENAME}
+    for field in ("rich", "outputs"):
+        key = getattr(row, f"{field}_key", None)
+        if isinstance(key, str) and key:
+            keys[field] = key
+    tasks = [
+        asyncio.create_task(artifact_store.async_load(namespace, object_id, key))
+        for key in keys.values()
+    ]
+    try:
+        loaded = dict(zip(keys, await asyncio.gather(*tasks), strict=True))
+    except BaseException:
+        # Preserve the original error type and join siblings on failure/cancel.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    content_bytes, _content_type = loaded["content"]
     _verify_stored_file(row, "content", content_bytes)
     content = content_bytes.decode("utf-8")
 
     rich_payload: dict[str, Any] | None = None
     rich_key = getattr(row, "rich_key", None)
     if isinstance(rich_key, str) and rich_key:
-        rich_bytes, _rich_type = await artifact_store.async_load(namespace, object_id, rich_key)
+        rich_bytes, _rich_type = loaded["rich"]
         _verify_stored_file(row, "rich", rich_bytes)
         raw_rich = json.loads(rich_bytes.decode("utf-8"))
         rich_payload = raw_rich if isinstance(raw_rich, dict) else None
@@ -210,9 +225,7 @@ async def hydrate_deliverable_payload(row: Any, artifact_store: Any) -> Any:
     outputs: dict[str, Any] | None = {}
     outputs_key = getattr(row, "outputs_key", None)
     if isinstance(outputs_key, str) and outputs_key:
-        outputs_bytes, _outputs_type = await artifact_store.async_load(
-            namespace, object_id, outputs_key
-        )
+        outputs_bytes, _outputs_type = loaded["outputs"]
         _verify_stored_file(row, "outputs", outputs_bytes)
         raw_outputs = json.loads(outputs_bytes.decode("utf-8"))
         outputs = raw_outputs if isinstance(raw_outputs, dict) else {}

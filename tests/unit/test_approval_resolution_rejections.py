@@ -129,7 +129,7 @@ def test_resolution_routes_expose_safe_reason_and_terminal_denial(
                 payload={"tool_name": "bash"},
             )
 
-        asyncio.run(seed())
+        client.portal.call(seed)
         client.app.state.providers.guardrails.submit_decision = AsyncMock(
             side_effect=ResolutionRejected(
                 409, {"detail": {"code": code, "message": "SECRET"} if structured else code}
@@ -145,7 +145,7 @@ def test_resolution_routes_expose_safe_reason_and_terminal_denial(
         assert detail["code"] == code
         assert "SECRET" not in response.text
         assert detail["details"]["resolved"] is True
-        current = asyncio.run(svc.get("approval-rejected"))
+        current = client.portal.call(svc.get, "approval-rejected")
         assert current.status == "resolved"
         assert current.resolution["decision"] == ("cancel" if code.startswith("stale_") else "deny")
 

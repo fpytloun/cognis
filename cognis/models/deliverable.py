@@ -19,6 +19,24 @@ from cognis import json_codec as json
 from cognis.rendering.rich_visuals import RICH_ICON_SYMBOLS, normalize_chart
 
 
+class TaskDeliverableFreshness(BaseModel):
+    """Workflow freshness, independent of document lineage and publication."""
+
+    state: Literal["current", "stale", "historical", "unknown"] = "unknown"
+    replacement_status: str | None = None
+    label: str = "Historical output — current status unknown"
+
+
+class TaskOutputPresentation(BaseModel):
+    """Selected task output; absent identity means ownership is unknown."""
+
+    deliverable_id: str | None = None
+    step_run_id: str | None = None
+    freshness: TaskDeliverableFreshness | None = None
+    format: str = "markdown"
+    title: str | None = None
+
+
 class DeliverableFormat(StrEnum):
     """Supported deliverable render formats."""
 
@@ -3294,6 +3312,8 @@ class Deliverable(BaseModel):
     """Typed, versioned artifact authored by a workflow step."""
 
     deliverable_id: str
+    author_email: str | None = None
+    author_agent_id: str | None = None
     step_run_id: str | None = None
     conversation_id: str | None = None
     session_id: str | None = None

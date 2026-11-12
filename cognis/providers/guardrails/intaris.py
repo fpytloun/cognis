@@ -41,6 +41,8 @@ from cognis.models.tool import EscalationRecord, EvaluationResult, ToolResult
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.circuit_breaker import CircuitBreaker
 from cognis.providers.guardrails.conflicts import EvaluationConflict
+from cognis.providers.guardrails.errors import IntarisHTTPError, IntarisTransportError
+from cognis.providers.guardrails.event_keys import validate_event_idempotency_key
 from cognis.providers.guardrails.events import (
     EventAppendListener,
     EventAppendNotification,
@@ -328,6 +330,25 @@ class IntarisProvider:
                 operation=metric_operation,
                 error_type=type(exc).__name__,
             ).inc()
+            if isinstance(exc, httpx.ConnectError):
+                request = getattr(exc, "request", None)
+                target = getattr(request, "url", self.client.base_url)
+                logger.warning(
+                    "intaris: connection failed",
+                    extra={
+                        "extra_data": {
+                            "operation": metric_operation,
+                            "scheme": target.scheme,
+                            "host": target.host,
+                            "port": target.port,
+                            "error_type": type(exc).__name__,
+                        }
+                    },
+                )
+            if isinstance(exc, httpx.HTTPStatusError):
+                raise IntarisHTTPError(exc, operation=metric_operation) from exc
+            if isinstance(exc, httpx.RequestError):
+                raise IntarisTransportError(exc, operation=metric_operation) from exc
             raise
         INTARIS_OPERATION_DURATION.labels(
             operation=metric_operation,
@@ -426,7 +447,12 @@ class IntarisProvider:
         parent_session_id: str | None = None,
         policy: dict[str, Any] | None = None,
         details: dict[str, Any] | None = None,
+        analytics_enabled: bool = True,
+        guardrails_enabled: bool = True,
     ) -> None:
+        flags = self._session_flags(analytics_enabled, guardrails_enabled)
+        if len(flags) != 2:
+            raise ValueError("Session creation requires boolean analytics and guardrails flags")
         logger.info(
             "intaris: create_session",
             extra={
@@ -446,6 +472,7 @@ class IntarisProvider:
             )
             response.raise_for_status()
             stored = response.json()
+            self._verify_session_flags(flags, stored)
             if parent_session_id and stored.get("parent_session_id") != parent_session_id:
                 raise ValueError("Intaris did not acknowledge the delegated parent.")
             self._verify_policy_ack(policy or {}, stored)
@@ -459,6 +486,7 @@ class IntarisProvider:
                     "details": details or {},
                     "policy": policy or {},
                     "parent_session_id": parent_session_id,
+                    **flags,
                 },
                 headers=self._headers(agent_id, user_id),
             )
@@ -488,6 +516,7 @@ class IntarisProvider:
                 )
             response.raise_for_status()
             created = response.json()
+            self._verify_session_flags(flags, created)
             if parent_session_id:
                 # Verify canonical source composition, including the stored
                 # parent relationship and session-level inherited bounds.
@@ -535,7 +564,10 @@ class IntarisProvider:
         details: dict[str, Any] | None = None,
         policy: dict[str, Any] | None = None,
         agent_owner_email: str | None = None,
+        analytics_enabled: bool | None = None,
+        guardrails_enabled: bool | None = None,
     ) -> dict[str, Any]:
+        flags = self._session_flags(analytics_enabled, guardrails_enabled)
         logger.info(
             "intaris: update_session_policy",
             extra={"extra_data": {"session_id": session_id, "agent_id": agent_id}},
@@ -544,7 +576,7 @@ class IntarisProvider:
         async def _do() -> dict[str, Any]:
             response = await self.client.patch(
                 f"/api/v1/session/{session_id}",
-                json={"details": details or {}, "policy": policy or {}},
+                json={"details": details or {}, "policy": policy or {}, **flags},
                 headers=self._headers(agent_id, user_id, agent_owner_email),
             )
             if not response.is_success:
@@ -559,6 +591,14 @@ class IntarisProvider:
                 )
             response.raise_for_status()
             self._verify_policy_ack(policy or {}, response.json())
+            if flags:
+                # Read the durable owner, not a local provider preference cache.
+                canonical = await self.client.get(
+                    f"/api/v1/session/{session_id}",
+                    headers=self._headers(agent_id, user_id, agent_owner_email),
+                )
+                canonical.raise_for_status()
+                self._verify_session_flags(flags, canonical.json())
             return dict(response.json().get("policy") or policy or {})
 
         return await self._call_with_retry(
@@ -567,6 +607,28 @@ class IntarisProvider:
             operation=f"intaris update_session_policy({session_id})",
             breaker=self.session_breaker,
         )
+
+    @staticmethod
+    def _session_flags(
+        analytics_enabled: bool | None, guardrails_enabled: bool | None
+    ) -> dict[str, bool]:
+        flags = {}
+        for name, value in (
+            ("analytics_enabled", analytics_enabled),
+            ("guardrails_enabled", guardrails_enabled),
+        ):
+            if value is not None:
+                if type(value) is not bool:
+                    raise ValueError(f"{name} must be a boolean")
+                flags[name] = value
+        return flags
+
+    @staticmethod
+    def _verify_session_flags(flags: dict[str, bool], response: dict[str, Any]) -> None:
+        for name, expected in flags.items():
+            actual = response.get(name)
+            if type(actual) is not bool or actual is not expected:
+                raise ValueError(f"Intaris did not acknowledge {name}.")
 
     @staticmethod
     def _verify_policy_ack(
@@ -1016,6 +1078,8 @@ class IntarisProvider:
         agent_id: str | None = None,
         agent_owner_email: str | None = None,
     ) -> EventAppendResult:
+        if idempotency_key is not None:
+            validate_event_idempotency_key(session_id, idempotency_key)
         authority = self._event_store_authority(
             user_email=user_email,
             agent_id=agent_id,

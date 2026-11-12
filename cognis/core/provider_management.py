@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select, update
 
@@ -26,6 +26,9 @@ from cognis.store.queries import (
     list_executors,
     update_llm_provider,
 )
+
+if TYPE_CHECKING:
+    from cognis.core.usage.price_publisher import UsagePricePublisher
 
 
 def validate_provider(location: str | None, config: dict[str, Any] | None) -> None:
@@ -268,6 +271,7 @@ class ProviderManagement:
 
     session_factory: Any
     llm: Any
+    usage_price_publisher: UsagePricePublisher | None = None
 
     async def create(
         self, actor: ManagementActor, payload: LLMProviderRequest, *, preview: bool = False
@@ -313,8 +317,12 @@ class ProviderManagement:
                 config=payload.config,
                 status=payload.status,
             )
+            if self.usage_price_publisher is not None:
+                await self.usage_price_publisher.notify_configuration(session)
             await session.commit()
             await session.refresh(row)
+        if self.usage_price_publisher is not None:
+            self.usage_price_publisher.wake()
         return row
 
     async def update(
@@ -384,7 +392,11 @@ class ProviderManagement:
                 status=payload.status,
             )
             row = await get_llm_provider(session, provider_id)
+            if self.usage_price_publisher is not None:
+                await self.usage_price_publisher.notify_configuration(session)
             await session.commit()
+        if self.usage_price_publisher is not None:
+            self.usage_price_publisher.wake()
         invalidate = getattr(self.llm, "invalidate_runtime_capability_cache_for_provider", None)
         if not callable(invalidate):
             invalidate = getattr(self.llm, "invalidate_json_mode_cache_for_provider", None)
@@ -420,7 +432,11 @@ class ProviderManagement:
             if preview:
                 return {"preview": True, "provider_id": provider_id, "deleted": False}
             ok = await delete_llm_provider(session, provider_id)
+            if self.usage_price_publisher is not None:
+                await self.usage_price_publisher.notify_configuration(session)
             await session.commit()
+        if self.usage_price_publisher is not None:
+            self.usage_price_publisher.wake()
         return {"ok": ok}
 
     async def set_default(

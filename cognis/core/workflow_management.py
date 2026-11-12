@@ -31,25 +31,8 @@ class SkillWorkflowSource(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
 
 
-_SKILL_WORKFLOW_CANDIDATE_PREFIX = "skill:"
-
-
-def encode_skill_workflow_candidate_id(skill_id: str) -> str:
-    """Encode a skill candidate for workflow selection."""
-
-    return f"{_SKILL_WORKFLOW_CANDIDATE_PREFIX}{skill_id}"
-
-
-def decode_skill_workflow_candidate_id(candidate_id: str) -> str | None:
-    """Decode a workflow-selection candidate back to a skill id."""
-
-    if candidate_id.startswith(_SKILL_WORKFLOW_CANDIDATE_PREFIX):
-        return candidate_id[len(_SKILL_WORKFLOW_CANDIDATE_PREFIX) :]
-    return None
-
-
 def skill_workflow_criteria(source: SkillWorkflowSource) -> str:
-    """Build classifier-facing criteria text for a decomposed skill."""
+    """Describe the intended domain of an explicitly selected skill workflow."""
 
     tags = [tag for tag in (getattr(source, "tags", None) or []) if isinstance(tag, str)]
     parts = [f"Tasks explicitly matching the skill domain: {source.name}."]
@@ -82,7 +65,7 @@ def build_skill_workflow_payload(
             "max_attempts": 3,
             "on_exhausted": "gate",
             "delivery": {
-                "completion_mode_family": "default",
+                "completion_mode_family": "auto",
                 "allow_silent_completion": False,
             },
         },

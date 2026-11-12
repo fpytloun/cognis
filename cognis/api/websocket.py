@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import inspect
 import os
+import time
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -66,6 +67,7 @@ from cognis.api.models import (
 from cognis.api.notification_preview import notification_preview
 from cognis.api.proxy import trusted_request_scheme
 from cognis.api.serializers import conversation_to_response
+from cognis.api.speech_websocket import LiveTranscription, handle_speech_message
 from cognis.api.timeline_visibility import (
     is_transient_compaction_start_notice,
     is_visible_persisted_system_message,
@@ -97,6 +99,7 @@ from cognis.core.turn_scheduler import (
 )
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
+from cognis.models.program import ProgramEventMetadata
 from cognis.providers.circuit_breaker import CircuitBreakerError
 from cognis.runtime_context import current_user_email
 from cognis.store.models import (
@@ -118,6 +121,32 @@ from cognis.store.queries import (
 from cognis.store.work_live_invalidation import read_live_work_revision
 
 logger = get_logger(__name__)
+
+
+def _program_event_linkage_kwargs(
+    producer: Any,
+    runtime_metadata: ProgramEventMetadata | dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(runtime_metadata, ProgramEventMetadata):
+        linkage = runtime_metadata
+    elif isinstance(runtime_metadata, dict):
+        try:
+            linkage = ProgramEventMetadata.model_validate(runtime_metadata)
+        except (TypeError, ValueError):
+            return {}
+    else:
+        return {}
+    try:
+        parameters = inspect.signature(producer).parameters
+    except (TypeError, ValueError):
+        return {}
+    if not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    ) and not all(
+        name in parameters for name in ("parent_call_id", "program_id", "kernel_generation")
+    ):
+        return {}
+    return linkage.model_dump(mode="json")
 
 
 async def _scheduler_queued_messages(
@@ -424,6 +453,7 @@ class AuthenticatedWebSocket:
     # to gate `tts_sentence_ready` emission.
     tts_enabled: bool = False
     tts_voice: str | None = None
+    speech_transcription: LiveTranscription | None = None
     send_timeout_seconds: float = DEFAULT_SEND_TIMEOUT_SECONDS
     ready_for_fanout: bool = True
     _outbound_queue: asyncio.Queue[_OutboundFrame] = field(init=False)
@@ -505,6 +535,9 @@ class AuthenticatedWebSocket:
             if isinstance(conversation_id, str)
             else (f"{data.get('reason')}:{data.get('task_id') or data.get('step_run_id') or ''}")
         )
+        scope_key = data.get("scope_key")
+        if isinstance(scope_key, str):
+            key = f"{key}:scope:{scope_key}"
         # Never let a routine refresh coalesce away a pending access invalidation.
         return f"{key}:metadata" if data.get("metadata_only") is True else key
 
@@ -535,6 +568,9 @@ class AuthenticatedWebSocket:
         """Cancel writer/enqueue tasks and drain queued frames for disconnect."""
 
         self._closed = True
+        if self.speech_transcription is not None:
+            await self.speech_transcription.close()
+            self.speech_transcription = None
         if self._overflow_task is not None and not self._overflow_task.done():
             self._overflow_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -1042,9 +1078,11 @@ class WebSocketTurnObserver:
         turn_id: str | None,
         assistant_phase_index: int | None = None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | dict[str, Any] | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).isoformat()
         _invalidate_chat_v2_phase_hint_items(session_id, turn_id)
+        linkage_kwargs = _program_event_linkage_kwargs(tool_call_runtime_item, runtime_metadata)
         chat_v2_tool_item = tool_call_runtime_item(
             session_id=session_id,
             call_id=call_id,
@@ -1054,6 +1092,7 @@ class WebSocketTurnObserver:
             assistant_phase_index=assistant_phase_index,
             turn_cycle_index=turn_cycle_index,
             timestamp=timestamp,
+            **linkage_kwargs,
         )
         # Flush any coalesced streaming snapshot before the tool boundary so the
         # client sees the final assistant content before the tool call.
@@ -1117,9 +1156,11 @@ class WebSocketTurnObserver:
         presentation: dict[str, Any] | None = None,
         assistant_phase_index: int | None = None,
         turn_cycle_index: int | None = None,
+        runtime_metadata: ProgramEventMetadata | dict[str, Any] | None = None,
     ) -> None:
         timestamp = datetime.now(UTC).isoformat()
         _invalidate_chat_v2_phase_hint_items(session_id, turn_id)
+        linkage_kwargs = _program_event_linkage_kwargs(tool_result_runtime_item, runtime_metadata)
         chat_v2_item = tool_result_runtime_item(
             session_id=session_id,
             call_id=call_id,
@@ -1135,6 +1176,7 @@ class WebSocketTurnObserver:
             turn_cycle_index=turn_cycle_index,
             timestamp=timestamp,
             presentation=presentation,
+            **linkage_kwargs,
         )
         # Flush any coalesced stream/tool-output snapshot before the result
         # boundary. Tool calls already do this so the client sees the final
@@ -1409,6 +1451,7 @@ class WebSocketTurnObserver:
         retry_reason: str | None = None,
         retry_source_turn_id: str | None = None,
         attempt: int | None = None,
+        task_outcome: dict[str, Any] | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "type": "system_message",
@@ -1425,6 +1468,8 @@ class WebSocketTurnObserver:
             payload["retry_source_turn_id"] = retry_source_turn_id
         if attempt is not None:
             payload["attempt"] = attempt
+        if task_outcome is not None:
+            payload["task_outcome"] = task_outcome
         await self._manager.send_to_conversation(conversation_id, payload)
         if notice_id is not None:
             scheduler = getattr(self._manager.app.state, "turn_scheduler", None)
@@ -1458,6 +1503,7 @@ class WebSocketTurnObserver:
                         retry_reason=retry_reason,
                         retry_source_turn_id=retry_source_turn_id,
                         attempt=attempt,
+                        metadata={"task_outcome": task_outcome},
                     )
                 ],
                 active_session_id=session_id,
@@ -1521,6 +1567,7 @@ class WebSocketConnectionManager:
         # Create the TurnObserver bridge
         self._observer = WebSocketTurnObserver(self)
         self._relay_runtime_items: dict[str, tuple[str, dict[str, TimelineItem]]] = {}
+        self._runtime_recovery_hint_at: dict[tuple[str, str], float] = {}
         self._local_runtime_authority = RuntimeAuthoritySource(uuid.uuid4().hex)
 
         # Register as global EventBus subscriber for UI fanout
@@ -1792,6 +1839,7 @@ class WebSocketConnectionManager:
         """Disable Chat v2 frames without changing the legacy subscription."""
 
         scope = connection.chat_v2_scopes.pop(scope_key, None)
+        self._runtime_recovery_hint_at.pop((connection.connection_id, scope_key), None)
         connection.chat_v2_session_ids.pop(scope_key, None)
         connection.chat_v2_rejected_session_ids.pop(scope_key, None)
         connection.chat_v2_cursors.pop(scope_key, None)
@@ -2329,14 +2377,14 @@ class WebSocketConnectionManager:
                     else None
                 ),
                 boundary_receipts=boundary_receipts,
-            )
+            ).bounded_overlay()
         if context is not None and relay is None:
             runtime_authority = self._local_runtime_authority.authority(
                 context, has_active_turn=has_active_turn, lifecycle=lifecycle
             )
         await self._fanout_chat_v2_runtime(
             conversation_id,
-            volatile_items=effective_items,
+            volatile_items=(envelope.volatile_items if envelope is not None else effective_items),
             has_active_turn=has_active_turn,
             active_session_id=active_session_id,
             context_usage=context_usage,
@@ -2539,6 +2587,27 @@ class WebSocketConnectionManager:
                     conversation_id=conversation_id,
                     block=False,
                 )
+                hint_key = (cid, scope_key)
+                if not volatile_items_complete:
+                    # Partial frames must not mask omitted canonical data while
+                    # they continue arriving. Use the existing scoped read hint,
+                    # rate-limited per subscription; terminal delivery always wakes.
+                    now = time.monotonic()
+                    last_hint = self._runtime_recovery_hint_at.get(hint_key)
+                    if (
+                        not has_active_turn or last_hint is None or now - last_hint >= 10.0
+                    ) and conn.send_scope_invalidation_nowait(
+                        {
+                            "type": "scope_invalidated",
+                            "reason": "chat_scope_changed",
+                            "revision": f"{overlay.runtime_epoch}:{overlay.runtime_revision}",
+                            "scope_key": scope_key,
+                            "conversation_id": conversation_id,
+                        }
+                    ):
+                        self._runtime_recovery_hint_at[hint_key] = now
+                if not has_active_turn:
+                    self._runtime_recovery_hint_at.pop(hint_key, None)
 
     def has_chat_v2_subscriber(self, conversation_id: str) -> bool:
         return bool(self._by_chat_v2_conversation.get(conversation_id))
@@ -3073,6 +3142,18 @@ class WebSocketConnectionManager:
         if conversation_id is None:
             return
 
+        if event.type in {
+            EventType.SESSION_COMPACTION_STARTED,
+            EventType.SESSION_COMPACTION_FINISHED,
+            EventType.SESSION_COMPACTED,
+        }:
+            session_id = event.data.get("session_id")
+            if isinstance(session_id, str) and await self._is_subsession(session_id):
+                # Child lifecycle events replay in their own canonical scope.
+                # Sharing a conversation does not make them parent-turn runtime,
+                # nor authorize a parent view to switch to the child's session.
+                return
+
         if event.type == EventType.USER_MESSAGE:
             await self.invalidate_chat_v2_admission(
                 conversation_id,
@@ -3566,17 +3647,14 @@ class WebSocketConnectionManager:
     async def _resolve_event_session_routes(
         self, event_session_token: str, cached_event_store: Any
     ) -> set[str]:
-        # Authorized conversation subscriptions may precede their first session.
+        # A conversation subscription can predate its first admitted session.
+        # Resolve its durable active pointer even when the original scope had none.
         subscribed_scopes = [
             (connection_id, scope)
             for connection_id, connection in self._connections.items()
             for scope in connection.chat_v2_scopes.values()
-            if (isinstance(scope.session_id, str) and scope.session_id)
-            or (
-                scope.kind == "conversation"
-                and isinstance(scope.conversation_id, str)
-                and scope.conversation_id
-            )
+            if scope.kind == "conversation"
+            or (isinstance(scope.session_id, str) and scope.session_id)
         ]
         if not subscribed_scopes:
             self._event_route_membership = ()
@@ -3622,11 +3700,7 @@ class WebSocketConnectionManager:
                 )
                 for _, scope in subscribed_scopes
             }
-            subscribed_session_ids = {
-                session_id
-                for session_id in session_id_by_scope_key.values()
-                if isinstance(session_id, str) and session_id
-            }
+            subscribed_session_ids = set(session_id_by_scope_key.values())
             result = await session.execute(
                 select(Session).where(Session.session_id.in_(subscribed_session_ids))
             )
@@ -3649,12 +3723,8 @@ class WebSocketConnectionManager:
             (connection_id, scope.key, scope.session_id, scope.conversation_id)
             for connection_id, connection in self._connections.items()
             for scope in connection.chat_v2_scopes.values()
-            if (isinstance(scope.session_id, str) and scope.session_id)
-            or (
-                scope.kind == "conversation"
-                and isinstance(scope.conversation_id, str)
-                and scope.conversation_id
-            )
+            if scope.kind == "conversation"
+            or (isinstance(scope.session_id, str) and scope.session_id)
         )
         if current_membership == membership:
             self._event_routes = routes
@@ -4480,6 +4550,15 @@ async def handle_websocket(websocket: WebSocket) -> None:
 
             message_type = message.get("type")
 
+            if message_type in {
+                "speech_stt_start",
+                "speech_stt_audio",
+                "speech_stt_commit",
+                "speech_stt_cancel",
+            }:
+                await handle_speech_message(websocket.app, connection, message)
+                continue
+
             if message_type == "ping":
                 await connection.send_json(WebSocketPong().model_dump())
                 continue
@@ -4697,6 +4776,14 @@ async def _send_chat_v2_catch_up(
             runtime_input=context.runtime_input,
             event_post_processor=context.event_post_processor,
             session_cache=context.session_cache,
+        )
+        from cognis.api.chat_v2.deliverables import hydrate_chat_deliverables
+
+        response = await hydrate_chat_deliverables(
+            app,
+            response,
+            caller_email=caller_email,
+            conversation_id=scope.conversation_id,
         )
         frame["sync"] = response.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001 - client falls back to REST sync

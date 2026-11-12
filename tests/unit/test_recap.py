@@ -172,7 +172,7 @@ async def test_ongoing_work_sources_block_automatic_recap(monkeypatch, kind) -> 
 
 
 @pytest.mark.anyio
-async def test_recap_is_classifier_side_call_with_no_turn_or_tools() -> None:
+async def test_recap_is_auxiliary_generation_side_call_with_no_turn_or_tools() -> None:
     service, providers = _service(
         {"choices": [{"message": {"content": "We researched caching. The next step is testing."}}]},
         [
@@ -185,7 +185,7 @@ async def test_recap_is_classifier_side_call_with_no_turn_or_tools() -> None:
     )
     assert result == "We researched caching. The next step is testing."
     kwargs = providers.llm.generate.await_args.kwargs
-    assert kwargs["task_type"] == "classifier"
+    assert kwargs["task_type"] == "auxiliary_generation"
     assert "tools" not in kwargs
     assert len(providers.llm.generate.await_args.args[0]) == 1
     append = providers.guardrails.record_events.await_args

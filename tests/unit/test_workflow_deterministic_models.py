@@ -12,6 +12,48 @@ def _workflow(steps: list[dict[str, object]]) -> dict[str, object]:
     return {"workflow_id": "wf_test", "name": "Test", "steps": steps}
 
 
+def test_workflow_admission_allows_empty_gate_options() -> None:
+    definition = _workflow(
+        [{"name": "approve", "type": "gate", "gate": {"message": "Approve?", "options": []}}]
+    )
+    assert validate_workflow_definition(definition)["steps"][0]["gate"]["options"] == []
+
+
+@pytest.mark.parametrize("action", ["reject", "revise(missing)", "revise(approve)", "revise:later"])
+def test_workflow_admission_rejects_unsupported_gate_actions(action: str) -> None:
+    definition = _workflow(
+        [
+            {"name": "build", "type": "run"},
+            {
+                "name": "approve",
+                "type": "gate",
+                "gate": {"message": "Approve?", "options": [{"label": "Choice", "action": action}]},
+            },
+            {"name": "later", "type": "run"},
+        ]
+    )
+    with pytest.raises(ValueError, match="gate action|Gate revision target"):
+        validate_workflow_definition(definition)
+
+
+@pytest.mark.parametrize("action", ["continue", "cancel", "fail", "revise(build)", "revise:build"])
+def test_workflow_admission_accepts_supported_gate_actions(action: str) -> None:
+    definition = _workflow(
+        [
+            {"name": "build", "type": "run"},
+            {
+                "name": "approve",
+                "type": "gate",
+                "gate": {"message": "Approve?", "options": [{"label": "Choice", "action": action}]},
+            },
+        ]
+    )
+    assert (
+        validate_workflow_definition(definition)["steps"][1]["gate"]["options"][0]["action"]
+        == action
+    )
+
+
 def test_deterministic_steps_parse_and_serialize_with_external_aliases() -> None:
     definition = _workflow(
         [
@@ -275,6 +317,7 @@ def test_workflow_authoring_tools_expose_deterministic_step_schema() -> None:
             "run",
             "gate",
             "tool_call",
+            "program",
             "condition",
             "complete",
         ]

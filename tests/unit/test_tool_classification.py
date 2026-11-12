@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import timedelta
 from typing import Any
 
@@ -17,6 +16,7 @@ from cognis.core.tool_classification_queue import (
 )
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolCapability, ToolSource, stable_tool_id
+from cognis.providers.llm.systemone import SystemOneRequest
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import ToolClassificationRow, User
 from cognis.store.queries import (
@@ -115,36 +115,45 @@ class _FailingQueue:
         raise RuntimeError("classification queue unavailable")
 
 
+def _answers(
+    request: SystemOneRequest,
+    group: str = "web",
+    capabilities: tuple[str, ...] = ("read",),
+    confidence: float = 0.9,
+) -> dict[str, Any]:
+    answers: dict[str, Any] = {}
+    for key, question in request.questions.items():
+        if question.type == "choice":
+            alternatives = [candidate for candidate in question.criteria if candidate != group]
+            probabilities = dict.fromkeys(question.criteria, 0.0)
+            probabilities[group] = confidence
+            probabilities[alternatives[0]] = 1 - confidence
+            answers[key] = {
+                "type": "choice",
+                "choice": group,
+                "confidence": confidence,
+                "probabilities": probabilities,
+            }
+        else:
+            answers[key] = {
+                "type": "noul",
+                "noul": 1.0 if key.split(":")[-1] in capabilities else 0.0,
+            }
+    return {"model": "jev/decision", "answers": answers}
+
+
 class _FakeLLM:
-    async def generate(self, *_args, **_kwargs):
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": '{"tools":[{"tool_id":"mcp:github:search/issues","category":"web","capabilities":["read"],"confidence":0.92}]}'
-                    }
-                }
-            ]
-        }
+    async def classify(self, request, **_kwargs):
+        return _answers(request, confidence=0.92)
 
 
 class _CountingLLM:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def generate(self, messages, **_kwargs):
+    async def classify(self, request, **_kwargs):
         self.calls += 1
-        tool_payload = json.loads(messages[1]["content"])
-        tools = [
-            {
-                "tool_id": tool["tool_id"],
-                "profile_group": "web",
-                "capabilities": ["read"],
-                "confidence": 0.9,
-            }
-            for tool in tool_payload["tools"]
-        ]
-        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+        return _answers(request)
 
 
 class _BlockingClassifierLLM(_CountingLLM):
@@ -153,115 +162,63 @@ class _BlockingClassifierLLM(_CountingLLM):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def generate(self, messages, **kwargs):
+    async def classify(self, request, **kwargs):
         self.started.set()
         await self.release.wait()
-        return await super().generate(messages, **kwargs)
+        return await super().classify(request, **kwargs)
 
 
 class _OwnerScopedCacheLLM:
     def __init__(self) -> None:
         self.calls: list[str | None] = []
 
-    async def generate(self, messages, **kwargs):
+    async def classify(self, request, **kwargs):
         owner_email = kwargs.get("acting_user_email")
         self.calls.append(owner_email)
-        tool_payload = json.loads(messages[1]["content"])
         profile_group = "web" if owner_email == "user-a@example.com" else "development"
-        tools = [
-            {
-                "tool_id": tool["tool_id"],
-                "profile_group": profile_group,
-                "capabilities": ["read"],
-                "confidence": 0.9,
-            }
-            for tool in tool_payload["tools"]
-        ]
-        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+        return _answers(request, group=profile_group)
 
 
 class _RecordingActingUserLLM:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def generate(self, messages, **kwargs):
-        self.calls.append({"messages": messages, **kwargs})
-        tool_payload = json.loads(messages[1]["content"])
-        tools = [
-            {
-                "tool_id": tool["tool_id"],
-                "profile_group": "web",
-                "capabilities": ["read"],
-                "confidence": 0.91,
-            }
-            for tool in tool_payload["tools"]
-        ]
-        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+    async def classify(self, request, **kwargs):
+        self.calls.append({"request": request, **kwargs})
+        return _answers(request, confidence=0.91)
 
 
 class _SoftMismatchClassifierLLM:
     def __init__(self) -> None:
         self.calls: list[list[dict[str, Any]]] = []
 
-    async def generate(self, messages, **_kwargs):
-        tool_payload = json.loads(messages[1]["content"])
-        self.calls.append(tool_payload["tools"])
-        tools = [
-            {
-                "tool_id": tool["tool_id"],
-                "profile_group": "personal",
-                "capabilities": ["read"],
-                "confidence": 0.88,
-            }
-            for tool in tool_payload["tools"]
-        ]
-        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+    async def classify(self, request, **_kwargs):
+        self.calls.append(request.state["tools"])
+        return _answers(request, group="personal", confidence=0.88)
 
 
 class _FailingClassifierLLM:
-    async def generate(self, *_args, **_kwargs):
+    async def classify(self, *_args, **_kwargs):
         raise RuntimeError("missing classifier api_key=super-secret-token")
 
 
 class _InvalidJsonClassifierLLM:
-    async def generate(self, *_args, **_kwargs):
-        return {"choices": [{"message": {"content": "not json"}}]}
+    async def classify(self, *_args, **_kwargs):
+        return {"answers": "not an answer object"}
 
 
 class _EmptyResponseClassifierLLM:
-    async def generate(self, *_args, **_kwargs):
-        return {"choices": [{"message": {"content": ""}}]}
+    async def classify(self, *_args, **_kwargs):
+        return {"answers": {}}
 
 
 class _FallbackClassifierLLM:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
-    async def generate(self, messages, **kwargs):
-        self.calls.append({"messages": messages, **kwargs})
-        if "response_format" in kwargs:
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {"confidence": 0.2, "reason": "missing tools array"}
-                            )
-                        }
-                    }
-                ]
-            }
-        tool_payload = json.loads(messages[1]["content"])
-        tools = [
-            {
-                "tool_id": tool["tool_id"],
-                "profile_group": "web",
-                "capabilities": ["read"],
-                "confidence": 0.9,
-            }
-            for tool in tool_payload["tools"]
-        ]
-        return {"choices": [{"message": {"content": json.dumps({"tools": tools})}}]}
+    async def classify(self, request, **kwargs):
+        self.calls.append({"request": request, **kwargs})
+        return {"answers": {}}
 
 
 async def _process_due_classifications_once(queue: ToolClassificationQueue) -> None:
@@ -1188,7 +1145,7 @@ async def test_tool_classification_queue_persists_actionable_generation_error(tm
         assert row.status == "pending"
         assert row.attempts == 1
         assert row.last_error is not None
-        assert row.last_error.startswith("llm_generate_failed:RuntimeError:")
+        assert row.last_error.startswith("llm_classify_failed:RuntimeError:")
         assert "api_key=[redacted]" in row.last_error
         assert "super-secret-token" not in row.last_error
 
@@ -1199,7 +1156,7 @@ async def test_tool_classification_queue_persists_actionable_generation_error(tm
 
 
 @pytest.mark.asyncio
-async def test_tool_classification_queue_persists_json_extraction_error(tmp_path):
+async def test_tool_classification_queue_persists_invalid_answer_shape(tmp_path):
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
     await run_schema_bootstrap(engine)
     session_factory = create_session_factory(engine)
@@ -1222,13 +1179,13 @@ async def test_tool_classification_queue_persists_json_extraction_error(tmp_path
         row = result.scalar_one()
         assert row.status == "pending"
         assert row.last_error is not None
-        assert row.last_error.startswith("llm_json_extract_failed:ValueError:")
+        assert row.last_error.startswith("llm_classify_failed:SystemOneResponseError:")
 
     await engine.dispose()
 
 
 @pytest.mark.asyncio
-async def test_tool_classification_queue_persists_response_extraction_error(tmp_path):
+async def test_tool_classification_queue_persists_missing_answer_error(tmp_path):
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/classifications.db")
     await run_schema_bootstrap(engine)
     session_factory = create_session_factory(engine)
@@ -1251,7 +1208,7 @@ async def test_tool_classification_queue_persists_response_extraction_error(tmp_
         row = result.scalar_one()
         assert row.status == "pending"
         assert row.last_error is not None
-        assert row.last_error.startswith("llm_response_extract_failed:ValueError:")
+        assert row.last_error.startswith("llm_classify_failed:SystemOneResponseError:")
 
     await engine.dispose()
 
@@ -1480,16 +1437,8 @@ async def test_invalid_llm_group_is_rejected_back_to_heuristic() -> None:
     )
 
     class _BadLLM:
-        async def generate(self, *_args, **_kwargs):
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": '{"tools":[{"tool_id":"mcp:unknown:sequentialthinking","profile_group":"mcp","capabilities":["read"],"confidence":0.95}]}'
-                        }
-                    }
-                ]
-            }
+        async def classify(self, request, **_kwargs):
+            return _answers(request, group="mcp", confidence=0.95)
 
     classified = await classify_tool_definitions([tool], llm=_BadLLM())
 
@@ -1508,9 +1457,8 @@ async def test_tool_classification_does_not_retry_invalid_payload_shape() -> Non
     assert classified[0].classification_source == "heuristic"
     assert classified[0].classification_status == "ready"
     assert len(llm.calls) == 1
-    assert "response_format" in llm.calls[0]
     assert "max_tokens" not in llm.calls[0]
-    tool_payload = json.loads(llm.calls[0]["messages"][1]["content"])
+    tool_payload = llm.calls[0]["request"].state
     assert "parameters" not in tool_payload["tools"][0]
 
 

@@ -745,3 +745,19 @@ async def test_task_files_group_direct_and_specialist_sessions_without_duplicate
         )
     ).json()
     assert hidden["items"] == []
+
+
+@pytest.mark.parametrize("kind", ["artifact", "deliverable"])
+def test_exact_item_scopes_recursive_producer_lookup_to_one_document(kind: str) -> None:
+    """A single-item read must not walk every readable document's session ancestry."""
+    from cognis.store.library_queries import library_items
+
+    compiled = (
+        sa.select(library_items("reader@example.com", kind, exact=True, ref_id="doc_exact"))
+        .compile(compile_kwargs={"literal_binds": True})
+        .string
+    )
+    seed, _, rest = compiled.partition("UNION ALL")
+    assert "library_session_ancestors" in seed
+    assert "'doc_exact'" in seed
+    assert "'doc_exact'" in rest

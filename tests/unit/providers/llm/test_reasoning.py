@@ -31,6 +31,7 @@ def _model_info(model_id: str) -> ModelInfo:
         "claude-sonnet-5",
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-mythos-5",
         "claude-mythos-preview",
     ],
@@ -84,6 +85,7 @@ def test_adaptive_models_send_explicit_supported_effort(effort: str) -> None:
     [
         "claude-fable-5",
         "claude-fable-5-1",
+        "claude-fable-5-2",
         "claude-mythos-5",
         "claude-opus-4-8",
         "claude-opus-4-7",

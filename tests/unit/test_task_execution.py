@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -43,6 +42,36 @@ async def _database(tmp_path: object) -> tuple[object, object]:
         )
         await session.commit()
     return engine, factory
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["running", "cancelled", "paused", "failed"])
+async def test_shutdown_preserves_remote_work_but_explicit_stop_does_not(tmp_path, status):
+    from cognis.providers.executor.delivery import preserve_task_execution_on_interrupt
+
+    engine, factory = await _database(tmp_path)
+    token = None
+    fence = None
+    try:
+        store = TaskExecutionStore(
+            factory, owner_id="controller-shutdown", max_active_global=1, max_active_per_agent=1
+        )
+        claim = await store.claim_ready()
+        assert claim is not None
+        fence = TaskExecutionFence(store, claim, asyncio.Event())
+        token = task_execution_module.bind_task_execution_fence(fence)
+        async with factory() as db:
+            task = await db.get(Task, claim.task_id)
+            task.status = status
+            await db.commit()
+        fence.cancel_event.set()
+        assert await preserve_task_execution_on_interrupt() is (status == "running")
+    finally:
+        if token is not None:
+            task_execution_module.reset_task_execution_fence(token)
+        if fence is not None:
+            await fence.close()
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -233,49 +262,62 @@ async def test_renewal_error_marks_fence_lost_and_cancels(
 
 
 @pytest.mark.asyncio
-async def test_tool_dispatch_boundaries_reuse_task_ownership_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
+async def test_tool_dispatch_boundaries_persist_metadata_before_send(
+    tmp_path: object,
 ) -> None:
-    fence = TaskExecutionFence(
-        store=object(),  # type: ignore[arg-type]
-        claim=object(),  # type: ignore[arg-type]
-        cancel_event=asyncio.Event(),
-    )
-    checkpoint = AsyncMock()
-    monkeypatch.setattr(fence, "checkpoint", checkpoint)
-    descriptors = [
-        {
-            "call_id": "call-1",
-            "tool_name": "bash",
-            "dispatch_state": "pending",
-        }
-    ]
-
-    await fence.record_tool_dispatch(
-        session_id="sess-task",
-        turn_id="turn-task",
-        descriptors=descriptors,
-    )
-    await fence.complete_tool_dispatch(
-        session_id="sess-task",
-        turn_id="turn-task",
-        call_ids=["call-1"],
-    )
-
-    assert checkpoint.await_args_list == [
-        call(
-            "tool_in_flight",
+    engine, factory = await _database(tmp_path)
+    try:
+        store = TaskExecutionStore(
+            factory,
+            owner_id="controller-a:boot-a",
+            max_active_global=1,
+            max_active_per_agent=1,
+        )
+        claim = await store.claim_ready()
+        assert claim is not None
+        fence = TaskExecutionFence(store, claim, asyncio.Event())
+        await fence.record_tool_dispatch(
             session_id="sess-task",
             turn_id="turn-task",
-            tool_calls=descriptors,
-        ),
-        call(
-            "tool_result_persisted",
+            descriptors=[
+                {
+                    "call_id": "call-1",
+                    "tool_name": "bash",
+                    "dispatch_state": "pending",
+                    "arguments": {"secret": "must-not-be-copied"},
+                    "frozen": {"arguments": {"secret": "must-not-be-copied"}},
+                }
+            ],
+        )
+        await fence.bind_tool_dispatch(
+            "call-1",
+            "executor-task",
+            "instance-task",
             session_id="sess-task",
             turn_id="turn-task",
-            call_ids=["call-1"],
-        ),
-    ]
+            dispatch_state="bound",
+        )
+        async with factory() as db:
+            task = await db.get(Task, claim.task_id)
+            batches = task.result_data["execution_recovery"]
+            descriptor = batches["sess-task:turn-task"]["tool_calls"][0]
+            assert descriptor == {
+                "call_id": "call-1",
+                "canonical_turn_id": "turn-task",
+                "tool_name": "bash",
+                "dispatch_state": "bound",
+                "executor_id": "executor-task",
+                "executor_instance_id": "instance-task",
+            }
+        await fence.complete_tool_dispatch(
+            session_id="sess-task", turn_id="turn-task", call_ids=["call-1"]
+        )
+        async with factory() as db:
+            task = await db.get(Task, claim.task_id)
+            assert task.result_data["execution_recovery"] == {}
+        await fence.close()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

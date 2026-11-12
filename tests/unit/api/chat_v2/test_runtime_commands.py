@@ -224,7 +224,14 @@ async def test_rebase_releases_database_before_intaris_and_copies_latest_runtime
 
     manager = SessionManager(
         runtime_app.factory,
-        SimpleNamespace(guardrails=SimpleNamespace(create_session=create_external_session)),
+        SimpleNamespace(
+            guardrails=SimpleNamespace(
+                get_session=AsyncMock(
+                    return_value=SimpleNamespace(analytics_enabled=True, guardrails_enabled=True)
+                ),
+                create_session=create_external_session,
+            )
+        ),
         runtime_app.cache,
     )
     rebased = await manager._create_history_rebase_session(

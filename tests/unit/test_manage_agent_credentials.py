@@ -274,6 +274,74 @@ async def test_management_context_is_required(deps: Any) -> None:
     assert result.is_error
 
 
+@pytest.mark.asyncio
+async def test_user_credential_requested_by_another_agent_can_be_granted_and_used(
+    deps: Any,
+) -> None:
+    await deps.credentials.upsert_credential(
+        credential_id="account",
+        user_email=OWNER,
+        agent_id="manager",
+        scope="user",
+        kind="token",
+        label="Account",
+        payload={"token": CANARY},
+    )
+
+    async def call(operation: str, **fields: Any) -> Any:
+        result = await handle_agent_management_tool(
+            tool_name="manage_agents",
+            arguments={
+                "action": operation,
+                "agent_id": "target",
+                "credential_id": "account",
+                **fields,
+            },
+            deps=deps,
+            user_email=OWNER,
+            current_agent_id="manager",
+            runtime_access=RuntimeAccessContext(
+                user_email=OWNER,
+                agent_id="manager",
+                agent_owner_email=OWNER,
+            ),
+        )
+        assert not result.is_error, result.output
+        assert CANARY not in result.output
+        return json.loads(result.output)
+
+    read = await call("credentials_get")
+    assert read["credential"]["agent_id"] == "manager"
+    await call("credentials_grant", expected_updated_at=read["updated_at"])
+    async with deps.session_factory() as session:
+        row = await get_agent(session, "target")
+        target = AgentDefinition(
+            agent_id="target",
+            owner_email=OWNER,
+            name="Target",
+            permissions=AgentPermissions.model_validate(row.permissions),
+        )
+    resolved = await deps.credentials.resolve_ref(
+        "$credential:account.token",
+        agent=target,
+        user_email=OWNER,
+    )
+    assert resolved.value == CANARY
+    await deps.credentials.upsert_credential(
+        credential_id="account",
+        user_email=OWNER,
+        agent_id="manager",
+        scope="agent",
+        kind="token",
+        label="Account",
+        payload={"token": CANARY},
+    )
+    with pytest.raises(CredentialAccessError, match="not scoped"):
+        await deps.credentials.resolve_ref(
+            "$credential:account.token", agent=target, user_email=OWNER
+        )
+
+
 def test_strict_operation_contracts() -> None:
     def valid(arguments: dict[str, Any]) -> bool:
         return (

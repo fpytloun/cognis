@@ -14,6 +14,7 @@ from fastapi import APIRouter, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.responses import Response
 
+from cognis.api.app_contact_presentation import contact_agent_response
 from cognis.api.attention_actions import (
     list_attention_rows_by_conversation,
     project_attention_summary,
@@ -29,6 +30,8 @@ from cognis.api.common import (
     require_resource_owner,
 )
 from cognis.api.conversation_identity import enrich_conversation_identity
+from cognis.api.conversation_summaries import conversation_list_summaries
+from cognis.api.datetimes import utc_datetime
 from cognis.api.models import (
     AgentDirectChatResponse,
     BackgroundCommandDetailResponse,
@@ -61,6 +64,7 @@ from cognis.api.serializers import (
     session_to_response,
 )
 from cognis.core.agent_profiles import resolve_agent_profile
+from cognis.core.app_contact_access import app_contact_binding_id
 from cognis.core.attachment_utils import hydrate_attachment_ref_groups
 from cognis.core.chat_modes import ChatMode
 from cognis.core.conversation_state import snapshot_for_conversation, snapshots_for_conversations
@@ -85,6 +89,7 @@ from cognis.core.turn_scheduler import TurnError
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import ConversationContext, SessionEvent, SessionModel
+from cognis.store.conversation_reads import mark_shared_conversation_read
 from cognis.store.database import read_snapshot
 from cognis.store.queries import (
     admit_managed_conversation_turn,
@@ -502,6 +507,40 @@ async def _require_readable_conversation(request: Request, row: Any) -> Any:
     return row
 
 
+async def _conversation_running_turn_states(
+    request: Request, session: Any, rows: list[Any]
+) -> dict[str, Any]:
+    """Read bounded activity metadata without loading another user's runtime details."""
+    scheduler = getattr(request.app.state, "turn_scheduler", None)
+    durable = getattr(scheduler, "durable_running_turn_states", None)
+    if callable(durable):
+        return dict(await durable([row.conversation_id for row in rows], session=session))
+    if scheduler is not None:
+        return {
+            row.conversation_id: scheduler.running_turn_state(row.conversation_id) for row in rows
+        }
+    return {}
+
+
+async def _shared_conversation_response(
+    request: Request, session: Any, row: Any, user_email: str
+) -> ConversationResponse:
+    activity = await _conversation_running_turn_states(request, session, [row])
+    items = await enrich_conversation_identity(
+        session,
+        [
+            conversation_to_response(
+                row,
+                viewer_email=user_email,
+                has_active_turn=activity.get(row.conversation_id) is not None,
+            )
+        ],
+        user_email=user_email,
+        can_mutate=require_current_user(request).role != "viewer",
+    )
+    return items[0]
+
+
 async def _conversation_attention_context(
     session: Any,
     rows: list[Any],
@@ -768,7 +807,6 @@ async def _conversation_page_projection(
     include_shared: bool = False,
     session: AsyncSession | None = None,
 ) -> CursorPage[ConversationResponse]:
-    supplied_session = session
     cursor_payload = decode_cursor(cursor)
     cursor_scope = {
         "q": (title_query or "").strip().casefold(),
@@ -785,7 +823,6 @@ async def _conversation_page_projection(
     if cursor_payload is not None and cursor_payload.get("scope") != cursor_scope:
         raise api_exception(400, "invalid_cursor", "Cursor does not match the current filters")
     cursor_id = str(cursor_payload.get("id", "")) if cursor_payload is not None else None
-    turn_scheduler = getattr(request.app.state, "turn_scheduler", None)
     async with (
         nullcontext(session) if session is not None else request.app.state.session_factory()
     ) as session:
@@ -809,97 +846,14 @@ async def _conversation_page_projection(
         )
         has_more = len(rows) > limit
         page_rows = rows[:limit]
-        own_rows = [row for row in page_rows if row.user_email == user_email]
-        active_sessions, pending_notifications = await _conversation_attention_context(
+        active_turn_states = await _conversation_running_turn_states(request, session, page_rows)
+        items = await conversation_list_summaries(
             session,
-            own_rows,
-            user_email,
-        )
-        attention_rows = (
-            await list_attention_rows_by_conversation(
-                session,
-                owner_email=user_email,
-                conversation_ids=[row.conversation_id for row in own_rows],
-            )
-            if include_attention_actions
-            else {}
-        )
-        durable_running_many = (
-            getattr(turn_scheduler, "durable_running_turn_states", None)
-            if turn_scheduler is not None
-            else None
-        )
-        if callable(durable_running_many):
-            active_turn_states = await durable_running_many(
-                [row.conversation_id for row in own_rows],
-                session=session,
-            )
-        elif turn_scheduler is not None:
-            active_turn_states = {
-                row.conversation_id: turn_scheduler.running_turn_state(row.conversation_id)
-                for row in own_rows
-            }
-        else:
-            active_turn_states = {row.conversation_id: None for row in page_rows}
-        active_rows = [
-            row for row in page_rows if active_turn_states.get(row.conversation_id) is not None
-        ]
-        todo_snapshots = await list_conversation_todos_by_conversation(
-            session,
-            [row.conversation_id for row in active_rows],
-        )
-        conversation_states = await snapshots_for_conversations(
-            session,
-            user_email=user_email,
-            conversations=active_rows,
-            running_turn_states=active_turn_states,
-            active_sessions=active_sessions,
-            conversation_todos=todo_snapshots,
-        )
-        managed_links = await list_managed_conversation_links_for_targets(
-            session,
-            [
-                row.conversation_id
-                for row in page_rows
-                if (row.context_data or {}).get("kind")
-                in {"agent_work", "managed_agent_conversation"}
-            ],
-            user_email=user_email,
-        )
-    items: list[ConversationResponse] = []
-    for row in page_rows:
-        active_turn_state = active_turn_states.get(row.conversation_id)
-        items.append(
-            conversation_to_response(
-                row,
-                viewer_email=user_email,
-                has_active_turn=active_turn_state is not None,
-                active_session=(
-                    active_sessions.get(row.active_session_id) if row.active_session_id else None
-                ),
-                active_turn_state=active_turn_state,
-                pending_notification_types=pending_notifications.get(row.conversation_id, []),
-                attention_actions=[
-                    project_attention_summary(
-                        action_row,
-                        can_mutate=require_current_user(request).role != "viewer",
-                    )
-                    for action_row in attention_rows.get(row.conversation_id, [])
-                ],
-                conversation_state=conversation_states.get(row.conversation_id),
-                managed_link=managed_links.get(row.conversation_id),
-            )
-        )
-    async with (
-        nullcontext(supplied_session)
-        if supplied_session is not None
-        else request.app.state.session_factory()
-    ) as identity_session:
-        await enrich_conversation_identity(
-            identity_session,
-            items,
+            page_rows,
             user_email=user_email,
             can_mutate=require_current_user(request).role != "viewer",
+            active_turn_states=active_turn_states,
+            include_attention_actions=include_attention_actions,
         )
     next_cursor = (
         encode_cursor({"id": items[-1].conversation_id, "scope": cursor_scope})
@@ -1092,6 +1046,25 @@ async def _agent_direct_chat_projection(
             agent_ids=_filter_values(agent_id, agent_ids),
             changed_since=changed_since,
         )
+        from cognis.core.app_contact_access import list_app_contact_agents
+
+        known_agents = {agent.agent_id for agent, _conversation in rows}
+        contact_filter = _filter_values(agent_id, agent_ids)
+        contacts = await list_app_contact_agents(session, user_email)
+        if changed_since is not None and contacts:
+            # An unchanged main chat still takes precedence in a sidebar delta.
+            known_agents.update(
+                agent.agent_id
+                for agent, _conversation in await list_agent_direct_chat_rows(
+                    session, user_email, agent_ids=[agent.agent_id for agent, _ in contacts]
+                )
+            )
+        rows.extend(
+            (agent, conversation)
+            for agent, conversation in contacts
+            if agent.agent_id not in known_agents
+            and (not contact_filter or agent.agent_id in contact_filter)
+        )
         active_sessions, pending_notifications = await _conversation_attention_context(
             session,
             [conversation for _agent, conversation in rows],
@@ -1141,7 +1114,11 @@ async def _agent_direct_chat_projection(
         active_turn_state = active_turn_states.get(conversation.conversation_id)
         responses.append(
             AgentDirectChatResponse(
-                agent=agent_to_response(agent),
+                agent=(
+                    contact_agent_response(agent, conversation)
+                    if app_contact_binding_id(conversation)
+                    else agent_to_response(agent)
+                ),
                 conversation=conversation_to_response(
                     conversation,
                     has_active_turn=active_turn_state is not None,
@@ -1479,6 +1456,15 @@ async def _build_sidebar_projection(
                 )
             ]
         )
+        if not is_delta:
+            from cognis.core.app_contact_access import list_app_contact_agents
+
+            known_ids = {agent.agent_id for agent in agents}
+            agents.extend(
+                contact_agent_response(agent, conversation)
+                for agent, conversation in await list_app_contact_agents(session, user.email)
+                if agent.agent_id not in known_ids
+            )
         conversations = await _conversation_page_projection(
             request,
             user_email=user.email,
@@ -1735,6 +1721,7 @@ async def open_conversation(
         user_email=user.email,
         agent_id=payload.agent_id,
         agent_profile_id=payload.agent_profile_id,
+        agent_profile_mode=payload.agent_profile_mode,
         context=ConversationContext(
             type=context_type,
             ref=context_ref,
@@ -1806,7 +1793,10 @@ async def resolve_conversation(
                 user_email=user.email,
                 agent_id=payload.agent_id,
                 agent_profile_id=payload.agent_profile_id,
-                agent_profile_explicit=payload.agent_profile_id is not None,
+                agent_profile_explicit=(
+                    payload.agent_profile_id is not None or payload.agent_profile_mode == "default"
+                ),
+                agent_profile_mode=payload.agent_profile_mode,
             )
         )
     else:
@@ -1815,6 +1805,7 @@ async def resolve_conversation(
             user_email=user.email,
             agent_id=payload.agent_id,
             agent_profile_id=payload.agent_profile_id,
+            agent_profile_mode=payload.agent_profile_mode,
             context=ConversationContext(
                 type=payload.context_type,
                 ref=context_ref,
@@ -1873,6 +1864,7 @@ async def create_conversation(
         title_source="manual" if payload.title else "unset",
         project_id=project_id,
         visibility=payload.visibility or "project",
+        agent_profile_mode=payload.agent_profile_mode,
     )
     await _emit_sidebar_conversation_upsert(request, conversation.conversation_id)
     return await _conversation_response(request, conversation)
@@ -1937,14 +1929,7 @@ async def conversation_detail(
         # private runtime state, notifications, or pending actions.
         user = require_current_user(request)
         async with request.app.state.session_factory() as session:
-            return (
-                await enrich_conversation_identity(
-                    session,
-                    [conversation_to_response(row, viewer_email=user.email)],
-                    user_email=user.email,
-                    can_mutate=user.role != "viewer",
-                )
-            )[0]
+            return await _shared_conversation_response(request, session, row, user.email)
     return await _conversation_response(
         request,
         row,
@@ -1963,14 +1948,7 @@ async def remember_opened_conversation(
         row = await get_conversation(session, conversation_id)
         row = await _require_readable_conversation(request, row)
         if row.user_email != user.email:
-            return (
-                await enrich_conversation_identity(
-                    session,
-                    [conversation_to_response(row, viewer_email=user.email)],
-                    user_email=user.email,
-                    can_mutate=user.role != "viewer",
-                )
-            )[0]
+            return await _shared_conversation_response(request, session, row, user.email)
         if user.role != "viewer" and _is_openable_chat_conversation(
             row,
             user_email=user.email,
@@ -2001,6 +1979,8 @@ async def conversation_title_suggestion(
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
     row = _require_visible_conversation(request, row)
+    if row.title_source == "cognis" and row.title:
+        return ConversationTitleSuggestionResponse(title=row.title, available=True)
     platform_data = row.context_data or {}
     suggestion = latest_intaris_title_from_platform_data(platform_data)
     if suggestion:
@@ -2033,7 +2013,7 @@ async def conversation_title_suggestion(
 
     return ConversationTitleSuggestionResponse(
         available=False,
-        reason="No Intaris title suggestion is available yet.",
+        reason="No title suggestion is available yet.",
     )
 
 
@@ -2104,21 +2084,30 @@ async def update_conversation(
 
 @router.post("/{conversation_id}/read", response_model=dict)
 async def mark_read(request: Request, conversation_id: str) -> dict[str, bool]:
-    """Mark a conversation as read (sets last_read_at to now)."""
-    require_current_user(request)
+    """Acknowledge only the caller's read state, including authorized project readers."""
+    user = require_current_user(request)
     payload: dict[str, Any] | None = None
     user_email: str | None = None
     async with request.app.state.session_factory() as session:
         row = await get_conversation(session, conversation_id)
-        row = _require_visible_conversation(request, row)
-        user_email = row.user_email
-        await mark_conversation_read(session, conversation_id)
+        if row is None or row.status == "deleted":
+            raise api_exception(404, "not_found", "Conversation not found")
+        if not await can_read_conversation(session, row, user.email):
+            raise api_exception(403, "forbidden", "Resource access denied")
+        user_email = user.email
+        if row.user_email == user.email:
+            await mark_conversation_read(session, conversation_id)
+            read_at = row.last_read_at
+        else:
+            read_at = await mark_shared_conversation_read(session, conversation_id, user.email)
         payload = {
             "type": "conversation_updated",
             "conversation_id": row.conversation_id,
             "has_unread": False,
-            "last_read_at": row.last_read_at.isoformat() if row.last_read_at else None,
-            "last_message_at": row.last_message_at.isoformat() if row.last_message_at else None,
+            "last_read_at": utc_datetime(read_at).isoformat() if read_at else None,
+            "last_message_at": (
+                utc_datetime(row.last_message_at).isoformat() if row.last_message_at else None
+            ),
         }
         await session.commit()
     if payload is not None:
@@ -2175,6 +2164,29 @@ async def _validate_project_access(request: Request, project_id: str | None) -> 
     await check_project_access(request, project, required="use")
 
 
+async def _terminate_conversation_program_scope(
+    request: Request,
+    *,
+    conversation_id: str,
+    active_executor_id: str | None,
+) -> None:
+    executor = getattr(request.app.state.providers, "executor", None)
+    terminate = getattr(executor, "terminate_program_scope", None)
+    if not callable(terminate):
+        return
+    try:
+        await terminate(
+            conversation_id,
+            executor_ids=[active_executor_id] if active_executor_id else None,
+        )
+    except Exception:
+        logger.warning(
+            "program runtime cleanup failed for deleted conversation",
+            extra={"extra_data": {"conversation_id": conversation_id}},
+            exc_info=True,
+        )
+
+
 @router.delete("/{conversation_id}", response_model=dict)
 async def delete_conversation(request: Request, conversation_id: str) -> dict[str, bool]:
     forbid_mutation_for_viewer(request)
@@ -2192,6 +2204,11 @@ async def delete_conversation(request: Request, conversation_id: str) -> dict[st
             )
     ok = await request.app.state.session_manager.soft_delete_conversation(conversation_id)
     if ok:
+        await _terminate_conversation_program_scope(
+            request,
+            conversation_id=conversation_id,
+            active_executor_id=row.active_executor_id,
+        )
         await _emit_sidebar_conversation_removed(
             request, user_email=row.user_email, conversation_id=conversation_id
         )
@@ -2218,6 +2235,11 @@ async def purge_conversation(request: Request, conversation_id: str) -> dict[str
             )
     ok = await request.app.state.session_manager.purge_conversation(conversation_id)
     if ok:
+        await _terminate_conversation_program_scope(
+            request,
+            conversation_id=conversation_id,
+            active_executor_id=row.active_executor_id,
+        )
         await _emit_sidebar_conversation_removed(
             request, user_email=row.user_email, conversation_id=conversation_id
         )
@@ -2350,6 +2372,8 @@ async def slash_command_suggestions(
 async def _require_managed_conversation(
     request: Request,
     conversation_id: str,
+    *,
+    action: str,
 ) -> tuple[Any, Any]:
     user = require_current_user(request)
     forbid_mutation_for_viewer(request)
@@ -2365,6 +2389,12 @@ async def _require_managed_conversation(
         )
         if link is None:
             raise api_exception(404, "not_found", "Agent work link not found")
+        if link.kind == "channel" and action not in {"send", "close"}:
+            raise api_exception(
+                403,
+                "managed_channel_action_not_allowed",
+                "Channel conversations only support private instructions and termination.",
+            )
     return user, link
 
 
@@ -2560,15 +2590,32 @@ async def _send_managed_conversation_message(
                 "Managed conversation already has a queued admission"
             )
 
-    error = await request.app.state.turn_scheduler.submit_turn(
-        conversation_id,
-        message,
-        user_email=user_email,
-        one_shot_chat_mode=one_shot_chat_mode,
-        turn_id=turn_id,
-        turn_observers=(_ManagedApiTurnObserver(),),
-        admission_observer=_on_admitted,
-    )
+    if link.kind == "channel":
+        service = getattr(request.app.state.providers, "managed_channel_service", None)
+        if service is None:
+            raise api_exception(503, "unavailable", "Managed channel runtime is unavailable")
+        try:
+            error = await service.submit_controller_instruction(
+                link=link,
+                message=message,
+                turn_id=turn_id,
+                wait=wait,
+                turn_observers=(_ManagedApiTurnObserver(),),
+                control_metadata=_managed_control_metadata_for_new_turn(link),
+            )
+        except ValueError as exc:
+            raise api_exception(409, "managed_channel_conflict", str(exc)) from exc
+    else:
+        error = await request.app.state.turn_scheduler.submit_turn(
+            conversation_id,
+            message,
+            user_email=user_email,
+            one_shot_chat_mode=one_shot_chat_mode,
+            turn_id=turn_id,
+            user_message_metadata={"source": "controller_instruction"},
+            turn_observers=(_ManagedApiTurnObserver(),),
+            admission_observer=_on_admitted,
+        )
     if error is not None:
         raise _turn_error_to_http(error)
     result = None
@@ -2592,7 +2639,7 @@ async def managed_conversation_send(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    user, link = await _require_managed_conversation(request, conversation_id)
+    user, link = await _require_managed_conversation(request, conversation_id, action="send")
     if link.conversation_state == "closed":
         raise api_exception(409, "closed", "Agent work is closed")
     _require_inactive_managed_conversation(request, link, conversation_id)
@@ -2615,7 +2662,7 @@ async def managed_conversation_wait(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    await _require_managed_conversation(request, conversation_id)
+    await _require_managed_conversation(request, conversation_id, action="wait")
     waited = await request.app.state.turn_scheduler.wait_for_turn(
         conversation_id,
         timeout_seconds=30 if payload.wait else 0,
@@ -2636,7 +2683,7 @@ async def managed_conversation_interrupt(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    _, link = await _require_managed_conversation(request, conversation_id)
+    _, link = await _require_managed_conversation(request, conversation_id, action="interrupt")
     cancelled = await request.app.state.turn_scheduler.cancel_turn(conversation_id)
     async with request.app.state.session_factory() as session:
         await update_managed_conversation_link(
@@ -2660,7 +2707,7 @@ async def managed_conversation_stop(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    user, link = await _require_managed_conversation(request, conversation_id)
+    user, link = await _require_managed_conversation(request, conversation_id, action="stop")
     if link.conversation_state == "closed":
         raise api_exception(409, "closed", "Agent work is closed")
 
@@ -2714,7 +2761,7 @@ async def managed_conversation_retry(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    _, link = await _require_managed_conversation(request, conversation_id)
+    _, link = await _require_managed_conversation(request, conversation_id, action="retry")
     if link.turn_state not in {"failed", "interrupted"}:
         raise api_exception(
             409,
@@ -2744,7 +2791,20 @@ async def managed_conversation_close(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    _, link = await _require_managed_conversation(request, conversation_id)
+    _, link = await _require_managed_conversation(request, conversation_id, action="close")
+    if link.kind == "channel":
+        service = getattr(request.app.state.providers, "managed_channel_service", None)
+        if service is None:
+            raise api_exception(503, "unavailable", "Managed channel runtime is unavailable")
+        try:
+            await service.terminate_controller_conversation(
+                link_id=link.link_id,
+                owner_epoch=link.owner_epoch,
+                reason=payload.reason or "Terminated by owner from web UI",
+            )
+        except ValueError as exc:
+            raise api_exception(409, "managed_channel_close_conflict", str(exc)) from exc
+        return await _managed_action_response(request, conversation_id, "closed")
     await request.app.state.turn_scheduler.cancel_turn(conversation_id)
     async with request.app.state.session_factory() as session:
         await update_managed_conversation_link(
@@ -2766,7 +2826,7 @@ async def managed_conversation_fork(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    user, link = await _require_managed_conversation(request, conversation_id)
+    user, link = await _require_managed_conversation(request, conversation_id, action="fork")
     active_turn_id = request.app.state.turn_scheduler.active_turn_id(conversation_id)
     from cognis.core.session import _to_conversation_model, _to_session_model
     from cognis.models.agent import AgentDefinition
@@ -2879,7 +2939,9 @@ async def managed_conversation_take_control(
     conversation_id: str,
     payload: ManagedConversationActionRequest,
 ) -> ManagedConversationActionResponse:
-    user, link = await _require_managed_conversation(request, conversation_id)
+    user, link = await _require_managed_conversation(
+        request, conversation_id, action="take-control"
+    )
     if link.conversation_state == "closed":
         control_metadata = link.control_metadata or {}
         follow_up_conversation_id = control_metadata.get("follow_up_conversation_id")

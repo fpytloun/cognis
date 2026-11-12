@@ -9,18 +9,32 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from cognis.core.agent_loop import CHAT_POLICY, AgentLoop, PauseWaiter, SessionLock, StepContext
+from cognis.core.agent_loop import (
+    CHAT_POLICY,
+    AgentLoop,
+    PauseWaiter,
+    SessionLock,
+    StepContext,
+    _delegated_system_builtin_tool_ids,
+)
+from cognis.core.agent_registry import SYSTEM_AGENTS
 from cognis.core.context import events_to_messages
 from cognis.core.session_cache import SessionCache
 from cognis.core.tool_exposure import LLMApiMode, ToolDiscoveryMode, ToolExposureContract
+from cognis.core.tool_router import ToolRouter
 from cognis.models.agent import AgentDefinition
 from cognis.models.config import ModelInfo
 from cognis.models.session import EventAppendResult, EventReadResult, SessionEvent
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolResult, ToolSource, stable_tool_id
-from cognis.models.workflow import StepDefinition
+from cognis.models.workflow import (
+    StepDefinition,
+    StepProfileConfig,
+    StepProfileMode,
+    StepToolOverrides,
+)
 from cognis.providers.llm.responses_bridge import messages_to_responses_input
-from cognis.tools.builtin.skill_management import SKILL_LOAD_TOOL
+from cognis.tools.builtin.skill_management import SKILL_LOAD_TOOL, materialize_loaded_skill_context
 from cognis.tools.registry import RegisteredTool, ToolRegistry
 from tests.unit.test_agent_loop import (
     _FakeContextAssembler,
@@ -33,10 +47,11 @@ from tests.unit.test_agent_loop import (
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("reload_changed", [True, False])
 @pytest.mark.parametrize("api", ["chat", "responses", "anthropic", "fallback"])
-@pytest.mark.parametrize("declared", [False, True])
+@pytest.mark.parametrize("declared,specialist", [(False, False), (True, False), (True, True)])
 async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
-    api: str, declared: bool
+    api: str, declared: bool, specialist: bool, reload_changed: bool
 ) -> None:
     target = ToolDefinition(
         name="calendar_events",
@@ -89,8 +104,14 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
         def count_tokens(self, text: str, *_args: object) -> int:
             return len(text) // 4
 
-        async def generate(self, *_args: object, **_kwargs: object) -> dict:
-            return {"choices": [{"message": {"content": json.dumps({"tool_ids": [target_id]})}}]}
+        async def classify(self, request, **_kwargs: object) -> dict:
+            return {
+                "model": "routes/classifier",
+                "answers": {
+                    tool_id: {"type": "noul", "noul": 1.0 if tool_id == target_id else 0.0}
+                    for tool_id in request.questions
+                },
+            }
 
         async def stream_generate(self, messages: list[dict], **kwargs: object):
             if api == "fallback":
@@ -111,7 +132,7 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
                 exposed_instructions = [
                     message["content"]
                     for message in messages
-                    if "<skill>" in str(message.get("content"))
+                    if "<loaded_skill>" in str(message.get("content"))
                 ]
                 durable_content = {
                     event.data.get("content") for event in guardrails.recorded_events
@@ -140,15 +161,25 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
                 ]
             }
 
-    activation = {
-        "skill_id": "skill_calendar",
-        "name": "calendar",
-        "instructions": "Read the calendar.",
-        "description": "Calendar work.",
-        "content_hash": "calendar-v1",
-    }
+    def loaded_result(instructions: str, content_hash: str) -> ToolResult:
+        output, metadata = materialize_loaded_skill_context(
+            skill_id="skill_calendar",
+            name="calendar",
+            instructions=instructions,
+            description="Calendar work.",
+            tools=[],
+            templates={},
+            asset_refs=[],
+            steps=[],
+            tags=[],
+            linked_tool_ids=[target_id] if declared else None,
+            content_hash=content_hash,
+        )
+        return ToolResult(output=json.dumps(output), metadata=metadata)
+
+    initial_result = loaded_result("Read the calendar.", "calendar-v1")
     skill_result = ToolResult(
-        output="Loaded calendar.",
+        output=initial_result.output,
         attachments=[
             {
                 "artifact_id": "art_0123456789abcdef0123456789abcdef",
@@ -160,11 +191,7 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
                 "content_b64": "must-not-be-recorded",
             }
         ],
-        metadata={
-            "protected_context": "<skill>Read the calendar.</skill>",
-            "skill_activation": activation,
-            "discovered_tool_ids": [target_id] if declared else [],
-        },
+        metadata=initial_result.metadata,
     )
     registry = ToolRegistry()
     for tool in (SKILL_LOAD_TOOL, target):
@@ -200,14 +227,21 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
 
     guardrails = Guardrails()
     cache = SessionCache(guardrails)
-    skill_reload = deepcopy(skill_result)
-    skill_reload.metadata["protected_context"] = "<skill>Read the refreshed calendar.</skill>"
-    skill_reload.metadata["skill_activation"]["content_hash"] = "calendar-v2"
-    skill_reload.metadata["skill_activation"]["instructions"] = "Read the refreshed calendar."
+    skill_reload = loaded_result(
+        "Read the refreshed calendar." if reload_changed else "Read the calendar.",
+        "calendar-v2" if reload_changed else "calendar-v1",
+    )
+    skill_reload.attachments = deepcopy(skill_result.attachments)
+    result_router = ToolRouter(guardrails=guardrails)
     router = SimpleNamespace(
         execute=AsyncMock(
-            side_effect=[skill_result, ToolResult(output="Calendar evidence."), skill_reload]
-        )
+            side_effect=[
+                result_router._sanitize_result("skill_load", skill_result, 50_000),
+                ToolResult(output="Calendar evidence."),
+                result_router._sanitize_result("skill_load", skill_reload, 50_000),
+            ]
+        ),
+        finalize_skill_result=result_router.finalize_skill_result,
     )
     loop = AgentLoop(
         providers=SimpleNamespace(llm=llm, guardrails=guardrails),
@@ -230,12 +264,28 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
         mnemory_session_id=None,
     )
     agent = AgentDefinition(agent_id="agent-1", owner_email="user@example.com", name="Agent")
+    if specialist:
+        agent = SYSTEM_AGENTS["system:code-review"].model_copy(deep=True)
 
     def context() -> StepContext:
+        step = StepDefinition(
+            name="direct", type="run", prompt="", step_profile_id="system:direct-default"
+        )
+        if specialist:
+            step = StepDefinition(
+                name="delegation",
+                type="run",
+                prompt="",
+                step_profile_mode=StepProfileMode.HARD,
+                step_profile=StepProfileConfig(
+                    tool_overrides=StepToolOverrides(
+                        include=_delegated_system_builtin_tool_ids(agent, registry)
+                    ),
+                    allow_tool_search=True,
+                ),
+            )
         return StepContext(
-            step_definition=StepDefinition(
-                name="direct", type="run", prompt="", step_profile_id="system:direct-default"
-            ),
+            step_definition=step,
             session=session,
             conversation=SimpleNamespace(
                 conversation_id=session.conversation_id,
@@ -264,8 +314,21 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
         for event in recorded
         if event.type == "developer_message" and event.data.get("kind") == "loaded_skill"
     ]
-    assert len(loaded) == 2
+    assert len(loaded) == (2 if reload_changed else 1)
     assert all(event.data["activated_tool_ids"] == [target_id] for event in loaded)
+    final_results = [
+        json.loads(message["content"].split("\n", 1)[1].rsplit("\n", 1)[0])
+        for message in llm.requests[3]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call_3"
+    ]
+    assert final_results[0]["status"] == ("loaded" if reload_changed else "already_loaded")
+    assert final_results[0]["instructions_loaded"] is reload_changed
+    assert next(
+        message["content"] for message in llm.requests[3] if message.get("tool_call_id") == "call_3"
+    ).startswith('<tool_result trust="untrusted">\n')
+    if reload_changed:
+        assert "replace the previously loaded instructions" in loaded[-1].data["content"]
+        assert "Read the refreshed calendar." in loaded[-1].data["content"]
     assert not any(event.data.get("event") == "prompt_injections" for event in recorded)
     assert "must-not-be-recorded" not in json.dumps([event.data for event in recorded])
     live_aux = [
@@ -273,7 +336,11 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
         for message in llm.requests[3]
         if any(
             marker in str(message.get("content"))
-            for marker in ("<skill>", "<skill_activation", "Untrusted tool output from skill_load")
+            for marker in (
+                "<loaded_skill>",
+                "<skill_activation",
+                "Untrusted tool output from skill_load",
+            )
         )
     ]
     cold_aux = [
@@ -281,7 +348,7 @@ async def test_skill_load_preserves_complete_tools_prefix_and_cold_eligibility(
         for message in events_to_messages(recorded, model_info=await llm.get_model_info())
         if message.get("_tool_context_call_id") or message.get("_tool_attachment_context")
     ]
-    assert len(live_aux) == 6
+    assert len(live_aux) == (6 if reload_changed else 5)
     assert messages_to_responses_input(cold_aux) == messages_to_responses_input(live_aux)
     if api in {"anthropic", "fallback"}:
         from cognis.providers.llm.anthropic.integration import _convert_messages

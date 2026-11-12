@@ -84,9 +84,8 @@ async def test_actual_prompt_current_policy_is_not_historical_denial_authority(
     assert '"evaluation_mode": "legacy"' in notice
     assert '"interaction_mode": "none"' in notice
     assert '"revision": 7' in notice
-    assert "historical, not automatic proof" in notice
-    assert "not a new user grant" in notice
-    assert "Explicit human refusals" in notice
+    assert "not a user grant" in notice
+    assert "explicit human refusals" in notice
     assert "POLICY_PROSE_MUST_NOT_DUPLICATE" not in notice
     assert len(notice.encode()) < 1800
     pruned = assembler._prune_messages(

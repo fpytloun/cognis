@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import os
 import re
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -18,6 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from cognis.core.agent_direct import AGENT_DIRECT_KIND, agent_direct_context_ref
 from cognis.core.agent_registry import SYSTEM_AGENTS
 from cognis.core.canonical_history import read_complete_history
+from cognis.core.delegate_configuration import (
+    DELEGATE_CONFIGURATION_KEY,
+    DelegateConfiguration,
+    delegated_configuration,
+)
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import FollowUpPolicy
 from cognis.core.immutable_prefix import (
@@ -25,6 +31,12 @@ from cognis.core.immutable_prefix import (
     ImmutablePrefixEntry,
     build_context_snapshot_event,
     build_prefix_message_events,
+)
+from cognis.core.initial_profile_selection import (
+    SELECTION_KEY,
+    ProfileSelectionMode,
+    initial_profile_metadata,
+    initial_profile_pending,
 )
 from cognis.core.session_cache import CachedEvent
 from cognis.core.session_event_types import INTARIS_APPENDABLE_EVENT_TYPES
@@ -52,6 +64,9 @@ from cognis.runtime_context import (
 )
 from cognis.store import queries
 from cognis.store.coordination import DatabaseLeaseStore, Lease
+from cognis.store.models import Session as SessionRow
+
+SessionCreationParticipant = Callable[[AsyncSession, SessionRow, bool], Awaitable[None]]
 
 logger = get_logger(__name__)
 
@@ -341,6 +356,14 @@ def _intaris_session_policy(
     if session_policy is None and runtime_access is not None:
         session_policy = runtime_access.session_policy
     policy.update(merge_session_policies(session_policy))
+    if inherited_evaluation is not None:
+        # Intaris inherits the parent's activated allowances. Ambient task
+        # clauses are not independent authorization for a delegated child.
+        policy.pop("allow_policies", None)
+    if isinstance(conversation_data, dict) and "managed_session_policy" in conversation_data:
+        # Managed roots are an independent configuration boundary, even when
+        # the target and controller have the same agent identity.
+        policy.pop("intaris_evaluation", None)
     from cognis.models.intaris_policy import DEFAULT_INTARIS_EVALUATION
 
     evaluation = (
@@ -457,6 +480,30 @@ class SessionManager:
             return str(policy["profile"])
         raise ValueError("Parent has an unsupported Intaris evaluation policy")
 
+    async def effective_session_agent(
+        self, session: SessionModel, agent: AgentDefinition
+    ) -> AgentDefinition:
+        """Apply persisted delegate configuration without changing runtime identity."""
+        configuration = delegated_configuration(session.delegation_metadata)
+        if configuration is not None:
+            return configuration.apply(agent)
+        # Pre-snapshot delegates reconstruct configuration from their owning
+        # parent. New children persist the snapshot before external provisioning.
+        if session.parent_session_id and session.delegation_mode in {
+            "delegate_sync",
+            "delegate_async",
+        }:
+            async with self.session_factory() as db_session:
+                parent_row = await queries.get_session_row(db_session, session.parent_session_id)
+                if parent_row is None or parent_row.user_email != session.user_email:
+                    raise ValueError("Delegated configuration parent is unavailable")
+                parent = _to_session_model(parent_row)
+                parent_agent = await self._require_agent(db_session, parent.agent_id)
+                conversation = await queries.get_conversation(db_session, parent.conversation_id)
+            parent_agent = await self.effective_session_agent(parent, parent_agent)
+            return DelegateConfiguration.capture(parent_agent, parent, conversation).apply(agent)
+        return agent
+
     async def set_conversation_yolo(
         self, conversation: ConversationModel, session: SessionModel, *, enabled: bool
     ) -> None:
@@ -550,6 +597,7 @@ class SessionManager:
                 db_session, session.conversation_id
             )
             project_paths = await _project_source_paths(db_session, project_id)
+        agent = await self.effective_session_agent(session, agent)
         inherited_evaluation = None
         if session.parent_session_id:
             async with self.session_factory() as db_session:
@@ -578,26 +626,39 @@ class SessionManager:
             return None
         intaris_session_id = session.intaris_session_id or session.session_id
         if hasattr(self.providers.guardrails, "update_session_policy"):
+            from cognis.core.policy_acknowledgements import (
+                policy_acknowledgement,
+            )
+
+            request: dict[str, Any] = {
+                "agent_id": session.agent_id,
+                "user_id": session.user_email,
+                "details": _intaris_session_details(workdir),
+                "policy": new_policy,
+                "analytics_enabled": agent.capabilities.analytics_enabled,
+                "guardrails_enabled": agent.capabilities.guardrails_enabled,
+            }
             try:
-                acknowledged_policy = await self.providers.guardrails.update_session_policy(
-                    intaris_session_id,
-                    agent_id=session.agent_id,
-                    user_id=session.user_email,
-                    details=_intaris_session_details(workdir),
-                    policy=new_policy,
-                )
-                return acknowledged_policy if isinstance(acknowledged_policy, dict) else new_policy
+                with policy_acknowledgement(intaris_session_id, request) as acknowledgement:
+                    if acknowledgement.policy is not None:
+                        return acknowledgement.policy
+                    acknowledged_policy = await self.providers.guardrails.update_session_policy(
+                        intaris_session_id,
+                        **request,
+                    )
+                    result = (
+                        acknowledged_policy if isinstance(acknowledged_policy, dict) else new_policy
+                    )
+                    acknowledgement.acknowledge(result)
+                    return result
             except Exception:
                 logger.warning(
                     "session: failed to refresh Intaris session policy",
                     extra={"extra_data": {"session_id": session.session_id}},
                     exc_info=True,
                 )
-                if new_policy.get("maximum_outcome") is not None or new_policy.get(
-                    "evaluation_policy_version"
-                ) in ("legacy", "hybrid_v1"):
-                    raise
-        return None
+                raise
+        raise ValueError("Guardrails provider cannot acknowledge session configuration")
 
     async def create_conversation(
         self,
@@ -606,6 +667,7 @@ class SessionManager:
         agent_id: str,
         context: ConversationContext,
         agent_profile_id: str | None = None,
+        agent_profile_mode: ProfileSelectionMode | None = None,
         title: str | None = None,
         title_source: str = "unset",
         conversation_id: str | None = None,
@@ -616,6 +678,13 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
+                agent = await self._require_agent(db_session, agent_id)
+                context_data = {
+                    **context.platform_data,
+                    SELECTION_KEY: initial_profile_metadata(
+                        agent, agent_profile_id, agent_profile_mode
+                    ),
+                }
                 conversation = await queries.create_conversation(
                     db_session,
                     user_email=user_email,
@@ -625,7 +694,7 @@ class SessionManager:
                     title=title,
                     title_source=title_source,
                     context_ref=context.ref,
-                    context_data=context.platform_data,
+                    context_data=context_data,
                     memory_labels=dict(context.memory_labels),
                     conversation_id=conversation_id,
                     project_id=project_id,
@@ -644,6 +713,7 @@ class SessionManager:
         agent_id: str,
         agent_profile_id: str | None = None,
         agent_profile_explicit: bool = False,
+        agent_profile_mode: ProfileSelectionMode | None = None,
     ) -> ConversationModel:
         """Return the sticky web direct chat for a user/agent pair."""
 
@@ -658,6 +728,14 @@ class SessionManager:
                     agent_id,
                 )
                 if existing is not None:
+                    if agent_profile_explicit and initial_profile_pending(existing.context_data):
+                        existing.context_data = {
+                            **(existing.context_data or {}),
+                            SELECTION_KEY: initial_profile_metadata(
+                                agent, agent_profile_id, "default"
+                            ),
+                        }
+                        await db_session.commit()
                     if existing.context_ref != context_ref:
                         if not await queries.mark_conversation_agent_direct(
                             db_session,
@@ -719,7 +797,12 @@ class SessionManager:
                         title=direct_title,
                         title_source="agent_direct",
                         context_ref=context_ref,
-                        context_data={"kind": AGENT_DIRECT_KIND},
+                        context_data={
+                            "kind": AGENT_DIRECT_KIND,
+                            SELECTION_KEY: initial_profile_metadata(
+                                agent, agent_profile_id, agent_profile_mode
+                            ),
+                        },
                         memory_labels={},
                     )
                     await db_session.commit()
@@ -748,6 +831,7 @@ class SessionManager:
         intention: str,
         agent_profile_id: str | None = None,
         session_id: str | None = None,
+        previous_session_id: str | None = None,
     ) -> SessionModel:
         """Create a root session and corresponding Intaris session."""
 
@@ -773,6 +857,7 @@ class SessionManager:
                     agent_id=agent_id,
                     agent_profile_id=agent_profile_id,
                     session_id=session_id,
+                    previous_session_id=previous_session_id,
                 )
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
@@ -789,6 +874,8 @@ class SessionManager:
                         intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        analytics_enabled=agent.capabilities.analytics_enabled,
+                        guardrails_enabled=agent.capabilities.guardrails_enabled,
                         details=_intaris_session_details(workdir),
                         policy=_intaris_session_policy(
                             workdir,
@@ -837,6 +924,11 @@ class SessionManager:
 
         normalized_intention = _normalize_intention(intention)
         async with self.session_factory() as db_session:
+            from cognis.core.app_contact_access import app_contact_binding_id
+
+            conversation_row = await queries.get_conversation(db_session, conversation_id)
+            if conversation_row is not None and app_contact_binding_id(conversation_row):
+                raise ValueError("App contact projections cannot own agent execution sessions")
             session_row = None
             try:
                 agent = await self._require_agent(db_session, agent_id)
@@ -866,6 +958,8 @@ class SessionManager:
                         intention=normalized_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        analytics_enabled=agent.capabilities.analytics_enabled,
+                        guardrails_enabled=agent.capabilities.guardrails_enabled,
                         details=_intaris_session_details(workdir, source=source_label),
                         policy=_intaris_session_policy(
                             workdir,
@@ -885,6 +979,9 @@ class SessionManager:
                 )
                 if not claimed:
                     winner = await queries.get_conversation(db_session, conversation_id)
+                    if winner is not None:
+                        # A losing UPDATE can still synchronize the cached pointer.
+                        await db_session.refresh(winner, ["active_session_id"])
                     active_session_id = winner.active_session_id if winner is not None else None
                     await db_session.delete(session_row)
                     await db_session.commit()
@@ -911,6 +1008,7 @@ class SessionManager:
         agent_id: str,
         context: ConversationContext,
         agent_profile_id: str | None = None,
+        agent_profile_mode: ProfileSelectionMode | None = "default",
         title: str | None = None,
         title_source: str = "unset",
         intention: str | None = None,
@@ -953,7 +1051,12 @@ class SessionManager:
                     title=title,
                     title_source=title_source,
                     context_ref=context.ref,
-                    context_data=context.platform_data,
+                    context_data={
+                        **context.platform_data,
+                        SELECTION_KEY: initial_profile_metadata(
+                            agent, agent_profile_id, agent_profile_mode
+                        ),
+                    },
                     memory_labels=dict(context.memory_labels),
                     project_id=project_id,
                     conversation_id=conversation_id,
@@ -1000,6 +1103,8 @@ class SessionManager:
                         intention=resolved_intention,
                         agent_id=agent_id,
                         user_id=user_email,
+                        analytics_enabled=agent.capabilities.analytics_enabled,
+                        guardrails_enabled=agent.capabilities.guardrails_enabled,
                         details=_intaris_session_details(workdir, source=source_label),
                         policy=_intaris_session_policy(
                             workdir,
@@ -1343,6 +1448,12 @@ class SessionManager:
                 db_session, current_session.conversation_id
             )
             project_paths = await _project_source_paths(db_session, project_id)
+        remote = await self.providers.guardrails.get_session(
+            current_session.intaris_session_id or current_session.session_id,
+            user_email=current_session.user_email,
+            agent_id=current_session.agent_id,
+            agent_owner_email=agent.owner_email,
+        )
         session_id = f"sess_{uuid.uuid4().hex}"
         workdir = _resolve_runtime_workdir()
         with scoped_runtime_context(
@@ -1355,6 +1466,8 @@ class SessionManager:
                 intention=_normalize_intention(intention),
                 agent_id=current_session.agent_id,
                 user_id=current_session.user_email,
+                analytics_enabled=remote.analytics_enabled,
+                guardrails_enabled=remote.guardrails_enabled,
                 details=_intaris_session_details(workdir, source="cognis:undo"),
                 policy=_intaris_session_policy(
                     workdir,
@@ -1474,6 +1587,8 @@ class SessionManager:
         workspace_root: str | None = None,
         working_directory: str | None = None,
         session_id: str | None = None,
+        creation_participant: SessionCreationParticipant | None = None,
+        parent_agent: AgentDefinition | None = None,
     ) -> SessionModel:
         """Create a delegated child session and corresponding Intaris session."""
 
@@ -1481,23 +1596,62 @@ class SessionManager:
         if parent_session:
             # Built-in specialists are execution roles, not separately configured
             # policy owners. Read the parent's effective mode before opening
-            # the child-creation transaction; do not copy grants or bounds.
+            # the child-creation transaction. Access grants remain separate;
+            # Intaris still composes and enforces the parent's current bounds.
             inherited_evaluation = await self._delegated_evaluation(parent_session)
+
+        async with self.session_factory() as db_session:
+            configuration_agent = parent_agent or await self._require_agent(
+                db_session, parent_session.agent_id
+            )
+            parent_conversation = await queries.get_conversation(
+                db_session, parent_session.conversation_id
+            )
+        configuration_agent = await self.effective_session_agent(
+            parent_session, configuration_agent
+        )
+        configuration = DelegateConfiguration.capture(
+            configuration_agent, parent_session, parent_conversation
+        )
+        delegation_metadata = dict(delegation_metadata or {})
+        delegation_metadata[DELEGATE_CONFIGURATION_KEY] = configuration.model_dump(mode="json")
 
         async with self.session_factory() as db_session:
             try:
                 child_agent = await self._require_agent(db_session, agent_id)
+                from cognis.core.task_execution import assert_task_execution_fence
+
+                # Use the recovery/finalization lock order: task, then child.
+                # Release the transaction before provisioning in Intaris.
+                await assert_task_execution_fence(db_session)
+                if delegation_metadata.get("task_call"):
+                    import hashlib
+                    import json
+
+                    delegation_metadata["task_child_agent_fingerprint"] = hashlib.sha256(
+                        json.dumps(child_agent.model_dump(mode="json"), sort_keys=True).encode()
+                    ).hexdigest()
+                child_agent = configuration.apply(child_agent)
                 conversation = await queries.get_conversation(
                     db_session, parent_session.conversation_id
                 )
                 session_row = (
                     await queries.get_session_row(db_session, session_id) if session_id else None
                 )
+                created = session_row is None
                 if session_row is not None:
                     # Execution adds runtime observations and may switch profiles.
                     # Neither changes the provisioned child's reservation identity.
                     reservation_metadata = dict(session_row.delegation_metadata or {})
                     reservation_metadata.pop("execution_runtime", None)
+                    reservation_metadata.pop("task_runtime_fingerprint", None)
+                    reservation_metadata.pop("task_execution_turn_id", None)
+                    reservation_metadata.pop("task_continuation", None)
+                    stored_configuration = reservation_metadata.pop(
+                        DELEGATE_CONFIGURATION_KEY, None
+                    )
+                    expected_metadata = dict(delegation_metadata)
+                    expected_metadata.pop(DELEGATE_CONFIGURATION_KEY, None)
                     if (
                         session_row.conversation_id != parent_session.conversation_id
                         or session_row.parent_session_id != parent_session.session_id
@@ -1508,10 +1662,19 @@ class SessionManager:
                             and session_row.agent_profile_id != agent_profile_id
                         )
                         or session_row.delegation_mode != mode
-                        or reservation_metadata != (delegation_metadata or {})
+                        or reservation_metadata != expected_metadata
                     ):
                         raise ValueError("Child reservation identity mismatch")
+                    if stored_configuration is not None:
+                        configuration = DelegateConfiguration.model_validate(stored_configuration)
+                        child_agent = configuration.apply(child_agent)
+                        delegation_metadata[DELEGATE_CONFIGURATION_KEY] = stored_configuration
+                    else:
+                        session_row.delegation_metadata = delegation_metadata
                     if session_row.intaris_session_id:
+                        if creation_participant is not None:
+                            await creation_participant(db_session, session_row, False)
+                        await db_session.commit()
                         return _to_session_model(session_row)
                 else:
                     session_row = await queries.create_session(
@@ -1576,33 +1739,48 @@ class SessionManager:
                     if conversation is not None
                     else None,
                 )
-                if session_id is not None:
-                    await db_session.commit()
-                with scoped_runtime_context(
-                    user_email=parent_session.user_email,
-                    agent_id=parent_session.agent_id,
-                    agent_owner_email=child_agent.owner_email,
-                ):
-                    await self.providers.guardrails.create_session(
-                        session_id=session_row.session_id,
-                        intention=resolved_intention,
-                        agent_id=agent_id,
-                        user_id=parent_session.user_email,
-                        parent_session_id=parent_session.intaris_session_id
-                        or parent_session.session_id,
-                        details=child_details,
-                        policy=child_policy,
-                    )
-                await queries.set_session_intaris_session_id(
-                    db_session, session_row.session_id, session_row.session_id
-                )
+                if creation_participant is not None:
+                    await creation_participant(db_session, session_row, created)
+                reserved = _to_session_model(session_row)
+                child_agent_owner = child_agent.owner_email
                 await db_session.commit()
             except Exception:
                 await db_session.rollback()
                 raise
 
-        session_row.intaris_session_id = session_row.session_id
-        return _to_session_model(session_row)
+        # Commit the reservation and explicit authority before external provisioning.
+        try:
+            with scoped_runtime_context(
+                user_email=parent_session.user_email,
+                agent_id=parent_session.agent_id,
+                agent_owner_email=child_agent_owner,
+            ):
+                await self.providers.guardrails.create_session(
+                    session_id=reserved.session_id,
+                    intention=resolved_intention,
+                    agent_id=agent_id,
+                    user_id=parent_session.user_email,
+                    parent_session_id=parent_session.intaris_session_id
+                    or parent_session.session_id,
+                    details=child_details,
+                    policy=child_policy,
+                    analytics_enabled=child_agent.capabilities.analytics_enabled,
+                    guardrails_enabled=child_agent.capabilities.guardrails_enabled,
+                )
+        except BaseException:
+            # Caller-reserved IDs retain their existing reconciliation path.
+            if created and session_id is None:
+                with contextlib.suppress(Exception):
+                    await self.mark_failed(
+                        reserved.session_id, result_summary="Child provisioning failed"
+                    )
+            raise
+        async with self.session_factory() as db_session:
+            await queries.set_session_intaris_session_id(
+                db_session, reserved.session_id, reserved.session_id
+            )
+            await db_session.commit()
+        return reserved.model_copy(update={"intaris_session_id": reserved.session_id})
 
     async def attach_mnemory_session(self, session_id: str, mnemory_session_id: str) -> bool:
         """Persist the first Mnemory session ID for a Cognis session."""
@@ -1724,6 +1902,47 @@ class SessionManager:
             await self._sync_intaris_status(session_id, "active")
         return updated
 
+    async def resolve_reserved_child_continuation(self, original: SessionModel) -> SessionModel:
+        """Follow only a single, scope-preserving physical child rotation chain."""
+        from sqlalchemy import select
+
+        from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+        from cognis.store.models import Session as SessionRow
+
+        current = original
+        seen = {original.session_id}
+        async with self.session_factory() as db:
+            for _ in range(128):
+                successors = list(
+                    (
+                        await db.execute(
+                            select(SessionRow)
+                            .where(SessionRow.previous_session_id == current.session_id)
+                            .limit(2)
+                        )
+                    ).scalars()
+                )
+                if not successors:
+                    return current
+                if len(successors) != 1:
+                    raise TaskRecoveryBlocked("Delegated child continuation is ambiguous.")
+                successor = _to_session_model(successors[0])
+                if (
+                    successor.session_id in seen
+                    or successor.user_email != original.user_email
+                    or successor.agent_id != original.agent_id
+                    or successor.parent_session_id != original.parent_session_id
+                    or successor.conversation_id != original.conversation_id
+                    or successor.delegation_metadata.get("task_call")
+                    != original.delegation_metadata.get("task_call")
+                    or successor.delegation_metadata.get("delegate_configuration")
+                    != original.delegation_metadata.get("delegate_configuration")
+                ):
+                    raise TaskRecoveryBlocked("Delegated child continuation scope does not match.")
+                current = successor
+                seen.add(current.session_id)
+        raise TaskRecoveryBlocked("Delegated child continuation chain exceeds recovery bounds.")
+
     async def mark_completed(
         self,
         session_id: str,
@@ -1735,6 +1954,9 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
+                from cognis.core.task_execution import assert_task_execution_fence
+
+                await assert_task_execution_fence(db_session)
                 updated = await queries.set_session_status(
                     db_session,
                     session_id,
@@ -1769,6 +1991,9 @@ class SessionManager:
 
         async with self.session_factory() as db_session:
             try:
+                from cognis.core.task_execution import assert_task_execution_fence
+
+                await assert_task_execution_fence(db_session)
                 updated = await queries.set_session_status(
                     db_session,
                     session_id,
@@ -1902,21 +2127,26 @@ class SessionManager:
         durable_summary_events: list[SessionEvent] = []
         summary_result: Any | None = None
 
-        # Compaction changes storage, not the task. Read the durable intention
-        # before taking rotation locks; retrieval failure leaves the old lane
-        # intact rather than silently creating a generic authorization scope.
-        if transition is SessionTransition.COMPACT:
-            async with self.session_factory() as db_session:
-                source_agent = await self._require_agent(db_session, current_session.agent_id)
-                source_owner = source_agent.owner_email
-            remote = await self.providers.guardrails.get_session(
-                current_session.intaris_session_id or current_session.session_id,
-                user_email=current_session.user_email,
-                agent_id=current_session.agent_id,
-                agent_owner_email=source_owner,
-            )
-            if remote.intention and remote.intention.strip():
-                intention = remote.intention
+        # Read durable preferences before rotation locks. Failure leaves the old
+        # lane intact; explicit false must never be replaced by agent defaults.
+        async with self.session_factory() as db_session:
+            source_agent = await self._require_agent(db_session, current_session.agent_id)
+        source_agent = await self.effective_session_agent(current_session, source_agent)
+        remote = await self.providers.guardrails.get_session(
+            current_session.intaris_session_id or current_session.session_id,
+            user_email=current_session.user_email,
+            agent_id=current_session.agent_id,
+            agent_owner_email=source_agent.owner_email,
+        )
+        inherited_evaluation = None
+        if current_session.parent_session_id:
+            inherited_evaluation = await self._delegated_evaluation(current_session)
+        if (
+            transition is SessionTransition.COMPACT
+            and remote.intention
+            and remote.intention.strip()
+        ):
+            intention = remote.intention
 
         async with self.session_factory() as db_session:
             try:
@@ -2012,7 +2242,7 @@ class SessionManager:
                 project_id = await self._lookup_conversation_project_id(db_session, conversation_id)
                 project_paths = await _project_source_paths(db_session, project_id)
                 workdir = _resolve_runtime_workdir()
-                agent = await self._require_agent(db_session, current_session.agent_id)
+                agent = source_agent
                 agent_owner_email = agent.owner_email
                 with scoped_runtime_context(
                     user_email=current_session.user_email,
@@ -2024,12 +2254,15 @@ class SessionManager:
                         intention=_normalize_intention(intention),
                         agent_id=current_session.agent_id,
                         user_id=current_session.user_email,
+                        analytics_enabled=remote.analytics_enabled,
+                        guardrails_enabled=remote.guardrails_enabled,
                         parent_session_id=current_session.parent_session_id,
                         details=_intaris_session_details(workdir),
                         policy=_intaris_session_policy(
                             workdir,
                             project_paths=project_paths,
                             agent=agent,
+                            inherited_evaluation=inherited_evaluation,
                             conversation_data=conversation.context_data
                             if conversation is not None
                             else None,
@@ -2319,8 +2552,16 @@ class SessionManager:
     ) -> None:
         """Copy recent un-compacted events into the rotated session."""
 
+        from cognis.core.compaction.projection import (
+            carried_event_sequence_map,
+            remap_projection_event_decisions,
+        )
+        from cognis.core.context_projection import projection_decision_batches
+
         session_id = new_session.intaris_session_id or new_session.session_id
         cloned_events: list[SessionEvent] = []
+        cloned_source_seqs: list[int | None] = []
+        projection_decisions: list[Any] = []
         skipped_event_types: dict[str, int] = {}
         for event in tail_events:
             event_type = getattr(event, "type", None)
@@ -2330,6 +2571,18 @@ class SessionManager:
             if event_type not in INTARIS_APPENDABLE_EVENT_TYPES:
                 skipped_event_types[event_type] = skipped_event_types.get(event_type, 0) + 1
                 continue
+            if event_type == "lifecycle" and data.get("event") == "conversation_recap":
+                continue
+            if event_type == "lifecycle" and data.get("event") == "context_projection":
+                decisions = data.get("decisions")
+                if isinstance(decisions, list):
+                    if data.get("compaction_tail") is True:
+                        decisions = remap_projection_event_decisions(
+                            decisions,
+                            carried_event_sequence_map(tail_events, data.get("source_session_id")),
+                        )
+                    projection_decisions.extend(decisions)
+                continue
             cloned_data = copy.deepcopy(data)
             cloned_data.setdefault("compaction_tail", True)
             cloned_data.setdefault("source_session_id", previous_session_id)
@@ -2337,6 +2590,7 @@ class SessionManager:
             if isinstance(source_seq, int):
                 cloned_data.setdefault("source_seq", source_seq)
             cloned_events.append(SessionEvent(type=event_type, data=cloned_data))
+            cloned_source_seqs.append(source_seq if isinstance(source_seq, int) else None)
         if skipped_event_types:
             logger.info(
                 "session: skipped non-appendable compaction tail events",
@@ -2355,6 +2609,7 @@ class SessionManager:
             cloned_events[index : index + batch_size]
             for index in range(0, len(cloned_events), batch_size)
         ]
+        sequence_map: dict[int, int] = {}
         try:
             with scoped_runtime_context(
                 user_email=new_session.user_email,
@@ -2378,8 +2633,69 @@ class SessionManager:
                     append_recorded_events = getattr(
                         self.session_cache, "append_recorded_events", None
                     )
+                    if not append_result.ok or append_result.count != len(batch_events):
+                        raise RuntimeError("Failed to seed rotated tail events")
+                    sequence_map.update(
+                        {
+                            source_seq: append_result.first_seq + index
+                            for index, source_seq in enumerate(
+                                cloned_source_seqs[
+                                    batch_index * batch_size : (batch_index + 1) * batch_size
+                                ]
+                            )
+                            if source_seq is not None
+                        }
+                    )
                     if append_result.ok and callable(append_recorded_events):
                         await append_recorded_events(new_session, batch_events, append_result)
+
+                # Intaris assigns destination sequences. Publish these rules only
+                # after every copied target has a confirmed destination identity.
+                remapped: dict[str, list[dict[str, Any]]] = {}
+                for decision in remap_projection_event_decisions(
+                    projection_decisions, sequence_map
+                ):
+                    event_seq = decision.get("event_seq")
+                    call_id = (
+                        f"event:{event_seq}"
+                        if decision.get("operation") == "omit_event"
+                        else decision.get("call_id")
+                    )
+                    if not isinstance(call_id, str) or not call_id:
+                        continue
+                    value = {
+                        key: decision[key]
+                        for key in ("operation", "rendering_policy_version", "parameters")
+                        if key in decision
+                    }
+                    values = remapped.setdefault(call_id, [])
+                    if value not in values:
+                        values.append(value)
+                for batch_index, projection_data in enumerate(
+                    projection_decision_batches(remapped)
+                ):
+                    projection_events = [
+                        SessionEvent(
+                            type="lifecycle",
+                            data=projection_data,
+                        )
+                    ]
+                    append_result = await self.providers.guardrails.record_events(
+                        session_id=session_id,
+                        events=projection_events,
+                        source="cognis",
+                        idempotency_key=(
+                            f"{new_session.session_id}:compaction_tail_projection:"
+                            f"{previous_session_id}:batch:{batch_index + 1}"
+                        ),
+                        retry_missing_session=True,
+                        user_email=new_session.user_email,
+                        agent_id=new_session.agent_id,
+                    )
+                    if not append_result.ok or append_result.count != len(projection_events):
+                        raise RuntimeError("Failed to seed rotated projection decisions")
+                    if callable(append_recorded_events):
+                        await append_recorded_events(new_session, projection_events, append_result)
         except Exception as exc:
             extra_data: dict[str, Any] = {"session_id": new_session.session_id}
             if isinstance(exc, httpx.HTTPStatusError):
@@ -2520,7 +2836,7 @@ class SessionManager:
                             },
                         )
                     )
-                follow_up_policy = FollowUpPolicy(llm=None)
+                follow_up_policy = FollowUpPolicy()
                 for child_session in recovered_child_sessions:
                     if str(getattr(child_session, "delegation_mode", "")) not in {
                         "delegate_async",

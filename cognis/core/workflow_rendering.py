@@ -10,9 +10,10 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dateutil.relativedelta import relativedelta
-from jinja2 import StrictUndefined, nodes
+from jinja2 import StrictUndefined, nodes, pass_eval_context
 from jinja2.exceptions import SecurityError, TemplateError
-from jinja2.filters import do_default
+from jinja2.filters import do_default, do_tojson
+from jinja2.nodes import EvalContext
 from jinja2.sandbox import SandboxedEnvironment
 
 from cognis import json_codec as json
@@ -175,6 +176,12 @@ def _bounded_join(values: list[Any], separator: str = "") -> str:
     return separator.join(parts)
 
 
+@pass_eval_context
+def _tojson_text(context: EvalContext, value: Any, indent: int | None = None) -> str:
+    # Workflow arguments are JSON data, not HTML; do not leak Jinja's Markup subtype.
+    return str(do_tojson(context, value, indent))
+
+
 class WorkflowRenderer:
     """Render workflow templates against an immutable JSON-like context."""
 
@@ -188,14 +195,14 @@ class WorkflowRenderer:
         self._environment.filters["length"] = len
         # Bounded JSON-like contexts make these pure formatting filters safe for
         # conditions and evidence-bearing prompts as well as workflow templates.
-        from jinja2.filters import do_lower, do_tojson, do_trim, do_upper
+        from jinja2.filters import do_lower, do_trim, do_upper
 
         self._environment.filters.update(
             {
                 "lower": do_lower,
                 "upper": do_upper,
                 "trim": do_trim,
-                "tojson": do_tojson,
+                "tojson": _tojson_text,
             }
         )
         self._environment.filters["join"] = _bounded_join

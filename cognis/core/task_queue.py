@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from prometheus_client import Counter, Gauge, Histogram
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from cognis.core.agent_loop import PauseResolution
 from cognis.core.events import Event, EventBus, EventType
+from cognis.core.feedback.admission import FeedbackTaskAdmission
+from cognis.core.feedback.primitives import FeedbackError, affected
 from cognis.core.task_execution import (
     StaleTaskExecutionOwner,
     TaskExecutionClaim,
@@ -27,13 +31,6 @@ from cognis.core.task_execution import (
     reset_task_execution_fence,
 )
 from cognis.core.workflow_engine import WorkflowEngine
-from cognis.core.workflow_management import (
-    SkillWorkflowSource,
-    decode_skill_workflow_candidate_id,
-    encode_skill_workflow_candidate_id,
-    materialize_skill_workflow,
-    skill_workflow_criteria,
-)
 from cognis.core.workflow_registry import WorkflowRegistry
 from cognis.logging import get_logger
 from cognis.models.session import next_event_page_after_seq
@@ -46,10 +43,13 @@ from cognis.models.workflow import (
     pin_effective_workflow,
 )
 from cognis.runtime_context import scoped_runtime_context
+from cognis.store.feedback_models import TaskRevisionReceiptRow
+from cognis.store.models import NotificationRow, Task
 from cognis.store.queries import (
     add_task_dependency,
     assert_task_attempt_current,
     create_task,
+    defer_running_task,
     fail_orphaned_running_step_runs,
     fail_running_step_runs_for_task,
     get_dependent_tasks,
@@ -58,7 +58,6 @@ from cognis.store.queries import (
     get_task_dependencies,
     get_unmet_dependencies,
     list_active_managed_conversation_links_for_controller_session,
-    list_project_workflow_ids,
     list_step_runs_for_task,
     list_tasks_by_status,
     supersede_step_runs_for_revision,
@@ -67,7 +66,11 @@ from cognis.store.queries import (
     update_task_workflow_state,
     update_workflow,
 )
-from cognis.tools.skills import resolve_skills_for_agent
+
+if TYPE_CHECKING:
+    from cognis.providers.executor.websocket import WebSocketExecutorProvider
+
+TaskCreationParticipant = Callable[[AsyncSession, Task], Awaitable[None]]
 
 logger = get_logger(__name__)
 
@@ -127,6 +130,7 @@ class TaskRevisionResult:
     target_step: str
     superseded_count: int
     relaunched: bool
+    admitted_attempt_number: int | None = None
 
     @property
     def status(self) -> TaskStatus:
@@ -134,7 +138,7 @@ class TaskRevisionResult:
 
     @property
     def attempt_number(self) -> int:
-        return self.task.attempt_number
+        return self.admitted_attempt_number or self.task.attempt_number
 
 
 def _recover_pause_options(value: Any) -> list[dict[str, Any]] | None:
@@ -172,7 +176,7 @@ class TaskQueue:
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
         agent_registry: Any = None,
-        llm_provider: Any = None,
+        websocket_provider: WebSocketExecutorProvider | None = None,
         controller_owner_id: str = "simple-controller",
         max_active_steps_global: int = DEFAULT_MAX_ACTIVE_STEPS_GLOBAL,
         max_active_steps_per_agent: int = DEFAULT_MAX_ACTIVE_STEPS_PER_AGENT,
@@ -183,7 +187,7 @@ class TaskQueue:
         self._workflow_registry = workflow_registry
         self._event_bus = event_bus
         self._agent_registry = agent_registry
-        self._llm_provider = llm_provider
+        self._websocket_provider = websocket_provider
         self._execution_store = TaskExecutionStore(
             session_factory,
             owner_id=controller_owner_id,
@@ -196,6 +200,8 @@ class TaskQueue:
         self._accepting = True
         self._stop_event = asyncio.Event()
         self._drain_task: asyncio.Task[None] | None = None
+        self._cancellation_task: asyncio.Task[None] | None = None
+        self._cancel_dispatch_wakeup = asyncio.Event()
         self._active_runs: dict[str, asyncio.Task[Any]] = {}
         self._task_claims: dict[str, TaskExecutionClaim] = {}
         self._run_controls: dict[str, asyncio.Event] = {}
@@ -206,6 +212,7 @@ class TaskQueue:
         self.cluster_signals: Any = None
 
     async def _on_cluster_change(self, event: Event) -> None:
+        self._cancel_dispatch_wakeup.set()
         if event.data.get("kind") == "task_queue_changed":
             self._wake_event.set()
 
@@ -230,7 +237,7 @@ class TaskQueue:
         workflow_registry: WorkflowRegistry,
         event_bus: EventBus,
         agent_registry: Any = None,
-        llm_provider: Any = None,
+        websocket_provider: WebSocketExecutorProvider | None = None,
         controller_owner_id: str = "simple-controller",
     ) -> TaskQueue:
         """Create a TaskQueue with DB-backed settings."""
@@ -251,7 +258,7 @@ class TaskQueue:
             workflow_registry=workflow_registry,
             event_bus=event_bus,
             agent_registry=agent_registry,
-            llm_provider=llm_provider,
+            websocket_provider=websocket_provider,
             controller_owner_id=controller_owner_id,
             max_active_steps_global=int(max_global)
             if isinstance(max_global, int)
@@ -268,6 +275,8 @@ class TaskQueue:
         self._event_bus.subscribe(EventType.CLUSTER_SCOPE_INVALIDATED, self._on_cluster_change)
         self._wake_event.set()
         self._drain_task = asyncio.create_task(self._drain_loop())
+        self._cancel_dispatch_wakeup.set()
+        self._cancellation_task = asyncio.create_task(self._cancelled_dispatch_loop())
         logger.info("Task queue started")
 
     async def stop(self) -> None:
@@ -283,6 +292,12 @@ class TaskQueue:
         self._event_bus.unsubscribe(EventType.CLUSTER_SCOPE_INVALIDATED, self._on_cluster_change)
         self._stop_event.set()
         self._wake_event.set()
+
+        if self._cancellation_task:
+            self._cancellation_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cancellation_task
+            self._cancellation_task = None
 
         if self._drain_task:
             self._drain_task.cancel()
@@ -340,6 +355,7 @@ class TaskQueue:
         scheduled_for: datetime | None = None,
         status: str = "queued",
         task_id: str | None = None,
+        creation_participant: TaskCreationParticipant | None = None,
     ) -> TaskModel:
         """Submit a task for execution.
 
@@ -350,6 +366,7 @@ class TaskQueue:
         if not self._accepting:
             raise RuntimeError("Task queue is not accepting new tasks")
 
+        workflow_id = workflow_id or "system:general-task"
         delivery = delivery or TaskDelivery()
         completion_delivery = completion_delivery or await self._resolve_completion_delivery_policy(
             workflow_id=workflow_id,
@@ -357,6 +374,9 @@ class TaskQueue:
             project_id=project_id,
         )
 
+        from cognis.models.task import validate_task_delivery
+
+        validate_task_delivery(delivery, completion_delivery)
         async with self._session_factory() as db_session:
             if (
                 source_session_id is None
@@ -395,6 +415,7 @@ class TaskQueue:
                 delivery_target=delivery.target,
                 completion_mode_family=completion_delivery.completion_mode_family,
                 allow_silent_completion=completion_delivery.allow_silent_completion,
+                on_finish_instructions=completion_delivery.on_finish_instructions,
                 interaction_mode_override=interaction_mode_override,
                 escalation_timeout_seconds=escalation_timeout_seconds,
                 session_policy=(
@@ -408,6 +429,8 @@ class TaskQueue:
                 working_directory=working_directory,
                 scheduled_for=scheduled_for,
             )
+            if creation_participant is not None:
+                await creation_participant(db_session, row)
             await db_session.commit()
 
             task = _row_to_task_model(row)
@@ -682,40 +705,52 @@ class TaskQueue:
                 raise ValueError("Task not found")
             if task_row.status != "failed":
                 raise ValueError("Only failed tasks can be retried via retry_failed_task")
-            # Reset workflow state — clear attempt counters so the step
-            # gets fresh attempts, and set status back to running.
-            ws = (
-                WorkflowState.model_validate(task_row.workflow_state)
-                if task_row.workflow_state
-                else WorkflowState()
-            )
-            ws.loop_iterations = {}  # Reset all attempt counters
-            ws.resume_failed_step = preserve_step_context
-            ws.status = "running"
-            ws.current_step_status = None
-            ws.pending_pause_type = None
-            ws.pending_pause_payload = None
-
         claim = await self._execution_store.claim_existing(task_id, statuses={"failed"})
         if claim is None:
             raise ValueError("Task execution ownership is unavailable")
-        async with self._session_factory() as db_session:
-            task_row = await get_task(db_session, task_id)
-            if task_row is None:
-                await self._execution_store.release(claim)
-                raise ValueError("Task not found")
-            task_row.workflow_state = ws.model_dump(mode="json")
-            if not preserve_step_context:
-                task_row.attempt_number += 1
-            task_row.completed_at = None
-            task_row.result_summary = None
-            task_row.result_data = None
-            if not await update_task_status(db_session, task_id, "running"):
-                await db_session.rollback()
-                await self._execution_store.release(claim)
-                raise ValueError("Task could not be retried")
-            await db_session.commit()
-            task = _row_to_task_model(task_row)
+        try:
+            fence = TaskExecutionFence(self._execution_store, claim, asyncio.Event())
+            fence.mark_terminal("failed")
+            async with self._session_factory() as db_session:
+                await fence.assert_current(db_session)
+                task_row = await get_task(db_session, task_id)
+                if task_row is None or task_row.status != "failed":
+                    raise ValueError("Only failed tasks can be retried")
+                recovery = (task_row.result_data or {}).get("execution_recovery")
+                if recovery and not preserve_step_context:
+                    raise ValueError(
+                        "recovery_required: reconcile outstanding tool calls before a fresh "
+                        "attempt, or explicitly cancel the task."
+                    )
+                ws = (
+                    WorkflowState.model_validate(task_row.workflow_state)
+                    if task_row.workflow_state
+                    else WorkflowState()
+                )
+                ws.loop_iterations = {}
+                ws.resume_failed_step = preserve_step_context
+                ws.status = "running"
+                ws.current_step_status = None
+                ws.pending_pause_type = None
+                ws.pending_pause_payload = None
+                task_row.workflow_state = ws.model_dump(mode="json")
+                if not preserve_step_context:
+                    task_row.attempt_number += 1
+                task_row.completed_at = None
+                task_row.result_summary = None
+                task_row.result_data = {"execution_recovery": recovery} if recovery else None
+                if not await update_task_status(db_session, task_id, "running"):
+                    raise ValueError("Task could not be retried")
+                await db_session.commit()
+                task = _row_to_task_model(task_row)
+        except StaleTaskExecutionOwner as exc:
+            await self._execution_store.release(claim)
+            raise ValueError(
+                "Task ownership changed before retry; reload its current state."
+            ) from exc
+        except BaseException:
+            await self._execution_store.release(claim)
+            raise
 
         task.workflow_state = ws
         claim = replace(claim, attempt_number=task.attempt_number)
@@ -752,6 +787,7 @@ class TaskQueue:
         target_step: str | None,
         instruction: str,
         expected_attempt: int | None = None,
+        feedback_admission: FeedbackTaskAdmission | None = None,
     ) -> TaskRevisionResult:
         """Serialize in-place revisions with lifecycle mutations."""
 
@@ -761,6 +797,7 @@ class TaskQueue:
                 target_step=target_step,
                 instruction=instruction,
                 expected_attempt=expected_attempt,
+                feedback_admission=feedback_admission,
             )
 
     async def _request_revision_locked(
@@ -770,11 +807,68 @@ class TaskQueue:
         target_step: str | None,
         instruction: str,
         expected_attempt: int | None = None,
+        feedback_admission: FeedbackTaskAdmission | None = None,
     ) -> TaskRevisionResult:
         """Re-enter a workflow from a human-selected step in-place."""
 
         pending_pause = None
         async with self._session_factory() as db_session:
+            if feedback_admission is not None:
+                receipt = await db_session.get(
+                    TaskRevisionReceiptRow, feedback_admission.revision_request_id
+                )
+                if receipt is not None:
+                    if (
+                        receipt.task_id != task_id
+                        or receipt.request_hash != feedback_admission.request_hash
+                    ):
+                        raise FeedbackError(
+                            409, "idempotency_conflict", "Task revision receipt changed"
+                        )
+                    current = await get_task(db_session, task_id)
+                    if current is None:
+                        raise FeedbackError(404, "not_found", "Task is unavailable")
+                    await feedback_admission.participant(db_session, receipt, True)
+                    await db_session.commit()
+                    return TaskRevisionResult(
+                        task=_row_to_task_model(current),
+                        target_step=receipt.target_step,
+                        superseded_count=receipt.superseded_count,
+                        relaunched=False,
+                        admitted_attempt_number=receipt.attempt_number,
+                    )
+                fence = await db_session.execute(
+                    update(Task)
+                    .where(
+                        Task.task_id == task_id,
+                        Task.feedback_state_generation == feedback_admission.expected_generation,
+                        Task.attempt_number == expected_attempt,
+                    )
+                    .values(feedback_state_generation=Task.feedback_state_generation)
+                )
+                if affected(fence) != 1:
+                    receipt = await db_session.get(
+                        TaskRevisionReceiptRow, feedback_admission.revision_request_id
+                    )
+                    if (
+                        receipt is not None
+                        and receipt.request_hash == feedback_admission.request_hash
+                    ):
+                        current = await get_task(db_session, task_id)
+                        if current is None:
+                            raise FeedbackError(404, "not_found", "Task is unavailable")
+                        await feedback_admission.participant(db_session, receipt, True)
+                        await db_session.commit()
+                        return TaskRevisionResult(
+                            task=_row_to_task_model(current),
+                            target_step=receipt.target_step,
+                            superseded_count=receipt.superseded_count,
+                            relaunched=False,
+                            admitted_attempt_number=receipt.attempt_number,
+                        )
+                    raise FeedbackError(
+                        409, "task_state_changed", "Task safety state changed; reconfirm"
+                    )
             if expected_attempt is not None and not await assert_task_attempt_current(
                 db_session, task_id, expected_attempt
             ):
@@ -800,14 +894,14 @@ class TaskQueue:
             step_names = [step.name for step in workflow.steps]
             if not step_names:
                 raise ValueError("Workflow has no steps")
-            if target_step and target_step not in step_names:
+            if not target_step:
+                raise ValueError("A target step is required for revision")
+            if target_step not in step_names:
                 raise ValueError("Target step not found")
 
             pending_pause = self._get_pending_interaction(task_id)
             state = task.workflow_state or WorkflowState()
-            target_index = (
-                step_names.index(target_step) if target_step else max(0, state.current_step_index)
-            )
+            target_index = step_names.index(target_step)
             new_attempt_number = int(getattr(task_row, "attempt_number", 1) or 1) + 1
             state.current_step_index = target_index
             state.status = "running"
@@ -832,11 +926,43 @@ class TaskQueue:
             task_row.workflow_state = state.model_dump(mode="json")
             task_row.updated_at = datetime.now(UTC)
             await self._execution_store.invalidate_task_lease(db_session, task_id)
+            if feedback_admission is not None:
+                await db_session.execute(
+                    update(NotificationRow)
+                    .where(
+                        NotificationRow.task_id == task_id,
+                        NotificationRow.status == "pending",
+                    )
+                    .values(
+                        status="resolved",
+                        resolution={
+                            "decision": "revise",
+                            "feedback_submission_id": feedback_admission.submission_id,
+                        },
+                        revision=NotificationRow.revision + 1,
+                        resolved_at=datetime.now(UTC),
+                    )
+                )
+                receipt = TaskRevisionReceiptRow(
+                    revision_request_id=feedback_admission.revision_request_id,
+                    task_id=task_id,
+                    actor_email=task.created_by,
+                    idempotency_key=feedback_admission.submission_id,
+                    submission_id=feedback_admission.submission_id,
+                    request_hash=feedback_admission.request_hash,
+                    attempt_number=new_attempt_number,
+                    target_step=step_names[target_index],
+                    state="running",
+                    superseded_count=superseded_count,
+                )
+                db_session.add(receipt)
+                await db_session.flush()
+                await feedback_admission.participant(db_session, receipt, False)
             await db_session.commit()
             await db_session.refresh(task_row)
             task = _row_to_task_model(task_row)
 
-        if pending_pause is not None:
+        if pending_pause is not None and feedback_admission is None:
             notification_service = self._workflow_engine._notification_service  # noqa: SLF001
             if notification_service is not None:
                 await notification_service.resolve(
@@ -924,17 +1050,20 @@ class TaskQueue:
         """Serialize cancellation with revisions and resume claims."""
 
         async with self._pick_lock:
-            return await self._cancel_task_locked(
+            task, transitioned = await self._cancel_task_locked(
                 task_id,
                 expected_attempt=expected_attempt,
             )
+        if transitioned:
+            await self._workflow_engine.deliver_task_outcome(task)
+        return task
 
     async def _cancel_task_locked(
         self,
         task_id: str,
         *,
         expected_attempt: int | None = None,
-    ) -> TaskModel:
+    ) -> tuple[TaskModel, bool]:
         """Cancel a task in any mutable state."""
         from cognis.store.models import Task as TaskRow
 
@@ -953,7 +1082,7 @@ class TaskQueue:
             if expected_attempt is not None and task_row.attempt_number != expected_attempt:
                 raise ValueError("Task attempt changed; refresh before mutating")
             if task_row.status in {"completed", "failed"}:
-                return _row_to_task_model(task_row)
+                return _row_to_task_model(task_row), False
             step_runs = await list_step_runs_for_task(db_session, task_id)
             if task_row.status != "cancelled":
                 ok = await update_task_status(
@@ -1012,20 +1141,15 @@ class TaskQueue:
                 await asyncio.wait_for(asyncio.shield(run_task), timeout=5.0)
         await self._cancel_task_owned_work(task, step_runs)
         if transitioned:
-            await self._event_bus.publish(
-                Event(
-                    type=EventType.TASK_CANCELLED,
-                    data={"task_id": task_id, "task_title": task.title, "title": task.title},
-                )
-            )
             cluster_signals = getattr(self._workflow_engine, "cluster_signals", None)
             if cluster_signals is not None:
                 await cluster_signals.publish_task_change(task_id)
-        return task.model_copy(update={"status": TaskStatus.CANCELLED})
+        return task.model_copy(update={"status": TaskStatus.CANCELLED}), transitioned
 
     async def _cancel_task_owned_work(self, task: TaskModel, step_runs: list[Any]) -> None:
         """Stop only sessions and managed turns proven to belong to task StepRuns."""
 
+        self._cancel_dispatch_wakeup.set()
         agent_loop = getattr(self._workflow_engine, "_agent_loop", None)
         session_manager = getattr(self._workflow_engine, "_session_manager", None)
         for step_run in step_runs:
@@ -1115,6 +1239,23 @@ class TaskQueue:
 
         return transitioned
 
+    async def _cancelled_dispatch_loop(self) -> None:
+        """Retry terminal cancellation outside workflow claiming/capacity."""
+        from cognis.core.invariants.task_dispatches import reconcile_cancelled_dispatches
+
+        while not self._stop_event.is_set():
+            self._cancel_dispatch_wakeup.clear()
+            try:
+                await reconcile_cancelled_dispatches(
+                    self._session_factory, self._websocket_provider
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Task dispatch cancellation reconciliation failed")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._cancel_dispatch_wakeup.wait(), timeout=30.0)
+
     async def recover_stale_tasks(
         self, stale_after_seconds: int = DEFAULT_STALE_AFTER_SECONDS
     ) -> list[str]:
@@ -1128,37 +1269,58 @@ class TaskQueue:
             local_run = self._active_runs.get(row.task_id)
             if local_run is not None and not local_run.done():
                 continue
-            claim = await self._execution_store.claim_existing(row.task_id, statuses={"running"})
+            claim = await self._execution_store.claim_existing(
+                row.task_id, statuses={"running"}, capacity=False
+            )
             if claim is None:
                 continue
             task = _row_to_task_model(row)
-            classification, details = await self._classify_crash_recovery(task)
-            TASK_RECOVERY_CLASSIFICATIONS.labels(classification=classification).inc()
-            if classification == "ambiguous_tool_execution":
-                fence = TaskExecutionFence(self._execution_store, claim, asyncio.Event())
+            fence = TaskExecutionFence(self._execution_store, claim, asyncio.Event())
+            fence.start()
+            try:
+                classification, details = await self._classify_crash_recovery(task)
+                TASK_RECOVERY_CLASSIFICATIONS.labels(classification=classification).inc()
                 async with self._session_factory() as db_session:
                     await fence.assert_current(db_session)
-                    await fail_running_step_runs_for_task(
-                        db_session, task.task_id, datetime.now(UTC)
-                    )
-                    await update_task_status(
-                        db_session,
-                        task.task_id,
-                        "failed",
-                        completed_at=datetime.now(UTC),
-                        result_summary=(
-                            "Workflow recovery stopped because a tool call may have "
-                            "completed without a durable result; it was not replayed."
-                        ),
-                        result_data={
-                            "recovery_classification": classification,
-                            **details,
-                        },
-                    )
+                    if classification == "ambiguous_tool_execution":
+                        await fail_running_step_runs_for_task(
+                            db_session, task.task_id, datetime.now(UTC)
+                        )
+                        await update_task_status(
+                            db_session,
+                            task.task_id,
+                            "failed",
+                            completed_at=datetime.now(UTC),
+                            result_summary=(
+                                "Workflow recovery stopped because a tool call may have "
+                                "completed without a durable result; it was not replayed."
+                            ),
+                            result_data={
+                                **(task.result_data or {}),
+                                "recovery_classification": classification,
+                                **details,
+                            },
+                        )
+                    else:
+                        await defer_running_task(
+                            db_session,
+                            task.task_id,
+                            scheduled_for=datetime.now(UTC)
+                            + timedelta(
+                                seconds=30 if classification == "infrastructure_wait" else 0
+                            ),
+                            result_summary="Workflow is recovering interrupted execution.",
+                        )
                     await db_session.commit()
-                await self._execution_store.release(claim)
-            else:
-                self._launch_claimed_task_run(task, claim)
+                if classification == "ambiguous_tool_execution":
+                    await self._event_bus.publish(
+                        Event(type=EventType.TASK_FAILED, data={"task_id": task.task_id})
+                    )
+                    task.status = TaskStatus.FAILED
+                    await self._deliver_terminal_task_failure(task)
+            finally:
+                await fence.close()
+            await self._wake_workers()
             recovered.append(task.task_id)
             logger.info(
                 "Recovered stale task",
@@ -1175,7 +1337,13 @@ class TaskQueue:
     async def _classify_crash_recovery(self, task: TaskModel) -> tuple[str, dict[str, Any]]:
         async with self._session_factory() as db_session:
             step_runs = await list_step_runs_for_task(db_session, task.task_id)
-        running = next((row for row in reversed(step_runs) if row.status == "running"), None)
+        batches = (task.result_data or {}).get("execution_recovery") or {}
+        if batches:
+            return "recoverable_pending_tool_calls", {}
+        running = next(
+            (row for row in reversed(step_runs) if row.status in {"running", "pending", "failed"}),
+            None,
+        )
         if running is None:
             return "safe_before_tool_dispatch", {}
         runtime_info = dict(running.runtime_info) if isinstance(running.runtime_info, dict) else {}
@@ -1194,6 +1362,8 @@ class TaskQueue:
                 return "safe_before_tool_dispatch", details
             if substate == "executing" and runtime_info.get("tool_read_only") is True:
                 return "retry_read_only_deterministic_tool", details
+            if substate == "executing" and runtime_info.get("durable_tool_dispatch") is True:
+                return "recoverable_pending_tool_calls", details
             return "ambiguous_tool_execution", {
                 **details,
                 "reason": "ambiguous_deterministic_tool_dispatch",
@@ -1204,7 +1374,7 @@ class TaskQueue:
         guardrails = getattr(self._workflow_engine, "_providers", None)
         guardrails = getattr(guardrails, "guardrails", None)
         if guardrails is None or not hasattr(guardrails, "read_events"):
-            return "ambiguous_tool_execution", {
+            return "infrastructure_wait", {
                 "step_run_id": running.step_run_id,
                 "reason": "tool_event_history_unavailable",
             }
@@ -1231,7 +1401,7 @@ class TaskQueue:
                 "task_queue: failed to read tool events during crash recovery",
                 extra={"extra_data": {"task_id": task.task_id}},
             )
-            return "ambiguous_tool_execution", {
+            return "infrastructure_wait", {
                 "step_run_id": running.step_run_id,
                 "reason": "tool_event_history_unavailable",
             }
@@ -1554,130 +1724,6 @@ class TaskQueue:
         # Signals coalesce: drain until durable work or capacity is exhausted.
         self._wake_event.set()
 
-    async def _select_workflow_for_task(self, task: TaskModel) -> str:
-        """Auto-select a workflow using the LLM classifier.
-
-        Falls back to ``system:general-task`` if the classifier is unavailable
-        or no workflows match. Persists the selection to the DB so the user can
-        see which workflow was chosen.
-        """
-        if self._llm_provider is None:
-            return "system:general-task"
-
-        from cognis.core.decision import select_workflow
-
-        def _selection_text() -> str:
-            parts = [f"Title: {task.title}"]
-            if task.description:
-                parts.append(f"Description: {task.description}")
-            if task.expected_output:
-                parts.append(f"Expected output: {task.expected_output}")
-            return "\n".join(parts)
-
-        try:
-            available = await self._workflow_registry.list_all(
-                owner_email=task.created_by,
-                project_id=task.project_id,
-            )
-            project_workflow_ids: set[str] = set()
-            if task.project_id is not None:
-                async with self._session_factory() as db_session:
-                    project_workflow_ids = set(
-                        await list_project_workflow_ids(db_session, task.project_id)
-                    )
-            workflow_candidates = [
-                {
-                    "workflow_id": workflow.workflow_id,
-                    "name": workflow.name,
-                    "description": workflow.description,
-                    "criteria": workflow.criteria,
-                    "tags": list(workflow.tags),
-                    "project_bound": workflow.workflow_id in project_workflow_ids,
-                }
-                for workflow in available
-            ]
-            if self._agent_registry is not None:
-                agent = await self._agent_registry.get(task.agent_id, owner_email=task.created_by)
-                if agent is not None:
-                    async with self._session_factory() as session:
-                        resolved_skills = await resolve_skills_for_agent(
-                            session,
-                            agent,
-                            owner_email=task.created_by,
-                        )
-                    for skill in resolved_skills.skills:
-                        if not skill.attached or not skill.steps:
-                            continue
-                        workflow_candidates.append(
-                            {
-                                "workflow_id": encode_skill_workflow_candidate_id(skill.skill_id),
-                                "name": f"Skill: {skill.name}",
-                                "description": skill.description,
-                                "criteria": skill_workflow_criteria(
-                                    SkillWorkflowSource(
-                                        skill_id=skill.skill_id,
-                                        name=skill.name,
-                                        description=skill.description,
-                                        instructions=skill.instructions,
-                                        tags=list(skill.tags),
-                                        steps=list(skill.steps),
-                                    )
-                                ),
-                                "tags": list(skill.tags),
-                                "candidate_type": "skill_workflow",
-                            }
-                        )
-            if not workflow_candidates:
-                return "system:general-task"
-
-            selection = await select_workflow(
-                llm=self._llm_provider,
-                task_description=_selection_text(),
-                available_workflows=workflow_candidates,
-                default_workflow_id="system:general-task",
-            )
-            workflow_id = selection.workflow_id
-            selected_skill_id = decode_skill_workflow_candidate_id(workflow_id)
-            if selected_skill_id is not None:
-                created_workflow = await materialize_skill_workflow(
-                    session_factory=self._session_factory,
-                    owner_email=task.created_by,
-                    skill_id=selected_skill_id,
-                    lifecycle="ephemeral",
-                    composition_source="agent_composed",
-                    composition_intent=_selection_text(),
-                )
-                workflow_id = created_workflow.workflow_id
-            logger.info(
-                "Auto-selected workflow for task",
-                extra={
-                    "extra_data": {
-                        "task_id": task.task_id,
-                        "workflow_id": workflow_id,
-                        "confidence": selection.confidence,
-                        "reason": selection.reason,
-                    }
-                },
-            )
-        except Exception:
-            logger.warning(
-                "Workflow auto-selection failed, falling back to system:general-task",
-                extra={"extra_data": {"task_id": task.task_id}},
-                exc_info=True,
-            )
-            workflow_id = "system:general-task"
-
-        # Persist the selected workflow on the task for visibility
-        task.workflow_id = workflow_id
-        async with self._session_factory() as db_session:
-            await assert_task_execution_fence(db_session)
-            row = await get_task(db_session, task.task_id)
-            if row is not None:
-                row.workflow_id = workflow_id
-                await db_session.commit()
-
-        return workflow_id
-
     async def _run_task(self, task: TaskModel, claim: TaskExecutionClaim) -> None:
         """Execute a task's workflow.
 
@@ -1705,11 +1751,7 @@ class TaskQueue:
             effective_working_directory=task.working_directory or task.workspace_root,
         ):
             try:
-                # Resolve workflow — auto-select via LLM classifier if not set
-                if task.workflow_id:
-                    workflow_id = task.workflow_id
-                else:
-                    workflow_id = await self._select_workflow_for_task(task)
+                workflow_id = task.workflow_id or "system:general-task"
                 state_was_absent = task.workflow_state is None
                 workflow = self._pinned_workflow(task)
                 if workflow is None:
@@ -1797,6 +1839,11 @@ class TaskQueue:
                         return
                     task_row = await get_task(db_session, task.task_id)
                     current_status = str(task_row.status) if task_row is not None else "failed"
+                    if current_status == "running":
+                        # Shutdown/lease recovery is not user cancellation.
+                        # Leave the step's in-flight evidence intact.
+                        await db_session.rollback()
+                        return
                     step_run_status = {
                         "cancelled": "cancelled",
                         "paused": "paused",
@@ -1816,6 +1863,7 @@ class TaskQueue:
                     extra={"extra_data": {"task_id": task.task_id}},
                 )
                 result_summary = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                completed_at = datetime.now(UTC)
                 fence.mark_terminal(str(TaskStatus.FAILED))
                 async with self._session_factory() as db_session:
                     await assert_task_execution_fence(db_session)
@@ -1824,12 +1872,12 @@ class TaskQueue:
                         task.task_id,
                         "failed",
                         result_summary=result_summary,
-                        completed_at=datetime.now(UTC),
+                        completed_at=completed_at,
                         expected_attempt=task.attempt_number,
                     )
                     await db_session.commit()
                 task.status = TaskStatus.FAILED
-                task.completed_at = datetime.now(UTC)
+                task.completed_at = completed_at
                 task.result_summary = result_summary
                 await self._deliver_terminal_task_failure(task)
             finally:
@@ -1961,6 +2009,7 @@ def _row_to_task_model(row: Any) -> TaskModel:
         completion_delivery=CompletionDeliveryPolicy(
             completion_mode_family=getattr(row, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+            on_finish_instructions=getattr(row, "on_finish_instructions", None),
         ),
         interaction_mode_override=getattr(row, "interaction_mode_override", None),
         escalation_timeout_seconds=getattr(row, "escalation_timeout_seconds", None),

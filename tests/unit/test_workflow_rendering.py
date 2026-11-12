@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from cognis import json_codec
 from cognis.core import workflow_rendering
 from cognis.core.workflow_rendering import (
     WorkflowRenderer,
@@ -36,6 +38,42 @@ def test_text_expression_and_recursive_native_modes(renderer: WorkflowRenderer) 
 def test_expression_requires_strict_boolean(renderer: WorkflowRenderer) -> None:
     with pytest.raises(WorkflowRenderError, match="boolean"):
         renderer.render_expression("{{ vars.count }}", {"vars": {"count": 1}})
+
+
+def test_receipt_manifest_tojson_is_safe_but_missing_runtime_path_is_not(
+    renderer: WorkflowRenderer,
+) -> None:
+    manifest = [{"filename": "control.py", "size_bytes": 42}]
+    context = {
+        "steps": {
+            "transport_assets": {
+                "outputs": {"asset_manifest": manifest, "python_environment": None}
+            }
+        }
+    }
+
+    rendered = renderer.render_native(
+        "{{ steps.transport_assets.outputs.asset_manifest | tojson }}", context
+    )
+    assert type(rendered) is str
+    assert json.loads(rendered) == manifest
+    args = {"env": {"ASSET_MANIFEST": rendered}}
+    assert json_codec.loads(json_codec.dumps(args)) == args
+    assert build_render_audit_record(template={}, rendered=args)["rendered"] == args
+    with pytest.raises(WorkflowRenderError, match="unsafe value"):
+        renderer.render_native(
+            "{{ steps.transport_assets.outputs.python_environment.python_path }}", context
+        )
+
+
+def test_tojson_keeps_jinja_escaping_and_indent(renderer: WorkflowRenderer) -> None:
+    value = {"value": "<script>&'\u00e9"}
+    rendered = renderer.render_native("{{ value | tojson(indent=2) }}", {"value": value})
+
+    assert type(rendered) is str
+    assert json.loads(rendered) == value
+    assert "\\u003cscript\\u003e\\u0026\\u0027" in rendered
+    assert "\n  " in rendered
 
 
 def test_evidence_filters_remain_bounded(renderer: WorkflowRenderer) -> None:

@@ -189,7 +189,9 @@ class Scheduler:
         for sched_row in due:
             if self._stop_event.is_set():
                 break
-            await self._fire_schedule(sched_row.schedule_id)
+            await self._fire_schedule(
+                sched_row.schedule_id, expected_fire_at=sched_row.next_fire_at
+            )
 
         # Compute sleep duration
         sleep_seconds = await self._seconds_until_next()
@@ -353,7 +355,9 @@ class Scheduler:
             raise RuntimeError("Task queue cannot activate a reserved manual task")
         return await submit_existing(task_id)
 
-    async def _fire_schedule(self, schedule_id: str) -> str | None:
+    async def _fire_schedule(
+        self, schedule_id: str, *, expected_fire_at: datetime | None = None
+    ) -> str | None:
         """Claim, dispatch, and settle one durable logical schedule fire."""
         if not hasattr(self, "_lease_store"):
             return await self._fire_schedule_uncoordinated(schedule_id)
@@ -371,6 +375,13 @@ class Scheduler:
             await self._lease_store.release(lease)
             return None
         scheduled_fire_at = sched.next_fire_at
+        if expected_fire_at is not None and (
+            scheduled_fire_at is None
+            or scheduled_fire_at.replace(tzinfo=scheduled_fire_at.tzinfo or UTC)
+            != expected_fire_at.replace(tzinfo=expected_fire_at.tzinfo or UTC)
+        ):
+            await self._lease_store.release(lease)
+            return None
         if scheduled_fire_at is None:
             scheduled_fire_at = datetime.now(UTC)
             async with self._db_session() as db:
@@ -608,6 +619,7 @@ class Scheduler:
         completion_delivery = CompletionDeliveryPolicy(
             completion_mode_family=getattr(sched, "completion_mode_family", "default"),
             allow_silent_completion=bool(getattr(sched, "allow_silent_completion", False)),
+            on_finish_instructions=getattr(sched, "on_finish_instructions", None),
         )
         try:
             return await self._task_queue.submit(
@@ -750,6 +762,7 @@ class Scheduler:
             completion_delivery = CompletionDeliveryPolicy(
                 completion_mode_family=getattr(sched, "completion_mode_family", "default"),
                 allow_silent_completion=bool(getattr(sched, "allow_silent_completion", False)),
+                on_finish_instructions=getattr(sched, "on_finish_instructions", None),
             )
 
             task = await self._task_queue.submit(
@@ -1234,7 +1247,9 @@ class Scheduler:
                     original_fire = sched_row.next_fire_at
                     if original_fire is not None and original_fire.tzinfo is None:
                         original_fire = original_fire.replace(tzinfo=UTC)
-                    await self._fire_schedule(sched_row.schedule_id)
+                    await self._fire_schedule(
+                        sched_row.schedule_id, expected_fire_at=sched_row.next_fire_at
+                    )
                     async with self._db_session() as db:
                         after_fire = await get_schedule(db, sched_row.schedule_id)
                     next_fire = after_fire.next_fire_at if after_fire is not None else None

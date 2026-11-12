@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from time import monotonic
-from typing import Any, get_args
+from typing import Any
 
 from fastapi import APIRouter, Request
 from sqlalchemy import select
@@ -36,7 +36,6 @@ from cognis.api.models import (
     StepProfileCreateRequest,
     StepProfileResponse,
     StepProfileUpdateRequest,
-    UserDisplayPreferences,
     UserPreferencesResponse,
     UserPreferencesUpdateRequest,
     WebBackendUpdateRequest,
@@ -44,6 +43,12 @@ from cognis.api.models import (
     WebDefaultsUpdateRequest,
 )
 from cognis.api.serializers import llm_provider_to_response, setting_to_response
+from cognis.api.user_preferences import (
+    USER_PREFERENCES_STATE_KEY,
+)
+from cognis.api.user_preferences import (
+    preferences_from_state as _preferences_from_state,
+)
 from cognis.api.web_reconfigure import (
     finalize_web_executor_reconfigure_for_app,
     run_web_mutation_cancellation_safe,
@@ -79,7 +84,6 @@ router = APIRouter(tags=["settings"])
 logger = get_logger(__name__)
 PROVIDER_TEST_COOLDOWN_SECONDS = 10.0
 SAME_SESSION_MODEL_SENTINEL = "__same_session_model__"
-USER_PREFERENCES_STATE_KEY = "ui.preferences"
 
 
 def _apply_last_test_metadata(
@@ -111,19 +115,6 @@ async def _validate_provider_executor_eligibility(
     await validate_executor_eligibility(
         session, location=location, config=config, owner_email=owner_email
     )
-
-
-def _preferences_from_state(value: dict[str, Any] | None) -> UserPreferencesResponse:
-    if not value:
-        return UserPreferencesResponse()
-    display = value.get("display")
-    if isinstance(display, dict):
-        family = UserDisplayPreferences.model_fields["theme_family"]
-        # Read-time fallback for future/invalid families; leave stored JSON
-        # and the rest of the account's preferences untouched.
-        if display.get("theme_family", family.default) not in get_args(family.annotation):
-            value = {**value, "display": {**display, "theme_family": family.default}}
-    return UserPreferencesResponse.model_validate(value)
 
 
 @router.get("/api/v1/user-preferences", response_model=UserPreferencesResponse)
@@ -752,7 +743,9 @@ async def llm_provider_create(request: Request, payload: LLMProviderRequest) -> 
     from cognis.core.provider_management import ProviderManagement
 
     row = await ProviderManagement(
-        request.app.state.session_factory, request.app.state.providers.llm
+        request.app.state.session_factory,
+        request.app.state.providers.llm,
+        usage_price_publisher=getattr(request.app.state, "usage_price_publisher", None),
     ).create(ManagementActor(user.email, user.role), payload)
     return _apply_last_test_metadata(request, llm_provider_to_response(row))
 
@@ -778,7 +771,9 @@ async def llm_provider_update(
     from cognis.core.provider_management import ProviderManagement
 
     row = await ProviderManagement(
-        request.app.state.session_factory, request.app.state.providers.llm
+        request.app.state.session_factory,
+        request.app.state.providers.llm,
+        usage_price_publisher=getattr(request.app.state, "usage_price_publisher", None),
     ).update(ManagementActor(user.email, user.role), provider_id, payload)
     if row is None:
         raise api_exception(404, "not_found", "LLM provider not found")
@@ -792,7 +787,9 @@ async def llm_provider_delete(request: Request, provider_id: str) -> dict[str, b
     from cognis.core.provider_management import ProviderManagement
 
     return await ProviderManagement(
-        request.app.state.session_factory, request.app.state.providers.llm
+        request.app.state.session_factory,
+        request.app.state.providers.llm,
+        usage_price_publisher=getattr(request.app.state, "usage_price_publisher", None),
     ).delete(ManagementActor(user.email, user.role), provider_id)
 
 
@@ -826,7 +823,7 @@ async def llm_provider_test(request: Request, provider_id: str) -> LLMProviderTe
     cooldowns[provider_id] = monotonic()
     try:
         result = await request.app.state.providers.llm.test_provider(
-            provider_id, timeout_seconds=15
+            provider_id, timeout_seconds=15, acting_user_email=user.email
         )
     finally:
         cooldowns[provider_id] = monotonic()

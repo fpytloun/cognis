@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from cognis.api.common import api_exception, require_current_user
 from cognis.api.models import DeliverableResponse
@@ -22,6 +22,29 @@ class FavoriteRequest(BaseModel):
     """Desired personal bookmark state."""
 
     favorite: bool
+
+
+class CommentCountsRequest(BaseModel):
+    """Exact document references visible in a human-facing listing."""
+
+    refs: list[Annotated[str, Field(min_length=1, max_length=128)]] = Field(max_length=100)
+
+
+class CommentCountsResponse(BaseModel):
+    """Open, non-hidden comments across revisions, disclosed only to the owner."""
+
+    counts: dict[str, int]
+
+
+@router.post("/comment-counts", response_model=CommentCountsResponse)
+async def library_comment_counts(
+    request: Request, body: CommentCountsRequest
+) -> CommentCountsResponse:
+    """Read counts without loading document payloads or creating feedback subjects."""
+    user = require_current_user(request)
+    async with request.app.state.session_factory() as session:
+        counts = await library.document_comment_counts(session, user.email, body.refs)
+    return CommentCountsResponse(counts=counts)
 
 
 @router.put("/items/{kind}/{ref}/favorite", response_model=library.LibraryItem)

@@ -19,6 +19,29 @@ from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base, LLMProvider
 
 
+@pytest.mark.parametrize("model_id", ["gpt-image-2.6-flare", "gpt-image-2.6-sunburst"])
+def test_gpt_image_26_documented_catalog_metadata(model_id):
+    metadata = resolve_model_metadata(model_id, preset="openai")
+    assert metadata["model_mode"] == "image_generation"
+    assert metadata["supports_image_generation"] is True
+    assert metadata["supports_vision"] is True
+    assert metadata["supports_tools"] is False
+    assert metadata["supports_streaming"] is False
+    assert metadata["supports_structured_output"] is False
+    assert "supported_openai_params" not in metadata
+    assert metadata["input_cost_per_mtok"] == 5
+    assert metadata["cache_read_cost_per_mtok"] == 1.25
+    assert metadata["pricing"]["input_cost_per_image_token"] == 0.000008
+    assert metadata["pricing"]["output_cost_per_image_token"] == 0.00003
+    assert metadata["pricing"]["cache_read_input_image_token_cost"] == 0.000002
+    # OpenAI pricing/capabilities must not leak to an unknown compatible host.
+    compatible = resolve_model_metadata(
+        model_id, preset="openai_compatible", base_url="https://images.test"
+    )
+    assert "pricing" not in compatible
+    assert "supports_image_generation" not in compatible
+
+
 @pytest.mark.parametrize(
     ("preset", "url", "explicit", "expected"),
     [
@@ -340,5 +363,85 @@ async def test_discovery_preview_saved_runtime_and_overrides(tmp_path: Path, mon
         updated = await provider.get_model_info("openai/gpt-oss-20b", "groq")
         assert updated.context_window == 32000
         assert updated.input_cost_per_mtok == 0
+    finally:
+        await engine.dispose()
+
+
+async def test_elevenlabs_discovery_saved_models_are_eligible_for_stt_routing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from cognis.core.routing_management import route_model_is_eligible
+
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/elevenlabs.db")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = create_session_factory(engine)
+    config = {
+        "preset": "elevenlabs",
+        "base_url": "https://api.elevenlabs.io",
+        "auth_config": {"mode": "none"},
+        "models": [],
+    }
+    async with factory() as db:
+        db.add(
+            LLMProvider(
+                provider_id="elevenlabs",
+                display_name="ElevenLabs",
+                location="controller",
+                backend="litellm",
+                owner_email=SYSTEM_USER_EMAIL,
+                config=config,
+            )
+        )
+        await db.commit()
+
+    async def models(self, url, **kwargs):
+        assert url == "https://api.elevenlabs.io/v1/models"
+        return httpx.Response(
+            200,
+            request=httpx.Request("GET", url),
+            json=[
+                {
+                    "model_id": "eleven_multilingual_v2",
+                    "name": "Multilingual",
+                    "can_do_text_to_speech": True,
+                },
+                {"model_id": "scribe_v2", "name": "Scribe v2", "can_do_text_to_speech": False},
+            ],
+        )
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", models)
+    provider = LiteLLMProvider(factory)
+    try:
+        preview = await provider.discover_models_preview(
+            preset="elevenlabs", base_url=config["base_url"]
+        )
+        discovered = await provider.discover_models("elevenlabs")
+        assert preview == discovered
+        expected = {"scribe_v1", "scribe_v2", "scribe_v2_realtime"}
+        assert [entry["model_id"] for entry in discovered].count("scribe_v2") == 1
+        stt = [entry for entry in discovered if entry.get("supports_transcription")]
+        assert {entry["model_id"] for entry in stt} == expected
+        for entry in stt:
+            assert entry["model_mode"] == "audio_transcription"
+            assert entry["supports_speech_synthesis"] is False
+            assert entry["supports_tools"] is False
+            assert entry["supports_streaming"] is (entry["model_id"] == "scribe_v2_realtime")
+        async with factory() as db:
+            row = await db.get(LLMProvider, "elevenlabs")
+            row.config = {**config, "models": discovered}
+            await db.commit()
+        async with factory() as db:
+            row = await db.get(LLMProvider, "elevenlabs")
+            assert {model["model_id"] for model in row.config["models"]} >= expected
+        for model_id in expected:
+            info = await provider.get_model_info(model_id, "elevenlabs")
+            assert info.supports_transcription
+            assert info.model_mode == "audio_transcription"
+            assert route_model_is_eligible("speech_to_text", model_id=model_id, model_info=info)
+            assert not route_model_is_eligible(
+                "text_to_speech", model_id=f"elevenlabs/{model_id}", model_info=info
+            )
+            assert not route_model_is_eligible("default", model_id=model_id, model_info=info)
     finally:
         await engine.dispose()

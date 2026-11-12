@@ -104,6 +104,7 @@ def test_task_dependency_management(stack: IntegrationStack, agent_id: str) -> N
             },
         )
         assert r.status_code == 200
+        assert r.json()["workflow_id"] == "system:general-task"
         tasks.append(r.json())
 
     dep = stack.client.post(

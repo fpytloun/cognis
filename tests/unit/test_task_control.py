@@ -26,8 +26,10 @@ from cognis.store.queries import (
     create_session,
     create_step_run,
     create_task,
+    get_step_run,
     get_task,
     mark_task_control_conversation_ready,
+    supersede_step_runs_for_revision,
     update_step_run,
 )
 
@@ -136,7 +138,10 @@ async def test_task_control_conversation_claim_is_concurrency_safe(tmp_path: obj
 
 
 @pytest.mark.asyncio
-async def test_task_control_context_uses_persisted_step_projection_fields(tmp_path: object) -> None:
+@pytest.mark.parametrize("supersession", ["none", "status", "pointer"])
+async def test_task_control_context_uses_persisted_step_projection_fields(
+    tmp_path: object, supersession: str
+) -> None:
     engine = create_engine(f"sqlite+aiosqlite:///{tmp_path}/task-control-context.db")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -238,6 +243,7 @@ async def test_task_control_context_uses_persisted_step_projection_fields(tmp_pa
                 "step_name": "implement",
                 "status": "running",
                 "attempt": 1,
+                "attempt_number": 1,
                 "conversation_id": "conv-step-running",
                 "session_id": "sess-step-running",
                 "deliverable_id": None,
@@ -248,6 +254,7 @@ async def test_task_control_context_uses_persisted_step_projection_fields(tmp_pa
                 "step_name": "review",
                 "status": "completed",
                 "attempt": 1,
+                "attempt_number": 1,
                 "conversation_id": "conv-step-completed",
                 "session_id": None,
                 "deliverable_id": None,
@@ -255,6 +262,56 @@ async def test_task_control_context_uses_persisted_step_projection_fields(tmp_pa
             },
         ]
         assert payload["links"]["control_chat"] == "/chat/conv-control"
+
+        # A human revision resets the per-step retry counter, not task history.
+        async with factory() as session:
+            persisted = await get_task(session, task.task_id)
+            assert persisted is not None
+            persisted.attempt_number = 2
+            assert await update_step_run(session, "sr-running", attempt=3)
+            if supersession == "status":
+                assert (
+                    await supersede_step_runs_for_revision(
+                        session, task.task_id, ["implement"], before_attempt_number=2
+                    )
+                    == 1
+                )
+            replacement = await create_step_run(
+                session,
+                task_id=task.task_id,
+                step_name="implement",
+                step_type="run",
+                agent_id="agent-1",
+                attempt=1,
+                attempt_number=2,
+                status="running",
+                started_at=datetime.now(UTC),
+            )
+            if supersession == "pointer":
+                original = await get_step_run(session, "sr-running")
+                assert original is not None
+                original.superseded_by_step_run_id = replacement.step_run_id
+            await session.commit()
+        revised_context = await build_task_control_turn_context(
+            factory,
+            task_id=task.task_id,
+            conversation_id="conv-control",
+        )
+        revised_payload = json.loads(
+            revised_context.split(
+                "This snapshot is refreshed for the current turn and is not transcript history.\n",
+                1,
+            )[1].rsplit("\n</task_control>", 1)[0]
+        )
+        implement = next(
+            step for step in revised_payload["latest_steps"] if step["step_name"] == "implement"
+        )
+        assert implement["status"] == "running"
+        assert implement["attempt"] == 1
+        assert implement["attempt_number"] == 2
+        assert any(
+            step["step_run_id"] == "sr-completed" for step in revised_payload["latest_steps"]
+        )
 
         async with factory() as session:
             assert not await claim_task_control_conversation(

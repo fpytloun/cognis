@@ -8,17 +8,12 @@ only explicit UI overrides and obvious conversational messages.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 from prometheus_client import Counter
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from cognis.core.json_utils import (
-    extract_json_object,
-    extract_text_from_response,
-)
 from cognis.logging import get_logger
 from cognis.models.agent import AgentDefinition
 from cognis.store.queries import get_setting_value
@@ -144,9 +139,8 @@ def _render_routing_reminder(category: str) -> str:
     }
     label = labels.get(category, "substantial work")
     return (
-        f"Routing hint: this request looks like {label}.\n"
-        "Consider delegation or a background task before doing it inline.\n"
-        "If it is truly small enough to complete correctly in this turn, inline execution is fine."
+        f"Routing hint: this request looks like {label}. Delegate it or start a "
+        "background task when that helps; do it inline when it fits in this turn."
     )
 
 
@@ -296,207 +290,4 @@ class DecisionEngine:
             predicted_tool_intensity=predicted_tool_intensity,
             override_source=override_source,
             degraded=degraded,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Workflow selection
-# ---------------------------------------------------------------------------
-
-
-class WorkflowSelectionResult(BaseModel):
-    """Result of workflow selection."""
-
-    workflow_id: str
-    confidence: float
-    reason: str
-    source: str  # "explicit" | "default" | "classifier"
-
-
-def _fallback_workflow_id(
-    available_workflows: list[dict[str, Any]],
-    default_workflow_id: str | None,
-) -> str:
-    """Choose a conservative fallback without similarity matching.
-
-    Fallbacks are used only when the classifier cannot produce a usable
-    workflow selection. Prefer non-skill workflows because decomposed skill
-    workflows are narrow operational procedures and unsafe as generic defaults.
-    """
-
-    workflows_by_id = {
-        str(workflow.get("workflow_id", "")): workflow for workflow in available_workflows
-    }
-    if default_workflow_id:
-        default_workflow = workflows_by_id.get(default_workflow_id)
-        if default_workflow is not None and not _is_skill_workflow_candidate(default_workflow):
-            return default_workflow_id
-
-    general_workflow = workflows_by_id.get("system:general-task")
-    if general_workflow is not None and not _is_skill_workflow_candidate(general_workflow):
-        return "system:general-task"
-
-    for workflow in available_workflows:
-        workflow_id = str(workflow.get("workflow_id", ""))
-        if workflow_id and not _is_skill_workflow_candidate(workflow):
-            return workflow_id
-
-    if default_workflow_id and default_workflow_id in workflows_by_id:
-        return default_workflow_id
-    return "system:general-task"
-
-
-def _is_skill_workflow_candidate(workflow: dict[str, Any]) -> bool:
-    return workflow.get("candidate_type") == "skill_workflow" or str(
-        workflow.get("workflow_id", "")
-    ).startswith("skill:")
-
-
-async def select_workflow(
-    *,
-    llm: Any,
-    task_description: str,
-    available_workflows: list[dict[str, Any]],
-    default_workflow_id: str | None = None,
-    selection_mode: str = "automatic",
-    classifier_timeout_seconds: float = 10.0,
-) -> WorkflowSelectionResult:
-    """Select a workflow for a task based on agent config and classifier.
-
-    Args:
-        llm: LLM provider for classifier calls.
-        task_description: Description of the task.
-        available_workflows: List of workflow candidate metadata dicts.
-        default_workflow_id: Agent's default workflow.
-        selection_mode: "automatic" | "always_ask" | "use_default".
-        classifier_timeout_seconds: Timeout for the LLM classifier.
-    """
-    if selection_mode == "use_default" and default_workflow_id:
-        return WorkflowSelectionResult(
-            workflow_id=default_workflow_id,
-            confidence=1.0,
-            reason="Agent default workflow",
-            source="default",
-        )
-
-    if not available_workflows:
-        return WorkflowSelectionResult(
-            workflow_id=default_workflow_id or "system:general-task",
-            confidence=0.5,
-            reason="No workflows available, using default",
-            source="default",
-        )
-
-    valid_ids = {w["workflow_id"] for w in available_workflows}
-
-    # Build classifier prompt from system agent
-    from cognis.core.agent_registry import SYSTEM_AGENTS
-
-    classifier_agent = SYSTEM_AGENTS.get("system:classifier")
-    classifier_prompt = (
-        classifier_agent.system_prompt
-        if classifier_agent and classifier_agent.system_prompt
-        else (
-            "Select the best workflow for the given task. "
-            "You MUST respond with a single JSON object and nothing else."
-        )
-    )
-
-    workflow_options = "\n".join(
-        (
-            f"- {w['workflow_id']}: {w.get('name', '')}\n"
-            f"  Description: {w.get('description', '')}\n"
-            f"  Criteria: {w.get('criteria', '')}\n"
-            f"  Tags: {', '.join(str(tag) for tag in w.get('tags', [])) if isinstance(w.get('tags'), list) else w.get('tags', '')}\n"
-            f"  Scope: {'project-bound' if w.get('project_bound') else 'global'}"
-        )
-        for w in available_workflows
-    )
-    prompt = [
-        {"role": "system", "content": classifier_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"Task: {task_description}\n\n"
-                "Select the workflow whose description, criteria, and tags best match the task. "
-                "Use the full task text, including any expected output or deliverable requirements, as selection signal. "
-                "Strongly prefer a project-bound workflow over a global/system workflow when it meaningfully matches. "
-                "Prefer non-skill workflows over skill-derived workflows by default. "
-                "Only choose a skill-derived workflow when the task is definitely and specifically about that skill's domain; "
-                "do not choose skills from generic verbs, broad similarity, or partial overlap. "
-                "If you choose a skill-derived workflow, include exact_skill_domain_match=true; otherwise omit it or set it false. "
-                "For concrete personal/tool actions, prefer system:general-task unless a specialized workflow clearly fits. "
-                "Return JSON with workflow_id, confidence, and reason.\n\n"
-                f"Available workflows:\n{workflow_options}"
-            ),
-        },
-    ]
-
-    try:
-
-        async def _generate(generate_kwargs: dict[str, Any]) -> dict[str, Any]:
-            return await asyncio.wait_for(
-                llm.generate(
-                    prompt,
-                    task_type="classifier",
-                    temperature=0,
-                    **generate_kwargs,
-                ),
-                timeout=classifier_timeout_seconds,
-            )
-
-        response = await _generate({"response_format": {"type": "json_object"}})
-        content = extract_text_from_response(response)
-        if not content or not content.strip():
-            raise ValueError("Classifier returned empty response")
-        payload = extract_json_object(content, label="classifier")
-        workflow_id = str(payload.get("workflow_id", ""))
-        confidence = float(payload.get("confidence", 0.5))
-
-        # Validate the selected workflow exists
-        if workflow_id not in valid_ids:
-            workflow_id = _fallback_workflow_id(available_workflows, default_workflow_id)
-        else:
-            selected = next(
-                (
-                    workflow
-                    for workflow in available_workflows
-                    if workflow["workflow_id"] == workflow_id
-                ),
-                None,
-            )
-            if selected is not None and _is_skill_workflow_candidate(selected):
-                exact_skill_domain_match = payload.get("exact_skill_domain_match") is True
-                if confidence < 0.95 or not exact_skill_domain_match:
-                    workflow_id = _fallback_workflow_id(available_workflows, default_workflow_id)
-
-        return WorkflowSelectionResult(
-            workflow_id=workflow_id,
-            confidence=confidence,
-            reason=str(payload.get("reason", "Classifier selection")),
-            source="classifier",
-        )
-
-    except TimeoutError:
-        logger.warning(
-            "Workflow selector timed out, using default",
-            extra={"extra_data": {"default": default_workflow_id}},
-        )
-        return WorkflowSelectionResult(
-            workflow_id=_fallback_workflow_id(available_workflows, default_workflow_id),
-            confidence=0.3,
-            reason="Classifier timeout fallback",
-            source="default",
-        )
-    except Exception:
-        logger.warning(
-            "Workflow selector failed, using default",
-            extra={"extra_data": {"default": default_workflow_id}},
-            exc_info=True,
-        )
-        return WorkflowSelectionResult(
-            workflow_id=_fallback_workflow_id(available_workflows, default_workflow_id),
-            confidence=0.3,
-            reason="Classifier fallback",
-            source="default",
         )

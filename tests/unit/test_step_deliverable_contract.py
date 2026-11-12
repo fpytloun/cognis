@@ -44,6 +44,7 @@ from cognis.tools.native_validation import (
 )
 from cognis.tools.registry import ToolRegistry
 from tests.unit.test_agent_loop import (
+    _RecordingGuardrails,
     _SingleTextLLM,
     _step_complete_test_context,
     _step_complete_test_loop,
@@ -631,3 +632,56 @@ def test_validation_fingerprint_binds_output_scope_step_and_actor():
             )
             != initial
         )
+
+
+@pytest.mark.asyncio
+async def test_task_document_is_replayed_before_later_step_progress(tmp_path):
+    from cognis.api.chat_v2.event_store import RawSessionEvent
+    from cognis.api.chat_v2.normalizer import normalize_session_events
+    from cognis.api.chat_v2.projector import project_timeline
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    factory, ctx = await database_context(engine)
+    loop = _step_complete_test_loop(
+        ScriptedTools(
+            [
+                ("validate_tool_call", {"tool": "write_deliverable", "arguments": PACKET}),
+                ("write_deliverable", PACKET),
+                (
+                    "step_todo_write",
+                    {"todos": [{"content": "Check published output", "status": "completed"}]},
+                ),
+                ("step_complete", {"summary": "Published and checked"}),
+            ]
+        ),
+    )
+    loop.session_manager.session_factory = factory
+    loop._session_factory = factory
+    loop.artifact_store = ArtifactStore(ArtifactStoreConfig(path=str(tmp_path / "artifacts")))
+    recorder = _RecordingGuardrails()
+    loop.providers.guardrails = recorder
+    try:
+        result = await loop.run_step(ctx)
+        assert result is not None and result.deliverable_id
+        raw = [
+            RawSessionEvent(
+                store_id="intaris",
+                session_id=ctx.session.session_id,
+                seq=index,
+                type=event.type,
+                data=event.data,
+            )
+            for index, event in enumerate(recorder.recorded_events, 1)
+        ]
+        replay = project_timeline(normalize_session_events(raw).events).timeline.items
+        documents = [item for item in replay if item.kind == "assistant_deliverable"]
+        assert [item.deliverable_id for item in documents] == [result.deliverable_id]
+        later = next(
+            item
+            for item in replay
+            if item.kind == "tool_call" and item.tool_name == "step_complete"
+        )
+        assert replay.index(documents[0]) < replay.index(later)
+        assert project_timeline(normalize_session_events(raw).events).timeline.items == replay
+    finally:
+        await engine.dispose()

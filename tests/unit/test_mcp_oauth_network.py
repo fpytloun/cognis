@@ -49,7 +49,7 @@ def dns(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> None:
         "[]",
         "true",
         "{",
-        '{"oauth-gateway.example.test:443":["10.73.5.19/32"],"oauth-gateway.example.test:443":["10.73.5.20/32"]}',
+        '{"oauth-gateway.example.test:443":["10.73.5.19/32"],"oauth-gateway.example.test:443":["10.0.0.1/32"]}',
         '{"*.example.test:443":["10.73.5.19/32"]}',
         '{"https://oauth-gateway.example.test:443":["10.73.5.19/32"]}',
         '{"oauth-gateway.example.test":["10.73.5.19/32"]}',
@@ -347,7 +347,7 @@ async def test_credential_redirects_never_follow(
 
     async def handle(self, request):
         seen.append(request)
-        return httpx.Response(307, headers={"Location": "https://other.example.test/token"})
+        return httpx.Response(307, headers={"Location": "https://other.fpy.cz/token"})
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     with pytest.raises(MCPOAuthError):
@@ -370,13 +370,13 @@ async def test_rebinding_after_first_request_cannot_reuse_pool(
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     async with httpx.AsyncClient(transport=OAuthDestinationTransport(), trust_env=False) as client:
         await client.get(URL)
-        dns(monkeypatch, "10.73.5.20")
+        dns(monkeypatch, "192.168.33.209")
         with pytest.raises(httpx.ConnectError, match="outside"):
             await client.get(URL)
     assert len(seen) == 1
 
 
-@pytest.mark.parametrize("addresses", [[], ["8.8.8.8", "10.73.5.19"]])
+@pytest.mark.parametrize("addresses", [[], ["8.8.8.8", "192.168.33.208"]])
 def test_default_empty_or_mixed_dns_is_denied(
     monkeypatch: pytest.MonkeyPatch,
     addresses: list[str],

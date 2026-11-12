@@ -1222,6 +1222,7 @@ async def test_immediate_progress_uses_shared_outbox_on_adapter_owner(
             read_events=AsyncMock(return_value=SimpleNamespace(events=events, has_more=False))
         )
         scheduler = object.__new__(TurnScheduler)
+        scheduler._turn_controls = {}
         scheduler._durable_request_by_conversation = {"conv-a": request.request_id}
         scheduler._durable_fences = {
             request.request_id: SimpleNamespace(lease=lease, assert_current=AsyncMock())

@@ -140,6 +140,47 @@ async def test_two_schedulers_dispatch_one_logical_fire(tmp_path: Any) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prior_task_active", [True, False])
+async def test_stale_contender_cannot_consume_future_occurrence(
+    tmp_path: Any, prior_task_active: bool
+) -> None:
+    engine, factory, _ = await _setup(tmp_path)
+    fire_at = datetime.now(UTC) - timedelta(seconds=2)
+    try:
+        async with factory() as session:
+            schedule = await session.get(Schedule, "schedule-1")
+            schedule.next_fire_at = fire_at
+            schedule.interval_seconds = 86400
+            await session.commit()
+        schedulers = [
+            Scheduler(
+                factory,
+                _DatabaseTaskQueue(factory),
+                EventBus(),
+                controller_owner_id=f"controller-{i}",
+            )
+            for i in (1, 2)
+        ]
+        task_id = await schedulers[0]._fire_schedule("schedule-1", expected_fire_at=fire_at)
+        assert task_id is not None
+        async with factory() as session:
+            if not prior_task_active:
+                task = await session.get(Task, task_id)
+                task.status = "completed"
+                await session.commit()
+        assert await schedulers[1]._fire_schedule("schedule-1", expected_fire_at=fire_at) is None
+        # A caller without a stale snapshot must still pass the atomic DB due guard.
+        assert await schedulers[1]._fire_schedule("schedule-1") is None
+        async with factory() as session:
+            assert len((await session.scalars(select(ScheduleFireRow))).all()) == 1
+            assert len((await session.scalars(select(Task))).all()) == 1
+            schedule = await session.get(Schedule, "schedule-1")
+            assert schedule.next_fire_at.replace(tzinfo=UTC) > datetime.now(UTC)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_old_controller_insert_snapshots_timezone_before_schedule_mutation(
     tmp_path: Any,
 ) -> None:

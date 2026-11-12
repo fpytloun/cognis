@@ -207,6 +207,36 @@ async def test_direct_final_waits_only_for_retryable_progress(
             progress.status = progress_status
             progress.created_at = final.created_at - timedelta(seconds=1)
             final.direct_turn_request_id = "request"
+            agent = await create_agent(
+                db,
+                agent_id="delivery-order-agent",
+                owner_email=final.user_email,
+                name="Delivery ordering agent",
+                status="active",
+            )
+            await create_conversation(
+                db,
+                conversation_id=final.conversation_id,
+                user_email=final.user_email,
+                agent_id=agent.agent_id,
+                context_type="matrix",
+            )
+            db.add(
+                DirectTurnRequestRow(
+                    request_id=final.direct_turn_request_id,
+                    turn_id="turn_delivery_order",
+                    conversation_id=final.conversation_id,
+                    agent_id=agent.agent_id,
+                    user_id=final.user_email,
+                    idempotency_scope="channel:delivery-order",
+                    idempotency_key="delivery-order",
+                    admission_hash="admission-hash",
+                    payload_hash="payload-hash",
+                    payload_version=1,
+                    payload={"schema_version": 1},
+                    status="running",
+                )
+            )
             await db.commit()
         adapter = SimpleNamespace(
             capabilities=ChannelCapabilities(supports_idempotent_send=True),

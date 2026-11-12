@@ -3578,7 +3578,7 @@ async def test_snapshot_cache_identity_uses_dedicated_schema_without_work_fence(
     )
 
     assert identity is not None
-    assert identity.value_key.startswith("cognis:chat-event-cache:v3:snapshot:")
+    assert identity.value_key.startswith("cognis:chat-event-cache:v4:snapshot:")
     assert identity.value_key != f"cognis:chat-event-cache:v2:snapshot:{old_digest}"
 
 

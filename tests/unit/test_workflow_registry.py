@@ -179,7 +179,10 @@ def test_general_task_workflow_has_deterministic_completion_contract() -> None:
         "result_status",
         "verification",
     }
-    assert w.steps[0].outcome_routes == [OutcomeRoute(status="failed", action="gate")]
+    assert w.steps[0].outcome_routes == [
+        OutcomeRoute(status="failed", action="gate"),
+        OutcomeRoute(status="rejected", action="continue"),
+    ]
     assert w.steps[0].objective
     assert w.steps[0].responsibilities
 
@@ -313,7 +316,7 @@ def test_software_development_review_steps_are_isolated_and_route_deterministica
         "Replan or escalate before continuing."
     )
     assert code_review_exhausted_gate.gate.options[0].action == "revise(plan)"
-    assert "metadata.code_review.should_fix_count > 0" in (
+    assert "metadata.code_review.should_fix_count > 0" not in (
         post_review_gate.gate.conditions[0].expression
     )
     assert commit_step.outcome_routes == [OutcomeRoute(status="failed", action="gate")]

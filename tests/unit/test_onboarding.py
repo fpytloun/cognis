@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -38,7 +37,7 @@ def test_compose_empty_admin_credentials_preserve_interactive_setup(
             async with client.app.state.session_factory() as session:
                 return await count_users(session)
 
-        assert asyncio.run(users()) == 0
+        assert client.portal.call(users) == 0
         assert client.app.state.setup_token_manager is not None
         assert client.get("/api/bootstrap-status").json()["setup_available"] is True
 
@@ -67,7 +66,7 @@ def test_onboarding_is_durable_owner_scoped_and_does_not_reset(
                     )
                 await session.commit()
 
-        asyncio.run(seed())
+        client.portal.call(seed)
 
         def headers(email: str, role: str) -> dict[str, str]:
             token = app.state.auth_provider.sign_access_token(email, email, role)

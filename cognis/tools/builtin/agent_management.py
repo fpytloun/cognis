@@ -5,14 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 from cognis.core.agent_management import (
+    GUARDRAIL_SETTING_FIELDS,
+    TOOL_ASSIGNMENT_FIELDS,
     AgentManagementDependencies,
     AgentManagementError,
     handle_agent_management_action,
     result_to_json,
 )
 from cognis.core.agent_registry import SYSTEM_AGENTS
+from cognis.models.agent import AgentCapabilities, AutoProfileSelectionSettings
 from cognis.models.hooks import HookAssignment, HookDefinition
 from cognis.models.tool import (
+    MCPServerConfig,
     NativeToolOperation,
     ToolCapability,
     ToolDefinition,
@@ -26,16 +30,26 @@ from cognis.runtime_context import RuntimeAccessContext, current_runtime_access_
 
 _SOURCE = ToolSource(type="builtin")
 
+_GUARDRAIL_SCHEMA = {
+    field: AgentCapabilities.model_json_schema()["properties"][field]
+    for field in GUARDRAIL_SETTING_FIELDS
+}
+
 _SETTINGS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "minProperties": 1,
     "additionalProperties": False,
     "properties": {
-        "available_workflow_ids": {"type": "array", "items": {"type": "string"}},
-        "default_workflow_id": {"type": ["string", "null"]},
-        "workflow_selection_mode": {
-            "type": "string",
-            "enum": ["automatic", "always_ask", "use_default"],
+        **_GUARDRAIL_SCHEMA,
+        "auto_profile_selection": {
+            **AutoProfileSelectionSettings.model_json_schema(),
+            "type": ["object", "null"],
+            "description": (
+                "Startup profile selection settings. Enabled by default; min_confidence "
+                "defaults to 0.85. Supplied fields patch this group; omitted fields are "
+                "preserved. Null restores defaults. Only enabled, agent-switchable "
+                "profiles are eligible. Low confidence keeps the configured default."
+            ),
         },
         "executor_id": {
             "type": ["string", "null"],
@@ -62,8 +76,43 @@ _SETTINGS_SCHEMA: dict[str, Any] = {
         "max_tokens": {"type": ["integer", "null"]},
         "reasoning_effort": {"type": ["string", "null"]},
         "voice": {"type": ["string", "null"]},
+        "voices": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": (
+                "Provider-scoped fallback voices when no explicit TTS binding/voice is set. "
+                "Replaces the map; {} clears it. Omission preserves it."
+            ),
+        },
+        "tts_provider_id": {
+            "type": ["string", "null"],
+            "description": (
+                "Agent-only TTS provider, independent of chat and global routes. "
+                "Use an existing provider ID and tts_model; null clears the provider override. "
+                "Clear both provider and model to inherit the system TTS route."
+            ),
+        },
+        "tts_model": {
+            "type": ["string", "null"],
+            "description": (
+                "Agent-only synthesis model. Null clears the model override; also clear "
+                "tts_provider_id to inherit the system TTS route."
+            ),
+        },
+        "tts_voice": {
+            "type": ["string", "null"],
+            "description": (
+                "Voice ID for the selected TTS provider/model. Null uses existing voice "
+                "inheritance/provider defaults. Unavailable voices fall back at synthesis "
+                "with a warning, as in the UI."
+            ),
+        },
         "memory_backend": {"type": "string"},
         "memory_backend_options": {"type": "object"},
+        "analytics_enabled": {
+            "type": "boolean",
+            "description": "Enable session analytics independently of guardrails. Omission preserves it.",
+        },
         "escalation_timeout_seconds": {
             "type": ["integer", "null"],
             "minimum": 1,
@@ -164,6 +213,9 @@ _SYSTEM_OVERRIDES_SCHEMA: dict[str, Any] = {
                 "max_tokens": {"type": ["integer", "null"]},
                 "reasoning_effort": {"type": ["string", "null"]},
                 "fast_mode": {"type": ["boolean", "null"]},
+                "tts_provider_id": _SETTINGS_SCHEMA["properties"]["tts_provider_id"],
+                "tts_model": _SETTINGS_SCHEMA["properties"]["tts_model"],
+                "tts_voice": _SETTINGS_SCHEMA["properties"]["tts_voice"],
             },
         },
         "skills": {
@@ -288,6 +340,20 @@ _BASE_SCHEMA: dict[str, Any] = {
         "delegation": _SETTINGS_SCHEMA["properties"]["delegation"],
         "llm_config": {"type": "object"},
         "execution": {"type": "object"},
+        "auto_profile_selection": _SETTINGS_SCHEMA["properties"]["auto_profile_selection"],
+        **_GUARDRAIL_SCHEMA,
+        **{
+            field: {"type": "array", "items": {"type": "string"}}
+            for field in ("disabled_tools", "disabled_mcp_servers", "intaris_mcp_servers")
+        },
+        "mcp_servers": {
+            "type": "array",
+            "items": MCPServerConfig.model_json_schema(),
+            "description": (
+                "Legacy agent-local MCP configuration. Runtime connections are managed on executors; "
+                "this does not provision or start servers."
+            ),
+        },
         "settings": {
             **_SETTINGS_SCHEMA,
             "description": (
@@ -403,6 +469,8 @@ def _operation(
     }
     if name.startswith("hooks_") or name.startswith("hook_assignments_"):
         schema["$defs"] = HookDefinition.model_json_schema().get("$defs", {})
+    if "mcp_servers" in fields:
+        schema["$defs"] = MCPServerConfig.model_json_schema().get("$defs", {})
     if any_of:
         schema["anyOf"] = any_of
     return NativeToolOperation(
@@ -438,13 +506,14 @@ _SYSTEM_REVISION_SEMANTICS = ToolValueSemantics(
         "re-read after conflict"
     ),
 )
-_TOOL_FIELDS = ("agent_id", "tool_groups", "allow_tools", "deny_tools")
+_TOOL_FIELDS = ("agent_id", *TOOL_ASSIGNMENT_FIELDS)
 _SKILL_FIELDS = ("agent_id", "skill_assignments")
 _KNOWLEDGEBASE_FIELDS = ("agent_id", "knowledgebase_ids")
 _PROFILE_ID_FIELDS = ("agent_id", "profile_id")
 _PROFILE_MUTATION_FIELDS = ("agent_id", "profile_id", "profile", "expected_updated_at")
 _UPDATE_FIELDS = (
     "agent_id",
+    "auto_profile_selection",
     "name",
     "display_name",
     "description",
@@ -583,7 +652,7 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
             example={
                 "action": "settings_update",
                 "agent_id": "managed-agent",
-                "settings": {"workflow_selection_mode": "automatic"},
+                "settings": {"temperature": 0.2},
             },
             semantics=_PATCH_SEMANTICS,
             dynamic_options=[
@@ -805,7 +874,7 @@ MANAGE_AGENTS_TOOL = ToolDefinition(
             "create",
             kind=ToolMutationKind.CREATE,
             fields=tuple(field for field in _UPDATE_FIELDS if field not in {"agent_id", "status"})
-            + ("agent_type", "assigned_knowledgebases"),
+            + ("agent_type", "assigned_knowledgebases", *GUARDRAIL_SETTING_FIELDS),
             required=("name",),
             example={"action": "create", "name": "New agent"},
             validator_ids=("manage_agents.create",),
@@ -1016,7 +1085,19 @@ async def handle_agent_management_tool(
     """Execute an agent-management tool call."""
     from cognis.core.intaris_policy import profile_mutation_error
 
-    profile_error = profile_mutation_error(arguments)
+    policy_arguments = dict(arguments)
+    if arguments.get("action") == "create":
+        for field in GUARDRAIL_SETTING_FIELDS:
+            policy_arguments.pop(field, None)
+    elif arguments.get("action") == "settings_update" and isinstance(
+        arguments.get("settings"), dict
+    ):
+        policy_arguments["settings"] = {
+            field: value
+            for field, value in arguments["settings"].items()
+            if field not in GUARDRAIL_SETTING_FIELDS
+        }
+    profile_error = profile_mutation_error(policy_arguments)
     if profile_error is not None:
         return profile_error
 

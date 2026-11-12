@@ -45,7 +45,7 @@ def _seed_user(client: TestClient, email: str = "admin@example.com", role: str =
             )
             await session.commit()
 
-    asyncio.run(_seed())
+    client.portal.call(_seed)
 
 
 def test_direct_turn_conflict_is_a_structured_http_conflict(monkeypatch, tmp_path) -> None:
@@ -89,7 +89,7 @@ def test_browser_refresh_accepts_sqlite_expiry_and_rejects_expired_session(
                 browser.expires_at = datetime.now(UTC) - timedelta(seconds=1)
                 await session.commit()
 
-        asyncio.run(expire())
+        client.portal.call(expire)
         assert client.post("/api/auth/refresh").status_code == 401
 
 
@@ -105,7 +105,7 @@ def _set_mfa_policy(client: TestClient, policy: str) -> None:
             )
             await session.commit()
 
-    asyncio.run(_set())
+    client.portal.call(_set)
 
 
 def _complete_required_setup(
@@ -168,7 +168,7 @@ def test_required_challenge_is_hashed_bounded_and_does_not_update_last_login(
                 assert user is not None
                 return challenge, user.last_login_at
 
-        challenge, last_login = asyncio.run(_read())
+        challenge, last_login = client.portal.call(_read)
         assert challenge.token_hash != login["challenge_token"]
         assert login["challenge_token"].encode() not in (challenge.pending_secret or b"")
         assert last_login is None
@@ -886,7 +886,7 @@ def test_native_refresh_rejects_expired_session(monkeypatch: object, tmp_path: P
                 row.expires_at = datetime.now(UTC) - timedelta(seconds=1)
                 await session.commit()
 
-        asyncio.run(_expire())
+        client.portal.call(_expire)
         response = client.post(
             "/api/auth/refresh",
             json={"mode": "native", "refresh_token": login["refresh_token"]},

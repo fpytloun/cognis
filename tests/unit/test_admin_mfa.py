@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -50,7 +49,7 @@ def test_reset_mfa_command_removes_factor_and_revokes_sessions(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         old_tokens = [
             app.state.auth_provider.sign_access_token(
                 "reset@example.com",
@@ -79,7 +78,7 @@ def test_reset_mfa_command_removes_factor_and_revokes_sessions(
                     )
                 ).scalar_one_or_none()
 
-        assert asyncio.run(_factor()) is None
+        assert client.portal.call(_factor) is None
         for token in old_tokens:
             assert (
                 client.get(
@@ -125,7 +124,7 @@ def test_reset_password_command_invalidates_all_access_tokens(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         old_tokens = [
             app.state.auth_provider.sign_access_token(
                 "password-reset@example.com",

@@ -22,6 +22,11 @@ _MESSAGES = [
         "tool_call_id": "call_wrapped",
         "content": json.dumps({"wrapped": json.dumps({"deliverable_id": "dlv_wrapped"})}),
     },
+    {
+        "role": "tool",
+        "tool_call_id": "call_generation",
+        "content": json.dumps({"kernel_generation": 987654321}),
+    },
 ]
 
 
@@ -51,7 +56,12 @@ def test_rendered_tool_call_arguments_use_resolved_placeholder() -> None:
                         "type": "tool_call",
                         "call_id": "call_v2",
                         "name": "write_deliverable",
-                        "arguments": {"supersedes": "{{tool_result:call_v1:deliverable_id}}"},
+                        "arguments": {
+                            "supersedes": "{{tool_result:call_v1:deliverable_id}}",
+                            "expected_generation": (
+                                "{{tool_result_number:call_generation:kernel_generation}}"
+                            ),
+                        },
                     }
                 ],
             }
@@ -60,4 +70,7 @@ def test_rendered_tool_call_arguments_use_resolved_placeholder() -> None:
     chunks = render_chat_completion_stream(scenario, messages=_MESSAGES)
     first = json.loads(chunks[0].removeprefix("data: "))
     arguments = first["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
-    assert json.loads(arguments) == {"supersedes": "dlv_abc"}
+    assert json.loads(arguments) == {
+        "supersedes": "dlv_abc",
+        "expected_generation": 987654321,
+    }

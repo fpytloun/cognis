@@ -31,6 +31,11 @@ class SettingSpec:
 
 
 _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
+    "usage.enabled": ("usage", True),
+    "usage.retention_enabled": ("usage", False),
+    "usage.detail_retention_days": ("usage", 30),
+    "usage.quota_history_retention_days": ("usage", 365),
+    "usage.bookkeeping_retention_days": ("usage", 30),
     "session.compaction_threshold": ("session", 0.85),
     "session.compaction_preserve_turns": ("session", 10),
     "session.compaction_max_input_tokens": ("session", 0),
@@ -46,7 +51,7 @@ _DEFAULT_VALUES: Final[dict[str, tuple[str, object]]] = {
     "session.core_memories_max_tokens": ("session", 2000),
     "session.immutable_prefix_repair_cooldown_seconds": ("session", 300),
     "session.recall_ttl_seconds": ("session", 86400),
-    "session.optional_recall_timeout_seconds": ("session", 5.0),
+    "session.optional_recall_timeout_seconds": ("session", 0.5),
     "session.max_tool_calls_per_turn": ("session", 500),
     "session.max_llm_cycles_per_turn": ("session", 150),
     "session.idle_timeout_seconds": ("session", 1800),
@@ -150,6 +155,10 @@ _HOT_KEYS: Final[set[str]] = {
 }
 
 _NEXT_OPERATION_KEYS: Final[set[str]] = {
+    "usage.retention_enabled",
+    "usage.detail_retention_days",
+    "usage.quota_history_retention_days",
+    "usage.bookkeeping_retention_days",
     "session.compaction_preserve_turns",
     "session.compaction_max_input_tokens",
     "session.compaction_llm_max_attempts",
@@ -175,6 +184,7 @@ _NEXT_OPERATION_KEYS: Final[set[str]] = {
 _NEXT_RUNTIME_KEYS: Final[set[str]] = {
     key for key in _DEFAULT_VALUES if key.startswith(("mcp.", "web."))
 } | {
+    "usage.enabled",
     "executors.allow_in_process",
     "executors.allow_subprocess",
     "work.source_preview_max_lifetime_seconds",
@@ -195,6 +205,9 @@ _ENUM_KEYS: Final[dict[str, tuple[str, ...]]] = {
 }
 
 _RANGES: Final[dict[str, tuple[int | float | None, int | float | None]]] = {
+    "usage.detail_retention_days": (30, 36500),
+    "usage.quota_history_retention_days": (1, 36500),
+    "usage.bookkeeping_retention_days": (1, 36500),
     "session.compaction_threshold": (0.3, 0.99),
     "session.max_llm_cycles_per_turn": (1, 1000),
     "session.optional_recall_timeout_seconds": (0.1, None),
@@ -202,6 +215,20 @@ _RANGES: Final[dict[str, tuple[int | float | None, int | float | None]]] = {
 }
 
 _DESCRIPTIONS: Final[dict[str, str]] = {
+    "usage.enabled": (
+        "Enable usage collection, aggregation, pricing and analytics pages. "
+        "Requires a controller restart. Disabling preserves stored history."
+    ),
+    "usage.retention_enabled": (
+        "Enable bounded usage-detail archiving and history cleanup after reviewing the retention preview. "
+        "Pending, unprojected or repair-blocked facts are preserved; this is not a hard erasure deadline."
+    ),
+    "usage.detail_retention_days": (
+        "Retain content-free attempt and request detail for at least this many days after observation. "
+        "UTC-day accounting and verified Cognis session totals remain available."
+    ),
+    "usage.quota_history_retention_days": "Days to retain quota and credit gauges; these are not spend counters.",
+    "usage.bookkeeping_retention_days": "Days to retain completed projection outboxes and maintenance history.",
     "session.compaction_threshold": (
         "Context utilization ratio that triggers automatic compaction."
     ),
@@ -266,6 +293,9 @@ _UNITS: Final[dict[str, str]] = {
 }
 _UNITS.update(
     {
+        "usage.detail_retention_days": "days",
+        "usage.quota_history_retention_days": "days",
+        "usage.bookkeeping_retention_days": "days",
         "evaluator.timeout_ms": "milliseconds",
         "managed_conversations.cleanup_retention_days": "days",
         "tts.cache_ttl_days": "days",
@@ -314,7 +344,7 @@ def _build_spec(key: str, category: str, default: object) -> SettingSpec:
     section = parts[1] if len(parts) > 2 else category
     return SettingSpec(
         key=key,
-        label=_humanize(parts[-1]),
+        label="Usage analytics" if key == "usage.enabled" else _humanize(parts[-1]),
         description=_DESCRIPTIONS.get(key, f"Controls {_humanize(key).lower()}."),
         category=category,
         section=section,

@@ -57,6 +57,11 @@ from cognis.api.tool_inventory import (
 from cognis.core.executor_availability import available_executor_types
 from cognis.core.executor_policy import is_executor_row_usable, load_executor_policy
 from cognis.core.executor_resolution import is_tool_enabled, select_executor_for_agent
+from cognis.core.program_config import (
+    PROGRAM_RUNTIME_TOOL_NAMES,
+    program_runtime_executor_enabled,
+    program_tool_allowed,
+)
 from cognis.mcp_runtime import (
     MCPClient,
     build_mcp_client,
@@ -546,6 +551,18 @@ async def _resolve_effective_tools_response(
             else "default"
         ),
     )
+    program_enabled = program_runtime_executor_enabled(
+        {"executor_id": selected.executor_id, "labels": selected.labels, "config": selected.config}
+    )
+    observed_program_names = (
+        {
+            entry.get("name")
+            for entry in selected.observed_tools or []
+            if isinstance(entry, dict) and entry.get("name") in PROGRAM_RUNTIME_TOOL_NAMES
+        }
+        if selected.desired_config_version == selected.applied_config_version
+        else set()
+    )
 
     configured_tools: list[ToolDefinition] = []
     kb_enabled = bool(getattr(request.app.state, "knowledgebase_enabled", False))
@@ -556,8 +573,20 @@ async def _resolve_effective_tools_response(
         )
         if tool.category != "web"
     ]:
-        if tool.source.type == "builtin" or is_tool_enabled(
-            tool, selected.enabled_tools or [], selected.enabled_tool_groups or []
+        if not program_tool_allowed(tool, program_enabled):
+            continue
+        if (
+            selected.executor_type in {"websocket", "subprocess"}
+            and tool.name in PROGRAM_RUNTIME_TOOL_NAMES
+            and tool.name not in observed_program_names
+        ):
+            continue
+        if (
+            tool.source.type == "builtin"
+            or (tool.source.type == "executor" and tool.name in PROGRAM_RUNTIME_TOOL_NAMES)
+            or is_tool_enabled(
+                tool, selected.enabled_tools or [], selected.enabled_tool_groups or []
+            )
         ):
             configured_tools.append(tool)
 
@@ -643,7 +672,8 @@ async def _resolve_effective_tools_response(
     configured_tools = [
         tool
         for tool in configured_tools
-        if not tool_disabled_by_agent_config(
+        if program_tool_allowed(tool, program_enabled)
+        and not tool_disabled_by_agent_config(
             tool,
             disabled_categories=disabled_categories,
             disabled_tools=disabled_tools_set,
@@ -693,6 +723,7 @@ async def _resolve_effective_tools_response(
             remote_tools = await conn.list_tools()
             merged_result = await _merge_remote_runtime_inventory(
                 remote_tools_data=remote_tools,
+                program_enabled=program_enabled,
                 agent_tools=configured_tools,
                 providers=request.app.state.providers,
                 agent=agent,

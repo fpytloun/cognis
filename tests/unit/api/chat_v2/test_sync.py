@@ -160,6 +160,139 @@ def _clear_chat_v2_read_caches() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("older_delta", [False, True])
+@pytest.mark.parametrize("page_cap", [1, 2, None])
+async def test_attachment_hydration_keeps_multiple_turn_boundaries_independent(
+    older_delta: bool,
+    page_cap: int | None,
+) -> None:
+    events = []
+    for turn in range(2):
+        events.append(
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-attachments",
+                seq=turn * 3 + 1,
+                type="user_message",
+                data={"content": f"Report {turn}"},
+            )
+        )
+        for update in range(2):
+            events.append(
+                RawSessionEvent(
+                    store_id="intaris",
+                    session_id="sess-attachments",
+                    seq=turn * 3 + update + 2,
+                    type="assistant_message",
+                    data={
+                        "turn_id": f"turn-{turn}",
+                        "message_id": f"turn-{turn}",
+                        "assistant_phase_index": 0,
+                        "content": f"Report {turn} update {update}",
+                        "content_is_delta": older_delta and turn == 0 and update == 1,
+                        "attachments": [
+                            {
+                                "artifact_id": f"art_{turn}",
+                                "filename": f"report-{turn}.csv",
+                                "kind": "file",
+                                "mime_type": "text/csv",
+                                "size_bytes": 10,
+                            }
+                        ]
+                        if update == 0
+                        else [],
+                    },
+                )
+            )
+    hydrated = await sync_module._hydrate_window_pairings(
+        [events[2], events[3], events[5]],
+        session_refs=[
+            ConversationSessionRef(
+                session_id="sess-attachments",
+                event_store_session_id="sess-attachments",
+                ordinal=0,
+            )
+        ],
+        event_store=FakeEventStore({"sess-attachments": events}, page_cap=page_cap),
+        lookback_limit=2,
+    )
+    items = sync_module._project_window(hydrated).items
+    assert [
+        item.content
+        for item in items
+        if isinstance(item, MessageTimelineItem) and item.role == "assistant"
+    ] == [
+        "Report 0 update 0Report 0 update 1" if older_delta else "Report 0 update 1",
+        "Report 1 update 1",
+    ]
+    assert [
+        [attachment.artifact_id for attachment in item.attachments]
+        for item in items
+        if isinstance(item, MessageTimelineItem) and item.role == "assistant"
+    ] == [["art_0"], ["art_1"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("page_cap", [1, 2, None])
+async def test_replacement_suffix_window_retains_earlier_assistant_attachments(
+    page_cap: int | None,
+) -> None:
+    events = [
+        RawSessionEvent(
+            store_id="intaris",
+            session_id="sess-attachments",
+            seq=1,
+            type="user_message",
+            data={"content": "Create a report"},
+        ),
+        *[
+            RawSessionEvent(
+                store_id="intaris",
+                session_id="sess-attachments",
+                seq=index + 2,
+                type="assistant_message",
+                data={
+                    "turn_id": "turn-report",
+                    "message_id": "turn-report",
+                    "assistant_phase_index": 0,
+                    "content": f"Report {index}",
+                    "attachments": [
+                        {
+                            "artifact_id": "art_report",
+                            "filename": "report.csv",
+                            "kind": "file",
+                            "mime_type": "text/csv",
+                            "size_bytes": 10,
+                        }
+                    ]
+                    if index == 0
+                    else [],
+                },
+            )
+            for index in range(3)
+        ],
+    ]
+    store = FakeEventStore({"sess-attachments": events}, page_cap=page_cap)
+    hydrated = await sync_module._hydrate_window_pairings(
+        [events[-1]],
+        session_refs=[
+            ConversationSessionRef(
+                session_id="sess-attachments",
+                event_store_session_id="sess-attachments",
+                ordinal=0,
+            )
+        ],
+        event_store=store,
+        lookback_limit=2,
+    )
+    [item] = sync_module._project_window(hydrated).items
+    assert isinstance(item, MessageTimelineItem)
+    assert item.content == "Report 2"
+    assert [attachment.artifact_id for attachment in item.attachments] == ["art_report"]
+    assert {event.seq for event in hydrated} == {2, 3, 4}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("page_cap", [1, 2, None])
 @pytest.mark.parametrize("with_tool_pair", [False, True])
 async def test_continuation_suffix_window_hydrates_all_prior_segments(
@@ -414,6 +547,83 @@ def test_snapshot_dense_eighteen_session_lineage_reads_only_newest_page(
         now=NOW,
     )
     assert len(cursor.session_watermarks) == 18
+
+
+@pytest.mark.parametrize("include_copied_start", [True, False])
+@pytest.mark.parametrize("page_cap", [None, 1])
+def test_snapshot_recovers_rotated_compaction_outside_latest_window(
+    include_copied_start: bool,
+    page_cap: int | None,
+) -> None:
+    events = [
+        _event(1, "lifecycle", {"event": "session_created"}),
+        _event(2, "lifecycle", {"event": "session_rotated", "timeline_visible": False}),
+        _event(
+            3,
+            "compaction_summary",
+            {
+                "compaction_id": "compact_recovered",
+                "summary": "Completed compaction",
+                "method": "summary",
+                "marker_role": "context_seed",
+                "session_id": "sess_1",
+                "source_session_id": "sess_old",
+            },
+        ),
+        *[_event(seq, "lifecycle", {"event": "context_projection"}) for seq in range(4, 804)],
+        _event(804, "user_message", {"content": "New message", "client_message_id": "after"}),
+    ]
+    if include_copied_start:
+        events[736] = _event(
+            737,
+            "lifecycle",
+            {
+                "event": "session_compaction_started",
+                "compaction_id": "compact_recovered",
+                "status": "running",
+                "session_id": "sess_old",
+                "compaction_tail": True,
+                "source_session_id": "sess_old",
+                "source_seq": 1200,
+            },
+        )
+    store = FakeEventStore({"intaris_1": events}, page_cap=page_cap)
+    refs = [ref.model_copy(update={"previous_session_id": "sess_old"}) for ref in _lineage()]
+    snapshot = _run(
+        build_chat_snapshot(
+            conversation=_conversation(),
+            session_refs=refs,
+            event_store=store,
+            cursor_secret=SECRET,
+            now=NOW,
+        )
+    )
+    compactions = [item for item in snapshot.timeline.items if item.kind == "compaction"]
+    assert len(compactions) == 1
+    assert compactions[0].status == "compacted"
+    assert compactions[0].session_id == "sess_1"
+    assert compactions[0].previous_session_id == "sess_old"
+    assert snapshot.timeline.items[-1].id == "user:after"
+    # Hydration does not rewind either paging frontier or the live cursor.
+    cursor = validate_cursor(
+        snapshot.cursor,
+        SECRET,
+        scope_key=_scope().key,
+        projection_version=sync_module.current_projection_version(),
+        now=NOW,
+    )
+    assert cursor.session_watermarks[0].last_seq == 804
+    before = validate_cursor(
+        snapshot.timeline.before_cursor,
+        SECRET,
+        scope_key=_scope().key,
+        projection_version=sync_module.current_projection_version(),
+        now=NOW,
+    )
+    # A capped backward reader supplies only its newest event; hydration must
+    # retain that frontier too, rather than pretending the full page was read.
+    expected_window_size = page_cap or sync_module.SNAPSHOT_WINDOW_EVENT_LIMIT
+    assert before.session_watermarks[0].last_seq == 804 - expected_window_size + 1
 
 
 def test_latest_window_sparse_lineage_expands_in_batches_and_caps_concurrency() -> None:

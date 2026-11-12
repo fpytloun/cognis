@@ -211,3 +211,22 @@ def test_compaction_truncates_raw_messages_inside_complete_envelopes() -> None:
         assert rendered.count("<message ") == rendered.count("</message>")
         assert rendered.index('sender="Alice"') < rendered.rindex(">P")
         assert "...[truncated]..." in rendered
+
+
+def test_context_without_metadata_uses_primary_timestamp_instead_of_disappearing() -> None:
+    """Admitted context such as feedback notices must never be dropped from model input."""
+    event = CachedEvent(
+        seq=1,
+        type="user_message",
+        data={
+            "content": "",
+            "message_metadata": {"feedback": {"submission_id": "fbsu_1"}},
+            "context_messages": [{"role": "user", "content": "Feedback submission fbsu_1"}],
+        },
+        ts="2026-08-01T11:00:00Z",
+    )
+
+    assert events_to_messages([event])[0]["content"] == (
+        '<message ts="2026-08-01T11:00:00Z">Feedback submission fbsu_1</message>\n'
+        '<message ts="2026-08-01T11:00:00Z"></message>'
+    )

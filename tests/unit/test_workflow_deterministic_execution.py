@@ -19,7 +19,11 @@ from cognis.core.runtime import ResolvedStepRuntime, TransientExecutorUnavailabl
 from cognis.core.session import SessionManager, _intaris_session_policy
 from cognis.core.workflow_engine import WorkflowEngine
 from cognis.core.workflow_registry import SOFTWARE_DEVELOPMENT_WORKFLOW
-from cognis.core.workflow_rendering import MAX_DETERMINISTIC_JUMPS, WorkflowRenderer
+from cognis.core.workflow_rendering import (
+    MAX_CONTEXT_STRING_BYTES,
+    MAX_DETERMINISTIC_JUMPS,
+    WorkflowRenderer,
+)
 from cognis.models.agent import AgentDefinition
 from cognis.models.task import TaskDelivery, TaskModel, TaskStatus
 from cognis.models.tool import EvaluationResult, NativeToolDefinition, ToolResult, ToolSource
@@ -39,6 +43,7 @@ from cognis.runtime_context import (
 )
 from cognis.store.database import create_engine, create_session_factory
 from cognis.store.models import Base
+from cognis.store.models import Task as TaskRow
 from cognis.store.queries import (
     create_agent,
     create_step_run,
@@ -49,6 +54,7 @@ from cognis.store.queries import (
     get_task,
     list_step_runs_for_task,
     update_step_run,
+    update_task_status,
     update_task_workflow_state,
 )
 from cognis.tools.registry import RegisteredTool, ToolRegistry
@@ -113,18 +119,15 @@ async def test_artifact_tool_after_run_recovers_executor(
     )
     ready = True
 
-    async def reconnect(*args, **kwargs):
-        nonlocal ready
-        ready = True
-        return connection
-
     engine._providers.executor = SimpleNamespace(
         websocket=SimpleNamespace(
             get_ready_connection=lambda executor_id: connection if ready else None,
             get_connection=lambda executor_id: connection,
             get_handle_metadata=lambda executor_id: {},
             notify_browser_session_terminal=AsyncMock(),
-            wait_for_connection=AsyncMock(side_effect=reconnect),
+            wait_for_connection=AsyncMock(
+                side_effect=AssertionError("Durable tasks must release capacity while unavailable")
+            ),
         )
     )
     engine._providers.executor_pin_notice_dispatcher = ExecutorPinNoticeDispatcher(
@@ -254,19 +257,175 @@ async def test_artifact_tool_after_run_recovers_executor(
     )
     try:
         result = await engine.execute_workflow(task, workflow)
+        assert result.status == TaskStatus.READY
+        assert result.workflow_state.current_step_index == 2
+        ready = True
+        async with factory() as db:
+            assert await update_task_status(
+                db, task.task_id, status="running", expected_status="ready"
+            )
+            await db.commit()
+        result = await engine.execute_workflow(result, workflow)
+        loop.run_step.assert_awaited_once()
         for output in result.workflow_state.step_outputs.values():
             assert not output.get("error"), output
-        assert result.status == TaskStatus.COMPLETED, result.workflow_state.step_outputs
+        assert result.status == TaskStatus.COMPLETED, result.workflow_state.pending_pause_payload
         ack = result.workflow_state.step_outputs["ack"]["outputs"]
         assert ack["revision"] == (3 if final_tool == "artifact_write" else 2)
         assert ack["project_id"] == task.project_id
-        engine._providers.executor.websocket.wait_for_connection.assert_awaited_once()
+        engine._providers.executor.websocket.wait_for_connection.assert_not_awaited()
         # The recovery window must be durable, not reset by a projection rollback.
         async with factory() as db:
             notices = list((await db.scalars(select(ExecutorRecoveryNoticeRow))).all())
             assert {notice.recovered for notice in notices} == {False, True}
             assert len({notice.unavailable_since for notice in notices}) == 1
             assert all(notice.delivered_at for notice in notices)
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.parametrize("permission", ["read", "write"])
+async def test_scheduled_artifact_write_uses_live_lineage_grant(tmp_path, permission):
+    from cognis.artifacts.store import ArtifactStore, ArtifactStoreConfig
+    from cognis.core.artifact_revisions import ContentActor, write_artifact_document
+    from cognis.core.document_sharing import replace_explicit_shares
+    from cognis.core.tool_router import ToolRouter
+    from cognis.models.session import ConversationContext, ConversationModel, SessionModel
+    from cognis.models.workflow import ToolCallStepConfig
+    from cognis.store.models import ArtifactRecordRow
+    from cognis.store.queries import create_conversation, create_session, update_agent
+    from cognis.tools.builtin.artifact_tools import ARTIFACT_WRITE_TOOL
+
+    store = ArtifactStore(ArtifactStoreConfig(path=str(tmp_path / "shared-state")))
+
+    class ArtifactLoop(_DeterministicAgentLoop):
+        async def execute_controller_tool(self, ctx, tool_call):
+            return await router.execute(
+                tool_call,
+                ctx.session,
+                ctx.agent,
+                ctx.tool_registry,
+                executor=ctx.executor_connection,
+                workflow_step_scope=ctx.workflow_step_scope,
+            )
+
+    loop = ArtifactLoop()
+    db_engine, factory, engine, task, _ = await _engine_runtime(tmp_path, agent_loop=loop)
+    guardrails = AsyncMock()
+    guardrails.evaluate.return_value = EvaluationResult(decision="approve", call_id="eval_scope")
+    router = ToolRouter(guardrails=guardrails, artifact_store=store, session_factory=factory)
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=ARTIFACT_WRITE_TOOL))
+
+    async def runtime(**kwargs):
+        return ResolvedStepRuntime(
+            tool_registry=registry,
+            executor_connection=SimpleNamespace(executor_id="executor-a"),
+            cleanup=AsyncMock(),
+            executor_environment=None,
+        )
+
+    async def persisted_session(task, step_def, agent, **kwargs):
+        async with factory() as db:
+            conversation = await create_conversation(
+                db, task.created_by, agent.agent_id, "agent_task"
+            )
+            session = await create_session(
+                db, conversation.conversation_id, task.created_by, agent.agent_id
+            )
+            await db.commit()
+            return (
+                ConversationModel(
+                    conversation_id=conversation.conversation_id,
+                    user_email=task.created_by,
+                    agent_id=agent.agent_id,
+                    context=ConversationContext(type=conversation.context_type),
+                ),
+                SessionModel.model_validate(session, from_attributes=True),
+                False,
+            )
+
+    engine._resolve_step_runtime = runtime
+    engine._reuse_or_create_step_session = persisted_session
+    engine._session_manager.refresh_intaris_session_policy = AsyncMock(
+        return_value={"evaluation_policy_version": "hybrid_v1"}
+    )
+    try:
+        async with factory() as db:
+            await update_agent(db, task.agent_id, updates={"status": "active"})
+            await create_agent(
+                db,
+                agent_id="state-producer",
+                owner_email=task.created_by,
+                name="Producer",
+                status="active",
+            )
+            await db.commit()
+        original, _ = await write_artifact_document(
+            session_factory=factory,
+            artifact_store=store,
+            actor=ContentActor(
+                user_email=task.created_by,
+                agent_id="state-producer",
+                conversation_id=None,
+                session_id=None,
+            ),
+            content=b'{"generation": 1}',
+            filename="state.json",
+            mime_type="application/json",
+            kind="file",
+            purpose="artifact_write",
+        )
+        async with factory() as db:
+            await replace_explicit_shares(
+                db,
+                await db.get(ArtifactRecordRow, original.artifact_id),
+                task.created_by,
+                [task.agent_id],
+                [task.agent_id] if permission == "write" else [],
+            )
+            await db.commit()
+        workflow = Workflow(
+            workflow_id=f"wf_{uuid.uuid4().hex}",
+            name="shared-state",
+            defaults={"evaluate": False},
+            steps=[
+                StepDefinition(
+                    name="save",
+                    type="tool_call",
+                    tool_call=ToolCallStepConfig(
+                        tool="artifact_write",
+                        allow_side_effects=True,
+                        args={
+                            "filename": "state.json",
+                            "content": '{"generation": 2}',
+                            "supersedes": original.artifact_id,
+                        },
+                    ),
+                )
+            ],
+        )
+        result = await engine.execute_workflow(task, workflow)
+        assert result.status == (
+            TaskStatus.COMPLETED if permission == "write" else TaskStatus.FAILED
+        )
+        if permission == "read":
+            assert "supersedes_not_found" in result.workflow_state.step_outputs["save"]["error"]
+        async with factory() as db:
+            rows = list(
+                await db.scalars(
+                    select(ArtifactRecordRow)
+                    .where(ArtifactRecordRow.lineage_id == original.artifact_id)
+                    .order_by(ArtifactRecordRow.revision)
+                )
+            )
+            assert len(rows) == (2 if permission == "write" else 1)
+            if permission == "write":
+                assert (rows[1].revision, rows[1].owner_agent_id, rows[1].author_agent_id) == (
+                    2,
+                    "state-producer",
+                    task.agent_id,
+                )
     finally:
         await db_engine.dispose()
 
@@ -295,6 +454,275 @@ class _DeterministicAgentLoop:
         return result.model_copy(update={"metadata": metadata})
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mode", ["receipt", "before_dispatch", "unresolved_read_only", "reconciled_not_sent"]
+)
+async def test_task_dispatch_recovery_after_owner_restart(
+    tmp_path, monkeypatch, mode, artifact_workflow_database
+):
+    from types import MethodType
+    from uuid import uuid4
+
+    from cognis.core.agent_loop import AgentLoop
+    from cognis.core.runtime import TransientExecutorUnavailable
+    from cognis.core.task_execution import (
+        TaskExecutionFence,
+        TaskExecutionStore,
+        bind_task_execution_fence,
+        reset_task_execution_fence,
+    )
+    from cognis.store.models import Task as TaskRow
+
+    db_engine, factory, engine, task, _ = await _engine_runtime(
+        tmp_path, database_engine=artifact_workflow_database
+    )
+    registry = ToolRegistry()
+    registry.register(
+        RegisteredTool(
+            definition=NativeToolDefinition(
+                name="mutate",
+                description="Test tool with explicit effect capabilities",
+                source=ToolSource(type="executor"),
+                read_only=mode == "unresolved_read_only",
+                capabilities=["read"] if mode == "unresolved_read_only" else ["write"],
+            ),
+        ),
+    )
+    _mock_tool_runtime(engine, monkeypatch, registry=registry)
+    original_session = engine._reuse_or_create_step_session.return_value
+    next_session = SimpleNamespace(
+        **{
+            **vars(original_session[1]),
+            "session_id": uuid4().hex,
+            "intaris_session_id": uuid4().hex,
+        }
+    )
+    engine._reuse_or_create_step_session.side_effect = [
+        original_session,
+        original_session,
+    ]
+    engine._create_step_session = AsyncMock(return_value=(original_session[0], next_session))
+    workflow = Workflow(
+        workflow_id="wf-durable-receipt",
+        name="Durable receipt",
+        defaults={"evaluate": False},
+        steps=[
+            StepDefinition(
+                name="mutate",
+                type="tool_call",
+                tool_call={
+                    "tool": "mutate",
+                    "args": {},
+                    "allow_side_effects": True,
+                    "outputs": {"value": "{{ result.value.value }}"},
+                },
+            ),
+            StepDefinition(
+                name="verify",
+                type="run",
+                prompt="Verify the recovered mutation.",
+                require_deliverable=False,
+                input={"type": "null"},
+            ),
+        ],
+    )
+    executor_id, instance_id = uuid4().hex, uuid4().hex
+    captured = {}
+    effects = []
+
+    async def accepted_then_disconnected(ctx, tc):
+        if "call_id" in captured:
+            assert tc.call_id == captured["call_id"]
+        captured["call_id"] = tc.call_id
+        await ctx.execution_fence.record_tool_dispatch(
+            session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+            turn_id=ctx.turn_id,
+            descriptors=[
+                {
+                    "call_id": tc.call_id,
+                    "tool_name": tc.name,
+                    "dispatch_state": "pending",
+                }
+            ],
+        )
+        first_call = len(loop.execute_controller_tool.await_args_list) == 1
+        if mode == "before_dispatch" and first_call:
+            ctx.executor_pool = SimpleNamespace(
+                by_id=lambda identifier: SimpleNamespace(executor_type="websocket")
+            )
+            await AgentLoop._handle_tool_after_same_executor_transient_failure(
+                loop,
+                ctx,
+                tc=tc,
+                registered=registry.get("mutate"),
+                target_executor_id=executor_id,
+                failed_connection=None,
+                output_chunk_callback=None,
+                original_result=ToolResult(
+                    output="Executor is not ready.",
+                    is_error=True,
+                    metadata={"delivery_state": "not_sent"},
+                ),
+            )
+            pytest.fail("Known non-delivery must suspend before effects")
+        await ctx.execution_fence.bind_tool_dispatch(
+            tc.call_id,
+            executor_id,
+            instance_id,
+            session_id=ctx.session.intaris_session_id or ctx.session.session_id,
+            turn_id=ctx.turn_id,
+            dispatch_state="sent",
+        )
+        if not (mode == "reconciled_not_sent" and first_call):
+            effects.append(tc.call_id)
+        if mode in {"unresolved_read_only", "reconciled_not_sent"} and first_call:
+            ctx.executor_pool = SimpleNamespace(
+                by_id=lambda identifier: SimpleNamespace(executor_type="websocket")
+            )
+            await AgentLoop._handle_tool_after_same_executor_transient_failure(
+                loop,
+                ctx,
+                tc=tc,
+                registered=registry.get("mutate"),
+                target_executor_id=executor_id,
+                failed_connection=None,
+                output_chunk_callback=None,
+                original_result=ToolResult(
+                    output="Executor delivery outcome needs reconciliation.",
+                    is_error=True,
+                    metadata={"delivery_state": "accepted_unknown"},
+                ),
+            )
+            pytest.fail("Reconciliation must suspend before releasing task ownership")
+        if mode in {"before_dispatch", "reconciled_not_sent"}:
+            return ToolResult(output='{"value":42}')
+        raise TransientExecutorUnavailable(
+            "Accepted call is still active", executor_id=executor_id, retry_after_seconds=30
+        )
+
+    loop = engine._agent_loop
+    loop.execute_controller_tool = AsyncMock(side_effect=accepted_then_disconnected)
+    loop.run_step = AsyncMock(return_value=StepOutput(summary="Verified", content="Verified"))
+    loop.providers = engine._providers
+    loop._bind_tool_dispatch_fence = AgentLoop._bind_tool_dispatch_fence
+    loop._handle_tool_after_same_executor_transient_failure = MethodType(
+        AgentLoop._handle_tool_after_same_executor_transient_failure, loop
+    )
+    loop._resolve_target_connection = lambda **kwargs: None
+    loop._tool_safe_for_same_executor_retry = MethodType(
+        AgentLoop._tool_safe_for_same_executor_retry, loop
+    )
+    loop._reconcile_accepted_tool_call = AsyncMock(
+        return_value=(
+            "terminal",
+            ToolResult(output='{"value":42}', is_error=False),
+            "recovered",
+        ),
+        side_effect=(
+            [
+                ("unresolved", None, "instance_mismatch"),
+                ("terminal", ToolResult(output='{"value":42}'), "recovered"),
+            ]
+            if mode == "unresolved_read_only"
+            else [("not_sent", None, "legacy_not_seen")]
+            if mode == "reconciled_not_sent"
+            else None
+        ),
+    )
+    token = None
+    fence = None
+    try:
+        owner = TaskExecutionStore(
+            factory, owner_id="receipt-owner-first", max_active_global=1, max_active_per_agent=1
+        )
+        claim = await owner.claim_existing(task.task_id, statuses={"running"})
+        assert claim is not None
+        fence = TaskExecutionFence(owner, claim, asyncio.Event())
+        token = bind_task_execution_fence(fence)
+        first = await engine.execute_workflow(task, workflow)
+        assert first.status == TaskStatus.READY
+        async with factory() as db:
+            row = await db.get(TaskRow, task.task_id)
+            assert row.result_data["execution_recovery"]
+            if mode in {"before_dispatch", "reconciled_not_sent"}:
+                descriptor = next(iter(row.result_data["execution_recovery"].values()))[
+                    "tool_calls"
+                ][0]
+                assert descriptor["dispatch_state"] == "not_sent"
+                assert descriptor["executor_id"] == executor_id
+                assert descriptor["executor_instance_id"] is None
+                assert not effects
+            elif mode == "unresolved_read_only":
+                descriptor = next(iter(row.result_data["execution_recovery"].values()))[
+                    "tool_calls"
+                ][0]
+                assert descriptor["dispatch_state"] == "sent"
+                assert descriptor["executor_instance_id"] == instance_id
+                assert effects == [captured["call_id"]]
+        reset_task_execution_fence(token)
+        token = None
+        await fence.close()
+        fence = None
+
+        canonical_call = next(
+            event.model_dump(mode="json")
+            for recorded in engine._providers.guardrails.record_events.await_args_list
+            for event in recorded.kwargs["events"]
+            if event.type == "tool_call"
+        )
+        monkeypatch.setattr(
+            "cognis.core.task_tool_recovery.read_canonical_tool_pairs",
+            AsyncMock(return_value={captured["call_id"]: (canonical_call, None)}),
+        )
+        replacement = TaskExecutionStore(
+            factory,
+            owner_id="receipt-owner-replacement",
+            max_active_global=1,
+            max_active_per_agent=1,
+        )
+        assert await replacement.claim_ready() is None
+        async with factory() as db:
+            row = await db.get(TaskRow, task.task_id)
+            # Advance the durable retry deadline without a wall-clock sleep.
+            row.scheduled_for = None
+            await db.commit()
+        claim = await replacement.claim_ready()
+        assert claim is not None
+        fence = TaskExecutionFence(replacement, claim, asyncio.Event())
+        token = bind_task_execution_fence(fence)
+        second = await engine.execute_workflow(task, workflow)
+        assert second.status == TaskStatus.COMPLETED
+        assert second.workflow_state.step_outputs["mutate"]["outputs"]["value"] == 42
+        assert loop.execute_controller_tool.await_count == (
+            2 if mode in {"before_dispatch", "reconciled_not_sent"} else 1
+        )
+        assert (
+            loop._reconcile_accepted_tool_call.await_count
+            == {
+                "receipt": 1,
+                "before_dispatch": 0,
+                "unresolved_read_only": 2,
+                "reconciled_not_sent": 1,
+            }[mode]
+        )
+        assert effects == [captured["call_id"]]
+        loop.run_step.assert_awaited_once()
+        assert (
+            loop.run_step.await_args.args[0].session.intaris_session_id
+            == next_session.intaris_session_id
+        )
+        async with factory() as db:
+            row = await db.get(TaskRow, task.task_id)
+            assert not row.result_data.get("execution_recovery")
+    finally:
+        if token is not None:
+            reset_task_execution_fence(token)
+        if fence is not None:
+            await fence.close()
+        await db_engine.dispose()
+
+
 async def _engine_runtime(
     tmp_path: object,
     *,
@@ -319,6 +747,7 @@ async def _engine_runtime(
             agent_id="agent-1",
             owner_email="user@example.com",
             name="Agent",
+            status="active",
         )
         await create_task(
             session,
@@ -372,6 +801,75 @@ async def _engine_runtime(
     return db_engine, session_factory, workflow_engine, task, event_bus
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", ["auth_denial", "uncertain_effect", "real_failure"])
+async def test_recovery_failure_keeps_source_and_truthful_status(tmp_path, cause):
+    import httpx
+
+    from cognis.core.task_recovery_errors import TaskRecoveryBlocked
+    from cognis.providers.guardrails.errors import IntarisHTTPError
+    from cognis.store.models import Task
+
+    db_engine, factory, engine, task, event_bus = await _engine_runtime(tmp_path)
+    source = {
+        "execution_recovery": {
+            "reserved": {
+                "session_id": "interrupted-session",
+                "turn_id": "interrupted-turn",
+                "attempt_number": 1,
+                "tool_calls": [{"call_id": "pending-call", "tool_name": "delegate"}],
+            }
+        }
+    }
+    async with factory() as db:
+        row = await db.get(Task, task.task_id)
+        row.result_summary = "Workflow is recovering interrupted execution."
+        row.result_data = source
+        await db.commit()
+    task.result_summary = "Workflow is recovering interrupted execution."
+    task.result_data = source
+    request = httpx.Request("GET", "https://guardrails.example.com/events")
+    if cause == "auth_denial":
+        failure = IntarisHTTPError(
+            httpx.HTTPStatusError(
+                "private diagnostic", request=request, response=httpx.Response(401, request=request)
+            ),
+            operation="read_events",
+        )
+    elif cause == "uncertain_effect":
+        failure = TaskRecoveryBlocked("Mutation outcome needs reconciliation.")
+    else:
+        failure = RuntimeError("private unexpected diagnostic")
+    engine._execute_run_step = AsyncMock(side_effect=failure)
+    event_bus.publish = AsyncMock()
+    workflow = Workflow(
+        workflow_id="recovery-boundary",
+        name="Recovery boundary",
+        steps=[StepDefinition(name="execute", type="run")],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+        async with factory() as db:
+            row = await db.get(Task, task.task_id)
+            assert row.result_data["execution_recovery"] == source["execution_recovery"]
+            assert row.result_summary != "Workflow is recovering interrupted execution."
+            assert "private" not in row.result_summary
+            if cause == "real_failure":
+                assert row.status == "failed"
+                assert "RuntimeError" in row.result_summary
+            else:
+                assert row.status == "paused"
+                assert row.result_data["recovery_blocked"]["error_type"] == type(failure).__name__
+                assert result.workflow_state.resume_failed_step
+                assert any(
+                    call.args[0].type == EventType.TASK_PAUSED
+                    for call in event_bus.publish.await_args_list
+                )
+        engine._execute_run_step.assert_awaited_once()
+    finally:
+        await db_engine.dispose()
+
+
 def _mock_tool_runtime(
     engine: WorkflowEngine,
     monkeypatch: pytest.MonkeyPatch,
@@ -402,6 +900,8 @@ def _mock_tool_runtime(
                     intaris_session_id="intaris-1",
                     parent_session_id=None,
                     delegation_mode=None,
+                    delegation_metadata={},
+                    status="active",
                     agent_id=agent.agent_id,
                     user_email=agent.owner_email,
                     conversation_id="conversation-1",
@@ -653,6 +1153,69 @@ async def test_deterministic_scope_uses_acknowledged_session_policy(
         else:
             guardrails.declare_workflow_step.assert_awaited_once()
             assert binding.declaration is guardrails.declare_workflow_step.call_args.args[0]
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome_status", ["success", "failed"])
+async def test_condition_routes_saved_run_outcome_to_matching_terminal(
+    tmp_path: object, outcome_status: str
+) -> None:
+    db_engine, session_factory, engine, task, _ = await _engine_runtime(tmp_path)
+    task.workflow_state.step_outputs["implement"] = StepOutput(
+        summary="Support updated" if outcome_status == "success" else "Source unavailable",
+        outcome={"status": outcome_status, "reason": "Actual run result"},
+    ).model_dump(mode="json")
+    task.workflow_state.current_step_index = 1
+    async with session_factory() as session:
+        row = await session.get(TaskRow, task.task_id)
+        row.workflow_state = task.workflow_state.model_dump(mode="json")
+        await session.commit()
+    workflow = Workflow(
+        workflow_id="wf-outcome-terminal",
+        name="Outcome terminal routing",
+        steps=[
+            StepDefinition(
+                name="implement",
+                type="run",
+                require_deliverable=False,
+                completion={"evaluate": False},
+                outcome_routes=[{"status": "failed", "action": "continue"}],
+            ),
+            StepDefinition(
+                name="route",
+                type="condition",
+                condition={
+                    "if": "{{ steps.implement.outcome.status == 'success' }}",
+                    "then": "complete_notify",
+                    "else": "complete_failed",
+                },
+            ),
+            StepDefinition(
+                name="complete_notify",
+                type="complete",
+                complete={"status": "completed", "summary": "{{ steps.implement.summary }}"},
+            ),
+            StepDefinition(
+                name="complete_failed",
+                type="complete",
+                complete={"status": "failed", "summary": "{{ steps.implement.summary }}"},
+            ),
+        ],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+
+        assert result.status == (
+            TaskStatus.COMPLETED if outcome_status == "success" else TaskStatus.FAILED
+        )
+        async with session_factory() as session:
+            rows = await list_step_runs_for_task(session, task.task_id)
+        assert [row.step_name for row in rows] == [
+            "route",
+            "complete_notify" if outcome_status == "success" else "complete_failed",
+        ]
     finally:
         await db_engine.dispose()
 
@@ -1430,6 +1993,7 @@ async def test_read_only_tool_output_drives_condition_and_target_executor(
         intaris_session_id="intaris-1",
         parent_session_id=None,
         delegation_mode=None,
+        status="active",
     )
     monkeypatch.setattr(engine, "_resolve_step_agents", AsyncMock(return_value=(agent, agent)))
     monkeypatch.setattr(
@@ -1561,6 +2125,106 @@ def test_large_tool_output_context_is_bounded_and_keeps_recovery_reference() -> 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("large_section", ["instructions", "templates"])
+async def test_skill_assets_step_excludes_model_only_metadata(
+    tmp_path, monkeypatch, large_section
+) -> None:
+    from cognis import json_codec as json
+    from cognis.models.skill import SkillAssetRef
+    from cognis.tools.builtin.skill_management import (
+        SKILL_LOAD_TOOL,
+        materialize_loaded_skill_context,
+    )
+
+    asset = SkillAssetRef(
+        asset_id="sa_reference",
+        artifact_object_id="reference-object",
+        filename="reference.md",
+        content_hash="a" * 64,
+        size_bytes=1,
+        content_type="text/markdown",
+    )
+    manifest = [
+        {
+            **asset.model_dump(mode="json"),
+            "local_path": str(tmp_path / "executor" / "reference.md"),
+            "executor_id": "executor-a",
+        }
+    ]
+    python_environment = {"python_path": str(tmp_path / "executor" / "bin" / "python")}
+    instructions = "Read the prepared reference."
+    templates = {}
+    oversized = "Skill guidance.\n" * (MAX_CONTEXT_STRING_BYTES // 10)
+    if large_section == "instructions":
+        instructions = oversized
+    else:
+        templates = {"operate": oversized}
+    payload, metadata = materialize_loaded_skill_context(
+        skill_id="skill_reference",
+        name="Reference",
+        description="Prepared reference assets.",
+        instructions=instructions,
+        templates=templates,
+        tools=[],
+        steps=[],
+        tags=[],
+        asset_refs=[asset],
+        linked_tool_ids=[],
+        prepared_assets=manifest,
+        python_environment=python_environment,
+    )
+    metadata["readiness"] = {"status": "ready"}
+    loop = _DeterministicAgentLoop(ToolResult(output=json.dumps(payload), metadata=metadata))
+    db_engine, factory, engine, task, _ = await _engine_runtime(tmp_path, agent_loop=loop)
+    registry = ToolRegistry()
+    registry.register(RegisteredTool(definition=SKILL_LOAD_TOOL))
+    _mock_tool_runtime(engine, monkeypatch, registry)
+    workflow = Workflow(
+        workflow_id="wf-skill-assets",
+        name="Skill assets",
+        steps=[
+            StepDefinition(
+                name="transport_assets",
+                type="tool_call",
+                tool_call={
+                    "tool": "skill_load",
+                    "args": {"skill_id": "skill_reference", "require_assets_ready": True},
+                    "allow_side_effects": True,
+                    "outputs": {
+                        "asset_manifest": "{{ result.value.asset_manifest }}",
+                        "python_environment": "{{ result.value.python_environment }}",
+                        "metadata": "{{ result.metadata }}",
+                    },
+                },
+            ),
+            StepDefinition(
+                name="done",
+                type="complete",
+                complete={"summary": "Assets ready.", "delivery_mode_override": "silent"},
+            ),
+        ],
+    )
+    try:
+        result = await engine.execute_workflow(task, workflow)
+        assert result.status == TaskStatus.COMPLETED, result.result_summary
+        async with factory() as db:
+            step = await get_latest_step_run_for_task_step(db, task.task_id, "transport_assets")
+            assert step.status == "approved"
+            outputs = step.output["outputs"]
+            assert outputs["asset_manifest"] == manifest
+            assert outputs["python_environment"] == python_environment
+            assert outputs["metadata"]["readiness"] == {"status": "ready"}
+            assert outputs["metadata"]["recovery_call_id"].startswith("det_")
+            assert "protected_context" not in outputs["metadata"]
+            assert "skill_activation" not in outputs["metadata"]
+        # Projection must not strip the original result used by ordinary model loading.
+        assert len(metadata["protected_context"].encode()) > MAX_CONTEXT_STRING_BYTES
+        assert metadata["skill_activation"]["instructions"] == instructions
+    finally:
+        await db_engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_write_capable_tool_is_default_denied_before_dispatch(
     tmp_path: object,
     monkeypatch: pytest.MonkeyPatch,
@@ -1605,6 +2269,7 @@ async def test_write_capable_tool_is_default_denied_before_dispatch(
                     intaris_session_id=None,
                     parent_session_id=None,
                     delegation_mode=None,
+                    status="active",
                 ),
                 False,
             )
@@ -1792,6 +2457,7 @@ async def test_transient_executor_unavailability_defers_deterministic_tool_step(
                     intaris_session_id=None,
                     parent_session_id=None,
                     delegation_mode=None,
+                    status="active",
                 ),
                 False,
             )

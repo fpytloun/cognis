@@ -163,6 +163,7 @@ async def _validate_tool_assignment(
     context: NativeValidationContext,
 ) -> list[NativeValidationIssue]:
     from cognis.core.agent_management import (
+        TOOL_ASSIGNMENT_FIELDS,
         AgentManagementError,
         _apply_assignment_delta,
         _configured_tool_assignment,
@@ -199,7 +200,7 @@ async def _validate_tool_assignment(
                     delta.get(key, []),
                     remove=action == "tools_remove",
                 )
-                for key in ("tool_groups", "allow_tools", "deny_tools")
+                for key in TOOL_ASSIGNMENT_FIELDS
             }
         result = _validate_tool_assignment(row, proposed, deps.assignable_tools)
     except AgentManagementError as exc:

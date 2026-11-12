@@ -242,6 +242,8 @@ class ChannelManager:
 
     async def start_account(self, config: ChannelAccountConfig) -> None:
         """Start a single channel account (local or executor-hosted)."""
+        if config.channel_type == "web":
+            return
         lock = self._account_locks.setdefault(config.account_id, asyncio.Lock())
         async with lock:
             lease = self._leases.get(config.account_id)
@@ -887,6 +889,8 @@ class ChannelManager:
                     with contextlib.suppress(Exception):
                         await self.stop_account(account_id)
             for row in rows:
+                if row.channel_type == "web":
+                    continue
                 if row.account_id not in self._leases:
                     try:
                         await self.start_account(_row_to_config(row))

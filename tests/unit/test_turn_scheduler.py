@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
+import uuid
 from collections import defaultdict, deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -19,7 +21,7 @@ from cognis.core.agent_loop import PauseResolution, PauseWaiter, PendingPause
 from cognis.core.attachment_utils import normalize_attachment_refs, strip_attachment_payload_bytes
 from cognis.core.canonical_history import CanonicalHistoryUnavailable
 from cognis.core.chat_modes import ResolvedChatMode
-from cognis.core.direct_turn_runtime import ToolRecoveryPersistenceError
+from cognis.core.direct_turn_runtime import DirectTurnExecutionFence, ToolRecoveryPersistenceError
 from cognis.core.events import Event, EventBus, EventType
 from cognis.core.followups import (
     LLM_CYCLE_CEILING_CONTINUATION_REASON,
@@ -67,6 +69,7 @@ from cognis.core.turn_scheduler import (
 from cognis.models.agent import AgentDefinition
 from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.channel import ChannelDeliveryDescriptor
+from cognis.models.program import ProgramEventMetadata
 from cognis.models.retry import RetryReason
 from cognis.models.session import (
     ConversationContext,
@@ -397,19 +400,22 @@ async def test_interruption_makes_durable_turn_recoverable_before_cancelling_loc
     task = asyncio.create_task(asyncio.Event().wait())
     await asyncio.sleep(0)
     lease = SimpleNamespace()
-    fence = SimpleNamespace(
+    store = SimpleNamespace(
+        settle_transient_failure=AsyncMock(
+            return_value=SimpleNamespace(status=DirectTurnStatus.RECOVERABLE.value)
+        )
+    )
+    fence = DirectTurnExecutionFence(
+        store=store,
+        request_id="request-1",
         lease=lease,
         user_append_phase="user_appended",
         user_append_session_id="session-1",
         last_phase="tool_result_persisted",
         last_metadata={"call_id": "call-1"},
     )
-    store = SimpleNamespace(
-        settle_transient_failure=AsyncMock(
-            return_value=SimpleNamespace(status=DirectTurnStatus.RECOVERABLE.value)
-        )
-    )
     scheduler._direct_turn_store = store
+    scheduler._turn_controls = {}
     scheduler._active_turns = {"conv-1": task}
     scheduler._admission_drain_lock = asyncio.Lock()
     scheduler._durable_request_by_conversation = {"conv-1": "request-1"}
@@ -1025,6 +1031,11 @@ class _RecordingGuardrails:
         self.calls: list[dict[str, object]] = []
 
     async def record_events(self, **kwargs: object) -> EventAppendResult:
+        key = kwargs.get("idempotency_key")
+        if key is not None:
+            assert isinstance(key, str)
+            assert key.startswith(f"{kwargs['session_id']}:")
+            assert re.fullmatch(r"[A-Za-z0-9_.:@-]{1,256}", key)
         self.calls.append(kwargs)
         events = kwargs.get("events")
         count = len(events) if isinstance(events, list) else 0
@@ -2453,7 +2464,7 @@ async def test_cancelled_turn_persists_partial_active_stream_and_completes_bubbl
 
 
 @pytest.mark.asyncio
-async def test_cancelled_active_stream_persistence_failure_returns_three_tuple() -> None:
+async def test_cancelled_active_stream_persistence_failure_is_not_an_empty_stream() -> None:
     scheduler = TurnScheduler(
         session_factory=SimpleNamespace(),
         workflow_engine=SimpleNamespace(),
@@ -2498,7 +2509,11 @@ async def test_cancelled_active_stream_persistence_failure_returns_three_tuple()
         ),
     )
 
-    assert result == (None, 0, None)
+    assert result.status == "uncertain"
+    assert result.failed
+    assert result.content is None
+    assert result.turn_cycle_index == 3
+    assert result.chunk_count == 1
     assert "conv-1" in scheduler._active_streams  # noqa: SLF001
 
 
@@ -2521,9 +2536,7 @@ def test_render_follow_up_turn_notice_includes_task_failure_metadata() -> None:
 
     notice = render_follow_up_turn_notice(follow_up)
 
-    assert notice.startswith("Turn initiated by task failure: Nightly import (task-1).")
-    assert "Status: failed." in notice
-    assert "Summary: Importer exited with code 1." in notice
+    assert notice == "Handling task: Nightly import (failed)"
 
 
 @pytest.mark.asyncio
@@ -2630,9 +2643,13 @@ async def test_follow_up_turn_persists_visible_system_notice() -> None:
     assert event.data["origin_kind"] == "task_result"
     assert event.data["source_id"] == "task-1"
     assert event.data["source_title"] == "Nightly import"
-    assert str(event.data["content"]).startswith(
-        "Turn initiated by task failure: Nightly import (task-1)."
-    )
+    assert event.data["content"] == "Handling task: Nightly import (failed)"
+    assert event.data["task_outcome"] == {
+        "task_id": "task-1",
+        "title": "Nightly import",
+        "status": "failed",
+        "attempt_number": 1,
+    }
     session_cache.append_recorded_events.assert_awaited_once()
     assert observer.system_message_events == [
         {
@@ -2754,6 +2771,19 @@ async def test_normal_user_turn_does_not_persist_visible_turn_notice() -> None:
             "Executor configuration is missing or invalid. Configure an executor on the agent page.",
             "Agent must explicitly configure executor_id or executor_selector. "
             "Configure an executor on the agent page before retrying.",
+            "executor_configuration_invalid",
+            False,
+        ),
+        (
+            ExecutorConfigurationError(
+                "No usable default executor is configured for your account. "
+                "Select your executor on this shared agent's page, or set an active "
+                "executor as your default in Settings > Executors."
+            ),
+            "Executor configuration is missing or invalid. Configure an executor on the agent page.",
+            "No usable default executor is configured for your account. "
+            "Select your executor on this shared agent's page, or set an active "
+            "executor as your default in Settings > Executors.",
             "executor_configuration_invalid",
             False,
         ),
@@ -3071,8 +3101,22 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
     control = _TurnControl()
     control.turn_id = "turn-1"
     scheduler._turn_controls["conv-1"] = control
+    linkage = ProgramEventMetadata(
+        parent_call_id=uuid.uuid4().hex,
+        program_id=uuid.uuid4().hex,
+        kernel_generation=3,
+    )
 
     try:
+        await scheduler._record_active_tool_arguments(
+            conversation_id="conv-1",
+            session_id="sess-1",
+            call_id="call-1",
+            tool_name="bash",
+            turn_id="turn-1",
+            arguments={"command": "printf"},
+            runtime_metadata=linkage,
+        )
         await scheduler._append_active_tool_output_chunk(
             conversation_id="conv-1",
             session_id="sess-1",
@@ -3086,6 +3130,9 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
         assert len(snapshots) == 1
         assert snapshots[0]["result"] == "hello"
         assert snapshots[0]["status"] == "running"
+        assert snapshots[0]["parent_call_id"] == linkage.parent_call_id
+        assert snapshots[0]["program_id"] == linkage.program_id
+        assert snapshots[0]["kernel_generation"] == linkage.kernel_generation
 
         await scheduler._finalize_active_tool_output(
             conversation_id="conv-1",
@@ -3096,6 +3143,7 @@ async def test_active_tool_output_snapshots_are_bounded_and_completed() -> None:
             result="cut",
             is_error=False,
             metadata={"transport_truncated": True, "output_size": 5},
+            runtime_metadata=linkage,
         )
         assert await scheduler.active_tool_output_snapshots("conv-1") == []
         assert ("conv-1", "sess-1", "call-1") not in scheduler._active_tool_outputs
@@ -3277,21 +3325,32 @@ async def test_active_tool_output_chunk_offsets_remain_monotonic_after_truncatio
 def test_active_tool_output_snapshot_roundtrips_structured_arguments() -> None:
     """The active-tool snapshot serializes/deserializes structured arguments so
     the runtime overlay can carry the per-tool subtitle/body across L2 reloads."""
+    parent_call_id = uuid.uuid4().hex
+    program_id = uuid.uuid4().hex
     snapshot = ActiveToolOutputSnapshot(
         conversation_id="conv-1",
         session_id="sess-1",
         call_id="call-read",
         tool_name="read",
         turn_id="turn-1",
+        parent_call_id=parent_call_id,
+        program_id=program_id,
+        kernel_generation=4,
         result="file contents",
         arguments={"file_path": "/tmp/x.py", "offset": 780, "limit": 55},
     )
     payload = snapshot.snapshot()
     assert payload["arguments"] == {"file_path": "/tmp/x.py", "offset": 780, "limit": 55}
+    assert payload["parent_call_id"] == parent_call_id
+    assert payload["program_id"] == program_id
+    assert payload["kernel_generation"] == 4
 
     restored = ActiveToolOutputSnapshot.from_snapshot(payload)
     assert restored is not None
     assert restored.arguments == {"file_path": "/tmp/x.py", "offset": 780, "limit": 55}
+    assert restored.parent_call_id == parent_call_id
+    assert restored.program_id == program_id
+    assert restored.kernel_generation == 4
 
     # Non-dict arguments are coerced to None (no leaking of unexpected shapes).
     payload["arguments"] = "not-a-dict"
@@ -6657,6 +6716,9 @@ async def test_follow_up_event_threads_channel_delivery_metadata() -> None:
     )
 
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -6735,6 +6797,9 @@ async def test_follow_up_event_creates_channel_delivery_intent_when_missing() ->
     created_outbox: list[dict[str, object]] = []
 
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -6848,6 +6913,9 @@ async def test_follow_up_event_respects_explicit_channel_delivery_suppression() 
     )
 
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -6933,6 +7001,9 @@ async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> 
     )
 
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -6999,6 +7070,9 @@ async def test_follow_up_event_publishes_turn_error_on_immediate_rejection() -> 
 @pytest.mark.asyncio
 async def test_follow_up_event_suppresses_duplicate_follow_up_id() -> None:
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -7063,6 +7137,9 @@ async def test_follow_up_event_suppresses_duplicate_follow_up_id() -> None:
 @pytest.mark.asyncio
 async def test_follow_up_event_retries_after_immediate_rejection() -> None:
     class _Session:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -8194,6 +8271,9 @@ async def test_follow_up_execution_is_blocked_when_durable_admission_is_unavaila
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _UnavailableSession:
+        get = AsyncMock(return_value=None)
+        scalar = AsyncMock(return_value=None)
+
         async def __aenter__(self):
             return self
 
@@ -10769,6 +10849,7 @@ async def test_retry_notice_uses_safe_reason_and_stable_lineage_id(
         reason.value,
         "turn-source",
         2,
+        None,
     )
     guardrails.record_events.return_value = SimpleNamespace(ok=True, count=0)
     await scheduler._persist_retry_turn_notice(

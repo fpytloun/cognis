@@ -1,11 +1,14 @@
 """Partial parallel-batch pruning must not rewrite accepted sibling results."""
 
+import base64
+import io
 import json
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from PIL import Image
 
 from cognis.core.agent_loop import AgentLoop
 from cognis.core.context import events_to_messages
@@ -23,6 +26,7 @@ from cognis.core.message_markers import PROJECTED_COMPACTED, PROTECTED_TOOL_OUTP
 from cognis.core.session_cache import SessionCache
 from cognis.models.session import SessionEvent
 from cognis.providers.llm.message_projection import project_messages_for_provider
+from cognis.providers.llm.responses_bridge import messages_to_responses_input
 from tests.unit.test_context_delivery import _EventStore, _projection_runtime
 
 LARGE_CALL = "call_abc5ab37a31e4a28a56da007bd49a5e8"
@@ -30,6 +34,127 @@ SIBLING_CALL = "call_d40d0c4bc9f0469f90068429563816f2"
 COMPACT_CALL = "call_13406d8464da4fe49e1cf1c70986a40b"
 INTERRUPTED = "[No result recorded - step may have been interrupted]"
 COMPACT = {"operation": "compact_result", "rendering_policy_version": 1, "parameters": {}}
+
+
+@pytest.mark.parametrize("pressure", ["pressure", "critical"])
+@pytest.mark.parametrize("image_last", [False, True])
+def test_fresh_parallel_image_reaches_first_consuming_request(
+    pressure: str, image_last: bool
+) -> None:
+    output = io.BytesIO()
+    Image.new("RGB", (4, 3), "red").save(output, format="PNG")
+    image_url = "data:image/png;base64," + base64.b64encode(output.getvalue()).decode()
+    messages = _batch("Sibling output\n" * 4000)[:-1]
+    image_call = SIBLING_CALL if image_last else LARGE_CALL
+    image_context = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": image_url}}],
+        "_tool_attachment_context": True,
+        "_tool_call_id": image_call,
+    }
+    messages.append(image_context)
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(count_tokens=lambda text, _model: len(text) // 4)
+    )
+    projected = loop._project_model_messages(
+        SimpleNamespace(),
+        messages=messages,
+        resolved_model="gpt-6.1-sol",
+        max_context_tokens=20_000,
+        pressure_mode=pressure,
+    )
+    wire = messages_to_responses_input(projected.messages)
+    images = [
+        part["image_url"]
+        for item in wire
+        for part in item.get("content", [])
+        if isinstance(part, dict) and part.get("type") == "input_image"
+    ]
+    assert images == [image_url]
+    # The following assistant response consumes the evidence. A later tool
+    # batch must not pin the image forever.
+    consumed = messages + [
+        {
+            "role": "assistant",
+            "content": "I inspected the screenshot.",
+            "tool_calls": [
+                {
+                    "id": "next-read",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "next-read", "content": "New evidence"},
+    ]
+    later = loop._project_model_messages(
+        SimpleNamespace(),
+        messages=consumed,
+        resolved_model="gpt-6.1-sol",
+        max_context_tokens=20_000,
+        pressure_mode=pressure,
+    )
+    decisions = later.decisions
+    assert {
+        "operation": "compact_attachment",
+        "rendering_policy_version": 2,
+        "parameters": {},
+    } in decisions[image_call]
+    replay_wire = messages_to_responses_input(apply_projection_decisions(consumed, decisions))
+    assert not any(
+        part.get("type") == "input_image"
+        for item in replay_wire
+        for part in item.get("content", [])
+        if isinstance(part, dict)
+    )
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("pressure", ["pressure", "critical"])
+def test_accepted_attachment_rendering_survives_reprojection(version: int, pressure: str) -> None:
+    original = _batch("Sibling output\n" * 4000)
+    original.insert(
+        4,
+        {
+            "role": "user",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,cG5n"}}],
+            "_tool_attachment_context": True,
+            "_tool_attachment_artifact_ids": ["att_replay_image"],
+            "_tool_call_id": LARGE_CALL,
+        },
+    )
+    accepted = apply_projection_decisions(
+        original,
+        {
+            LARGE_CALL: [
+                {
+                    "operation": "compact_attachment",
+                    "rendering_policy_version": version,
+                    "parameters": {},
+                }
+            ]
+        },
+    )
+    placeholder = accepted[4]["content"]
+    loop = object.__new__(AgentLoop)
+    loop.providers = SimpleNamespace(
+        llm=SimpleNamespace(count_tokens=lambda text, _model: len(text) // 4)
+    )
+    projected = loop._project_model_messages(
+        SimpleNamespace(),
+        messages=accepted,
+        resolved_model="gpt-6.1-sol",
+        max_context_tokens=20_000,
+        pressure_mode=pressure,
+    )
+    assert any(message.get("content") == placeholder for message in projected.messages)
+    assert not any(
+        decision.get("operation") == "compact_attachment"
+        and decision.get("rendering_policy_version") != version
+        for decisions in projected.decisions.values()
+        for decision in decisions
+    )
 
 
 def _batch(sibling: str) -> list[dict]:

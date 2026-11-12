@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -228,18 +229,156 @@ def test_durable_work_projection_repairs_partial_schema(tmp_path: Path) -> None:
         engine.dispose()
 
 
-def test_postgres_integration_schemas_never_fall_back_to_public() -> None:
-    offenders = []
-    for path in sorted(POSTGRES_INTEGRATION_TESTS.glob("*postgres.py")):
-        source = path.read_text(encoding="utf-8")
-        if "CreateSchema(" not in source:
-            continue
-        if "search_path" in source and ",public" in source:
-            offenders.append(str(path))
-        assert "DropSchema(" in source, path
-        assert "Base.metadata.create_all" in source or "command.upgrade" in source, path
+SHARED_USAGE_SETUP = {
+    "tests.usage_query_schema_fixtures": {"exercise_query_upgrade", "explain_query_indexes"},
+    "tests.unit.test_usage_schema": {"exercise_usage_schema"},
+}
 
-    assert offenders == []
+
+def _has_shared_usage_setup(source: str, root: Path = Path(".")) -> bool:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.ImportFrom) or node.module not in SHARED_USAGE_SETUP:
+            continue
+        helper_path = root.joinpath(*node.module.split(".")).with_suffix(".py")
+        if not helper_path.is_file():
+            continue
+        helper_tree = ast.parse(helper_path.read_text(encoding="utf-8"))
+        canonical_names = {
+            alias.asname or alias.name
+            for item in helper_tree.body
+            if isinstance(item, ast.ImportFrom) and item.module == "cognis.store.usage.schema"
+            for alias in item.names
+            if alias.name == "ensure_usage_schema"
+        }
+        for alias in node.names:
+            if alias.name not in SHARED_USAGE_SETUP[node.module]:
+                continue
+            local_name = alias.asname or alias.name
+            referenced = any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "run_sync"
+                and call.args
+                and isinstance(call.args[0], ast.Name)
+                and call.args[0].id == local_name
+                for call in ast.walk(tree)
+            )
+            initialized = any(
+                isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and function.name == alias.name
+                and function.args.args
+                and any(
+                    isinstance(call, ast.Call)
+                    and isinstance(call.func, ast.Name)
+                    and call.func.id in canonical_names
+                    and call.args
+                    and isinstance(call.args[0], ast.Name)
+                    and call.args[0].id == function.args.args[0].arg
+                    for call in ast.walk(function)
+                )
+                for function in helper_tree.body
+            )
+            if referenced and initialized:
+                return True
+    return False
+
+
+def _assert_postgres_schema_isolation(source: str, path: Path, root: Path = Path(".")) -> None:
+    if "CreateSchema(" not in source:
+        return
+    assert not ("search_path" in source and re.search(r",\s*public\b", source, re.I)), path
+    assert "DropSchema(" in source, path
+    assert (
+        "Base.metadata.create_all" in source
+        or "command.upgrade" in source
+        or _has_shared_usage_setup(source, root)
+    ), path
+
+
+def test_postgres_integration_schemas_never_fall_back_to_public() -> None:
+    for path in sorted(POSTGRES_INTEGRATION_TESTS.glob("*postgres.py")):
+        _assert_postgres_schema_isolation(path.read_text(encoding="utf-8"), path)
+
+
+@pytest.mark.parametrize("setup", ["Base.metadata.create_all", "command.upgrade"])
+def test_postgres_schema_guard_accepts_direct_setup(setup: str) -> None:
+    _assert_postgres_schema_isolation(f"CreateSchema()\nDropSchema()\n{setup}", Path("direct"))
+
+
+@pytest.mark.parametrize(
+    ("module", "helper"),
+    [
+        ("tests.usage_query_schema_fixtures", "exercise_query_upgrade"),
+        ("tests.usage_query_schema_fixtures", "explain_query_indexes"),
+        ("tests.unit.test_usage_schema", "exercise_usage_schema"),
+    ],
+)
+def test_postgres_schema_guard_accepts_referenced_shared_setup(module: str, helper: str) -> None:
+    source = (
+        f"from {module} import {helper}\n"
+        f"CreateSchema()\nDropSchema()\nconnection.run_sync({helper})"
+    )
+    _assert_postgres_schema_isolation(source, Path("shared"))
+
+
+@pytest.mark.parametrize(
+    "setup",
+    [
+        "connection.run_sync(unknown_setup)",
+        "from tests.usage_query_schema_fixtures import exercise_query_upgrade",
+        "from tests.usage_query_schema_fixtures import previous_180_schema\n"
+        "connection.run_sync(previous_180_schema)",
+        "from tests.unrelated import exercise_query_upgrade\n"
+        "connection.run_sync(exercise_query_upgrade)",
+    ],
+)
+def test_postgres_schema_guard_rejects_unsupported_setup(setup: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(f"CreateSchema()\nDropSchema()\n{setup}", Path("unknown"))
+
+
+def test_postgres_schema_guard_rejects_missing_or_changed_shared_owner(tmp_path: Path) -> None:
+    source = (
+        "from tests.usage_query_schema_fixtures import exercise_query_upgrade\n"
+        "CreateSchema()\nDropSchema()\nconnection.run_sync(exercise_query_upgrade)"
+    )
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(source, Path("missing"), tmp_path)
+    helper = tmp_path / "tests" / "usage_query_schema_fixtures.py"
+    helper.parent.mkdir()
+    helper.write_text("def exercise_query_upgrade(connection):\n    pass\n", encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(source, Path("changed"), tmp_path)
+    helper.write_text(
+        "from another_module import ensure_usage_schema\n"
+        "def exercise_query_upgrade(connection):\n    ensure_usage_schema(connection)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(source, Path("wrong-owner"), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'CreateSchema()\nDropSchema()\nsearch_path = "private, public"\ncommand.upgrade()',
+        "CreateSchema()\ncommand.upgrade()",
+    ],
+)
+def test_postgres_schema_guard_rejects_public_fallback_and_missing_cleanup(source: str) -> None:
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(source, Path("unsafe"))
+
+
+@pytest.mark.parametrize("unsafe", ['search_path = "private, public"\nDropSchema()', ""])
+def test_postgres_schema_guard_rejects_unsafe_shared_setup(unsafe: str) -> None:
+    source = (
+        "from tests.usage_query_schema_fixtures import explain_query_indexes\n"
+        f"CreateSchema()\n{unsafe}\nconnection.run_sync(explain_query_indexes)"
+    )
+    with pytest.raises(AssertionError):
+        _assert_postgres_schema_isolation(source, Path("unsafe-shared"))
 
 
 @pytest.mark.parametrize("corruption", ["unknown-table", "ordinary-search-tables"])

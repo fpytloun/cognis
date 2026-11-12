@@ -654,15 +654,20 @@ class DirectTurnStore:
                 queued_behind_predecessor=queued_behind_predecessor,
             )
 
-    async def get(self, request_id: str) -> DirectTurnRequestRow | None:
-        async with self._session_factory() as session:
-            return (
-                await session.execute(
-                    select(DirectTurnRequestRow).where(
-                        DirectTurnRequestRow.request_id == request_id
-                    )
-                )
-            ).scalar_one_or_none()
+    async def get(
+        self, request_id: str, *, session: AsyncSession | None = None
+    ) -> DirectTurnRequestRow | None:
+        """Read a request, optionally within the caller-owned transaction."""
+        if session is None:
+            async with self._session_factory() as owned_session:
+                return await self.get(request_id, session=owned_session)
+        return (
+            await session.execute(
+                select(DirectTurnRequestRow)
+                .where(DirectTurnRequestRow.request_id == request_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
 
     @staticmethod
     def _payload_deferred() -> Any:
@@ -2712,36 +2717,42 @@ class DirectTurnStore:
             outcome=outcome,
         )
 
-    async def has_fence(self, request_id: str, *, lease: Lease) -> bool:
+    async def has_fence(
+        self, request_id: str, *, lease: Lease, session: AsyncSession | None = None
+    ) -> bool:
         """Check the exact ownership tuple in one indexed EXISTS (no payload decode).
 
         The owner and resource comparisons run in SQL: a NULL owner column makes
         the concatenation NULL, so the comparison is false exactly where the
         previous Python ``is None`` guards returned ``False``.
+
+        A supplied session belongs to the caller: this check neither commits nor
+        closes it. Document writes use their existing transaction and locks;
+        ownership predicates, cancellation, and recovery policy are unchanged.
         """
 
-        async with self._session_factory() as session:
-            statement = select(
-                exists(
-                    select(1).where(
-                        DirectTurnRequestRow.request_id == request_id,
-                        (
-                            DirectTurnRequestRow.owner_controller_id
-                            + ":"
-                            + DirectTurnRequestRow.owner_incarnation_id
-                        )
-                        == lease.owner_id,
-                        ("direct-turn:conversation:" + DirectTurnRequestRow.conversation_id)
-                        == lease.resource_key,
-                        DirectTurnRequestRow.fencing_token == lease.fencing_token,
-                        DirectTurnRequestRow.status.in_(
-                            [status.value for status in ACTIVE_STATUSES]
-                        ),
-                        self._lease_predicate(session, lease),
+        if session is None:
+            async with self._session_factory() as owned_session:
+                return await self.has_fence(request_id, lease=lease, session=owned_session)
+        statement = select(
+            exists(
+                select(1).where(
+                    DirectTurnRequestRow.request_id == request_id,
+                    (
+                        DirectTurnRequestRow.owner_controller_id
+                        + ":"
+                        + DirectTurnRequestRow.owner_incarnation_id
                     )
+                    == lease.owner_id,
+                    ("direct-turn:conversation:" + DirectTurnRequestRow.conversation_id)
+                    == lease.resource_key,
+                    DirectTurnRequestRow.fencing_token == lease.fencing_token,
+                    DirectTurnRequestRow.status.in_([status.value for status in ACTIVE_STATUSES]),
+                    self._lease_predicate(session, lease),
                 )
             )
-            return bool((await session.execute(statement)).scalar_one())
+        )
+        return bool((await session.execute(statement)).scalar_one())
 
     async def _mark_terminal(
         self,

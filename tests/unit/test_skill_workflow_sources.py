@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -89,7 +88,7 @@ async def _seed_skill_workflow_source(app: object) -> str:
 
 def test_task_create_accepts_decomposed_skill_source(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_skill_workflow_source(client.app))
+        client.portal.call(_seed_skill_workflow_source, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post(
@@ -118,7 +117,7 @@ def test_schedule_create_accepts_decomposed_skill_source(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_skill_workflow_source(client.app))
+        client.portal.call(_seed_skill_workflow_source, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post(
@@ -151,7 +150,7 @@ def test_materialized_skill_workflow_uses_latest_saved_skill_version(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        skill_id = asyncio.run(_seed_skill_workflow_source(client.app))
+        skill_id = client.portal.call(_seed_skill_workflow_source, client.app)
 
         async def _create_latest_version() -> None:
             async with client.app.state.session_factory() as session:  # type: ignore[attr-defined]
@@ -180,10 +179,10 @@ def test_materialized_skill_workflow_uses_latest_saved_skill_version(
                 await set_current_version(session, skill_id, version.version_id)
                 await session.commit()
 
-        asyncio.run(_create_latest_version())
+        client.portal.call(_create_latest_version)
 
-        workflow_row = asyncio.run(
-            materialize_skill_workflow(
+        workflow_row = client.portal.call(
+            lambda: materialize_skill_workflow(
                 session_factory=client.app.state.session_factory,  # type: ignore[attr-defined]
                 owner_email="user@example.com",
                 skill_id=skill_id,
@@ -202,7 +201,7 @@ def test_materialized_skill_workflow_uses_latest_saved_skill_version(
 
 def test_task_create_rejects_unattached_skill_source(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_skill_workflow_source(client.app))
+        client.portal.call(_seed_skill_workflow_source, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post(

@@ -364,14 +364,25 @@ class ProfilingControl:
             report = json.encode(capture.report)
             if len(report) > 131072:
                 capture.report["truncated"] = True
-                cpu = capture.report.get("resources", {}).get("cpu") or {}
-                stacks = cpu.get("top_endpoint_stacks", [])
-                while len(report) > 131072 and stacks:
-                    stacks.pop()
+                omitted = capture.report.setdefault(
+                    "omitted", {"cpu_stack_rows": 0, "allocation_samples": 0, "memory_samples": 0}
+                )
+                # Keep endpoint evidence and hottest stacks before intermediate samples.
+                memory = capture.report.get("resources", {}).get("memory", [])
+                while len(report) > 131072 and len(memory) > 2:
+                    memory.pop(1)
+                    omitted["memory_samples"] += 1
                     report = json.encode(capture.report)
                 allocations = capture.report["allocations"]
                 while len(report) > 131072 and len(allocations) > 2:
                     allocations.pop(1)
+                    omitted["allocation_samples"] += 1
+                    report = json.encode(capture.report)
+                cpu = capture.report.get("resources", {}).get("cpu") or {}
+                stacks = cpu.get("top_endpoint_stacks", [])
+                while len(report) > 131072 and stacks:
+                    stacks.pop()
+                    omitted["cpu_stack_rows"] += 1
                     report = json.encode(capture.report)
                 if len(report) > 131072:
                     report = json.encode({"truncated": True, "errors": ["report_size_exceeded"]})

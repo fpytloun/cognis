@@ -195,6 +195,7 @@ def _row_to_response(
         fail_paused_task_on_next_fire=bool(getattr(row, "fail_paused_task_on_next_fire", True)),
         completion_mode_family=getattr(row, "completion_mode_family", "default"),
         allow_silent_completion=bool(getattr(row, "allow_silent_completion", False)),
+        on_finish_instructions=getattr(row, "on_finish_instructions", None),
         interaction_mode_override=getattr(row, "interaction_mode_override", "none"),
         session_policy=(row.task_template or {}).get("session_policy") or {},
         last_fired_at=row.last_fired_at,
@@ -381,10 +382,19 @@ async def create_schedule_route(
     )()
     scheduler_instance = Scheduler.__new__(Scheduler)
     next_fire = scheduler_instance._compute_next_fire(temp_sched, now)
-    CompletionDeliveryPolicy(
-        completion_mode_family=body.completion_mode_family,
-        allow_silent_completion=body.allow_silent_completion,
-    )
+    from cognis.models.task import TaskDelivery, validate_task_delivery
+
+    try:
+        validate_task_delivery(
+            TaskDelivery.model_validate(body.task_template.get("delivery") or {}),
+            CompletionDeliveryPolicy(
+                completion_mode_family=body.completion_mode_family,
+                allow_silent_completion=body.allow_silent_completion,
+                on_finish_instructions=body.on_finish_instructions,
+            ),
+        )
+    except ValueError as exc:
+        raise api_exception(400, "validation_error", str(exc)) from exc
     task_template = dict(body.task_template)
     task_template.pop("workflow_id", None)
     task_template.pop("skill_id", None)
@@ -414,6 +424,7 @@ async def create_schedule_route(
             fail_paused_task_on_next_fire=body.fail_paused_task_on_next_fire,
             completion_mode_family=body.completion_mode_family,
             allow_silent_completion=body.allow_silent_completion,
+            on_finish_instructions=body.on_finish_instructions,
             interaction_mode_override=body.interaction_mode_override,
             next_fire_at=next_fire,
             created_by=user.email,
@@ -590,23 +601,16 @@ async def update_schedule_route(
             task_template = dict(fields.get("task_template") or existing.task_template or {})
             task_template["session_policy"] = body.session_policy.model_dump()
             fields["task_template"] = task_template
-        if "completion_mode_family" in fields or "allow_silent_completion" in fields:
-            CompletionDeliveryPolicy(
-                completion_mode_family=fields.get(
-                    "completion_mode_family", getattr(existing, "completion_mode_family", "default")
-                ),
-                allow_silent_completion=fields.get(
-                    "allow_silent_completion",
-                    bool(getattr(existing, "allow_silent_completion", False)),
-                ),
-            )
         if not fields:
             return _row_to_response(
                 existing,
                 await _load_latest_task_run(request, schedule_id, created_by=user.email),
             )
 
-        row = await update_schedule(db, schedule_id, **fields)
+        try:
+            row = await update_schedule(db, schedule_id, **fields)
+        except ValueError as exc:
+            raise api_exception(400, "validation_error", str(exc)) from exc
         await db.commit()
 
     # Notify scheduler to recompute next_fire_at

@@ -142,6 +142,16 @@ def stream_failure(chunk: dict[str, Any]) -> LLMStreamProviderError | None:
 
 def commits_output(chunk: dict[str, Any]) -> bool:
     """Semantic output includes native/replay state, not role-only SSE preludes."""
+    if chunk.get("encoding") == "pcm_s16le" and chunk.get("type") in {
+        "start",
+        "audio",
+        "partial",
+        "transcript",
+        "done",
+    }:
+        # A ready STT session must reach its microphone producer before any
+        # transcript can exist. Never buffer speech behind text output.
+        return True
     for event in chunk.get("anthropic_native_events") or []:
         block = event.get("content_block") or {}
         if event.get("type") in {"content_block_delta", "message_delta"} or (
@@ -494,6 +504,11 @@ class InferenceRecovery:
                                         failure_category=str(category),
                                     )
                                 raise self._exhausted(exc) from exc
+                            if replay_safe and category == "authentication":
+                                # Rejected credentials need the user, so retrying this
+                                # target cannot help and is not an outage either. Another
+                                # route target may still serve the request.
+                                break
                             if not replay_safe or not (recoverable or quota):
                                 raise self._exhausted(exc) from exc
                             now = time.monotonic()

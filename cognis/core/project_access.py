@@ -131,8 +131,8 @@ async def can_read_conversation(session: AsyncSession, row: Any, user_email: str
         return False
     if (
         getattr(row, "context_type", None) in _MANAGED_CONTEXT_TYPES
-        and row.user_email != user_email
-    ):
+        or bool((getattr(row, "context_data", None) or {}).get("app_contact_binding_id"))
+    ) and row.user_email != user_email:
         return False
     return await can_read_project_resource(
         session,
@@ -252,6 +252,8 @@ def project_assignment_refusal(row: Any) -> str | None:
             "they use the agent's default project."
         )
     data = context.platform_data if isinstance(context.platform_data, dict) else {}
+    if data.get("app_contact_binding_id"):
+        return "Managed app channel exchanges are private to their recipient."
     if data.get("kind") == "task_control" or str(context.type) == "task":
         return "Task conversations use their task's project."
     if str(context.type) in _MANAGED_CONTEXT_TYPES:
@@ -416,6 +418,44 @@ async def default_project_id_for_new_topic(
         return None
     resolution = await resolve_project_role(session, project, user_email)
     return str(project.project_id) if role_satisfies(resolution.role, "use") else None
+
+
+class ManagedProjectError(ValueError):
+    """The requested project cannot hold the new managed conversation."""
+
+
+async def managed_conversation_project_id(
+    session: AsyncSession,
+    *,
+    requested_project_id: str | None,
+    controller_project_id: str | None,
+    target_agent: Any,
+    user_email: str,
+) -> str | None:
+    """Return the project of a new managed conversation.
+
+    An explicit request from the controlling agent wins, then the controlling
+    conversation's project, then the target agent's default project. An
+    explicit project must be active and usable by the user and the target agent.
+    """
+
+    if requested_project_id:
+        project, role = await resolve_project_role_by_id(session, requested_project_id, user_email)
+        if (
+            project is None
+            or getattr(project, "status", None) != "active"
+            or not role_satisfies(role.role, "use")
+            or not await agent_usable_in_project(
+                session, agent=target_agent, user_email=user_email, project_id=requested_project_id
+            )
+        ):
+            raise ManagedProjectError("The project was not found or is not usable for this agent.")
+        return requested_project_id
+    if controller_project_id:
+        return controller_project_id
+    return await default_project_id_for_new_topic(
+        session, agent_id=target_agent.agent_id, user_email=user_email
+    )
 
 
 # --- Agent access through project assignment ---

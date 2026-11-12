@@ -762,16 +762,17 @@ def _session(identifier: str, conversation_id: str, **updates: Any) -> Any:
     return SimpleNamespace(**values)
 
 
-def test_delegate_sharing_activity_scope_remains_a_separate_workstream() -> None:
-    root = _session("s-root", "conversation", activity_scope_id="scope-current")
+@pytest.mark.parametrize("successor_edge", ["rotation", "delegate", "retry"])
+def test_delegate_sharing_activity_scope_remains_a_separate_workstream(successor_edge: str) -> None:
+    root = _session("a-root", "conversation", activity_scope_id="scope-current")
     root_successor = _session(
-        "s-root-successor",
+        "a-root-successor",
         "conversation",
         previous_session_id=root.session_id,
         activity_scope_id="scope-current",
     )
     delegate = _session(
-        "s-delegate",
+        "z-delegate",
         "conversation",
         parent_session_id=root_successor.session_id,
         activity_scope_id="scope-current",
@@ -800,7 +801,7 @@ def test_delegate_sharing_activity_scope_remains_a_separate_workstream() -> None
             root.session_id: (None, "root"),
             root_successor.session_id: (root.session_id, "rotation"),
             delegate.session_id: (root_successor.session_id, "delegate"),
-            delegate_successor.session_id: (delegate.session_id, "rotation"),
+            delegate_successor.session_id: (delegate.session_id, successor_edge),
             sibling_delegate.session_id: (root_successor.session_id, "delegate"),
         },
         root_session_id=root_successor.session_id,
@@ -821,7 +822,9 @@ def test_delegate_sharing_activity_scope_remains_a_separate_workstream() -> None
     sibling_node = next(node for node in nodes if node.session_id == sibling_delegate.session_id)
     assert root_node.key == root.activity_scope_id
     assert root_node.backing_session_ids == [root.session_id, root_successor.session_id]
-    assert delegate_node.backing_session_ids == [delegate.session_id, delegate_successor.session_id]
+    assert delegate_node.backing_session_ids == sorted(
+        [delegate.session_id, delegate_successor.session_id]
+    )
     assert delegate_node.parent_key == root_node.key
     assert sibling_node.backing_session_ids == [sibling_delegate.session_id]
     assert sibling_node.parent_key == root_node.key
@@ -2420,3 +2423,61 @@ async def test_topology_reparenting_changes_graph_fingerprint() -> None:
     assert next(node for node in second.nodes if node.session_id == "s-child").parent_key == (
         "session:s-parent"
     )
+
+
+@pytest.mark.asyncio
+async def test_database_delegate_rotation_retains_external_parent(tmp_path: Path) -> None:
+    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'delegate-rotation.db'}")
+    factory = create_session_factory(engine)
+    await run_schema_bootstrap(engine)
+    try:
+        async with factory() as db:
+            db.add(User(email="owner@example.com", name="Owner", password_hash="x", role="user"))
+            await db.flush()
+            db.add(Agent(agent_id="agent-1", owner_email="owner@example.com", name="Agent"))
+            await db.flush()
+            db.add(
+                Conversation(
+                    conversation_id="root",
+                    user_email="owner@example.com",
+                    agent_id="agent-1",
+                    context_type="web",
+                    active_session_id="a-root",
+                )
+            )
+            await db.flush()
+            for identifier, parent, previous in [
+                ("a-root", None, None),
+                ("z-delegate", "a-root", None),
+                ("z-successor", "z-delegate", "z-delegate"),
+            ]:
+                db.add(
+                    Session(
+                        session_id=identifier,
+                        activity_scope_id="scope-current",
+                        conversation_id="root",
+                        user_email="owner@example.com",
+                        agent_id="agent-1",
+                        intaris_session_id=f"stream-{identifier}",
+                        parent_session_id=parent,
+                        previous_session_id=previous,
+                        delegation_mode="delegate" if parent else None,
+                        delegation_metadata={},
+                    )
+                )
+                await db.flush()
+            await db.commit()
+        async with factory() as db:
+            graph = await resolve_authorized_work_graph(
+                db,
+                user_email="owner@example.com",
+                scope=TimelineScope(
+                    key="conversation:root", kind="conversation", conversation_id="root"
+                ),
+            )
+        assert len(graph.nodes) == 2
+        delegate = next(node for node in graph.nodes if node.kind == "delegate")
+        assert delegate.parent_key == "scope-current"
+        assert delegate.backing_session_ids == ["z-delegate", "z-successor"]
+    finally:
+        await engine.dispose()

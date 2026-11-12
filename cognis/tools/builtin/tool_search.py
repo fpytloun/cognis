@@ -212,7 +212,7 @@ def search_inventory(
         return []
     normalized_category = category.strip().lower() if isinstance(category, str) else None
     limit = max(1, min(limit, 20))
-    query_terms = _tokenize(normalized_query)
+    query_terms = tokenize_search_text(normalized_query)
     already_visible_tool_ids = already_visible_tool_ids or set()
     extra_data = {
         "target": "search_tools",
@@ -264,7 +264,7 @@ def search_inventory(
         haystack = f"{display_name} {tool.description} {tool.category} {profile_group}".lower()
         candidates.append((tool, display_name, profile_group, haystack))
 
-    bm25_scores = _bm25_scores(
+    candidate_scores = bm25_scores(
         [candidate[3] for candidate in candidates],
         query_terms,
     )
@@ -272,7 +272,7 @@ def search_inventory(
     scored_candidates: list[dict[str, Any]] = []
     for (tool, display_name, profile_group, haystack), bm25_score in zip(
         candidates,
-        bm25_scores,
+        candidate_scores,
         strict=False,
     ):
         score = bm25_score
@@ -522,15 +522,17 @@ def _tool_handle(
     }
 
 
-def _tokenize(text: str) -> list[str]:
+def tokenize_search_text(text: str) -> list[str]:
+    """Split text into lowercase search terms."""
     return _TOKEN_PATTERN.findall(text.lower())
 
 
-def _bm25_scores(documents: list[str], query_terms: list[str]) -> list[float]:
+def bm25_scores(documents: list[str], query_terms: list[str]) -> list[float]:
+    """Score documents against query terms with BM25."""
     if not documents or not query_terms:
         return [0.0 for _ in documents]
 
-    tokenized_docs = [_tokenize(document) for document in documents]
+    tokenized_docs = [tokenize_search_text(document) for document in documents]
     avgdl = sum(len(doc) for doc in tokenized_docs) / max(1, len(tokenized_docs))
     document_frequencies: dict[str, int] = {}
     for doc in tokenized_docs:

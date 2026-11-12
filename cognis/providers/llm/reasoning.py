@@ -21,6 +21,7 @@ _ANTHROPIC_ADAPTIVE_MODEL_KEYS = frozenset(
     {
         "fable-5",
         "fable-5-1",
+        "fable-5-2",
         "mythos-5",
         "mythos-preview",
         "opus-4-6",
@@ -47,11 +48,14 @@ _ANTHROPIC_LEGACY_MODEL_KEYS = frozenset(
         "sonnet-4-5",
     }
 )
-_ANTHROPIC_ALWAYS_ON_MODEL_KEYS = frozenset({"fable-5", "fable-5-1", "mythos-5", "mythos-preview"})
+_ANTHROPIC_ALWAYS_ON_MODEL_KEYS = frozenset(
+    {"fable-5", "fable-5-1", "fable-5-2", "mythos-5", "mythos-preview"}
+)
 _ANTHROPIC_XHIGH_MODEL_KEYS = frozenset(
     {
         "fable-5",
         "fable-5-1",
+        "fable-5-2",
         "mythos-5",
         "opus-4-7",
         "opus-4-8",

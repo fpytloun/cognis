@@ -105,8 +105,7 @@ class TestSignalTrustModeNormalization:
 
 class TestSignalFatalErrorClassification:
     def test_registered_error_is_fatal(self) -> None:
-        # Ofcom reserves 07700 900000–900999 for fictional mobile numbers.
-        assert _is_fatal_signal_error("User +447700900123 is not registered.") is True
+        assert _is_fatal_signal_error("User +447727940997 is not registered.") is True
 
     def test_generic_error_is_not_fatal(self) -> None:
         assert _is_fatal_signal_error("signal-cli process exited unexpectedly") is False
@@ -1451,7 +1450,7 @@ class TestDirectRuntimeFatalFailures:
         adapter = SignalAdapter()
         runtime = MagicMock()
         runtime.is_running = False
-        runtime._process_exit_message.return_value = "signal-cli process exited unexpectedly (returncode=1, stderr_lines=1, stderr_tail=['User +447700900123 is not registered.'])"
+        runtime._process_exit_message.return_value = "signal-cli process exited unexpectedly (returncode=1, stderr_lines=1, stderr_tail=['User +447727940997 is not registered.'])"
         adapter._runtime = runtime
         adapter._stop_event.clear()
 

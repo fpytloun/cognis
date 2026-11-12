@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -71,7 +70,7 @@ def test_list_channel_types(monkeypatch: object, tmp_path: Path) -> None:
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.get(
             "/api/v1/channels/types", headers=_auth_headers(client.app, email="user@example.com")
@@ -88,6 +87,104 @@ def test_list_channel_types(monkeypatch: object, tmp_path: Path) -> None:
         )
         assert delivery_field["default"] == "final_only"
         assert delivery_field["options"] == ["final_only", "concatenated", "immediate"]
+
+
+def test_builtin_app_channel_is_preferable_always_enabled_and_owner_scoped(
+    monkeypatch: object, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+
+        async def seed() -> None:
+            async with client.app.state.session_factory() as db:
+                for email in ("app-owner@example.com", "other@example.com"):
+                    await create_user(
+                        db, email=email, name="User", password_hash="hash", role="user"
+                    )
+                await create_agent(
+                    db, agent_id="app-agent", owner_email="app-owner@example.com", name="App agent"
+                )
+                await db.commit()
+
+        client.portal.call(seed)
+        headers = _auth_headers(client.app, email="app-owner@example.com")
+        response = client.get("/api/v1/channels/accounts", headers=headers)
+        assert response.status_code == 200
+        account = next(row for row in response.json() if row["channel_type"] == "web")
+        path = f"/api/v1/channels/accounts/{account['account_id']}"
+        assert account["enabled"] is True
+        assert account["preferred_for_task_delivery"] is True
+        assert (
+            client.patch(path, headers=headers, json={"preferred_for_task_delivery": False}).json()[
+                "preferred_for_task_delivery"
+            ]
+            is True
+        )
+        assert (
+            client.post(
+                "/api/v1/channels/accounts",
+                headers=headers,
+                json={
+                    "channel_type": "web",
+                    "agent_id": "app-agent",
+                    "display_name": "Duplicate app",
+                },
+            ).status_code
+            == 400
+        )
+        for field, value in {
+            "display_name": "Renamed app",
+            "agent_id": "other-agent",
+            "default_agent_profile_id": "chat",
+            "settings": {"transport": "rest_api"},
+            "dm_policy": "open",
+            "group_policy": "open",
+            "allowed_senders": ["sender"],
+            "allow_new_conversations": False,
+            "adapter_location": "executor",
+            "executor_id": "exec-signal",
+        }.items():
+            assert client.patch(path, headers=headers, json={field: value}).status_code == 400
+        assert (
+            client.patch(
+                path, headers=headers, json={"preferred_for_task_delivery": True}
+            ).status_code
+            == 200
+        )
+        assert client.get(path, headers=headers).json()["preferred_for_task_delivery"] is True
+        assert client.patch(path, headers=headers, json={"enabled": False}).status_code == 400
+        assert client.post(f"{path}/stop", headers=headers).status_code == 400
+        assert client.delete(path, headers=headers).status_code == 400
+        assert len(client.get("/api/v1/channels/accounts", headers=headers).json()) == 1
+
+        async def add_external() -> None:
+            async with client.app.state.session_factory() as db:
+                await create_channel_account(
+                    db,
+                    account_id="app-owner-telegram",
+                    channel_type="telegram",
+                    display_name="Telegram",
+                    user_email="app-owner@example.com",
+                    agent_id="app-agent",
+                    preferred_for_task_delivery=True,
+                )
+                await db.commit()
+
+        client.portal.call(add_external)
+        assert client.get(path, headers=headers).json()["preferred_for_task_delivery"] is False
+        assert (
+            client.delete(
+                "/api/v1/channels/accounts/app-owner-telegram", headers=headers
+            ).status_code
+            == 200
+        )
+        assert client.get(path, headers=headers).json()["preferred_for_task_delivery"] is True
+        assert (
+            client.get(
+                f"{path}/status",
+                headers=_auth_headers(client.app, email="other@example.com"),
+            ).status_code
+            == 404
+        )
 
 
 def test_create_channel_account_applies_defaults(monkeypatch: object, tmp_path: Path) -> None:
@@ -112,7 +209,7 @@ def test_create_channel_account_applies_defaults(monkeypatch: object, tmp_path: 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         created = client.post(
             "/api/v1/channels/accounts",
@@ -132,7 +229,7 @@ def test_create_channel_account_applies_defaults(monkeypatch: object, tmp_path: 
                 assert row is not None
                 return row.dm_policy, row.group_policy, row.config or {}
 
-        dm_policy, group_policy, config = asyncio.run(_fetch())
+        dm_policy, group_policy, config = client.portal.call(_fetch)
         assert dm_policy == "pairing"
         assert group_policy == "pairing"
         assert config["assistant_delivery_mode"] == "final_only"
@@ -163,7 +260,7 @@ def test_create_channel_account_rejects_coerced_group_context_settings(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
         for settings, expected in (
             (
@@ -210,7 +307,7 @@ def test_create_webhook_channel_generates_secret(monkeypatch: object, tmp_path: 
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/channels/accounts",
@@ -246,7 +343,7 @@ def test_create_signal_account_accepts_non_secret_fields_in_settings(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/channels/accounts",
@@ -298,7 +395,7 @@ def test_create_signal_direct_account_requires_executor_opt_in(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/channels/accounts",
@@ -356,7 +453,7 @@ def test_update_signal_account_accepts_partial_non_secret_updates(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.patch(
             "/api/v1/channels/accounts/signal-1",
@@ -404,7 +501,7 @@ def test_update_channel_account_hot_reloads_running_account(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         manager = _FakeChannelManager(running=True)
         app.state.channel_manager = manager
 
@@ -452,7 +549,7 @@ def test_update_channel_account_does_not_start_stopped_account_on_config_edit(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         manager = _FakeChannelManager(running=False)
         app.state.channel_manager = manager
 
@@ -492,7 +589,7 @@ def test_create_channel_account_rejects_secondary_agent(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/channels/accounts",
@@ -554,7 +651,7 @@ def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         listed = client.get(
             "/api/v1/channels/pairing-requests",
@@ -588,7 +685,7 @@ def test_pairing_endpoints(monkeypatch: object, tmp_path: Path) -> None:
                 contact = await get_channel_contact(session, "signal", "+420111222333")
                 return bool(contact and contact.verified)
 
-        assert asyncio.run(_verify_contact()) is True
+        assert client.portal.call(_verify_contact) is True
 
 
 def test_reject_nonexistent_pairing_request(monkeypatch: object, tmp_path: Path) -> None:
@@ -606,7 +703,7 @@ def test_reject_nonexistent_pairing_request(monkeypatch: object, tmp_path: Path)
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
 
         response = client.post(
             "/api/v1/channels/pairing-requests/missing/reject",
@@ -647,7 +744,7 @@ def test_channel_default_profile_round_trip_and_agent_change_clear(
                     )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
         created = client.post(
             "/api/v1/channels/accounts",
@@ -717,7 +814,7 @@ def test_channel_default_profile_rejects_missing_disabled_or_foreign_agent(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(app, email="user@example.com")
         for agent_id, profile_id, status in (
             ("agent-1", "missing", 400),
@@ -770,7 +867,7 @@ def test_channel_account_detail_mutations_are_owner_scoped(
                 await session.commit()
                 return account.account_id
 
-        account_id = asyncio.run(_seed())
+        account_id = client.portal.call(_seed)
         headers = _auth_headers(app, email="viewer@example.com")
         assert (
             client.get(f"/api/v1/channels/accounts/{account_id}", headers=headers).status_code

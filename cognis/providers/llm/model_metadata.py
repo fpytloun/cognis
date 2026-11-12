@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import litellm
 
+from cognis import json_codec as json
 from cognis.models.config import ModelInfo
 from cognis.providers.llm.hosted import (
     is_systemone_model,
@@ -60,6 +62,31 @@ LIMIT_FIELDS = {
 }
 
 
+BUNDLED_CATALOG = Path(__file__).parent / "data" / "litellm_model_prices.json"
+_bundled_catalog: dict[str, Any] | None = None
+
+
+def bundled_catalog() -> dict[str, Any]:
+    """Load the reviewed LiteLLM snapshot once and overlay it on the package map.
+
+    The pinned LiteLLM package map lags model releases. The snapshot is refreshed
+    by ``scripts/update_model_prices.py``, with reviewed per-model corrections
+    from provider documentation when needed. It is never fetched at runtime.
+    """
+    global _bundled_catalog
+    if _bundled_catalog is None:
+        snapshot = json.loads(BUNDLED_CATALOG.read_bytes())
+        models = snapshot.get("models", {}) if isinstance(snapshot, dict) else {}
+        for name, entry in models.items():
+            if isinstance(name, str) and isinstance(entry, dict):
+                litellm.model_cost[name] = dict(entry)
+        _bundled_catalog = {key: snapshot[key] for key in ("source", "fetched_at", "sha256")}
+    return _bundled_catalog
+
+
+bundled_catalog()
+
+
 def catalog_provider_for(preset: str, base_url: str, explicit: str | None = None) -> str | None:
     """Resolve hosting identity without treating a model namespace as a provider."""
     if explicit and explicit.strip():
@@ -97,7 +124,13 @@ def normalize_model_metadata(info: dict[str, Any]) -> dict[str, Any]:
                 info.setdefault(key, info["pricing"][remote_key])
     result: dict[str, Any] = {}
     for field in ModelInfo.model_fields:
-        if field in {"model_id", "provider_metadata", "runtime_metadata", "pricing"}:
+        if field in {
+            "model_id",
+            "provider_metadata",
+            "runtime_metadata",
+            "pricing",
+            "untiered_tariff",
+        }:
             continue
         value = info.get(field)
         if value is None:
@@ -132,7 +165,7 @@ def normalize_model_metadata(info: dict[str, Any]) -> dict[str, Any]:
     pricing = {
         key: value
         for key, value in info.items()
-        if ("cost_per_" in key or key.endswith("_token_cost")) and _number(value) is not None
+        if ("cost_per_" in key or "_token_cost" in key) and _number(value) is not None
     }
     if isinstance(info.get("pricing"), dict):
         pricing.update(
@@ -152,6 +185,15 @@ def normalize_model_metadata(info: dict[str, Any]) -> dict[str, Any]:
         result["supports_embedding"] = mode == "embedding"
         if mode == "systemone":
             result.update(systemone_metadata())
+        elif mode == "image_generation":
+            result.update(
+                supports_image_generation=True,
+                supports_tools=False,
+                supports_parallel_tools=False,
+                supports_streaming=False,
+                supports_structured_output=False,
+                supports_reasoning=False,
+            )
         elif mode == "video":
             result.update(
                 supports_video_generation=True,
@@ -193,7 +235,19 @@ def resolve_model_metadata(
         # Only strip our hosting prefix; publisher namespaces belong to the wire ID.
         lookup = model_id if model_id.startswith(f"{hosting}/") else f"{hosting}/{model_id}"
         try:
-            info: Any = litellm.get_model_info(model=lookup, custom_llm_provider=hosting)
+            entry = litellm.model_cost.get(lookup) or litellm.model_cost.get(
+                model_id.removeprefix(f"{hosting}/")
+            )
+            # LiteLLM's chat-oriented projection drops image pricing fields and
+            # fabricates chat parameters. Native image metadata uses the same
+            # provider-scoped catalog entry without that lossy projection.
+            info: Any = (
+                entry
+                if isinstance(entry, dict)
+                and entry.get("litellm_provider") == hosting
+                and entry.get("mode") == "image_generation"
+                else litellm.get_model_info(model=lookup, custom_llm_provider=hosting)
+            )
             if isinstance(info, dict) and info.get("litellm_provider") in {None, hosting}:
                 catalog = normalize_model_metadata(info)
                 status = "matched"

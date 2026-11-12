@@ -10,11 +10,10 @@ from cognis.models.session import IntarisSession, SessionModel
 
 _HEADING = "CURRENT POLICY SNAPSHOT\n"
 _GUIDANCE = (
-    "Observed effective controller policy, not a new user grant. Previous-run audit/journal "
-    "denials are historical, not automatic proof of current prohibition. Explicit human "
-    "refusals and operational preconditions remain binding. Tools must still be evaluated "
-    "normally; do not evade a denial or retry ambiguous executed mutations. Unknown fields "
-    "do not establish permission or YOLO."
+    "Observed controller policy, not a user grant. Earlier denials are history, not proof "
+    "of a current prohibition; explicit human refusals and operational preconditions still "
+    "bind. Tools are still evaluated normally: do not evade a denial or retry an ambiguous "
+    "executed mutation. Unknown fields grant no permission."
 )
 
 

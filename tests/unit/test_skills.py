@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from cognis.models.agent import AgentDefinition
 from cognis.models.skill import (
     AgentSkillRef,
@@ -541,93 +543,69 @@ def test_build_available_skills_metadata_empty() -> None:
     assert build_available_skills_metadata(skill_set) == ""
 
 
-def test_build_available_skills_metadata_basic() -> None:
-    skill_set = ResolvedSkillSet(
-        skills=[
-            ResolvedSkill(
-                skill_id="git-release",
-                name="Git Release",
-                description="Automate git release workflows",
-                version_id="v1",
-                version_number=1,
-                content_hash="h1",
-                instructions="Automate git release workflows with tagging and changelog generation.",
-                tools=[SkillToolSpec(name="tag_release", description="Tag a release")],
-                attached=True,
-            ),
-        ]
-    )
-    metadata = build_available_skills_metadata(skill_set)
-    assert "<available_skills>" in metadata
-    assert "<name>Git Release</name>" in metadata
-    assert "<skill_id>git-release</skill_id>" in metadata
-    assert "<tools>" not in metadata
-    assert "<linked_tools>" not in metadata
-    # Description should use the real description field
-    assert "Automate git release workflows" in metadata
-    assert "<attached>true</attached>" in metadata
-    # Should NOT contain version ids (for prompt caching stability)
-    assert "v1" not in metadata
-    assert "h1" not in metadata
+def _catalog_skill(skill_id: str, **overrides: Any) -> ResolvedSkill:
+    values: dict[str, Any] = {
+        "skill_id": skill_id,
+        "name": skill_id.title(),
+        "description": f"Use {skill_id} procedures.",
+        "version_id": f"version-{skill_id}",
+        "version_number": 3,
+        "content_hash": f"hash-{skill_id}",
+        "instructions": f"Instructions for {skill_id}.",
+        "tags": [f"tag-{skill_id}"],
+        "tools": [SkillToolSpec(name=f"{skill_id}_tool", description="Tool")],
+    }
+    values.update(overrides)
+    return ResolvedSkill(**values)
 
 
-def test_build_available_skills_metadata_fallback_description() -> None:
-    """When description is None, fall back to truncated instruction snippet."""
-    skill_set = ResolvedSkillSet(
-        skills=[
-            ResolvedSkill(
-                skill_id="no-desc",
-                name="No Description",
-                description=None,
-                version_id="v1",
-                version_number=1,
-                content_hash="h1",
-                instructions="This skill does something specific and useful.",
-            ),
-        ]
-    )
-    metadata = build_available_skills_metadata(skill_set)
-    assert "This skill does something specific" in metadata
-
-
-def test_build_available_skills_metadata_attach_to_all_agents() -> None:
-    skill_set = ResolvedSkillSet(
-        skills=[
-            ResolvedSkill(
-                skill_id="always-on",
-                name="Always On",
-                version_id="v1",
-                version_number=1,
-                content_hash="h1",
-                instructions="Always active skill.",
-                auto_load=True,
-                attached=True,
-            ),
-        ]
-    )
-    metadata = build_available_skills_metadata(skill_set)
-    assert "<attach_to_all_agents>true</attach_to_all_agents>" in metadata
-
-
-def test_build_available_skills_metadata_marks_auto_loaded_skills_loaded() -> None:
-    skill_set = ResolvedSkillSet(
-        skills=[
-            ResolvedSkill(
-                skill_id="coding",
-                name="Coding",
-                version_id="v1",
-                version_number=1,
-                content_hash="h1",
-                instructions="Coding discipline.",
-                attached=True,
-                auto_load_instructions=True,
-            ),
-        ]
+def test_catalog_lists_attached_and_global_skills_and_counts_the_rest() -> None:
+    long_description = "x" * 1500
+    metadata = build_available_skills_metadata(
+        ResolvedSkillSet(
+            skills=[
+                _catalog_skill("attached", attached=True, description=long_description),
+                _catalog_skill("global", attached=True, auto_load=True),
+                _catalog_skill("preloaded", attached=True, auto_load_instructions=True),
+                _catalog_skill("other-one"),
+                _catalog_skill("other-two"),
+            ]
+        )
     )
 
-    metadata = build_available_skills_metadata(skill_set)
-    assert "<loaded>true</loaded>" in metadata
-    assert "<auto_load_instructions>true</auto_load_instructions>" in metadata
+    assert metadata == (
+        "<available_skills>\n"
+        "  <skill>\n"
+        "    <skill_id>attached</skill_id>\n"
+        "    <name>Attached</name>\n"
+        f"    <description>{'x' * 1021}...</description>\n"
+        "  </skill>\n"
+        "  <skill>\n"
+        "    <skill_id>global</skill_id>\n"
+        "    <name>Global</name>\n"
+        "    <description>Use global procedures.</description>\n"
+        "  </skill>\n"
+        "  2 more skills are available; find them with skill_search.\n"
+        "</available_skills>"
+    )
+
+
+def test_catalog_falls_back_to_an_instruction_excerpt_without_description() -> None:
+    metadata = build_available_skills_metadata(
+        ResolvedSkillSet(
+            skills=[
+                _catalog_skill(
+                    "bare",
+                    attached=True,
+                    description=None,
+                    instructions="Step one.\nStep two." + " more" * 60,
+                )
+            ]
+        )
+    )
+
+    assert "<description>Step one. Step two. more more" in metadata
+    assert "...</description>" in metadata
 
 
 # ---------------------------------------------------------------------------
@@ -671,7 +649,7 @@ def test_skill_management_tool_count() -> None:
     from cognis.tools.builtin.skill_management import skill_management_tools
 
     tools = skill_management_tools()
-    assert len(tools) == 12
+    assert len(tools) == 13
 
 
 def test_skill_load_asset_manifest_strips_internal_references() -> None:

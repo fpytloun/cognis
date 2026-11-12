@@ -621,16 +621,13 @@ async def test_terminal_replay_result_wins_after_recovery_deadline(
         metadata={"delivery_state": "completed", "result_id": "result-1"},
     )
     loop_with_pool.tool_router.execute = AsyncMock(return_value=authoritative)
-    event_loop = asyncio.get_running_loop()
-    clock = event_loop.time()
-    recovery_deadline = clock + 0.005
+    real_wait_for = asyncio.wait_for
 
     async def finish_after_deadline(awaitable: Any, *, timeout: float) -> Any:
-        nonlocal clock
-        assert timeout == pytest.approx(0.005)
-        clock = recovery_deadline + 0.01
+        await asyncio.sleep(timeout + 0.01)
         return await awaitable
 
+    monkeypatch.setattr(asyncio, "wait_for", finish_after_deadline)
     clear_recovery = AsyncMock()
     monkeypatch.setattr(
         "cognis.core.executor_recovery.clear_executor_recovery",
@@ -643,10 +640,11 @@ async def test_terminal_replay_result_wins_after_recovery_deadline(
         deadline=now + timedelta(seconds=900),
         database_remaining_seconds=900,
     )
-    # Setup must not consume the replay budget before dispatch starts.
-    with monkeypatch.context() as clock_patch:
-        clock_patch.setattr(event_loop, "time", lambda: clock)
-        clock_patch.setattr(asyncio, "wait_for", finish_after_deadline)
+    # Dispatch must start before the deadline; the patched wait_for then finishes
+    # just after it. A tiny window would race with scheduling on a loaded host.
+    recovery_deadline = asyncio.get_running_loop().time() + 0.5
+
+    try:
         result = await loop_with_pool._handle_tool_after_same_executor_transient_failure(
             ctx,
             tc=_toolcall("read", {"file_path": "/tmp/example"}),
@@ -658,8 +656,10 @@ async def test_terminal_replay_result_wins_after_recovery_deadline(
             recovery_deadline=recovery_deadline,
             recovery_window=window,
         )
-        assert event_loop.time() > recovery_deadline
+    finally:
+        monkeypatch.setattr(asyncio, "wait_for", real_wait_for)
 
+    assert asyncio.get_running_loop().time() > recovery_deadline
     assert result is not None
     assert result.output == authoritative.output
     assert result.is_error == authoritative.is_error

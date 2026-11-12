@@ -18,7 +18,13 @@ logger = logging.getLogger(__name__)
 
 def ensure_artifact_access_schema(connection: Connection) -> None:
     """Preserve provenance while making content ownership independent of its source."""
+    from cognis.store.document_write_schema import ensure_document_write_schema
+
+    # Current ORM grant reads also run during older bootstrap/migration paths.
+    ensure_document_write_schema(connection)
     tables = set(sa.inspect(connection).get_table_names())
+    # Null is initialized ownership too; infer only while adding owner columns.
+    initialize_owners: set[str] = set()
     for table, columns in (
         ("sessions", ("artifact_scope_id",)),
         ("artifacts", ("owner_agent_id",)),
@@ -30,14 +36,17 @@ def ensure_artifact_access_schema(connection: Connection) -> None:
         for column in columns:
             if column not in existing:
                 connection.execute(sa.text(f"ALTER TABLE {table} ADD COLUMN {column} VARCHAR"))
+                if column in {"owner_email", "owner_agent_id"}:
+                    initialize_owners.add(table)
     cast(sa.Table, ArtifactGrantRow.__table__).create(connection, checkfirst=True)
     if (
         not {"artifacts", "deliverables", "conversations", "sessions", "tasks", "step_runs"}
         <= tables
     ):
         return
-    connection.execute(
-        sa.text("""
+    if "deliverables" in initialize_owners:
+        connection.execute(
+            sa.text("""
         UPDATE deliverables SET owner_email = COALESCE(
             owner_email,
             (SELECT t.created_by FROM tasks t JOIN step_runs r ON r.task_id = t.task_id
@@ -56,9 +65,10 @@ def ensure_artifact_access_schema(connection: Connection) -> None:
              AND (deliverables.owner_email IS NULL OR c.user_email = deliverables.owner_email)))
         WHERE owner_email IS NULL OR owner_agent_id IS NULL
     """)
-    )
-    connection.execute(
-        sa.text("""
+        )
+    if "artifacts" in initialize_owners:
+        connection.execute(
+            sa.text("""
         UPDATE artifacts SET owner_agent_id = COALESCE(
             (SELECT d.owner_agent_id FROM deliverables d
              WHERE d.deliverable_id = artifacts.artifact_id AND d.owner_email = artifacts.owner_email),
@@ -68,7 +78,7 @@ def ensure_artifact_access_schema(connection: Connection) -> None:
              WHERE c.conversation_id = artifacts.conversation_id AND c.user_email = artifacts.owner_email))
         WHERE owner_agent_id IS NULL
     """)
-    )
+        )
     connection.execute(
         sa.text("""
         UPDATE artifacts SET conversation_id = (
@@ -109,10 +119,12 @@ def ensure_artifact_access_schema(connection: Connection) -> None:
                     ondelete="SET NULL",
                 )
     if {"agents", "managed_conversation_links"} <= tables:
-        _backfill_entitlements(connection, tables)
+        _backfill_entitlements(connection, tables, initialize_owners)
 
 
-def _backfill_entitlements(connection: Connection, tables: set[str]) -> None:
+def _backfill_entitlements(
+    connection: Connection, tables: set[str], initialize_owners: set[str]
+) -> None:
     from cognis.store.models import (
         Agent,
         ArtifactRecordRow,
@@ -379,7 +391,9 @@ def _backfill_entitlements(connection: Connection, tables: set[str]) -> None:
             producer = sessions.get(row["session_id"]) if row["session_id"] else None
             if producer is not None and producer["user_email"] != owner:
                 continue
-            if not row["owner_agent_id"] or row["owner_agent_id"].startswith("system:"):
+            if model.__tablename__ in initialize_owners and (
+                not row["owner_agent_id"] or row["owner_agent_id"].startswith("system:")
+            ):
                 task = session_tasks.get((owner, row["session_id"])) if row["session_id"] else None
                 conversation = (
                     conversations.get(row["conversation_id"]) if row["conversation_id"] else None

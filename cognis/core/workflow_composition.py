@@ -13,6 +13,7 @@ from cognis.core.json_utils import (
     extract_json_object,
     extract_text_from_response,
 )
+from cognis.core.program_guidance import workflow_skill_guidance
 from cognis.core.step_profiles import list_step_profile_definitions
 from cognis.logging import get_logger
 from cognis.models.skill import ResolvedSkill, ResolvedSkillSet, SkillToolSpec
@@ -399,7 +400,7 @@ async def decompose_skill_material(
     response = await _generate_json_response(
         llm=llm,
         messages=messages,
-        task_type="classifier",
+        task_type="auxiliary_generation",
         label="skill_decomposer",
         logger_obj=logger,
         warning_context={"skill_id": skill_id},
@@ -431,6 +432,7 @@ async def compose_workflow_plan(
     persist: bool,
     schedule_requested: bool,
     validator_feedback: str | None = None,
+    allow_program_steps: bool = False,
     timeout_seconds: float = 45.0,
 ) -> WorkflowComposerOutput:
     """Compose a reusable workflow or select an existing one."""
@@ -455,6 +457,11 @@ async def compose_workflow_plan(
             }
         )
     skill_payload = [skill.model_dump(mode="json") for skill in skill_materials]
+    program_authoring_guidance = (
+        workflow_skill_guidance({"python_execute", "create_workflow"})
+        if allow_program_steps
+        else None
+    )
     messages = [
         {"role": "system", "content": system_prompt},
         {
@@ -479,7 +486,14 @@ async def compose_workflow_plan(
                 "meaningful stages. Phases are concise user-facing labels over contiguous steps and "
                 "must cover every step exactly once in canonical order. Every run step should include "
                 "step_profile_id, and when skill-defined tools are required you should use inline "
-                "step_profile.tool_overrides.include for those tool names."
+                "step_profile.tool_overrides.include for those tool names. "
+                + (
+                    "A program step may be proposed only as an untrusted candidate; do not execute "
+                    "or schedule it until an owner reviews and accepts the pinned code/config."
+                    if allow_program_steps
+                    else "Do not create program steps; this runtime has not enabled python_execute."
+                )
+                + (f"\n\n{program_authoring_guidance}" if program_authoring_guidance else "")
             ),
         },
     ]
@@ -487,7 +501,7 @@ async def compose_workflow_plan(
     response = await _generate_json_response(
         llm=llm,
         messages=messages,
-        task_type="classifier",
+        task_type="auxiliary_generation",
         label="workflow_composer",
         logger_obj=logger,
         warning_context={"intent_preview": intent[:80]},
@@ -502,6 +516,7 @@ def validate_composed_workflow(
     payload: dict[str, Any],
     *,
     skill_materials: list[SkillMaterial] | None = None,
+    allow_program_steps: bool = False,
 ) -> Workflow:
     """Validate a composed workflow definition."""
 
@@ -530,6 +545,8 @@ def validate_composed_workflow(
 
     workflow = Workflow.model_validate(normalized_payload)
     _validate_workflow(workflow)
+    if not allow_program_steps and any(step.type == "program" for step in workflow.steps):
+        raise ValueError("composed program steps require an enabled python_execute runtime")
     return workflow
 
 

@@ -7,6 +7,7 @@ import contextlib
 import uuid
 from collections.abc import Awaitable, Callable
 
+from cognis.core.cancellation import join_owned_task
 from cognis.logging import get_logger
 from cognis.store.coordination import DatabaseLeaseStore, Lease
 
@@ -43,6 +44,19 @@ async def run_periodic_maintenance(
     if lease_store is None:
         await passes()
         return
+
+    async def settle_owned_work(work: asyncio.Task[None] | None, lease: Lease | None) -> None:
+        try:
+            if work is not None:
+                work.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await work
+        finally:
+            if lease is not None:
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(_TTL_SECONDS / 3):
+                        await lease_store.release(lease)
+
     while not stop.is_set():
         lease: Lease | None = None
         work: asyncio.Task[None] | None = None
@@ -65,13 +79,10 @@ async def run_periodic_maintenance(
                 "Maintenance ownership failed", extra={"resource_key": resource_key}, exc_info=True
             )
         finally:
-            if work is not None:
-                work.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await work
-            if lease is not None:
-                with contextlib.suppress(Exception):
-                    async with asyncio.timeout(_TTL_SECONDS / 3):
-                        await lease_store.release(lease)
+            # A shutdown cancellation must not interrupt work already closing
+            # its database session after lease loss.
+            await join_owned_task(
+                asyncio.create_task(settle_owned_work(work, lease), name=f"{resource_key}:cleanup")
+            )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=min(interval_seconds, _TTL_SECONDS / 3))

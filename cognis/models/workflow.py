@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal, cast
 
+from jsonschema import Draft202012Validator, SchemaError
 from pydantic import BaseModel, Field, field_validator, model_serializer, model_validator
 
 from cognis import json_codec as json
@@ -22,9 +23,11 @@ class InteractionMode(BaseModel):
 
 
 class CompletionModeFamily(StrEnum):
-    """Family used when publishing a completed task result."""
+    """Policy for publishing terminal task outcomes."""
 
-    DEFAULT = "default"
+    DEFAULT = "auto"
+    # Preserve the persisted value in existing tasks, schedules and workflow revisions.
+    AGENT = "default"
     DIRECT = "direct"
 
 
@@ -49,6 +52,26 @@ class CompletionDeliveryPolicy(BaseModel):
 
     completion_mode_family: CompletionModeFamily = CompletionModeFamily.DEFAULT
     allow_silent_completion: bool = False
+    on_finish_instructions: str | None = Field(default=None, max_length=8000)
+
+    @model_validator(mode="after")
+    def _validate_finish_instructions(self) -> CompletionDeliveryPolicy:
+        if self.on_finish_instructions:
+            self.on_finish_instructions = self.on_finish_instructions.strip() or None
+        if (
+            self.on_finish_instructions
+            and self.completion_mode_family == CompletionModeFamily.DIRECT
+        ):
+            raise ValueError("on_finish_instructions requires Default or Agent completion delivery")
+        return self
+
+    def mode_for_outcome(self, *, succeeded: bool) -> Literal["default", "direct"]:
+        """Resolve Default once for both owner delivery and project fan-out."""
+        if self.completion_mode_family == CompletionModeFamily.DIRECT or (
+            self.completion_mode_family == CompletionModeFamily.DEFAULT and succeeded
+        ):
+            return "direct"
+        return "default"
 
 
 class SessionPolicy(BaseModel):
@@ -138,6 +161,20 @@ class GateOption(BaseModel):
     label: str
     action: str  # "continue" | "revise(step_name)" | "cancel" — free-form for revise()
     prompt: bool = False
+
+
+def effective_gate_options(options: object) -> list[Any]:
+    """Return gate actions, including the supported empty-options default.
+
+    Read-time normalization remains necessary until older empty gates settle.
+    """
+
+    if isinstance(options, list) and not options:
+        return [
+            {"label": "Approve & continue", "action": "continue", "prompt": False},
+            {"label": "Cancel task", "action": "cancel", "prompt": False},
+        ]
+    return options if isinstance(options, list) else []
 
 
 class GateCondition(BaseModel):
@@ -373,6 +410,71 @@ class ToolCallStepConfig(BaseModel):
         return value
 
 
+class ProgramLimits(BaseModel):
+    """Optional per-program limits; runtime policy remains the hard ceiling."""
+
+    model_config = {"extra": "forbid"}
+
+    wall_seconds: int | None = Field(default=None, ge=1)
+    max_calls: int | None = Field(default=None, ge=1)
+    concurrency: int | None = Field(default=None, ge=1)
+    output_bytes: int | None = Field(default=None, ge=1)
+
+
+def _validate_program_schema(value: dict[str, Any], *, field_name: str) -> dict[str, Any]:
+    try:
+        Draft202012Validator.check_schema(value)
+    except SchemaError as exc:
+        raise ValueError(f"program.{field_name} is not a valid JSON Schema: {exc.message}") from exc
+    if value.get("type") != "object":
+        raise ValueError(f"program.{field_name} must declare type 'object'")
+    return value
+
+
+class ProgramStepConfig(BaseModel):
+    """Literal Python source and separately rendered, typed workflow data."""
+
+    model_config = {"extra": "forbid"}
+
+    language: Literal["python"] = "python"
+    description: str
+    code: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    tools: list[str]
+    limits: ProgramLimits | None = None
+
+    @field_validator("description", "code")
+    @classmethod
+    def _validate_required_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("program description and code must not be empty")
+        return value
+
+    @field_validator("input_schema", "output_schema")
+    @classmethod
+    def _validate_schema(cls, value: dict[str, Any], info: Any) -> dict[str, Any]:
+        return _validate_program_schema(value, field_name=info.field_name)
+
+    @field_validator("tools")
+    @classmethod
+    def _validate_tool_ids(cls, value: list[str]) -> list[str]:
+        allowed_namespaces = {"builtin", "controller", "mcp", "skill"}
+        normalized = [tool_id.strip() for tool_id in value]
+        if any(
+            not tool_id
+            or ":" not in tool_id
+            or tool_id.split(":", 1)[0] not in allowed_namespaces
+            or not tool_id.split(":", 1)[1]
+            for tool_id in normalized
+        ):
+            raise ValueError("program.tools must contain canonical tool IDs")
+        if len(normalized) != len(set(normalized)):
+            raise ValueError("program.tools must not contain duplicate tool IDs")
+        return normalized
+
+
 class ConditionStepConfig(BaseModel):
     """Boolean expression and optional named branches."""
 
@@ -443,7 +545,7 @@ class StepDefinition(BaseModel):
     """A single step within a workflow."""
 
     name: str
-    type: Literal["run", "gate", "tool_call", "condition", "complete"]
+    type: Literal["run", "gate", "tool_call", "program", "condition", "complete"]
     description: str = ""
     prompt: str = ""
     objective: str | None = None
@@ -469,6 +571,7 @@ class StepDefinition(BaseModel):
     on_error: Literal["fail", "continue", "skip", "gate"] | None = None
     next: str | None = None
     tool_call: ToolCallStepConfig | None = None
+    program: ProgramStepConfig | None = None
     condition: ConditionStepConfig | None = None
     complete: CompleteStepConfig | None = None
 
@@ -477,11 +580,12 @@ class StepDefinition(BaseModel):
         configs = {
             "gate": self.gate,
             "tool_call": self.tool_call,
+            "program": self.program,
             "condition": self.condition,
             "complete": self.complete,
         }
         required = configs.get(self.type)
-        if self.type in {"tool_call", "condition", "complete"} and required is None:
+        if self.type in {"tool_call", "program", "condition", "complete"} and required is None:
             raise ValueError(f"{self.type} step {self.name!r} requires {self.type} configuration")
         mixed = [
             name for name, config in configs.items() if config is not None and name != self.type
@@ -491,7 +595,7 @@ class StepDefinition(BaseModel):
                 f"{self.type} step {self.name!r} has incompatible configuration: {mixed}"
             )
 
-        deterministic = self.type in {"tool_call", "condition", "complete"}
+        deterministic = self.type in {"tool_call", "program", "condition", "complete"}
         if not deterministic and any(
             value is not None for value in (self.when, self.on_skip, self.on_error, self.next)
         ):

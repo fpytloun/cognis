@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognis.api.common import api_exception
 from cognis.api.serializers import setting_to_response
@@ -35,6 +36,8 @@ class SettingsManagement:
     apply: Callable[[str, object], Awaitable[None]]
     secrets: Any = None
     finalize_web: Callable[[], Awaitable[Any]] | None = None
+    notify_usage_settings: Callable[[AsyncSession], Awaitable[None]] | None = None
+    usage_settings_committed: Callable[[], None] | None = None
 
     async def put(
         self,
@@ -125,7 +128,11 @@ class SettingsManagement:
                                 category="web",
                                 updated_by=updated_by,
                             )
+                if key.startswith("usage.") and self.notify_usage_settings is not None:
+                    await self.notify_usage_settings(session)
                 await session.commit()
+                if key.startswith("usage.") and self.usage_settings_committed is not None:
+                    self.usage_settings_committed()
                 if key.startswith("web.") and self.finalize_web is not None:
                     await self.finalize_web()
                 await session.refresh(row)

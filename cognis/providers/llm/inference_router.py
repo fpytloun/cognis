@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -13,13 +14,20 @@ from cognis.core.executor_resolution import labels_match
 from cognis.json_stream import merge_incremental_json_fragment
 from cognis.models.config import ImageGenerationResult, SpeechToTextResult, TextToSpeechResult
 from cognis.models.executor_inference import executor_local_inference_routable
+from cognis.models.speech import MAX_SPEECH_FRAME_BYTES, SpeechStreamEvent
 from cognis.ownership import SYSTEM_USER_EMAIL, is_shared_owner_email
-from cognis.providers.executor.websocket import ExecutorDisconnectedError, WebSocketExecutorProvider
+from cognis.providers.executor.websocket import (
+    ExecutorDisconnectedError,
+    WebSocketExecutorConnection,
+    WebSocketExecutorProvider,
+)
 from cognis.providers.llm.ollama import ollama_model_name
 from cognis.providers.llm.terminal import (
     ResponseIncompleteDetails,
     response_incomplete_details,
 )
+from cognis.providers.llm.usage_binding import take_binding
+from cognis.providers.llm.usage_executor import executor_metadata, ingest_executor
 from cognis.store.models import (
     ExecutorRow,
     LocalModelDeployment,
@@ -42,13 +50,15 @@ def _provider_safe_kwargs(request_kwargs: dict[str, Any] | None) -> dict[str, An
     return {
         key: value
         for key, value in (request_kwargs or {}).items()
-        if key
+        if not key.startswith("_cognis_usage_")
+        and key
         not in {
             "executor_id",
             "executor_labels",
             "cognis_executor_affinity",
             "_cognis_executor_affinity_id",
         }
+        and not key.startswith("_cognis_usage")
     }
 
 
@@ -123,6 +133,28 @@ class InferenceRouter:
             ),
         )
 
+    async def discover_voices(
+        self,
+        *,
+        preset: str,
+        base_url: str,
+        api_key: str,
+        executor_id: str | None,
+        executor_labels: dict[str, str] | None,
+    ) -> list[dict[str, Any]]:
+        """Keep voice discovery on the configured executor, without local fallback."""
+        if not executor_id and not executor_labels:
+            raise RuntimeError("No executor selector was provided for voice discovery")
+        conn = await self._find_executor(executor_id, executor_labels, readiness_aware=False)
+        if conn is None:
+            raise RuntimeError("The speech provider executor is unavailable")
+        result = await conn.rpc_call(
+            "llm.discover_voices",
+            {"preset": preset, "base_url": base_url, "api_key": api_key},
+            timeout=35,
+        )
+        return cast(list[dict[str, Any]], result.get("voices", []))
+
     async def route_stream(
         self,
         *,
@@ -146,6 +178,8 @@ class InferenceRouter:
                 }
                 return
             executor_id = pinned_id
+        request_kwargs = dict(request_kwargs or {})
+        usage_binding = take_binding(request_kwargs, model=model)
         request_kwargs = _provider_safe_kwargs(request_kwargs)
         backend_metadata = _provider_safe_metadata(backend_metadata)
         try:
@@ -194,17 +228,34 @@ class InferenceRouter:
                     }
                     return
 
+        backend_metadata, usage_context = executor_metadata(
+            usage_binding,
+            backend_metadata,
+            executor_id=handle.executor_id,
+            parameters=request_kwargs,
+            streaming=True,
+        )
+        request_id = uuid.uuid4().hex
+        terminal_received = False
         try:
             async for chunk in conn.llm_complete_stream(
-                request_id=uuid.uuid4().hex,
+                request_id=request_id,
                 messages=messages,
                 model=model,
-                request_kwargs=request_kwargs or {},
+                request_kwargs=_provider_safe_kwargs(request_kwargs),
                 backend=backend,
                 provider_id=provider_id,
                 owner_email=owner_email,
                 backend_metadata=backend_metadata or {},
             ):
+                chunk = ingest_executor(chunk, usage_binding, usage_context)
+                terminal_received = bool(chunk.get("done"))
+                if usage_binding is not None and (
+                    chunk.get("content")
+                    or chunk.get("tool_calls")
+                    or chunk.get("reasoning_content")
+                ):
+                    usage_binding.request.mark_generated()
                 if chunk.get("error"):
                     error_chunk = {
                         "error": chunk["error"],
@@ -216,8 +267,10 @@ class InferenceRouter:
                     yield error_chunk
                     return
                 if chunk.get("done"):
-                    metadata = chunk.get("backend_metadata")
-                    self.last_backend_metadata = metadata if isinstance(metadata, dict) else None
+                    terminal_metadata = chunk.get("backend_metadata")
+                    self.last_backend_metadata = (
+                        terminal_metadata if isinstance(terminal_metadata, dict) else None
+                    )
                     final_chunk = {
                         "choices": [
                             {"delta": {}, "finish_reason": chunk.get("finish_reason", "stop")}
@@ -225,8 +278,8 @@ class InferenceRouter:
                         "usage": chunk.get("usage", {}),
                         "response_status": chunk.get("response_status", "completed"),
                         "anthropic_native_envelope": (
-                            metadata.get("anthropic_native_envelope")
-                            if isinstance(metadata, dict)
+                            terminal_metadata.get("anthropic_native_envelope")
+                            if isinstance(terminal_metadata, dict)
                             else None
                         ),
                     }
@@ -236,7 +289,9 @@ class InferenceRouter:
                     if incomplete_details is not None:
                         final_chunk["response_incomplete_details"] = incomplete_details
                     performance = (
-                        metadata.get("performance") if isinstance(metadata, dict) else None
+                        terminal_metadata.get("performance")
+                        if isinstance(terminal_metadata, dict)
+                        else None
                     )
                     if isinstance(performance, dict):
                         performance = dict(performance)
@@ -310,6 +365,12 @@ class InferenceRouter:
                 },
             }
 
+        finally:
+            if not terminal_received and usage_binding is not None:
+                cancelled = await conn.cancel_inference(request_id)
+                if isinstance(cancelled, dict):
+                    ingest_executor(cancelled, usage_binding, usage_context)
+
     async def route_generate(
         self,
         *,
@@ -335,6 +396,15 @@ class InferenceRouter:
             )
             if conn is None:
                 raise RuntimeError("No executor matches the provider selector")
+            request_kwargs = dict(request_kwargs or {})
+            usage_binding = take_binding(request_kwargs, model=model)
+            backend_metadata, usage_context = executor_metadata(
+                usage_binding,
+                backend_metadata,
+                executor_id=getattr(conn, "executor_id", None),
+                parameters=request_kwargs,
+                streaming=False,
+            )
             request_id = uuid.uuid4().hex
             try:
                 response = await conn.rpc_call(
@@ -344,7 +414,7 @@ class InferenceRouter:
                         "stream": False,
                         "messages": messages,
                         "model": model,
-                        "request_kwargs": request_kwargs or {},
+                        "request_kwargs": _provider_safe_kwargs(request_kwargs),
                         "backend": backend,
                         "provider_id": provider_id,
                         "owner_email": owner_email,
@@ -352,8 +422,11 @@ class InferenceRouter:
                     },
                     timeout=float((request_kwargs or {}).get("timeout", 120)),
                 )
+                response = ingest_executor(response, usage_binding, usage_context)
             except (asyncio.CancelledError, TimeoutError):
-                await conn.cancel_inference(request_id)
+                cancelled = await conn.cancel_inference(request_id)
+                if isinstance(cancelled, dict):
+                    ingest_executor(cancelled, usage_binding, usage_context)
                 raise
             except ExecutorDisconnectedError as exc:
                 from cognis.providers.llm.errors import LLMStreamProviderError
@@ -366,7 +439,7 @@ class InferenceRouter:
                 raise failure
             if response.get("status") == "streaming":
                 raise RuntimeError("Executor upgrade required for nonstreaming inference")
-            return cast(dict[str, Any], response)
+            return response
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         reasoning_summary_parts: list[str] = []
@@ -531,7 +604,8 @@ class InferenceRouter:
             raise RuntimeError("No executor matches the provider selector for image generation")
 
         try:
-            result = await conn.rpc_call(
+            result = await self._media_rpc(
+                conn,
                 method="llm.image_generate",
                 params={
                     "request_id": uuid.uuid4().hex,
@@ -550,6 +624,107 @@ class InferenceRouter:
             return ImageGenerationResult.model_validate(result)
         except ExecutorDisconnectedError:
             raise RuntimeError("Executor disconnected during image generation") from None
+
+    async def route_speech_stream(
+        self,
+        *,
+        operation: str,
+        model: str,
+        provider_preset: str,
+        executor_id: str | None = None,
+        executor_labels: dict[str, str] | None = None,
+        request_kwargs: dict[str, Any] | None = None,
+        audio: AsyncIterator[bytes] | None = None,
+        **parameters: Any,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Carry native speech over existing fenced, bounded inference transport."""
+        conn = await self._find_executor(executor_id, executor_labels)
+        if conn is None:
+            raise RuntimeError("No executor matches the speech provider selector")
+        request_id = uuid.uuid4().hex
+        sender: asyncio.Task[None] | None = None
+        terminal: dict[str, Any] | None = None
+        complete = False
+
+        async def send_audio() -> None:
+            assert audio is not None
+            async for frame in audio:
+                if not frame or len(frame) % 2 or len(frame) > MAX_SPEECH_FRAME_BYTES:
+                    raise ValueError("Invalid microphone PCM frame")
+                await conn.rpc_call(
+                    "llm.speech_input",
+                    {
+                        "request_id": request_id,
+                        "audio_base64": base64.b64encode(frame).decode("ascii"),
+                    },
+                    timeout=10,
+                )
+            await conn.rpc_call(
+                "llm.speech_input", {"request_id": request_id, "final": True}, timeout=10
+            )
+
+        kwargs = dict(request_kwargs or {})
+        binding = take_binding(kwargs, model=model)
+        metadata, context = executor_metadata(
+            binding,
+            None,
+            executor_id=getattr(conn, "executor_id", None),
+            parameters=kwargs,
+            streaming=True,
+        )
+        events = conn.llm_complete_stream(
+            request_id=request_id,
+            messages=[],
+            model=model,
+            speech_operation=operation,
+            provider_preset=provider_preset,
+            request_kwargs=_provider_safe_kwargs(kwargs),
+            **({"backend_metadata": metadata} if context is not None else {}),
+            **parameters,
+        )
+        receive: asyncio.Task[dict[str, Any]] | None = None
+        try:
+            while True:
+                if sender is not None and sender.done():
+                    await sender
+                receive = asyncio.create_task(anext(events))
+                if sender is not None and not sender.done():
+                    done, _ = await asyncio.wait(
+                        {receive, sender}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if sender in done:
+                        await sender
+                try:
+                    chunk = await receive
+                except StopAsyncIteration:
+                    break
+                chunk = ingest_executor(chunk, binding, context)
+                if chunk.get("error"):
+                    raise RuntimeError("Executor speech streaming failed")
+                if chunk.get("done"):
+                    if terminal is None:
+                        raise RuntimeError("Executor speech ended before provider completion")
+                    complete = True
+                    yield terminal
+                    return
+                event = SpeechStreamEvent.model_validate(chunk["speech"])
+                if event.type == "start" and audio is not None and sender is None:
+                    sender = asyncio.create_task(send_audio())
+                if event.type == "done":
+                    terminal = event.model_dump(mode="json", exclude_none=True)
+                else:
+                    yield event.model_dump(mode="json", exclude_none=True)
+            raise RuntimeError("Executor speech stream ended unexpectedly")
+        finally:
+            if receive is not None:
+                receive.cancel()
+                await asyncio.gather(receive, return_exceptions=True)
+            if sender is not None:
+                sender.cancel()
+                await asyncio.gather(sender, return_exceptions=True)
+            await events.aclose()
+            if not complete:
+                await conn.cancel_inference(request_id)
 
     async def route_transcribe(
         self,
@@ -571,7 +746,8 @@ class InferenceRouter:
             raise RuntimeError("No executor matches the provider selector for speech-to-text")
 
         try:
-            result = await conn.rpc_call(
+            result = await self._media_rpc(
+                conn,
                 method="llm.transcribe",
                 params={
                     "request_id": uuid.uuid4().hex,
@@ -610,7 +786,8 @@ class InferenceRouter:
             raise RuntimeError("No executor matches the provider selector for text-to-speech")
 
         try:
-            result = await conn.rpc_call(
+            result = await self._media_rpc(
+                conn,
                 method="llm.synthesize",
                 params={
                     "request_id": uuid.uuid4().hex,
@@ -645,6 +822,36 @@ class InferenceRouter:
                 else None
             ),
         )
+
+    async def _media_rpc(
+        self,
+        conn: WebSocketExecutorConnection,
+        *,
+        method: str,
+        params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Carry correlation without counting the RPC as a physical submission."""
+        from cognis.providers.llm.recovery import stream_failure
+
+        params = dict(params)
+        kwargs = dict(params.get("request_kwargs") or {})
+        binding = take_binding(kwargs, model=params.get("model"))
+        params["request_kwargs"] = _provider_safe_kwargs(kwargs)
+        metadata, context = executor_metadata(
+            binding,
+            None,
+            executor_id=getattr(conn, "executor_id", None),
+            parameters={**kwargs, "size": params.get("size"), "quality": params.get("quality")},
+            streaming=False,
+        )
+        if context is not None:
+            params["backend_metadata"] = metadata
+        result = await conn.rpc_call(method=method, params=params)
+        result = ingest_executor(result, binding, context)
+        failure = stream_failure(result)
+        if failure is not None:
+            raise failure
+        return result
 
     async def _find_executor(
         self,

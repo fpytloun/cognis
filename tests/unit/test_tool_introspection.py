@@ -390,9 +390,9 @@ def test_orchestration_target_catalog_enriches_schema_descriptor_and_validation(
         ),
     )
     managed_target = OrchestrationTarget(
-        agent_id="fixture-primary",
-        name="Fixture primary agent",
-        description="Synthetic primary agent",
+        agent_id="sample-curator",
+        name="Sample curator",
+        description="Fictional museum primary agent",
         agent_type="primary",
         is_system=False,
         profiles=(
@@ -416,7 +416,7 @@ def test_orchestration_target_catalog_enriches_schema_descriptor_and_validation(
     )
 
     assert tool_input_schema(delegate)["properties"]["agent_id"]["enum"] == ["system:code-review"]
-    assert tool_input_schema(managed)["properties"]["agent_id"]["enum"] == ["fixture-primary"]
+    assert tool_input_schema(managed)["properties"]["agent_id"]["enum"] == ["sample-curator"]
     assert (
         "Findings-first review"
         in tool_input_schema(delegate)["properties"]["agent_id"]["description"]
@@ -613,8 +613,8 @@ def test_write_deliverable_registers_authoritative_dashboard_operation() -> None
 
 
 def test_write_deliverable_guides_substantial_payloads_through_artifacts() -> None:
-    assert "substantial Rich payload" in WRITE_DELIVERABLE_TOOL.description
-    assert "editable local JSON file" in WRITE_DELIVERABLE_TOOL.description
+    assert "large Rich payload" in WRITE_DELIVERABLE_TOOL.description
+    assert "local JSON file" in WRITE_DELIVERABLE_TOOL.description
     assert "validate_tool_call" in WRITE_DELIVERABLE_TOOL.description
     assert "exact unchanged arguments" in WRITE_DELIVERABLE_TOOL.description
 

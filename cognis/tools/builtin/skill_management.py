@@ -53,6 +53,7 @@ def skill_management_tools() -> list[ToolDefinition]:
     """Return all skill management tool definitions."""
     return [
         SKILL_LIST_TOOL,
+        SKILL_SEARCH_TOOL,
         SKILL_LOAD_TOOL,
         SKILL_GET_TOOL,
         SKILL_VERSIONS_TOOL,
@@ -70,10 +71,42 @@ def skill_management_tools() -> list[ToolDefinition]:
 SKILL_LIST_TOOL = ToolDefinition(
     name="skill_list",
     description=(
-        "List all available skills. Usually prefer the available_skills metadata in the "
-        "system prompt and load a specific skill with skill_load instead of browsing here."
+        "List all available skills. To find a skill for a task, prefer skill_search and "
+        "load the match with skill_load instead of browsing here."
     ),
     parameters={"type": "object", "properties": {}},
+    source=_SKILL_SOURCE,
+    category="skill",
+    read_only=True,
+    timeout_seconds=15,
+)
+
+SKILL_SEARCH_TOOL = ToolDefinition(
+    name="skill_search",
+    description=(
+        "Search all visible skills, including those not listed in available_skills, by "
+        "name, description, and tags. Returns skill_id, name, and description; load a "
+        "relevant match with skill_load."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "minLength": 1,
+                "description": "What the skill should help with.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 8,
+                "description": "Maximum number of matches to return.",
+            },
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+    },
     source=_SKILL_SOURCE,
     category="skill",
     read_only=True,
@@ -89,6 +122,8 @@ SKILL_LOAD_TOOL = ToolDefinition(
         "— the available_skills metadata in the system prompt only contains summaries. "
         "Do not read filesystem SKILL.md files as a substitute for loading visible "
         "Cognis skills. "
+        "Repeated loads succeed without repeating instructions already current in context; "
+        "asset preparation still runs and returns current executor paths and readiness. "
         "Loading a skill also makes its deferred skill tools available for subsequent model calls."
         " Assets are automatically verified and cached on the active authorized executor; "
         "Python assets share an automatically maintained skill virtualenv. Dependencies come "
@@ -96,11 +131,18 @@ SKILL_LOAD_TOOL = ToolDefinition(
         "Use python_environment.python_path with each returned local_path. Preparation failures "
         "do not block instructions: inspect preparation_warning, correct executor issues through "
         "normal tools, and reload to retry. Reload after publishing assets or switching executors."
+        " Set require_assets_ready=true when executing bundled assets: incomplete preparation "
+        "then returns a structured error instead of instruction-only success."
     ),
     parameters={
         "type": "object",
         "properties": {
             "skill_id": {"type": "string", "description": "The skill ID to load"},
+            "require_assets_ready": {
+                "type": "boolean",
+                "default": False,
+                "description": "Require verified asset paths and a ready runtime for Python assets.",
+            },
         },
         "required": ["skill_id"],
     },
@@ -424,6 +466,7 @@ SKILL_RESTORE_VERSION_TOOL = ToolDefinition(
 
 _SKILL_TOOL_NAMES = {
     "skill_list",
+    "skill_search",
     "skill_load",
     "skill_get",
     "skill_versions",
@@ -448,49 +491,72 @@ def is_skill_management_tool(tool_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def _auto_bind_skill_to_agent(
-    session_factory: Any, skill_id: str, *, agent_id: str | None = None
-) -> None:
-    """Add a skill to the current agent's selected skills if not already present.
+_SKILL_ATTACHING_MUTATIONS = frozenset(
+    {
+        "skill_write",
+        "skill_patch",
+        "skill_asset_write",
+        "skill_asset_delete",
+        "skill_import_url",
+        "skill_restore_version",
+    }
+)
 
-    Uses ``current_agent_id`` from the runtime context.  Best-effort:
-    silently returns if no agent context is available or on any error.
+
+async def _acting_agent_id(
+    session_factory: Any, user_email: str, agent_id: str | None, session_id: str | None
+) -> str | None:
+    """Return the persistent agent a session acts for; delegates act for their parent."""
+    from cognis.core.content_projects import acting_agent_id
+
+    async with session_factory() as session:
+        return await acting_agent_id(
+            session, user_email=user_email, agent_id=agent_id, session_id=session_id
+        )
+
+
+async def _attach_skill_to_agent(
+    session_factory: Any, skill_id: str, *, agent_id: str, user_email: str
+) -> bool:
+    """Attach a skill the agent created or edited; existing assignments stay unchanged.
+
+    Only the agent owner's own mutations attach, and skills already attached
+    to all agents need no per-agent entry. The skill mutation has already
+    committed, so a failure here is logged instead of failing the tool call.
     """
-    from cognis.runtime_context import current_agent_id
-    from cognis.store.queries import get_agent, update_agent
+    from cognis.store.queries import get_agent, get_skill, update_agent
+    from cognis.tools.skills import is_agent_assignable_skill
 
-    target_agent_id = agent_id or current_agent_id.get()
-    if not target_agent_id:
-        return
-
+    if not is_agent_assignable_skill(skill_id):
+        return False
     try:
         async with session_factory() as session:
-            agent_row = await get_agent(session, target_agent_id)
-            if agent_row is None:
-                return
-
+            agent_row = await get_agent(session, agent_id)
+            skill_row = await get_skill(session, skill_id)
+            if (
+                agent_row is None
+                or agent_row.owner_email != user_email
+                or skill_row is None
+                or skill_row.auto_load
+            ):
+                return False
             skills_json = dict(agent_row.skills or {})
-            items = skills_json.get("items", [])
-            if not isinstance(items, list):
-                items = []
-
-            # Check if already bound
-            for item in items:
-                if isinstance(item, dict) and item.get("skill_id") == skill_id:
-                    return  # already bound
-
-            # Add the skill ref
+            items = skills_json.get("items")
+            items = list(items) if isinstance(items, list) else []
+            if any(isinstance(item, dict) and item.get("skill_id") == skill_id for item in items):
+                return False
             items.append({"skill_id": skill_id, "enabled": True})
             skills_json["items"] = items
-
-            await update_agent(session, target_agent_id, updates={"skills": skills_json})
+            await update_agent(session, agent_id, updates={"skills": skills_json})
             await session.commit()
+            return True
     except Exception:
         logger.warning(
-            "Failed to auto-bind skill to agent",
-            extra={"extra_data": {"skill_id": skill_id, "agent_id": target_agent_id}},
+            "Failed to attach skill to agent",
+            extra={"extra_data": {"skill_id": skill_id, "agent_id": agent_id}},
             exc_info=True,
         )
+        return False
 
 
 def _resolve_attach_to_all_agents(arguments: dict[str, Any]) -> bool:
@@ -696,57 +762,47 @@ async def handle_skill_management_tool(
     artifact_store: Any | None = None,
     current_agent_id: str | None = None,
     executor: Any | None = None,
+    expected_version_id: str | None = None,
+    before_asset_prepare: Any = None,
+    session_id: str | None = None,
 ) -> ToolResult:
     """Handle a skill management tool call."""
+    from cognis.core.direct_turn_runtime import StaleDirectTurnOwner
+    from cognis.core.task_execution import StaleTaskExecutionOwner
+
     try:
-        if tool_name == "skill_list":
-            return await _handle_skill_list(session_factory, user_email)
-        if tool_name == "skill_load":
-            return await _handle_skill_load(
-                session_factory,
-                user_email,
-                arguments,
-                executor=executor,
-                artifact_store=artifact_store,
+        agent_id = None
+        if current_agent_id and tool_name in _AGENT_SCOPED_SKILL_TOOLS:
+            agent_id = await _acting_agent_id(
+                session_factory, user_email, current_agent_id, session_id
+            )
+        if tool_name == "skill_search":
+            return await _handle_skill_search(
+                session_factory, user_email, arguments, agent_id=agent_id
             )
         if tool_name == "skill_get":
-            return await _handle_skill_get(session_factory, user_email, arguments)
-        if tool_name == "skill_versions":
-            return await _handle_skill_versions(session_factory, user_email, arguments)
-        if tool_name == "skill_write":
-            return await _handle_skill_write(
-                session_factory,
-                user_email,
-                arguments,
-                llm=llm,
-                artifact_store=artifact_store,
-                current_agent_id=current_agent_id,
+            return await _handle_skill_get(
+                session_factory, user_email, arguments, agent_id=agent_id
             )
-        if tool_name == "skill_patch":
-            return await _handle_skill_patch(
-                session_factory, user_email, arguments, artifact_store=artifact_store
+        result = await _dispatch_skill_tool(
+            tool_name,
+            arguments,
+            session_factory,
+            user_email,
+            llm=llm,
+            artifact_store=artifact_store,
+            current_agent_id=current_agent_id,
+            executor=executor,
+            expected_version_id=expected_version_id,
+            before_asset_prepare=before_asset_prepare,
+        )
+        if agent_id and not result.is_error:
+            await _record_agent_skill_effect(
+                session_factory, tool_name, result, agent_id=agent_id, user_email=user_email
             )
-        if tool_name == "skill_asset_write":
-            return await _handle_skill_asset_write(
-                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
-            )
-        if tool_name == "skill_asset_delete":
-            return await _handle_skill_asset_delete(
-                session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
-            )
-        if tool_name == "skill_delete":
-            return await _handle_skill_delete(session_factory, user_email, arguments)
-        if tool_name == "skill_import_url":
-            return await _handle_skill_import_url(
-                session_factory, user_email, arguments, artifact_store=artifact_store
-            )
-        if tool_name == "skill_restore_version":
-            return await _handle_skill_restore_version(session_factory, user_email, arguments)
-        if tool_name == "skill_export":
-            return await _handle_skill_export(
-                session_factory, user_email, arguments, artifact_store=artifact_store
-            )
-        return ToolResult(output=f"Unknown skill tool: {tool_name}", is_error=True)
+        return result
+    except (StaleTaskExecutionOwner, StaleDirectTurnOwner):
+        raise
     except Exception as exc:
         logger.warning(
             "Skill management tool failed",
@@ -754,6 +810,128 @@ async def handle_skill_management_tool(
             exc_info=True,
         )
         return ToolResult(output=f"Skill operation failed: {str(exc)[:500]}", is_error=True)
+
+
+_AGENT_SCOPED_SKILL_TOOLS = frozenset(
+    {"skill_search", "skill_load", "skill_get", *_SKILL_ATTACHING_MUTATIONS}
+)
+
+
+async def _dispatch_skill_tool(
+    tool_name: str,
+    arguments: dict[str, Any],
+    session_factory: Any,
+    user_email: str,
+    *,
+    llm: Any | None,
+    artifact_store: Any | None,
+    current_agent_id: str | None,
+    executor: Any | None,
+    expected_version_id: str | None,
+    before_asset_prepare: Any,
+) -> ToolResult:
+    if tool_name == "skill_list":
+        return await _handle_skill_list(session_factory, user_email)
+    if tool_name == "skill_load":
+        return await _handle_skill_load(
+            session_factory,
+            user_email,
+            arguments,
+            executor=executor,
+            artifact_store=artifact_store,
+            expected_version_id=expected_version_id,
+            before_asset_prepare=before_asset_prepare,
+        )
+    if tool_name == "skill_versions":
+        return await _handle_skill_versions(session_factory, user_email, arguments)
+    if tool_name == "skill_write":
+        return await _handle_skill_write(
+            session_factory,
+            user_email,
+            arguments,
+            llm=llm,
+            artifact_store=artifact_store,
+            current_agent_id=current_agent_id,
+        )
+    if tool_name == "skill_patch":
+        return await _handle_skill_patch(
+            session_factory, user_email, arguments, artifact_store=artifact_store
+        )
+    if tool_name == "skill_asset_write":
+        return await _handle_skill_asset_write(
+            session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
+        )
+    if tool_name == "skill_asset_delete":
+        return await _handle_skill_asset_delete(
+            session_factory, user_email, arguments, llm=llm, artifact_store=artifact_store
+        )
+    if tool_name == "skill_delete":
+        return await _handle_skill_delete(session_factory, user_email, arguments)
+    if tool_name == "skill_import_url":
+        return await _handle_skill_import_url(
+            session_factory, user_email, arguments, artifact_store=artifact_store
+        )
+    if tool_name == "skill_restore_version":
+        return await _handle_skill_restore_version(session_factory, user_email, arguments)
+    if tool_name == "skill_export":
+        return await _handle_skill_export(
+            session_factory, user_email, arguments, artifact_store=artifact_store
+        )
+    return ToolResult(output=f"Unknown skill tool: {tool_name}", is_error=True)
+
+
+async def _record_agent_skill_effect(
+    session_factory: Any, tool_name: str, result: ToolResult, *, agent_id: str, user_email: str
+) -> None:
+    """Count a successful load or attach the mutated skill to the acting agent."""
+    from cognis import json_codec as json
+    from cognis.store.skill_usage import record_skill_load
+
+    skill_id = json.loads(result.output).get("skill_id")
+    if not isinstance(skill_id, str) or not skill_id:
+        return
+    if tool_name in _SKILL_ATTACHING_MUTATIONS:
+        await _attach_skill_to_agent(
+            session_factory, skill_id, agent_id=agent_id, user_email=user_email
+        )
+        return
+    try:
+        async with session_factory() as session:
+            await record_skill_load(session, agent_id, skill_id)
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "Failed to record skill load",
+            extra={"extra_data": {"skill_id": skill_id, "agent_id": agent_id}},
+            exc_info=True,
+        )
+
+
+async def _handle_skill_search(
+    session_factory: Any, user_email: str, arguments: dict[str, Any], *, agent_id: str | None
+) -> ToolResult:
+    from cognis import json_codec as json
+    from cognis.core.skill_access import list_readable_skills
+    from cognis.store.skill_usage import record_skill_search_hits
+    from cognis.tools.skills import search_skill_rows
+
+    async with session_factory() as session:
+        rows = await list_readable_skills(session, actor_email=user_email, agent_id=agent_id)
+    matches = search_skill_rows(rows, str(arguments["query"]), limit=int(arguments.get("limit", 8)))
+    if agent_id and matches:
+        try:
+            async with session_factory() as session:
+                await record_skill_search_hits(
+                    session, agent_id, [match["skill_id"] for match in matches]
+                )
+                await session.commit()
+        except Exception:
+            logger.warning(
+                "Failed to record skill search hits",
+                extra={"extra_data": {"agent_id": agent_id, "match_count": len(matches)}},
+                exc_info=True,
+            )
+    return ToolResult(output=json.dumps({"skills": matches}, indent=2))
 
 
 def _canonical_asset_inputs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -870,10 +1048,10 @@ async def _refresh_skill_steps_if_needed(
 
 async def _handle_skill_list(session_factory: Any, user_email: str) -> ToolResult:
     from cognis import json_codec as json
-    from cognis.store.queries import list_skills
+    from cognis.core.skill_access import list_readable_skills
 
     async with session_factory() as session:
-        rows = await list_skills(session, owner_email=user_email)
+        rows = await list_readable_skills(session, actor_email=user_email)
 
     skills = []
     for row in rows:
@@ -900,6 +1078,8 @@ async def _handle_skill_load(
     *,
     executor: Any = None,
     artifact_store: Any = None,
+    expected_version_id: str | None = None,
+    before_asset_prepare: Any = None,
 ) -> ToolResult:
     """Load a skill's full instructions, templates, and asset manifest.
 
@@ -907,18 +1087,19 @@ async def _handle_skill_load(
     returns the latest published version.
     """
     from cognis import json_codec as json
-    from cognis.store.queries import get_skill_scoped, list_skills
+    from cognis.core.skill_access import list_readable_skills
 
     skill_id = str(arguments.get("skill_id") or arguments.get("skill") or "").strip()
     if not skill_id:
         return ToolResult(output="skill_id is required", is_error=True)
 
     async with session_factory() as session:
-        row = await get_skill_scoped(session, skill_id, owner_email=user_email)
+        rows = await list_readable_skills(session, actor_email=user_email, skill_id=skill_id)
+        row = rows[0] if rows else None
         if row is None and not skill_id.startswith("skill_"):
             candidates = [
                 skill
-                for skill in await list_skills(session, owner_email=user_email)
+                for skill in await list_readable_skills(session, actor_email=user_email)
                 if skill.name == skill_id or skill.skill_id == skill_id
             ]
             if len(candidates) == 1:
@@ -927,6 +1108,16 @@ async def _handle_skill_load(
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
 
         version_row = await resolve_current_skill_version(session, row)
+        if expected_version_id is not None:
+            from cognis.store.queries import get_skill_version
+
+            version_row = await get_skill_version(session, expected_version_id)
+            if version_row is None or version_row.skill_id != row.skill_id:
+                return ToolResult(
+                    output="The skill preparation version is no longer available.",
+                    is_error=True,
+                    metadata={"code": "skill_assets_version_unavailable"},
+                )
         instructions = version_row.instructions if version_row is not None else row.instructions
         tools = version_row.tools if version_row is not None else row.tools
         templates = (
@@ -946,7 +1137,26 @@ async def _handle_skill_load(
         owner_email=user_email,
         executor=executor,
         artifact_store=artifact_store,
+        before_send=before_asset_prepare,
     )
+    if arguments.get("require_assets_ready") is True and preparation.warning:
+        failure = preparation.failure or {
+            "code": "skill_assets_not_ready",
+            "phase": "skill_assets_prepare",
+        }
+        return ToolResult(
+            output=json.dumps(
+                {
+                    "status": "assets_not_ready",
+                    "skill_id": row.skill_id,
+                    "version_id": version_row.version_id if version_row else None,
+                    "error": failure,
+                    "preparation_warning": preparation.warning,
+                }
+            ),
+            is_error=True,
+            metadata=failure,
+        )
     result, metadata = materialize_loaded_skill_context(
         skill_id=row.skill_id,
         name=row.name,
@@ -968,6 +1178,10 @@ async def _handle_skill_load(
         python_environment=preparation.python_environment,
         preparation_warning=preparation.warning,
     )
+    result["asset_preparation"] = {
+        "status": "incomplete" if preparation.warning else "ready",
+        "error": preparation.failure,
+    }
     declared_tool_ids = metadata.get("discovered_tool_ids", [])
     skill_activation = metadata.get("skill_activation")
     if isinstance(skill_activation, dict):
@@ -1024,17 +1238,26 @@ def _skill_asset_llm_manifest(asset_refs: list[Any]) -> list[dict[str, Any]]:
 
 
 async def _handle_skill_get(
-    session_factory: Any, user_email: str, arguments: dict[str, Any]
+    session_factory: Any,
+    user_email: str,
+    arguments: dict[str, Any],
+    *,
+    agent_id: str | None = None,
 ) -> ToolResult:
     from cognis import json_codec as json
-    from cognis.store.queries import get_skill_scoped, list_skill_versions
+    from cognis.core.skill_access import list_readable_skills
+    from cognis.store.queries import get_agent, list_skill_versions
+    from cognis.tools.skills import agent_skill_usage_report
 
     skill_id = str(arguments.get("skill_id", "")).strip()
     if not skill_id:
         return ToolResult(output="skill_id is required", is_error=True)
 
     async with session_factory() as session:
-        row = await get_skill_scoped(session, skill_id, owner_email=user_email)
+        rows = await list_readable_skills(
+            session, actor_email=user_email, agent_id=agent_id, skill_id=skill_id
+        )
+        row = rows[0] if rows else None
         if row is None:
             return ToolResult(output=f"Skill '{skill_id}' not found", is_error=True)
 
@@ -1062,6 +1285,14 @@ async def _handle_skill_get(
                 "asset_manifest": [ref.model_dump(mode="json") for ref in asset_refs],
             }
         versions = await list_skill_versions(session, skill_id)
+        agent_usage = None
+        agent_row = await get_agent(session, agent_id) if agent_id else None
+        if agent_row is not None:
+            report = await agent_skill_usage_report(
+                session, agent=agent_row, owner_email=user_email, skill_id=row.skill_id
+            )
+            if report:
+                agent_usage = {"agent_id": agent_row.agent_id, **report[0]}
 
     result = {
         "skill_id": row.skill_id,
@@ -1074,6 +1305,7 @@ async def _handle_skill_get(
         "source": row.source,
         "current_version": version_data,
         "version_count": len(versions),
+        "agent_usage": agent_usage,
     }
     return ToolResult(output=json.dumps(result, indent=2, default=str))
 
@@ -1322,11 +1554,6 @@ async def _handle_skill_write(
         await session.commit()
 
     metadata: dict[str, Any] = {}
-    if current_agent_id:
-        # Keep created and updated skills attached to the agent that performed the mutation.
-        await _auto_bind_skill_to_agent(session_factory, skill_id, agent_id=current_agent_id)
-        metadata["attached_skill_id"] = skill_id
-
     if created_new_skill or current_agent_id:
         metadata["attached_skill_id"] = skill_id
         metadata["discovered_tool_ids"] = sorted(
@@ -1957,9 +2184,6 @@ async def _handle_skill_import_url(
             return ToolResult(output=str(exc), is_error=True)
         await set_current_version(session, row.skill_id, version_row.version_id)
         await session.commit()
-
-    # Auto-bind the imported skill to the current agent
-    await _auto_bind_skill_to_agent(session_factory, row.skill_id)
 
     result = {
         "skill_id": row.skill_id,

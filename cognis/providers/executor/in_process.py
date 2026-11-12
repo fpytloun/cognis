@@ -29,6 +29,7 @@ from cognis.mcp_runtime import (
     runtime_mcp_server_key,
 )
 from cognis.models.config import ProviderHealth
+from cognis.models.program import ProgramRuntimeBinding
 from cognis.models.tool import (
     ExecutorCapabilities,
     ExecutorConfig,
@@ -39,6 +40,7 @@ from cognis.models.tool import (
 )
 from cognis.providers.base import ToolOutputChunkCallback
 from cognis.providers.circuit_breaker import CircuitBreaker
+from cognis.providers.executor.program_rpc import program_rpc_key, program_rpc_key_from_params
 from cognis.tools.builtin.conversations import build_conversation_tool_handlers
 from cognis.tools.builtin.system import StatusProvider, build_system_tool_handlers
 from cognis.tools.builtin.task_continuation import build_task_continuation_tool_handlers
@@ -101,14 +103,62 @@ class InProcessExecutorConnection:
         breaker: CircuitBreaker,
         runtime_metadata: dict[str, Any] | None = None,
         internal_handlers: dict[str, Any] | None = None,
+        program_runtime: Any | None = None,
     ) -> None:
         self.handle = handle
+        self.executor_instance_id = uuid.uuid4().hex
         self.registry = registry
         self.breaker = breaker
         self.runtime_metadata = runtime_metadata or {}
         self.internal_handlers = dict(internal_handlers or {})
+        self.program_runtime = program_runtime
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
         self._background_controls: dict[str, ToolBackgroundControl] = {}
+        self._program_tool_call_handlers: dict[
+            tuple[str, str, str, str, str],
+            Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+        ] = {}
+        self._closed = False
+
+    @property
+    def executor_id(self) -> str:
+        """Return the identity of the current executor handle."""
+        return self.handle.executor_id
+
+    def register_program_tool_call_handler(
+        self,
+        binding: ProgramRuntimeBinding,
+        handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]],
+    ) -> None:
+        if (
+            binding.executor_id != self.executor_id
+            or binding.executor_instance_id != self.executor_instance_id
+        ):
+            raise ValueError("Program callback executor identity does not match this connection.")
+        self._program_tool_call_handlers[program_rpc_key(binding)] = handler
+
+    def unregister_program_tool_call_handler(self, binding: ProgramRuntimeBinding) -> None:
+        self._program_tool_call_handlers.pop(program_rpc_key(binding), None)
+
+    async def _program_tool_call(self, params: dict[str, Any]) -> dict[str, Any]:
+        key = program_rpc_key_from_params(params)
+        handler = self._program_tool_call_handlers.get(key) if key is not None else None
+        if handler is None:
+            raise RuntimeError("Program tool-call routing is not active.")
+        return await handler(params)
+
+    async def send_program_status(self, params: dict[str, Any]) -> bool:
+        update_status = getattr(self.program_runtime, "update_status", None)
+        return bool(update_status(params)) if callable(update_status) else False
+
+    async def terminate_program_scope(self, scope_id: str) -> dict[str, Any]:
+        terminate = getattr(self.program_runtime, "terminate_scope", None)
+        if not callable(terminate):
+            return {"closed": 0}
+        return cast(
+            dict[str, Any],
+            await terminate(scope_id, reason="conversation_terminal"),
+        )
 
     async def rpc_call(
         self, method: str, params: dict[str, Any], timeout: float | None = None
@@ -122,6 +172,11 @@ class InProcessExecutorConnection:
 
             async with asyncio.timeout(timeout):
                 return await prepare_skill_assets(params)
+        if method == "fs.digest":
+            from cognis.executor.file_digest import file_digests
+
+            async with asyncio.timeout(timeout):
+                return await file_digests(params)
         if method == "tool.execute":
             tool_call = ToolCall(
                 call_id=str(params.get("call_id") or uuid.uuid4().hex),
@@ -180,6 +235,10 @@ class InProcessExecutorConnection:
             }
         raise ValueError(f"Unsupported executor method: {method}")
 
+    async def file_digests(self, *, paths: list[str]) -> dict[str, Any]:
+        """Read-only SHA-256 of regular files on this in-process executor."""
+        return await self.rpc_call("fs.digest", {"paths": list(paths)}, timeout=10.0)
+
     async def list_tools(self) -> list[dict[str, Any]]:
         """Return tool metadata available on the executor."""
 
@@ -196,6 +255,8 @@ class InProcessExecutorConnection:
         """Execute a tool call through the runtime registry."""
 
         del before_send, on_sent
+        if self._closed:
+            return ToolResult(output="Executor connection is closed.", is_error=True)
         registered_tool = self.registry.get(tool_call.name)
         handler = None if registered_tool is None else registered_tool.handler
         if handler is None:
@@ -234,9 +295,15 @@ class InProcessExecutorConnection:
 
         async def invoke_handler() -> ToolResult:
             start = perf_counter()
+            runtime_metadata = {**self.runtime_metadata, **tool_call.runtime_metadata}
+            from cognis.core.program_config import PROGRAM_RUNTIME_TOOL_NAMES
+
+            if tool_call.name in PROGRAM_RUNTIME_TOOL_NAMES:
+                runtime_metadata["_program_runtime"] = self.program_runtime
+                runtime_metadata["_program_rpc_call"] = self._program_tool_call
             context = ToolExecutionContext(
                 executor_handle=self.handle,
-                runtime_metadata={**self.runtime_metadata, **tool_call.runtime_metadata},
+                runtime_metadata=runtime_metadata,
                 shared_runtime_metadata=self.runtime_metadata,
                 execution_scope_id=tool_call.execution_scope_id or self.handle.executor_id,
                 output_chunk_callback=output_chunk_callback,
@@ -251,13 +318,20 @@ class InProcessExecutorConnection:
                     metadata={"browser_lifecycle_error": exc.code},
                 )
             duration_ms = int((perf_counter() - start) * 1000)
-            return _normalize_tool_result(result, duration_ms)
+            normalized = _normalize_tool_result(result, duration_ms)
+            return normalized.model_copy(
+                update={
+                    "attachments": await context.binary_transfers.prepare_attachments(
+                        normalized.attachments
+                    )
+                }
+            )
 
         task = asyncio.create_task(self.breaker.call(invoke_handler))
         self._active_calls[tool_call.call_id] = task
         self._background_controls[tool_call.call_id] = background_control
         try:
-            if timeout_seconds is not None:
+            if timeout_seconds is not None and timeout_seconds != 0:
                 return await asyncio.wait_for(task, timeout=timeout_seconds)
             return await task
         except TimeoutError:
@@ -295,9 +369,28 @@ class InProcessExecutorConnection:
         if task is not None and not task.done():
             task.cancel()
 
+    async def close(self) -> None:
+        """Cancel calls owned by this disposable connection, not its PTC runtime."""
+        if self._closed:
+            return
+        self._closed = True
+        tasks = tuple(self._active_calls.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_calls.clear()
+        self._background_controls.clear()
+
 
 class InProcessExecutorProvider:
-    """In-process executor provider for MVP tool execution."""
+    """Own turn connections and configured-executor-scoped PTC runtimes.
+
+    Turn cancellation closes only the connection and its active calls; retained
+    PTC runtimes live until their configured executor scope is terminated or
+    this provider shuts down.
+    """
 
     def __init__(
         self,
@@ -311,6 +404,7 @@ class InProcessExecutorProvider:
         self.guardrails_provider = guardrails_provider
         self.compaction_strategy = compaction_strategy
         self._active: dict[str, _ExecutorRuntime] = {}
+        self._program_runtimes: dict[str, Any] = {}
         self._browser_cleanup_retainer = BrowserManagerCleanupRetainer()
         self.breaker = CircuitBreaker(failure_threshold=5, recovery_timeout=30.0)
         self._background_shell_completed_callback: (
@@ -348,7 +442,9 @@ class InProcessExecutorProvider:
             mcp_clients = await self.breaker.call(lambda: self._start_mcp_clients(config))
             discovered_tools = await self._discover_mcp_tools(config, mcp_clients)
             runtime_tools = [*config.tools, *discovered_tools]
-            handle.capabilities = ExecutorCapabilities(tools=[tool.name for tool in runtime_tools])
+            handle.capabilities = ExecutorCapabilities(
+                tools=[tool.name for tool in runtime_tools], binary_transfers=True
+            )
             registry = ToolRegistry()
             for tool in runtime_tools:
                 handler = _build_runtime_handler(
@@ -389,6 +485,24 @@ class InProcessExecutorProvider:
                     exc_info=True,
                 )
 
+            program_runtime = None
+            program_runtime_executor_id = config.program_runtime_executor_id
+            if program_runtime_executor_id is not None:
+                if not program_runtime_executor_id.strip():
+                    raise ValueError("Program runtime executor identity must not be empty")
+                program_runtime = self._program_runtimes.get(program_runtime_executor_id)
+                if program_runtime is None:
+                    from cognis.executor.program_runtime import (
+                        ProgramRuntime,
+                        executor_state_ledger_path,
+                    )
+
+                    program_runtime = ProgramRuntime(
+                        executor_id=program_runtime_executor_id,
+                        ledger_path=executor_state_ledger_path(program_runtime_executor_id),
+                    )
+                    self._program_runtimes[program_runtime_executor_id] = program_runtime
+
             connection = InProcessExecutorConnection(
                 handle,
                 registry,
@@ -397,6 +511,7 @@ class InProcessExecutorProvider:
                 internal_handlers={
                     INTERNAL_PROJECT_CONTEXT_PROBE_TOOL: handle_project_context_probe
                 },
+                program_runtime=program_runtime,
             )
         except TimeoutError:
             outcome = "timeout"
@@ -429,7 +544,7 @@ class InProcessExecutorProvider:
         return runtime.connection
 
     async def cancel(self, handle: ExecutorHandle) -> None:
-        """Cancel and remove an active executor runtime."""
+        """Cancel one turn connection while preserving provider-owned PTC state."""
 
         runtime = self._active.pop(handle.executor_id, None)
         if runtime is None:
@@ -438,6 +553,7 @@ class InProcessExecutorProvider:
         if isinstance(browser_manager, BrowserManager):
             self._browser_cleanup_retainer.retain(browser_manager)
         try:
+            await runtime.connection.close()
             await _close_clients(runtime.mcp_clients)
             await cleanup_lsp_manager(runtime.lsp_manager, executor_id=handle.executor_id)
         finally:
@@ -448,6 +564,29 @@ class InProcessExecutorProvider:
                     "shell: cleanup error during executor cancel",
                     extra={"extra_data": {"executor_id": handle.executor_id}},
                 )
+
+    def has_program_runtime(self, executor_id: str) -> bool:
+        """Return whether a configured executor owns retained PTC state."""
+        return executor_id in self._program_runtimes
+
+    async def terminate_program_scope(
+        self,
+        scope_id: str,
+        *,
+        executor_ids: list[str] | None = None,
+    ) -> None:
+        """Terminate a scope on every retained runtime, including without live turns.
+
+        A conversation can have used multiple configured executors over its
+        lifetime, so terminal cleanup must not be limited to the current pin.
+        """
+        if not scope_id:
+            return
+        del executor_ids
+        for program_runtime in list(self._program_runtimes.values()):
+            terminate = getattr(program_runtime, "terminate_scope", None)
+            if callable(terminate):
+                await terminate(scope_id, reason="conversation_terminal")
 
     async def list_active(self) -> list[ExecutorHandle]:
         """List active executor handles."""
@@ -523,10 +662,22 @@ class InProcessExecutorProvider:
         return reports
 
     async def cleanup(self) -> None:
-        """Close all active executor runtimes."""
+        """Close active connections and all provider-owned PTC runtimes."""
 
         for executor_id in list(self._active):
             await self.cancel(self._active[executor_id].handle)
+        program_runtimes = list(self._program_runtimes.values())
+        self._program_runtimes.clear()
+        for program_runtime in program_runtimes:
+            close_program_runtime = getattr(program_runtime, "close", None)
+            if callable(close_program_runtime):
+                try:
+                    await close_program_runtime()
+                except Exception:
+                    _logger.debug(
+                        "program runtime cleanup failed during provider shutdown",
+                        exc_info=True,
+                    )
         await self._browser_cleanup_retainer.wait_until_empty()
 
     async def health(self) -> ProviderHealth:

@@ -7,6 +7,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -48,11 +49,31 @@ async def resource_db(request, tmp_path):
     )
     if not url:
         pytest.skip("requires an isolated COGNIS_RESOURCE_TEST_DATABASE_URL")
-    engine = create_async_engine(url)
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
-    await engine.dispose()
+    admin = None
+    if request.param == "postgresql":
+        schema = f"resource_test_{uuid4().hex}"
+        admin = create_async_engine(url)
+        try:
+            async with admin.begin() as connection:
+                await connection.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+        except BaseException:
+            await admin.dispose()
+            raise
+        engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    else:
+        engine = create_async_engine(url)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
+        if admin is not None:
+            try:
+                async with admin.begin() as connection:
+                    await connection.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+            finally:
+                await admin.dispose()
 
 
 async def test_inventory_postgresql(resource_db):
@@ -250,6 +271,7 @@ async def test_read_transaction_released_while_dependency_stalls(
     sa.event.listen(engine.sync_engine, "checkout", checkout)
     sa.event.listen(engine.sync_engine, "checkin", checkin)
     if boundary == "task_delivery":
+        from cognis.models.task import TaskModel
 
         async def latest(session, *args):
             await session.execute(sa.select(1))
@@ -262,8 +284,14 @@ async def test_read_transaction_released_while_dependency_stalls(
             _session_factory=resource_db,
             _providers=SimpleNamespace(guardrails=SimpleNamespace(record_events=stalled)),
         )
-        task = SimpleNamespace(
-            status="completed", task_id="audit", title="Audit", result_summary="", result_data={}
+        task = TaskModel(
+            status="completed",
+            task_id="audit",
+            title="Audit",
+            created_by="audit@example.com",
+            agent_id="audit-agent",
+            result_summary="",
+            result_data={},
         )
         operation = WorkflowEngine._deliver_task_result_default(runtime, task, "audit")
     else:

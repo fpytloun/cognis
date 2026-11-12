@@ -24,7 +24,7 @@ from cognis.core.session_fork import fork_session_events
 from cognis.core.task_execution import StaleTaskExecutionOwner
 from cognis.models.session import SessionEvent
 from cognis.runtime_context import scoped_runtime_context
-from cognis.store.models import AgentHookRunRow
+from cognis.store.models import AgentHookRunRow, Session
 from cognis.store.queries import get_child_session_continuation_chain
 
 logger = logging.getLogger(__name__)
@@ -392,6 +392,14 @@ class HookSubsessions:
             prompt += await runtime.handoffs.input(run, source)
         prompt = runtime._prompt_envelope(run, definition, prompt)
         await fence.assert_current()
+        async with runtime.session_factory() as db:
+            existing_child = await db.get(Session, execution["session_id"])
+            # A changed source profile must not reinterpret an already provisioned child.
+            child_profile_id = (
+                existing_child.agent_profile_id
+                if existing_child is not None
+                else source.agent_profile_id
+            )
         child = await runtime.session_manager.create_child_session(
             source,
             mode="hook",
@@ -409,7 +417,7 @@ class HookSubsessions:
             ),
             agent_id=run.agent_id,
             effective_agent_id=run.agent_id,
-            agent_profile_id=source.agent_profile_id,
+            agent_profile_id=child_profile_id,
             session_id=execution["session_id"],
             delegation_metadata={
                 "hook_run_id": run.run_id,

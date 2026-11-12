@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.system_skills import get_system_skill_default
 from cognis.core.workflow_composition import SkillDecompositionResult
 from cognis.store.queries import create_agent, create_user, get_agent
 
@@ -36,7 +36,7 @@ async def _seed_user(app: object, email: str = "user@example.com", role: str = "
 
 def test_list_skills_marks_system_skills(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.get(
             "/api/v1/skills", headers=_auth_headers(client.app, email="user@example.com")
@@ -53,7 +53,7 @@ def test_list_skills_marks_system_skills(monkeypatch: object, tmp_path: Path) ->
 
 def test_skill_create_accepts_attach_to_all_agents(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post(
@@ -95,7 +95,7 @@ def test_skill_create_with_agent_id_binds_skill_to_agent(
                 )
                 await session.commit()
 
-        asyncio.run(_seed())
+        client.portal.call(_seed)
         headers = _auth_headers(client.app, email="user@example.com")
 
         response = client.post(
@@ -117,12 +117,12 @@ def test_skill_create_with_agent_id_binds_skill_to_agent(
                 assert agent is not None
                 return list(agent.skills["items"])
 
-        assert asyncio.run(_load_items()) == [{"skill_id": skill_id, "enabled": True}]
+        assert client.portal.call(_load_items) == [{"skill_id": skill_id, "enabled": True}]
 
 
 def test_system_skill_delete_is_forbidden(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.delete(
             "/api/v1/skills/cognis-task-manager",
@@ -134,7 +134,7 @@ def test_system_skill_delete_is_forbidden(monkeypatch: object, tmp_path: Path) -
 
 def test_system_skill_reset_restores_default(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         update = client.put(
@@ -152,7 +152,9 @@ def test_system_skill_reset_restores_default(monkeypatch: object, tmp_path: Path
         assert reset.status_code == 200
         body = reset.json()
         assert body["is_system"] is True
-        assert body["instructions"].startswith("# Purpose")
+        default = get_system_skill_default("cognis-task-manager")
+        assert default is not None
+        assert body["instructions"] == default["instructions"]
         assert body["name"] == "Cognis Task Manager"
         assert body["tags"] == ["cognis", "management", "tasks"]
         assert body["current_version"] is not None
@@ -160,7 +162,7 @@ def test_system_skill_reset_restores_default(monkeypatch: object, tmp_path: Path
 
 def test_non_system_skill_reset_is_forbidden(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -180,7 +182,7 @@ def test_non_system_skill_reset_is_forbidden(monkeypatch: object, tmp_path: Path
 
 def test_non_admin_cannot_reset_system_skill(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
 
         response = client.post(
             "/api/v1/skills/cognis-task-manager/reset",
@@ -194,7 +196,7 @@ def test_reset_system_skill_is_idempotent_when_already_default(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app, email="admin@example.com", role="admin"))
+        client.portal.call(lambda: _seed_user(client.app, email="admin@example.com", role="admin"))
         headers = _auth_headers(client.app, email="admin@example.com", role="admin")
 
         first = client.get("/api/v1/skills/cognis-task-manager", headers=headers)
@@ -209,7 +211,7 @@ def test_reset_system_skill_is_idempotent_when_already_default(
 
 def test_skill_update_can_attach_artifact_backed_asset(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -251,7 +253,7 @@ def test_skill_update_can_attach_artifact_backed_asset(monkeypatch: object, tmp_
 
 def test_skill_version_can_be_restored(monkeypatch: object, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -292,7 +294,7 @@ def test_skill_decompose_preview_returns_gateway_timeout_on_timeout(
     )
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -323,7 +325,7 @@ def test_skill_decompose_preview_returns_provider_error_on_invalid_output(
     )
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -369,7 +371,7 @@ def test_skill_update_refreshes_saved_decomposition_when_inputs_change(
     monkeypatch.setattr("cognis.core.workflow_composition.decompose_skill_material", _refresh)
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -418,7 +420,7 @@ def test_skill_update_fails_when_decomposition_refresh_fails(
     monkeypatch.setattr("cognis.core.workflow_composition.decompose_skill_material", _refresh)
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -457,7 +459,7 @@ def test_skill_linked_tool_ids_are_versioned_and_restorable(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -499,7 +501,7 @@ def test_skill_update_with_identical_content_does_not_create_new_version(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(
@@ -523,7 +525,7 @@ def test_skill_metadata_edit_with_existing_assets_does_not_create_new_version(
     monkeypatch: object, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client.app))
+        client.portal.call(_seed_user, client.app)
         headers = _auth_headers(client.app, email="user@example.com")
 
         created = client.post(

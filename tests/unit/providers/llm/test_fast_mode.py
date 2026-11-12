@@ -19,6 +19,7 @@ from cognis.providers.llm.fast_mode import ANTHROPIC_FAST_BETA, enrich_fast_mode
         ("claude-opus-4-6", False),
         ("claude-sonnet-5", False),
         ("claude-fable-5-1", False),
+        ("claude-fable-5-2", False),
         ("claude-opus-5-invented", False),
     ],
 )

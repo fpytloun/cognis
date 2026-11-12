@@ -253,7 +253,9 @@ async def test_account_and_observed_target_search_are_owner_scoped(tmp_path) -> 
     engine, _factory, handlers = await _setup(tmp_path)
     try:
         accounts = await handlers["list_channel_accounts"]({}, _context())
-        assert len(accounts) == 1
+        assert len(accounts) == 2
+        assert accounts[1]["channel_type"] == "web"
+        assert accounts[1]["agent_id"] == "agent-owner"
         assert accounts[0]["display_name"] == "Owner Signal"
         assert accounts[0]["target_discovery"] == {
             "observed_chats": True,
@@ -546,9 +548,33 @@ async def test_search_targets_reports_no_observed_traffic(tmp_path) -> None:
             await session.commit()
         result = await handlers["search_channel_targets"]({}, _context())
         assert result["targets"] == []
-        assert result["capabilities"]["account_count"] == 1
+        assert result["capabilities"]["account_count"] == 2
         assert result["capabilities"]["observed_target_count"] == 0
         assert result["capabilities"]["observation_status"] == "no_observed_traffic"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_app_target_search_resolves_only_exact_active_user_email(tmp_path) -> None:
+    engine, _factory, handlers = await _setup(tmp_path)
+    try:
+        accounts = await handlers["list_channel_accounts"]({}, _context())
+        app_account = next(row for row in accounts if row["channel_type"] == "web")
+        broad = await handlers["search_channel_targets"](
+            {"query": "other", "account_ref": app_account["account_ref"]}, _context()
+        )
+        assert broad["targets"] == []
+        exact = await handlers["search_channel_targets"](
+            {"query": "other@example.com", "account_ref": app_account["account_ref"]}, _context()
+        )
+        assert len(exact["targets"]) == 1
+        target = exact["targets"][0]
+        assert target["channel_type"] == "web"
+        assert target["kind"] == "direct"
+        assert target["target_ref"]
+        assert "chat_id" not in target
+        assert "sender_id" not in target
     finally:
         await engine.dispose()
 
@@ -562,7 +588,7 @@ async def test_search_targets_distinguishes_no_enabled_accounts(tmp_path) -> Non
             assert account is not None
             account.enabled = False
             await session.commit()
-        result = await handlers["search_channel_targets"]({}, _context())
+        result = await handlers["search_channel_targets"]({"channel_type": "signal"}, _context())
         assert result["targets"] == []
         assert result["capabilities"]["account_count"] == 0
         assert result["capabilities"]["observed_target_count"] == 0

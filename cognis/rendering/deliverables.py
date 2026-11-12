@@ -38,7 +38,7 @@ from cognis.rendering.rich_visuals import (
 )
 from cognis.ui_assets import resolve_standalone_manifest, standalone_asset_url
 
-RENDERER_VERSION = "standalone-deliverable-v23"
+RENDERER_VERSION = "standalone-deliverable-v25"
 HTML_CACHE_FILENAME = "render.html"
 PDF_CACHE_FILENAME = "render.pdf"
 PDF_INPUT_MAX_BYTES = 20 * 1024 * 1024
@@ -262,28 +262,44 @@ class PublicationContext:
         self._prepare_citations(self.blocks, self.sources)
 
     def _index_blocks(self, blocks: list[dict[str, Any]], *, level: int = 2) -> None:
+        # Untitled Markdown blocks form one outline at this structural level.
+        markdown_base = min(
+            (
+                source_level
+                for block in blocks
+                if block.get("type") == "markdown" and not _block_title(block)
+                for source_level, _ in _markdown_headings(_block_content(block))
+            ),
+            default=1,
+        )
         for block in blocks:
             title = _navigation_title(block)
             block_type = str(block.get("type") or "")
+            markdown_headings = (
+                _markdown_headings(_block_content(block)) if block_type == "markdown" else []
+            )
+            heading_level = (
+                min(4, level + markdown_headings[0][0] - markdown_base)
+                if markdown_headings and not _block_title(block)
+                else level
+            )
             if title and block_type not in {"hero", "divider"}:
                 anchor = self.ids.user(
                     _text(block, "id") or _text(block, "anchor") or title,
                     fallback="section",
                 )
                 self.heading_ids[id(block)] = anchor
-                self.headings.append(HeadingEntry(anchor=anchor, title=title, level=level))
+                self.headings.append(HeadingEntry(anchor=anchor, title=title, level=heading_level))
                 if block_type == "markdown":
-                    markdown_headings = _markdown_headings(_block_content(block))
                     start = 0 if _block_title(block) else 1
                     nested = []
-                    first_source_level = markdown_headings[0][0] if markdown_headings else 1
                     for index, (source_level, markdown_title) in enumerate(
                         markdown_headings[start:], start=start
                     ):
                         relative_level = (
                             source_level
                             if _block_title(block)
-                            else max(1, source_level - first_source_level)
+                            else max(0, source_level - markdown_base)
                         )
                         entry = HeadingEntry(
                             anchor=self.ids.user(markdown_title),
@@ -543,6 +559,8 @@ def render_standalone_shell(
     markdown_url: str = "",
     rich_payload_override: dict[str, Any] | None = None,
     share_expired: bool = False,
+    embedded_document_url: str = "",
+    theme_family: str | None = None,
 ) -> str:
     """Render a client-mounted standalone shell backed by same-origin assets.
 
@@ -574,6 +592,8 @@ def render_standalone_shell(
             {
                 "content": content,
                 "instanceId": str(getattr(row, "deliverable_id", "") or ""),
+                "embeddedDocumentUrl": embedded_document_url,
+                "themeFamily": theme_family,
                 "payload": payload,
                 "title": title,
             },
@@ -1516,7 +1536,7 @@ def _is_substantial_document(blocks: list[dict[str, Any]], top_level_headings: i
 def _toc_depth(metadata: dict[str, Any]) -> int:
     value = metadata.get("toc")
     raw_depth = value.get("depth") if isinstance(value, dict) else metadata.get("toc_depth")
-    return 4 if raw_depth == 4 else 3 if raw_depth == 3 else 2
+    return 2 if raw_depth == 2 else 3 if raw_depth == 3 else 4
 
 
 def _numbering_enabled(metadata: dict[str, Any], kind: str) -> bool:

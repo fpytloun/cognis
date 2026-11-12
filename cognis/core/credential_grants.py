@@ -60,8 +60,6 @@ async def update_credential_assignment(
     if expected != actual:
         raise CredentialGrantError("Credential assignment conflict; re-read and retry")
     if grant:
-        if credential.agent_id not in (None, agent_id):
-            raise CredentialGrantError("Credential is scoped to a different agent")
         if credential.scope not in {"user", "agent"}:
             raise CredentialGrantError("Unsupported credential scope")
         if credential.scope == "agent" and credential.agent_id != agent_id:

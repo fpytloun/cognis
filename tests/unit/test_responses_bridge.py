@@ -388,10 +388,10 @@ async def test_nested_management_arguments_survive_responses_stream(
         "memory_backend": "mnemory",
         "memory_backend_options": {"mode": "full_auto"},
     }
-    envelope = {"action": "settings_update", "agent_id": "fixture-agent", "settings": settings}
+    envelope = {"action": "settings_update", "agent_id": "sample-agent", "settings": settings}
     expected = {"tool": "manage_agents", "arguments": envelope} if wrapper else envelope
     fragments = [
-        '{"action":"settings_update","agent_id":"fixture-agent","settings":',
+        '{"action":"settings_update","agent_id":"sample-agent","settings":',
         json.dumps(settings),
         "}",
     ]

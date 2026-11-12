@@ -53,6 +53,42 @@ def _compose_first_step(workflow: object):
 
 
 @pytest.mark.parametrize(
+    ("name", "objective", "deferred"),
+    [
+        ("implement", "Implement, validate, commit locally and deliver the authorized fix.", []),
+        ("implement", "Implement the approved fix.", ["commit", "summary"]),
+        ("review", "Read-only review. Do not write files or fix findings.", ["implement"]),
+    ],
+)
+def test_explicit_step_authority_survives_prompt_composition(
+    name: str, objective: str, deferred: list[str]
+) -> None:
+    workflow = GENERAL_TASK_WORKFLOW.model_copy(
+        update={
+            "steps": [
+                StepDefinition(
+                    name=name,
+                    type="run",
+                    objective=objective,
+                    responsibilities=["Verify the requested result."],
+                    defer_to=deferred,
+                )
+            ]
+        }
+    )
+    controller = _compose_first_step(workflow).controller_message
+
+    assert objective in controller
+    assert controller.count("Verify the requested result.") == 1
+    assert "A step name alone does not prohibit authorized implementation" in controller
+    assert "Respect user, repository and runtime write restrictions." in controller
+    assert ("Deferred downstream:" in controller) == bool(deferred)
+    for owner in deferred:
+        assert f"- {owner}" in controller
+    assert "Defer commit, publication" not in controller
+
+
+@pytest.mark.parametrize(
     "workflow",
     [GENERAL_TASK_WORKFLOW, RESEARCH_WORKFLOW, SOFTWARE_DEVELOPMENT_WORKFLOW],
     ids=["general", "research", "software-development"],
@@ -310,6 +346,32 @@ def test_retry_and_routed_revision_do_not_replay_task_or_deliverable() -> None:
     assert retry_message.count("HUMAN_INSTRUCTION_SENTINEL") == 1
     assert state.last_revision_context is None
     assert ctx.user_visible_message is None
+
+    assert "The evaluator requested revisions" in retry_message
+    state.last_evaluation_feedback = None
+    state.last_operator_instruction = None
+    state.last_retry_reason = None
+    generic = loop._build_retry_step_prompt(ctx, loop._compose_step_prompt(ctx))
+    assert "new effort to complete the unresolved original step objective" in generic
+    assert "not a final answer" in generic
+    assert "calling completion again" in generic
+    assert "reconcile prior actions and their outcomes" in generic
+    assert "Do not assume permission or repeat unsafe or uncertain mutations" in generic
+    assert "genuine blocker remains" in generic
+    assert "current basis" in generic
+    assert "original task and approval constraints" in generic
+    assert "TASK_DESCRIPTION_SENTINEL" not in generic
+
+    state.last_operator_instruction = "OPERATOR_FEEDBACK_SENTINEL"
+    with_feedback = loop._build_retry_step_prompt(ctx, loop._compose_step_prompt(ctx))
+    assert with_feedback.count("OPERATOR_FEEDBACK_SENTINEL") == 1
+    assert "new effort" in with_feedback
+
+    state.last_retry_reason = "execution_failed"
+    execution_failed = loop._build_retry_step_prompt(ctx, loop._compose_step_prompt(ctx))
+    assert "previous attempt ended before producing a final response" in execution_failed
+    assert "Do not restart the step or repeat inspection" in execution_failed
+    assert "new effort" not in execution_failed
 
 
 def test_human_revision_is_the_visible_part_of_internal_step_prompt() -> None:

@@ -5,13 +5,13 @@
     "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
   },
   {
-    "value": {"z": null, "a": [true, false, 1, 1.0, "příklad"]},
-    "canonical_json": "{\"a\":[true,false,1,1.0,\"příklad\"],\"z\":null}",
-    "sha256": "4d4707b0df7383bcadb5b31a45670ceac48879d9cb76c79f9aa48d1ee169d886"
+    "value": {"z": null, "a": [true, false, 1, 1.0, "domeček"]},
+    "canonical_json": "{\"a\":[true,false,1,1.0,\"domeček\"],\"z\":null}",
+    "sha256": "cd3d318f80ec84af995a8e47876a2a5ac4fed4eee762014d5b0057d29885ac14"
   },
   {
-    "value": {"command": "printf %s café", "target_executor": "fixture-executor"},
-    "canonical_json": "{\"command\":\"printf %s café\",\"target_executor\":\"fixture-executor\"}",
-    "sha256": "5034c8df24677fbeab62063aa726317fb32a200bcc1bce2d05faeda087038d6a"
+    "value": {"command": "printf %s café", "target_executor": "sample-desktop"},
+    "canonical_json": "{\"command\":\"printf %s café\",\"target_executor\":\"sample-desktop\"}",
+    "sha256": "e7fb304772442d65d55a05b5d4506fbdee092a1392042c53419335433d676246"
   }
 ]

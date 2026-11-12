@@ -5,9 +5,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from time import monotonic
-from typing import Any, cast
+from typing import Annotated, Any, cast
 
 from fastapi import APIRouter, Query, Request, Response
 from pydantic import ValidationError
@@ -15,6 +16,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 
 from cognis import json_codec as json
+from cognis.api.chat_v2.admission_history import confirm_admitted_input
 from cognis.api.chat_v2.cursors import ChatCursorError
 from cognis.api.chat_v2.event_store import RawSessionEvent, SessionEventStore
 from cognis.api.chat_v2.event_store_refs import session_read_ref, session_read_refs
@@ -36,6 +38,7 @@ from cognis.api.chat_v2.schemas import (
     ControlMutationV2Request,
     ForkAssistantMessageV2Request,
     ForkAssistantMessageV2Response,
+    MessageAdmissionV2Response,
     QueueMutationResponse,
     QueueUpdateV2Request,
     RetryProviderOption,
@@ -86,7 +89,9 @@ from cognis.api.chat_v2.sync import (
     state_view_from_snapshot,
 )
 from cognis.api.chat_v2.work_graph import (
+    WORK_GRAPH_MAX_SECONDS,
     AuthorizedWorkGraph,
+    resolve_authorized_work_graph,
 )
 from cognis.api.chat_v2.work_materializer import WORK_MATERIALIZER_VERSION
 from cognis.api.chat_v2.work_overview_metrics import WORK_OVERVIEW_METRICS
@@ -122,6 +127,8 @@ from cognis.models.artifact import ArtifactKind, AttachmentRef
 from cognis.models.retry import RetryReason
 from cognis.models.session import SessionModel
 from cognis.providers.circuit_breaker import CircuitBreakerError
+from cognis.store.chat_admissions import read_message_admission
+from cognis.store.database import read_snapshot
 from cognis.store.deliverable_storage import hydrate_deliverable_payload
 from cognis.store.direct_turns import AdmissionResult
 from cognis.store.models import ChatClientTransactionRow, DeliverableRow, WorkRecordRow
@@ -639,6 +646,14 @@ async def chat_v2_sync(
             event_post_processor=context.event_post_processor,
             session_cache=context.session_cache,
         )
+        from cognis.api.chat_v2.deliverables import hydrate_chat_deliverables
+
+        result = await hydrate_chat_deliverables(
+            request.app,
+            result,
+            caller_email=require_current_user(request).email,
+            conversation_id=conversation_id,
+        )
         outcome = "reset" if getattr(result, "reset_required", False) else "success"
         return result
     except ChatCursorError as exc:
@@ -668,15 +683,30 @@ async def chat_v2_timeline(
 
     context = await _load_read_context(request, conversation_id)
     try:
-        return await build_timeline_backfill_response(
-            scope=context.scope,
-            before=before,
+
+        async def read_page(page_limit: int) -> TimelineBackfillResponse:
+            return await build_timeline_backfill_response(
+                scope=context.scope,
+                before=before,
+                limit=page_limit,
+                session_refs=context.session_refs,
+                event_store=cast(SessionEventStore, context.event_store),
+                cursor_secret=context.cursor_secret,
+                event_post_processor=context.event_post_processor,
+                session_cache=context.session_cache,
+                strict_pairing=True,
+            )
+
+        result = await read_page(limit)
+        from cognis.api.chat_v2.deliverables import hydrate_history_page
+
+        return await hydrate_history_page(
+            request.app,
+            result,
+            caller_email=require_current_user(request).email,
+            conversation_id=conversation_id,
             limit=limit,
-            session_refs=context.session_refs,
-            event_store=cast(SessionEventStore, context.event_store),
-            cursor_secret=context.cursor_secret,
-            event_post_processor=context.event_post_processor,
-            session_cache=context.session_cache,
+            read_page=read_page,
         )
     except CircuitBreakerError as exc:
         raise api_exception(
@@ -686,6 +716,78 @@ async def chat_v2_timeline(
         ) from exc
     except ChatV2SyncError as exc:
         raise api_exception(400, exc.code, str(exc)) from exc
+
+
+@router.get(
+    "/conversations/{conversation_id}/messages/{client_txn_id}/admission",
+    response_model=MessageAdmissionV2Response,
+)
+async def message_admission(
+    conversation_id: str,
+    client_txn_id: str,
+    request: Request,
+    canonical_client_message_id: Annotated[list[str] | None, Query(max_length=100)] = None,
+) -> MessageAdmissionV2Response:
+    return await _message_admission_response(
+        request,
+        conversation_id,
+        client_txn_id=client_txn_id,
+        canonical_client_message_ids=canonical_client_message_id or [],
+    )
+
+
+@router.get(
+    "/conversations/{conversation_id}/message-admissions/{client_message_id}",
+    response_model=MessageAdmissionV2Response,
+)
+async def message_admission_by_client(
+    conversation_id: str,
+    client_message_id: str,
+    request: Request,
+    canonical_client_message_id: Annotated[list[str] | None, Query(max_length=100)] = None,
+) -> MessageAdmissionV2Response:
+    """Recover deployed local inputs whose device record lacks a transaction ID."""
+    return await _message_admission_response(
+        request,
+        conversation_id,
+        client_message_id=client_message_id,
+        canonical_client_message_ids=canonical_client_message_id or [],
+    )
+
+
+async def _message_admission_response(
+    request: Request,
+    conversation_id: str,
+    *,
+    client_txn_id: str | None = None,
+    client_message_id: str | None = None,
+    canonical_client_message_ids: list[str],
+) -> MessageAdmissionV2Response:
+    user = require_current_user(request)
+    authority = await _conversation_read_authority(request, conversation_id, user.email)
+    result = await read_message_admission(
+        request.app.state.session_factory,
+        conversation_id=conversation_id,
+        principal_id=authority,
+        client_txn_id=client_txn_id,
+        client_message_id=client_message_id,
+        canonical_client_message_ids=canonical_client_message_ids,
+    )
+    if result is None:
+        raise api_exception(404, "not_found", "Message admission not found")
+    input_persisted = False
+    if result.status in {"failed", "cancelled"}:
+        input_persisted = await confirm_admitted_input(
+            request.app,
+            conversation_id=conversation_id,
+            principal_id=authority,
+            admission=result,
+        )
+    payload = asdict(result)
+    del payload["session_id"]
+    return MessageAdmissionV2Response.model_validate(
+        {"conversation_id": conversation_id, **payload, "input_persisted": input_persisted}
+    )
 
 
 @router.put(
@@ -720,6 +822,11 @@ async def chat_v2_send_message(
             "attachments": [item.model_dump(mode="json") for item in payload.attachments],
             "client_message_id": payload.client_message_id,
             "chat_mode": payload.chat_mode,
+            **(
+                {"feedback": payload.feedback.model_dump(mode="json")}
+                if payload.feedback is not None
+                else {}
+            ),
         },
     )
     tx_row, created = await _claim_transaction(
@@ -774,19 +881,53 @@ async def chat_v2_send_message(
         ) from None
     submit_started = monotonic()
     turn_latency.observe("request_prepare", submit_started - prepare_started)
+    feedback_receipt = None
     with turn_latency.measure("submit_total"):
-        error = await turn_scheduler.submit_turn(
-            conversation_id,
-            normalized.content,
-            user_email=user.email,
-            admission_origin=authenticated_direct_user_origin(),
-            attachments=[item.model_dump(mode="json") for item in attachments],
-            client_message_id=payload.client_message_id,
-            one_shot_chat_mode=payload.chat_mode,
-            idempotency_scope=f"chat-v2:{conversation_id}:{user.email}",
-            idempotency_key=client_txn_id,
-            durable_admission_observer=_observe_durable_admission,
-        )
+        if payload.feedback is not None:
+            from cognis.core.feedback.primitives import Actor
+            from cognis.core.feedback.submissions import DispatchCommand
+
+            feedback = request.app.state.feedback
+            submission = await feedback.submissions.prepare(
+                Actor.user(user.email),
+                payload.feedback,
+                DispatchCommand(
+                    content=normalized.content,
+                    attachments=[item.model_dump(mode="json") for item in attachments],
+                    chat_mode=payload.chat_mode,
+                    client_message_id=payload.client_message_id,
+                    client_txn_id=client_txn_id,
+                    origin_conversation_id=conversation_id,
+                ),
+                standalone=False,
+            )
+            feedback_receipt = await feedback.submissions.dispatch(
+                Actor.user(user.email), submission.submission_id
+            )
+            if feedback_receipt.delivery != "accepted":
+                raise api_exception(
+                    409 if feedback_receipt.delivery == "rejected" else 503,
+                    feedback_receipt.rejection.code
+                    if feedback_receipt.rejection
+                    else "feedback_pending",
+                    "Feedback admission requires confirmation refresh."
+                    if feedback_receipt.rejection
+                    else "Feedback delivery is being reconciled; retry this same send identity.",
+                )
+            error = None
+        else:
+            error = await turn_scheduler.submit_turn(
+                conversation_id,
+                normalized.content,
+                user_email=user.email,
+                admission_origin=authenticated_direct_user_origin(),
+                attachments=[item.model_dump(mode="json") for item in attachments],
+                client_message_id=payload.client_message_id,
+                one_shot_chat_mode=payload.chat_mode,
+                idempotency_scope=f"chat-v2:{conversation_id}:{user.email}",
+                idempotency_key=client_txn_id,
+                durable_admission_observer=_observe_durable_admission,
+            )
     if error is not None:
         await _complete_transaction(
             request,
@@ -827,6 +968,11 @@ async def chat_v2_send_message(
         ),
         "cursor": None,
         "server_time": _server_time(),
+        **(
+            {"feedback_receipt": feedback_receipt.model_dump(mode="json")}
+            if feedback_receipt is not None
+            else {}
+        ),
     }
     tx_row = await _complete_transaction(
         request, tx_row.transaction_id, status=result_status, result=result
@@ -2065,6 +2211,10 @@ async def _require_mutable_conversation(request: Request, conversation_id: str) 
         if row is None or getattr(row, "status", None) == "deleted":
             raise api_exception(404, "not_found", "Conversation not found")
         require_resource_owner(request, row.user_email)
+        from cognis.core.app_contact_access import app_contact_binding_id
+
+        if app_contact_binding_id(row):
+            raise api_exception(409, "conflict", "Reply using the app contact participant route")
         agent = await get_agent(session, row.agent_id)
     if agent is None:
         raise api_exception(404, "not_found", "Agent not found")
@@ -2783,6 +2933,8 @@ async def _build_work_graph_projection_with_stages(
         )
         primary = WorkDeliverable(
             deliverable_id=primary_row.deliverable_id,
+            created_at=primary_row.created_at.isoformat(),
+            updated_at=primary_row.created_at.isoformat(),
             lineage_id=primary_row.lineage_id,
             revision=primary_row.revision,
             sort_key="",
@@ -2829,6 +2981,10 @@ async def _build_work_graph_projection_with_stages(
                 )
             }
         )
+    from cognis.api.chat_v2.work_output_metadata import hydrate_work_artifact_metadata
+
+    async with request.app.state.session_factory() as db:
+        await hydrate_work_artifact_metadata(db, projection, owner_email=user.email)
     return projection
 
 
@@ -2871,27 +3027,33 @@ async def _build_activity_overview(
     outcome = "error"
     try:
         for attempt in range(2):
-            async with request.app.state.session_factory() as db:
-                revision_before = await read_live_work_revision(db, user.email)
-            try:
+            if attempt == 0:
+                async with request.app.state.session_factory() as db:
+                    revision_before = await read_live_work_revision(db, user.email)
                 graph = await request.app.state.work_graph_resolver.resolve(
                     user_email=user.email,
                     scope=scope,
                     source_revision=revision_before,
                 )
-            except ChatV2SyncError as exc:
-                status = 503 if exc.code == "work_graph_timeout" else 400
-                raise api_exception(status, exc.code, str(exc)) from exc
-            async with request.app.state.session_factory() as db:
+            # Preserve shared reads normally; under churn, graph, rows and
+            # watermark must come from one SQL snapshot, not a quiet account.
+            read_session = (
+                read_snapshot(request.app.state.session_factory)
+                if attempt
+                else request.app.state.session_factory()
+            )
+            async with read_session as db:
+                if attempt:
+                    revision_before = await read_live_work_revision(db, user.email)
+                    graph = await resolve_authorized_work_graph(
+                        db,
+                        user_email=user.email,
+                        scope=scope,
+                        deadline=monotonic() + WORK_GRAPH_MAX_SECONDS,
+                    )
                 revision_after_graph = await read_live_work_revision(db, user.email)
                 if revision_after_graph != revision_before:
-                    if attempt == 0:
-                        continue
-                    raise api_exception(
-                        503,
-                        "activity_overview_changed",
-                        "Activity state changed during projection",
-                    )
+                    continue
                 overview = await read_activity_overview(
                     db,
                     owner_email=user.email,
@@ -2907,16 +3069,13 @@ async def _build_activity_overview(
                 )
                 revision_after_projection = await read_live_work_revision(db, user.email)
             if revision_after_projection != revision_after_graph:
-                if attempt == 0:
-                    continue
-                raise api_exception(
-                    503,
-                    "activity_overview_changed",
-                    "Activity state changed during projection",
-                )
+                continue
             outcome = "success"
             return overview
         raise AssertionError("unreachable")
+    except ChatV2SyncError as exc:
+        status = 503 if exc.code == "work_graph_timeout" else 400
+        raise api_exception(status, exc.code, str(exc)) from exc
     finally:
         WORK_OVERVIEW_METRICS.overview_request(outcome, monotonic() - started)
 

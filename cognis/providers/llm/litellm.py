@@ -14,8 +14,9 @@ import threading
 import uuid
 from collections import Counter as CollectionsCounter
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
+from contextlib import aclosing, asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from enum import Enum
 from pathlib import Path
@@ -49,6 +50,7 @@ from cognis.models.config import (
     TokenUsage,
     normalize_reasoning_level,
 )
+from cognis.models.usage_pricing import configured_untiered_model_info
 from cognis.offline_runtime import configure_offline_runtime
 from cognis.ownership import SYSTEM_USER_EMAIL
 from cognis.providers.llm.anthropic.integration import (
@@ -152,6 +154,7 @@ from cognis.providers.llm.errors import (
     LLMStreamProviderError,
     MidStreamErrorPayload,
     OpenAIToolSearchFallbackRequired,
+    ProviderReauthorizationRequired,
     build_mid_stream_error_chunk,
     classify_llm_exception,
     reasoning_summary_rejected,
@@ -169,7 +172,16 @@ from cognis.providers.llm.hosted import (
     systemone_provider_preset,
 )
 from cognis.providers.llm.message_projection import project_messages_for_provider
-from cognis.providers.llm.model_metadata import normalize_model_metadata, resolve_model_metadata
+from cognis.providers.llm.model_metadata import (
+    TOKEN_PRICES,
+    normalize_model_metadata,
+    resolve_model_metadata,
+)
+from cognis.providers.llm.oauth_reauthorization import (
+    OAUTH_REFRESH_REJECTED_STATUSES,
+    mark_reauthorization_required,
+    reauthorization_required,
+)
 from cognis.providers.llm.ollama import (
     discover_ollama_models,
     fetch_ollama_show,
@@ -208,7 +220,16 @@ from cognis.providers.llm.terminal import (
     ResponseIncompleteDetails,
     response_incomplete_details,
 )
-from cognis.providers.llm.transport import LiteLLMTransport, ResponsesTransport
+from cognis.providers.llm.transport import LiteLLMTransport, ResponsesTransport, observed_sdk
+from cognis.providers.llm.usage_attribution import controller_request
+from cognis.providers.llm.usage_binding import (
+    USAGE_BINDING_KEY,
+    USAGE_REQUEST_KEY,
+    UsageBinding,
+    take_binding,
+)
+from cognis.providers.llm.usage_capture import UsageCapture, UsageRequest
+from cognis.providers.llm.usage_http import observed_http
 from cognis.store.models import LLMProvider as LLMProviderRow
 from cognis.store.models import ModelRouting
 from cognis.store.queries import get_model_routing
@@ -240,6 +261,7 @@ PRESET_TO_MODEL_PREFIX: dict[str, str] = {
     "ollama": "ollama",
     "gemini": "gemini",
     "bedrock": "bedrock",
+    "elevenlabs": "elevenlabs",
 }
 
 # Preset-to-image-generation strategy mapping.
@@ -1420,11 +1442,6 @@ def _normalized_json_mode_response(
     return normalized, "normalized"
 
 
-def _supports_image_response_format(model: str) -> bool:
-    normalized = model.rsplit("/", 1)[-1].lower()
-    return not normalized.startswith("gpt-image-")
-
-
 def _iter_gemini_image_content_parts(content: Any) -> list[Any]:
     if isinstance(content, list):
         return content
@@ -1495,7 +1512,7 @@ def _metadata_floor_for_model(model_id: str) -> dict[str, int] | None:
             "max_input_tokens": 922_000,
             "max_output_tokens": 128_000,
         }
-    if normalized == "gpt-6.1-sol":
+    if normalized in {"gpt-6.1-sol", "gpt-6.1-terra"}:
         return {
             "context_window": 1_050_000,
             "max_context_window": 1_050_000,
@@ -2238,6 +2255,8 @@ def _looks_like_openai_apply_patch_model(model_name: str) -> bool:
             "openai/gpt-6-astra",
             "gpt-6.1-sol",
             "openai/gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "openai/gpt-6.1-terra",
             "gpt-6-sol",
             "openai/gpt-6-sol",
             "gpt-6-luna",
@@ -2301,8 +2320,11 @@ class LiteLLMProvider:
         inference_router: Any | None = None,
         credentials_provider: Any | None = None,
         artifact_store: Any | None = None,
+        *,
+        usage_capture: UsageCapture | None = None,
     ) -> None:
         self.session_factory = session_factory
+        self._usage_capture = usage_capture
         self._secrets = secrets_provider
         self._inference_router = inference_router
         self._credentials = credentials_provider
@@ -2365,11 +2387,60 @@ class LiteLLMProvider:
         self._reasoning_summary_broken_keys: CapabilityMarkers = _CapabilityMarkers()
         self._anthropic_defer_loading_broken_keys: CapabilityMarkers = _CapabilityMarkers()
         self._fast_mode_broken_keys: CapabilityMarkers = _CapabilityMarkers()
+        self._reauthorization_observer: Callable[[str], None] | None = None
+
+    def resource_owner_counts(self) -> dict[str, int]:
+        """Observe cache cardinalities without resolving models or retaining data."""
+        return {
+            "anthropic_http_clients": len(self._anthropic_http_clients),
+            "codex_transports": len(self._direct_codex_transports),
+            "oauth_locks": len(self._oauth_locks),
+            "resolved_models": len(self._resolved_model_cache),
+            "model_info": len(self._model_info_cache),
+            "model_providers": len(self._model_provider_cache),
+            "proxy_catalogs": len(self._proxy_model_info_cache),
+            "discovery_catalogs": len(self._discovery_metadata_cache),
+            "codex_catalogs": len(self._codex_model_cache),
+            "anthropic_catalogs": len(self._anthropic_subscription_model_cache),
+            "tokenizer_backends": len(self._tokenizer_backend_cache),
+            "token_count_memos": len(self._count_memo),
+            "token_count_warning_keys": len(self._count_fallback_warn_state),
+        }
+
+    @property
+    def usage_capture(self) -> UsageCapture | None:
+        """Return the observer, absent when usage analytics is disabled."""
+        return self._usage_capture
 
     def set_artifact_store(self, artifact_store: Any) -> None:
         """Set the controller artifact store used for native image normalization."""
 
         self._artifact_store = artifact_store
+
+    def set_reauthorization_observer(self, observer: Callable[[str], None] | None) -> None:
+        """Notify ``observer(provider_id)`` whenever provider OAuth needs the user."""
+
+        self._reauthorization_observer = observer
+
+    def _reauthorization_required(
+        self, provider: LLMProviderRow, *, never_authorized: bool = False
+    ) -> ProviderReauthorizationRequired:
+        """Build the typed failure and tell the observer before it is raised."""
+
+        if self._reauthorization_observer is not None:
+            try:
+                self._reauthorization_observer(provider.provider_id)
+            except Exception:
+                logger.warning(
+                    "Provider reauthorization observer failed",
+                    extra={"extra_data": {"provider_id": provider.provider_id}},
+                    exc_info=True,
+                )
+        return ProviderReauthorizationRequired(
+            provider_id=provider.provider_id,
+            provider_label=provider.display_name,
+            never_authorized=never_authorized,
+        )
 
     async def _prepare_native_image_messages(
         self,
@@ -2379,6 +2450,7 @@ class LiteLLMProvider:
         conversation_id: str | None,
         agent_id: str | None,
         session_id: str | None = None,
+        llm_request_id: str | None = None,
     ) -> list[dict[str, Any]]:
         # Reuse the bounded, authorized Codex normalizer. Its 2048px ceiling
         # also satisfies Anthropic's stricter 3000px many-image request limit.
@@ -2400,6 +2472,7 @@ class LiteLLMProvider:
             agent_id=agent_id,
             normalization_cache=self._codex_image_cache,
             session_id=session_id,
+            llm_request_id=llm_request_id,
         )
 
     @staticmethod
@@ -2595,13 +2668,11 @@ class LiteLLMProvider:
                         token_secret_name, _oauth_secret_owner(provider), None
                     )
                 except KeyError as exc:
-                    raise RuntimeError(
-                        "ChatGPT OAuth is not authorized; complete the provider OAuth device flow first"
-                    ) from exc
+                    raise self._reauthorization_required(provider, never_authorized=True) from exc
                 if not existing.strip():
-                    raise RuntimeError(
-                        "ChatGPT OAuth is not authorized; complete the provider OAuth device flow first"
-                    )
+                    raise self._reauthorization_required(provider, never_authorized=True)
+                if reauthorization_required(existing):
+                    raise self._reauthorization_required(provider)
                 self._validate_chatgpt_authorized_record(existing)
                 await asyncio.to_thread(auth_path.write_text, existing, encoding="utf-8")
                 with _ScopedEnv(
@@ -2650,16 +2721,18 @@ class LiteLLMProvider:
                     token_secret_name, _oauth_secret_owner(provider), None
                 )
             except KeyError as exc:
-                raise RuntimeError(
-                    "ChatGPT OAuth is not authorized; complete the device flow first"
-                ) from exc
+                raise self._reauthorization_required(provider, never_authorized=True) from exc
+            if reauthorization_required(existing):
+                raise self._reauthorization_required(provider)
             auth_record = _parse_chatgpt_authorized_record(existing)
             access_token = auth_record["access_token"]
             expires_at = _chatgpt_access_token_expires_at(access_token)
             if expires_at is None:
                 expires_at = _positive_int(auth_record.get("expires_at"), 0) or None
             if expires_at is None or datetime.now(UTC).timestamp() >= expires_at - 60:
-                auth_record = await self._refresh_chatgpt_auth_record(auth_record, provider)
+                auth_record = await self._refresh_chatgpt_auth_record(
+                    auth_record, provider, stored=existing
+                )
                 access_token = auth_record["access_token"]
             account_id = auth_record.get("account_id") or _chatgpt_account_id_from_tokens(
                 auth_record.get("id_token"), access_token
@@ -2682,18 +2755,31 @@ class LiteLLMProvider:
             lock,
             self._postgres_advisory_lock(f"llm-oauth:{provider_id}"),
         ):
+            owner_email = _anthropic_oauth_secret_owner(provider)
             try:
-                existing = await self._secrets.get_secret(
-                    token_secret_name, _anthropic_oauth_secret_owner(provider), None
-                )
+                existing = await self._secrets.get_secret(token_secret_name, owner_email, None)
             except KeyError as exc:
-                raise RuntimeError(
-                    "Claude subscription OAuth is not authorized; complete OAuth first"
-                ) from exc
+                raise self._reauthorization_required(provider, never_authorized=True) from exc
+            if reauthorization_required(existing):
+                raise self._reauthorization_required(provider)
             auth_record = _parse_anthropic_authorized_record(existing)
             expires_at = _positive_float(auth_record.get("expires_at"), 0.0) or None
             if expires_at is None or datetime.now(UTC).timestamp() >= expires_at - 60:
-                refreshed = await _refresh_anthropic_authorized_record(auth_record)
+                try:
+                    refreshed = await _refresh_anthropic_authorized_record(
+                        auth_record,
+                        provider_id=provider_id,
+                        provider_label=provider.display_name,
+                    )
+                except ProviderReauthorizationRequired:
+                    await self._secrets.set_secret(
+                        token_secret_name,
+                        mark_reauthorization_required(existing),
+                        owner_email,
+                        scope="user",
+                        description=_anthropic_oauth_secret_description(provider),
+                    )
+                    raise self._reauthorization_required(provider) from None
                 await self._secrets.set_secret(
                     token_secret_name,
                     json.dumps(refreshed, ensure_ascii=True, sort_keys=True),
@@ -2812,6 +2898,7 @@ class LiteLLMProvider:
             bundle,
             provider_fingerprint=context.chain_id,
             model_fingerprint=model,
+            usage_binding=request_kwargs.get(USAGE_BINDING_KEY),
         )
 
     async def _native_anthropic_stream(
@@ -2851,6 +2938,7 @@ class LiteLLMProvider:
             bundle,
             provider_fingerprint=context.chain_id,
             model_fingerprint=model,
+            usage_binding=request_kwargs.get(USAGE_BINDING_KEY),
         ):
             yield chunk
 
@@ -2888,9 +2976,12 @@ class LiteLLMProvider:
             await asyncio.gather(*close_operations)
 
     async def _refresh_chatgpt_auth_record(
-        self, auth_record: dict[str, str], provider: LLMProviderRow
+        self, auth_record: dict[str, str], provider: LLMProviderRow, *, stored: str
     ) -> dict[str, str]:
         from litellm.llms.chatgpt.common_utils import CHATGPT_CLIENT_ID, CHATGPT_OAUTH_TOKEN_URL
+
+        if self._secrets is None:
+            raise RuntimeError("ChatGPT OAuth requires the encrypted secrets provider")
 
         refresh_token = auth_record["refresh_token"]
         async with httpx.AsyncClient(timeout=30) as client:
@@ -2903,8 +2994,16 @@ class LiteLLMProvider:
                     "scope": "openid profile email",
                 },
             )
-        if response.status_code >= 400:
-            raise RuntimeError("ChatGPT OAuth expired; re-authorize the provider")
+        if response.status_code in OAUTH_REFRESH_REJECTED_STATUSES:
+            await self._secrets.set_secret(
+                _oauth_token_secret_name(provider),
+                mark_reauthorization_required(stored),
+                _oauth_secret_owner(provider),
+                scope="system",
+                description=_oauth_secret_description(provider),
+            )
+            raise self._reauthorization_required(provider)
+        response.raise_for_status()
         data = response.json()
         access_token = data.get("access_token")
         id_token = data.get("id_token")
@@ -2923,8 +3022,6 @@ class LiteLLMProvider:
         account_id = _chatgpt_account_id_from_tokens(id_token, access_token)
         if account_id:
             refreshed["account_id"] = account_id
-        if self._secrets is None:
-            raise RuntimeError("ChatGPT OAuth requires the encrypted secrets provider")
         await self._secrets.set_secret(
             _oauth_token_secret_name(provider),
             json.dumps(refreshed, ensure_ascii=True, sort_keys=True),
@@ -2940,11 +3037,27 @@ class LiteLLMProvider:
         *,
         model_id: str,
         timeout_seconds: int,
+        usage_request: UsageRequest | None = None,
     ) -> None:
         """Run a non-interactive health check for ChatGPT/Codex providers."""
 
         auth = await self._chatgpt_codex_auth(provider)
-        await test_codex_responses(auth, model=model_id, timeout=float(timeout_seconds))
+        binding = (
+            UsageBinding(
+                usage_request,
+                provider.provider_id,
+                model_id,
+                provider.owner_email or SYSTEM_USER_EMAIL,
+            )
+            if usage_request is not None
+            else None
+        )
+        await test_codex_responses(
+            auth,
+            model=model_id,
+            timeout=float(timeout_seconds),
+            usage_binding=binding,
+        )
 
     @asynccontextmanager
     async def _postgres_advisory_lock(self, key: str) -> AsyncIterator[None]:
@@ -3011,6 +3124,8 @@ class LiteLLMProvider:
                 with contextlib.suppress(KeyError):
                     token_raw = await self._secrets.get_secret(token_secret_name, owner_email, None)
                     self._validate_chatgpt_authorized_record(token_raw)
+                    if reauthorization_required(token_raw):
+                        return {"status": "reauthorization_required", "provider_id": provider_id}
                     return {"status": "authorized", "provider_id": provider_id}
                 return {"status": "not_started", "provider_id": provider_id}
             try:
@@ -3150,6 +3265,8 @@ class LiteLLMProvider:
                         _anthropic_oauth_token_secret_name(provider), owner_email, None
                     )
                     _parse_anthropic_authorized_record(token_raw)
+                    if reauthorization_required(token_raw):
+                        return {"status": "reauthorization_required", "provider_id": provider_id}
                     return {"status": "authorized", "provider_id": provider_id}
                 return {"status": "not_started", "provider_id": provider_id}
             try:
@@ -3564,6 +3681,7 @@ class LiteLLMProvider:
         provider_id: str | None = None,
         timeout: float = 120,
         max_retries: int = 0,
+        _cognis_usage_request: UsageRequest | None = None,
     ) -> SpeechToTextResult:
         resolved_model, provider = await self._resolve_model_target(
             model,
@@ -3605,7 +3723,13 @@ class LiteLLMProvider:
         if self._should_route_to_executor(provider):
             if self._inference_router is None:
                 raise RuntimeError("Speech-to-text executor routing is unavailable")
-            request_kwargs = await self._resolve_provider_kwargs(provider)
+            request_kwargs = await self._inference_kwargs(
+                provider,
+                resolved_model,
+                task_type,
+                {USAGE_REQUEST_KEY: _cognis_usage_request},
+                actor=acting_user_email,
+            )
             request_kwargs["timeout"] = timeout
             request_kwargs = await self._single_executor_attempt(request_kwargs)
             return cast(
@@ -3631,7 +3755,13 @@ class LiteLLMProvider:
             filename=filename,
             supported_mime_types=supported_audio_mime_types,
         )
-        request_kwargs = await self._resolve_provider_kwargs(provider)
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            {USAGE_REQUEST_KEY: _cognis_usage_request},
+            actor=acting_user_email,
+        )
         api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
         if not isinstance(api_base, str) or not api_base:
             api_base = "https://api.openai.com"
@@ -3639,8 +3769,23 @@ class LiteLLMProvider:
         extra_headers = request_kwargs.get("extra_headers")
         request_kwargs["timeout"] = timeout
         request_kwargs = await self._single_executor_attempt(request_kwargs)
+        if provider_preset == "elevenlabs":
+            from cognis.providers.llm.elevenlabs import transcribe
+
+            return await transcribe(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                filename=filename,
+                model=model_name,
+                language=language,
+                prompt=prompt,
+                request_kwargs=request_kwargs,
+                usage_binding=take_binding(request_kwargs, model=resolved_model),
+            )
         timeout = request_kwargs["timeout"]
         data: dict[str, str] = {"model": model_name}
+        if model_name.rsplit("/", 1)[-1] == "whisper-1":
+            data["response_format"] = "verbose_json"
         if prompt:
             data["prompt"] = prompt
         if language:
@@ -3656,11 +3801,15 @@ class LiteLLMProvider:
         file_obj.name = filename
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(
-                    openai_endpoint(api_base, "audio/transcriptions"),
-                    headers=headers,
-                    data=data,
-                    files={"file": (filename, file_obj, mime_type)},
+                response = await observed_http(
+                    lambda: client.post(
+                        openai_endpoint(api_base, "audio/transcriptions"),
+                        headers=headers,
+                        data=data,
+                        files={"file": (filename, file_obj, mime_type)},
+                    ),
+                    binding=take_binding(request_kwargs, model=resolved_model),
+                    parameters={},
                 )
                 response.raise_for_status()
         except httpx.HTTPStatusError as exc:
@@ -3688,6 +3837,151 @@ class LiteLLMProvider:
             duration_seconds=float(duration) if isinstance(duration, int | float) else None,
         )
 
+    async def _speech_stream_binding(
+        self,
+        model: str | None,
+        task_type: str,
+        provider_id: str | None,
+        acting_user_email: str | None,
+        usage_request: UsageRequest | None = None,
+    ) -> tuple[str, str, LLMProviderRow, dict[str, Any]]:
+        """Resolve native speech using the batch authorization and secret owner."""
+        resolved, provider = await self._resolve_model_target(
+            model,
+            task_type=task_type,
+            explicit_provider_id=provider_id,
+            acting_user_email=acting_user_email,
+        )
+        if provider is None:
+            raise ValueError("No provider is configured for speech streaming")
+        if provider.location == "executor" and self._inference_router is None:
+            raise RuntimeError("Speech streaming executor routing is unavailable")
+        preset = str(dict(provider.config).get("preset", "")).lower()
+        wire_model = self._transcription_wire_model(resolved, preset)
+        request = await self._inference_kwargs(
+            provider,
+            resolved,
+            task_type,
+            {USAGE_REQUEST_KEY: usage_request},
+            actor=acting_user_email,
+        )
+        return wire_model, preset, provider, request
+
+    async def synthesize_stream(
+        self,
+        text: str,
+        *,
+        voice: str,
+        model: str | None = None,
+        task_type: str = "text_to_speech",
+        speed: float = 1.0,
+        provider_id: str | None = None,
+        acting_user_email: str | None = None,
+        timeout: float = 120,
+        max_retries: int = 0,
+        _cognis_usage_request: UsageRequest | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Stream one native PCM synthesis attempt at the configured location."""
+        from cognis.providers.llm.speech_streaming import stream_synthesis
+
+        wire_model, preset, provider, request = await self._speech_stream_binding(
+            model,
+            task_type,
+            provider_id,
+            acting_user_email,
+            _cognis_usage_request,
+        )
+        request["timeout"] = timeout
+        request = await self._single_executor_attempt(request)
+        if self._should_route_to_executor(provider):
+            if self._inference_router is None:
+                raise RuntimeError("Speech streaming executor routing is unavailable")
+            async with aclosing(
+                self._inference_router.route_speech_stream(
+                    operation="tts",
+                    model=wire_model,
+                    provider_preset=preset,
+                    executor_id=dict(provider.config).get("executor_id"),
+                    executor_labels=dict(provider.config).get("executor_labels"),
+                    request_kwargs=request,
+                    text=text,
+                    voice=voice,
+                    speed=speed,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
+            return
+        async with aclosing(
+            stream_synthesis(
+                provider_preset=preset,
+                model=wire_model,
+                text=text,
+                voice=voice,
+                request_kwargs=request,
+                speed=speed,
+                usage_binding=take_binding(request, model=wire_model),
+            )
+        ) as stream:
+            async for event in stream:
+                yield event.model_dump(mode="json", exclude_none=True)
+
+    async def transcribe_stream(
+        self,
+        audio: AsyncIterator[bytes],
+        *,
+        model: str | None = None,
+        task_type: str = "speech_to_text",
+        language: str | None = None,
+        provider_id: str | None = None,
+        acting_user_email: str | None = None,
+        timeout: float = 120,
+        max_retries: int = 0,
+        _cognis_usage_request: UsageRequest | None = None,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Stream live PCM once without changing the selected provider or model."""
+        from cognis.providers.llm.speech_streaming import stream_transcription
+
+        wire_model, preset, provider, request = await self._speech_stream_binding(
+            model,
+            task_type,
+            provider_id,
+            acting_user_email,
+            _cognis_usage_request,
+        )
+        request["timeout"] = timeout
+        request = await self._single_executor_attempt(request)
+        if self._should_route_to_executor(provider):
+            if self._inference_router is None:
+                raise RuntimeError("Speech streaming executor routing is unavailable")
+            async with aclosing(
+                self._inference_router.route_speech_stream(
+                    operation="stt",
+                    model=wire_model,
+                    provider_preset=preset,
+                    executor_id=dict(provider.config).get("executor_id"),
+                    executor_labels=dict(provider.config).get("executor_labels"),
+                    request_kwargs=request,
+                    audio=audio,
+                    language=language,
+                )
+            ) as stream:
+                async for event in stream:
+                    yield event
+            return
+        async with aclosing(
+            stream_transcription(
+                audio,
+                provider_preset=preset,
+                model=wire_model,
+                request_kwargs=request,
+                language=language,
+                usage_binding=take_binding(request, model=wire_model),
+            )
+        ) as stream:
+            async for event in stream:
+                yield event.model_dump(mode="json", exclude_none=True)
+
     async def synthesize(
         self,
         text: str,
@@ -3702,6 +3996,7 @@ class LiteLLMProvider:
         acting_user_email: str | None = None,
         timeout: float = 120,
         max_retries: int = 0,
+        _cognis_usage_request: UsageRequest | None = None,
     ) -> TextToSpeechResult:
         """Synthesize speech via LiteLLM (OpenAI, ElevenLabs, Azure, etc.).
 
@@ -3738,7 +4033,13 @@ class LiteLLMProvider:
                 }
             },
         )
-        request_kwargs = await self._resolve_provider_kwargs(provider)
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            {USAGE_REQUEST_KEY: _cognis_usage_request},
+            actor=acting_user_email,
+        )
         request_kwargs["timeout"] = timeout
         if low_latency:
             configured_timeout = request_kwargs.get("timeout", 120)
@@ -4025,14 +4326,36 @@ class LiteLLMProvider:
                 merged["reasoning_efforts"] = (
                     codex_info.get("reasoning_efforts") or existing_efforts
                 )
+            # Subscription usage is estimated at the same model's OpenAI API price.
+            # Only prices are taken; Codex capabilities and limits stay authoritative.
+            api_catalog = resolve_model_metadata(model_id, preset="openai")
+            api_sources = api_catalog.get("provider_metadata", {}).get("field_sources", {})
+            api_prices = {
+                field: api_catalog[field]
+                for field in (*TOKEN_PRICES, "pricing")
+                if field in api_catalog and api_sources.get(field, "").startswith("catalog:")
+            }
+            if api_prices:
+                merged.update(api_prices)
+                metadata = dict(merged.get("provider_metadata") or {})
+                metadata["field_sources"] = {
+                    **dict(metadata.get("field_sources") or {}),
+                    **{field: api_sources[field] for field in api_prices},
+                }
+                merged["provider_metadata"] = metadata
         elif preset == "openai" and model_id in {
             "gpt-6-sol",
             "gpt-6-luna",
             "gpt-6.1-sol",
+            "gpt-6.1-terra",
         }:
             openai_catalog_info = codex_catalog_model_info(model_id)
             if openai_catalog_info is not None:
                 merged.update(openai_catalog_info)
+                if model_id == "gpt-6.1-terra":
+                    # Terra's Codex catalog includes the Codex-only "ultra"
+                    # effort; the direct OpenAI API documents efforts through "max".
+                    merged["reasoning_efforts"] = ["low", "medium", "high", "xhigh", "max"]
 
         if (
             preset == "ollama"
@@ -5176,6 +5499,7 @@ class LiteLLMProvider:
     ) -> dict[str, Any]:
         from cognis.providers.llm.retry import with_llm_retry
 
+        llm_request_id = cast(str | None, kwargs.pop("cognis_llm_request_id", None))
         cognis_session_id = cast(str | None, kwargs.pop("cognis_session_id", None))
         cognis_conversation_id = cast(str | None, kwargs.pop("cognis_conversation_id", None))
         cognis_agent_id = cast(str | None, kwargs.pop("cognis_agent_id", None))
@@ -5215,8 +5539,13 @@ class LiteLLMProvider:
                 prefixed_model=prefixed_model,
                 model_info=model_info,
             )
-        request_kwargs = _merge_request_kwargs(
-            await self._resolve_provider_kwargs(provider), kwargs
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            kwargs,
+            actor=acting_user_email,
+            model_info=model_info,
         )
         existing_reasoning = normalize_reasoning_level(
             request_kwargs.get("reasoning_effort")
@@ -5319,6 +5648,7 @@ class LiteLLMProvider:
                 conversation_id=cognis_conversation_id,
                 agent_id=cognis_agent_id,
                 session_id=cognis_session_id,
+                llm_request_id=llm_request_id,
             )
         logger.debug(
             "LLM generate",
@@ -5784,8 +6114,13 @@ class LiteLLMProvider:
                 model_info=model_info,
             )
         phase_started_at = monotonic()
-        request_kwargs = _merge_request_kwargs(
-            await self._resolve_provider_kwargs(provider), kwargs
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            kwargs,
+            actor=acting_user_email,
+            model_info=model_info,
         )
         _observe_provider_phase(
             llm_request_id=llm_request_id,
@@ -5892,6 +6227,8 @@ class LiteLLMProvider:
                 owner_email=acting_user_email,
                 conversation_id=cognis_conversation_id,
                 agent_id=cognis_agent_id,
+                session_id=cognis_session_id,
+                llm_request_id=llm_request_id,
             )
             _observe_provider_phase(
                 llm_request_id=llm_request_id,
@@ -6677,9 +7014,15 @@ class LiteLLMProvider:
         try:
             import tiktoken
 
+            memo_key = _count_memo_key(model, "tiktoken_o200k_base", text)
+            cached = self._count_memo_get(memo_key)
+            if cached is not None:
+                self._record_tokenizer_backend(model, family, "tiktoken_o200k_base")
+                return cached
             encoding = tiktoken.get_encoding("o200k_base")
             count = len(encoding.encode(text))
             self._record_tokenizer_backend(model, family, "tiktoken_o200k_base")
+            self._count_memo_put(memo_key, count)
             return count
         except Exception as exc:
             self._warn_token_count_fallback(
@@ -6855,6 +7198,60 @@ class LiteLLMProvider:
         )
         self._model_info_cache.clear()
         return entries
+
+    async def discover_voices(
+        self, provider_id: str, *, model: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Discover voices at the provider's configured inference location."""
+        async with self.session_factory() as session:
+            provider = await session.get(LLMProviderRow, provider_id)
+        if provider is None:
+            raise ValueError("Unknown speech provider")
+        preset = _provider_preset(provider)
+        if preset != "elevenlabs":
+            configured = provider.config.get("voices")
+            if isinstance(configured, list):
+                return [
+                    {"voice_id": str(voice), "name": str(voice)}
+                    for voice in configured
+                    if isinstance(voice, str)
+                ]
+            if preset == "openai":
+                identifier = (model or "").removeprefix("openai/")
+                names = [
+                    "alloy",
+                    "ash",
+                    "coral",
+                    "echo",
+                    "fable",
+                    "onyx",
+                    "nova",
+                    "sage",
+                    "shimmer",
+                ]
+                if not identifier or identifier.startswith("gpt-4o-mini-tts"):
+                    names += ["ballad", "verse", "marin", "cedar"]
+                elif identifier not in {"tts-1", "tts-1-hd"}:
+                    return []
+                return [{"voice_id": voice, "name": voice} for voice in names]
+            return []
+        kwargs = await self._resolve_provider_kwargs(provider)
+        base_url = str(kwargs.get("api_base") or kwargs.get("base_url") or "")
+        api_key = str(kwargs.get("api_key") or "")
+        if provider.location == "executor":
+            if self._inference_router is None:
+                raise RuntimeError("Executor inference router unavailable")
+            result = await self._inference_router.discover_voices(
+                preset=preset,
+                base_url=base_url,
+                api_key=api_key,
+                executor_id=provider.executor_id,
+                executor_labels=provider.executor_labels,
+            )
+            return cast(list[dict[str, Any]], result)
+        from cognis.providers.llm.elevenlabs import discover_voices
+
+        return await discover_voices(base_url=base_url, api_key=api_key)
 
     @staticmethod
     def _discovery_metadata_key(provider: LLMProviderRow) -> str:
@@ -7058,8 +7455,8 @@ class LiteLLMProvider:
         ChatGPT OAuth providers read the Codex usage endpoint. Claude
         subscription providers read the OAuth usage endpoint and attach the
         latest rate-limit headers. API-key Anthropic providers only have the
-        header snapshot. Every other provider reports ``ok: False`` instead of
-        failing, so callers can hide the panel without special-casing errors.
+        header snapshot. ElevenLabs reads subscription credit metadata. Other
+        providers report ``ok: False`` so callers can hide unsupported panels.
         """
 
         async with self.session_factory() as session:
@@ -7069,6 +7466,17 @@ class LiteLLMProvider:
         if _looks_like_chatgpt_oauth_provider(provider):
             auth = await self._chatgpt_codex_auth(provider)
             return await fetch_codex_usage(auth)
+        if str(dict(provider.config).get("preset", "")).lower() == "elevenlabs":
+            from cognis.providers.llm.elevenlabs_usage import (
+                fetch_subscription_usage,
+                unavailable_usage,
+            )
+
+            if provider.location != "controller":
+                return unavailable_usage(
+                    "Subscription quota requires controller-hosted ElevenLabs credentials"
+                )
+            return await fetch_subscription_usage(await self._resolve_provider_kwargs(provider))
         if not is_anthropic_native_provider(provider):
             return _unsupported_provider_usage()
         rate_limits = _anthropic_rate_limit_usage_from_snapshot(
@@ -7232,7 +7640,13 @@ class LiteLLMProvider:
             details={"model_resolved": resolved_model},
         )
 
-    async def test_provider(self, provider_id: str, timeout_seconds: int = 15) -> dict[str, Any]:
+    async def test_provider(
+        self,
+        provider_id: str,
+        timeout_seconds: int = 15,
+        *,
+        acting_user_email: str | None = None,
+    ) -> dict[str, Any]:
         async with self.session_factory() as session:
             provider = await session.get(LLMProviderRow, provider_id)
         if provider is None:
@@ -7244,6 +7658,17 @@ class LiteLLMProvider:
             raise ValueError("Provider default_model is not configured")
 
         prefixed_model = self._apply_model_prefix(default_model, provider)
+        usage_request = (
+            controller_request(
+                self.usage_capture,
+                actor=acting_user_email,
+                purpose="provider_test",
+                model=default_model,
+                kwargs={},
+            )
+            if self._usage_capture is not None
+            else None
+        )
         started_at = monotonic()
         tested_at = datetime.now(UTC)
         executor_routed = self._should_route_to_executor(provider)
@@ -7271,6 +7696,7 @@ class LiteLLMProvider:
                     provider,
                     model_id=default_model,
                     timeout_seconds=timeout_seconds,
+                    usage_request=usage_request,
                 )
                 return _test_result(True, error_type=None, error_detail=None)
             except TimeoutError as exc:
@@ -7301,6 +7727,7 @@ class LiteLLMProvider:
                     ),
                     provider,
                     timeout=float(timeout_seconds),
+                    usage_request=usage_request,
                 )
                 return _test_result(True, error_type=None, error_detail=None)
             except Exception as exc:
@@ -7310,7 +7737,13 @@ class LiteLLMProvider:
                     error_detail="System One provider test failed",
                 )
 
-        request_kwargs = await self._resolve_provider_kwargs(provider)
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            default_model,
+            "provider_test",
+            {USAGE_REQUEST_KEY: usage_request},
+            actor=acting_user_email,
+        )
         configured_timeout = request_kwargs.get("timeout")
         request_kwargs["timeout"] = (
             min(timeout_seconds, configured_timeout)
@@ -7615,6 +8048,60 @@ class LiteLLMProvider:
             request_kwargs["api_key"] = api_key
         return request_kwargs
 
+    async def _inference_kwargs(
+        self,
+        provider: LLMProviderRow | None,
+        model: str,
+        purpose: str,
+        overrides: dict[str, Any],
+        *,
+        actor: str | None = None,
+        model_info: ModelInfo | None = None,
+    ) -> dict[str, Any]:
+        """Carry request-owned correlation to the actual dispatch adapters."""
+        from cognis.providers.llm.usage_capture import UsageRequest
+
+        overrides = dict(overrides)
+        request = overrides.pop(USAGE_REQUEST_KEY, None)
+        merged = _merge_request_kwargs(await self._resolve_provider_kwargs(provider), overrides)
+        if self._usage_capture is not None and provider is not None:
+            if model_info is None:
+                # Every operation (embeddings, typed, image, speech) prices from
+                # the same cached metadata as chat. Accounting never gates dispatch.
+                try:
+                    model_info = await self.get_model_info(
+                        model, provider_id=provider.provider_id, acting_user_email=actor
+                    )
+                except Exception:
+                    logger.debug(
+                        "Usage pricing metadata unavailable",
+                        extra={"extra_data": {"provider_id": provider.provider_id}},
+                    )
+            if not isinstance(request, UsageRequest):
+                request = controller_request(
+                    self.usage_capture,
+                    actor=actor,
+                    purpose=purpose,
+                    model=model,
+                    kwargs=overrides,
+                )
+            merged[USAGE_BINDING_KEY] = UsageBinding(
+                request,
+                provider.provider_id,
+                model,
+                provider.owner_email or SYSTEM_USER_EMAIL,
+                model_info=model_info or configured_untiered_model_info(provider.config, model),
+                provider_config=provider.config,
+                media_operation="image_generate"
+                if purpose == "image_generation"
+                else "transcribe"
+                if purpose == "speech_to_text"
+                else "synthesize"
+                if purpose == "text_to_speech"
+                else None,
+            )
+        return merged
+
     async def resolve_stream_idle_config(
         self,
         *,
@@ -7854,10 +8341,20 @@ class LiteLLMProvider:
         return getattr(provider, "location", None) == "executor"
 
     async def _system_one_for_provider(
-        self, payload: SystemOneRequest, provider: LLMProviderRow, *, timeout: float
+        self,
+        payload: SystemOneRequest,
+        provider: LLMProviderRow,
+        *,
+        timeout: float,
+        usage_request: Any = None,
     ) -> dict[str, Any]:
         """Dispatch native typed inference without entering chat fallbacks."""
-        kwargs = await self._resolve_provider_kwargs(provider)
+        kwargs = await self._inference_kwargs(
+            provider,
+            payload.model,
+            "provider_test",
+            {USAGE_REQUEST_KEY: usage_request},
+        )
         base_url = str(kwargs.get("api_base") or kwargs.get("base_url") or "")
         preset = systemone_provider_preset(str(provider.config.get("preset", "")), base_url)
         if preset is None:
@@ -7879,13 +8376,18 @@ class LiteLLMProvider:
                 provider,
                 request_kwargs={
                     "cognis_llm_api": "systemone",
+                    USAGE_BINDING_KEY: kwargs.get(USAGE_BINDING_KEY),
                     "payload": payload.model_dump(mode="json", exclude_none=True),
                     **transport_kwargs,
                 },
                 acting_user_email=provider.owner_email,
             )
             return validate_systemone_response(result, payload)
-        return await request_systemone(payload, **transport_kwargs)
+        return await request_systemone(
+            payload,
+            **transport_kwargs,
+            usage_binding=take_binding(kwargs, model=payload.model),
+        )
 
     async def _executor_generate(
         self,
@@ -8043,8 +8545,12 @@ class LiteLLMProvider:
         if provider is None:
             raise ValueError(f"No LLM provider found for embedding model {resolved_model!r}")
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        request_kwargs = _merge_request_kwargs(
-            await self._resolve_provider_kwargs(provider), kwargs
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            kwargs,
+            actor=acting_user_email,
         )
         if provider.location == "executor":
             response = await self._executor_generate(
@@ -8056,7 +8562,11 @@ class LiteLLMProvider:
             )
         else:
             async with self._provider_oauth_token_context(provider):
-                response = await litellm.aembedding(
+                response = await observed_sdk(
+                    litellm.aembedding,
+                    take_binding(request_kwargs, model=resolved_model),
+                    operation="embeddings",
+                )(
                     model=prefixed_model,
                     input=texts,
                     **request_kwargs,
@@ -8190,13 +8700,25 @@ class LiteLLMProvider:
             model,
             task_type=task_type,
             explicit_provider_id=kwargs.pop("provider_id", None),
-            acting_user_email=kwargs.pop("acting_user_email", None),
+            acting_user_email=(acting_user_email := kwargs.pop("acting_user_email", None)),
         )
         if provider is None:
             raise ValueError(f"No LLM provider found for image generation model {resolved_model!r}")
         prefixed_model = self._apply_model_prefix(resolved_model, provider)
-        request_kwargs = await self._resolve_provider_kwargs(provider)
+        request_kwargs = await self._inference_kwargs(
+            provider,
+            resolved_model,
+            task_type,
+            kwargs,
+            actor=acting_user_email,
+        )
 
+        image_binding = request_kwargs.get(USAGE_BINDING_KEY)
+        if isinstance(image_binding, UsageBinding):
+            request_kwargs[USAGE_BINDING_KEY] = replace(
+                image_binding,
+                media_operation="image_edit" if images is not None else "image_generate",
+            )
         # Determine strategy from provider preset
         preset = ""
         if provider is not None:
@@ -8206,6 +8728,15 @@ class LiteLLMProvider:
         # Proxy/compatible presets are pass-through — detect Gemini by model name
         if strategy == "aimage_generation" and "gemini" in prefixed_model.lower():
             strategy = "acompletion_modalities"
+
+        # Carry configured OpenAI routing to both runtimes without relying on
+        # LiteLLM's model catalog to recognize newly configured image models.
+        if (
+            preset == "openai"
+            and strategy == "aimage_generation"
+            and not prefixed_model.startswith("openai/")
+        ):
+            prefixed_model = f"openai/{prefixed_model}"
 
         # Route to executor if configured
         if self._should_route_to_executor(provider):
@@ -8279,7 +8810,8 @@ class LiteLLMProvider:
         mask: ImageInput | None = None,
         **kwargs: Any,
     ) -> ImageGenerationResult:
-        """Generate image using litellm.aimage_generation (OpenAI path)."""
+        """Generate or edit through the corresponding LiteLLM image API."""
+        from cognis.providers.llm.image_api import image_api_kwargs
         from cognis.providers.llm.retry import with_llm_retry
 
         gen_kwargs: dict[str, Any] = {}
@@ -8288,16 +8820,21 @@ class LiteLLMProvider:
         if request_kwargs.get("api_base"):
             gen_kwargs["api_base"] = request_kwargs["api_base"]
 
-        image_kwargs: dict[str, Any] = {}
-        if _supports_image_response_format(model):
-            image_kwargs["response_format"] = response_format
-        if images is not None:
-            image_kwargs["image"] = [image.b64_json for image in images]
-        if mask is not None:
-            image_kwargs["mask"] = mask.b64_json
+        image_kwargs = image_api_kwargs(
+            model, response_format=response_format, images=images, mask=mask
+        )
         operation = "image_edit" if images is not None else "image_generate"
+        binding = take_binding(request_kwargs, model=model)
+        if binding is not None:
+            binding = replace(
+                binding, media_operation="image_edit" if images is not None else "image_generate"
+            )
         response = await with_llm_retry(
-            litellm.aimage_generation,
+            observed_sdk(
+                litellm.aimage_edit if images is not None else litellm.aimage_generation,
+                binding,
+                operation="native",
+            ),
             prompt=prompt,
             model=model,
             n=n,
@@ -8347,7 +8884,8 @@ class LiteLLMProvider:
         messages = [{"role": "user", "content": content}]
 
         # Filter kwargs — don't pass image-specific params to acompletion
-        completion_kwargs = {k: v for k, v in request_kwargs.items() if k not in ("size",)}
+        completion_kwargs = {**request_kwargs, **kwargs}
+        completion_kwargs.pop("size", None)
         from cognis.providers.llm.image_config import gemini_image_config
 
         image_config = gemini_image_config(size, model)
@@ -8355,7 +8893,11 @@ class LiteLLMProvider:
             completion_kwargs["imageConfig"] = image_config
 
         response = await with_llm_retry(
-            litellm.acompletion,
+            observed_sdk(
+                litellm.acompletion,
+                take_binding(completion_kwargs, model=model),
+                operation="chat",
+            ),
             model=model,
             messages=messages,
             modalities=["image", "text"],
@@ -8363,7 +8905,6 @@ class LiteLLMProvider:
             n=n,
             operation=f"image_generate_completion({model})",
             **completion_kwargs,
-            **kwargs,
         )
 
         return self._normalize_gemini_image_response(response, model)
@@ -8550,7 +9091,25 @@ async def _run_synthesize_local(
     abstract (or older LiteLLM versions) still work. Returns the audio bytes
     and a content type derived from ``response_format``.
     """
+    binding = take_binding(request_kwargs, model=resolved_model)
     content_type = _content_type_for_tts_format(response_format)
+    if provider_preset == "elevenlabs":
+        from cognis.providers.llm.elevenlabs import synthesize
+
+        try:
+            return await synthesize(
+                text=text,
+                model=wire_model,
+                voice=voice,
+                response_format=response_format,
+                speed=speed,
+                request_kwargs=request_kwargs,
+                usage_binding=binding,
+            )
+        except Exception as exc:
+            raise LLMStreamProviderError(
+                "Speech synthesis failed", payload=classify_llm_exception(exc)
+            ) from exc
     direct_first = prefer_direct_http and provider_preset in {
         "openai",
         "openai_compatible",
@@ -8561,7 +9120,7 @@ async def _run_synthesize_local(
     if callable(aspeech) and not direct_first:
         request_kwargs = await LiteLLMProvider._single_executor_attempt(request_kwargs)
         try:
-            result = await aspeech(
+            result = await observed_sdk(aspeech, binding, operation="native")(
                 model=wire_model,
                 input=text,
                 voice=voice,
@@ -8591,7 +9150,7 @@ async def _run_synthesize_local(
                 ) from exc
             logger.debug(
                 "litellm.aspeech failed; falling back to direct HTTP",
-                extra={"extra_data": {"error": str(exc)[:200], "model": wire_model}},
+                extra={"extra_data": {"error_type": type(exc).__name__, "model": wire_model}},
             )
 
     # Direct HTTP fallback against an OpenAI-compatible /v1/audio/speech.
@@ -8617,10 +9176,14 @@ async def _run_synthesize_local(
     timeout = request_kwargs.get("timeout", 120)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                openai_endpoint(api_base, "audio/speech"),
-                headers=headers,
-                json=body,
+            response = await observed_http(
+                lambda: client.post(
+                    openai_endpoint(api_base, "audio/speech"),
+                    headers=headers,
+                    json=body,
+                ),
+                binding=binding,
+                parameters={"input_characters": len(text)},
             )
             response.raise_for_status()
     except httpx.HTTPStatusError as exc:

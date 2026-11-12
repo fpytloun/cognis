@@ -264,12 +264,9 @@ async def test_create_assign_ingest_image_search_and_original_provenance(tmp_pat
             actor_email="owner@example.com",
             current_agent_id="creator",
             arguments={
-                "action": "settings_update",
+                "action": "update",
                 "agent_id": target_id,
-                "settings": {
-                    "available_workflow_ids": ["system:direct"],
-                    "default_workflow_id": "system:direct",
-                },
+                "description": "Travel knowledge assistant",
             },
         )
         await handle_agent_management_action(

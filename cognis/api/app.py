@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import secrets
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -42,6 +43,7 @@ from cognis.api.middleware import (
     KnowledgebaseDocumentUploadLimitMiddleware,
 )
 from cognis.api.routes.agents import router as agents_router
+from cognis.api.routes.app_contacts import router as app_contacts_router
 from cognis.api.routes.artifact_documents import router as artifact_documents_router
 from cognis.api.routes.artifacts import router as artifacts_router
 from cognis.api.routes.auth import router as auth_router
@@ -502,12 +504,55 @@ def create_app(
             owner_allowlist=config_runtime.trusted_evidence_owner_allowlist,
         )
         redis_service = RedisService(config_runtime.redis_url)
+        from cognis.core.usage.runtime import UsageRuntime
+        from cognis.core.usage.settings import load_usage_enabled
+
+        async with session_factory() as usage_settings_session:
+            usage_enabled = await load_usage_enabled(usage_settings_session)
+        usage_runtime = (
+            UsageRuntime(session_factory, controller_owner_id=controller_runtime.owner_id)
+            if usage_enabled
+            else None
+        )
+        app.state.usage_analytics_enabled = usage_enabled
+        app.state.usage_runtime = usage_runtime
+        if usage_runtime is not None:
+            await usage_runtime.start()
+        app.state.usage_service = usage_runtime.service if usage_runtime else None
+        app.state.usage_projector = usage_runtime.projector if usage_runtime else None
+        app.state.usage_maintenance = usage_runtime.maintenance if usage_runtime else None
+        app.state.usage_capture = usage_runtime.capture if usage_runtime else None
+        app.state.usage_quota_recorder = usage_runtime.quota if usage_runtime else None
         providers = build_provider_registry(
-            config_runtime, session_factory, auth_provider, redis_service=redis_service
+            config_runtime,
+            session_factory,
+            auth_provider,
+            redis_service=redis_service,
+            usage_capture=app.state.usage_capture,
         )
         from cognis.providers.llm.inference_api import InferenceAPIService
 
         app.state.inference_api = InferenceAPIService(providers.llm, session_factory)
+        if usage_runtime is not None:
+            await usage_runtime.start_pricing(resolve_model=providers.llm.get_model_info)
+            assert usage_runtime.price_publisher is not None
+        app.state.usage_price_publisher = usage_runtime.price_publisher if usage_runtime else None
+        from cognis.api.routes.usage import create_usage_router
+        from cognis.core.usage.query_service import create_usage_query_service
+
+        usage_query_service = (
+            await create_usage_query_service(
+                session_factory,
+                cursor_secret=hmac.digest(
+                    mfa_cipher.key_material, b"cognis.usage.cursors.v1", "sha256"
+                ),
+            )
+            if usage_enabled
+            else None
+        )
+        app.state.usage_query_service = usage_query_service
+        if usage_query_service is not None:
+            app.include_router(create_usage_router(usage_query_service), prefix="/api/v1")
         await providers.executor.websocket.configure_cluster(
             enabled=config_runtime.runtime_mode == "ha",
             session_factory=session_factory,
@@ -670,7 +715,13 @@ def create_app(
         maintenance_leases = DatabaseLeaseStore(session_factory)
         from cognis.core.provider_monitor import ProviderMonitor
 
-        provider_monitor = ProviderMonitor(session_factory, providers.llm)
+        provider_monitor = ProviderMonitor(
+            session_factory,
+            providers.llm,
+            usage_observer=usage_runtime.quota.observe if usage_runtime else None,
+            inbox=inbox_service,
+        )
+        providers.llm.set_reauthorization_observer(provider_monitor.report_reauthorization_required)
         app.state.provider_monitor = provider_monitor
         tool_output_maintenance = ToolOutputMaintenanceService(
             tool_output_store, lease_store=maintenance_leases
@@ -792,9 +843,32 @@ def create_app(
         from cognis.core.video import VideoService
 
         video_service = VideoService(
-            session_factory=session_factory, artifacts=artifact_store, llm=providers.llm
+            session_factory=session_factory,
+            artifacts=artifact_store,
+            llm=providers.llm,
+            usage_maintenance=usage_runtime.maintenance if usage_runtime else None,
         )
         app.state.video_service = video_service
+        from cognis.core.audio_jobs import AudioJobService
+        from cognis.core.speech import SpeechService
+
+        audio_jobs = AudioJobService(
+            SpeechService(
+                session_factory=session_factory, artifacts=artifact_store, llm=providers.llm
+            )
+        )
+        app.state.audio_jobs = audio_jobs
+        audio_stop = asyncio.Event()
+        audio_worker = asyncio.create_task(
+            run_periodic_maintenance(
+                audio_jobs.tick,
+                stop=audio_stop,
+                interval_seconds=3,
+                resource_key="deliverable-audio-jobs",
+                lease_store=maintenance_leases,
+            ),
+            name="deliverable-audio-jobs",
+        )
         video_stop = asyncio.Event()
         video_worker = asyncio.create_task(
             run_periodic_maintenance(
@@ -805,6 +879,39 @@ def create_app(
                 lease_store=maintenance_leases,
             ),
             name="video-provider-jobs",
+        )
+
+        from cognis.core.binary_transfers import BinaryTransferService
+
+        binary_transfers = BinaryTransferService(session_factory, artifact_store)
+        app.state.binary_transfers = binary_transfers
+        binary_transfer_stop = asyncio.Event()
+        binary_transfer_worker = asyncio.create_task(
+            run_periodic_maintenance(
+                binary_transfers.cleanup,
+                stop=binary_transfer_stop,
+                interval_seconds=60,
+                resource_key="binary-transfer-cleanup",
+                lease_store=maintenance_leases,
+            ),
+            name="binary-transfer-cleanup",
+        )
+
+        from cognis.core.invariants import UntitledConversationReconciler
+
+        untitled_conversations = UntitledConversationReconciler(
+            session_factory, providers.guardrails, event_bus, providers.llm
+        )
+        untitled_title_stop = asyncio.Event()
+        untitled_title_worker = asyncio.create_task(
+            run_periodic_maintenance(
+                untitled_conversations.reconcile,
+                stop=untitled_title_stop,
+                interval_seconds=30,
+                resource_key="untitled-conversation-titles",
+                lease_store=maintenance_leases,
+            ),
+            name="untitled-conversation-titles",
         )
 
         tool_router = await ToolRouter.from_session_factory(
@@ -844,6 +951,7 @@ def create_app(
             shared_connection=shared_runtime.executor_connection,
             session_factory=session_factory,
             project_management_service=project_management_service,
+            usage_query_service=usage_query_service,
             artifact_store=artifact_store,
             knowledgebase_service=knowledgebase_service if knowledgebase_backend_enabled else None,
         )
@@ -948,7 +1056,7 @@ def create_app(
             workflow_registry=workflow_registry,
             event_bus=event_bus,
             agent_registry=agent_registry,
-            llm_provider=providers.llm,
+            websocket_provider=providers.executor.websocket,
             controller_owner_id=controller_runtime.owner_id,
         )
         tool_router._task_queue = task_queue
@@ -1103,9 +1211,13 @@ def create_app(
         # TurnScheduler — core-layer turn orchestration, no WebSocket dependency.
         # Must be registered BEFORE task_queue.start() so recovered tasks
         # that complete during startup have a handler for their follow-up.
+        from cognis.core.initial_profile_selection import InitialProfileSelector
         from cognis.core.turn_scheduler import TurnScheduler
 
         turn_scheduler = TurnScheduler(
+            initial_profile_selector=InitialProfileSelector(
+                session_factory, providers.llm, session_cache
+            ),
             session_factory=session_factory,
             workflow_engine=workflow_engine,
             decision_engine=decision_engine,
@@ -1388,6 +1500,8 @@ def create_app(
                 update_lock=app.state.settings_update_lock,
                 apply=lambda key, value: apply_runtime_setting(app, key, value),
                 secrets=providers.secrets,
+                notify_usage_settings=usage_runtime.notify_settings if usage_runtime else None,
+                usage_settings_committed=usage_runtime.wake if usage_runtime else None,
                 finalize_web=lambda: finalize_web_executor_reconfigure_for_app(
                     app, reason="web_setting_update"
                 ),
@@ -1397,6 +1511,7 @@ def create_app(
             provider_test_cooldowns=app.state.provider_test_cooldowns,
             provider_test_results=app.state.provider_test_results,
             step_profiles=StepProfileManagement(session_factory, step_profile_registry),
+            usage_price_publisher=app.state.usage_price_publisher,
         )
 
         ws_manager = WebSocketConnectionManager(app)
@@ -1429,6 +1544,31 @@ def create_app(
         )
         app.state.intaris_event_store = intaris_event_store
         app.state.cached_event_store = cached_event_store
+        from cognis.api.feedback_sources import FeedbackEventSources
+        from cognis.core.feedback.agents import FeedbackAgents
+        from cognis.core.feedback.primitives import Payloads, Tokens
+        from cognis.core.feedback.service import FeedbackService
+        from cognis.core.feedback.sources import Sources
+        from cognis.core.invariants.feedback import FeedbackReconciler
+
+        feedback_events = FeedbackEventSources(session_factory, cached_event_store)
+        feedback_payloads = Payloads(session_factory, artifact_store)
+        feedback_sources = Sources(
+            session_factory,
+            artifact_store,
+            Tokens(f"feedback:{artifact_signing_secret}"),
+            feedback_events,
+        )
+        feedback_agents = FeedbackAgents(
+            feedback_sources, feedback_payloads, feedback_events.tool_provenance
+        )
+        feedback = FeedbackService(
+            feedback_sources, feedback_payloads, feedback_agents, turn_scheduler, task_queue
+        )
+        agent_loop.configure_feedback_tools(feedback_agents, sharing=feedback.public)
+        tool_router.configure_feedback_tools(feedback_agents, sharing=feedback.public)
+        app.state.feedback = feedback
+        feedback_reconciler = FeedbackReconciler(feedback)
         app.state.shared_chat_snapshot_cache = shared_chat_snapshot_cache
 
         cluster_signals = ClusterSignalService(
@@ -1440,6 +1580,12 @@ def create_app(
             enabled=config_runtime.runtime_mode == "ha",
             event_store=cached_event_store,
             owner_token_secret=artifact_signing_secret,
+            usage_waker=usage_runtime.wake if usage_runtime else None,
+            usage_pricing_waker=(
+                usage_runtime.price_publisher.wake
+                if usage_runtime and usage_runtime.price_publisher
+                else None
+            ),
         )
         app.state.cluster_signals = cluster_signals
         notification_service.cluster_signals = cluster_signals
@@ -1705,6 +1851,19 @@ def create_app(
         providers.channel_binding_lookup = DatabaseManagedChannelBindingLookup(session_factory)
         channel_delivery.set_recipient_resolution_service(providers.recipient_resolution_service)
         managed_channel_service.set_delivery_service(channel_delivery)
+        from cognis.channels.app_contact import AppContactService
+
+        app_contact_service = AppContactService(
+            session_factory=session_factory,
+            session_manager=session_manager,
+            providers=providers,
+            event_bus=event_bus,
+            managed_channels=managed_channel_service,
+            turn_scheduler=turn_scheduler,
+            session_cache=session_cache,
+        )
+        channel_delivery.set_app_contact_service(app_contact_service)
+        app.state.app_contact_service = app_contact_service
         turn_scheduler.set_channel_delivery_service(channel_delivery)
         workflow_engine._channel_delivery = channel_delivery  # noqa: SLF001
 
@@ -1836,7 +1995,11 @@ def create_app(
         app.state.observability_service = observability_service
         recap_service.start()
         hook_runtime.start(scheduler=turn_scheduler, task_queue=task_queue, agent_loop=agent_loop)
-        yield
+        feedback_reconciler.start()
+        try:
+            yield
+        finally:
+            await feedback_reconciler.stop()
 
         await hook_runtime.stop()
         await recap_service.stop()
@@ -1876,6 +2039,18 @@ def create_app(
         await provider_monitor.stop()
         await managed_conversation_maintenance.stop()
         video_stop.set()
+        untitled_title_stop.set()
+        untitled_title_worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await untitled_title_worker
+        binary_transfer_stop.set()
+        binary_transfer_worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await binary_transfer_worker
+        audio_stop.set()
+        audio_worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await audio_worker
         video_worker.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await video_worker
@@ -1890,9 +2065,11 @@ def create_app(
         await remember_queue.stop()
         await tool_classification_queue.stop()
         await providers.executor.cleanup()
+        await providers.llm.aclose()
+        if usage_runtime is not None:
+            await usage_runtime.aclose()
         await cluster_signals.begin_drain()
         await cluster_signals.stop()
-        await providers.llm.aclose()
         await session_cache.aclose()
         await shared_chat_snapshot_cache.aclose()
         await cached_event_store.aclose()
@@ -1909,13 +2086,20 @@ def create_app(
     @asynccontextmanager
     async def monitored_lifespan(app: FastAPI) -> AsyncIterator[None]:
         from cognis.core.profiling_control import ProfilingControl
+        from cognis.core.profiling_owners import ProfilingOwners
 
         async with lifespan(app):
             control = ProfilingControl(
                 app.state.redis_service,
                 app.state.controller_directory,
                 app.state.controller_runtime.owner_id,
-                app.state.session_cache.resource_owner_accounting,
+                ProfilingOwners(
+                    app.state.session_cache.resource_owner_accounting,
+                    {
+                        "turn_scheduler": app.state.turn_scheduler.resource_owner_counts,
+                        "llm": getattr(app.state.providers.llm, "resource_owner_counts", None),
+                    },
+                ),
             )
             app.state.profiling_control = control
             await control.start()
@@ -1924,7 +2108,18 @@ def create_app(
             finally:
                 await control.stop()
 
-    app = FastAPI(title="Cognis", version=__version__, lifespan=monitored_lifespan)
+    @asynccontextmanager
+    async def accounted_lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """Also close usage workers when another service aborts startup/shutdown."""
+        try:
+            async with monitored_lifespan(app):
+                yield
+        finally:
+            runtime = getattr(app.state, "usage_runtime", None)
+            if runtime is not None:
+                await runtime.aclose()
+
+    app = FastAPI(title="Cognis", version=__version__, lifespan=accounted_lifespan)
 
     # Middleware stack (execution order is bottom-to-top):
     # 1. SPA middleware — serves UI static files for non-API paths
@@ -1961,8 +2156,12 @@ def create_app(
         max_parts=52,
     )
     from cognis.api.inference_limits import InferenceBodyLimitMiddleware
+    from cognis.api.usage_lifecycle import UsageDeliveryLifecycleMiddleware
 
     app.add_middleware(InferenceBodyLimitMiddleware)
+    app.add_middleware(
+        UsageDeliveryLifecycleMiddleware, capture=lambda: getattr(app.state, "usage_capture", None)
+    )
     app.add_middleware(AuthenticationMiddleware)
     app.include_router(auth_router)
     app.include_router(profiling_router)
@@ -1976,6 +2175,23 @@ def create_app(
     app.include_router(inference_routes_router)
     app.include_router(system_router)
     app.include_router(artifacts_router)
+    from cognis.api.routes.feedback import (
+        feedback_error_response,
+    )
+    from cognis.api.routes.feedback import (
+        public_router as feedback_public_router,
+    )
+    from cognis.api.routes.feedback import (
+        router as feedback_router,
+    )
+    from cognis.core.feedback.primitives import FeedbackError
+
+    app.include_router(feedback_router)
+    app.include_router(feedback_public_router)
+    app.add_exception_handler(FeedbackError, feedback_error_response)
+    from cognis.api.routes.transfers import router as transfers_router
+
+    app.include_router(transfers_router)
     app.include_router(artifact_documents_router)
     app.include_router(library_router)
     app.include_router(channels_router)
@@ -2010,10 +2226,14 @@ def create_app(
     app.include_router(escalations_router)
     app.include_router(notifications_router)
     app.include_router(inbox_router)
+    app.include_router(app_contacts_router)
     app.include_router(attention_router)
     app.include_router(projects_router)
     app.include_router(push_router)
     app.include_router(tts_router)
+    from cognis.api.routes.audio import router as audio_router
+
+    app.include_router(audio_router)
     app.include_router(stt_router)
     app.include_router(users_router)
 

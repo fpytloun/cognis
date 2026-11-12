@@ -10,15 +10,16 @@ method and feed both the ``file=`` and ``artifact_id=`` paths.
 
 from __future__ import annotations
 
-import asyncio
 import io
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 from cognis.api.app import create_app
+from cognis.core.speech_cache import SpeechGenerationInterrupted
 from cognis.models.config import SpeechToTextResult, TextToSpeechResult
 from cognis.store.queries import (
     create_user,
@@ -79,13 +80,34 @@ class _StubLLMProvider:
         self.synthesize_calls: list[dict[str, Any]] = []
         self.transcribe_calls: list[dict[str, Any]] = []
 
+    async def discover_voices(self, provider_id: str, *, model: str | None = None):
+        return [
+            {"voice_id": voice, "name": voice}
+            for voice in (
+                "alloy",
+                "ash",
+                "coral",
+                "echo",
+                "fable",
+                "onyx",
+                "nova",
+                "sage",
+                "shimmer",
+            )
+        ]
+
     async def resolve_model_target(
-        self, _explicit: str | None, *, task_type: str
+        self,
+        _explicit: str | None,
+        *,
+        task_type: str,
+        acting_user_email: str | None = None,
+        explicit_provider_id: str | None = None,
     ) -> tuple[str, str | None]:
         # Mirror the real LiteLLMProvider contract: returns
         # ``(model_id, provider_id | None)`` — second element is a string id.
         if task_type == "text_to_speech":
-            return "tts-1", "stub-provider"
+            return _explicit or "tts-1", explicit_provider_id or "stub-provider"
         if task_type == "speech_to_text":
             return "whisper-1", "stub-provider"
         raise ValueError(f"unknown task_type {task_type}")
@@ -165,48 +187,55 @@ def _install_stub_llm(client: TestClient) -> _StubLLMProvider:
 
 def test_tts_resynthesis_survives_old_generation_cleanup(monkeypatch, tmp_path):
     from cognis.core.artifact_maintenance import ArtifactMaintenanceService
-    from cognis.store.queries import get_tts_cache_entry, mark_artifact_deleted
+    from cognis.core.speech import cache_identity
+    from cognis.core.speech_models import SpeechRequest
+    from cognis.store.queries import (
+        get_artifact_record,
+        get_tts_cache_entry,
+        mark_artifact_deleted,
+    )
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stub_provider(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stub_provider, client)
+        client.portal.call(_seed_tts_routing, client)
         _install_stub_llm(client)
         headers = _auth_headers(client.app)
         payload = {"text": "Generation race.", "message_id": "msg_race", "voice": "nova"}
+        key = cache_identity(
+            "user@example.com", payload["text"], "stub-provider", SpeechRequest(**payload)
+        )
         first = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
         assert first.status_code == 200
 
         async def tombstone():
             async with client.app.state.session_factory() as db:
-                cached = await get_tts_cache_entry(
-                    db, message_id="msg_race", voice="nova", model="tts-1"
-                )
+                cached = await get_tts_cache_entry(db, message_id=key, voice="nova", model="tts-1")
                 old_id = cached.artifact_id
                 await mark_artifact_deleted(db, old_id)
                 await db.commit()
                 return old_id
 
-        old_id = asyncio.run(tombstone())
+        old_id = client.portal.call(tombstone)
         second = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
         assert second.status_code == 200 and not second.json()["cached"]
         service = ArtifactMaintenanceService(
             session_factory=client.app.state.session_factory,
             artifact_store=client.app.state.artifact_store,
         )
-        asyncio.run(service.run_once())
+        client.portal.call(service.run_once)
 
         async def verify():
             async with client.app.state.session_factory() as db:
-                cached = await get_tts_cache_entry(
-                    db, message_id="msg_race", voice="nova", model="tts-1"
-                )
+                cached = await get_tts_cache_entry(db, message_id=key, voice="nova", model="tts-1")
                 assert cached.artifact_id != old_id
+                record = await get_artifact_record(db, cached.artifact_id)
+                assert record is not None
                 assert await client.app.state.artifact_store.async_exists(
-                    "tts", cached.artifact_id, cached.artifact_filename
+                    record.namespace, record.object_id, record.filename
                 )
 
-        asyncio.run(verify())
+        client.portal.call(verify)
         third = client.post("/api/v1/tts/synthesize", headers=headers, json=payload)
         assert third.status_code == 200 and third.json()["cached"]
 
@@ -215,9 +244,9 @@ def test_tts_synthesize_cache_miss_then_hit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stub_provider(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stub_provider, client)
+        client.portal.call(_seed_tts_routing, client)
         stub = _install_stub_llm(client)
         headers = _auth_headers(client.app)
 
@@ -246,6 +275,131 @@ def test_tts_synthesize_cache_miss_then_hit(
         assert body2["cached"] is True
         assert len(stub.synthesize_calls) == 1
 
+        catalogue = client.get(
+            "/api/v1/tts/voices",
+            params={"provider_id": "stub-provider", "model": "gpt-4o-mini-tts"},
+            headers=headers,
+        )
+        assert catalogue.status_code == 200, catalogue.text
+        assert catalogue.json()["model"] == "gpt-4o-mini-tts"
+        preview = client.post(
+            "/api/v1/tts/synthesize",
+            headers=headers,
+            json={
+                "text": "Selected provider preview.",
+                "provider_id": "stub-provider",
+                "model": "gpt-4o-mini-tts",
+                "voice": "nova",
+            },
+        )
+        assert preview.status_code == 200, preview.text
+        assert stub.synthesize_calls[-1]["provider_id"] == "stub-provider"
+        assert stub.synthesize_calls[-1]["model"] == "gpt-4o-mini-tts"
+
+
+def test_conversation_preflight_uses_authorized_agent_tts_without_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from cognis.store.queries import create_agent
+
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stub_provider, client)
+        stub = _install_stub_llm(client)
+
+        async def seed():
+            async with client.app.state.session_factory() as db:
+                await create_agent(
+                    db,
+                    agent_id="narrator",
+                    owner_email="user@example.com",
+                    name="Narrator",
+                    llm_config={"tts_provider_id": "stub-provider", "tts_model": "gpt-4o-mini-tts"},
+                    status="active",
+                )
+                await db.commit()
+
+        async def resolve(explicit, *, task_type, explicit_provider_id=None, **kwargs):
+            if task_type == "text_to_speech" and explicit is None:
+                raise ValueError("No global TTS route")
+            return explicit or "whisper-1", explicit_provider_id or "stub-provider"
+
+        client.portal.call(seed)
+        stub.resolve_model_target = AsyncMock(side_effect=resolve)
+        stub.discover_voices = AsyncMock(wraps=stub.discover_voices)
+        headers = _auth_headers(client.app)
+        response = client.get("/api/v1/tts/capabilities?agent_id=narrator", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "tts": True,
+            "stt": True,
+            "streaming_tts": True,
+            "streaming_stt": False,
+            "stt_sample_rate": 24000,
+            "detail": None,
+        }
+        stub.discover_voices.assert_not_awaited()
+        assert stub.synthesize_calls == []
+        assert (
+            client.get(
+                "/api/v1/tts/capabilities?agent_id=absent-narrator", headers=headers
+            ).status_code
+            == 404
+        )
+
+
+def test_system_speech_overrides_and_non_retryable_interruption(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    with _create_test_client(monkeypatch, tmp_path) as client:
+        client.portal.call(_seed_user, client)
+        client.portal.call(lambda: _seed_user(client, email="other@example.com"))
+        client.portal.call(_seed_stub_provider, client)
+        stub = _install_stub_llm(client)
+        headers = _auth_headers(client.app)
+        system_id = "system:explore"
+        override = {
+            "tts_provider_id": "stub-provider",
+            "tts_model": "gpt-4o-mini-tts",
+            "tts_voice": "nova",
+        }
+        updated = client.put(
+            f"/api/v1/agents/{system_id}", headers=headers, json={"llm_config": override}
+        )
+        assert updated.status_code == 200, updated.text
+        assert "llm_config.tts_model" in updated.json()["editable_fields"]
+        capabilities = client.get(f"/api/v1/tts/capabilities?agent_id={system_id}", headers=headers)
+        assert capabilities.status_code == 200 and capabilities.json()["tts"] is True
+        body = {"text": "Effective system speech.", "agent_id": system_id}
+        recording = client.post("/api/v1/tts/synthesize", headers=headers, json=body)
+        assert recording.status_code == 200, recording.text
+        assert recording.json()["model"] == "gpt-4o-mini-tts"
+        assert stub.synthesize_calls[-1]["voice"] == "nova"
+        other = client.post(
+            "/api/v1/tts/synthesize",
+            json=body,
+            headers=_auth_headers(client.app, email="other@example.com"),
+        )
+        assert other.status_code == 200, other.text
+        assert other.json()["model"] == "tts-1" and other.json()["voice"] == "alloy"
+        cleared = client.put(
+            f"/api/v1/agents/{system_id}",
+            headers=headers,
+            json={"llm_config": dict.fromkeys(override)},
+        )
+        assert cleared.status_code == 200, cleared.text
+        inherited = client.post("/api/v1/tts/synthesize", headers=headers, json=body)
+        assert inherited.status_code == 200, inherited.text
+        assert inherited.json()["model"] == "tts-1" and inherited.json()["voice"] == "alloy"
+        stub.synthesize = AsyncMock(
+            side_effect=SpeechGenerationInterrupted("Retry explicitly; it may have been billed.")
+        )
+        interrupted = client.post(
+            "/api/v1/tts/synthesize", headers=headers, json={"text": "Interrupted shared work."}
+        )
+        assert interrupted.status_code == 409, interrupted.text
+        assert interrupted.json()["error"]["code"] == "speech_generation_interrupted"
+
 
 def test_tts_synthesize_recovers_from_stale_artifact_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -260,9 +414,9 @@ def test_tts_synthesize_recovers_from_stale_artifact_record(
     from cognis.store.models import TtsCacheRow
 
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stub_provider(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stub_provider, client)
+        client.portal.call(_seed_tts_routing, client)
         _install_stub_llm(client)
         headers = _auth_headers(client.app)
 
@@ -280,7 +434,7 @@ def test_tts_synthesize_recovers_from_stale_artifact_record(
                 await session.execute(delete(TtsCacheRow))
                 await session.commit()
 
-        asyncio.run(_wipe_cache_only())
+        client.portal.call(_wipe_cache_only)
 
         # Second call — must succeed (no IntegrityError on artifacts_pkey).
         second = client.post(
@@ -305,8 +459,8 @@ def test_tts_synthesize_rejects_when_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_tts_routing, client)
         _install_stub_llm(client)
 
         async def _disable() -> None:
@@ -314,7 +468,7 @@ def test_tts_synthesize_rejects_when_disabled(
                 await upsert_setting(session, key="tts.enabled", value=False, category="tts")
                 await session.commit()
 
-        asyncio.run(_disable())
+        client.portal.call(_disable)
 
         response = client.post(
             "/api/v1/tts/synthesize",
@@ -333,9 +487,9 @@ def test_tts_synthesize_handles_string_provider_id_from_resolve(
     *string*, not a row. Earlier the route accessed ``.config`` on the second
     element directly and crashed with ``AttributeError``."""
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stub_provider(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stub_provider, client)
+        client.portal.call(_seed_tts_routing, client)
         _install_stub_llm(client)
 
         response = client.post(
@@ -354,8 +508,8 @@ def test_tts_synthesize_validates_empty_text(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_tts_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_tts_routing, client)
         _install_stub_llm(client)
 
         response = client.post(
@@ -370,7 +524,7 @@ def test_tts_synthesize_no_routing_returns_503(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
+        client.portal.call(_seed_user, client)
         # Intentionally no routing.
 
         # Use a real LLM provider whose resolve_model_target raises when
@@ -400,8 +554,8 @@ def test_tts_synthesize_no_routing_returns_503(
 
 def test_stt_transcribe_multipart_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stt_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stt_routing, client)
         stub = _install_stub_llm(client)
 
         files = {"file": ("voice.webm", io.BytesIO(b"fake-audio"), "audio/webm")}
@@ -424,8 +578,8 @@ def test_stt_transcribe_requires_file_or_artifact_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stt_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stt_routing, client)
         _install_stub_llm(client)
 
         response = client.post(
@@ -438,8 +592,8 @@ def test_stt_transcribe_requires_file_or_artifact_id(
 
 def test_stt_transcribe_rejects_empty_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     with _create_test_client(monkeypatch, tmp_path) as client:
-        asyncio.run(_seed_user(client))
-        asyncio.run(_seed_stt_routing(client))
+        client.portal.call(_seed_user, client)
+        client.portal.call(_seed_stt_routing, client)
         _install_stub_llm(client)
 
         files = {"file": ("voice.webm", io.BytesIO(b""), "audio/webm")}

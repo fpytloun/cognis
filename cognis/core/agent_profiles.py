@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+from typing import Any
 
 from cognis.models.agent import AgentDefinition, AgentRuntimeProfile
 
@@ -253,11 +254,20 @@ def render_agent_profile_context(
     resolved: ResolvedAgentProfile,
     *,
     switch_eligible_profiles: list[tuple[str, str]] | None = None,
+    startup_selection: dict[str, Any] | None = None,
 ) -> str | None:
     """Render the dynamic prompt block for a resolved runtime profile."""
 
     eligible_profiles = switch_eligible_profiles or []
-    if not resolved.system_prompt_extra and resolved.synthetic and not eligible_profiles:
+    classified = (
+        isinstance(startup_selection, dict) and startup_selection.get("classifier_used") is True
+    )
+    if (
+        not resolved.system_prompt_extra
+        and resolved.synthetic
+        and not eligible_profiles
+        and not classified
+    ):
         return None
     lines = [
         "<agent_runtime_profile>",
@@ -282,6 +292,30 @@ def render_agent_profile_context(
                 "</profile_instructions>",
             ]
         )
+    if classified:
+        assert startup_selection is not None
+        outcome = startup_selection.get("profile_id") or "configured default"
+        confidence = startup_selection.get("confidence")
+        prediction = startup_selection.get("prediction_profile_id") or (
+            "configured default" if confidence is not None else "unknown"
+        )
+        lines.extend(
+            [
+                "",
+                "<startup_profile_selection>",
+                f"Startup Auto classifier prediction: {prediction}.",
+                f"Classifier confidence (0–1): {confidence if confidence is not None else 'unknown'}.",
+                f"Startup outcome: {outcome} ({startup_selection['reason']}).",
+                "This was an initial estimate, not a fixed requirement. Respect explicit user "
+                "profile choices.",
+            ]
+        )
+        if any(profile_id != resolved.profile_id for profile_id, _ in eligible_profiles):
+            lines.append(
+                "If task evidence shows another profile is more suitable for the remaining work, "
+                "use switch_agent_profile to select from the currently eligible profiles listed below."
+            )
+        lines.append("</startup_profile_selection>")
     if eligible_profiles:
         lines.extend(["", "<switch_eligible_profiles>"])
         alternatives = 0

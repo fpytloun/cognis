@@ -15,6 +15,7 @@ from cognis.core.session import _intaris_session_policy
 from cognis.models.agent import AgentCapabilities
 from cognis.models.tool import ToolCall
 from cognis.models.workflow import SessionPolicy, WorkflowDefaults, merge_session_policies
+from cognis.providers.guardrails.errors import IntarisHTTPError
 from cognis.providers.guardrails.intaris import IntarisProvider, _safe_evaluation_error_detail
 from cognis.tools.builtin.agent_management import handle_agent_management_tool
 from cognis.tools.builtin.schedule import handle_schedule_tool
@@ -69,21 +70,24 @@ async def test_evaluate_http_diagnostics_exclude_response_echoes(status: int) ->
         with pytest.raises(httpx.HTTPStatusError) as caught:
             await provider.evaluate("session-evaluation", "read", {"path": secret})
         error = caught.value
-        assert type(error) is httpx.HTTPStatusError
+        assert type(error) is IntarisHTTPError
         assert error.request is requests[0]
         assert error.response is responses[0]
         assert error.response.status_code == status
         assert len(requests) == 1
         assert secret not in str(error)
+        assert type(error.__cause__) is httpx.HTTPStatusError
+        diagnostic = str(error.__cause__)
+        assert secret not in diagnostic
         if status == 422:
-            assert '"loc":["body","context"],"type":"value_error"' in str(error)
-            assert '"type":"unknown"' in str(error)
-            assert "input" not in str(error)
+            assert '"loc":["body","context"],"type":"value_error"' in diagnostic
+            assert '"type":"unknown"' in diagnostic
+            assert "input" not in diagnostic
         else:
-            assert '"code":"context_insufficient"' in str(error)
-            assert '"estimated_input_tokens":11250' in str(error)
-            assert "framing_tokens" not in str(error)
-            assert "margin_tokens" not in str(error)
+            assert '"code":"context_insufficient"' in diagnostic
+            assert '"estimated_input_tokens":11250' in diagnostic
+            assert "framing_tokens" not in diagnostic
+            assert "margin_tokens" not in diagnostic
     finally:
         await provider.client.aclose()
 
@@ -244,7 +248,7 @@ async def test_schedule_tool_rejects_nested_mode(action: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_tool_rejects_mode_even_with_self_mutation_approval() -> None:
+async def test_agent_tool_rejects_mode_without_root_owner_context() -> None:
     result = await handle_agent_management_tool(
         tool_name="manage_agents",
         arguments={"action": "settings_update", "settings": {"intaris_evaluation": "legacy"}},
@@ -278,7 +282,15 @@ async def test_wire_acknowledgement(operation: str, mode: str, matches: bool) ->
             assert json.loads(request.content)["policy"] == policy
         if operation == "conflict" and request.method == "POST":
             return httpx.Response(409, json={})
-        return httpx.Response(200, json={"active_policy": acknowledged, "policy": acknowledged})
+        return httpx.Response(
+            200,
+            json={
+                "active_policy": acknowledged,
+                "policy": acknowledged,
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            },
+        )
 
     provider = IntarisProvider(
         "http://intaris.test", SimpleNamespace(sign_service_jwt=lambda *a, **kw: "signed-token")
@@ -316,7 +328,16 @@ async def test_hybrid_cannot_silently_run_on_old_intention_ack() -> None:
     await provider.client.aclose()
     provider.client = httpx.AsyncClient(
         base_url="http://intaris.test",
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "analytics_enabled": True,
+                    "guardrails_enabled": True,
+                },
+            )
+        ),
     )
     try:
         with pytest.raises(ValueError, match="active_policy"):
@@ -338,7 +359,14 @@ async def test_stored_policy_is_not_hybrid_activation_ack(operation: str) -> Non
     def respond(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             return httpx.Response(409, json={})
-        return httpx.Response(200, json={"policy": policy})
+        return httpx.Response(
+            200,
+            json={
+                "policy": policy,
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            },
+        )
 
     provider = IntarisProvider(
         "http://intaris.test", SimpleNamespace(sign_service_jwt=lambda *a, **kw: "signed-token")
@@ -379,9 +407,25 @@ async def test_hybrid_maximum_outcome_ack_uses_stored_policy(
     def respond(request: httpx.Request) -> httpx.Response:
         if request.method == "POST":
             # IntentionResponse: snapshot only, no session policy.
-            return httpx.Response(200, json={"ok": True, "active_policy": snapshot})
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "active_policy": snapshot,
+                    "analytics_enabled": True,
+                    "guardrails_enabled": True,
+                },
+            )
         # PATCH and GET return SessionResponse with both.
-        return httpx.Response(200, json={"policy": stored, "active_policy": snapshot})
+        return httpx.Response(
+            200,
+            json={
+                "policy": stored,
+                "active_policy": snapshot,
+                "analytics_enabled": True,
+                "guardrails_enabled": True,
+            },
+        )
 
     provider = IntarisProvider(
         "http://intaris.test", SimpleNamespace(sign_service_jwt=lambda *a, **kw: "signed-token")
@@ -427,7 +471,7 @@ def test_approval_mode_validation_and_default() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("value", [None, "ask", "unattended"])
 @pytest.mark.parametrize("action", ["settings_update", "create", "update"])
-async def test_agent_tool_rejects_approval_mode_even_with_self_mutation_approval(
+async def test_agent_tool_rejects_approval_mode_without_root_context_or_at_opaque_paths(
     value: str | None, action: str
 ) -> None:
     deps = Mock()
@@ -440,7 +484,10 @@ async def test_agent_tool_rejects_approval_mode_even_with_self_mutation_approval
         self_mutation_approved=True,
     )
     assert result.is_error
-    assert "human_policy_selection_required" in result.output
-    assert "approval mode" in result.output
+    if action == "settings_update":
+        assert result.metadata["code"] == "agent_management_context_denied"
+    else:
+        assert "human_policy_selection_required" in result.output
+        assert "approval mode" in result.output
     assert deps.mock_calls == []
     assert profile_mutation_error({"capabilities": {"approval_mode": value}}).is_error

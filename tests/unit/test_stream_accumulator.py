@@ -55,12 +55,12 @@ def test_nested_management_envelope_survives_fragmentation(wrapper: str | None) 
         "memory_backend": "mnemory",
         "memory_backend_options": {"mode": "full_auto"},
     }
-    envelope = {"action": "settings_update", "agent_id": "fixture-agent", "settings": settings}
+    envelope = {"action": "settings_update", "agent_id": "sample-agent", "settings": settings}
     if wrapper:
         _feed_tool_delta(acc, '{"tool":"manage_agents","arguments":', name=wrapper)
     _feed_tool_delta(
         acc,
-        '{"action":"settings_update","agent_id":"fixture-agent","settings":',
+        '{"action":"settings_update","agent_id":"sample-agent","settings":',
         name=wrapper or "manage_agents",
     )
     _feed_tool_delta(acc, json.dumps(settings), name=wrapper or "manage_agents")
@@ -296,20 +296,19 @@ def test_oversized_tool_arguments_become_recoverable_failure() -> None:
 
 
 def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
-    """Recover a synthetic Unicode task with fictional external bindings."""
     acc = StreamAccumulator()
     _feed_tool_delta(
         acc,
-        '{"tasks":[content":"Aktualizovat zkušební katalog",'
+        '{"tasks":[content":"Ověřit ukázkové popisky katalogu",'
         '"description":"","priority":"p4","dueString":"Monday",'
         '"deadlineDate":"","duration":"","labels":[],"'
-        'projectId":"demoProject000001","sectionId":"demoSection000001",'
+        'projectId":"project-demo-catalog","sectionId":"section-demo-labels",'
         '"parentId":"","order":0,"responsibleUser":"",'
-        '"isUncompletable":false}]}{"tasks":[{"content":"Aktualizovat zkušební '
-        'katalog","description":"","priority":"p4",'
+        '"isUncompletable":false}]}{"tasks":[{"content":"Ověřit ukázkové '
+        'popisky katalogu","description":"","priority":"p4",'
         '"dueString":"Monday","deadlineDate":"","duration":"",'
-        '"labels":[],"projectId":"demoProject000001",'
-        '"sectionId":"demoSection000001","parentId":"","order":0,'
+        '"labels":[],"projectId":"project-demo-catalog",'
+        '"sectionId":"section-demo-labels","parentId":"","order":0,'
         '"responsibleUser":"","isUncompletable":false}]}',
         name="mcp__todoist_add_tasks",
     )
@@ -319,15 +318,15 @@ def test_recover_trailing_valid_object_for_mcp_tool_arguments() -> None:
     assert calls[0].arguments == {
         "tasks": [
             {
-                "content": "Aktualizovat zkušební katalog",
+                "content": "Ověřit ukázkové popisky katalogu",
                 "description": "",
                 "priority": "p4",
                 "dueString": "Monday",
                 "deadlineDate": "",
                 "duration": "",
                 "labels": [],
-                "projectId": "demoProject000001",
-                "sectionId": "demoSection000001",
+                "projectId": "project-demo-catalog",
+                "sectionId": "section-demo-labels",
                 "parentId": "",
                 "order": 0,
                 "responsibleUser": "",
