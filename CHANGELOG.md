@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
-## [0.19.0] - 2026-11-12
+## [0.19.0] - 2026-11-13
 
 ### Added
 
@@ -29,6 +29,7 @@ All notable changes to this project will be documented in this file.
 - Task outcomes support direct delivery, agent handling, and optional finish instructions. Default handling sends successful results directly and uses an agent for other outcomes. Existing always-agent settings remain available as Agent. Primary agents can inspect and revise their owner's tasks from the owner's main chat. Task history distinguishes previous outputs from a replacement in progress.
 ### Fixed
 
+- Restore the chat deliverable footer below the document and remove the separate task link line under successful task results.
 - Preserve message order, interrupted replies, queued input, and the current request across refresh, compaction, and reconnects. Repair disconnected device-history windows and duplicate cached timeline identities. Add Force refresh to rebuild server history without discarding unsent or recoverable input. Recover PWA sessions after temporary browser-storage failures.
 - Added document-local Find with Command-F / Ctrl-F, literal matching, match counts and previous/next navigation for opened deliverables and text, HTML and PDF artifacts. Chat and documents share compact search controls inside their existing toolbar, without covering or shifting content. On phones search replaces the header contents at the same height. Document action bars and extended menus offer search on touch devices. Search stays inside the document instead of reaching the Library or a view behind a modal.
 - Unify document controls and revision selection across chat, Work, Library, and standalone viewers. Include assistant attachments in Work, group image revisions in a gallery, and prepare authorized documents with chat history. Improve PDF zoom, mobile controls, rich-document first paint, and public audio and video previews.

@@ -22,8 +22,8 @@ from scripts import export_usage_query_contract as exporter
 ROOT = exporter.ROOT
 CONTRACTS = ROOT / "ui/e2e/usage/contracts"
 VALIDATOR = ROOT / "ui/e2e/usage/validate-fixtures.py"
-SOURCE = "3520924c472de4ea20cc69e918f58015fbe475d6"
-TREE = "ee87d2c4ed0a8b61ff10ac70d22ba5c0478802f0"
+SOURCE = "19550ae31b60471c4bacff95b2ad888320761a99"
+TREE = "ca613d218bcc75556dd723045e0fb9143c37006f"
 START = datetime(2026, 10, 1, tzinfo=UTC)
 models = exporter.query_models
 

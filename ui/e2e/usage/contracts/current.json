@@ -1,9 +1,9 @@
 {
   "format_version": 1,
-  "directory": "3520924c472d",
+  "directory": "19550ae31b60",
   "sha256": {
     "usage-query-contract.json": "46df2086e8d39de72ebc31415d30eab0f0cb14fa1152067388795a9df1de3b23",
     "usage-query-api.md": "e9f3dc83c4ab8f6f04e1b36e3d33ec3cb0eb0edc5b7c440860bf1efae548e480",
-    "provenance.json": "ccdab24570edcbb56dede51bbfae99a93f81ef331e1fd7097fe0b330d989347d"
+    "provenance.json": "cdce66988e580da882a42d2368c9edeeca65951190f8affa410d8c3346ee28b3"
   }
 }

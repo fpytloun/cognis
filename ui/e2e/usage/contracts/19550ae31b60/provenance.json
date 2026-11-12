@@ -1,7 +1,7 @@
 {
   "format_version": 1,
-  "model_source_commit": "3520924c472de4ea20cc69e918f58015fbe475d6",
-  "model_source_tree": "ee87d2c4ed0a8b61ff10ac70d22ba5c0478802f0",
+  "model_source_commit": "19550ae31b60471c4bacff95b2ad888320761a99",
+  "model_source_tree": "ca613d218bcc75556dd723045e0fb9143c37006f",
   "sources": {
     "cognis/core/usage/query_models.py": {
       "git_blob": "2ecf5923a84474120cdd4b4b2057a0fea4f434b4",
