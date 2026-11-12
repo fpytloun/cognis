@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from cognis.bootstrap import bootstrap_runtime
 from cognis.config import load_config
+from cognis.core.program_config import PROGRAM_RUNTIME_PROFILE_LABEL
 from cognis.logging import setup_logging
 from cognis.models.agent import AgentDefinition
 from cognis.models.session import SessionEvent
@@ -285,7 +286,11 @@ async def _seed_executor(
     config: LocalSeedConfig,
     auth_provider: JWTAuthProvider,
 ) -> str:
-    labels = {"deployment": "local-compose", "role": "primary"}
+    labels = {
+        "deployment": "local-compose",
+        "role": "primary",
+        PROGRAM_RUNTIME_PROFILE_LABEL: "pod",
+    }
     enabled_tool_groups = ["filesystem", "shell", "web", "browser", "development", "office"]
     existing = await get_executor_row(session, EXECUTOR_ID)
     if existing is None:

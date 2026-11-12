@@ -8,6 +8,16 @@
 
 ## UI problems
 
+- **The PWA returns to login after resuming**
+  - Startup tries the refresh cookie when the access cookie has expired.
+  - A temporary browser storage-coordination failure revokes existing document
+    access and shows a loading/recovery state, rather than declaring the session
+    expired. Recovery rechecks coordination and the server session, including
+    when the app comes online or becomes visible. Persistent storage failure
+    remains fail-closed; use the workspace Retry action once storage is available.
+  - Explicit logout is not undone by automatic recovery, even if storage fails.
+  - A deployed service-worker update can also reload the installed PWA. That
+    update reload is separate from authentication recovery.
 - **The browser opens `:8080` but no UI is shown**
   - Confirm bundled UI assets are present.
   - If you intentionally split deployments, set `COGNIS_SERVE_UI=false` and serve the UI separately.
@@ -32,6 +42,38 @@
     access plans without changing server defaults or leaving pooled connections
     modified. The transaction closes before URL generation.
   - Investigate the slow stage before extending deadlines or flushing caches.
+
+## Slow chat replies
+
+Runtime preparation batches visible skills' current versions and assets rather
+than issuing one pair of queries per skill. Executor selection and inventory
+assembly reuse one build-owned pool observation when it contains the selected
+executor; a concurrent pin winner outside that observation triggers a fresh
+resolution. Context and tool admission still refresh eligibility independently.
+Forwarded catalog reads use the physical owner's catalog cache, with bridge
+ownership checks and an overall deadline covering cache-lock waits. Forwarders
+do not retain a separate catalog cache.
+
+- Correlate `turn: stage completed` logs by `session_id` and `turn_id`.
+  `runtime.resolve` covers runtime admission, while `runtime.build_attempt`
+  covers each attempt, including an interrupted attempt before recovery.
+- Runtime child stages distinguish `runtime.policy_load`, `runtime.pin_read`,
+  `runtime.scope_resolve`, `runtime.executor_select`, `runtime.pool_resolve`,
+  `runtime.web_config`, `runtime.image_tool_descriptions`, and
+  `runtime.skills_resolve`. Remote admission additionally records
+  `runtime.catalog_read`, `runtime.inventory_merge` (including program policy
+  and MCP composition), and `runtime.registry_build`.
+- `runtime.recovery_wait` measures the connection wait only, not durable
+  recovery bookkeeping or retry backoff. Stages are emitted only for executed
+  paths. They contain identifiers, duration, and outcome, not request content.
+- Do not add parent and child durations: they overlap. Child stages are not
+  exhaustive; compare them with the enclosing attempt to locate remaining work.
+  An `interrupted` outcome means the operation raised or was cancelled, even
+  when the caller subsequently recovered.
+- Provider stream durations are not isolated model compute. Logged time to first
+  token may include reasoning or tool deltas, not visible text. Measure browser
+  submission, first visible text, and completion separately before claiming an
+  end-to-end latency improvement.
 
 ## Provider problems
 

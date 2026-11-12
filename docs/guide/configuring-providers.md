@@ -45,6 +45,62 @@ For provider-specific settings not covered by the structured fields (e.g., Azure
 
 ## Common provider choices
 
+### Explicit untiered aggregate-token estimates
+
+An omitted service tier is normally unknown, not an untiered tariff. Two audited
+OpenAI SDK resources can additionally carry operation-scoped evidence that the
+service-tier parameter is not applicable: `embeddings.create` and
+`images.generate`. This does not qualify image edits, other embedding transports,
+audio, video, or arbitrary compatible API extensions.
+
+The initial configuration surface is the owner-authorized provider API:
+`POST /api/v1/llm-providers` or `PUT /api/v1/llm-providers/{provider_id}`.
+Set the declaration and explicit scalar rates together on the corresponding
+`config.models[]` entry. Preserve the provider's other intended configuration
+when updating it. There is no new tariff editor or automatic catalog conversion.
+
+For example, this model entry declares an **illustrative configured estimate**,
+not the model's published provider price:
+
+```json
+{
+  "model_id": "text-embedding-3-small",
+  "model_mode": "embedding",
+  "input_cost_per_mtok": 2.0,
+  "untiered_tariff": {
+    "version": 1,
+    "scope": {
+      "version": 1,
+      "resource": "openai.embeddings.create",
+      "abi_revision": 1
+    },
+    "billing_basis": "aggregate_input_tokens"
+  }
+}
+```
+
+For `openai.images.generate`, use `aggregate_input_output_tokens` and explicitly
+configure both `input_cost_per_mtok` and `output_cost_per_mtok`. This declaration
+means the scalar rates cover the reported aggregate token totals. It does **not**
+model heterogeneous text/image rates, per-image/size/quality charges, audio
+seconds, or video billing. Do not declare an aggregate tariff unless that
+configured estimate is the intended cost basis.
+
+The runtime independently requires the exact audited resource/ABI and absence of
+unproven construction overrides. User kwargs, `extra_body`, arbitrary extensions,
+provider defaults, a compatible hostname, and `tier: "standard"` cannot supply
+this evidence. Missing required native usage still prevents a complete estimate.
+Old null tariffs and historical unknown tiers are not converted or backfilled
+into this contract. A cold price cache remains unpriced without inference-time
+SQL or provider calls.
+An observed image count or other media unit with no applicable rate keeps the
+result partial, even when its aggregate-token subtotal is known.
+
+The new optional fields extend strict persisted and executor payloads. Upgrade
+controller, common and executor packages together before capturing this evidence;
+older binaries are not supported readers of newly extended payloads. Existing
+payloads without the fields retain their unknown semantics and booked costs.
+
 ### Hosted providers and System One
 
 Select Groq, OpenRouter, Gemini, or System One in the provider form. The form
@@ -68,11 +124,22 @@ endpoint, on either the controller or an executor.
 
 System One models return typed Choice, Score, and Noul results, not generated
 text. Cognis excludes decision models from agent/chat model options. Select
-`typesafe/jev-1.13` (pinned version) or `~typesafe/jev-latest` (latest alias) only
-for the `intaris_evaluation` companion override, or access it explicitly through
+`typesafe/jev-1.13` (pinned version) or `~typesafe/jev-latest` (latest alias)
+for the `classifier` route or `intaris_evaluation` companion override, or access it explicitly through
 the [inference API](inference-api.md). OpenRouter and direct TypeSafe providers
 use the same native contract. Both controller and executor locations work;
 credentials are resolved by the controller before executor dispatch.
+
+The `classifier` route answers typed questions for tool metadata and skill-tool
+selection. It supports both native decision models and chat models, including
+mixed native/chat fallback targets in a named inference route. Tool permissions
+and candidate validation still apply; a classification never grants access.
+
+The separate `auxiliary_generation` route generates conversation titles and recaps,
+composes workflows, and decomposes skills into workflow steps. It requires a chat model
+and inherits the default chat route when unset. If these jobs previously used
+your classifier's chat model, assign that model to `auxiliary_generation`
+before changing `classifier` to Jev.
 
 `typesafe/jev-router` is a **chat router**, not a System One evaluator. It
 remains available for chat. Rediscover models after upgrading to refresh the

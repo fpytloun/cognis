@@ -15,11 +15,14 @@ from zipfile import ZipFile
 COMMON_ALLOWED_PREFIXES = (
     "cognis/__init__.py",
     "cognis/json_codec.py",
+    "cognis/json_schema.py",
     "cognis/json_stream.py",
+    "cognis/executor_transport.py",
     "cognis/guardrails_redaction.py",
     "cognis/logging.py",
     "cognis/mcp_runtime.py",
     "cognis/ownership.py",
+    "cognis/program_guidance.py",
     "cognis/providers/retry.py",
     "cognis/providers/circuit_breaker.py",
     "cognis/core/anchored_output.py",
@@ -37,10 +40,24 @@ COMMON_ALLOWED_PREFIXES = (
     "cognis/providers/llm/bedrock.py",
     "cognis/providers/llm/cache_policy.py",
     "cognis/providers/llm/hosted.py",
+    "cognis/providers/llm/elevenlabs.py",
+    "cognis/providers/llm/image_api.py",
     "cognis/providers/llm/image_config.py",
+    "cognis/providers/llm/speech_streaming.py",
     "cognis/providers/llm/systemone.py",
     "cognis/providers/llm/terminal.py",
+    "cognis/providers/llm/usage_binding.py",
+    "cognis/providers/llm/usage_capture.py",
+    "cognis/providers/llm/usage_http.py",
+    "cognis/providers/llm/usage_normalization.py",
+    "cognis/providers/llm/usage_parameters.py",
+    "cognis/providers/llm/usage_sdk.py",
+    "cognis/providers/llm/usage_sdk_dispatch.py",
+    "cognis/providers/llm/usage_sdk_litellm.py",
+    "cognis/providers/llm/usage_sdk_openai.py",
+    "cognis/providers/llm/usage_sdk_purpose.py",
     "cognis/providers/video.py",
+    "cognis/providers/video_errors.py",
     "cognis/providers/video_media.py",
     "cognis/rendering/rich_visuals.py",
     "cognis/tools/argument_normalization.py",
@@ -53,6 +70,7 @@ COMMON_ALLOWED_PREFIXES = (
     "cognis/tools/introspection.py",
     "cognis/tools/native_validation.py",
     "cognis/tools/registry.py",
+    "cognis/transfers/",
 )
 COMMON_FORBIDDEN_IMPORTS = (
     b"\nimport subprocess",
@@ -61,7 +79,13 @@ COMMON_FORBIDDEN_IMPORTS = (
     b"\nfrom multiprocessing",
     b"create_subprocess",
 )
-COMMON_RUNTIME_IMPORT_ALLOWED_PREFIXES = ("cognis/channels/adapters/signal_cli_",)
+# Shared runtime used by both controller and executor processes: the Signal
+# adapter runs signal-cli, and ElevenLabs Scribe transcription (controller and
+# executor-routed inference) converts recordings with FFmpeg.
+COMMON_RUNTIME_IMPORT_ALLOWED_PREFIXES = (
+    "cognis/channels/adapters/signal_cli_",
+    "cognis/providers/llm/elevenlabs.py",
+)
 FORBIDDEN_EXECUTOR_PREFIXES = (
     "cognis/api/",
     "cognis/store/",

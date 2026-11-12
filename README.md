@@ -6,12 +6,11 @@
 
 **Cloud-native Agent OS for self-hosted AI agents.** Cognis is not only a place to chat with agents. It is a workspace where agents perform, coordinate, and expose real work. Use it at your desk, at home, or from your phone.
 
-![Cognis desktop workspace with an agent conversation and its Work inspector](docs/assets/screenshots/showcase/desktop-workspace.png)
-
-*A desktop conversation with its work history alongside it. Fictional demo data.
-[Explore the product showcase](docs/guide/showcase.md).*
-
 Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
+
+<p align="center">
+  <img src="docs/assets/images/cognis-cloud-native-agent-os.svg" alt="Cognis cloud-native Agent OS architecture" />
+</p>
 
 Cognis works with companion services for memory and guardrails:
 
@@ -36,41 +35,82 @@ Cognis works with companion services for memory and guardrails:
 
 ## Screenshots
 
-Screenshots use fictional demo data. Example metrics are not product benchmarks.
+The screenshots use Lumen, a fictional lighting company with a crew of four
+agents: Atlas coordinates, Forge writes code, Iris writes and researches, and
+Vela runs operations.
 
-### Inspect the work behind a reply
+![Cognis dashboard with agents, upcoming schedules, finished tasks and conversations waiting for review](docs/assets/screenshots/dashboard.webp)
 
-The activity sidebar shows the files, commands, mutations, artifacts, and
-deliverables for the current work graph. Open command output or inspect a diff
-while the agent continues its work.
+### Work in windows
 
-![An inline file diff beside the agent conversation](docs/assets/screenshots/showcase/desktop-diff.png)
+Open conversations and documents as windows on the dashboard, find anything
+with the command palette, and switch between them from the dock.
 
-### Keep approvals in your hands
+![Opening a conversation and a document as dashboard windows and switching between them](docs/assets/screenshots/dashboard-windows.gif)
 
-Tasks have visible phases, step results, and approval gates. Review the evidence
-and decide whether work should continue.
+### Agents one click away
 
-![A task cockpit paused at a human approval gate](docs/assets/screenshots/showcase/task-approval.png)
+Pin a chat and its agent stays at the edge of the screen on every page. Click
+an avatar to open a compact chat, switch between agents, and get back to work.
+In the [macOS app](docs/guide/macos-companion.md), pinned agents float on the
+desktop itself, so they are available over any application, even with the
+Cognis window closed.
 
-### Get more than a wall of text
+![Opening pinned agent chats from the Library and switching between agents](docs/assets/screenshots/pinned-chats.gif)
 
-Rich deliverables turn results into readable reports, comparisons, dashboards,
-and versioned documents. The example below uses synthetic dashboard data.
+### Results you can review
 
-![A rich deliverable with example metrics and a grouped chart](docs/assets/screenshots/showcase/rich-dashboard.png)
-
-### Continue from your phone
-
-The responsive mobile workspace keeps task context and approval controls
-accessible away from your desk.
+Agents deliver structured documents with metrics, charts and figures. Select
+any part of a result, comment on it, and send the feedback straight back to the
+agent.
 
 <p align="center">
-  <img src="docs/assets/screenshots/showcase/mobile-approval.png" alt="Mobile task view with an approval gate and bottom navigation" width="330" />
+  <img src="docs/assets/screenshots/rich-overview.png" alt="Rich launch plan with audience metrics and an autumn illustration" />
 </p>
 
-[See the complete product showcase](docs/guide/showcase.md) for desktop windows,
-activity inspection, task approvals, rich deliverables, and mobile views.
+![Selecting a figure in a document, commenting on it and sending the feedback to the agent](docs/assets/screenshots/work-feedback.gif)
+
+### Projects
+
+Each project brings its agents, conversations, tasks, schedules and resources
+together, and can be shared with a team.
+
+![Project dashboard with assigned agents and conversations waiting for review](docs/assets/screenshots/project-dashboard.webp)
+
+### Know what it costs
+
+Usage shows spend by day, provider, model, agent, project and conversation.
+Drill into an expensive day and follow the cost flow down to the tasks and
+chats behind it.
+
+![Drilling from the most expensive day into the cost flow by project, agent and conversation](docs/assets/screenshots/usage-drilldown.gif)
+
+### See what agents are doing
+
+The Work view groups files, commands, mutations, artifacts and deliverables
+for the current work. Inspect changed files, expand a diff, and read command
+output.
+
+<p align="center">
+  <img src="docs/assets/screenshots/work-file-navigation.png" alt="Changed-file tree with the new cart tests selected" width="49%" />
+  <img src="docs/assets/screenshots/desktop-work-diff.webp" alt="Conversation beside the saved-carts source diff" width="49%" />
+</p>
+
+![Work command history with git diff output](docs/assets/screenshots/desktop-work-commands.webp)
+
+### Keep working from mobile
+
+Follow running sessions, check activity and review changes from the
+installable mobile app.
+
+<p align="center">
+  <img src="docs/assets/screenshots/mobile-conversations.webp" alt="Mobile conversation list with an agent working" width="32%" />
+  <img src="docs/assets/screenshots/mobile-ongoing-work.webp" alt="Mobile overview with a running session" width="32%" />
+  <img src="docs/assets/screenshots/pwa-chat.webp" alt="Mobile chat with file edits and command activity" width="32%" />
+</p>
+
+[See the complete product showcase](docs/guide/showcase.md). Compare the
+[appearance families in Light and Dark](docs/guide/appearance.md#appearance-gallery).
 
 ## Features
 
@@ -99,8 +139,6 @@ to compare versions and review upgrade notes. Contributors maintain release
 fragments as described in [changelog.d](changelog.d/README.md).
 
 ## Architecture
-
-![Cognis cloud-native Agent OS architecture](docs/assets/images/cognis-cloud-native-agent-os.svg)
 
 ![Cognis ecosystem overview](docs/assets/images/cognis-ecosystem-overview.svg)
 
@@ -354,6 +392,7 @@ Still ahead:
 - [Creating Agents](docs/guide/creating-agents.md)
 - [Using Chat](docs/guide/using-chat.md)
 - [Managing Tasks](docs/guide/managing-tasks.md)
+- [Work Feedback](docs/guide/work-feedback.md)
 - [Schedules](docs/guide/schedules.md)
 - [Workflows](docs/guide/workflows.md)
 - [Tools and Skills](docs/guide/tools-and-skills.md)

@@ -465,6 +465,13 @@ transcript shape. It is intentionally distinct from compaction:
   repeatedly recovering the same output.
 - Projection modes are `normal`, `pressure`, and `critical`. The agent loop
   retries stricter projection before treating context pressure as a hard stop.
+- Fresh tool image blocks after the latest assistant tool batch remain available
+  until a subsequent assistant response. Text results remain prunable. This is
+  derived from canonical message order, so retries and cold/rotated replay need
+  no mutable delivery flag; existing hard-budget admission still applies.
+- New attachment placeholders use rendering policy 2 and recover through
+  `artifact_read` with canonical artifact IDs. Persisted policy-1 decisions
+  retain their original rendering. Neither policy changes artifact access.
 - Projection is not user-visible during normal operation. It is logged and
   summarized in `/context` and `/info`; compaction remains the visible session
   lifecycle event.

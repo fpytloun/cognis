@@ -21,8 +21,11 @@ class CustomBuildHook(BuildHookInterface):
     PLUGIN_NAME = "custom"
 
     def initialize(self, version: str, build_data: dict[str, object]) -> None:
-        del version
-        self._maybe_build_ui()
+        # Editable installs (uv sync, uv run) must not rebuild the UI: every
+        # pyproject change would rerun npm ci and two builds outside the
+        # validation lock. Already built assets are still staged.
+        if version != "editable":
+            self._maybe_build_ui()
         self._stage_built_assets()
         if self.target_name == "sdist" and PACKAGE_UI_DIR.exists():
             force_include = build_data.setdefault("force_include", {})

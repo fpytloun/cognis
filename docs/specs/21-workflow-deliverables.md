@@ -19,6 +19,31 @@ This document defines:
 
 Related specs: [`14-workflow-engine.md`](14-workflow-engine.md), [`22-step-profiles.md`](22-step-profiles.md), [`06-tool-system.md`](06-tool-system.md), [`09-ui-ux.md`](09-ui-ux.md), [`27-workflow-composer.md`](27-workflow-composer.md).
 
+## Task output presentation
+
+Task-owned writes append the existing UI-only `assistant_deliverable` event to
+the tool cycle's canonical event batch after persistence, before subsequent
+progress. Direct-chat turn-end presentation is unchanged. This reuses the
+existing Intaris append/idempotency boundary and scheduler cancellation owner;
+there is no new event type, DB field, external dispatch, or retry policy.
+
+`core/task_output_presentation.py` owns read-only workflow freshness and task
+output selection. Task detail, summary, step metadata, and authorized inline
+document hydration consume the same resolver. Its state lasts for one metadata
+read; publication, access checks, and document-lineage semantics are unchanged.
+The canonical step deliverable pointer establishes a newly written output even
+before step completion. A cleared pointer or superseded producer retains the
+previous output as stale until replacement, including paused or terminal
+replacement states. Final-result selection uses an explicit canonical result or
+a proven linear producer from the pinned workflow; uncertain ownership stays
+unknown.
+
+Pre-change histories without a canonical deliverable timeline item retain the
+existing epilogue document path. That path renders resolver freshness and is
+suppressed when the document is already in the timeline. It can be removed when
+pre-change task histories are no longer supported; no receipt projection or
+event-store backfill is introduced.
+
 ## Motivation
 
 Before this spec, a workflow step's user-facing output was whatever free text the assistant wrote before calling `step_complete`. That shape was responsible for an entire class of observed regressions:
@@ -45,6 +70,26 @@ Inside a workflow step, the model authors the user-facing output with one `write
 ### 2. One delivery per workflow
 
 A workflow may have many steps, and every step may write deliverables. Exactly one deliverable — the final delivering step's latest approved version — is delivered to the channel. All other deliverables remain buffered in the database for the UI and for evaluator input.
+
+An Agent outcome-handling turn may explicitly forward an already authorized
+deliverable with `attach_artifact(content_ref=...)`. This presents the existing
+document/revision; it neither reauthors the document nor changes its owning step.
+Automatic step authoring still does not emit a direct-chat deliverable event.
+
+The direct turn owns its primary presentation reference and pending reference
+events for that turn, including compaction/retry continuation. The last authored
+or attached direct-chat document supplies the final `StepOutput` reference.
+Reference events use the existing append/deduplication boundary; scheduler
+cancellation and project-recipient admission/delivery guards remain authoritative.
+There is no new transaction, lock, stored content copy, or permission grant.
+Database authorization finishes before event-store or channel I/O.
+
+Reference attachment and canonical media materialization share document-read
+authorization, independently of the source task's delivery policy or status.
+An explicit document project remains authoritative. Otherwise, published task
+or conversation provenance can supply read access only when both that source
+and the acting agent's project scope are readable. This read-only inheritance
+does not share the document, grant revision rights, or relax automatic fan-out.
 
 ### 3. Delivery is gated on acceptance and approval
 

@@ -29,3 +29,14 @@ New cursors bind the conversation and event-kind filter.
 The `around` anchor uses a sequence-number window, not a count of matching events.
 Known history gaps appear in `history_gaps`; filtered sequence gaps alone do not prove retention loss.
 Legacy output search and anchor tools remain unchanged.
+
+## Image attachments
+
+`artifact_read` can prepare an authorized image for a subsequent inference.
+Successful preparation is not confirmation that the model received its pixels:
+context budgets, authorization and provider materialization still apply.
+
+An attachment-compacted notice means its visual block was omitted from model
+context, not that its file was deleted. Use `artifact_read` with the exact
+artifact ID to prepare the image again. `read_tool_output` recovers tool text;
+it does not restore an omitted image block.

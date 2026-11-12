@@ -9,8 +9,14 @@ value references, and chat attachment hydration use the same content policy:
 
 - The owning agent can read its content across conversations.
 - `artifact_share(content_ref, agent_id, action)` grants or revokes explicit read
-  access to another agent of the same user. Read access is not permission to
-  reshare, revise, or delete content.
+  access to another active agent of the same user across existing and future
+  revisions, for both artifacts and deliverables. `action="get"` lists explicit
+  and inherited access; `action="set"` replaces explicit recipients using
+  `agent_ids` (`[]` clears them). Owner and inherited access remain unchanged,
+  matching Library **Share with agents**. Root owner primary chats can manage
+  their user's documents; other agents can manage only their own documents.
+  Read access is not permission to reshare, revise, or delete content.
+  Neither the UI nor these tools transfer ownership or grant revision rights.
 - An assigned knowledgebase gives access to its linked artifacts. This is checked
   dynamically; removing the assignment or membership removes that access.
 - Task, managed conversation, and delegate ancestors can read descendant outputs,
@@ -20,6 +26,15 @@ value references, and chat attachment hydration use the same content policy:
   Specialist inputs are scoped to a logical session, not the reusable system
   agent. Compaction retains that scope; retry/follow-up copies retained inputs.
   Sibling specialist jobs do not share inputs.
+
+For project-scoped descendant results, an ancestor does not need its own agent
+assignment to the project. It can read only the specific outputs authorized by
+work provenance or durable output grants, while the human must still have
+current read access to the active project. This also applies to a task's owning
+agent when another agent executes its steps. Work inside a different project
+cannot use this exception. It grants neither project browsing nor revision,
+sharing, or write permission; explicit, input, and knowledgebase grants alone do
+not qualify.
 
 Search filtering occurs before pagination. Inaccessible references are reported as
 not found. An already-issued signed URL remains a bearer capability until expiry;

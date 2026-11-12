@@ -24,8 +24,10 @@ CATALOG = "cognis/providers/llm/data/codex_models.json"
 SOURCES = {
     "claude": "https://platform.claude.com/docs/en/models/overview.md",
     "openai": "https://developers.openai.com/api/docs/models.md",
+    "openai_catalog": "https://developers.openai.com/api/docs/models/all.md",
     "codex": "https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json",
 }
+OPENAI_MODEL_ID = r"gpt-(?:\d|image-\d)[\w.-]*"
 CLAUDE_FIELDS = {
     "Claude API ID": "id",
     "Pricing": "pricing",
@@ -95,15 +97,63 @@ def claude_models(markdown: str) -> dict[str, dict[str, str]]:
 
 
 def openai_models(markdown: str) -> list[str]:
-    """Extract numbered GPT API IDs, excluding unrelated specialized families."""
-    models = set(re.findall(r"\]\(/api/docs/models/(gpt-\d[\w.-]*)\.md\)", markdown, re.IGNORECASE))
+    """Extract numbered GPT and GPT Image API IDs."""
+    models = set(
+        re.findall(rf"\]\(/api/docs/models/({OPENAI_MODEL_ID})\.md\)", markdown, re.IGNORECASE)
+    )
     if not models:
         raise ValueError("OpenAI GPT model links missing")
     return sorted(models)
 
 
+def openai_catalog(markdown: str) -> dict[str, str]:
+    """Extract monitored GPT IDs and explicit lifecycle labels from the full catalog."""
+    if not markdown.startswith("# All models\n"):
+        raise ValueError("OpenAI full catalog heading missing")
+    sections = re.split(r"(?m)^## (.+)\n", markdown)
+    if len(sections) < 3:
+        raise ValueError("OpenAI full catalog sections missing")
+    by_name = dict(zip(sections[1::2], sections[2::2], strict=True))
+    if len(by_name) != len(sections[1::2]):
+        raise ValueError("OpenAI full catalog has duplicate sections")
+    if not {"Flagship models", "More models", "Deprecated models"} <= by_name.keys():
+        raise ValueError("OpenAI full catalog sections incomplete")
+    for name in ("Flagship models", "More models", "Deprecated models"):
+        if not re.search(r"\]\(/api/docs/models/gpt-\d", by_name[name], re.IGNORECASE):
+            raise ValueError(f"OpenAI full catalog section empty: {name}")
+    result: dict[str, str] = {}
+    pattern = re.compile(
+        rf"^-\s+\[[^\]]+\]\(/api/docs/models/({OPENAI_MODEL_ID})\.md\):\s*(.*)$",
+        re.IGNORECASE,
+    )
+    for name, section in by_name.items():
+        for line in section.splitlines():
+            match = pattern.match(line)
+            if not match:
+                if re.search(rf"\]\(/api/docs/models/{OPENAI_MODEL_ID}", line, re.IGNORECASE):
+                    raise ValueError("OpenAI full catalog model entry malformed")
+                continue
+            model_id, description = match.groups()
+            if name == "Deprecated models":
+                if description.startswith("Shut down."):
+                    status = "shutdown"
+                elif description.startswith("Deprecated."):
+                    status = "deprecated"
+                else:
+                    raise ValueError(f"OpenAI lifecycle label missing: {model_id}")
+            else:
+                status = "listed"
+            if model_id in result and result[model_id] != status:
+                raise ValueError(f"conflicting OpenAI catalog status: {model_id}")
+            result[model_id] = status
+    return dict(sorted(result.items()))
+
+
 def current_gpt(model_id: str) -> bool:
     """Check full details for current GPT families; older IDs still get monitored."""
+    if model_id.startswith("gpt-image-"):
+        match = re.match(r"^gpt-image-(\d+)(?:\.(\d+))?(?:-|$)", model_id)
+        return bool(match and (int(match[1]), int(match[2] or 0)) >= (2, 6))
     match = re.match(r"^gpt-(\d+)(?:\.(\d+))?(?:-|$)", model_id)
     if not match:
         return False
@@ -118,14 +168,59 @@ def openai_model_details(markdown: str, model_id: str) -> dict[str, Any]:
     if not model_details:
         raise ValueError(f"OpenAI model details missing: {model_id}")
 
+    def section(name: str) -> str:
+        return markdown.partition(f"## {name}\n")[2].partition("\n## ")[0]
+
+    if model_id.startswith("gpt-image-"):
+        modalities = {}
+        for direction in ("Input", "Output"):
+            match = re.search(rf"^- {direction} modalities: (.+)$", model_details, re.MULTILINE)
+            if match is None:
+                raise ValueError(f"OpenAI image modalities missing: {model_id}")
+            modalities[f"{direction.lower()}_modalities"] = match[1]
+        image_endpoints = dict(
+            re.findall(
+                r"^\| [^|]+ \| `(v1/[^`]+)` \| (Supported|Not supported) \|",
+                section("Endpoints"),
+                re.MULTILINE,
+            )
+        )
+        if (
+            not {"v1/images/generations", "v1/images/edits", "v1/responses"}
+            <= image_endpoints.keys()
+        ):
+            raise ValueError(f"OpenAI image endpoints incomplete: {model_id}")
+        image_pricing = {}
+        for kind, labels in (
+            ("Text tokens", ("Input", "Cached input")),
+            ("Image tokens", ("Input", "Cached input", "Output")),
+        ):
+            table = section("Pricing").partition(f"### {kind}\n")[2].partition("\n### ")[0]
+            prices = {
+                label.lower().replace(" ", "_"): match[1]
+                for label in labels
+                if (
+                    match := re.search(
+                        rf"^\| {label} \| (\$[\d.]+) \| 1M tokens \|", table, re.MULTILINE
+                    )
+                )
+            }
+            if len(prices) != len(labels):
+                raise ValueError(f"OpenAI image pricing incomplete: {model_id}")
+            image_pricing[kind.lower().replace(" ", "_")] = prices
+        return {
+            **modalities,
+            "endpoints": {
+                route: status == "Supported" for route, status in image_endpoints.items()
+            },
+            "pricing": image_pricing,
+        }
+
     def count(pattern: str) -> int:
         match = re.search(pattern, model_details, re.IGNORECASE | re.MULTILINE)
         if match is None:
             raise ValueError(f"OpenAI token limit missing: {model_id}")
         return int(match[1].replace(",", ""))
-
-    def section(name: str) -> str:
-        return markdown.partition(f"## {name}\n")[2].partition("\n## ")[0]
 
     def bullets(name: str) -> list[str]:
         return sorted(
@@ -156,7 +251,7 @@ def openai_model_details(markdown: str, model_id: str) -> dict[str, Any]:
     input_modalities = re.search(r"^- Input modalities: (.+)$", model_details, re.MULTILINE)
     if input_modalities is None:
         raise ValueError(f"OpenAI input modalities missing: {model_id}")
-    return {
+    details = {
         "context_window": count(r"^- ([\d,]+) context window$"),
         "max_input_tokens": count(r"^- Maximum input tokens: ([\d,]+)$"),
         "max_output_tokens": count(r"^- ([\d,]+) max output tokens$"),
@@ -167,6 +262,10 @@ def openai_model_details(markdown: str, model_id: str) -> dict[str, Any]:
         "features": bullets("Supported features"),
         "tools": bullets("Supported tools"),
     }
+    if model_id == "gpt-6-cyber":
+        notice = markdown.partition(f"Model ID: `{model_id}`")[2].partition("## Model details\n")[0]
+        details["access_requirements"] = " ".join(notice.split())
+    return details
 
 
 def codex_models(payload: Any) -> dict[str, dict[str, Any]]:
@@ -259,18 +358,32 @@ async def check(
     except FileNotFoundError:
         if not bootstrap:
             raise
-        old_docs = {"schema_version": 2, "claude": {}, "openai": [], "openai_details": {}}
-    if old_docs.get("schema_version") not in ({1, 2} if bootstrap else {2}):
+        old_docs = {"schema_version": 3, "claude": {}, "openai": [], "openai_details": {}}
+    if old_docs.get("schema_version") not in ({1, 2, 3} if bootstrap else {2, 3}):
         raise ValueError("unsupported model preflight baseline")
     if not isinstance(old_docs.get("claude"), dict) or not isinstance(old_docs.get("openai"), list):
         raise ValueError("model preflight baseline is malformed")
     old_catalog = codex_models(json.loads(repo_text(CATALOG)))
     pages = await fetch_sources()
-    openai_ids = openai_models(pages["openai"])
+    index_ids = set(openai_models(pages["openai"]))
+    catalog = openai_catalog(pages["openai_catalog"])
+    missing = (set(old_docs["openai"]) | index_ids) - catalog.keys()
+    if missing:
+        raise ValueError(f"OpenAI full catalog missing tracked or indexed IDs: {sorted(missing)}")
+    openai_ids = sorted(catalog)
+    old_status = old_docs.get("openai_status", {})
+    if not isinstance(old_status, dict) or any(
+        key not in old_docs["openai"] or value not in {"listed", "deprecated", "shutdown"}
+        for key, value in old_status.items()
+    ):
+        raise ValueError("OpenAI baseline statuses malformed")
+    if old_docs["schema_version"] == 3 and set(old_status) != set(old_docs["openai"]):
+        raise ValueError("OpenAI baseline statuses incomplete")
     live_docs: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "claude": claude_models(pages["claude"]),
         "openai": openai_ids,
+        "openai_status": catalog,
         "openai_details": await fetch_openai_details(openai_ids),
     }
     live_catalog = codex_models(json.loads(pages["codex"]))
@@ -284,6 +397,7 @@ async def check(
             old_docs.get("openai_details", {}),
             live_docs["openai_details"],
         ),
+        "openai_status": difference(old_status, catalog),
         "codex": difference(old_catalog, live_catalog),
     }
     changed = any(values for category in diff.values() for values in category.values())
@@ -292,6 +406,8 @@ async def check(
         "update_required": changed,
         "check_complete": True,
         "differences": diff,
+        "openai_missing_from_index": sorted(catalog.keys() - index_ids),
+        "openai_catalog_status": catalog,
         "sources": SOURCES,
         "baseline_ref": ref or "working_tree",
     }, live_docs

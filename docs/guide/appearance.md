@@ -15,8 +15,9 @@ chat, tools, documents and settings, rather than only changing the page canvas.
 
 The existing account preferences own this setting. It follows the verified
 account and server profile, including preference resets and failed-save
-rollback. Signing out or changing the account returns to System until the
-replacement account's preferences are available.
+rollback. A device-local cosmetic hint keeps loading and expired-session pages
+consistent while verified preferences are unavailable. Explicit logout removes
+that hint and returns to Classic/System.
 
 ## Bundled families
 
@@ -31,6 +32,20 @@ Application and chat text default to 14px; Paper uses 15px. Editing controls on
 coarse-pointer devices may remain 16px to prevent automatic iOS input zoom.
 Family selection does not change chat layout, message identity or saved content.
 
+## Appearance gallery
+
+The same Usage data from the fictional Lumen demo workspace is shown in each
+view. These figures are not actual inference or billing. Classic remains the default;
+Porcelain Light is used for the documentation examples.
+
+| Family | Light | Dark |
+|---|---|---|
+| Classic | ![Classic Light Usage](../assets/screenshots/appearance/classic-usage.png) | ![Classic Dark Usage](../assets/screenshots/appearance/classic-dark-usage.png) |
+| Porcelain | ![Porcelain Light Usage](../assets/screenshots/appearance/porcelain-usage.png) | ![Porcelain Dark Usage](../assets/screenshots/appearance/porcelain-dark-usage.png) |
+| Paper | ![Paper Light Usage](../assets/screenshots/appearance/paper-usage.png) | ![Paper Dark Usage](../assets/screenshots/appearance/paper-dark-usage.png) |
+
+Gruvbox is also available in both modes.
+
 Gruvbox preserves its original colors rather than recoloring them to pass a
 uniform contrast threshold. Some UI status/muted tones and decorative
 boundaries have lower contrast. The six syntax foreground roles are deepened
@@ -40,16 +55,18 @@ to read. Do not rely on syntax color alone to understand code or status.
 
 ## Startup and native surfaces
 
-Before account verification, the loading screen and browser chrome use Classic
-with the operating system's light/dark mode. Cognis does not replay an unverified
-global “last theme” cache. If your account's family or explicit mode differs
-from this startup default, you can see an appearance transition when the
-account-bound cache is admitted.
+Before account verification, a small device-local cosmetic hint supplies the
+loading screen and browser chrome appearance. It contains only the resolved
+family, mode and palette, never account data or permissions. Missing account
+preferences do not overwrite this hint with Classic defaults while loading.
+Without a valid hint, startup uses Classic with the operating system's mode.
+The verified account's cached or freshly loaded preferences remain authoritative.
 
 Apple launch images can follow only the operating system, not the verified
 account's family or mode. Their backgrounds are Classic Dark (`#07111A`) and
 Classic Light (`#D4DCE5`), with the same centered jade mark. A custom family
-therefore appears after the OS launch screen and account verification. The
+therefore appears after the OS launch screen when the cosmetic hint or verified
+account preferences are applied. The
 static web manifest uses Classic Light for both `theme_color` and
 `background_color`, matching the page's default metadata; runtime browser/native
 chrome continues to follow the resolved account appearance.

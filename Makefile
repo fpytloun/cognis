@@ -22,9 +22,18 @@ HA_E2E_PROJECT ?= cognis-ha-e2e
 COMPOSE_HA_E2E := $(DOCKER_COMPOSE) --project-name $(HA_E2E_PROJECT) --env-file .local/cognis-ha-e2e/current/compose.env -f compose.local.yml -f compose.e2e.yml -f compose.ha-e2e.yml
 COMPOSE_REDIS_HA_E2E := $(COMPOSE_HA_E2E) -f compose.redis-ha-e2e.yml
 PYTHON ?= python3
-# The unit suite loads a large application graph per worker. Leave capacity for
-# the controller and concurrent development tools on typical 8-core/16-GiB hosts.
-PYTEST_XDIST_WORKERS ?= 2
+# Match Vitest: half the available CPUs, rounded down, with at least one worker.
+PYTEST_XDIST_WORKERS ?= $(shell $(PYTHON) -c 'import os; cpus = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count() or 1; print(max(1, cpus // 2))')
+# One heavy validation command per host/user, including other worktrees.
+# The helper reports its owner PID while waiting and never expires a live lock.
+VALIDATION_LOCK_TIMEOUT ?= 3600
+VALIDATION_LOCK = $(PYTHON) "$(abspath scripts/with_validation_lock.py)" --timeout $(VALIDATION_LOCK_TIMEOUT) --
+PYTEST_ARGS ?= tests/unit/ -v
+# Tests create many file-backed SQLite databases, and each DDL statement syncs to
+# disk. Keep their temporary files in RAM when the host has /dev/shm.
+PYTEST_TMPDIR ?= $(if $(wildcard /dev/shm),/dev/shm/cognis-pytest-$(shell id -u))
+PYTEST_ENV = $(if $(PYTEST_TMPDIR),env TMPDIR=$(PYTEST_TMPDIR))
+VITEST_ARGS ?=
 
 # ---------------------------------------------------------------------------
 # E2E stack lifecycle
@@ -32,7 +41,7 @@ PYTEST_XDIST_WORKERS ?= 2
 
 .PHONY: e2e-up
 e2e-up:
-	$(COMPOSE_E2E) up -d --build
+	$(VALIDATION_LOCK) $(COMPOSE_E2E) up -d --build
 	@echo ""
 	@echo "E2E stack started:"
 	@echo "  Cognis:   http://localhost:8080"
@@ -73,9 +82,12 @@ e2e-seed-work-conformance:
 	@echo "Work Activity conformance fixtures seeded."
 
 .PHONY: e2e-down
+# Destructive: use only for a disposable Compose project you created.
 e2e-down:
-	@$(COMPOSE_E2E) run --rm --no-deps -e WORK_CONFORMANCE_RESTORE_ONLY=true seed-work-conformance
-	$(COMPOSE_E2E) down
+	@restore_status=0; \
+	$(COMPOSE_E2E) run --rm --no-deps -e WORK_CONFORMANCE_RESTORE_ONLY=true seed-work-conformance || restore_status=$$?; \
+	$(COMPOSE_E2E) down -v --remove-orphans || exit $$?; \
+	exit $$restore_status
 
 .PHONY: e2e-logs
 e2e-logs:
@@ -95,12 +107,12 @@ e2e-events: e2e-events-capture e2e-events-replay
 .PHONY: e2e-events-capture
 e2e-events-capture:
 	@echo "Capturing golden event streams from live stack..."
-	uv run pytest tests/e2e/ -m e2e -v --tb=short
+	$(VALIDATION_LOCK) uv run pytest tests/e2e/ -m e2e -v --tb=short
 
 .PHONY: e2e-events-replay
 e2e-events-replay:
 	@echo "Replaying every promoted canonical Chat v2 capture through the production sync engine..."
-	cd ui && npm test -- --reporter=verbose --run \
+	cd ui && $(VALIDATION_LOCK) npm test -- --reporter=verbose --run \
 		src/lib/chat-v2/capture-replay.invariants.test.ts \
 		src/lib/chat-v2/sync-engine.invariants.test.ts
 
@@ -117,11 +129,11 @@ e2e-browser:
 	fi; \
 	COGNIS_E2E_MOCK_LLM_CONTROL=container \
 	COGNIS_E2E_MOCK_LLM_CONTAINER_ID="$$MOCK_CONTAINER" \
-	uv run python scripts/run_browser_matrix.py
+	$(VALIDATION_LOCK) uv run python scripts/run_browser_matrix.py
 
 .PHONY: e2e-browser-ui
 e2e-browser-ui:
-	cd ui && npx playwright test e2e/ --ui
+	cd ui && $(VALIDATION_LOCK) npx playwright test e2e/ --ui
 
 # ---------------------------------------------------------------------------
 # UI iteration during interactive debugging
@@ -130,7 +142,7 @@ e2e-browser-ui:
 .PHONY: e2e-ui-build
 e2e-ui-build:
 	@echo "Building UI (served by Cognis)..."
-	cd ui && npm run build
+	cd ui && $(VALIDATION_LOCK) npm run build
 	@echo "UI built. Cognis serves the updated assets at http://localhost:8080"
 
 .PHONY: e2e-ui-dev
@@ -156,23 +168,39 @@ e2e-promote:
 
 .PHONY: test test-serial
 test:
-	uv run pytest tests/unit/ -v -n $(PYTEST_XDIST_WORKERS)
+	$(if $(PYTEST_TMPDIR),mkdir -p $(PYTEST_TMPDIR))
+	$(VALIDATION_LOCK) $(PYTEST_ENV) uv run pytest $(PYTEST_ARGS) -n $(PYTEST_XDIST_WORKERS)
 
 test-serial:
-	uv run pytest tests/unit/ -v -n 0
+	$(if $(PYTEST_TMPDIR),mkdir -p $(PYTEST_TMPDIR))
+	$(VALIDATION_LOCK) $(PYTEST_ENV) uv run pytest $(PYTEST_ARGS) -n 0
 
 .PHONY: test-ui
 test-ui:
-	cd ui && npm test
+	cd ui && $(VALIDATION_LOCK) npm test -- $(VITEST_ARGS)
+
+.PHONY: check-ui build-ui build-standalone validate
+check-ui:
+	cd ui && $(VALIDATION_LOCK) npm run check
+
+build-ui: e2e-ui-build
+
+build-standalone:
+	cd ui && $(VALIDATION_LOCK) npm run build:standalone
+
+# Wrap custom focused checks too: make validate COMMAND='uv run pytest tests/contract/ -v'
+# Use an explicit sh -c for pipelines or compound commands.
+validate:
+	$(if $(strip $(COMMAND)),$(VALIDATION_LOCK) $(COMMAND),$(error Usage: make validate COMMAND='command args'))
 
 .PHONY: lint
 lint:
-	uv run ruff check cognis/ tests/
-	uv run ruff format --check cognis/ tests/
+	$(VALIDATION_LOCK) uv run ruff check cognis/ tests/
+	$(VALIDATION_LOCK) uv run ruff format --check cognis/ tests/
 
 .PHONY: deployment-validate
 deployment-validate:
-	./scripts/validate_deployment.sh
+	$(VALIDATION_LOCK) ./scripts/validate_deployment.sh
 
 .PHONY: ha-e2e-prepare
 ha-e2e-prepare:
@@ -180,7 +208,7 @@ ha-e2e-prepare:
 
 .PHONY: ha-e2e-up
 ha-e2e-up: ha-e2e-prepare
-	$(COMPOSE_HA_E2E) up -d --build
+	$(VALIDATION_LOCK) $(COMPOSE_HA_E2E) up -d --build
 
 .PHONY: ha-e2e-down
 ha-e2e-down:
@@ -188,7 +216,7 @@ ha-e2e-down:
 
 .PHONY: redis-ha-e2e-up
 redis-ha-e2e-up: ha-e2e-prepare
-	$(COMPOSE_REDIS_HA_E2E) up -d --build
+	$(VALIDATION_LOCK) $(COMPOSE_REDIS_HA_E2E) up -d --build
 
 .PHONY: redis-ha-e2e-down
 redis-ha-e2e-down:
@@ -205,13 +233,13 @@ redis-ha-e2e-config: ha-e2e-prepare
 .PHONY: redis-ha-e2e-qualify
 redis-ha-e2e-qualify:
 	COGNIS_REDIS_HA_E2E_URL=http://localhost:$${COGNIS_HA_E2E_PORT:-18080} \
-		uv run pytest tests/e2e/test_redis_ha_live.py -m e2e -v --tb=short
+		$(VALIDATION_LOCK) uv run pytest tests/e2e/test_redis_ha_live.py -m e2e -v --tb=short
 
 .PHONY: ha-e2e-qualify
 ha-e2e-qualify:
-	./scripts/qualify_ha_e2e.sh
+	$(VALIDATION_LOCK) ./scripts/qualify_ha_e2e.sh
 
 .PHONY: typecheck
 typecheck:
-	uv run mypy cognis/
-	cd ui && npm run check
+	$(VALIDATION_LOCK) uv run mypy cognis/
+	cd ui && $(VALIDATION_LOCK) npm run check

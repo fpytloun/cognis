@@ -335,10 +335,11 @@ document schema:
 ```
 
 - TOCs appear automatically only when a document has at least four titled H2-level
-  blocks. `metadata.toc` may be a boolean or `{ "enabled": boolean, "depth": 2|3 }`.
+  blocks. `metadata.toc` may be a boolean or `{ "enabled": boolean, "depth": 2|3|4 }`.
   A depth-only object does not override `metadata.show_toc`; `show_toc` remains the
-  compatibility boolean. Depth is `2` by default. Markdown blocks use their first
-  level-1–3 Markdown heading when they do not have an explicit block title.
+  compatibility boolean. Depth is `4` by default so nested headings remain visible;
+  an explicit depth of `2` or `3` limits navigation to that level. Markdown blocks use their first
+  level-1–4 Markdown heading when they do not have an explicit block title.
 - Heading anchors are stable ASCII slugs with deterministic `-2`, `-3` suffixes.
   Explicit block `id` or `anchor` values seed the slug. Ordinary Markdown fragment
   links such as `[see evaluation](#evaluation)` are the conservative cross-reference
@@ -363,7 +364,10 @@ document schema:
 - A Markdown block with an explicit title renders that title as its anchored H2/H3
   publication heading. Its Markdown H1–H3 content is normalized to subordinate H3
   headings and joins the TOC only at depth 3. Without an explicit title, the first
-  Markdown heading owns the block anchor and later headings are subordinate. This
+  Markdown heading owns the block anchor. Untitled Markdown siblings share an
+  outline: their shallowest source heading maps to the structural block level,
+  same-level headings remain peers, and deeper headings nest (up to H4).
+  Splitting Markdown prose across blocks does not flatten that hierarchy. This
   avoids attaching a title-derived target to unrelated content or duplicating titles.
 - Navigation indexes top-level blocks and explicit canonical `blocks`/`children`
   descendants. Item-backed `tabs`, `accordion`, and `gallery` entries remain
@@ -435,30 +439,29 @@ Pulse guarantees:
 - responsive single-column composition on narrow screens and restrained newsroom
   columns on desktop/PDF.
 
-The following fictional museum-day payload illustrates the daily-brief structure.
-Dates, activities, conditions, and institutions are invented:
+The following daily-brief payload uses fictional museum data:
 
 ```json
 {
   "metadata": {
     "presentation": "pulse",
-    "eyebrow": "Ukázkové muzeum · fiktivní den",
-    "subtitle": "16. dubna 2030 · data 08:00 CEST"
+    "eyebrow": "Ukázka · Městské muzeum",
+    "subtitle": "Fiktivní data · 09:00 UTC"
   },
   "blocks": [
     {
       "type": "hero",
-      "eyebrow": "Demonstrační přehled · 08:00",
-      "title": "Ranní pulse",
-      "subtitle": "Místní datum, časové pásmo a nejstarší čas dat"
+      "eyebrow": "Ilustrační přehled",
+      "title": "Denní přehled muzea",
+      "subtitle": "Fiktivní program a provozní údaje"
     },
     {
       "type": "grid",
       "blocks": [
-        { "type": "metric", "label": "Agenda", "value": "2", "delta": "Kontrola 10:00" },
-        { "type": "metric", "label": "Podmínky", "value": "11 °C", "delta": "Syntetická hodnota" },
-        { "type": "metric", "label": "Katalog", "value": "Ukázka", "delta": "Žádné skutečné záznamy" },
-        { "type": "metric", "label": "Priorita", "value": "Popisky", "delta": "Demonstrační kontrola" }
+        { "type": "metric", "label": "Program", "value": "4", "delta": "Další prohlídka 10:00" },
+        { "type": "metric", "label": "Návštěvníci", "value": "120", "delta": "Ilustrační denní odhad" },
+        { "type": "metric", "label": "Expozice", "value": "5", "delta": "Jedna nová expozice" },
+        { "type": "metric", "label": "Prohlídky", "value": "10–14", "delta": "Fiktivní časové rozmezí" }
       ]
     },
     {
@@ -468,7 +471,7 @@ Dates, activities, conditions, and institutions are invented:
           "type": "section",
           "eyebrow": "Hlavní zpráva",
           "title": "Silný konkrétní titulek",
-          "content": "Fiktivní muzeum předvádí ukázkový katalog.\\n\\n**Pro návštěvníka:** přístupné popisky.",
+          "content": "Dvě až tři věty o fiktivním programu.\\n\\n**Pro návštěvníky:** praktické informace.",
           "blocks": [{
             "type": "figure",
             "src": "https://verified.example/news-image.jpg",
@@ -488,7 +491,7 @@ Dates, activities, conditions, and institutions are invented:
     },
     {
       "type": "day_agenda",
-      "title": "Ukázkový den 16. dubna",
+      "title": "Neděle 12. července",
       "now": "2026-07-12T07:10:00+02:00",
       "timezone": "Europe/Prague",
       "freshness": "07:08 CEST",

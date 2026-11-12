@@ -1,8 +1,8 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "claude": {
-    "claude-fable-5-1": {
-      "pricing": "$10 / input MTok, $50 / output MTok",
+    "claude-fable-5-2": {
+      "pricing": "$8 / input MTok, $40 / output MTok",
       "thinking": "Adaptive (always on)",
       "default_effort": "`high`",
       "context_window": "1M tokens",
@@ -79,10 +79,83 @@
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-6-astra",
+    "gpt-6-cyber",
     "gpt-6-luna",
     "gpt-6-sol",
-    "gpt-6.1-sol"
+    "gpt-6.1-sol",
+    "gpt-6.1-terra",
+    "gpt-image-1",
+    "gpt-image-1-mini",
+    "gpt-image-1.5",
+    "gpt-image-2",
+    "gpt-image-2.5-flare",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.6-flare",
+    "gpt-image-2.6-sunburst"
   ],
+  "openai_status": {
+    "gpt-3.5-turbo": "shutdown",
+    "gpt-4": "shutdown",
+    "gpt-4-turbo": "shutdown",
+    "gpt-4-turbo-preview": "shutdown",
+    "gpt-4.1": "deprecated",
+    "gpt-4.1-mini": "deprecated",
+    "gpt-4.1-nano": "shutdown",
+    "gpt-4.5-preview": "shutdown",
+    "gpt-4o": "deprecated",
+    "gpt-4o-audio-preview": "shutdown",
+    "gpt-4o-mini": "deprecated",
+    "gpt-4o-mini-audio-preview": "shutdown",
+    "gpt-4o-mini-realtime-preview": "shutdown",
+    "gpt-4o-mini-search-preview": "shutdown",
+    "gpt-4o-mini-transcribe": "deprecated",
+    "gpt-4o-mini-tts": "deprecated",
+    "gpt-4o-realtime-preview": "shutdown",
+    "gpt-4o-search-preview": "shutdown",
+    "gpt-4o-transcribe": "deprecated",
+    "gpt-4o-transcribe-diarize": "deprecated",
+    "gpt-5": "deprecated",
+    "gpt-5-chat-latest": "shutdown",
+    "gpt-5-codex": "shutdown",
+    "gpt-5-mini": "deprecated",
+    "gpt-5-nano": "deprecated",
+    "gpt-5-pro": "deprecated",
+    "gpt-5.1": "deprecated",
+    "gpt-5.1-chat-latest": "shutdown",
+    "gpt-5.1-codex": "shutdown",
+    "gpt-5.1-codex-max": "shutdown",
+    "gpt-5.1-codex-mini": "shutdown",
+    "gpt-5.2": "listed",
+    "gpt-5.2-chat-latest": "shutdown",
+    "gpt-5.2-codex": "shutdown",
+    "gpt-5.2-pro": "listed",
+    "gpt-5.3-chat-latest": "shutdown",
+    "gpt-5.3-codex": "deprecated",
+    "gpt-5.4": "listed",
+    "gpt-5.4-mini": "listed",
+    "gpt-5.4-nano": "deprecated",
+    "gpt-5.4-pro": "listed",
+    "gpt-5.5": "listed",
+    "gpt-5.5-pro": "listed",
+    "gpt-5.6-cyber": "listed",
+    "gpt-5.6-luna": "listed",
+    "gpt-5.6-sol": "listed",
+    "gpt-5.6-terra": "listed",
+    "gpt-6-astra": "listed",
+    "gpt-6-cyber": "listed",
+    "gpt-6-luna": "listed",
+    "gpt-6-sol": "listed",
+    "gpt-6.1-sol": "listed",
+    "gpt-6.1-terra": "listed",
+    "gpt-image-1": "shutdown",
+    "gpt-image-1-mini": "deprecated",
+    "gpt-image-1.5": "deprecated",
+    "gpt-image-2": "deprecated",
+    "gpt-image-2.5-flare": "listed",
+    "gpt-image-2.5-sunburst": "listed",
+    "gpt-image-2.6-flare": "listed",
+    "gpt-image-2.6-sunburst": "listed"
+  },
   "openai_details": {
     "gpt-5.6-cyber": {
       "context_window": 400000,
@@ -260,6 +333,40 @@
         "web_search"
       ]
     },
+    "gpt-6-cyber": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$20",
+        "cached_input": "$2",
+        "output": "$100"
+      },
+      "reasoning_efforts": [],
+      "features": [
+        "function_calling",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "function_calling",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ],
+      "access_requirements": "Your organization needs Daybreak Red access and approval to use GPT-6-Cyber. Your account team can confirm access. The standard rate limits below apply to approved organizations and may differ if your organization has custom limits. [Set up your organization and project](/api/docs/guides/daybreak#set-up-gpt-6-cyber) before sending your first request."
+    },
     "gpt-6-luna": {
       "context_window": 1050000,
       "max_input_tokens": 922000,
@@ -381,6 +488,117 @@
         "tool_search",
         "web_search"
       ]
+    },
+    "gpt-6.1-terra": {
+      "context_window": 1050000,
+      "max_input_tokens": 922000,
+      "max_output_tokens": 128000,
+      "input_modalities": "text, image",
+      "responses_api": true,
+      "pricing": {
+        "input": "$1",
+        "cached_input": "$0.05",
+        "output": "$5"
+      },
+      "reasoning_efforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "features": [
+        "file_search",
+        "function_calling",
+        "image_input",
+        "prompt_caching",
+        "streaming",
+        "structured_outputs",
+        "web_search"
+      ],
+      "tools": [
+        "apply_patch",
+        "code_interpreter",
+        "computer_use",
+        "file_search",
+        "hosted_shell",
+        "image_generation",
+        "mcp",
+        "skills",
+        "tool_search",
+        "web_search"
+      ]
+    },
+    "gpt-image-2.6-flare": {
+      "input_modalities": "text, image",
+      "output_modalities": "image",
+      "endpoints": {
+        "v1/live/sessions": false,
+        "v1/chat/completions": false,
+        "v1/responses": false,
+        "v1/realtime": false,
+        "v1/realtime/translations": false,
+        "v1/realtime/transcription_sessions": false,
+        "v1/assistants": false,
+        "v1/batch": false,
+        "v1/fine-tuning": false,
+        "v1/embeddings": false,
+        "v1/images/generations": true,
+        "v1/videos": false,
+        "v1/images/edits": true,
+        "v1/audio/speech": false,
+        "v1/audio/transcriptions": false,
+        "v1/audio/translations": false,
+        "v1/moderations": false,
+        "v1/completions": false
+      },
+      "pricing": {
+        "text_tokens": {
+          "input": "$5",
+          "cached_input": "$1.25"
+        },
+        "image_tokens": {
+          "input": "$8",
+          "cached_input": "$2",
+          "output": "$30"
+        }
+      }
+    },
+    "gpt-image-2.6-sunburst": {
+      "input_modalities": "text, image",
+      "output_modalities": "image",
+      "endpoints": {
+        "v1/live/sessions": false,
+        "v1/chat/completions": false,
+        "v1/responses": false,
+        "v1/realtime": false,
+        "v1/realtime/translations": false,
+        "v1/realtime/transcription_sessions": false,
+        "v1/assistants": false,
+        "v1/batch": false,
+        "v1/fine-tuning": false,
+        "v1/embeddings": false,
+        "v1/images/generations": true,
+        "v1/videos": false,
+        "v1/images/edits": true,
+        "v1/audio/speech": false,
+        "v1/audio/transcriptions": false,
+        "v1/audio/translations": false,
+        "v1/moderations": false,
+        "v1/completions": false
+      },
+      "pricing": {
+        "text_tokens": {
+          "input": "$5",
+          "cached_input": "$1.25"
+        },
+        "image_tokens": {
+          "input": "$8",
+          "cached_input": "$2",
+          "output": "$30"
+        }
+      }
     }
   }
 }

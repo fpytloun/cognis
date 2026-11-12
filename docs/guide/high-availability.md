@@ -37,6 +37,18 @@ stores raw Intaris results partitioned by authority and invalidated with
 generation-safe keys; it never serves stale canonical data after a Redis or
 Intaris error.
 
+Runtime delivery projects a bounded cumulative working set before local and
+cross-controller fanout. It prefers current work and recent phases, preserves
+whole items and generation authority, and marks omitted items with
+`volatile_items_complete=false`. It does not truncate text or discard the
+producer's source generation. A single item too large for the working set is
+temporarily omitted; its persisted content remains available through canonical
+snapshot/sync. Partial frames carry scoped canonical-read hints, at most once
+per ten seconds per active subscription and always on terminal delivery.
+Post-append invalidations still wake readers when persistence catches up.
+Reconnect hydration uses the bounded latest overlay plus canonical history.
+The existing 2 MiB raw and 512 KiB wire relay limits are unchanged.
+
 The canonical event cache defaults to a one-hour sliding TTL. Reads refresh
 expiration only after half the TTL has elapsed, avoiding a Redis write on every
 local hit. Redis hits atomically validate the session generation while
@@ -109,6 +121,27 @@ hook and controller Deployment.
 Controllers forward calls to the owner of an executor connection through
 `/api/internal/executor-bridge`. The endpoint validates a controller JWT,
 requester liveness, target owner, and connection epoch.
+
+Each bridge connection admits up to 128 in-flight calls across sessions. The
+sending controller queues up to 128 additional calls in FIFO order, waiting at
+most two seconds per admission. A full queue or expired wait returns
+`executor_bridge_capacity` with delivery state `not_sent`; queued calls have not
+been dispatched. Cancellation removes a queued call, and closing or retiring a
+proxy wakes its waiters without sending them. Tool send-time checks run after
+admission, immediately before dispatch.
+
+The receiving controller enforces the same in-flight limit without blocking its
+reader, so results and cancellations can continue during a burst. Result frame
+and assembly memory limits are unchanged. During a rolling controller upgrade,
+an older receiving controller still enforces its lower limit.
+
+Within each controller, overlapping background-shell status reads on the same
+executor connection share one RPC per `include_completed` value. Direct and
+forwarded connections use the same policy. Completed snapshots and failures are
+not cached, and callers receive independent copies with their existing
+user/conversation filtering. Cancelling one caller leaves other callers running;
+when the last caller leaves, the shared RPC is cancelled. Replacing a connection
+starts a separate read scope.
 
 The bridge shares port 8080 with public APIs. Catch-all Ingress rules can make
 it technically reachable externally; controller JWT authentication is the

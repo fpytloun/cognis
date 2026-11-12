@@ -24,12 +24,6 @@ to its original step-run lineage. An inactive source session is safely forked;
 missing or unreadable history fails closed instead of starting the step with
 an empty context. The separate re-run operation still creates a fresh task.
 
-A pre-execution setup failure may create its first session only after a fenced,
-unfiltered lookup proves that the current task attempt has no run for that step
-and no saved step output exists. This exception applies to resolved null, last,
-or summary inputs only. Full-history input and explicit source-session reuse
-retain strict continuity requirements; lookup failures never establish absence.
-
 The UI derives actionable chat failures from the complete loaded canonical
 timeline and current runtime identity, never from the viewport slice. Retry
 lineage supersedes the source failure. Local suppression bridges accepted

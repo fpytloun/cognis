@@ -52,6 +52,15 @@ expression with structured arguments, not JS supplied by a bridge caller.
 Incompatible bridge versions fail clearly; server release-number differences
 are not an automatic rejection.
 
+Standalone chat windows retain the existing `open-window` message with only
+`conversationId`. Project and deliverable windows use `open-resource-window`
+with exactly `kind` (`project` or `deliverable`) and `id`. The native contract
+constructs allowlisted routes from validated identifiers; callers cannot supply
+a URL or path. Typed destinations namespace window reuse and own reload/reopen
+identity. All kinds share the existing ten-window registry, account/server
+retirement, workspace fencing and download teardown. Resource documents use the
+`resource` native surface and the same trusted-frame/key-window save admission.
+
 ## Ownership and lifecycle
 
 The existing web pin store is the sole membership owner. Native pins are

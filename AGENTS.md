@@ -13,6 +13,7 @@ The backend uses Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.x, and
 ## Read Before Editing
 
 1. Read this file.
+   For UI work, also read `ui/DESIGN.md` explicitly; it is not auto-loaded.
 2. Inspect the current implementation and tests for the area that will change.
 3. Use `docs/specs/README.md` to locate a specification when the change affects
    an architecture or contract documented there.
@@ -131,6 +132,35 @@ rules that another transport must reproduce.
 
 ### Execution and lifecycle
 
+Task-owned delegation identities live in the existing attempt-fenced
+`execution_recovery` metadata. Reserve child/session and turn IDs before external
+provisioning; assert ownership inside reservation/finalization transactions,
+locking the task before the child. Release DB transactions before external I/O.
+The workflow/queue owns suspension and bounded deferral; only explicit task
+cancellation or resolved human cancellation/denial may cancel its child. Reuse
+canonical tool settlement and executor receipts, never blind-replay an uncertain
+mutation. Automatic child continuations persist their active turn and typed
+retry bookkeeping before dispatch; transcript and todo content stay in Intaris.
+Child configuration/tool scope changes and legacy calls without reserved identity
+require reconciliation.
+These metadata-only compatibility checks add no content store or schema.
+
+Delegation tool-call events retain exact recovery arguments in Intaris separately
+from bounded model/UI previews. Legacy previews are usable only when removing
+presentation fields reproduces the reserved argument binding exactly; truncated
+or changed inputs remain blocked. This reuses the existing attempt fence,
+settlement, transaction, and cancellation owners without new side effects.
+Delegated policies inherit activated parent allowances in Intaris rather than
+redeclaring ambient task grants; child deny clauses remain effective.
+
+Unrecoverable executor mutations in agent run steps settle as canonical uncertain
+results so the agent can inspect effects before continuing. Deterministic steps
+still require explicit reconciliation. The turn-owned duplicate ledger retains
+uncertainty, never success; Intaris remains its restart source. Result persistence
+precedes task descriptor retirement and receipt acknowledgment. Existing task
+fences, transactions, append idempotency and scheduler cancellation still own
+recovery; no new lock, replay permission or persisted format is introduced.
+
 - All interactive and task execution uses the workflow execution model.
 - A normal workflow step completes only through its explicit completion
   contract. LLM silence is not completion.
@@ -194,6 +224,14 @@ Keep this note proportional. Routine local changes do not need architecture
 boilerplate.
 
 ### Session preamble lifetime
+
+Executor eligibility is a read-only, turn-owned observation refreshed before
+context preparation and executor tool/switch admission. Refresh revalidates the
+effective shared-agent scope and current policy without expanding assignments,
+rebuilding inventory, or changing pins. Database sessions end before dispatch;
+failed observations are unknown and fail closed. Cancellation remains owned by
+the turn scheduler, and refresh never retries a delivered tool. Changed executor
+guidance uses the existing append-only context audit/delivery boundary.
 
 `ContextAssembler` owns the rendered pre-history preamble and append-only
 superseding context updates. Intaris `lifecycle/context_preamble` events are
@@ -310,6 +348,22 @@ New loaded-skill events preserve earlier instruction notices while updating late
 skill state, including slash-command reloads. Legacy events retain their original
 supersession behavior. Live project-exposure notices carry their canonical audit
 source and role so provider wrappers do not change on cold replay.
+Skill tool results deduplicate unchanged instruction/template blocks against the
+turn's actual trusted messages, not historical loaded-skill snapshots. Asset
+preparation still finishes before result settlement; only duplicate instruction
+injection is skipped. Changed blocks append full replacement guidance. This is
+a pure result transformation using existing turn serialization, event persistence,
+replay, cancellation and retry owners; it adds no state, locks or durable format.
+Settlement transforms the router's complete raw skill payload, then reapplies
+the same sanitization and output budget before recording or presenting it.
+Never parse the wrapped or truncated presentation as skill JSON.
+
+Attachment compaction policy 2 recovers canonical artifact references through
+`artifact_read`; SessionCache accepts it only for that operation and retains
+policy-1 replay. Fresh image protection is derived from canonical message order
+through the next assistant response, not a durable delivery claim. Text pruning,
+hard budgets, access checks, turn cancellation and projection commit ownership
+are unchanged; no new side effect, lock, transaction or retry is introduced.
 
 Within-turn soft-target projection can reuse the accepted rendering plus new
 messages after exact counting passes the existing loop-pressure, hard, and
@@ -322,7 +376,45 @@ when source identity is unknown. Projection decisions still commit through the
 existing delivery boundary. No new side effects, locks, retries, event formats,
 durable snapshots, or cross-turn threshold changes are introduced.
 
+Rotation copies content before rebasing event-scoped projection decisions to
+Intaris-assigned destination sequences. Projection-only batches use deterministic
+rotation-owned append keys; cancellation remains scheduler-owned and retries
+reuse confirmed append identities. Call-scoped decisions retain stable IDs.
+SessionCache resolves legacy copied projection references in their source
+namespace, drops absent targets, and reloads pre-fix event-scoped L2 state once.
+This compatibility path is required for existing Intaris histories and can be
+removed only when such histories are no longer supported. No DB schema, lock,
+transaction, content store, or provider API changes are involved. Recap cards
+remain in their original sessions; old compaction-tail recap copies are hidden
+at the shared Chat v2 normalization boundary.
+
 ### Controller tool contracts
+
+Skill resolution batches version and asset reads only after owner-scoped
+visibility resolution; ordering, missing-version and manifest fallbacks remain
+unchanged. Executor pool reuse is limited to one runtime build, including
+selection and inventory assembly; changed pin winners absent from that pool
+require fresh resolution. Eligibility refresh remains the authorization owner
+before context/tool admission. Forwarded catalog discovery uses the physical
+connection's existing cache and invalidation rules after bridge ownership
+checks. Its deadline includes lock waiting, and cached results never claim
+physical delivery. No new cross-turn cache, transaction, retry, or durable state
+is introduced.
+
+Chat preparation reuses identical acknowledged Intaris configuration writes only
+within a scheduler-owned turn. Every refresh still resolves current policy inputs;
+changed inputs and failed writes cannot hit the cache. Cancellation/return closes
+the cache, including inherited child contexts. This adds no durable policy state
+or tool-authorization cache.
+
+WebSocket tool catalogs belong to one physical executor connection. Reuse requires
+the executor's explicit catalog-notification contract; configuration changes and
+MCP recovery invalidate it, and reconnect/ownership replacement starts cold.
+Legacy executors keep per-call discovery. Registry permission filtering remains
+fresh. Context identity and Intaris status reads may overlap, but prefix persistence
+and event-cache refresh remain serialized; gather/cancellation owns all read tasks.
+Existing canonical write ordering, idempotency, fences, and retry ownership remain
+unchanged. MCP OAuth I/O runs after metadata sessions close.
 
 - Controller-injected tool schemas have one source of truth in
   `cognis/tools/builtin/workflow.py`.
@@ -333,6 +425,13 @@ durable snapshots, or cross-turn threshold changes are introduced.
   correct the call.
 
 ### API and lifecycle contracts
+
+Task lifecycle tools accept the owner's non-delegated primary chat as well as
+the task's bound control chat. `core/task_control.py` revalidates current metadata
+authority per call; a UI context marker or a prior inspection is not a grant.
+DB reads finish before queue dispatch. The existing queue mutation transactions,
+attempt CAS, execution leases, cancellation and retry owners remain unchanged;
+no task-control token, content store or replay permission is introduced.
 
 - API response models must represent every producer. Add contract coverage in
   `tests/unit/test_api_contracts.py`.
@@ -392,6 +491,36 @@ uv run python -m cognis serve
 Before each commit, run focused tests and checks for the changed behavior.
 Expand validation when the affected surface, integration risk, repository
 policy, or release scope requires it. Report checks not run and why.
+
+### Shared-host validation safety
+
+Use locked Make targets for focused or full tests, type checks, and builds,
+including isolated worktrees. They share one slot per host/Unix user at
+`/tmp/cognis-validation-<uid>.lock`; direct `uv`/`npm`/`npx` bypass it.
+Focused checks remain preferred for bounded changes:
+
+```bash
+make test PYTEST_ARGS='tests/unit/test_validation_lock.py -q -k deadline'
+make test-ui VITEST_ARGS='src/lib/chat-v2/outbox-clone.test.ts --maxWorkers=2'
+make validate COMMAND='uv run pytest tests/contract/ -v'
+```
+
+Use `make check-ui`, `make build-ui`, `make build-standalone`, or the E2E targets
+for broader checks. Pytest and Vitest default to CPU/2 (rounded down, minimum one;
+four on an eight-CPU host). Do not raise worker counts above this default.
+Waiting reports the owner PID immediately and every five minutes. The default
+wait is one hour; callers may override `VALIDATION_LOCK_TIMEOUT` in seconds.
+Never delete a live lock or nest locked Make targets. Keep launchers alive and
+stop task-owned orphan validators after cancellation before retrying. Separate
+users/temporary directories and detached services are outside the lock's scope.
+See `docs/development/release-validation.md` for lifecycle details.
+
+After tests, clean up only resources you created: `docker compose down -v
+--remove-orphans` (use `--rm` for one-off containers), disposable containers,
+volumes and networks; stop your processes and browsers.
+After merge or push, remove your worktree with `git worktree remove` (never
+`--force` over uncommitted changes) and its merged local branch. Never remove
+anything you did not create.
 
 The commands below are the canonical repository check inventory, not a
 mandatory checklist for every commit. Run the checks that own or cover the
@@ -461,7 +590,7 @@ For ordering, identity, reconnect, or projection changes:
 ```bash
 uv run pytest tests/e2e/ -v
 make e2e-events-replay
-uv run python scripts/run_browser_matrix.py
+make e2e-browser
 ```
 
 Canonical client invariants live in

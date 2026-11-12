@@ -84,6 +84,12 @@ Purpose: provide document-level references and provenance.
 Purpose: show one annotated visual or a related collection of visuals. Provide
 useful alternative text and only reference authorized media.
 
+Inline figures, galleries, and card images retain their natural proportions and
+never enlarge beyond their intrinsic CSS size. Large images shrink to the
+available width without cropping. Card media `width` and `height` constrain the
+image rather than enlarging it; decorative background frames can leave empty
+space around a smaller image. Opening an image preview still allows explicit zoom.
+
 ![Figure block](../assets/screenshots/rich-deliverables/figure.png)
 ![Gallery block](../assets/screenshots/rich-deliverables/gallery.png)
 

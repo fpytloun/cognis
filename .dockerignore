@@ -6,6 +6,7 @@
 .ruff_cache
 .venv
 .worktrees
+**/.local
 __pycache__
 *.py[cod]
 build
@@ -21,3 +22,6 @@ ui/build
 ui/standalone-build
 ui/coverage
 ui/node_modules
+ui/review-artifacts
+ui/test-results
+ui/playwright-report

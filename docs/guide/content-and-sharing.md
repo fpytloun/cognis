@@ -1,5 +1,30 @@
 # Content and Temporary Sharing
 
+## Document headers
+
+Document headers use one **Share** control. Choose **Private** in the expiration
+selector to copy the internal Library link without creating a public link or
+granting anyone access. Choose a duration or custom expiration to create a
+public link. Private is the default when an internal link is available.
+
+The star beside the document name toggles the same favorite state used by
+Library. Saved favorites also show a filled star in Work and project activity
+lists, without needing to open the document.
+
+## Conversation Work
+
+The conversation **Work** sidebar lists agent-produced artifacts and deliverables,
+not uploaded user attachments. **All workstreams** includes historical backing
+sessions and descendant work; select a child workstream to narrow the list.
+Search matches output names and deliverable preview text as well as workstream
+and agent names. Filtered lists continue loading older pages, so a search is not
+limited to the first page. Time filters preserve the selected tab.
+
+Output rows show a relative creation or revision time and a revision label such
+as **v4**. Artifact rows also identify the latest live revision when the listed
+reference is older. The listed file remains the exact revision produced or
+attached at that point; it is not silently replaced by newer content.
+
 ## Library
 
 ### Create and edit files
@@ -19,25 +44,53 @@ remain readable. New drafts and unsaved edits warn before navigation or reload.
 
 ### Share documents
 
+![Sharing a document with a named local commenter](../assets/screenshots/document-sharing.png)
+
+The example uses fictional local accounts. It shows the owner's sharing
+controls, not a verified reviewer or anonymous-access test.
+
 Artifacts and deliverables use the same preview-header controls in chat and
 Library. Next to **Download**, **Copy internal link** copies the authenticated
 Library address, and **Share public link** opens a separate dialog.
 
 - **Agent access:** the details sidebar shows owner and recipient avatars.
   Use **+** to open the agent picker and select explicit recipients. The same
-  picker is available in **New artifact**. Project, producer, and other
+  picker is available in **New artifact**. Existing documents offer **Read** or
+  **Read + write** for each explicit recipient. Project, producer, and other
   inherited access is labeled separately and cannot be removed by clearing an
   explicit selection. Explicit changes apply to the document's existing revision
-  history; new revisions inherit these grants.
+  history; new revisions inherit these grants. Explicit grants work independently
+  of project membership and remain until revoked. Agents assigned to the
+  document's project inherit read + write automatically. The picker shows both
+  sources; removing an explicit grant does not remove inherited project access.
+  A document grant never grants project browsing or access to its source chat,
+  task, or other documents.
 - **Public link:** choose **View in browser** or **Download file**, then select
   an expiry or custom expiration. Previewable formats default to View; unsupported
   formats default to Download. HTML View links open the standalone page.
-  Links target the exact revision and do not silently follow future edits.
+  Links always open the latest version of the document: a link created from any
+  revision serves the newest live revision when it is opened, and public viewers
+  get no revision history. Comments made through a link stay on the revision they
+  were written against.
 
 Anyone with a public link can use it until expiration. These are signed,
 stateless links: there is no individual-link revocation, and removing an agent
 grant does not invalidate a public link already issued. Editing and sharing
-controls are owner-only; project readers remain read-only.
+and grant-management controls are owner-only. Agent write access permits only a
+new revision, not deletion, resharing, or changing the lineage's owner/project.
+Each revision records its author separately from the owner; revision history
+and Library details show that author.
+
+Agents use `artifact_share` to inspect or change sharing. Its `grant` action
+defaults to `permission: "read"`; use `"write"` explicitly to allow revisions.
+The `set` action accepts `agent_ids` and its `write_agent_ids` subset.
+Both `artifact_write` and `write_deliverable` require the exact revision last
+read as `supersedes` when continuing a lineage. If another write has moved the
+head, the server rejects the write with the current head. Re-read it and decide
+what to write; the server never merges or retries. This also applies to two
+writes from one session and explicit revisions from the same workflow step.
+Revoking or downgrading write takes effect at the next publication transaction,
+including in running sessions. It does not cancel already committed revisions.
 
 JSON is pretty-printed and highlighted in the shared source and code readers,
 including artifact previews, chat attachments, knowledge documents, and rich
@@ -92,6 +145,43 @@ link has expired.
 
 > Cognis temporary sharing is not web hosting. A signed URL is a bearer link:
 > anyone who has it can use it until it expires.
+
+## Feedback and revocable commenting links
+
+**Feedback** opens source-bound threads beside a document or in a narrow-screen
+sheet. Comments retain their exact revision or recorded event. Missing historical
+locations are reported, not silently moved to a newer revision. Thread
+resolution, delivery and agent work status are separate.
+
+Saving does not dispatch work. In chat, review and explicitly include prepared
+feedback in the composer. Outside chat, choose an authorized destination: an
+origin, preferred follow-up, fresh conversation or eligible task reopen. A task
+reopen requires confirmation of the target, downstream invalidation and
+side-effect warning. Changing the selection or destination invalidates that
+confirmation.
+
+Review freezes exact entry versions and minimum parent context. Outside-chat
+sends are saved before dispatch. After reload or response loss, **Check saved
+send** reconciles the same creation key. A new review requires a known accepted
+or rejected delivery.
+
+In **Access**, feedback read, comment, moderation, dispatch and disclosure are
+independent permissions. Viewing content alone does not grant these powers.
+Revocable commenting links are separate from ordinary stateless public links.
+They pin one document revision and enable comments explicitly. **Own comments
+only** is the default; shared discussion is an explicit alternative. Owners can
+disable commenting or revoke a link.
+
+Guest names are unverified labels, not account identities. Guests have no agent
+send control or owner-session fallback, even in a signed-in browser. The public
+viewer exchanges and removes the raw URL token, then uses bounded public
+capabilities rather than private URLs or owner cookies. Guest recovery is
+tab-scoped. Offline exports remain read-only.
+
+Public outcomes show only an owner-published disposition and reason, never
+private packet text, task IDs or conversation links. Authorized internal history
+can inspect the immutable packet and exact results. Dashboard documents expose
+their preferred follow-up and explicitly linked result revisions.
 
 ## Content lifecycle
 

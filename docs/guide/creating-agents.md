@@ -36,9 +36,71 @@ Panels mount on first visit and retain their state afterward. Tool catalogs,
 hooks, and collaboration data load when their tabs are first opened.
 
 Under **Providers & models**, memory and guardrails have separate groups.
-**Advanced evaluation controls** contains outcome overrides and the escalation
-timeout. This group opens automatically when an override is configured; safety
-warnings remain visible even when the group is collapsed.
+With **Intaris** selected, **Advanced evaluation controls** contains outcome
+overrides and the escalation timeout. This group opens automatically when an
+override is configured; safety warnings remain visible even when the group is
+collapsed. With **None**, evaluation and approval controls are hidden; the backend
+selector and **Session analytics** toggle remain available.
+
+**Session analytics** (`capabilities.analytics_enabled`, default `true`) controls
+Intaris summaries and behavioral analytics independently of the guardrails
+backend. Turning it off does not remove session events or tool audit records.
+With guardrails **None**, ordinary evaluation and proactive intention/alignment
+work are disabled; explicit mandatory evaluation still runs. All four
+guardrails/analytics combinations are supported.
+
+| Guardrails | Session analytics | Effect |
+|---|---|---|
+| Intaris | On | Preventive tool evaluation plus retrospective session and behavioral analysis. Usual baseline for personal assistants and autonomous or public-facing agents handling untrusted input. |
+| Intaris | Off | Preventive evaluation and recording remain, without retrospective analytics. Useful for trusted, lower-risk automation where analytics are not needed. |
+| None | On | Retrospective monitoring without ordinary preventive guardrail evaluation. Analytics can identify patterns later; they do not block the action being analyzed. |
+| None | Off | No Intaris guardrail or analytics LLM calls on the normal Cognis path. Session storage and audit remain; this is not a promise of zero total inference cost. |
+
+For isolated coding agents, turn analytics off when its additional monitoring is
+not useful. Consider **None** only when filesystem/network isolation, scoped tools,
+and the task's risk provide adequate containment. Guardrails are not a replacement
+for that isolation. For personal assistants and autonomous or public-facing agents,
+keep both controls on as the usual baseline. For trusted lower-risk automation,
+keep guardrails on and choose analytics according to monitoring needs.
+
+These choices do not change defaults or automatically update existing agents.
+
+Owner root primary agents can also manage guardrails with `manage_agents`:
+`settings_update` accepts `guardrails_backend`, `intaris_evaluation`,
+`approval_mode`, `minimum_outcome`, and `maximum_outcome`. The same fields are
+available on `create`, and `settings_get` returns their effective defaults.
+Supplied settings patch existing capabilities; nullable outcome bounds clear
+with `null`. Switching guardrails to `none` requires clearing outcome bounds
+and restoring approval mode to `ask` in the same update.
+
+`tools_get`, `tools_set`, `tools_add`, and `tools_remove` cover builtin and
+caller-assignable MCP tool IDs, `disabled_tools`, `disabled_mcp_servers`,
+`intaris_mcp_servers`, and legacy `mcp_servers` configuration. `tools_set`
+replaces supplied lists and preserves omitted lists; add/remove apply list
+deltas. Legacy inline MCP configuration does not provision a runtime connection:
+manage connections on executors. Removing a server from the disabled list
+enables its otherwise assigned tools.
+
+An owner can grant a user-scoped credential to any owned agent, even when
+another agent originally requested it. The credential's originating `agent_id`
+does not restrict user scope; agent-scoped credentials remain restricted to
+their designated agent. Use `credentials_get` and its fresh `updated_at` for
+`credentials_grant` or `credentials_revoke`.
+
+Existing history is retained; analytics eligibility for sessions follows the
+effective configuration rather than deleting earlier analysis. Delegated work
+inherits the parent's effective configuration. Managed conversations instead use
+the target agent's configuration, including when the target is the same agent.
+
+Cognis generates new automatic conversation titles separately through
+`auxiliary_generation`, regardless of either toggle. Optional vector search can
+also require embedding inference. See [Guardrails, analytics, and cost](security-and-privacy.md#guardrails-analytics-and-cost)
+for the separate evaluation and analytics lifecycles.
+
+Speech has its own **TTS provider**, **TTS model**, and **Provider voice** controls
+in this tab, independent of the chat model. Leave the provider inherited to use
+the system `text_to_speech` route. Model options are filtered for synthesis, and
+voice options follow the selected provider/model. See [Speech and audio](speech.md).
 
 ![Executor tool pool to effective tool set](../assets/images/cognis-agent-tool-inheritance.svg)
 
@@ -95,6 +157,65 @@ Agents can manage the same fields through `manage_agents`:
 Updates preserve omitted fields; set `quick_switch` to false to remove a profile
 from the control without deleting it. `runtime_profiles_delete` removes the
 profile under the existing default and in-use safeguards.
+
+### Automatic startup profile selection
+
+New conversations use **Auto** unless the target agent opts out under **Profiles**.
+Auto matches the first request against profile descriptions through the typed
+`classifier` route. Only enabled profiles with `agent_switchable=true` are
+eligible; manual-only profiles and their descriptions are never sent to the
+classifier. A human can still choose those profiles explicitly.
+
+Auto compares profile descriptions equally and selects the least specialized
+profile that clearly fits the work. A clear ordinary request can select a lighter
+profile even when the configured default is more specialized. Missing incidental
+details, task size, or production use alone do not justify a specialist.
+
+Auto conservatively keeps the configured default when it fits best, the request
+is unclear, classification fails, or confidence is below **0.55**. The **Auto selection minimum
+confidence** setting accepts values from 0.5 to 1; raise it to prefer the default
+more often. No classifier call is made if there is no eligible non-default
+alternative. A sole non-default alternative still needs confidence to beat the
+keep-default outcome; it is not an automatic upgrade.
+
+Select **Default profile** to skip classification for one new conversation, or
+disable **Automatically select a startup profile** to opt the agent out. Selection
+happens once before the first response and is persisted. Existing conversations,
+reconnects, later messages, and inherited forks are not reclassified. Explicit
+profile choices always win.
+
+When classification is used, the system context identifies its initial prediction,
+confidence when available, and final startup outcome. This is an estimate, not a
+fixed role: the agent may select a better-fitting profile from the currently
+eligible list as the task becomes clearer. Explicit user choices remain authoritative.
+Native typed classifiers and normal chat models use the same classifier policy.
+
+The lower default applies to omitted settings. Existing explicitly saved confidence
+thresholds, including **0.85**, are preserved; lower an agent's saved threshold to
+opt into less conservative startup selection.
+
+The agent REST create/update configuration is:
+
+```json
+{
+  "execution": {
+    "auto_profile_selection": {
+      "enabled": true,
+      "min_confidence": 0.55
+    }
+  }
+}
+```
+
+For `manage_agents`, use top-level `auto_profile_selection` on create/update or
+`settings.auto_profile_selection` on `settings_update`. Supplied group fields
+preserve omitted fields; `null` restores defaults.
+
+Conversation create/open/resolve APIs and `agent_conversation_create` /
+`agent_conversation_create_channel` accept `agent_profile_mode: "auto" | "default"`.
+Omitting it follows the target agent's configuration, not the controller's profile.
+`agent_profile_id` remains a real profile identifier and takes precedence.
+Workflow/task/step profile overrides keep their explicit/default behavior.
 
 ### Personality
 
@@ -159,7 +280,7 @@ loads the updated agent definition; revocation does not cancel in-flight tool wo
 
 ### Intaris evaluation outcomes
 
-**Intaris evaluation** is one human-owned setting: `legacy`, `strict`,
+**Intaris evaluation** is one owner-controlled setting: `legacy`, `strict`,
 `balanced`, or `bounded_autonomy`. Hybrid modes send `hybrid_v1` and the
 selected profile to Intaris; legacy sends `legacy` without a profile.
 The default is Balanced. Explicitly configured legacy selections remain legacy.
@@ -167,6 +288,20 @@ The default is Balanced. Explicitly configured legacy selections remain legacy.
 Delegated child sessions inherit their parent's effective Intaris policy instead
 of selecting the child agent's default. Runtime policy refreshes preserve that
 inheritance; delegation does not create a new independent policy boundary.
+Delegates also inherit the parent's effective memory backend/options, guardrails
+capabilities and analytics preference. Their specialist identity, model, role and
+access permissions remain unchanged; secondary specialists still skip automatic
+memory. Retry, follow-up and fork use the same inheritance boundary.
+
+Managed conversations instead use the **target agent's** configuration, even when
+the target is the same agent as the controller. Inherited allow/deny clauses
+remain enforced, but the controller's evaluation selection is not copied.
+Managed retry and derived conversations retain this independence.
+
+Session flags are persisted by Intaris and acknowledged before execution.
+Rotation preserves the effective session flags. Deploy a compatible Intaris
+version before using these controls: an older server that drops flags cannot
+acknowledge activation, especially an explicit `false`.
 
 Set `capabilities.intaris_evaluation` on an agent. A task can override it with
 `session_policy.intaris_evaluation`; schedules forward the selection in their
@@ -177,10 +312,11 @@ Workflow defaults cannot choose an evaluation mode.
 Agent null values are invalid. Omitted agent updates preserve the selection.
 For a task or schedule policy, null restores inheritance; omitted policy updates
 leave the existing policy unchanged. Whole-policy replacement retains the
-existing API semantics. Model-authored tools cannot select or clear evaluation
-modes, including through nested metadata; prose-only tool updates preserve the
-human selection. Existing clauses, outcome bounds, and human approval precedence
-still apply.
+existing API semantics. Owner root primary chats can update agent defaults
+through the explicit guardrail fields of `manage_agents`. Other model-authored
+workflow, task, schedule, and nested metadata paths cannot select or clear
+evaluation modes; prose-only tool updates preserve the owner's selection.
+Existing clauses, outcome bounds, and human approval precedence still apply.
 
 Hybrid activation requires Intaris to acknowledge the exact active version and
 profile. An older server that drops these fields cannot silently run a hybrid
@@ -276,6 +412,22 @@ use the grantee's override or their default executor, never the owner's binding.
 Grantees cannot change the owner's settings through `manage_agents`; they can
 configure their own executor on the shared agent page.
 
+Creating or updating a primary agent as active, activating it, and creating an
+`owner_executor` share reject a missing primary executor binding before making
+the change.
+A `grantee_executor` share does not require the owner's binding: its recipient
+must select their own executor on the shared agent page or have a usable default
+under **Settings → Executors**. Missing recipient configuration is reported as
+`executor_configuration_invalid` with these recovery steps.
+
+Sharing an agent also lets its recipient read and use the owner's explicitly
+assigned, enabled skills, including automatic instructions and versioned assets.
+This works with either executor scope. Assets are prepared on the session's
+executor. It does not expose the owner's other skills, grant general artifact
+access, or permit skill edits. Removing the assignment or revoking agent access
+blocks subsequent skill loads; already delivered instructions and files are not
+erased.
+
 Knowledgebase assignment is separate from tool assignment: `allowed_knowledgebases`
 controls which KBs the agent can access, while knowledgebase tools control what
 the agent can do with those KBs.
@@ -324,6 +476,26 @@ under `system_agents`, and they are tuned per user through overrides:
   and a supplied object replaces the whole field. Tools beyond the shipped set,
   skills, knowledgebases, and credentials must be available to the caller.
 - `system_disable`, `system_enable`, and `system_overrides_reset`.
+
+### System specialist skills
+
+Visible system specialists can use `skill_load` and `skill_get` for skills
+available to the requesting user. Delegated sessions retain their role-specific
+tool limits: loading a skill does not grant management tools, bypass explicit
+tool denials, expose another user's skills or credentials, or inherit the
+parent's loaded instructions.
+
+Implement, Code Review, and Architect automatically receive Cognis Coding
+instructions. Research automatically receives Cognis Web Research instructions.
+Explore and Committer retain their focused role instructions without a default
+autoloaded skill. This does not autoload the rest of the user's skill library.
+Implement and Research use shorter identity instructions only when the matching
+skill body is actually delivered in the prompt.
+
+Existing system-agent skill overrides inherit the autoload flag for a retained
+default skill when that flag was omitted. Explicit `auto_load_instructions: false`,
+disabled refs, and removed refs remain respected. Existing tool overrides still
+get the skill readers unless explicitly denied or disabled by category.
 
 All accept an optional `expected_updated_at` from the last read; an empty
 string asserts that no override exists yet. Internal hidden system agents are
@@ -378,14 +550,16 @@ MCP tool categories provided by that executor.
 
 Use overrides only when the agent really needs different behavior from the default routing policy.
 
-### Workflow settings
+### Workflow execution
 
-- available workflows
-- default workflow
-- selection mode
-- step agent overrides
+Choose a workflow explicitly when creating a task or schedule. If no workflow
+or decomposed skill is supplied, the task uses `system:general-task`; Cognis
+does not classify the request to choose a workflow.
 
-Workflow settings matter most when the agent should do structured background work instead of only direct chat responses.
+Agent execution settings retain step-agent overrides, but no longer include an
+available-workflow list, default workflow, or automatic selection mode.
+Legacy workflow-selection keys in saved agent execution JSON are ignored and
+discarded when execution settings are saved.
 
 ## Practical create flow
 
@@ -395,6 +569,6 @@ In the create form, the most useful order is:
 2. personality and behavior guidance
 3. executor and tool restrictions
 4. provider/model overrides only if necessary
-5. workflow defaults for structured execution
+5. step-agent overrides only when structured execution needs them
 
 Most agents should inherit as much as possible from system defaults and only override what truly makes them different.

@@ -47,6 +47,20 @@ their current permissions until explicitly configured.
 
 ### Owner-scoped credential assignment
 
+MCP `credential_bearer` authentication binds one existing `.token` credential
+reference to one owner agent and a private HTTPS MCP destination. Resolution uses
+the canonical credential provider. Controller dispatch checks current durable
+grants, owner, private WebSocket executor assignment and credential version;
+executor dispatch checks the matching client generation. Discovery applies the
+same agent binding. Changed configurations require reconfiguration, never reuse
+a stale cached bearer. Static secret and OAuth contracts are unchanged.
+
+`manage_executors.provision_token` atomically persists the executor token version,
+encrypted agent-scoped credential and caller grant in one transaction. It uses
+the existing signer and post-commit fence. An operation ID stored with the
+credential reconciles retries, including a pending fence after cancellation.
+No secret CRUD, HTTP impersonation, signing path or database schema is added.
+
 `manage_agents` declares `credentials_get` (read) and `credentials_grant` /
 `credentials_revoke` (update) in its canonical native operation registry.
 All three require an exact `agent_id` and `credential_id`; mutations additionally
@@ -70,7 +84,7 @@ Tools come from five sources, each with a priority for deduplication:
 | Source | Priority | Description |
 |--------|----------|-------------|
 | `builtin` | 500 | Controller-side tools (orchestration, system, workflow directives) |
-| `executor` | 400 | Executor-native tools (filesystem, search, shell, web). Always available. |
+| `executor` | 400 | Executor-native tools (filesystem, search, shell, web, and gated Python PTC). |
 | `skill` | 300 | Skill-provided tools (DB-managed instruction + tool bundles) |
 | `local_mcp` | 200 | Per-agent MCP servers running on the executor |
 | `intaris_mcp` | 100 | Remote MCP servers proxied through Intaris |
@@ -92,16 +106,124 @@ LLM returns tool calls
   │    → Intaris evaluates + executes in one call
   │    → Executor NOT involved
   │
-  ├─ Executor-native (read, write, edit, bash, glob, grep, etc.)
+  ├─ Executor-native (read, write, edit, bash, glob, grep, Python PTC, etc.)
   │    → Controller evaluates via Intaris
   │    → If approved: Controller sends tool.execute to Executor
   │    → Executor runs native handler, returns result
+  │    → PTC nested tool calls return through the controller's normal router
   │
   └─ Local MCP (per-agent MCP servers)
        → Controller evaluates via Intaris
        → If approved: Controller sends tool.execute to Executor
        → Executor dispatches to MCP server, returns result
 ```
+
+### Programmatic tool calling (PTC)
+
+The executor-native PTC tools are `python_execute`,
+`python_kernel_status`, and `python_kernel_reset`. `python_execute` requires a
+non-empty `description` and literal `code`; optional `inputs`,
+`input_schema`, `output_schema`, and `limits` are passed as separate arguments.
+Workflow source is pinned and never template-rendered; workflow input and the
+single emitted result are schema-validated. See
+[`34-deterministic-workflows.md`](34-deterministic-workflows.md) for the
+workflow-specific contract and
+[`tools-and-skills.md`](../guide/tools-and-skills.md#programmatic-tool-calling-ptc)
+for the interactive argument example.
+
+`python_execute` and `python_kernel_reset` are non-bypassable. The required
+description is bound to the parent program invocation, and Intaris evaluates it
+through the ordinary policy/approval path; child calls are evaluated separately.
+A pending child approval suspends the same cell and does not consume its active
+wall-time budget.
+
+PTC visibility is gated by executor configuration in
+`cognis/core/program_config.py`: a configured executor whose
+`labels.cognis_runtime_profile` is exactly `pod` is eligible by default, unless
+`config.program_runtime.enabled` is `false`. All other identities (including
+WebSocket or unknown executors not labelled `pod`) require
+`config.program_runtime.host_enabled: true`. The host opt-in does not override
+an explicit `enabled: false`.
+
+Each call receives a controller-bound scope, generation, description, executor
+identity, and effective tool plan. Interactive scope is the conversation ID, or
+session ID if no conversation ID exists; on the same executor its IPython
+namespace persists across cells while the kernel remains alive. State is
+volatile, not an on-disk heap:
+the local ledger stores recovery metadata, not variables. Kernel state can be
+lost on executor restart, idle reclamation, or terminal cleanup. The default
+idle TTL is 30 minutes and the executor caps live kernels at 64. Workflow PTC
+uses the current fresh `StepRun` ID and discards the kernel at the step boundary;
+each new run starts fresh.
+
+`python_kernel_status` takes no arguments and reports `state`,
+`kernel_generation`, and available `state_lost_reason`, not namespace values.
+`python_kernel_reset` requires the current
+`expected_generation`, only resets an idle kernel, and advances its generation.
+Subsequent `python_execute` calls in an existing scope must supply the current
+`expected_generation`. On state loss or an uncertain outcome, inspect
+`state_lost_reason` and `child_call_references`, then reconcile effects before
+retry; execution is not blindly replayed.
+
+Nested calls are restricted to the current effective plan.
+`await cognis.tools.search(query, limit=10)` searches that plan;
+`await cognis.tools.describe(tool_id)` returns one descriptor; and
+`cognis.tools.load(descriptor)` creates an async callable for a deferred member
+of that plan. They do not expose a broader catalog. Each child call is
+independently evaluated through `ToolRouter` and normal Intaris policy and
+approval; parent approval is not inherited. Writable tools are eligible unless
+an explicit session policy requires read-only access. Workflow programs remain
+read-only, apply their explicit canonical-ID allowlist, and exclude
+model-invoking, recursive, management, and unsupported-source tools. When a
+plan includes writable tools, child calls are serialized in v1. The generated
+`cognis.runtime_guide` is the per-call authority for exact aliases, schemas,
+executor policy, limits, and discovery.
+
+Forwarded program RPC uses the authenticated controller bridge capability
+`program_rpc_v1`, with at most 64 active reverse child calls. The controller
+owning the live invocation performs authorization and approval; the physical
+executor owner only relays the call and status/cancel messages. Without the
+capability, Python execution is rejected before dispatch. Disconnect does not
+replay an accepted/unknown cell or child effect. Pending approval/child work is
+interrupted when trusted continuation cannot be retained; uncertain outcomes
+block subsequent governed child dispatch until reconciliation. Existing
+same-instance accepted-call recovery may retrieve a retained terminal result.
+A live heap and its bridge/continuation are separate: an idle remote kernel may
+survive a controller disconnect, while an in-flight child continuation may
+not. Executor process restart or local provider shutdown closes kernels and
+advances generation; no heap restoration is attempted.
+
+The Python kernel is not a sandbox and nested tool governance does not constrain
+direct Python operations. Code can use the executor user's accessible
+filesystem, credentials, mounts, network, and processes available to that user.
+Keep secrets out of source and inputs. Use normal Intaris evaluation for
+approval-sensitive nested mutations.
+
+The Chat v2 timeline uses the existing real-time tool-call cards: a Python parent
+card discloses highlighted source, readable output/result, generation, and linked
+child tool cards without duplicating the generic input/result body. Python uses
+a separate code activity group. Flushed stdout/stderr retain IOPub ordering and
+stream identity through the ordinary bounded tool-progress spool, reconnect, and
+Chat v2 runtime overlay; terminal previews come from the canonical program result.
+No Python-specific output spool or replay mechanism is introduced. Protocol
+metadata is behind an explicit raw-data disclosure. A child awaiting approval
+remains actionable and marks the parent as
+waiting; contiguous linked events are grouped under the parent rather than
+duplicated at top level. The live acceptance harness distinguishes end-to-end
+execution from synthetic timeline coverage.
+`tests/e2e/test_ptc_live_qualification.py` exercises real Cognis, Intaris,
+Mnemory, and IPython with a deterministic model/policy provider, including
+separately approved nested mutations. The canonical browser acceptance in
+`tests/e2e/test_ptc_live_browser_acceptance.py` verifies parent/child ordering,
+stable identity, reconnect/reload deduplication, and persistent second-cell
+state. Synthetic timeline fixtures alone do not prove live backend execution.
+
+The runtime guide renderer and upstream-adaptation provenance remain owned by
+`cognis/core/program_guidance.py`; this contract intentionally does not duplicate
+that prompt text.
+
+Not shipped in this PTC slice: recursive agent bindings or vendor-specific PTC
+adapters, kernel-heap restore, notebook UI, or production A/B evaluation.
 
 ## Tool Definition
 
@@ -1684,10 +1806,13 @@ workflow extensions such as `steps:` and `workflow_templates:` are optional.
 
 Skills have three distinct runtime states:
 
-1. **Discoverable** — all visible skills for the user. These are announced in
-   compact prompt metadata and can be loaded explicitly with `skill_load`.
+1. **Discoverable** — all visible skills for the user. Unattached ones are only
+   counted in the prompt, found with the always-exposed `skill_search` core
+   tool, and loaded explicitly with `skill_load`.
 2. **Attached** — skills selected on the agent plus skills attached to all
-   agents. These are highlighted in the prompt as preferred defaults.
+   agents. Only these are listed in the prompt catalog, with `skill_id`, name,
+   and description (capped at 1,024 characters). Attached skills whose
+   instructions are auto-loaded are omitted from the catalog.
 3. **Forced/Inherited** — workflow or delegation scoped attachments that can be
    injected into a sub-session explicitly.
 
@@ -1706,8 +1831,17 @@ derived structure is advisory to the composer and is never written back unless a
 user or agent explicitly saves it.
 
 Discoverability and attachment are intentionally separate. Agents should
-usually choose from prompt-announced skills and call `skill_load` directly
-rather than browsing with `skill_list`.
+choose from the prompt catalog or `skill_search` results and call `skill_load`
+directly rather than browsing with `skill_list`. `skill_search` is a dedicated
+skill tool rather than a `search_tools` result type: it returns skills, which
+are loaded with `skill_load`, not tool handles invoked through `call_tool`.
+
+Skill mutations by an agent (`skill_write`, `skill_patch`, asset changes,
+`skill_import_url`, `skill_restore_version`) attach the skill to the acting
+persistent agent; delegated `system:*` specialists act for their parent.
+The `agent_skill_usage` table stores content-free per-agent load counters,
+the last load time, and loads that followed a `skill_search` result. These
+drive advisory curation hints only.
 
 ### Deferred Skill Tools
 
@@ -1722,7 +1856,7 @@ tools:
   `allowed_tools` restrictions) controls visibility without changing the stable
   tool inventory.
 
-This lets Cognis keep all visible skills discoverable while still encouraging
+This lets Cognis keep all visible skills loadable while still encouraging
 explicit skill loading and preserving prompt caching.
 
 ### Cloud-Native Skill Storage

@@ -40,6 +40,13 @@ document-level context that blocks can reference by ID.
 6. Keep the Markdown fallback complete enough for channels and accessibility.
 7. Do not nest cards inside cards without a clear information hierarchy.
 
+Consider useful visuals during research, not only during composition. Verified
+subject-specific media such as film posters or product photos can aid
+recognition and comparison; place them with the relevant item and provide
+specific alt text and provenance. Diagrams can clarify relationships,
+architecture, or processes. Omit visuals that add no value or cannot be
+verified; do not invent URLs or use unrelated decorative imagery.
+
 ### Web presentation and spacing
 
 Standalone and full-view documents use an edge-to-edge canvas, at least as

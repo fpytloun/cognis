@@ -55,7 +55,11 @@ services:
     environment:
       # Disable LLM-backed analysis — event store still works
       ANALYSIS_ENABLED: "false"
-      # Point at mock-llm as a safety net (won't be called with analysis off)
+      # Keep the evaluator on its existing default unless the isolated PTC
+      # qualification run explicitly selects its deterministic test model.
+      LLM_MODEL: ${COGNIS_E2E_INTARIS_POLICY_MODEL:-gpt-5.4-nano}
+      JUDGE_LLM_MODEL: ${COGNIS_E2E_INTARIS_POLICY_MODEL:-gpt-5.4}
+      # Point at mock-llm for policy evaluation and optional analysis.
       LLM_API_KEY: mock-key
       LLM_BASE_URL: http://mock-llm:8090/v1
       ANALYSIS_LLM_API_KEY: mock-key

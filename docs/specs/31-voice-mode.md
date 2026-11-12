@@ -1,5 +1,50 @@
 # Cognis: Voice Mode (TTS, STT, Conversation Mode)
 
+## Current implementation
+
+The original sections below describe the initial design, including historical
+motivation and planned behavior. Current product behavior is documented in
+[Speech and audio](../guide/speech.md).
+
+Speech policy is centralized in `core/speech.py` for HTTP playback and agent
+tools. ElevenLabs has a shared native transport in `cognis-common` used by both
+controller and executor inference. Synthesis and transcription capabilities are
+explicit model metadata. `audio_narrative` inherits `companion_lite` and handles
+optional message adaptation (off by default) and source-grounded single-narrator
+podcast scripts.
+
+Deliverable audio jobs pin an exact revision, store only metadata/references,
+and reuse the renewable maintenance lease and atomic state-transition fences.
+Scripts and ordered audio parts are artifacts. Cancellation or restart never
+implicitly starts a new paid job; interrupted work requires explicit generation.
+Playback is available for a generating recording's committed prefix; later parts
+append without restarting playback. The job remains incomplete until its existing
+terminal CAS succeeds. The idle speaker becomes
+play/pause once ready; circular 10-second seeking controls appear only during
+playback. Pending synthesis remains cancellable.
+
+The web conversation overlay now projects speech from the admitted Chat v2
+turn's cumulative messages. It does not subscribe to the historical
+`tts_sentence_ready` or `message_complete` frames described below. Idle runtime
+observations trigger read-only admission reconciliation and canonical snapshot
+recovery; only an authoritative terminal admission releases the turn guard.
+The microphone resumes after synthesis and playback drain. This is still an
+utterance-based, half-duplex pipeline, not a real-time full-duplex media session.
+
+Native transport contracts live in `cognis-common` and normalize OpenAI/ElevenLabs
+speech to bounded PCM events. `LLMService` retains selection, authorization,
+executor placement, physical-attempt admission and no-replay recovery. Existing
+executor inference streams also carry speech; microphone input uses the same
+request's fenced continuation RPC, including cross-controller forwarding.
+
+`POST /api/v1/tts/stream` exposes disposable NDJSON previews of the canonical
+speech/cache operation. Only explicit provider completion and validated,
+contiguous PCM can produce a replayable artifact/cache receipt. A slow or
+disconnected preview cannot publish partial audio as a completed artifact.
+Browser microphone commands run on an authenticated WebSocket connection and
+are cancelled with its revocation/disconnection lifetime. Partial transcripts
+remain ephemeral; only the final committed utterance enters turn admission.
+
 ## Purpose
 
 This spec defines first-class **voice** support across Cognis: text-to-speech

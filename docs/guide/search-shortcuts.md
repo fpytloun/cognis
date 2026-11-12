@@ -38,14 +38,25 @@ its main conversation, not a previously visited topic; it is resolved only after
 selection. Project destinations always open Overview, even if another project
 tab was last selected. App pages use the same destinations as the sidebar.
 
-Use **Up/Down** to select, **Enter** to open, or **Command-1 through Command-9**
-(Ctrl on other platforms) to open a numbered match immediately. **Escape**
-closes the palette and restores focus. Browser-reserved shortcuts may depend
-on the browser or native host.
+Use **Up/Down** to select, **Enter** to open, or **Control-Shift-1 through
+Control-Shift-9** to open a numbered match immediately on any platform.
+On Mac, use **Control (⌃), not Command (⌘)**: Command-number selects browser
+tabs, and several Command-Shift-number combinations take screenshots.
+**Escape** closes the palette and restores focus.
+
+Press **Up** in an empty search box to recall the most recent search, then use
+**Up/Down** to browse earlier searches and return to your draft. **Alt-Up/Down**
+(Option on Mac) also browses history without discarding typed text. Typing or
+pressing **Left/Right** exits history browsing; Up/Down then selects results again.
+Closing the palette remembers the query, not the results. History is stored
+locally in this browser, separately for each account, with at most 20 searches.
+Use **Clear history** in the palette footer to remove it.
 
 On the main dashboard, opening a result opens or focuses its workspace window.
-On a project dashboard, only results belonging to that project open in its
-workspace; other results navigate to their canonical page. Elsewhere, results
+On any tab of an open project, only results belonging to that project open in its
+workspace (or its modal fallback on phones or when windows are disabled);
+other results navigate to their canonical page. Documents and files use the
+Library reader, including items outside the project's recent activity. Elsewhere, results
 navigate normally. **Command-Enter** / **Ctrl-Enter**, or the small redirect
 arrow, always navigates to Chat, Tasks, Schedules, Library, or Settings.
 Existing window capacity and access checks still apply.
@@ -59,11 +70,13 @@ Small raster images can show thumbnails. Large originals and SVG files use
 icons instead of downloading or decoding them for a search result.
 
 The server reads metadata only, using native name indexes. Searches have
-two-second database deadlines, a three-second operation limit, per-user and
-controller-wide admission/rate limits, and no
-automatic retry loop. Client query caches are short-lived, memory-only,
-bounded, and cleared on account changes. A busy or timed-out search leaves
-local actions available and offers an explicit retry.
+ten-second database deadlines, a fifteen-second operation limit, and per-user
+and controller-wide admission/rate limits. The client allows twenty seconds per
+request and automatically waits through brief admission contention for up to
+thirty seconds. Changing the query or closing the palette retires that retry.
+Client query caches are short-lived, memory-only, bounded, and cleared on account
+changes. Persistent contention or a timed-out search leaves local actions
+available and offers an explicit retry.
 Routine background activity does not clear visible matches. Access changes
 retire cached metadata immediately and refresh the current search automatically.
 
@@ -74,6 +87,21 @@ view's search field and select its existing text. The shortcut does not submit
 a search or change a draft.
 
 - In a full conversation, it opens conversation search when collapsed.
+- In an opened deliverable or artifact, it opens **Find in document**. You can
+  also tap the magnifier in the document action bar or **Search in document**
+  in its ⋯ menu. Chat and documents use the same compact field inside their
+  existing toolbar, with a count, arrows and Close. On phones it replaces the
+  header contents at the same height; closing restores them and focus. No
+  content is covered or shifted. Matching is literal and case-insensitive;
+  **Enter** and **Shift-Enter** navigate matches and wrap at either end.
+  **Escape** closes find without closing the document. Rich/Markdown and text
+  previews search displayed text, not comments, controls or Library metadata.
+  HTML search stays inside its sandbox. PDF search reads the embedded text
+  across all pages and opens the selected page; scanned images need OCR first.
+  Truncated text previews search only the displayed preview.
+  Standalone Rich/text readers have the same find bar. External signed HTML
+  pages keep browser-native Find inside their original opaque iframe; their
+  strict trusted-shell CSP is unchanged.
 - When focus is in the conversation sidebar or the Work file explorer, its
   existing search field takes priority.
 - In the dashboard, an active workspace window's search takes priority.

@@ -2,7 +2,30 @@
 
 The `Settings` workspace is where operators configure the Cognis environment after the first login. It is the main place for providers, routing, secrets, executors, MCP servers, diagnostics, and user administration.
 
+## Chat preparation latency
+
+Intaris intention generation is submitted before inference without waiting for
+generation to finish. Intaris tool evaluation still owns the intention barrier;
+this does not bypass tool authorization or canonical event persistence.
+
+`session.optional_recall_timeout_seconds` defaults to **0.5 seconds** for optional
+per-turn memory search. A timeout cancels that search and surfaces a notice that
+the turn continues without recalled memories. Core identity/instruction loading
+is not subject to this optional-search budget, and explicit memory tools retain
+their own timeouts. Existing database overrides are preserved.
+
+Content-free `turn: stage completed` logs distinguish runtime resolution, core
+identity preparation, optional recall, event refresh, Intaris status reads,
+reasoning submission, and context delivery. CPU preparation logs separately
+report queue wait and execution duration. Correlate by `turn_id`/`session_id`;
+stage durations can overlap and must not be blindly summed. These server-side
+timings do not measure browser paint or replace provider TTFT measurements.
+
 ## Main areas
+
+For speech-provider setup, the optional listening preference, the
+`audio_narrative` route, and deliverable narration/podcasts, see
+[Speech and audio](speech.md).
 
 Depending on your role, the settings workspace can include:
 
@@ -41,6 +64,12 @@ default, independent of the selected agent template. Its available management
 skills are attached and auto-loaded. Advanced options allow explicit opt-out.
 Existing agents are not silently upgraded: enable individual tools in the agent
 editor and attach the corresponding skills.
+An owner can also use `manage_agents` with `tools_add` to assign an individual
+management tool, for example `allow_tools: ["builtin:manage_settings"]`.
+The owner's root primary chat lists unassigned management tools as assignment
+candidates without enabling their discovery or execution. Changing the current
+agent still requires explicit user review before persistence. New agents do not
+inherit management tools merely because those tools are assignable.
 
 | Tool | Scope | Skill |
 | --- | --- | --- |
@@ -90,6 +119,9 @@ overwriting a newer durable value. These tools do not expose arbitrary database
 keys, environment editing, service restarts, secret retrieval, or user administration.
 
 ## Providers and routing
+
+For typed usage-retention defaults, bounded previews, coverage limitations and
+explicit activation, see [Usage accounting storage and retention](usage-accounting.md).
 
 Use the provider and routing tabs to decide:
 
@@ -169,6 +201,15 @@ evaluated from fresh, unexpired windows and appear only inside Cognis, not throu
 push or external notification channels. Anthropic API-key limits come from previously
 observed response headers, not a proactive usage API; refreshing cannot make those
 observations fresh. Without observations, usage is unknown.
+
+Controller-hosted ElevenLabs API keys report subscription credits, remaining
+credits, plan, and the provider's actual reset date through the same monitor.
+These are credit units, not necessarily input characters; model credit rates
+can differ. Enabled usage-based billing and its reported cap are kept separate
+from the included allowance. Missing counts or restricted subscription access
+mean unknown quota, not exhausted credits or an inference outage. A quota
+permission refusal clears the old meter instead of presenting it as current.
+Executor-hosted ElevenLabs credentials do not currently support this quota read.
 
 ## Notification inbox
 

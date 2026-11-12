@@ -102,8 +102,9 @@ without a clear hierarchy.
 
 Use `card` with `variant: "visual"` for one image-led editorial story where
 the image carries genuine context: a place, event, product, person, or
-decision. The card renders the media full-bleed with a contrast overlay,
-eyebrow, title, and short summary. Supply specific media alt text and
+decision. The card shows the media behind a contrast overlay, eyebrow, title,
+and short summary. The current rendering may letterbox the image rather than
+filling the card. Supply specific media alt text and
 provenance. If an appropriate image is unavailable, use `feature` or
 `editorial` rather than inventing decorative media.
 

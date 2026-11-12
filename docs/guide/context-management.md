@@ -65,6 +65,12 @@ which complete tool groups were omitted, and which historical events were droppe
 They contain identifiers and rendering decisions, not copied message content.
 Replay reapplies those decisions after a restart or Redis loss.
 
+When compaction rotates to a new session, event-scoped decisions are rebased to
+the copied events' new sequence numbers. Rules targeting events outside the
+preserved tail are discarded; tool-call-scoped rules keep their stable call IDs.
+Historical recap cards stay in their original session and are not copied into
+the continuation as new recaps.
+
 Controller notices append when their content changes; earlier notices are not
 rewritten or removed. Executor assignment notices also retain their original
 position across turns and cache loss. An unchanged pool adds no duplicate notice,

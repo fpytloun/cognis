@@ -256,32 +256,33 @@ browser, and other executor tools.
 
 ## Kubernetes
 
-### Fictional Single-Replica Example
+### Illustrative Single-Replica Deployment
 
-This illustrative installation uses separate application and storage namespaces.
-Names, domains, storage class, and sizes below are invented, not an operational
-inventory. Choose values appropriate to your cluster. The bundled image serves
-both the API and the UI on `:8080`.
+The following fictional installation shows one possible topology, not an
+inventory of a running system. All namespaces, addresses, node names, storage
+choices and capacities are illustrative; configure them for the target cluster.
+Cognis runs as a single replica alongside Mnemory and Intaris in this example.
+The bundled image serves both the API and the UI on `:8080`.
 
 ```
-Namespace: assistant-demo
+Namespace: agent-platform (example, shared with Mnemory, Intaris)
   Deployment: cognis (replicas: 1, strategy: RollingUpdate)
   Service: cognis (ClusterIP, port 8080)
-  Ingress: assistant.example.test (TLS via cert-manager)
-  Certificate: assistant.example.test (configured ACME issuer)
-  Secret: assistant-keys (JWT keys, secrets key, DB URL, object-store credentials)
-  PVC: assistant-data (4Gi, configured storage class, for COGNIS_DATA_DIR)
+  Ingress: cognis.example.test (TLS via cert-manager)
+  Certificate: cognis.example.test (letsencrypt-prod)
+  Secret: cognis-secret (JWT keys, secrets key, DB URL, MinIO creds)
+  PVC: cognis-data (2Gi, example storage class, for COGNIS_DATA_DIR)
 ```
 
 #### Dependencies
 
 | Dependency | Service URL | Purpose |
 |------------|-------------|---------|
-| PostgreSQL | `metadata-db.storage-demo.svc.cluster.local:5432` | Cognis metadata DB |
-| Redis (optional) | `session-cache.storage-demo.svc.cluster.local:6379` | L2 session cache |
-| MinIO | `http://object-store.storage-demo.svc.cluster.local:9000` | Artifacts + tool outputs |
-| Mnemory | `http://mnemory.assistant-demo.svc.cluster.local:8050` | Memory provider |
-| Intaris | `http://intaris.assistant-demo.svc.cluster.local:8060` | Guardrails provider |
+| PostgreSQL | `postgresql.data-services.svc.cluster.local:5432` | Cognis metadata DB |
+| Redis (optional) | `redis.cache-services.svc.cluster.local:6379` | L2 session cache |
+| MinIO | `http://minio.object-store.svc.cluster.local:9000` | Artifacts + tool outputs |
+| Mnemory | `http://mnemory.agent-platform.svc.cluster.local:8050` | Memory provider |
+| Intaris | `http://intaris.agent-platform.svc.cluster.local:8060` | Guardrails provider |
 
 #### JWT/JWKS Integration
 
@@ -289,10 +290,10 @@ Cognis issues ES256 JWTs. Mnemory and Intaris validate them via JWKS:
 
 ```bash
 # Mnemory
-MNEMORY_JWKS_URL=http://cognis.assistant-demo.svc.cluster.local:8080/.well-known/jwks.json
+MNEMORY_JWKS_URL=http://cognis.agent-platform.svc.cluster.local:8080/.well-known/jwks.json
 
 # Intaris
-INTARIS_JWKS_URL=http://cognis.assistant-demo.svc.cluster.local:8080/.well-known/jwks.json
+INTARIS_JWKS_URL=http://cognis.agent-platform.svc.cluster.local:8080/.well-known/jwks.json
 ```
 
 Existing API key auth on Mnemory/Intaris is preserved for standalone
@@ -341,19 +342,15 @@ profiles, shell history, caches, and workspace files stable across restarts.
 
 Use `enableServiceLinks: false` on the pod. Kubernetes service-link
 environment variables can collide with Cognis env names such as
-`COGNIS_PORT` and inject values like `tcp://192.0.2.10:8080`, which
+`COGNIS_PORT` and inject values like `tcp://192.0.2.20:8080`, which
 break executor startup paths that parse those variables as integers.
-
-The following manifest uses fictional resource and node names and a
-documentation-only controller address. Replace the namespace, node name,
-controller address, and token with your deployment's values before applying it.
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
   name: cognis-executor-browser-secret
-  namespace: cognis
+  namespace: agent-platform
 type: Opaque
 stringData:
   token: "<executor-jwt-token>"
@@ -362,20 +359,20 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: cognis-executor-browser-home
-  namespace: cognis
+  namespace: agent-platform
 spec:
   accessModes:
     - ReadWriteOnce
   storageClassName: local-path
   resources:
     requests:
-      storage: 50Gi
+      storage: 20Gi
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: cognis-executor-browser
-  namespace: cognis
+  namespace: agent-platform
 spec:
   serviceName: cognis-executor-browser
   replicas: 1
@@ -389,7 +386,7 @@ spec:
     spec:
       enableServiceLinks: false
       nodeSelector:
-        kubernetes.io/hostname: worker-node-1
+        kubernetes.io/hostname: browser-demo-node
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

@@ -2,6 +2,10 @@
 
 The chat workspace is where you talk to an agent, watch responses stream in real time, and follow tool usage or delegated work without leaving the conversation.
 
+![Cognis chat with a research brief built from web search and page fetch results](../assets/screenshots/chat-desktop.webp)
+
+The example uses seeded demo history; no web requests were made.
+
 ## Starting a conversation
 
 The main menu shows a colored dot when collapsed and an exact numeric badge
@@ -58,9 +62,64 @@ status appear, without an alert or toast. A successful refresh clears it.
 Open `Chat`, create a new conversation, and select an agent.
 Web conversations can exist before they have an active session; Cognis creates the root session when you send the first real message.
 
-That first message is also used to bootstrap Intaris intention generation right away, so the session purpose is available from the first turn instead of waiting for a follow-up turn.
+When guardrails are enabled, that first message also bootstraps Intaris intention
+generation. Conversation titles do not depend on this operation.
+
+Cognis generates a useful automatic title from bounded, recorded user messages
+through the `auxiliary_generation` route, including with guardrails **None** and
+analytics off. Generation is optional background work and never blocks a user
+turn. Checks run in bounded batches every 30 seconds; a backlog can take multiple
+passes. Failed or interrupted model attempts retry after a five-minute cooldown,
+including after controller restart, without another message.
+
+Only an empty title whose source is still unset can be initialized. Manual and
+supplied titles, channel/task/managed titles, agent-direct chats, and every
+existing generated title are preserved. Titles are generated once, not refreshed
+on each turn or rotation. Intaris titles may remain read-only suggestions but no
+longer initialize the visible title. Title inference has its own auxiliary cost,
+independent of the guardrails and analytics controls.
+
+## Review feedback before sending
+
+Open **Feedback** on a document, attachment, preview, message or recorded file
+change. Selection tools depend on the source: text, rich-document items, image
+regions, PDF pages and recorded diff lines or hunks. HTML observations use a
+reviewed screenshot. An observation is evidence, not proof of correctness.
+
+A saved comment is **ready to include**, not included. Saving never sends an
+agent turn. The composer shows ready feedback even with the sidebar closed. Choose
+**Review feedback**, select exact comment versions, inspect their source
+revisions and parent context, then choose **Include with next message**. Guest
+comments require an explicit review acknowledgement.
+
+The composer shows what the next send includes. Inspect or exclude that packet
+without deleting its source comments. Later edits, replies and new comments do
+not silently join it. Changed or expired selections require another review.
+
+Feedback inside a conversation stays in that conversation, including fullscreen
+previews and documents produced elsewhere. It is never redirected to the
+producer. Text, attachments, mode and feedback are admitted as **one normal
+turn**. Feedback-only sends are allowed. Feedback does not implicitly answer a
+pending question or approval. Exclude it before running an actual slash command;
+one-message Plan/Build prefixes still select the normal message mode.
+
+Once sending starts, the reviewed packet is immutable. After response loss,
+**Check delivery** reconciles the original outbox transaction and creation key,
+rather than creating another feedback turn. Delivery and execution status are
+separate. Retained input, attachments and mode remain available during recovery.
 
 ## What the chat UI shows
+
+Fenced `mermaid` blocks render as interactive diagrams in user and completed
+assistant messages. Drag to pan, scroll or pinch to zoom. The controls at the
+top right open fullscreen, fit the diagram to its box, zoom in or out, and copy
+the Mermaid source. Focus a diagram to use arrow keys to pan, `+`/`-` to zoom,
+and `0` to fit; `Escape` closes fullscreen. Invalid diagrams retain their source.
+
+Cancelling or failing a turn does not undo a user message already recorded in
+history. Once its canonical persistence is confirmed, its temporary local copy
+does not reappear at the end of the chat, even outside the loaded history window.
+Input without that confirmation remains available for recovery.
 
 Recoverable model failures use bounded automatic retries. Errors that happen
 before provider recovery starts still receive the turn's retry allowance.
@@ -72,6 +131,14 @@ The recovery bar belongs only to the latest unresolved request. It disappears
 when a retry starts, the request recovers, or you send a newer message. Reload,
 reconnect, and scrolling through history do not make an old failure actionable
 again. Historical error details remain available in the timeline.
+
+An accepted or queued message can still fail or be cancelled before processing
+starts. Chat retains its text and marks it **Failed** or **Cancelled** when the
+server confirms that outcome, including
+after reopening cached history. It does not resend the message automatically.
+Where a later recorded message proves a safe boundary, the failed input appears
+before it instead of trailing newer work. Otherwise, Chat preserves the input
+without guessing its position from timestamps.
 
 Depending on what the agent is doing, the conversation can display:
 
@@ -92,9 +159,23 @@ message presentation. Their inspector provides **Overview**, **Work**, and
 **Session** tabs and adapts to the available window width. Delegation and managed
 conversation cards use the same navigation as the work tree. The back arrow returns
 to the parent view; the link also supports opening the parent conversation in a
-new tab. Read-only task and child logs do not expose the normal chat composer.
-While a turn is running, three subtle dots at the transcript tail provide progress
-feedback; no follow-status banner is shown in the header or transcript.
+new tab. **Work → Artifacts** includes images and files attached to assistant
+messages as well as explicitly published artifacts. Repeated references to the
+same artifact appear once; user-uploaded inputs are not work outputs.
+Read-only task and child logs do not expose the normal chat composer.
+Managed conversation views show a stable spinner labelled **running** on the
+right of the bottom turn summary, not dots in the transcript. Other read-only
+session logs retain their transcript-tail progress indicator.
+In a subsession, **Ongoing work** sits above the bottom **Agent work** area rather
+than above the transcript. The parent link and **Actions** toggle stay visible;
+clicking **Parent conversation** restores that conversation in the current view.
+Modified clicks still open the canonical parent URL in a new tab or window.
+expand **Actions** to stop a turn, send an instruction, continue, or take control.
+Actions start collapsed, and collapsing them preserves a typed instruction for
+the current conversation. The compact header shows the title above the inline
+agent avatar and name, with only Search and Info on the right. Search uses the
+normal chat search bar for the loaded subsession history; load earlier history
+to include older messages. The back arrow returns to the parent.
 
 Full chat, dashboard windows, and pinned chats share one composer for each
 conversation: text, attachments, and message mode stay in sync. Opening an empty
@@ -102,6 +183,10 @@ view does not change the draft. Sending from any view clears only the submitted
 input in the other views; newer edits remain. Other browser windows adopt saved
 draft changes when they have no pending local edit. Conflicting concurrent edits
 are retained instead of overwriting one another.
+An untouched empty composer does not conflict with local input. Saving or sending
+can replace an unconsumed draft with no text, attachments, included feedback or
+selected mode; meaningful competing input and previously sent drafts remain
+protected.
 
 If browser storage stops responding after the app resumes, account coordination
 times out rather than leaving later chat loads waiting indefinitely. The app
@@ -258,6 +343,8 @@ first tap prepares the file; tap **Save/share** when it is ready, then choose
 preserve the browser's user-activation permission after loading the file.
 If the browser cannot share a file, Cognis shows an error rather than navigating
 away from chat. Directly opened signed URLs retain their existing browser behavior.
+In the native macOS app, downloads open a **Save** sheet so you can choose the
+filename and destination without leaving the app.
 
 ## Queued messages
 
@@ -330,8 +417,15 @@ Some work is better handled through delegated or structured execution instead of
 - final completion or failure updates
 
 The main conversation stays responsive while the sub-session or workflow continues.
+Delegation calls show **Queued** without a running timer until their child session
+starts. Queued calls are not yet sessions in the work tree or **Ongoing work**.
+Consecutive delegation calls can run concurrently within the configured limit,
+including after an earlier todo update has completed.
 The **Ongoing work** drawer lists tasks, managed conversations, delegated
-sub-sessions, and background commands. Tap a task or session title to open it.
+sub-sessions, and background commands. Long titles stay on one line and scroll
+horizontally without a scrollbar, like todo text. The expanded drawer scrolls
+vertically when needed, keeping todos and work cards separate.
+Tap a task or session title to open it.
 Tap a command title to expand its command, working directory, executor, process,
 runtime, status, and latest output tail. **Refresh details** fetches a new
 snapshot; **Open source session** opens the command's originating session.
@@ -381,6 +475,10 @@ See [Context management](context-management.md) for the budgets, projection
 modes, evidence rules, and worked examples.
 
 Long conversations may be compacted so the active context stays usable. When that happens, the timeline can show a compaction card and Cognis continues from the new active session with the compacted summary included in context.
+
+Delegated sub-sessions keep their compaction cards in their own history, not at
+the end of the parent conversation. Reopening a managed conversation shows its
+cached history while newer events are loading.
 
 Cognis stops execution if required history is unavailable or incomplete. A
 profile switch must retain the current turn and its recorded switch boundary.
@@ -487,6 +585,16 @@ Admins may see setup guidance until:
 
 ## Recovery and diagnostics
 
+If stale activity or misplaced messages survive reopening chat, use **Force
+refresh** beside **Download chat diagnostics** in the session's diagnostic
+section. It rebuilds history from the server and removes cached activity on this
+device. Queued messages, unsent drafts and recoverable input are kept; nothing is
+resent automatically. Wait for **History refreshed.** If refresh fails, your
+input remains available and you can try again.
+
+Previously confirmed inputs do not reappear at the end when the refreshed
+history window excludes older messages. Inputs without confirmation are kept.
+
 If something looks wrong, check the system section for:
 
 - provider health
@@ -511,6 +619,8 @@ When installed:
 - Updates are applied automatically. When a new version is available, a small banner appears at the top of the screen with a "Reload" action.
 
 ## Mobile-specific behavior
+
+![Cognis mobile chat with file edits and command activity in browser emulation](../assets/screenshots/pwa-chat.webp)
 
 - Primary navigation on mobile is a bottom tab bar (Chat / Tasks / Agents / Settings). Inside a chat conversation the bar hides so the composer owns the bottom safe-area.
 - Tapping the hamburger button in the header opens a right-side sheet drawer with the full navigation. The sheet supports swipe-down-to-dismiss.
@@ -542,6 +652,8 @@ conversation information panel (**ⓘ**), select **Session**, expand
 **Show context & runtime details**, and select **Download chat diagnostics**
 at the bottom while the problem is visible. The filename includes the conversation
 identifier so captures from different conversations are easy to distinguish.
+In the native macOS app, this opens a save dialog so you can choose the file
+location. In a browser or installed PWA, it uses the browser's download handling.
 
 The JSON file records that device's frontend build, projection version, item
 identities, source references, and sort keys. Canonical history, local fallbacks,

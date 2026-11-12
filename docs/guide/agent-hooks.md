@@ -200,6 +200,11 @@ independent. Result/card delivery can retry without repeating inference or holdi
 an execution slot. Legacy unfinished runs from the hook-retry implementation are
 finalized as failed on upgrade, not resumed.
 
+Recovery resumes existing executions before inspecting idle candidates. Slow or
+unavailable idle evidence must not prevent an orphaned execution from reaching
+its original deadline, failing visibly, and releasing its slot. Recovery workers
+remain independent of cancellation of the idle-evidence scan.
+
 Web chat shows one hook card, not a separate slash-command notice. Its running
 state and **Open session** action are available without expanding the card; the
 session viewer follows the ongoing child session. Updates follow the source

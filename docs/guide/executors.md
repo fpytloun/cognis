@@ -2,7 +2,71 @@
 
 Executors are the part of Cognis that perform tool execution. The controller decides what should happen; executors are the hands that actually run tools.
 
+## Durable execution receipts
+
+Upgraded WebSocket executors commit private execution receipts before invoking
+tools and before returning terminal results. The journal lives under the
+executor data directory at `receipts/<controller-and-executor-hash>/calls.sqlite3`.
+Preserve that directory across process and container replacement; an ephemeral
+container filesystem cannot provide process-replacement recovery.
+
+Results can be fetched after an executor process restart. Acceptance without a
+terminal result remains indeterminate: a receipt cannot prove whether an
+external mutation finished immediately before a crash. Never delete the journal
+as a recovery shortcut.
+
+Agent run steps receive an explicit unknown-outcome result when a mutation cannot
+be recovered. The agent must inspect the affected files or external state on the
+same executor using read-only tools, then continue without repeating completed
+effects or apply only a verified remaining change. Identical-call uncertainty
+protection remains active; an unknown outcome is never reported as success.
+Temporary disconnection and still-running calls continue waiting for recovery.
+Deterministic workflow steps pause for explicit reconciliation because they have
+no agent to inspect the effects.
+
+Unacknowledged receipts are not evicted. After the controller acknowledges durable
+canonical settlement, results are cached for up to fourteen days. Under admission
+pressure, the oldest acknowledged payloads can be reclaimed earlier. Permanent
+deduplication records remain and prevent re-execution; these records do not consume
+the retained-call admission quota. Reclaimed results report
+`terminal_result_unavailable`, never permission to replay.
+
+The defaults are a 1 GiB payload admission budget and 100,000 retained calls,
+with 2 MiB reserved for each unfinished call plus the proposed admission.
+These are logical admission budgets, not hard SQLite file-size limits: accepted
+results may be larger than their reservation, tombstones remain, and freed pages
+are reused without shrinking the file. If unacknowledged evidence alone exhausts
+a budget, new execution stops instead of discarding that evidence. Increasing a
+limit provides headroom but does not settle unresolved calls.
+
+Set `COGNIS_EXECUTOR_RECEIPT_MAX_BYTES` (integer bytes, minimum 2097152) and
+`COGNIS_EXECUTOR_RECEIPT_MAX_CALLS` (positive integer) in the executor service
+environment to override the defaults, then restart the executor. Invalid limits
+fail startup. Admission errors and executor logs distinguish `capacity`, `sqlite`,
+`filesystem`, and `identity_conflict`, with numeric usage/limit evidence for
+capacity failures and a storage error code when available. This distinguishes
+the journal quota from filesystem free space. Monitor
+the executor data volume and investigate admission errors; result envelopes may
+contain sensitive data and must not be copied into logs or public diagnostics.
+Permissions are restricted to the executor user. Acknowledgement is a settlement
+hint, not a claim of generic exactly-once external effects.
+
+The executor journal owns reclamation and admission in one SQLite write
+transaction. Controller acknowledgments still occur only after canonical result
+settlement; neither reclamation nor capacity errors retry tool execution. This
+uses the existing private journal format and requires no Cognis database migration.
+
+Upgrade both controller and executor to enable durable receipts. Older executors
+retain same-process reconnect recovery; their mutations cannot be safely
+recovered across process replacement.
+
 ![Controller and executor split](../assets/images/cognis-controller-executor-split.svg)
+
+Executor browser settings and tools now appear in separate tabs.
+
+![Executor browser automation configuration](../assets/screenshots/executor-browser-tools.webp)
+
+![Executor tools and runtime capabilities](../assets/screenshots/executor-tools.png)
 
 ## Why executors exist
 
@@ -62,6 +126,14 @@ Depending on configuration, Cognis can use:
 
 For multi-user production setups, remote executors are the preferred model.
 
+Remote executors and controllers negotiate chunked transfers for large artifacts
+and other large RPC payloads. This prevents a large result from exceeding the
+WebSocket message limit and disconnecting unrelated tools. Upgrade both sides to
+enable this behavior; mixed-version connections retain the older wire format.
+Chunking does not change artifact-storage limits or tool deadlines. Transfers
+use temporary disk space on the receiving side and still materialize the complete
+result for normal processing.
+
 ## What executors control
 
 Executors define the effective tool pool available to agents. Agents inherit tools from their executor and can then further limit categories, individual tools, and permission policy.
@@ -74,6 +146,64 @@ Executors can also be used to:
 - host Playwright-backed browser automation
 - host channel adapters that need local services
 - route provider calls to executor-side inference when supported
+
+## Program runtime (PTC)
+
+`python_execute`, `python_kernel_status`, and `python_kernel_reset` run on the
+selected executor. Their availability is controlled by the executor's configured
+identity and `config.program_runtime`:
+
+- A configured executor with `labels.cognis_runtime_profile == "pod"` is
+  eligible by default.
+- `config.program_runtime.enabled: false` disables PTC even for a pod-profile
+  executor.
+- Every other profile—including a WebSocket executor that is not labelled
+  `pod`, or an unknown executor type—requires
+  `config.program_runtime.host_enabled: true`.
+
+`host_enabled` is an explicit host-execution opt-in; it does not override
+`enabled: false`. A WebSocket connection is not itself a pod identity, and a
+profile label is a configuration assertion, not a sandbox. Verify the actual
+execution boundary before applying the `pod` label. The kernel runs as the
+executor's user: it can access that user's files, credentials, mounts, and
+network, and launch processes permitted to that identity.
+
+After configuration changes, inspect the selected executor's effective tool
+inventory. If the PTC tools are absent, first check the executor identity,
+profile label, and `config.program_runtime`; tool discovery cannot override
+executor eligibility. The normal `ToolRouter` and Intaris policy still decide
+whether an invocation or nested tool call is allowed.
+Remote tool advertisements do not grant eligibility. The controller checks the
+actual selected executor's current configuration before dispatch, including
+after an executor switch or a per-call target selection. Missing configuration
+fails closed; disabling PTC does not interrupt a program already running.
+
+The pilot also requires a direct WebSocket or in-process connection to the
+executing controller. Cross-controller-forwarded program execution is not
+supported and fails closed before code dispatch; ordinary forwarded tools are
+unchanged.
+
+On the same executor, interactive kernels are scoped to the conversation (or
+its session when no conversation ID exists). Python variables are volatile: an
+executor restart, kernel loss, or idle reclamation can discard them. Idle
+kernels are reaped after 30 minutes; each executor caps its live kernels at 64.
+The executor's recovery ledger records state metadata, not a restorable Python heap.
+`COGNIS_PTC_STATE_PATH` still selects the ledger file for a standalone runtime.
+When the controller owns multiple in-process runtimes, that path is the base
+file: each stable configured executor identity receives a sibling ledger named
+with a SHA-256 identity suffix, so initialization and atomic writes stay within
+that executor's records. The raw identity is not included in the filename.
+The unsuffixed ledger is left untouched and is not imported because its records
+do not identify an owning executor. Ledger files remain mode `0600` in
+directories created as mode `0700`; this metadata does not persist or migrate
+Python heap state.
+Use `python_kernel_status` to inspect state and generation; it does not reveal
+variables. Reset only an idle kernel with `python_kernel_reset` and its current
+`expected_generation`. Before retrying after state loss or an uncertain result,
+reconcile completed/uncertain child calls and external effects. Workflow program
+steps instead use a fresh `StepRun` scope; each new run starts without prior
+kernel variables. See the [interactive PTC guide](tools-and-skills.md#programmatic-tool-calling-ptc)
+and [workflow program steps](workflows.md#program-steps-ptc).
 
 ## Where to manage executors
 
@@ -160,6 +290,11 @@ ready. Each new conversation turn gets its own recovery budget; retries and
 controller takeovers of the same turn retain the original deadline. These
 notices describe active work, not background monitoring of idle executors.
 
+Connection attempts use exponential backoff from 1 to 60 seconds while they
+keep failing. An accepted registration resets that backoff, so a later
+disconnect does not inherit delays from an earlier outage. Clean disconnects
+reconnect immediately. This changes connection timing only, not tool replay.
+
 Cognis may retry a small allowlist of read-only unary executor RPCs after an
 ambiguous transport failure. Those retries reuse a stable logical call ID. The
 executor keeps a bounded, short-lived in-memory cache of terminal results and
@@ -237,6 +372,13 @@ executors. The command reports normalized executor-local status:
 
 `/lsp` is read-only. It does not auto-install language servers or trigger any
 network fetches.
+
+Language servers are separate code-analysis processes, usually one per server
+and project root. The configured concurrent-server limit counts both running
+servers and servers still starting. Requests for the same starting server share
+its initialization rather than reserving another slot; failed or cancelled
+starts release their slot. This is a process-count limit, not a RAM budget:
+large projects and multiple worktrees can still consume substantial memory.
 
 ### Python edit-time diagnostics
 
@@ -320,6 +462,13 @@ asymmetric:
   asks for them explicitly: per-call via the `target_executor` parameter
   on a tool call, or session-wide via the `switch_executor` tool. The
   controller never picks them automatically.
+
+During a long-running turn, executor eligibility is refreshed before model requests
+and again before executor tool calls or switches. Reconnected assigned executors
+can be used without starting another conversation. Refresh preserves assignments,
+inventory and the active pin, and revalidates current ownership, sharing and policy.
+If eligibility cannot be verified, it is reported as unknown and the executor call
+is not dispatched.
 
 Explicit primary bindings do not automatically change. Label-selector primaries
 are different: if the active executor stays unavailable beyond reconnect grace,

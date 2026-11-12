@@ -56,6 +56,11 @@ When a schedule fires, Cognis:
 
 This means scheduled work uses the same safety checks, workflow gates, and audit trail as manually created tasks.
 
+Controllers claim an immutable occurrence and recheck its due time in the
+database. A stale timer cannot consume the next occurrence early. Completion of
+an older task does not replace the visible status of a newer occurrence; failure
+counts and automatic disabling still apply to task outcomes.
+
 ## Tips
 
 - Use workflows for anything more complex than a single direct response.

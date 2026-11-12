@@ -18,6 +18,13 @@ bound projects. Project-scoped lists retain their existing filtering.
 
 ## What a workflow contains
 
+Deterministic conditions can inspect a prior run's canonical outcome through
+`steps.<name>.outcome.status` and `.reason`. For example, a failed-outcome route
+with `action: continue` can hand off to a condition selecting a failed `complete`
+step rather than treating a blocker as successful completion. Step lifecycle
+`status` is separate from the business outcome. Old stored outputs without an
+outcome do not provide that evidence; do not infer success from a missing field.
+
 Deterministic tool-call steps declare their pinned workflow scope to Intaris
 before execution, without creating synthetic user messages. Declaration failures
 stop the step before dispatch. Persisted owner-created tasks and schedules can
@@ -41,10 +48,97 @@ The workflow editor is designed for operators and advanced users. Most end users
 
 ## Common workflow patterns
 
+For a deterministic `skill_load` whose assets are consumed by later steps, add
+`require_assets_ready: true` to its `tool_call.args` and keep `fail_on_error: true`
+(the default). The engine waits through transient preparation failures on the
+same executor and rejects an incomplete required runtime before rendering
+successful-path outputs. Instruction-only loads retain their default partial
+success behavior. Existing workflow definitions must explicitly opt in:
+
+```yaml
+tool_call:
+  tool: skill_load
+  args:
+    skill_id: "{{ vars.skill_id }}"
+    require_assets_ready: true
+```
+
 - `direct` style flows for simple work
 - plan -> execute -> review flows for larger tasks
 - gated steps that pause for human approval
 - deterministic condition routes that revise a step from structured review metadata
+
+Explicit gate options support `continue`, `cancel`, `fail`, and
+`revise(step_name)`; a revision target must name an earlier step. The legacy
+`revise:step_name` spelling is also accepted. An unsupported saved action or
+target pauses the task for reconciliation rather than advancing it.
+
+## Program steps (PTC)
+
+Use a `program` step only for a bounded, predictable read/filter/aggregate stage
+whose structured result is much smaller than its inputs. The step runs without
+an LLM turn through the ordinary `python_execute` controller-tool path:
+
+```yaml
+- name: aggregate
+  type: program
+  program:
+    language: python
+    description: Count the input rows and return the total.
+    code: |
+      await cognis.emit({"count": len(inputs["rows"])})
+    inputs:
+      rows: [1, 2, 3]
+    input_schema:
+      type: object
+      properties:
+        rows:
+          type: array
+      required: [rows]
+      additionalProperties: false
+    output_schema:
+      type: object
+      properties:
+        count:
+          type: integer
+      required: [count]
+      additionalProperties: false
+    tools: []
+    limits:
+      wall_seconds: 30
+      max_calls: 4
+      concurrency: 2
+      output_bytes: 16384
+```
+
+The source is literal workflow configuration: it is never Jinja-rendered.
+Workflow values belong in `inputs`, which are rendered separately and validated
+against `input_schema`; the one emitted JSON object becomes
+`steps.aggregate.outputs` after `output_schema` validation. `tools` is a
+required allowlist of canonical tool IDs (`[]` is valid when the calculation
+needs no nested tools). Only active tools marked read-only and not in the
+model-backed memory/knowledgebase categories are accepted in this workflow
+integration. Per-program `limits` may tighten but never raise the executor's
+configured ceilings.
+Do not pass credentials or other secrets as inputs; program code can inspect
+every value it receives.
+
+Program code is an untrusted candidate until an owner reviews and accepts its
+pinned workflow configuration through the owner-configured workflow/task path.
+An agent-composed workflow cannot execute or schedule its program step before
+that acceptance. Nested tools still use their normal authorization and approval
+rules; approval suspends the same call and must not be duplicated. A restarted
+or uncertain execution is never blindly replayed and must be reconciled first.
+
+Python itself is not sandboxed by the tool allowlist: code can use whatever
+filesystem, network, and process capabilities the executor exposes. Use native
+tools and ordinary workflow steps for writes, approval-sensitive actions, and
+adaptive judgment. PTC guidance appears only when the effective runtime exposes
+`python_execute`; composer callers must explicitly enable program candidates.
+This backend slice preserves program fields in workflow JSON/model serialization
+and agent-managed create/update operations. It does not add program-step controls
+to the browser editor; avoid editing a program workflow there until its import/
+export path has explicit program round-trip support.
 
 ### Internal packets and final Daily Brief output
 
@@ -120,6 +214,11 @@ The workflow editor supports YAML import and export so you can:
 - keep workflow definitions in version control
 - copy a workflow between environments
 
+The workflow model and agent-managed create/update tools retain program code as
+a literal source field. Inputs and outputs remain separate typed JSON objects;
+serialization does not interpolate them into source. The browser editor's YAML
+import/export flow is unchanged and is not covered by this backend change.
+
 ## Workflow execution in tasks
 
 When a task runs with a workflow, Cognis records:
@@ -130,6 +229,19 @@ When a task runs with a workflow, Cognis records:
 - pauses for gates or questions
 - gate condition evaluation details, including values, operators, outcomes, and branch/action taken
 - final completion or failure state
+
+Step logs show newly written deliverables at their place in the timeline, with
+subsequent progress below them. Older task histories without document timeline
+events retain the output below the logs.
+
+When a step retries or a task re-enters revision, the previous result is collapsed
+and marked stale until a replacement is written. You can expand it to read it.
+Paused, failed, and cancelled revisions keep the stale marker with their actual
+state; they do not restore the previous output as current. Writing a replacement
+makes that document current even before the step finishes. Document revision
+numbers describe document history, not task attempts. If a branching workflow
+does not establish which output is the task result, the task view reports unknown
+ownership rather than selecting an unrelated document.
 
 Clarification questions from tasks and child executions first reach the responsible
 conversation agent. It can answer from context and your preferences, or ask you
@@ -148,6 +260,41 @@ For an optional output, use
 `default(false)` replaces a missing value, not an existing false, null, or string
 value. Conditions must still evaluate to a boolean; other filters, object
 methods, and Python attribute access remain unavailable.
+
+Model-only instruction and skill-activation payloads are excluded from
+`result.metadata`. A deterministic `skill_load` step can return prepared asset
+manifests and Python environment paths without putting the full skill instructions
+into the template context. Model loading retains those instructions; workflow
+rendering limits are unchanged.
+
+Deterministic tool results expose **reference-only attachments**. The same
+projection is used for `result.attachments`, persisted step attachments, and
+`steps.<name>.attachments`, including historical outputs read after recovery.
+Artifact IDs, filenames, MIME types, sizes, and revision metadata remain available.
+Existing URL-only, lazy tool-artifact, and deliverable references retain their
+identity; a reference does not grant access to its content.
+
+Inline `content_b64` is no longer available in deterministic attachment templates,
+even for small files. Transfer receipts, upload/download capabilities, local source
+paths, and signed URLs accompanying an artifact ID are not copied into these
+attachment projections. Missing or malformed references and unmaterialized binary
+attachments fail the step rather than disappearing silently. Renderer limits
+remain unchanged. Ordinary model attachments and canonical tool evidence are
+unaffected.
+
+For a large local file, use a side-effect-authorized `artifact_publish` step and
+project only `{"artifact_id": "{{ result.metadata.artifact_id }}"}` into its
+outputs. That metadata ID is supplied by the controller only after successful
+inline or staged publication. Pass the ID to later tools using the existing
+`$artifact:<id>.*` value references; normal access checks still apply. Request a
+fresh URL through the artifact tools when needed, instead of persisting an
+expiring artifact attachment URL.
+
+Publication can finish before rendering or step persistence fails. Do not replay
+an interrupted side-effecting publish blindly: reconcile its artifact and step
+evidence first. Recovery reuses persisted step output, or reports an ambiguous
+write outcome without redispatching it. This does not add an inline-publication
+exactly-once guarantee or change artifact revision compare-and-swap behavior.
 
 From a task's logs, **View session** opens a delegate's logs. **Back** returns to
 the parent session, including when the task is opened in the dashboard modal.

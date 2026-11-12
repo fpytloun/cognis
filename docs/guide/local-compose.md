@@ -92,7 +92,7 @@ manifests:
 These are recommendations only. Configure the actual companion models in
 Settings; the seed environment configures the Cognis provider, not the
 companions independently. A chat-only endpoint does not supply embeddings.
-Jev is a typed-decision model, only suitable for Intaris evaluation. Use a
+Jev is a typed-decision model for the classifier route or Intaris evaluation, not chat. Use a
 current Intaris image supporting `EVALUATOR_BACKEND=auto` (the Compose default).
 Select literal upstream IDs from discovery; OpenRouter embeddings use
 `openai/text-embedding-3-small`.

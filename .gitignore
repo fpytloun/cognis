@@ -15,9 +15,10 @@ ui/standalone-build/
 ui/coverage/
 ui/playwright-report/
 ui/test-results/
+ui/.selection-copy-artifacts/
 ui/.chat-workspace-results/
-ui/.window-drag-build/
 ui/.component-runtime-build/
+ui/.window-drag-build/
 ui/e2e/window-drag/node_modules/
 ui/review-artifacts/
 cognis/ui_dist/

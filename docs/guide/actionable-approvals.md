@@ -4,6 +4,10 @@ Approval messages show the approval ID, tool, pre-redacted action arguments,
 decision reason and expiry. Web prompts expose action scope and provide commands
 for that particular approval.
 
+Question requests and tool approvals use collapsible panels above web chat.
+Select the panel heading to collapse or expand it without losing your draft.
+Expanded details scroll within a bounded height, leaving the conversation visible.
+
 Use `/approve --id <approval-id> [optional note]` or
 `/deny --id <approval-id> [optional note]`.
 A full UUID immediately after `/approve` or `/deny` is also an explicit target.

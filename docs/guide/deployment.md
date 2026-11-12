@@ -46,6 +46,23 @@ Executors own runtime work:
 
 For ephemeral jobs, a WebSocket executor can be mostly stateless. For browser profiles, local identity, code workspaces, and LSP caches, mount a persistent executor home directory.
 
+## Database connections
+
+Each PostgreSQL controller process lazily opens and retains up to 15 database
+connections, with no temporary overflow. This preserves the previous maximum of
+15 simultaneous connections, but no longer discards connections above five after
+each burst. Reuse avoids repeated driver authentication that can block the
+controller's event loop. Connection health checks, rollback on return, and
+shutdown disposal remain enabled. SQLite continues to use `NullPool`.
+
+Budget PostgreSQL capacity for every controller process, overlapping processes
+during rollout, other database clients, and reserved administrative connections.
+More connections can remain idle between bursts; the per-process maximum has
+not increased. Compare `cognis_db_pool_connections_total` and
+`cognis_db_pool_connections_closed_total` rates after warm-up with
+`cognis_db_pool_checked_out`, event-loop lag, request latency, and workload.
+Persistent reconnects or invalidations still require investigation.
+
 ## Trusted internal MCP OAuth destinations
 
 OAuth HTTP requests reject private and link-local destinations by default.
@@ -214,6 +231,30 @@ and WebSocket origin checks. Trusted proxies must replace untrusted
 
 Remote executors should connect to `wss://<host>/api/executor/ws`.
 
+### Native binary transfers
+
+Upgraded executors transfer file bodies over ordinary streaming HTTP rather than
+embedding base64 in WebSocket RPC. Executors must reach the controller's
+advertised public URL at `/api/v1/transfers` and the authorized artifact download
+URLs. No inbound executor port is needed. Upgrade both peers for large-file
+support; older peers keep their existing compatibility transport.
+
+Do not buffer entire upload requests at the reverse proxy or configure an
+artifact-size ceiling on the transfer and artifact-upload routes. Allow streamed
+responses and suitable inactivity timeouts. Parser, rendering, tool-execution,
+disk-capacity, and provider limits remain independent constraints.
+
+Multiple controllers must share artifact storage (S3 or a shared filesystem);
+load-balancer affinity cannot make controller-local files shared. Use shared
+signing material so authorized downloads remain valid across replicas.
+
+Native S3 writes use multipart uploads. In addition to the existing object
+read/write/delete permissions, allow multipart abort and
+`s3:ListBucketMultipartUploads` for abandoned-upload cleanup. Configure a bucket
+lifecycle rule to abort incomplete multipart uploads as a further safeguard.
+These IAM and ingress changes are deployment work, not automatic consequences
+of upgrading application code.
+
 ## Kubernetes and high availability
 
 The Helm chart at [`deploy/helm/cognis`](../../deploy/helm/cognis/) supports the
@@ -348,6 +389,15 @@ flag disabled. Enable the canary only after all Cognis replicas use this binary.
 
 ### External rolling-update watchdog
 
+Internal image promotion discovers the currently present
+`cognis/executor-<name>.yml` manifests in the GitOps repository. Each must contain
+exactly one Cognis executor image and define the corresponding
+`cognis-executor-<name>` StatefulSet. Controller and migration manifests remain
+required. A not-yet-created executor manifest is not required by promotion.
+CI checks every discovered executor image and its desired/ready replica count;
+the expected executor pod total is their sum, not a fixed number of executors.
+Promotion can change a subset when other manifests already have the target tag.
+
 Run the watchdog on an independent management host with the approved cluster
 access. Do not run it in a Cognis controller pod. Start it before the Argo sync
 that changes the controller configuration:
@@ -419,7 +469,7 @@ Before upgrading production:
 - review release notes for schema or executor changes
 - restart executors after controller upgrades when tool schemas or browser settings changed
 
-### Preparing for 0.18.2
+### Preparing for 0.18.0
 
 Review the upcoming notes in **Docs → What's new** before upgrading. Changes
 since 0.17.1 include project collaboration and knowledgebase grants, document

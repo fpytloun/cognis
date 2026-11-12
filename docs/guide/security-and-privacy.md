@@ -93,7 +93,9 @@ credentials, and local network access.
 
 ## Guardrails and approvals
 
-Intaris evaluates tool calls, records session activity, and can escalate sensitive actions for human approval. Non-bypassable tools still go through guardrail checks even when an agent has broad tool permission.
+When the Intaris guardrails backend is selected, Intaris evaluates tool calls,
+records session activity, and can escalate sensitive actions for human approval.
+Broad tool permission is not a substitute for guardrail evaluation.
 
 Approvals are important for:
 
@@ -102,6 +104,57 @@ Approvals are important for:
 - external communication
 - browser actions that submit forms or mutate remote state
 - skill or tool mutations
+
+### Guardrails, analytics, and cost
+
+The agent's guardrails backend and **Session analytics** toggle are independent:
+Intaris/On enables preventive evaluation and retrospective monitoring;
+Intaris/Off keeps preventive evaluation without analytics; None/On keeps
+retrospective monitoring without ordinary preventive evaluation; None/Off disables
+both kinds of optional Intaris LLM work on the normal Cognis path. Neither switch
+disables durable event recording or tool audit.
+
+It helps to distinguish three levels:
+
+- **L1: recording and per-action evaluation.** Recording preserves the session's
+  activity and audit trail. Evaluation is a separate policy operation, potentially
+  involving inference. With Intaris guardrails on, turning analytics off does not
+  turn evaluation off.
+- **L2: session-window analysis.** Analytics summarize and assess windows within a
+  session, including its compaction lifecycle. Repeated windows can process
+  substantial context over a long session. These are retrospective operations,
+  not permission checks for the action currently executing.
+- **L3: cross-session behavioral profiles.** Analytics aggregate evidence across
+  sessions to identify recurring behavior. This provides monitoring context,
+  not a preventive authorization decision.
+
+Evaluation cost follows evaluation activity; L2 cost follows eligible session
+windows and compaction, and L3 cost follows behavioral-profile analysis cadence.
+Actual tokens and cost depend on the configured models, context sizes, and
+service scheduling. Enabling analytics is not a single fixed-cost request.
+Disabling it prevents subsequent eligible analytics work without deleting existing
+history or earlier results. Sessions use their effective analytics eligibility;
+changing a toggle is not retroactive erasure.
+
+With **None** and analytics **Off**, the normal Cognis path makes no Intaris
+guardrail/analytics LLM calls. Storage and audit still operate. Cognis's own
+conversation titles use `auxiliary_generation` separately; agent inference,
+other auxiliary jobs, and optional vector-search embeddings can also have costs.
+Do not interpret this combination as zero total inference or infrastructure cost.
+
+Keep both controls on as the usual baseline for personal assistants and
+autonomous/public-facing agents exposed to untrusted inputs. For isolated coding
+agents, analytics can be off, and None may be appropriate when isolation and
+scoped capabilities adequately contain the risk. Trusted lower-risk automation
+can keep guardrails on while choosing analytics independently. Delegation inherits
+the parent's effective configuration; managed conversations use the target's
+configuration even for a same-agent target. Defaults remain unchanged, and Cognis
+does not automatically toggle existing agents.
+
+**None is not an authorization bypass.** Explicit mandatory Cognis constraints
+and mandatory evaluation remain in force. Calling Intaris directly, including
+`evaluate`, does not grant tool access or override Cognis authorization, ownership,
+or approval requirements.
 
 ## Channel pairing
 

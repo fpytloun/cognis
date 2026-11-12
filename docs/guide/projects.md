@@ -2,6 +2,8 @@
 
 Projects group related work so agents can understand which repository, source, workflow, task, or conversation they are operating inside.
 
+![Cognis mobile conversation drawer in browser emulation](../assets/screenshots/pwa-conversations.webp)
+
 Use projects when work has a durable context: a codebase, customer environment, research area, operations domain, or recurring workflow family.
 
 ## What a project contains
@@ -17,6 +19,15 @@ A project can track:
 
 Source hints are context, not authority. Cognis uses them to help agents understand where work belongs and when a task touches a relevant path. Actual file, browser, shell, and network access still depends on the executor and tool permissions.
 
+### Choose a project icon
+
+In **Settings → Project icon**, search the full bundled Lucide library by name,
+or browse with **Show more icons**. Select an icon, then **Save project**.
+**Use default** restores the briefcase. Existing icon selections are preserved.
+Icons use the project's color and remain line icons in monochrome display.
+An uploaded or generated avatar still takes precedence in avatar display; the
+icon is independent of that image. Custom SVG icons are not supported.
+
 ## Work from the project home
 
 The main navigation's **Projects** entry returns to your last opened project and
@@ -25,6 +36,11 @@ Use **All projects** in the project header to browse or create projects without
 being redirected. This preference is per signed-in user. If the remembered
 project was deleted or is no longer accessible, the project list opens instead.
 Open conversation/task previews are not restored.
+
+Use **Open project in separate window**, immediately left of **New chat in
+project**, to keep the current project tab in its own window. The window hides
+the main navigation and **All projects** link so you can focus on the project.
+Project headers omit the description when none is set.
 
 The main dashboard's **Projects** tab sits between Notifications and Providers.
 It shows a horizontally scrollable avatar/name strip linked to project homes,
@@ -48,6 +64,10 @@ Conversations and tasks use the same cards and activity lanes as the dashboard.
 Scroll to load older items; **Load more** and retry controls are also available.
 Agent filtering is applied on the server before pagination. A refresh after
 closing a workspace retains the range you already loaded.
+Live state changes refresh conversations, tasks, schedules and recent outputs
+without closing the workspace or reloading the page. Conversations with running
+child work remain in **Active now**, with a purple background-work indicator;
+requests for your approval or input still take priority in **Waiting**.
 
 The Conversations section contains topic chats, not task/step conversations,
 channel history or agent-direct history, just like the main dashboard. Its
@@ -80,6 +100,8 @@ On tablets and desktops (768px and wider), use **Pin conversation** in a chat
 header to keep it available while browsing the app. Conversation and agent-chat
 windows opened on the main dashboard join the same pinned workspace automatically.
 Tasks, schedules and attention windows remain dashboard-only.
+
+![Pinned agent avatars and a compact chat over the Library](../assets/screenshots/pinned-chats.webp)
 
 Outside the main dashboard, pins appear as avatars along the right screen edge. Drag the
 avatar or chat's grip vertically, or use **Alt+Up/Down** while focused in the dock.
@@ -163,6 +185,10 @@ dock or its pin control.
 assigned to this project, regardless of the agent's default project.
 Other members' shared conversations remain read-only. **Continue in my chat**
 creates your own project chat with a reference to the source conversation.
+In dashboard and chat, these read-only conversations never enter **Waiting**:
+the author's pending input is not an action for you. Ongoing shared activity can
+still appear in **Active** as information. The unread dot is personal and clears
+after you view the conversation; this does not mark it read for anyone else.
 Shared tasks do not expose the author's control chat or private step logs.
 Schedules still follow their existing owner-only access rules.
 

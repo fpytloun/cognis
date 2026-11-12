@@ -15,7 +15,7 @@ and immutable API-provider ownership for shared browser timelines.
 | `03-session-model.md` | Session model, turn lifecycle, context assembly, recovery, retention |
 | `04-controller-executor.md` | Controller-executor separation, executor placement, and runtime hosting |
 | `05-integrations.md` | Mnemory/Intaris/LLM/tool contracts with verified APIs |
-| `06-tool-system.md` | Tool routing, permissions, MCP, trust model |
+| `06-tool-system.md` | Tool routing, permissions, MCP, programmatic tool calling (PTC), and trust model |
 | `07-security-identity.md` | JWT auth, bootstrap, cross-service access, threat model |
 | `08-federation.md` | Future federation design (A2A, DID) |
 | `09-ui-ux.md` | SvelteKit UI, Typer CLI, WebSocket protocol |
@@ -52,3 +52,5 @@ and immutable API-provider ownership for shared browser timelines.
 | `implementation/stage-42-work-cache-reconstruction.md` | Reconstructable Work caches: Intaris history availability, cache generations, fenced recovery, immutable summaries and Current Files, cache-only foreground reads, lazy file history, and canonical activity listing |
 | `knowledgebase.md` | Optional artifact-linked Knowledgebases: ownership and agent assignment, shared-agent use semantics, generic artifact attachment lifecycle, asynchronous Qdrant indexing, hybrid dense/lexical retrieval, metadata filters, source locators, and configuration notes |
 | `officecli-tools.md` | Executor-native OfficeCLI runtime certification, Office tool surface, artifact behavior, and version bump checklist |
+| `native-binary-transfers.md` | Native raw-binary HTTP data plane: bounded-memory uploads/downloads, scoped grants and receipts, atomic artifact adoption, multi-controller consistency, and local 1 GiB qualification |
+| `work-feedback.md` | Unified anchored feedback, reviewed submissions, context-bound chat composer staging, task/follow-up routing, sharing, and revision/work history |

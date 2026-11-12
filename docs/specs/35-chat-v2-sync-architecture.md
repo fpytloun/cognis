@@ -61,6 +61,28 @@ before releasing their previous interest. Existing deadlines, owner fencing and
 canonical revision watermarks still govern the entire operation. Device hydration
 is readable but unreconciled until an authoritative load completes.
 
+Canonical item IDs remain unique across snapshot recovery and device-cache
+hydration. Copied compaction tails can retain an earlier sort position, so
+snapshot membership is resolved by ID before preserving older backfilled rows.
+Older rows are preserved only when the cached window shares at least one item
+with the snapshot; a disjoint cached window would leave an unloaded gap above
+the snapshot's before-cursor, so the snapshot replaces it.
+Existing duplicate cache entries are merged with the same item-state rules
+before they reach a renderer; no server history is rewritten.
+
+Scoped views position and reveal hydrated history before starting catch-up sync;
+an unresolved network request must not keep a cached managed conversation hidden.
+Initial-position masking must not hide an actionable load error.
+
+Delegate compaction lifecycle events belong to their session-scoped canonical
+replay, not the containing conversation's runtime or active-session navigation.
+The shared controller repairs deployed source-free overlays using positive
+delegate session ownership from the lightweight activity graph. Missing or
+truncated graph membership is not evidence to remove anything. Canonical items,
+unknown sessions, legitimate conversation compactions, runtime authority, and
+local user admissions are preserved. Metadata reads are coalesced and fenced by
+account and lineage; unavailable metadata is retried after later successful loads.
+
 New device timeline writes use the existing IndexedDB record envelope with kind
 `timeline`. Read-only migration accepts deployed `scoped-view.state` and
 `conversation-view.chatV2State` records, choosing the newest legacy timestamp.
@@ -73,6 +95,88 @@ or a new reset, not runtime-only or local admissions. Snapshot application
 preserves accepted overlays and local admissions through the sync engine.
 Recovery settles only on an accepted base, a ready newer canonical state, or
 a bounded actionable error; a runtime frame cannot mark a canonical gap ready.
+
+The diagnostic panel's **Force refresh** requests an explicit shared-controller
+snapshot rebuild. It waits for an ordinary load before starting its stronger
+recovery; equivalent manual requests share one flight. Only an accepted,
+scope-matched snapshot replaces cached canonical history and non-user local
+activity. Local user admissions, processing outcomes, current runtime authority,
+and separate outbox/composer storage are preserved, including across projection
+version changes. Canonical progress or account changes fence out stale rebuilds.
+The refreshed timeline is saved before success is reported; fetch or storage
+failure remains actionable without deleting input. This is a read-only recovery,
+not a queue mutation or message resubmission.
+
+Before discarding a canonical page, refresh preserves exact, same-scope Intaris
+user confirmation in the existing admission metadata. Source-free local copies
+remain stored but no longer reappear at the tail when that page leaves the
+window. Sourced canonical rows retain their identities, order and provenance.
+
+HTTP acceptance is separate from successful processing. The shared controller
+reconciles unresolved accepted user admissions, including formerly queued inputs
+absent from the authoritative live queue, after canonical loads and live
+changes through
+`GET /api/v1/chat/v2/conversations/{conversation_id}/messages/{client_txn_id}/admission`.
+This read uses the existing conversation-read authorization and returns only
+receipt/execution metadata: client and turn identities, processing status,
+whether an execution start was recorded, durable admission order, and an optional
+later started admission's client identity. Receipt binding never loads queued
+input payloads and never writes, retries, or resubmits a request.
+
+For failed or cancelled execution, the read independently confirms canonical
+input persistence through `input_persisted`. It checks exact client-message and
+turn identities in Intaris user events, under the source session's authority.
+The request's session is preferred within the owned root compaction lineage;
+child sessions and unrelated conversations are ineligible. DB sessions close
+before event-store I/O. Confirmation reads at most eight 200-event filtered
+pages across eight streams within five seconds, with a 64-session lineage cap
+and advancing pagination. Missing or truncated lineage, exhausted bounds,
+unavailable storage and absent evidence mean unconfirmed, never absent.
+No event content or ordering is copied into the receipt or Cognis DB.
+
+Positive confirmation is retained through the existing `historyConfirmed`
+device-cache metadata and suppresses only the local echo, irrespective of the
+turn's failure or cancellation. Raw recovery input, canonical rows, runtime
+authority and queue state are unchanged. A successor placement alone does not
+establish persistence or prevent confirmation after the next authoritative load.
+
+Deployed cache entries without a transaction ID use the same owner-scoped reader
+through `GET /api/v1/chat/v2/conversations/{conversation_id}/message-admissions/{client_message_id}`.
+This compatibility lookup requires one unique owned transaction; ambiguous
+identities remain unknown. It remains necessary while cache formats lacking
+transaction IDs are supported. A successful lookup records the actual transaction
+identity. Both routes accept up to 100 `canonical_client_message_id` query values
+to find a successor in the current window rather than an off-window admission.
+The client still verifies that successor's durable source before placement.
+
+The client binds outcomes to the exact conversation, transaction, client message
+and known turn. Failed input remains recoverable; delivery acceptance and
+processing disposition are persisted separately in the existing device cache.
+An unstarted terminal failure can use its later admission only when the current
+canonical window proves that successor's exact client identity and durable
+source. This is an upper-bound, view-only placement, not a canonical event.
+Raw IDs, source references, sort keys, text, runtime authority and queue state
+remain unchanged. Canonical confirmation always wins. Missing, inaccessible or
+unavailable receipts remain unknown; timestamps and equal message bodies never
+establish ordering or replacement. Owner cancellation and lineage fences reject
+late results, and bounded concurrent lookups do not poll while idle or repeat
+for runtime text chunks.
+
+Owned completed requests and durably absorbed inputs also suppress their
+source-free optimistic copies outside canonical history. A legacy completed
+request can lack an execution-start timestamp even though its user event was
+persisted; that missing metadata does not invalidate its terminal success.
+Their raw input remains cached, and an HTTP acceptance alone still does not
+establish processing confirmation. Absorbed inputs may have been folded into
+another turn, so their exact transaction/client identity, not a local effective
+turn binding, identifies the receipt.
+
+Carried thinking, assistant and tool rows use the same view-only placement
+boundary when a noninterleaved closed turn is proven by later canonical work.
+Canonical source sessions across that turn may establish its compaction
+continuity; neither a timestamp nor an unrelated session is sufficient.
+Phase, kind and sibling order remain deterministic, with raw overlay keys and
+provenance unchanged in the cache. Unproven and active execution is not repositioned.
 
 The store's membership transition boundary prepares every registered view
 before replacing state and commits their view-local reconciliation afterwards.
@@ -115,11 +219,18 @@ Canonical assistant phases supersede earlier runtime phases by message identity,
 even when the runtime text is only a prefix of the saved text.
 
 Bounded recovery snapshots can omit earlier persisted cycles of an active turn.
-The visible projection suppresses terminal assistant, tool, and thinking overlays
+The visible projection suppresses terminal runtime assistant, tool, and thinking overlays
 absent from canonical history when one same-turn canonical item has both a
 strictly later explicit cycle and phase. This applies to runtime overlays and
-settled local carry alike, including delayed runtime hydration after cached
-history renders. Live work, missing or conflicting coordinates, and canonical
+settled tool/thinking carry alike, including delayed runtime hydration after cached
+history renders. Retained assistant text is different: later coordinates do not
+prove that its exact phase was saved. Carried assistant replies remain explicitly
+partial until their matching canonical identity replaces them. Proven closed-turn
+boundaries place these view-only copies beside their own turn; coherent later
+phase/cycle witnesses bound their position before that progress. Raw keys and
+runtime provenance remain unchanged in the device cache. Ambiguous, interleaved,
+or cross-session evidence does not justify a guessed historical placement.
+Live work, missing or conflicting coordinates, and canonical
 identity matches remain eligible for merging. Suppression does not delete stored
 items or change runtime authority; backfill restores older canonical history in
 its canonical position.
@@ -132,7 +243,17 @@ position immediately before its durable head. An identified admission requires
 head execution in its turn, execution in a later different turn, no active
 same-turn authority, and no queue or canonical confirmation. A completed rotation
 requires its target to match the head's unambiguous Intaris source session.
-Ambiguous, live, runtime-supplied, and unconfirmed rows keep their placement.
+For the active head turn, only its durable request's explicit
+`primary_client_message_id` proves that a user admission precedes execution;
+sharing a turn ID does not establish this for queued follow-ups. The scheduler
+projects this identifier from existing request metadata without writes, new
+locks, retries, or changes to turn lifetime/cancellation. Snapshot relay hydration
+and same-request/fence client frames preserve that immutable identity.
+An identified primary admission can be local or runtime-supplied; ambiguous and
+other live rows keep their placement. Retry notices are not inferred to precede
+the window: recovery can resume an already-started turn with the same identity.
+Persisted system notices take precedence over their runtime fallbacks once
+canonical backfill reaches them.
 This bucket preserves deterministic fallback order, not reconstructed chronology.
 Canonical backfill takes precedence; raw keys, source references, cache state,
 runtime authority and membership are never modified.
@@ -1572,6 +1693,13 @@ Runtime rules:
   within one exact authority.
 - `volatile_items_complete=false` marks a partial durable snapshot. Missing
   items in a partial snapshot do not remove same-authority volatile items.
+- Oversized cumulative relay overlays use the same partial contract: select
+  whole current/recent items within a conservative uncompressed wire budget,
+  retain authority and receipts, and apply the same projection locally and
+  remotely. The producer keeps the full generation until its existing retirement
+  boundary. Partial delivery wakes scope-authorized canonical readers periodically
+  and at terminal delivery; it is not proof that omitted content is persisted.
+  Existing post-append invalidation and canonical sync own full-content recovery.
 - A complete snapshot replaces same-authority volatile items.
 - A canonical same-ID item suppresses an incomplete runtime preparation item.
 - `runtime_epoch`, `runtime_revision`, and `generated_at` remain legacy

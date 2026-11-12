@@ -70,8 +70,8 @@ routes, and do not invent unavailable choices. Existing embedding routes are
 never changed automatically. The provider test checks chat access, not every
 embedding, evaluation, or image model.
 
-**Jev is a typed-decision evaluator, not a chat model.** Select it only for
-`intaris_evaluation`. Intaris must support managed System One inference and use
+**Jev is a typed-decision model, not a chat model.** Select it for `classifier`
+or `intaris_evaluation`, not generation routes. For Intaris evaluation, Intaris must support managed System One inference and use
 `EVALUATOR_BACKEND=auto` (`INTARIS_EVALUATOR_BACKEND=auto` in the Compose env),
 the local stack's default. For older releases use GPT-OSS-20B until upgrading.
 

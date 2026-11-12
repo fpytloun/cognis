@@ -2,6 +2,8 @@
 
 The `Tools` workspace helps you understand what Cognis can execute and how those capabilities are exposed to agents.
 
+![Tools and skills registry](../assets/screenshots/tools-skills.webp)
+
 ## Tool registry
 
 The tool registry lists available tools from multiple sources, including:
@@ -64,6 +66,149 @@ incomplete provider tool calls are discarded. Successful recovery records
 discovery through the canonical `tool_discovery` lifecycle event so session
 cache replay restores the handle consistently.
 
+## Programmatic tool calling (PTC)
+
+When enabled for the selected executor, `python_execute` runs a Python cell in
+that executor's persistent IPython kernel. A call requires a clear `description`
+and `code`; `inputs`, JSON Schemas, and tighter `limits` are optional.
+
+The runtime supports direct WebSocket, in-process, and authenticated
+cross-controller executor connections. Forwarded program RPC requires the
+negotiated `program_rpc_v1` bridge capability; an unsupported peer is rejected
+before Python code dispatch.
+
+This is a first-call example using the actual tool arguments:
+
+```json
+{
+  "description": "Count the supplied rows and return the count.",
+  "code": "await cognis.emit({\"count\": len(inputs[\"rows\"])})",
+  "inputs": {
+    "rows": [1, 2, 3]
+  },
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "rows": {
+        "type": "array",
+        "items": { "type": "integer" }
+      }
+    },
+    "required": ["rows"],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "count": { "type": "integer" }
+    },
+    "required": ["count"],
+    "additionalProperties": false
+  },
+  "limits": {
+    "wall_seconds": 30,
+    "max_calls": 4,
+    "concurrency": 2,
+    "output_bytes": 16384
+  }
+}
+```
+
+`inputs` are passed separately from literal source, and an emitted value is
+validated against `output_schema` when supplied. Use top-level `await` for
+`cognis.emit(value)`. After the first call, include `expected_generation` from
+the latest result or `python_kernel_status`; a missing or stale generation is
+not a reason to guess and retry.
+
+`python_execute` is non-bypassable and its required description is part of the
+ordinary Intaris evaluation/approval context. Intaris may allow, escalate, or
+deny the call under its normal policy; the tool does not grant itself approval.
+
+The optional limits are clamped to executor bounds: `wall_seconds` defaults to
+120 seconds and has a 300-second maximum; `max_calls` defaults to and is capped
+at 50; `concurrency` defaults to and is capped at 4; and `output_bytes` defaults
+to and is capped at 1 MiB. `max_calls` and `concurrency` bound nested calls; the
+wall-time budget pauses while a nested call awaits approval. When the effective
+plan contains any writable tool, nested calls are serialized in v1 even if a
+higher concurrency was requested.
+
+The executor generates `cognis.runtime_guide` from the exact effective plan for
+each call. It lists the current aliases, schemas, limits, and discovery
+availability. `await cognis.tools.search(query, limit=10)` searches that plan
+(maximum limit 50), ranking exact tool IDs, names, and aliases before partial
+names and description-only matches. `await cognis.tools.describe(tool_id)`
+returns one descriptor. `cognis.tools.load(descriptor)` creates an async callable from a
+descriptor in the plan; await that callable to invoke the tool. These helpers do
+not add tools outside the current inventory or grant permission. A nested call
+returns a bounded `ToolValue`: use `.data` only for declared structured output,
+otherwise inspect `.text`, `.is_error`, `.truncated`, and any call or recovery
+references. Runtime guidance is inserted only when the effective runtime
+exposes `python_execute`; it is not a substitute for the live plan.
+
+For a known tool, describe its canonical ID directly rather than assuming that
+the first result of a broad description search is the intended tool:
+
+```python
+descriptor = await cognis.tools.describe("builtin:memory_search")
+search = cognis.tools.load(descriptor)
+value = await search(query="Python runtime read-only smoke check", limit=1)
+await cognis.emit({"call_id": value.call_id, "is_error": value.is_error})
+```
+
+`load` is synchronous; await the returned tool callable. `cognis.load_tool` is
+not part of this API. Discovery changes require an updated executor build and a
+new kernel; deploying the controller does not update host executor installations.
+
+Nested Cognis calls are drawn from the current effective plan and each uses the
+normal `ToolRouter`/Intaris policy and approval flow. Writable tools are
+eligible unless the session explicitly requires read-only access. Workflow
+programs remain read-only and use their explicit canonical tool-ID allowlist.
+Recursive, orchestration, management, and unsupported-source tools remain
+excluded. The parent Python approval is not approval for any child: each child
+mutation is evaluated and approved independently. A pending approval suspends
+the same cell; do not issue a duplicate call.
+
+If a child delivery outcome becomes uncertain, the program stops dispatching
+additional governed child tools, even if Python catches the reported error.
+Already dispatched siblings may still need reconciliation. The bridge bounds
+concurrent reverse child calls to 64. On disconnect, accepted or unknown child
+calls are never replayed and an unadoptable pending child/approval is
+interrupted. Same-process accepted-call recovery may return a retained terminal
+result; it does not resend a cell or child effect. The Python kernel is not a
+sandbox: code can still directly use the selected executor user's filesystem,
+credentials, mounts, network, and process access. Do not put secrets in
+`inputs` or source.
+
+On the same executor, interactive variables and helpers persist across cells in
+the same conversation scope only while the kernel lives; they are not a durable
+notebook or a recoverable heap. `python_kernel_status` reports `state`,
+`kernel_generation`, and `state_lost_reason` when available, not variable
+contents. A remote kernel heap can survive a controller/bridge disconnect even
+when its active cell's child-RPC continuation cannot; a later cell can resume
+only through a new live controller invocation. Executor process restart or
+provider shutdown closes kernels, advances generation, and loses heap state;
+variables are never serialized or restored. `python_kernel_reset` requires the
+current `expected_generation` and discards an idle kernel, advancing its
+generation. After state loss or an uncertain result, inspect status and
+reconcile recorded tool calls and external effects before retrying; never replay
+an interrupted cell blindly. Status and reset are separate executor tools, not
+methods on the in-kernel `cognis` API.
+
+In the chat timeline, Python executions appear under **Running code**, separately
+from shell commands. One expandable card shows the description, highlighted
+source, generation, output, final value, and linked tool activity. Flushed stdout
+and stderr appear incrementally while the cell is running, through the same
+bounded live-output and reconnect path as shell tools. For example, use
+`print("progress", flush=True)` before a long `await`. Final output remains
+available after completion and reload; protocol metadata is available separately
+under **Raw execution data**. A child waiting for approval keeps the ordinary
+approval action and is surfaced as waiting on the parent card; contiguous linked
+child events are presented under the parent rather than duplicated as separate
+top-level cards. This is a live activity view, not a notebook or variable
+inspector. For workflow-program rules, see [Program steps](workflows.md#program-steps-ptc)
+and the
+[tool-system contract](../specs/06-tool-system.md#programmatic-tool-calling-ptc).
+
 ## Model-specific file editors
 
 Cognis selects file editors from the authorized inventory before tool discovery:
@@ -78,6 +223,78 @@ silently hiding the editing surface.
 Discovery and indirect calls cannot restore incompatible editors. This policy
 does not grant missing tools or bypass read-only restrictions. External MCP tools
 with similar names retain their own authorization.
+
+## Existing credentials as MCP bearer authentication
+
+`manage_mcp.servers_create` and `servers_update` accept a narrow credential
+binding in `auth_config`:
+
+```json
+{
+  "type": "credential_bearer",
+  "credential_ref": "$credential:<credential_id>.token",
+  "credential_agent_id": "<consumer agent_id>"
+}
+```
+
+Use discovered IDs. The binding requires an HTTPS HTTP MCP endpoint, no URL
+userinfo and no manually supplied Authorization header. Only private WebSocket
+executors owned by the credential owner are supported. In an opted-in owner-root
+primary chat, the configuring agent may bind a different consumer agent owned by
+the same user. Both agents must be active and independently hold the current
+stored credential grant; configuration never creates or restores a grant. The
+consumer needs no management tools. Configuration and management results
+contain references or metadata, never the bearer value. The controller resolves
+the value transiently into `Authorization: Bearer …` when configuring the assigned
+executor. Static `$secret:NAME` headers and OAuth retain their existing paths.
+
+The binding is restricted to its named consumer, not its configurator. To retain
+access for multiple agents, create separate MCP server records referencing the
+same credential and endpoint, and assign each record to the intended executor.
+Discovery hides a binding from other
+agents, and each call revalidates current durable grants, credential status,
+executor assignment and credential generation. Missing or revoked credentials
+fail closed. Credential rotation or changed destination/header configuration
+requires executor reconfiguration; an old cached client cannot dispatch with a
+newly authorized generation. Revocation does not recall already sent calls.
+Executors must advertise the `credential-bearer-v1` protocol on their current
+authenticated connection. Older executors receive no bearer and report
+`mcp_credential_executor_upgrade_required`; upgrade/reconnect them before use.
+This requirement is checked again before dispatch, including resumed sessions.
+
+## Secure executor token provisioning
+
+In an opted-in owner primary chat, `manage_executors.provision_token` accepts
+`executor_id`, the `expected_updated_at` returned by `get`, and a stable
+`operation_id` chosen once for that operation. It uses the existing executor JWT
+signer and rotation/fencing path. No connected runtime is required.
+
+The token version, encrypted agent-scoped credential and caller-agent grant
+commit atomically. The result contains `token_ref`, `credential_id`, token version,
+and persisted/fenced state, never a token value. An authorized executor tool can
+consume the reference in its supported secure credential input to provision an
+external Secret. Do not embed it in a shell command: shell arguments are not a
+credential-resolution interface. Cognis does not add a Kubernetes provisioner.
+
+If delivery is interrupted or uncertain, repeat the **same** operation ID and
+original precondition to reconcile. A committed operation resumes pending
+fencing without rotating again; a superseded, revoked or unauthorized operation
+fails closed. A new operation ID rotates again and needs a fresh precondition.
+This operation cannot issue shared, local or another user's executor tokens.
+Manual token rotation in Settings remains unchanged.
+
+### Management readback and newly assigned tools
+
+Read-only management operations such as executor `get` and MCP
+`assignments_get` can be repeated within the same turn to inspect changed
+state. Mutating and unknown operations retain duplicate and uncertain-outcome
+protection; a readback does not authorize replaying a mutation.
+
+Executor reconfiguration and a chat's admitted tool inventory are separate.
+After adding an MCP assignment, finish the current turn and start a new user
+turn before discovering and calling newly added tools. Answering a pending
+question or resuming the same turn does not refresh that inventory. Do not
+guess a tool ID or bypass discovery when a new tool is not yet exposed.
 
 ## Skills
 
@@ -117,9 +334,18 @@ In the UI you can:
 
 Skills use a hybrid lazy-loading model for token efficiency:
 
-1. **Compact metadata in the system prompt** -- visible skills are announced in the immutable prompt prefix with an ID, name, short description, and attachment/loading state. Tool inventories are omitted. Attached skills are marked so the agent knows which ones are preferred defaults.
-2. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions, prompt templates, and asset references are loaded into the mutable context, not the cached prefix. Saved workflow decomposition and tool summaries stay out of the model context.
-3. **Deferred tool exposure** -- linked runtime tools and bundled executable skill tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools through the normal tool runtime after the agent loads the skill, without duplicating their schemas in the skill context.
+1. **Attached skills in the system prompt** -- only skills attached to the agent or to all agents are listed in the immutable prompt prefix, each with its ID, name, and description (capped at 1,024 characters). Skills whose instructions are auto-loaded are omitted from the list because their full instructions are already in context. Every other visible skill is summarized as one line with a count.
+2. **Search via `skill_search`** -- the agent finds unlisted skills by name, description, and tags. Each result contains only the skill ID, name, and description. Like `skill_load`, `skill_search` is always directly callable; the agent never needs `search_tools` to reach it.
+3. **On-demand loading via `skill_load`** -- the agent uses the `skill_load` tool to read full instructions when a skill is relevant to the current task. Instructions, prompt templates, and asset references are loaded into the mutable context, not the cached prefix. Saved workflow decomposition and tool summaries stay out of the model context.
+4. **Deferred tool exposure** -- linked runtime tools and bundled executable skill tools are discoverable but treated as deferred. Attached skills start available by default; other skills expose their tools through the normal tool runtime after the agent loads the skill, without duplicating their schemas in the skill context.
+
+Repeated `skill_load` calls return success with `status: "already_loaded"` and
+`instructions_loaded: false` when the same instructions and templates are still
+present in the model context, including automatic preloads. Asset preparation
+still runs on the selected executor, and the result contains its current paths,
+environment, readiness, and any errors. Changed instructions are supplied in full
+with a notice that they replace the earlier version, not as a diff. If earlier
+instructions are no longer in context after compaction, loading supplies them again.
 
 This means:
 - adding or removing skills does not invalidate the entire prompt cache
@@ -136,9 +362,25 @@ authorized executor. The returned manifest and loaded context include each
 asset's `local_path`, executor ID, version ID, and SHA-256 hash. Relative bundle
 directories are preserved. Matching cached files are reused; replacements are
 atomic and versions have separate paths.
-Asset preparation currently supports Linux and macOS executors. Unsupported
-platforms return an explicit preparation error rather than reporting a load as
-successful.
+Asset preparation currently supports Linux and macOS executors. By default,
+preparation errors leave instructions available with `preparation_warning` and
+`asset_preparation.status: incomplete`; they do not establish runtime readiness.
+
+Pass `require_assets_ready: true` when the next operation consumes bundled assets.
+This requires verified paths and, for Python assets, a ready managed environment.
+Incomplete preparation returns a structured error without activating the skill
+as a successful load. Temporary executor delivery failures use the existing
+same-executor recovery window, cancellation, and ownership fences; they do not
+fall back to another executor. Re-preparing the version-pinned cache is safe
+after an unknown prepare outcome. This never authorizes replaying a helper or
+an uncertain external write.
+
+Recovery keeps the task/conversation-owned durable deadline and the existing
+turn/task cancellation owner. It holds no database transaction across executor
+I/O or reconnect waits. Retries retain the selected skill version and revalidate
+executor eligibility and the ownership fence at dispatch. A controller restart
+may re-prepare an unfinished read-only step; completed step outputs remain
+authoritative and uncertain mutations retain their no-replay contract.
 
 Reload after publishing or replacing assets, switching executors, or losing
 cached files. Load sends the authorized version directly, so it does not depend
@@ -156,7 +398,7 @@ permission to use an old local copy or claim end-to-end success.
 
 ### Agent skill selection
 
-In the agent editor, you can select which skills to attach to an agent. Attached skills are highlighted in prompt metadata and their tools are available immediately through the deferred tool-loading path.
+In the agent editor, you can select which skills to attach to an agent. Only attached skills appear in the agent's prompt, and their tools are available immediately through the deferred tool-loading path. Attach the skills an agent uses regularly; leave occasional ones unattached so they stay reachable through `skill_search` without growing every prompt.
 
 Attached-skill defaults now include linked runtime tools as well as bundled skill tools. This lets a skill bring an existing builtin or MCP tool surface into scope without duplicating that tool definition inside the skill.
 
@@ -165,13 +407,23 @@ Some shipped system agents also come with default attached skills. For example,
 skill by default. When a system agent allows overrides, its attached skill list
 can be replaced per user through the normal agent editor.
 
-All visible skills remain discoverable via prompt metadata and `skill_load`. Resolution order is deterministic: agent-attached skills first, then skills attached to all agents, then other discoverable skills.
+Every visible skill can still be loaded by ID with `skill_load`; attachment changes what is advertised, not what is authorized.
+
+#### Usage-based curation
+
+Cognis counts, per agent and skill, how often the skill is loaded, when it was last loaded, and how many loads followed a `skill_search` result. Only identifiers, counters, and timestamps are stored. The agent editor uses these counters for two advisory hints:
+
+- an attached skill that has not been loaded for 30 days suggests removal. Cognis does not store when a skill was attached, so the window also starts no earlier than the agent's last update and the start of usage counting;
+- an unattached skill that the agent found through search and loaded three or more times suggests attaching it.
+
+Nothing is detached or archived automatically. Agents see the same data in `skill_get` (`agent_usage`) and in the `manage_agents` skill assignment view (`skill_usage`). Skills attached to all agents and skills with auto-loaded instructions are not part of these suggestions.
 
 ### LLM skill management
 
 Agents can manage skills through built-in tools:
 
 - `skill_list` -- list available skills
+- `skill_search` -- find skills by name, description, and tags
 - `skill_load` -- load a skill's full instructions and related metadata
 - `skill_get` -- get skill details for inspection or debugging
 - `skill_versions` -- inspect version history
@@ -183,7 +435,7 @@ Agents can manage skills through built-in tools:
 - `skill_restore_version` -- restore a previous immutable version
 - `skill_export` -- export a skill as SKILL.md, YAML, or a full Cognis package
 
-All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates or imports a skill, Cognis automatically attaches it to that agent for future runs.
+All mutation tools are non-bypassable and evaluated by Intaris guardrails. When an agent creates, imports, or edits a skill (`skill_write`, `skill_import_url`, `skill_patch`, asset changes, or a version restore), Cognis attaches it to that agent if it is not attached yet. A delegated specialist acts for its persistent parent agent, so the parent receives the attachment. Other agents are never changed, existing assignments are kept as they are, and skills attached to all agents need no per-agent entry. Only the agent owner's own runs attach skills.
 
 An asset upsert can reuse `existing_asset_id` under a different filename. Renames
 copy verified bytes into a new immutable storage object; the original version
@@ -195,12 +447,36 @@ When a skill already has saved decomposition and its decomposition-driving input
 
 ### Built-in Cognis skills
 
-Cognis also ships global management skills for Cognis-native operations such as task and workflow management. These skills are intended for the main chat agent and are discoverable through the normal skill tools (`skill_list`, `skill_load`). They guide the agent to inspect state first, use the correct management tools, and avoid mutating protected resources such as system workflows.
+Cognis also ships global management skills for Cognis-native operations such as task and workflow management. These skills are intended for the main chat agent and are discoverable through the normal skill tools (`skill_search`, `skill_load`). They guide the agent to inspect state first, use the correct management tools, and avoid mutating protected resources such as system workflows.
 
 Cognis also ships reusable execution guidance. `Cognis Coding` defines the
-software delivery workflow. `Cognis Frontend Engineering` adds product judgment,
-interaction completeness, visual restraint, and cross-surface validation for
-product pages, web and mobile apps, dashboards, and control centers.
+software delivery workflow: minimal changes without speculative fallbacks or
+test scaffolding, behavior-level tests, and debuggable error handling.
+`Cognis Frontend Engineering` adds product judgment, interaction completeness,
+visual restraint, and cross-surface validation for product pages, web and
+mobile apps, dashboards, and control centers. It reads a repository's
+`DESIGN.md` explicitly, builds from the shared component vocabulary, and keeps
+disclaimers and implementation language out of interface copy.
+
+`Cognis Claude Code` (`cognis-claude-code`) delegates bounded coding tasks to
+the official Claude Code CLI on an assigned executor. Load it on demand or
+attach it to a coordinating agent. The executor needs an installed,
+authenticated CLI and the repository; the skill does not install software or
+configure authentication.
+
+The coordinator supplies a scoped brief and an isolated worktree, launches a
+background headless job, monitors its streamed output, and resumes follow-ups
+by the exact native session ID. It reviews the diff and verifies results before
+publishing through Cognis artifact/deliverable tools. Claude manages context
+only inside its worker session; Cognis keeps its normal runtime and workflows.
+
+Claude's native tools are not individually evaluated by Cognis/Intaris. Use
+explicit Claude tool permissions and a suitably isolated executor; a worktree
+is not a sandbox. The skill defaults to a read-only command and requires
+task-scoped permissions for edits and tests, never permission bypass. Native
+session persistence belongs to the selected executor and is not made portable
+by this skill. Cognis skills, hooks, and tools are not automatically inherited
+by the worker.
 
 ### Importing skills
 
@@ -243,6 +519,10 @@ without deleting earlier exposed instructions; the latest state controls eligibi
 
 `describe_tool`, `validate_tool_call`, `call_tool`, and exact `search_tools`
 lookups use the same reference resolution within their authorized inventory.
+That inventory includes enabled controller helpers such as `validate_tool_call`,
+not only executor tools. Discovery does not enable a disabled helper or add a
+direct schema; `call_tool` preserves the helper's normal validation and execution
+path, including session-local Rich authoring preflight requirements.
 Exact discovery also returns a matching tool that is already visible. Natural
 language searches remain relevance-ranked; a failed lookup is not evidence that
 the underlying service is unavailable.
@@ -350,6 +630,18 @@ This means:
 Use `image_generate` to create a new image from a prompt. It optionally accepts
 an ordered `references` array of Cognis image or artifact IDs. Use the prompt to
 state how each reference should influence the result.
+
+OpenAI-style providers use the image edit endpoint for reference-guided
+generation and explicit edits, uploading the original image bytes in order.
+Text-only requests use the image generation endpoint. Gemini continues to use
+its multimodal image path.
+
+OpenAI `gpt-image-2.6-flare` and `gpt-image-2.6-sunburst` use these native
+Image API endpoints for generation and reference/masked edits, not Chat
+Completions or Responses. They use the existing image tool options and PNG
+output; complexity, markup, SVG, and animation controls are not exposed by
+these tools. Availability still requires an authorized configured API provider;
+a bundled catalog entry does not grant access or change model routing.
 
 Use `image_edit` to modify or combine existing images. Its required `images`
 array is ordered and passed to the selected model as supplied. An optional

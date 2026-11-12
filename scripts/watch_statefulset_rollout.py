@@ -211,8 +211,8 @@ def _execute_rollback(args: argparse.Namespace) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Monitor a Cognis StatefulSet rolling update. Run on an independent management host, "
-            "outside the Cognis controller deployment."
+            "Monitor a Cognis StatefulSet rolling update. Run this program on "
+            "an independent management host, outside the Cognis controller deployment."
         )
     )
     parser.add_argument("--namespace", required=True)

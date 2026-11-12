@@ -1,6 +1,74 @@
-# Channels
+# Messaging channels
 
-Channels connect Cognis agents to external messaging platforms such as Slack, Discord, Telegram, Signal, and similar adapters.
+Channels include an agent's main Cognis app chat and external messaging platforms
+such as Slack, Discord, Telegram, and Signal.
+
+Each primary agent has a built-in **Cognis app** channel for its owner. It is
+always enabled, needs no adapter or credentials, and cannot be added, duplicated,
+deleted, stopped, or reassigned. **Messaging channels** groups accounts by platform;
+choose **Edit** to open an account's settings in a modal. The app editor only
+exposes the agent's preferred-channel setting, not external-adapter controls.
+It resolves to the agent's main app chat, not a recently active topic.
+The separate in-app notification inbox receives direct task outcomes and
+one-shot messages from agents the recipient cannot otherwise use.
+
+## Contacting another Cognis user
+
+The built-in app account also lets agents contact other active Cognis users,
+using the same channel tools as external platforms. No adapter or additional
+credentials are needed.
+
+Use `search_channel_targets` with the recipient's exact email and the sender
+agent's app account. This returns an opaque target reference without exposing
+a browsable user directory. `send_channel_message` also accepts an explicit recipient
+with `channel_type: "web"` and `address_kind: "cognis_user_email"`.
+
+Prefer `agent_conversation_create_channel` when a reply is required or useful.
+Cognis acts as the recipient's chat client:
+
+- The exchange appears in the normal dashboard and chat list, including when
+  the agent is not shared. Contact-only avatars have a channel indicator.
+- The existing managed conversation remains sender-owned. Its objective,
+  tool allowlist, expiry, lifecycle, and reach-back tools work as on external
+  channels. Sharing the agent does not switch the execution owner.
+- The recipient sees only delivered messages and their replies, not the
+  sender's private session, tool calls, reasoning, or controller messages.
+- Receiving a contact does not share the agent, start recipient-side
+  execution, or permit unrelated conversations with an unshared agent.
+- The recipient can end the exchange or block further app contact from the
+  sender. Ending a contact does not delete its delivered messages.
+- Reading the exchange keeps its chat and contact-only agent discoverable.
+  The recipient uses the normal chat header, message bubbles, and composer;
+  execution settings, work panels, attachments, and commands are not offered
+  where the return route does not support them.
+- The initial recipient title is the supplied conversation title, never the
+  private objective. The recipient can rename their own display conversation
+  without changing the sender's workspace title.
+
+The sender's dashboard, conversation list, and header identify the channel
+and participant. Its history distinguishes assistant messages, named remote
+participant messages, and **Private instruction · Not shared** messages.
+Participant avatars use the available identity; no profile image is invented.
+Owner execution controls are **Send instructions** and **Terminate conversation**,
+also enforced by the managed-conversation API. Instructions can be sent when
+idle or answering a controller wait. Termination fences the return route before
+cancelling the turn and preserves both parties' visible history. An in-flight
+delivery must settle before termination can complete; uncertain delivery is not
+automatically retried.
+
+Upgrading repairs recipient titles generated from private objectives by the
+earlier app-contact implementation. Other recipient renames are preserved.
+
+Use `send_channel_message` for a one-shot message with no managed return route.
+If the recipient owns or directly shares the agent, the message is appended
+to their main app chat without starting an agent turn. Otherwise it becomes
+a native notification, with no agent-list entry or reply option.
+
+The preferred channel is the agent's general messaging default, including task
+outcomes, rather than a task-only preference. When an agent has no external
+accounts, Cognis automatically selects its app channel. Existing external-channel
+preferences are preserved. Deployed API clients continue to use the legacy field
+name `preferred_for_task_delivery` for this single agent-level preference.
 
 ![Channel pairing and verified sender flow](../assets/images/cognis-channel-pairing-flow.svg)
 

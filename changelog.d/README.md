@@ -60,6 +60,5 @@ freshness, not whether every commit has a fragment.
    section is the canonical archive; correct it explicitly rather than
    re-generating it from today's commits.
 
-Fragments describe upcoming changes only. Finalized release notes live in
-`CHANGELOG.md` and the generated bundled index; publication remains a separate
-release step.
+Unconsumed fragments describe upcoming changes. They are a preview, not a claim
+that a release has shipped.

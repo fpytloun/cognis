@@ -1,5 +1,48 @@
 # Cognis: API Specification
 
+## Usage API client logs
+
+`POST /api/v1/usage/requests` accepts the existing bounded detail query plus
+`pagination_unit: "attempt" | "request"` (default `"attempt"`). Request mode
+pages indexed unique logical headers, newest first. `POST
+/api/v1/usage/requests/detail` accepts `scope`, `start`, `end`, `pricing_basis`,
+required encrypted `selection_ref`, and optional attempt `limit`/`cursor`;
+it returns `{meta, request, attempts, next_cursor}`.
+
+Analytics add `traffic_origins`, `auth_types`, `client_ids`, `key_ids` filters
+and `traffic_origin`, `auth_type`, `client`, `key` group/facet dimensions.
+Request mode adds `http_status_codes`; provider/model filters select matching
+requests without restricting totals to only their matching attempts.
+Client/key selectors and private header metadata are unavailable in project
+scope. References are not authorization grants.
+See [Usage accounting](../guide/usage-accounting.md#api-clients-and-logical-request-logs)
+for fields, retention, privacy, pagination and upgrade behavior.
+
+## Streaming speech
+
+Authenticated `GET /api/v1/tts/capabilities` adds `streaming_tts`,
+`streaming_stt`, and `stt_sample_rate` to the existing readiness response.
+These fields describe the selected providers/models, not a provider substitution.
+
+`POST /api/v1/tts/stream` accepts the normal synthesis request and returns
+`application/x-ndjson` with caching/proxy buffering disabled. Events are:
+`audio_start`, ordered `audio` (base64 mono signed little-endian PCM, 24 kHz,
+sample offsets), `audio_done`, completed `part` receipts with a `streamed` flag,
+and a final `complete` containing the normal synthesis response. A cached part
+can have a receipt without live frames. `audio_done` is not an artifact receipt;
+only a complete manifest confirms the request finished. A transport/provider
+failure emits a sanitized `error` and does not authorize automatic regeneration.
+Viewer restrictions, agent access and speech preferences match normal synthesis.
+
+The authenticated browser WebSocket accepts `speech_stt_start`,
+`speech_stt_audio`, `speech_stt_commit`, and `speech_stt_cancel` for one
+connection-owned `request_id`. Audio frames contain `audio_base64`, bounded to
+32 KiB of mono PCM16. `speech_stt_event` carries normalized start/partial/
+transcript/done events; `speech_stt_error` carries a safe code. Only final
+transcript/done confirms a committed utterance. Viewer requests are refused.
+Connections retain the existing authentication, revocation and rate limits;
+there is no reconnect/replay protocol for live microphone input.
+
 ## Controller profiling administration
 
 Admin session users and ordinary admin API keys can access
@@ -96,9 +139,25 @@ viewer-role callers, and preserve source provenance on new revisions.
 - `GET /api/v1/library/agents`: selectable active owned primary agents.
 - `GET/PUT /api/v1/library/items/{kind}/{ref}/sharing`: describe inherited versus
   explicit agent access, or replace explicit recipients across the lineage.
+- `GET/PUT /api/v1/library/items/{kind}/{ref}/people`: owner-only direct human
+  access for the whole lineage, including future revisions. Writes use
+  `principal_email`, `expected_version`, `allow_comments` and `revoked`;
+  a stale version returns 409. Revocation retains its versioned tombstone.
+  Recipients must be active existing users when granting access. This grants no
+  conversation/task access, agent runtime access, moderation or resharing rights.
+  Managed outputs remain subject to their explicit-context visibility fence.
 - `POST /api/v1/library/items/{kind}/{ref}/public-link`: signed exact-revision
   `view` or `download` link; expiry uses the existing deliverable sharing contract.
   Omitted mode selects View only for eligible formats.
+
+Managed revision-pinned public links are independent of human lineage grants.
+`GET /api/v1/feedback/public-shares/{share_id}/link` returns an owner's original
+recoverable token with `Cache-Control: no-store`, without changing its expiration
+or version. `ShareResponse.can_copy` distinguishes recoverable live links.
+Legacy random tokens cannot be recovered or silently rotated. New managed shares
+support `link_mode=view|download`; download links cannot enable commenting.
+Human-only artifact readers receive authenticated `/api/v1/artifacts/{ref}/bytes`
+URLs, not new public bearer capabilities.
 
 Text authoring is limited to 1 MiB and uploaded files to 20 MiB. Object storage
 writes and failed-write cleanup use the canonical revision service. Revision
@@ -133,6 +192,30 @@ filters, and grouping; they never grant access.
 Existing ownership, project membership, and revision metadata remain canonical.
 Existing artifact preview/download and deliverable revision/export/share routes
 serve the corresponding operations.
+
+## Usage resource rankings
+
+`POST /api/v1/usage/query` and the corresponding usage tool share the
+`UsageQuery` / `UsageQueryResponse` contract.
+
+- `view: "ranking"` accepts `group_by: "task" | "schedule" | "conversation"`
+  alongside the other existing dimensions.
+- Optional `filters.task_origin: "scheduled" | "one_off"` and
+  `filters.schedule_ids: string[]` narrow the population before aggregation.
+  Schedule grouping excludes usage without an unambiguous schedule-fire link.
+- `groups[].key` remains an ID; `groups[].label` is an authorized current title
+  or name, or null. Accounting-admin visibility is not content-read authority.
+- `ranking_measure` is null outside ranking responses, otherwise `"attempts"`,
+  `"input"`, `"output"` or `"known_priced_subtotal"` for `metric: "cost"`.
+  Cost ranking accepts partial pricing and retains the existing pricing-coverage
+  counts and cost-band quality. Mixed monetary currency/basis strata still fail.
+- `bucket: "day"` permits up to 730 days; hourly windows permit up to 90 days.
+  Resource grouping uses retained summaries, not archives. Windows crossing an
+  authorized detail-expiry cutoff fail with HTTP 422, code
+  `resource_detail_expired`, and a message containing that cutoff. Retention is
+  disabled by default.
+
+See [usage accounting](../guide/usage-accounting.md) for coverage and retention.
 
 ## Overview
 

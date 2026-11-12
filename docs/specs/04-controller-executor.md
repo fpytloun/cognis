@@ -59,6 +59,66 @@ local models (e.g., ollama on a Mac Studio).
 
 ## Executor Provider Interface
 
+### Large WebSocket messages
+
+Native HTTP binary-transfer capability is negotiated per live connection and
+preserved through full configuration and reconnect fast paths. Persisted
+capabilities must not enable native transfer on a legacy connection.
+
+After authentication, `executor.ready` negotiates `message_transport:
+"chunked-json-v1"` in its parameters and registration result. Both peers must
+advertise support before sending chunks; mixed-version connections retain the
+original JSON-RPC format. Upgrade both controller and executor for large transfers.
+
+Logical messages over 65,536 characters are split into JSON-RPC
+`transport.chunk` notifications. Each carries `transfer_id` (32-character ID),
+zero-based `index`, `data` (at most 65,536 characters), and boolean `final` in
+`params`. JSON escaping and UTF-8 expansion keep each wire message below 1 MiB.
+Chunks are separate WebSocket messages, not fragments of one oversized message.
+Only one large transfer is active per sending direction; small control messages
+may interleave so heartbeats continue during artifact transfers.
+
+The shared common-package codec spools incoming chunks to a temporary file and
+decodes the complete JSON-RPC object off the event loop before normal dispatch.
+There is no aggregate transport-size ceiling; RPC deadlines and memory needed
+to materialize a complete buffered result still apply.
+An incomplete transfer expires after 60 seconds without another chunk.
+Disconnect/cancellation discards temporary state, and interrupted sends retire
+the physical socket. Existing call reconciliation, not transport replay, decides
+whether a tool operation can be retried. Ownership checks fence every incoming
+chunk as well as complete messages.
+
+### Tool catalog reuse
+
+`tool.list` responses may include `catalog_notifications: true`. Only then may
+the controller reuse the raw catalog on that physical connection. Executors emit
+`executor.tools_changed` before reconfiguration and after successful MCP recovery;
+reads during configuration do not advertise cacheability. The controller invalidates
+before outbound configure/recovery requests as well, and an in-flight response
+cannot populate a cache invalidated after its request began.
+
+Reconnect and ownership replacement start cold. Older executors that omit the
+field retain per-call discovery throughout rolling upgrades. Every runtime still
+applies current ownership, availability, and tool-permission filters; the catalog
+is not an authorization cache. RPC replies retain their normal ordering.
+
+### Native file bodies
+
+Executors advertising `binary_transfers: true` use `http-binary-v1` for file
+bodies. Authorized calls receive a scoped upload grant; JSON-RPC carries only
+descriptors and integrity receipts. The controller streams bytes into artifact
+storage and consumes receipts atomically with the existing artifact publication
+transaction. Artifact downloads stream to an executor-local temporary file
+before atomic replacement.
+
+File transport has no product-wide artifact-size ceiling. Parsing, rendering,
+tool deadlines, available storage, and upstream services retain their own limits.
+Multipart writes use bounded concurrency and disk-backed parts rather than
+in-memory file buffers. See [native binary transfers](native-binary-transfers.md)
+for ownership, compatibility, recovery, and qualification boundaries, and the
+[deployment guide](../guide/deployment.md#native-binary-transfers) for ingress,
+shared storage, and S3 permissions.
+
 ```python
 class ExecutorProvider(Protocol):
     """Interface for executor backends."""

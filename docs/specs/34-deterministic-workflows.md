@@ -23,8 +23,9 @@ workflow phases, effective-definition snapshots, and UI cutover are specified in
 
 ## Non-Goals
 
-- No arbitrary scripts, Python execution, shell snippets, or unbounded workflow
-  expression language.
+- No general-purpose script fields, shell snippets, or unbounded workflow
+  expression language. The bounded `program` type below is the sole explicit
+  Python exception.
 - No direct channel posting from deterministic notification or completion steps.
   Delivery still goes through task/conversation delivery.
 - No secret material rendered into templates. Credentials remain tool/runtime
@@ -61,7 +62,7 @@ workflow phases, effective-definition snapshots, and UI cutover are specified in
      "outputs": {},
      "metadata": {
        "deterministic_step": true,
-       "step_type": "tool_call|condition|complete"
+       "step_type": "tool_call|program|condition|complete"
      },
      "claims": []
    }
@@ -87,7 +88,10 @@ workflow phases, effective-definition snapshots, and UI cutover are specified in
 ### New deterministic v1 types
 
 - `tool_call` — render arguments and execute exactly one Cognis tool through the
-  existing tool router.
+  existing `execute_controller_tool` path.
+- `program` — execute literal, owner-reviewed Python through the PTC runtime,
+  with separately rendered JSON inputs, typed output, and an explicit
+  read-only tool-ID allowlist.
 - `condition` — evaluate a deterministic expression and route to a named step or
   continue.
 - `complete` — finish the workflow/task without an LLM, including silent no-op
@@ -112,7 +116,7 @@ All step types may eventually support these controller-owned fields:
 ```python
 class StepDefinition:
     name: str
-    type: Literal["run", "gate", "tool_call", "condition", "complete"]
+    type: Literal["run", "gate", "tool_call", "program", "condition", "complete"]
 
     # Optional deterministic precondition.
     when: str | None = None
@@ -173,14 +177,14 @@ Semantics:
 2. Render `args` using native typed rendering.
 3. Validate the rendered arguments are JSON-serializable and satisfy the target
    tool schema before dispatch.
-4. Execute exactly one tool through the existing `ToolRouter`.
+4. Execute exactly one tool through the existing `execute_controller_tool`
+   path.
 5. Convert `ToolResult` into a `StepOutput`.
 6. Persist output references rather than copying huge raw outputs into future
    prompts.
 
-`tool_call` must not fake an agent turn. The implementation should extract a
-small reusable tool-execution helper from the current agent-loop tool dispatch
-path so deterministic steps preserve:
+`tool_call` and `program` must not fake an agent turn. They use the normal
+controller-tool entry point so deterministic steps preserve:
 
 - `target_executor` stripping and validation;
 - executor-pool lookup and active-executor refresh;
@@ -203,6 +207,75 @@ Autonomous and scheduled workflows must default to safe behavior:
 - destructive tools should require a gate or a future stronger approval model.
 
 The first implementation should prefer default-deny over best-effort warnings.
+
+## `program` Step
+
+```python
+class ProgramStepConfig:
+    language: Literal["python"] = "python"
+    description: str  # required: what runs and why
+    code: str         # literal source; never template-rendered
+    inputs: dict[str, Any] = {}
+    input_schema: dict[str, Any]  # JSON Schema object
+    output_schema: dict[str, Any] # JSON Schema object
+    tools: list[str]              # canonical stable tool IDs; [] is valid
+    limits: ProgramLimits | None = None
+
+
+class ProgramLimits:
+    wall_seconds: int | None = None
+    max_calls: int | None = None
+    concurrency: int | None = None
+    output_bytes: int | None = None
+```
+
+`input_schema` and `output_schema` must be valid JSON Schema (2020-12) with
+top-level `type: object`. `limits` only tightens runtime-configured ceilings;
+omitted values do not create a new quota or expand the runtime policy. The
+`tools` list is explicit, canonical, unique, and checked against the active
+registry. Only tools marked `read_only=true` are accepted in this initial
+workflow integration. Model-backed `memory` and `knowledgebase` categories are
+also rejected so the program path does not recursively invoke model inference.
+
+Program source is versioned workflow configuration. It is not Jinja-rendered
+and must not contain interpolated workflow values, tool output, or secrets.
+Workflow data is rendered into `inputs` and validated before dispatch. Do not
+pass credentials or other secrets in `inputs`; Python can inspect every value
+it receives. The runtime reads `program.tools` from the pinned `StepContext`;
+it does not accept a broader tool catalog from program source. The single
+emitted object is at `python_execute` result JSON's `result` field. Cognis validates that
+object against `output_schema` and maps it directly to
+`steps.<name>.outputs`; call references, generation, metrics, and diagnostics
+remain metadata.
+
+Execution uses the normal `execute_controller_tool` path and a new
+`execution_scope_id` equal to the fresh `StepRun` ID. Nested calls retain
+ordinary authorization, approval suspension, and continuation behavior.
+Approval waits do not consume the program's execution-time limit. A pending
+approval is not a successful result. Program execution is not retried after an
+ambiguous interruption or restart; recovery must reconcile evidence first.
+Existing `on_error` policy applies to execution, input/output validation, and
+runtime failures.
+
+An agent-composed program is a candidate, not permission to run code. It must
+be reviewed and accepted as pinned workflow configuration through the existing
+owner-configured workflow/task path before execution or scheduling. The
+workflow engine rejects an agent-composed execution. This approval of the
+configuration does not bypass normal approval for nested tool calls.
+
+This is arbitrary Python in the executor, not a sandbox. The read-only tool
+allowlist does not prevent code from using Python's ordinary filesystem,
+network, or process capabilities available in that executor, including direct
+network calls outside the Cognis tool API. PTC is intended for bounded,
+predictable read/filter/aggregate work; use native tools and
+normal workflow steps for writes, adaptive decisions, and high-impact actions.
+
+The runtime tool description, runtime-guide renderer, workflow guidance, and
+upstream-source attribution have one owner in
+`cognis/core/program_guidance.py`. Operational guidance is inserted only when
+the effective runtime exposes `python_execute`; workflow authoring guidance
+also requires workflow-management tools. Composer calls default to rejecting
+program steps unless the caller explicitly confirms that capability.
 
 ## `condition` Step
 

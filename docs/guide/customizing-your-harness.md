@@ -6,19 +6,66 @@ Cognis separates runtime rules from reusable work guidance and user-owned agent 
 
 ### 1. Core runtime guidance
 
-The controller supplies generic safety, capability, and context rules. These rules describe available tools, permissions, isolated child contexts, and compact delegation contracts.
+The controller supplies short, generic safety, capability, and context rules.
+Agents apply them silently: replies lead with the result in the user's language
+and do not describe how the request was classified. Live
+orchestration guidance owns the shared **Agent briefs** instructions for both
+specialist delegates and managed conversations, including workflow steps.
+Tool descriptions explain their fields and lifecycle rather than repeating a
+mandatory briefing form.
 
-A child contract normally includes:
+Brief an agent like a capable colleague who has not seen the conversation:
+explain the outcome, relevant facts and references, and real boundaries. Separate
+evidence from assumptions. For investigations, pass the question, not a procedure
+based on an unverified diagnosis. For implementation, define ownership, expected
+behavior, authority, and completion checks while leaving the approach to the agent.
 
-- the objective and confirmed context
-- exact source references
-- scope, ownership, and non-goals
-- acceptance and validation requirements
-- the required result and evidence
+Use normal sentences and spaces, short Markdown paragraphs, and helpful bullets
+or headings. Remove repetition, not meaning. A simple question needs no template;
+larger assignments need enough context for judgment, not the entire transcript.
+Ask for the result, supporting evidence, and material uncertainties or blockers.
 
 Reuse a child only when its role, responsibility, authority, tools, and output contract remain compatible. Use a fork only for an independent branch that needs inherited context.
 
 Core guidance does not require named execution modes, a coding hierarchy, or a specific team structure.
+
+#### Proportional brief examples
+
+These are illustrative assignments, not instructions to run them automatically.
+Small lookups normally stay inline.
+
+**Lookup**
+
+> In `cognis/core/orchestration_policy.py`, find where agent briefing guidance is
+> assembled. Return the function name, file and line range. Read-only; no broader
+> prompt audit is needed.
+
+**Implementation**
+
+> Make agent handoffs readable and proportional without adding a runtime
+> validator. Own the shared briefing guidance and directly affected tool
+> descriptions, specialist prompts, and tests. Preserve permissions, context
+> isolation, lifecycle, and parent ownership. Work in an isolated worktree.
+> Verify assembled prompts and tool descriptions, run focused regressions, and
+> obtain independent review. Return the change, check results, and local commit;
+> do not push, merge, or deploy.
+
+**Investigation**
+
+> Find why some handoffs lose spaces in long conversations. One observed case
+> already contained the unreadable text in model-generated tool arguments, so
+> rendering alone does not explain that case. We do not know whether other cases
+> share its cause.
+>
+> Read-only. Distinguish confirmed evidence from hypotheses and return the
+> strongest supported explanation, the references that separate it from
+> alternatives, and what remains unknown. Do not implement a fix.
+
+Tests can verify that the intended instructions and examples reach the model
+unchanged. They cannot demonstrate improved model behavior. A behavioral comparison
+needs separate model runs with fixed tasks, source snapshots, model/provider and
+reasoning settings, permissions, and context. Compare readability, preserved facts
+and restrictions, scope, and usable evidence; do not use length alone as success.
 
 The built-in Explore specialist provides lightweight, read-only discovery and
 analysis of existing information, including documents, files, configuration,

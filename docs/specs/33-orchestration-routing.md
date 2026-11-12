@@ -18,6 +18,61 @@ safety net.
 
 ## Runtime invariants
 
+### Delegation batching after sequential tools
+
+The agent loop owns response-local delegation batching. A preceding sequential
+tool settles before a following consecutive delegate run enters the existing
+bounded fanout. Budget rejections, duplicate calls, and non-delegate calls end
+that run. Results remain source-ordered and child creation retains its existing
+side-effect, provisioning, and join contracts. The turn scheduler and existing
+fanout own cancellation; there are no new locks, transactions, durable formats,
+or automatic retries.
+
+### Delegated configuration and managed independence
+
+The controller snapshots only Cognis-owned capability configuration in delegated
+session metadata, before external provisioning. The snapshot includes effective
+parent memory profile options, not the parent's identity, model, permissions,
+tools, executor grants, or Intaris-derived content. Child runtime construction
+and policy refresh use that snapshot; specialist memory opt-outs remain in force.
+Pre-snapshot delegates reconstruct configuration from their parent on admission.
+
+Intaris durably owns session `analytics_enabled` and `guardrails_enabled` flags.
+Creation explicitly sends and acknowledges both; policy refresh PATCHes them and
+checks canonical readback. Rotation reads the source flags before taking locks.
+These operations retain existing admission serialization, cancellation,
+reservation identity and idempotent provisioning ownership; there is no new lock
+or shared mutable provider preference cache.
+
+WorkflowStep v1 declarations require an existing session. Flags are provisioned
+or reconciled before declaration installation; the frozen declaration schema and
+digest do not contain them. Declaration installation must preserve session flags.
+
+Managed primary-agent conversations are independent configuration boundaries,
+including same-agent targets. Only existing allow/deny policy clauses cross that
+boundary, not the controller's evaluation selection. Access restrictions and
+managed-depth enforcement are unchanged.
+
+### Task outcomes
+
+The workflow engine owns terminal routing; channel delivery owns external
+outbox transport; Intaris owns app-chat content; the existing notification inbox
+owns direct app notifications. Recipient identity remains separate from channel
+identity. Current routing is task-owner-only, including shared/project tasks.
+
+Default outcomes use a neutral `handle` follow-up with task/result references
+and optional persisted finish instructions. They do not use a separate
+notify-versus-integrate classifier. Direct delivery never admits an agent turn;
+missing routes fall back to the recipient's app inbox.
+
+Delivery idempotency identifies the terminal occurrence using task ID, attempt,
+status, and normalized completion timestamp. Retrying that occurrence reuses its
+follow-up/outbox/inbox identity; a later occurrence does not. Task execution
+fences and turn-scheduler admission retain cancellation and serialization
+ownership. Database transactions end before Intaris/channel I/O. No new lock,
+automatic repair loop, or transport retry owner is introduced. Existing
+serialized `notify`/`integrate` follow-ups remain readable.
+
 ### Signal destination policy
 
 Signal sends use local destination admission through the channel manager.
@@ -115,19 +170,27 @@ and route recovery. Error text does not determine delivery certainty.
     investigative context is materially useful and its role, criteria, findings,
     and dispositions remain preserved; otherwise start a fresh reviewer. Fork only
     an independent branch requiring inherited context.
-12. Child-context guidance is compact and evidence-oriented. Continue only the
+12. Live capability guidance owns one proportional agent-briefing block for
+    delegates and managed conversations on all orchestration-enabled surfaces.
+    Brief a capable colleague with the outcome, relevant facts and references,
+    and real boundaries, using readable sentences and Markdown rather than a
+    mandatory form. Investigations receive questions and known facts, not steps
+    based on unverified hypotheses; implementers receive ownership and expected
+    behavior with room to choose the approach. Tool descriptions own field and
+    lifecycle semantics; skills own delivery-specific procedures.
+    Continue only the
     same bounded problem when role, responsibilities, tools, authority, and
     output remain compatible and retained context is materially useful; send
     only the context delta. Create a fresh isolated child for a changed
-    responsibility or capability scope or an independent workstream, with a
-    compact contract and exact references, never the parent transcript. Fork
+    responsibility or capability scope or an independent workstream, with
+    relevant references, never the parent transcript. Fork
     only an independent branch requiring inherited context, not an ordinary
     handoff or review. Reviewer input includes objective, criteria, exact
     diff/artifact, verification, and invariants, not implementation reasoning.
     Re-review preserves reviewer role, criteria, findings, and dispositions and
-    reuses context only when materially useful. Child returns include status,
-    results/findings, changed references, verification, risks, and questions;
-    detailed logs remain inspectable outside the parent's active context.
+    reuses context only when materially useful. Child returns contain the result,
+    supporting evidence, and material uncertainty or blockers, proportional to the
+    task; detailed logs remain inspectable outside the parent's active context.
 13. In coordinate mode, the architect owns decomposition through integration,
     acceptance, and final delivery. Workers have bounded responsibilities; do
     not downgrade the architect into a worker by default. Preserve proportional
