@@ -123,4 +123,35 @@ final class ContractTests: XCTestCase {
             XCTAssertThrowsError(try BridgeMessage.decode(message(payload), generation: generation, trustedMainFrame: true))
         }
     }
+    func testResourceWindowCommandIsTypedScopedAndCannotChooseArbitraryRoutes() throws {
+        func message(_ payload: [String: Any]) -> [String: Any] {
+            ["version": 1, "generation": generation, "type": "open-resource-window", "payload": payload]
+        }
+        for kind in [StandaloneTarget.Kind.project, .deliverable] {
+            let value = message(["kind": kind.rawValue, "id": "shared_id"])
+            guard case .openResourceWindow(let target) = try BridgeMessage.decode(value,
+                generation: generation, trustedMainFrame: true) else { return XCTFail("Expected resource window") }
+            XCTAssertEqual(target, StandaloneTarget(kind: kind, id: "shared_id"))
+            XCTAssertThrowsError(try BridgeMessage.decode(value, generation: UUID().uuidString, trustedMainFrame: true))
+            XCTAssertThrowsError(try BridgeMessage.decode(value, generation: generation, trustedMainFrame: false))
+        }
+        for payload: [String: Any] in [
+            ["kind": "conversation", "id": "shared_id"], ["kind": "artifact", "id": "shared_id"],
+            ["kind": "project", "id": "../chat"], ["kind": "project", "id": "id?window=1"],
+            ["kind": "deliverable", "id": "https://untrusted.test"],
+            ["kind": "project", "id": "id", "path": "/settings"],
+            ["kind": "project"], ["id": "id"], ["kind": "project", "id": NSNull()]
+        ] {
+            XCTAssertThrowsError(try BridgeMessage.decode(message(payload), generation: generation, trustedMainFrame: true))
+        }
+        let chat = StandaloneTarget(kind: .conversation, id: "shared_id")
+        let project = StandaloneTarget(kind: .project, id: "shared_id")
+        let deliverable = StandaloneTarget(kind: .deliverable, id: "shared_id")
+        XCTAssertEqual(Set([chat.key, project.key, deliverable.key]).count, 3)
+        XCTAssertEqual(chat.key, "shared_id")
+        XCTAssertEqual(chat.path, "/chat/shared_id?window=1")
+        XCTAssertEqual(project.path, "/projects/shared_id?window=1")
+        XCTAssertEqual(deliverable.path, "/library/deliverable/shared_id?window=1")
+        XCTAssertEqual(project.surface, "resource")
+    }
 }

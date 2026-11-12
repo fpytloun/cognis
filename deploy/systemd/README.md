@@ -10,6 +10,16 @@ Systemd unit files for running Cognis as managed services on Linux.
 | `cognis-executor@.service` | System template unit | Per-user executor (`cognis-executor`) |
 | `cognis-executor.user.service` | User unit | Executor without root access |
 
+Both executor units set `OOMPolicy=continue`: if Linux kills a tool or browser
+child under memory pressure, systemd must not terminate the executor and unrelated
+calls as well. `Restart=on-failure` still restarts a killed executor main process.
+This does not prevent OOMs or restore an interrupted child's effects.
+
+Existing installations must also set `OOMPolicy=continue` in their installed
+executor unit or a `[Service]` drop-in and reload the systemd manager. A package
+or controller upgrade alone does not update custom units. Verify with
+`systemctl --user show cognis-executor -p OOMPolicy` for a user service.
+
 ## Controller (system-level)
 
 Runs the Cognis controller as a dedicated `cognis` system user.

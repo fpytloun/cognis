@@ -289,7 +289,10 @@ def _preflight_sources(
         ):
             raise ValueError(f"Tool binding is incomplete for {visible!r}")
         if visible in seen_visible or canonical in seen_canonical or stable in seen_stable:
-            raise ValueError("Tool bindings must be one-to-one and collision-free")
+            raise ValueError(
+                "Tool bindings must be one-to-one and collision-free: "
+                f"visible={visible!r} canonical={canonical!r} stable_id={stable!r}"
+            )
         aliases = (argument_alias_map or {}).get(canonical, {})
         if not isinstance(aliases, Mapping):
             raise TypeError(f"Reverse argument aliases for {canonical!r} must be an object")

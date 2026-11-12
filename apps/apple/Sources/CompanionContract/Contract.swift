@@ -72,12 +72,24 @@ public struct TrayAgent: Codable, Equatable, Sendable {
     }
 }
 
+public struct PanelTargets: Codable, Sendable {
+    public let ready: Bool
+    public let pinnedAgents: [String]
+    public var isValid: Bool {
+        pinnedAgents.count <= 24 && pinnedAgents.allSatisfy(validIdentifier)
+            && Set(pinnedAgents).count == pinnedAgents.count
+    }
+}
+
 public struct Snapshot: Codable, Sendable {
     public let epoch: Int
     public let authenticated: Bool
     public let connection: String
     public let pins: [Pin]
     public let agents: [TrayAgent]
+    // Older bridge-v1 projections can render the shell but cannot admit queued
+    // panel URLs until target discovery is authoritative.
+    public let panelTargets: PanelTargets?
     public var isValid: Bool {
         epoch >= 1 && epoch <= 1_000_000 && pins.count <= 24
         && ["idle", "connecting", "connected", "reconnecting", "stalled"].contains(connection)
@@ -85,13 +97,17 @@ public struct Snapshot: Codable, Sendable {
         && Set(pins.map(\.conversationId)).count == pins.count
         && agents.allSatisfy(\.isValid)
         && Set(agents.map(\.agentId)).count == agents.count
+        && (panelTargets?.isValid ?? true)
         && (authenticated || (pins.isEmpty && agents.isEmpty))
     }
 }
 
 public enum BridgeMessage: Sendable {
+    case openReference(String)
+    case saveDiagnostic(DiagnosticExport)
     case openMain(String)
     case openWindow(String)
+    case openResourceWindow(StandaloneTarget)
     case workspace(WorkspaceFrame)
     case rail(String, String?, Double?)
     case railSize(Double, Double)
@@ -114,9 +130,16 @@ public enum BridgeMessage: Sendable {
         guard value["generation"] as? String == generation,
               let type = value["type"] as? String,
               let payload = value["payload"] as? [String: Any],
-              try JSONSerialization.data(withJSONObject: body).count <= (["workspace", "snapshot"].contains(type) ? 524_288 : 32_768)
+              try JSONSerialization.data(withJSONObject: body).count <= (
+                type == "save-diagnostic" ? DiagnosticExport.maximumEnvelopeBytes
+                  : ["workspace", "snapshot"].contains(type) ? 524_288 : 32_768)
         else { throw HostError.invalidMessage }
         switch type {
+        case "open-reference":
+            guard Set(payload.keys) == ["path"], let path = payload["path"] as? String, validRoute(path)
+            else { throw HostError.invalidMessage }
+            return .openReference(path)
+        case "save-diagnostic": return .saveDiagnostic(try DiagnosticExport.decode(payload))
         case "notification-settings":
             guard Set(payload.keys) == ["action"], let action = payload["action"] as? String,
                   ["status", "show"].contains(action) else { throw HostError.invalidMessage }
@@ -197,7 +220,14 @@ public enum BridgeMessage: Sendable {
             else { throw HostError.invalidMessage }
             return .appearance(theme, background)
         case "snapshot":
-            guard Set(payload.keys) == ["epoch", "authenticated", "connection", "pins", "agents"] else { throw HostError.invalidMessage }
+            let keys = Set(payload.keys)
+            guard keys == ["epoch", "authenticated", "connection", "pins", "agents"]
+                || keys == ["epoch", "authenticated", "connection", "pins", "agents", "panelTargets"]
+            else { throw HostError.invalidMessage }
+            if keys.contains("panelTargets") {
+                guard let targets = payload["panelTargets"] as? [String: Any],
+                      Set(targets.keys) == ["ready", "pinnedAgents"] else { throw HostError.invalidMessage }
+            }
             let snapshot = try JSONDecoder().decode(Snapshot.self, from: JSONSerialization.data(withJSONObject: payload))
             guard let agents = payload["agents"] as? [[String: Any]],
                   agents.allSatisfy({ Set($0.keys) == ["agentId", "name"] }) else { throw HostError.invalidMessage }
@@ -213,6 +243,13 @@ public enum BridgeMessage: Sendable {
                   let id = payload["conversationId"] as? String, validIdentifier(id)
             else { throw HostError.invalidMessage }
             return .openWindow(id)
+        case "open-resource-window":
+            guard Set(payload.keys) == ["kind", "id"],
+                  let rawKind = payload["kind"] as? String,
+                  let kind = StandaloneTarget.Kind(rawValue: rawKind), kind != .conversation,
+                  let id = payload["id"] as? String, validIdentifier(id)
+            else { throw HostError.invalidMessage }
+            return .openResourceWindow(StandaloneTarget(kind: kind, id: id))
         case "route":
             guard Set(payload.keys) == ["path"], let path = payload["path"] as? String,
                   validRoute(path) else { throw HostError.invalidMessage }

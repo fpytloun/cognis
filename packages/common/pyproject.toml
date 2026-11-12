@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-common"
-version = "0.18.3"
+version = "0.19.0"
 description = "Shared contracts and portable runtimes for Cognis"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
@@ -22,6 +22,7 @@ dependencies = [
     "msgspec>=0.19.0",
     "pydantic>=2.0.0",
     "prometheus-client>=0.20.0",
+    "referencing>=0.37.0",
     "websockets>=14.0",
 ]
 

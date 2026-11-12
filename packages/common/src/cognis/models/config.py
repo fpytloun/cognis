@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from cognis.models.usage import UsageUntieredTariffDeclaration
+
 NORMALIZED_REASONING_LEVELS: tuple[str, ...] = (
     "default",
     "none",
@@ -90,6 +92,8 @@ class ModelInfo(BaseModel):
     supports_streaming: bool = True
     supports_vision: bool = False
     supports_audio_input: bool = False
+    supports_speech_synthesis: bool = False
+    supports_transcription: bool = False
     supports_pdf_input: bool = False
     supports_file_input: bool = False
     supports_reasoning: bool = False
@@ -132,6 +136,7 @@ class ModelInfo(BaseModel):
     model_mode: str | None = None
     pricing: dict[str, Any] = Field(default_factory=dict)
     tier: str = "standard"
+    untiered_tariff: UsageUntieredTariffDeclaration | None = None
     provider_metadata: dict[str, Any] = Field(default_factory=dict)
     runtime_metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -153,6 +158,7 @@ class ModelRoutingPolicy(BaseModel):
     evaluator: dict[str, str | None] = Field(default_factory=dict)
     speech_to_text: dict[str, str | None] = Field(default_factory=dict)
     text_to_speech: dict[str, str | None] = Field(default_factory=dict)
+    audio_narrative: dict[str, str | None] = Field(default_factory=dict)
     image_generation: dict[str, str | None] = Field(default_factory=dict)
     video_generation: dict[str, str | None] = Field(default_factory=dict)
     video_editing: dict[str, str | None] = Field(default_factory=dict)

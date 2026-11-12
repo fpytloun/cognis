@@ -669,6 +669,104 @@ WEB_RESEARCH_TOOL = ToolDefinition(
     timeout_seconds=300,
 )
 
+# -- Program runtime tools ------------------------------------------------------
+
+# Program cells use an active-time budget; controller approval waits do not
+# consume it. The runtime, not a transport watchdog, owns this deadline.
+PYTHON_EXECUTE_ACTIVE_TIMEOUT_SECONDS = 330
+
+PYTHON_EXECUTE_TOOL = ToolDefinition(
+    name="python_execute",
+    capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
+    description=(
+        "Execute a Python program in the explicitly enabled executor's persistent "
+        "IPython kernel. Python has the executor host's full user-level filesystem, "
+        "credential, and network access and is not a sandbox. Nested Cognis tools "
+        "are separately routed through normal controller governance. Supply a clear "
+        "description, code, optional JSON inputs/output schema, and an expected "
+        "kernel generation after the first call. Use top-level await; use "
+        "cognis.create_task() for managed tasks, which are canceled at the cell "
+        "boundary if left pending. Finish workflow results with "
+        "await cognis.emit(json_value). State is scoped by Cognis, not by arguments. "
+        "Do not use for unattended or host-destructive work without explicit "
+        "authorization."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "description": {"type": "string", "minLength": 1, "maxLength": 8192},
+            "code": {"type": "string"},
+            "inputs": {"type": "object"},
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+            "limits": {
+                "type": "object",
+                "properties": {
+                    "wall_seconds": {"type": "integer", "minimum": 1},
+                    "max_calls": {"type": "integer", "minimum": 1},
+                    "concurrency": {"type": "integer", "minimum": 1},
+                    "output_bytes": {"type": "integer", "minimum": 1},
+                },
+                "additionalProperties": False,
+            },
+            "expected_generation": {"type": ["integer", "null"], "minimum": 1},
+        },
+        "required": ["description", "code"],
+        "additionalProperties": False,
+    },
+    source=_EXECUTOR_SOURCE,
+    category="program",
+    profile_group="development",
+    classification_source="declared",
+    classification_status="ready",
+    classification_confidence=1.0,
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=PYTHON_EXECUTE_ACTIVE_TIMEOUT_SECONDS,
+)
+
+PYTHON_KERNEL_STATUS_TOOL = ToolDefinition(
+    name="python_kernel_status",
+    capabilities=[ToolCapability.READ],
+    description=(
+        "Inspect the state and generation of the current controller-assigned "
+        "Python kernel scope. Does not expose variables or kernel contents."
+    ),
+    parameters={"type": "object", "properties": {}, "additionalProperties": False},
+    source=_EXECUTOR_SOURCE,
+    category="program",
+    profile_group="development",
+    classification_source="declared",
+    classification_status="ready",
+    classification_confidence=1.0,
+    read_only=True,
+    timeout_seconds=10,
+)
+
+PYTHON_KERNEL_RESET_TOOL = ToolDefinition(
+    name="python_kernel_reset",
+    capabilities=[ToolCapability.WRITE, ToolCapability.PRIVILEGED],
+    description=(
+        "Explicitly discard the idle Python kernel in the current Cognis-assigned "
+        "scope. This loses all in-memory program state and advances the generation."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {"expected_generation": {"type": "integer", "minimum": 1}},
+        "required": ["expected_generation"],
+        "additionalProperties": False,
+    },
+    source=_EXECUTOR_SOURCE,
+    category="program",
+    profile_group="development",
+    classification_source="declared",
+    classification_status="ready",
+    classification_confidence=1.0,
+    read_only=False,
+    non_bypassable=True,
+    timeout_seconds=30,
+)
+
 # -- Public API ----------------------------------------------------------------
 
 
@@ -693,6 +791,9 @@ _CORE_EXECUTOR_TOOLS: list[ToolDefinition] = [
     BASH_TOOL,
     BASH_OUTPUT_TOOL,
     BASH_KILL_TOOL,
+    PYTHON_EXECUTE_TOOL,
+    PYTHON_KERNEL_STATUS_TOOL,
+    PYTHON_KERNEL_RESET_TOOL,
 ]
 # Kept for compatibility with callers that inspect the static core inventory.
 ALL_EXECUTOR_TOOLS = list(_CORE_EXECUTOR_TOOLS)

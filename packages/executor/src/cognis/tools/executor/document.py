@@ -152,6 +152,11 @@ ARTIFACT_PUBLISH_TOOL = ToolDefinition(
                 "type": "string",
                 "description": "Optional purpose label stored with the artifact.",
             },
+            "allow_comments": {
+                "type": "boolean",
+                "default": False,
+                "description": "Ask the controller to create a public, revocable exact-revision guest-comment link. Returned as comment_url; never grants agent dispatch. A link failure preserves the artifact and must not trigger republication.",
+            },
             "supersedes": {
                 "type": "string",
                 "description": (
@@ -174,9 +179,10 @@ ARTIFACT_PUBLISH_TOOL = ToolDefinition(
     category="document",
     read_only=False,
     mutation_kind="create",
+    non_bypassable=True,
     side_effects=[
         "Reads a local executor file and creates persistent private owner-scoped Cognis storage.",
-        "Does not deliver to an external recipient or publish publicly; sharing is a separate operation.",
+        "With allow_comments=true, the controller also creates a public comment link; otherwise content stays private. Does not send to an external recipient.",
     ],
     timeout_seconds=60,
     max_result_size=50_000,
@@ -188,7 +194,7 @@ async def handle_document_generate(
     context: ToolExecutionContext,
 ) -> ToolResult:
     try:
-        source_kind, source_text, base_dir = await _load_source(arguments)
+        source_kind, source_text, base_dir = await _load_source(arguments, context)
         input_format = str(arguments.get("input_format") or "markdown").lower()
         if input_format not in {"markdown", "html"}:
             return ToolResult(
@@ -199,6 +205,7 @@ async def handle_document_generate(
         assets, companion_attachments, pdf_appendices, warnings = await _resolve_assets(
             arguments.get("assets") or [],
             append_pdf_assets=append_pdf_assets,
+            context=context,
         )
         template = str(arguments.get("template") or "default")
         page_size = str(arguments.get("page_size") or "A4")
@@ -244,7 +251,7 @@ async def handle_document_generate(
             {
                 "filename": filename,
                 "mime_type": "application/pdf",
-                "content_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+                **context.binary_transfers.attachment_content(pdf_bytes),
                 "kind": "pdf",
                 "purpose": "document_output",
             },
@@ -261,7 +268,6 @@ async def handle_artifact_publish(
     arguments: dict[str, Any],
     context: ToolExecutionContext,
 ) -> ToolResult:
-    del context
     try:
         raw_path = arguments.get("path")
         if not isinstance(raw_path, str) or not raw_path.strip():
@@ -271,7 +277,6 @@ async def handle_artifact_publish(
             return ToolResult(
                 output=f"Artifact publish failed: file not found: {raw_path}", is_error=True
             )
-        content = path.read_bytes()
         filename = str(arguments.get("filename") or path.name or "attachment")
         mime_type = str(
             arguments.get("mime_type")
@@ -279,6 +284,31 @@ async def handle_artifact_publish(
             or mimetypes.guess_type(path.name)[0]
             or "application/octet-stream"
         )
+        if context.binary_transfers.grant is not None:
+            receipt = await context.binary_transfers.upload_file(
+                path, filename=filename, mime_type=mime_type
+            )
+            return ToolResult(
+                output=str(
+                    {
+                        "published_path": str(path),
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "size_bytes": receipt.size_bytes,
+                    }
+                ),
+                attachments=[
+                    {
+                        "transfer_receipt": receipt.model_dump(),
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "kind": "pdf" if mime_type == "application/pdf" else "file",
+                        "purpose": str(arguments.get("purpose") or "artifact_publish"),
+                    }
+                ],
+            )
+        # Mixed-version rollout: older controllers do not issue upload capabilities.
+        content = path.read_bytes()
         output = {
             "published_path": str(path),
             "filename": filename,
@@ -301,7 +331,9 @@ class DocumentGenerationError(Exception):
     pass
 
 
-async def _load_source(arguments: dict[str, Any]) -> tuple[str, str, str | None]:
+async def _load_source(
+    arguments: dict[str, Any], context: ToolExecutionContext | None = None
+) -> tuple[str, str, str | None]:
     provided = [
         key for key in ("content", "source_path", "source_artifact_id") if arguments.get(key)
     ]
@@ -317,6 +349,25 @@ async def _load_source(arguments: dict[str, Any]) -> tuple[str, str, str | None]
             raise DocumentGenerationError(f"Source file not found: {source_path}")
         text = path.read_text(encoding="utf-8", errors="replace")
         return "path", text, str(path.parent)
+    if context is not None and (raw := arguments.get("source_artifact_download")):
+        from cognis.transfers.models import DownloadDescriptor
+
+        descriptor = DownloadDescriptor.model_validate(raw)
+        if not (
+            descriptor.mime_type.startswith("text/")
+            or descriptor.mime_type.split(";", 1)[0]
+            in {
+                "application/json",
+                "application/xml",
+                "application/xhtml+xml",
+            }
+        ):
+            raise DocumentGenerationError("Document source must be a text artifact.")
+        with tempfile.TemporaryDirectory(prefix="cognis-document-source-") as directory:
+            path = Path(directory) / "source"
+            await context.binary_transfers.download_file(descriptor, path)
+            text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+        return "artifact", text, None
     if artifact_content := arguments.get("source_artifact_content"):
         return "artifact", str(artifact_content), None
     raise DocumentGenerationError(
@@ -328,6 +379,7 @@ async def _resolve_assets(
     raw_assets: list[Any],
     *,
     append_pdf_assets: bool,
+    context: ToolExecutionContext | None = None,
 ) -> tuple[dict[str, dict[str, str]], list[dict[str, Any]], list[tuple[str, bytes]], list[str]]:
     resolved: dict[str, dict[str, str]] = {}
     companion_attachments: list[dict[str, Any]] = []
@@ -339,7 +391,7 @@ async def _resolve_assets(
         name = raw.get("name")
         if not isinstance(name, str) or not name:
             continue
-        asset_bytes, mime_type, filename = await _load_asset_bytes(raw)
+        asset_bytes, mime_type, filename = await _load_asset_bytes(raw, context)
         if mime_type == "application/pdf":
             if append_pdf_assets:
                 pdf_appendices.append((filename, asset_bytes))
@@ -379,9 +431,20 @@ async def _resolve_assets(
     return resolved, companion_attachments, pdf_appendices, warnings
 
 
-async def _load_asset_bytes(raw: dict[str, Any]) -> tuple[bytes, str, str]:
+async def _load_asset_bytes(
+    raw: dict[str, Any], context: ToolExecutionContext | None = None
+) -> tuple[bytes, str, str]:
     filename = str(raw.get("filename") or raw.get("name") or "attachment")
     mime_type = str(raw.get("mime_type") or "")
+    if context is not None and (download := raw.get("artifact_download")):
+        from cognis.transfers.models import DownloadDescriptor
+
+        descriptor = DownloadDescriptor.model_validate(download)
+        with tempfile.TemporaryDirectory(prefix="cognis-document-asset-") as directory:
+            path = Path(directory) / "asset"
+            await context.binary_transfers.download_file(descriptor, path)
+            content = await asyncio.to_thread(path.read_bytes)
+        return content, descriptor.mime_type, descriptor.filename
     if content_b64 := raw.get("content_b64"):
         if not isinstance(content_b64, str):
             raise DocumentGenerationError(f"Asset '{raw.get('name')}' has invalid inline content.")

@@ -84,8 +84,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("--clobber", mac)
         self.assertNotIn("gh release create", mac)
         self.assertNotIn("gh release edit", mac)
-        self.assertIn(".isDraft == true and .isPrerelease == true", mac)
-        self.assertIn(".tagName == env.RELEASE_TAG", mac)
+        self.assertIn(
+            ".isDraft == true and .isPrerelease == true and .tagName == env.RELEASE_TAG", mac
+        )
         self.assertIn('record["identity"]["source"] == source', mac)
         docker = (directory / "docker-publish.yml").read_text()
         self.assertEqual(docker.count("if: needs.release-gate.outputs.project == 'true'"), 2)

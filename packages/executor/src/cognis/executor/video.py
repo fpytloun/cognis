@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from cognis.executor.usage_observer import ExecutorUsageObserver
 from cognis.models.video import VideoOutput, VideoRequest
 from cognis.providers.video import VideoConnection, VideoHTTPAdapter, VideoInput
 
@@ -27,10 +28,18 @@ def ticket_url(ticket: dict[str, Any]) -> str:
     return url
 
 
-async def video_rpc(params: dict[str, Any]) -> dict[str, Any]:
+async def video_rpc(
+    params: dict[str, Any],
+    *,
+    usage_observer: ExecutorUsageObserver | None = None,
+) -> dict[str, Any]:
     """No automatic retry: loss of a submit response is an uncertain paid operation."""
     async with httpx.AsyncClient(timeout=1200, follow_redirects=False) as client:
-        adapter = VideoHTTPAdapter(VideoConnection.model_validate(params["connection"]), client)
+        adapter = VideoHTTPAdapter(
+            VideoConnection.model_validate(params["connection"]),
+            client,
+            usage_binding=usage_observer.binding if usage_observer is not None else None,
+        )
         operation = params["operation"]
         if operation == "capabilities":
             return (await adapter.capabilities()).model_dump(mode="json")
@@ -40,7 +49,9 @@ async def video_rpc(params: dict[str, Any]) -> dict[str, Any]:
                 ticket_url(ticket),
                 headers={"X-Cognis-Video-Transfer": ticket["token"]},
                 content=adapter.output_stream(
-                    VideoOutput.model_validate(params["output"]), ticket["max_bytes"]
+                    VideoOutput.model_validate(params["output"]),
+                    ticket["max_bytes"],
+                    output_index=params.get("output_index"),
                 ),
             )
             if response.status_code != 200:

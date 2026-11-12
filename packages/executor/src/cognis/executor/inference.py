@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 from collections.abc import AsyncIterator, Sequence
+from dataclasses import replace
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ from cognis.executor.backends.registry import ExecutorBackendRegistry, resolve_b
 from cognis.executor.backends.tts import run_synthesize_local
 from cognis.executor.inference_types import CognisInferenceRequest, image_generation_result_payload
 from cognis.executor.providers.llm.ollama import discover_ollama_models
+from cognis.executor.usage_observer import ExecutorUsageObserver, executor_observer
 from cognis.logging import get_logger
 from cognis.models.config import ImageInput
 from cognis.providers.llm.bedrock import discover_bedrock_models
@@ -22,13 +24,11 @@ from cognis.providers.llm.hosted import (
     discover_hosted_models,
     is_openrouter_catalog,
 )
+from cognis.providers.llm.image_api import image_api_kwargs
+from cognis.providers.llm.usage_binding import UsageBinding, observed_sdk
+from cognis.providers.llm.usage_http import observed_http
 
 logger = get_logger(__name__)
-
-
-def _supports_image_response_format(model: str) -> bool:
-    normalized = model.rsplit("/", 1)[-1].lower()
-    return not normalized.startswith("gpt-image-")
 
 
 class InferenceHandler:
@@ -41,6 +41,7 @@ class InferenceHandler:
 
     def __init__(self, registry: ExecutorBackendRegistry | None = None) -> None:
         self._registry = registry or ExecutorBackendRegistry()
+        self.usage_context_gaps = 0
 
     async def close(self) -> None:
         """Close any backend background resources."""
@@ -57,8 +58,10 @@ class InferenceHandler:
         provider_id: str | None = None,
         owner_email: str | None = None,
         backend_metadata: dict[str, Any] | None = None,
+        usage_observer: ExecutorUsageObserver | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         request_kwargs = dict(request_kwargs)
+        observer = usage_observer
         try:
             request = CognisInferenceRequest(
                 request_id=request_id,
@@ -71,16 +74,24 @@ class InferenceHandler:
                 backend_metadata=backend_metadata or {},
             )
             selected = self._registry.select(request)
+            observer = observer or executor_observer(backend_metadata)
+            if observer is None:
+                self.usage_context_gaps += 1
+            else:
+                request = replace(request, usage_binding=observer.binding)
             async for chunk in selected.stream_complete(request):
+                if observer is not None:
+                    chunk = observer.attach(chunk)
                 yield chunk
         except Exception as exc:
             error_chunk = build_mid_stream_error_chunk(exc)
-            yield {
+            result = {
                 "done": True,
                 "error": f"Inference error: {str(error_chunk.get('error') or exc)[:500]}",
                 "response_error": error_chunk.get("response_error"),
                 "finish_reason": "error",
             }
+            yield observer.attach(result) if observer is not None else result
             return
 
     async def generate(
@@ -94,6 +105,7 @@ class InferenceHandler:
         provider_id: str | None = None,
         owner_email: str | None = None,
         backend_metadata: dict[str, Any] | None = None,
+        usage_observer: ExecutorUsageObserver | None = None,
     ) -> dict[str, Any]:
         request_kwargs = dict(request_kwargs)
         request = CognisInferenceRequest(
@@ -107,7 +119,14 @@ class InferenceHandler:
             owner_email=owner_email,
             backend_metadata=backend_metadata or {},
         )
-        return await self._registry.select(request).generate(request)
+        selected = self._registry.select(request)
+        observer = usage_observer or executor_observer(backend_metadata)
+        if observer is None:
+            self.usage_context_gaps += 1
+        else:
+            request = replace(request, usage_binding=observer.binding)
+        result = await selected.generate(request)
+        return observer.attach(result) if observer is not None else result
 
     async def discover_models(
         self,
@@ -148,6 +167,7 @@ class InferenceHandler:
         images: list[ImageInput] | None = None,
         mask: ImageInput | None = None,
         request_kwargs: dict[str, Any],
+        usage_binding: UsageBinding | None = None,
     ) -> dict[str, Any]:
         """Generate an image through LiteLLM on the executor side."""
         gen_kwargs: dict[str, Any] = {
@@ -182,7 +202,7 @@ class InferenceHandler:
                     "Masked image editing is not supported by Gemini image generation."
                 )
             messages = [{"role": "user", "content": content}]
-            response = await litellm.acompletion(
+            response = await observed_sdk(litellm.acompletion, usage_binding, operation="chat")(
                 model=model,
                 messages=messages,
                 modalities=["image", "text"],
@@ -192,14 +212,14 @@ class InferenceHandler:
             )
             return image_generation_result_payload(response, model)
 
-        image_kwargs: dict[str, Any] = {}
-        if _supports_image_response_format(model):
-            image_kwargs["response_format"] = response_format
-        if images is not None:
-            image_kwargs["image"] = [image.b64_json for image in images]
-        if mask is not None:
-            image_kwargs["mask"] = mask.b64_json
-        response = await litellm.aimage_generation(
+        image_kwargs = image_api_kwargs(
+            model, response_format=response_format, images=images, mask=mask
+        )
+        response = await observed_sdk(
+            litellm.aimage_edit if images is not None else litellm.aimage_generation,
+            usage_binding,
+            operation="native",
+        )(
             prompt=prompt,
             model=model,
             n=n,
@@ -222,6 +242,7 @@ class InferenceHandler:
         request_kwargs: dict[str, Any],
         prompt: str | None = None,
         language: str | None = None,
+        usage_binding: UsageBinding | None = None,
     ) -> dict[str, Any]:
         from cognis.executor.audio_preprocessing import (
             prepare_audio_for_stt as _prepare_audio_for_stt,
@@ -233,6 +254,20 @@ class InferenceHandler:
             filename=filename,
             supported_mime_types=[str(item) for item in supported_audio_mime_types or []],
         )
+        if provider_preset == "elevenlabs":
+            from cognis.providers.llm.elevenlabs import transcribe
+
+            result = await transcribe(
+                audio_bytes=audio_bytes,
+                mime_type=mime_type,
+                filename=filename,
+                model=model,
+                language=language,
+                prompt=prompt,
+                request_kwargs=request_kwargs,
+                usage_binding=usage_binding,
+            )
+            return result.model_dump()
         api_base = request_kwargs.get("api_base") or request_kwargs.get("base_url")
         if not isinstance(api_base, str) or not api_base:
             api_base = "https://api.openai.com"
@@ -256,6 +291,8 @@ class InferenceHandler:
             },
         )
         data: dict[str, str] = {"model": wire_model}
+        if wire_model.rsplit("/", 1)[-1] == "whisper-1":
+            data["response_format"] = "verbose_json"
         if prompt:
             data["prompt"] = prompt
         if language:
@@ -265,11 +302,15 @@ class InferenceHandler:
         file_obj.name = filename
         async with httpx.AsyncClient(timeout=request_kwargs.get("timeout", 120)) as client:
             try:
-                response = await client.post(
-                    f"{api_base.rstrip('/')}/v1/audio/transcriptions",
-                    headers=headers,
-                    data=data,
-                    files={"file": (filename, file_obj, mime_type)},
+                response = await observed_http(
+                    lambda: client.post(
+                        f"{api_base.rstrip('/')}/v1/audio/transcriptions",
+                        headers=headers,
+                        data=data,
+                        files={"file": (filename, file_obj, mime_type)},
+                    ),
+                    binding=usage_binding,
+                    parameters={},
                 )
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
@@ -293,6 +334,7 @@ class InferenceHandler:
         speed: float = 1.0,
         request_kwargs: dict[str, Any],
         low_latency: bool = False,
+        usage_binding: UsageBinding | None = None,
     ) -> dict[str, Any]:
         """Run text-to-speech via LiteLLM on the executor side."""
         wire_model = _transcription_wire_model(model, provider_preset or "")
@@ -312,6 +354,7 @@ class InferenceHandler:
             resolved_model=model,
             provider_preset=provider_preset or "",
             prefer_direct_http=low_latency,
+            usage_binding=usage_binding,
         )
         return {
             "audio_hex": result.audio_bytes.hex(),

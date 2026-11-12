@@ -638,7 +638,7 @@ async def handle_read(arguments: dict[str, Any], context: ToolExecutionContext) 
     mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
     if _should_route_binary_read(path, raw_content, mime_type):
         await _record_read(context, path)
-        return _binary_read_result(path, raw_content, mime_type)
+        return _binary_read_result(path, raw_content, mime_type, context)
 
     if path.suffix.lower() == ".ipynb":
         content = _render_notebook_content(path, raw_content)
@@ -725,7 +725,9 @@ def _should_route_binary_read(path: Path, content: bytes, mime_type: str) -> boo
     }
 
 
-def _binary_read_result(path: Path, content: bytes, mime_type: str) -> ToolResult:
+def _binary_read_result(
+    path: Path, content: bytes, mime_type: str, context: ToolExecutionContext
+) -> ToolResult:
     if len(content) > _MAX_INLINE_BINARY_READ_BYTES:
         return ToolResult(
             output=(
@@ -749,7 +751,7 @@ def _binary_read_result(path: Path, content: bytes, mime_type: str) -> ToolResul
             {
                 "filename": path.name,
                 "mime_type": mime_type,
-                "content_b64": base64.b64encode(content).decode("ascii"),
+                **context.binary_transfers.attachment_content(content),
             }
         ],
     )
@@ -892,6 +894,44 @@ async def handle_artifact_save(
     """Save a controller-resolved Cognis artifact to the executor filesystem."""
     file_path = arguments.get("file_path", "")
     content_b64 = arguments.get("source_artifact_content_b64")
+    download = arguments.get("source_artifact_download")
+
+    if download is not None:
+        from cognis.transfers.models import DownloadDescriptor
+
+        try:
+            descriptor = DownloadDescriptor.model_validate(download)
+            target = _resolve_path(file_path, context)
+        except ValueError as exc:
+            return ToolResult(output=str(exc), is_error=True)
+
+        async def authorize_write() -> None:
+            if target.exists():
+                await _assert_can_modify_existing(context, target)
+
+        async def stream_binary() -> ToolResult:
+            try:
+                await authorize_write()
+                await context.binary_transfers.download_file(
+                    descriptor, target, before_replace=authorize_write
+                )
+                await _record_write(context, target)
+                return ToolResult(
+                    output=str(
+                        {
+                            "saved_path": str(target),
+                            "source_artifact_id": arguments.get("source_artifact_id"),
+                            "source_filename": descriptor.filename,
+                            "mime_type": descriptor.mime_type,
+                            "size_bytes": descriptor.size_bytes,
+                        }
+                    ),
+                    metadata={"files_written": [str(target)]},
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                return ToolResult(output=f"Cannot save artifact: {exc}", is_error=True)
+
+        return await _with_file_lock(context, target, stream_binary)
 
     if not isinstance(content_b64, str) or not content_b64.strip():
         return ToolResult(

@@ -34,7 +34,7 @@ async def handle_office_read(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-read-") as tmp:
-        source = _materialize_source(arguments, Path(tmp), context)
+        source = await _materialize_source(arguments, Path(tmp), context)
         view = str(arguments.get("view") or "text")
         mode = "text" if view == "json" else view
         args = [str(source.path), mode]
@@ -48,7 +48,7 @@ async def handle_office_read(
 
 async def handle_office_get(arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-get-") as tmp:
-        source = _materialize_source(arguments, Path(tmp), context)
+        source = await _materialize_source(arguments, Path(tmp), context)
         args = [str(source.path), str(arguments["object_path"])]
         if depth := arguments.get("depth"):
             args.extend(["--depth", str(depth)])
@@ -63,7 +63,7 @@ async def handle_office_query(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-query-") as tmp:
-        source = _materialize_source(arguments, Path(tmp), context)
+        source = await _materialize_source(arguments, Path(tmp), context)
         args = [str(source.path), str(arguments["selector"])]
         parse_json = bool(arguments.get("json", True))
         if parse_json:
@@ -76,7 +76,7 @@ async def handle_office_validate(
     arguments: dict[str, Any], context: ToolExecutionContext
 ) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-validate-") as tmp:
-        source = _materialize_source(arguments, Path(tmp), context)
+        source = await _materialize_source(arguments, Path(tmp), context)
         result = await _run(
             context, "validate", [str(source.path), "--json"], arguments, parse_json=True
         )
@@ -89,7 +89,7 @@ async def handle_office_render(
 ) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-render-") as tmp:
         tmp_path = Path(tmp)
-        source = _materialize_source(arguments, tmp_path, context)
+        source = await _materialize_source(arguments, tmp_path, context)
         render = str(arguments["render"])
         suffix = _render_suffix(render)
         filename = _safe_filename(arguments.get("output_filename"), f"{source.path.stem}.{suffix}")
@@ -107,7 +107,7 @@ async def handle_office_render(
             return ToolResult(
                 output="OfficeCLI render did not produce the expected output file.", is_error=True
             )
-        return _artifact_result(output_path, filename, arguments, source.metadata)
+        return await _artifact_result(output_path, filename, arguments, source.metadata, context)
 
 
 async def handle_office_create(
@@ -129,7 +129,9 @@ async def handle_office_create(
         )
         if op_error is not None:
             return op_error
-        return _artifact_or_path_result(output_path, filename, arguments, {"format": fmt})
+        return await _artifact_or_path_result(
+            output_path, filename, arguments, {"format": fmt}, context
+        )
 
 
 async def handle_office_patch(
@@ -137,7 +139,7 @@ async def handle_office_patch(
 ) -> ToolResult:
     with tempfile.TemporaryDirectory(prefix="cognis-office-patch-") as tmp:
         tmp_path = Path(tmp)
-        source = _materialize_source(arguments, tmp_path, context)
+        source = await _materialize_source(arguments, tmp_path, context)
         expected = arguments.get("expected_base_sha256") or arguments.get("expected_sha256")
         if expected and str(expected).lower() != source.sha256:
             return ToolResult(
@@ -173,7 +175,9 @@ async def handle_office_patch(
                     validation, {"operation": "validate", **source.metadata}
                 )
         filename = _safe_filename(arguments.get("output_filename"), target_path.name)
-        return _artifact_or_path_result(target_path, filename, arguments, source.metadata)
+        return await _artifact_or_path_result(
+            target_path, filename, arguments, source.metadata, context
+        )
 
 
 class _Source:
@@ -184,13 +188,33 @@ class _Source:
         self.metadata = metadata
 
 
-def _materialize_source(
+async def _materialize_source(
     arguments: dict[str, Any], tmp_path: Path, context: ToolExecutionContext
 ) -> _Source:
     provided = [key for key in ("source_path", "source_artifact_id") if arguments.get(key)]
     if len(provided) != 1:
         raise ValueError("Exactly one of source_path or source_artifact_id is required.")
     if artifact_id := arguments.get("source_artifact_id"):
+        if descriptor := arguments.get("source_artifact_download"):
+            from cognis.transfers.models import DownloadDescriptor
+
+            download = DownloadDescriptor.model_validate(descriptor)
+            if download.size_bytes > _MAX_INPUT_BYTES:
+                raise ValueError(f"Office source exceeds parser limit of {_MAX_INPUT_BYTES} bytes.")
+            path = tmp_path / _safe_filename(download.filename, "source.docx")
+            await context.binary_transfers.download_file(download, path)
+            sha = download.sha256 or _sha256_file(path)
+            _check_expected(arguments, sha)
+            return _Source(
+                path,
+                "artifact",
+                sha,
+                {
+                    "source_kind": "artifact",
+                    "source_artifact_id": str(artifact_id),
+                    "base_sha256": sha,
+                },
+            )
         b64 = arguments.get("source_artifact_content_b64")
         if not isinstance(b64, str) or not b64:
             raise ValueError(
@@ -330,11 +354,15 @@ def _is_positive_number(value: Any) -> bool:
         return False
 
 
-def _artifact_or_path_result(
-    path: Path, filename: str, arguments: dict[str, Any], metadata: dict[str, Any]
+async def _artifact_or_path_result(
+    path: Path,
+    filename: str,
+    arguments: dict[str, Any],
+    metadata: dict[str, Any],
+    context: ToolExecutionContext,
 ) -> ToolResult:
     if arguments.get("publish_artifact", True):
-        return _artifact_result(path, filename, arguments, metadata)
+        return await _artifact_result(path, filename, arguments, metadata, context)
     return ToolResult(
         output=json.dumps(
             {"output_path": str(path), "output_sha256": _sha256_file(path), **metadata},
@@ -343,9 +371,38 @@ def _artifact_or_path_result(
     )
 
 
-def _artifact_result(
-    path: Path, filename: str, arguments: dict[str, Any], metadata: dict[str, Any]
+async def _artifact_result(
+    path: Path,
+    filename: str,
+    arguments: dict[str, Any],
+    metadata: dict[str, Any],
+    context: ToolExecutionContext,
 ) -> ToolResult:
+    if context.binary_transfers.grant is not None:
+        receipt = await context.binary_transfers.upload_file(
+            path, filename=filename, mime_type=_mime_type(filename)
+        )
+        return ToolResult(
+            output=json.dumps(
+                {
+                    "filename": filename,
+                    "size_bytes": receipt.size_bytes,
+                    "output_sha256": receipt.sha256,
+                    **metadata,
+                    **({"output_path": str(path)} if arguments.get("output_path") else {}),
+                },
+                sort_keys=True,
+            ),
+            attachments=[
+                {
+                    "filename": filename,
+                    "mime_type": _mime_type(filename),
+                    "transfer_receipt": receipt.model_dump(),
+                    "kind": "file",
+                    "purpose": str(arguments.get("purpose") or "officecli_output"),
+                }
+            ],
+        )
     content = path.read_bytes()
     attachment = {
         "filename": filename,

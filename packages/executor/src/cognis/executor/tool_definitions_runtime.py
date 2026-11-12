@@ -7,6 +7,11 @@ from typing import Any
 from cognis.executor.component_registry import load_component
 from cognis.models.tool import NativeToolDefinition as ToolDefinition
 from cognis.models.tool import ToolCapability, ToolSource
+from cognis.tools.executor.definitions import (
+    PYTHON_EXECUTE_TOOL,
+    PYTHON_KERNEL_RESET_TOOL,
+    PYTHON_KERNEL_STATUS_TOOL,
+)
 from cognis.tools.executor.filesystem import (
     handle_apply_patch,
     handle_artifact_save,
@@ -760,6 +765,9 @@ _CORE_EXECUTOR_TOOLS: list[ToolDefinition] = [
     BASH_TOOL,
     BASH_OUTPUT_TOOL,
     BASH_KILL_TOOL,
+    PYTHON_EXECUTE_TOOL,
+    PYTHON_KERNEL_STATUS_TOOL,
+    PYTHON_KERNEL_RESET_TOOL,
 ]
 # Kept for compatibility with callers that inspect the static core inventory.
 ALL_EXECUTOR_TOOLS = list(_CORE_EXECUTOR_TOOLS)
@@ -805,6 +813,9 @@ def executor_tool_handlers() -> dict[str, Any]:
         "bash": handle_bash,
         "bash_output": handle_bash_output,
         "bash_kill": handle_bash_kill,
+        "python_execute": handle_python_execute,
+        "python_kernel_status": handle_python_kernel_status,
+        "python_kernel_reset": handle_python_kernel_reset,
     }
     component_handlers = {
         "browser": (
@@ -866,3 +877,143 @@ def executor_tool_handlers() -> dict[str, Any]:
             if handler is not None:
                 handlers[name] = handler
     return handlers
+
+
+def _program_runtime_context(context: Any) -> tuple[Any, Any, Any]:
+    runtime = getattr(context, "runtime_metadata", {})
+    if not isinstance(runtime, dict):
+        raise ValueError("Controller program runtime context is missing.")
+    program_context = runtime.get("program_runtime")
+    program_runtime = runtime.get("_program_runtime")
+    rpc_call = runtime.get("_program_rpc_call")
+    if not isinstance(program_context, dict) or program_runtime is None or not callable(rpc_call):
+        raise ValueError("Controller program runtime context is incomplete.")
+    from cognis.models.program import ProgramRuntimeBinding
+
+    return program_runtime, rpc_call, ProgramRuntimeBinding.model_validate(program_context)
+
+
+async def handle_python_execute(arguments: dict[str, Any], context: Any) -> Any:
+    """Run one controller-owned program invocation in the executor kernel."""
+    from cognis import json_codec as json
+    from cognis.models.program import (
+        ProgramExecutionRequest,
+        ProgramLimits,
+        ProgramToolValue,
+    )
+    from cognis.models.tool import ToolResult
+
+    try:
+        runtime, rpc_call, program_context = _program_runtime_context(context)
+        request = ProgramExecutionRequest(
+            program_id=program_context.program_id,
+            execution_id=program_context.execution_id,
+            scope_id=program_context.scope_id,
+            expected_generation=program_context.expected_generation,
+            description=arguments["description"],
+            code=arguments["code"],
+            inputs=arguments.get("inputs") or {},
+            input_schema=program_context.input_schema,
+            output_schema=program_context.output_schema,
+            executor_policy=program_context.executor_policy,
+            program_digest=program_context.program_digest,
+            code_digest=program_context.code_digest,
+            tool_manifest_digest=program_context.tool_manifest_digest,
+            tools=program_context.tools,
+            limits=ProgramLimits.model_validate(arguments.get("limits") or {}),
+            mode=program_context.mode,
+        )
+
+        async def invoke(call: Any) -> ProgramToolValue:
+            raw = await rpc_call(
+                {
+                    **call.model_dump(mode="json"),
+                    "executor_id": program_context.executor_id,
+                    "executor_instance_id": program_context.executor_instance_id,
+                    "scope_id": request.scope_id,
+                }
+            )
+            return ProgramToolValue.model_validate(raw)
+
+        async def emit_output(text: str, stream: str) -> None:
+            callback = getattr(context, "output_chunk_callback", None)
+            if callback is not None:
+                await callback(text, stream)
+
+        result = await runtime.execute(
+            request,
+            tool_call_handler=invoke,
+            output_callback=emit_output
+            if getattr(context, "output_chunk_callback", None)
+            else None,
+        )
+        outcome_certainty = (
+            result.error.outcome_certainty
+            if result.error is not None
+            else "known"
+            if result.status == "completed"
+            else "unknown"
+        )
+        return ToolResult(
+            output=json.dumps(result.model_dump(mode="json"), ensure_ascii=False),
+            is_error=result.status != "completed",
+            metadata={
+                "code": result.error.code if result.error is not None else None,
+                "program": result.model_dump(mode="json"),
+                "outcome_certainty": outcome_certainty,
+            },
+        )
+    except Exception as exc:
+        return ToolResult(
+            output=f"Program execution was not started: {str(exc)[:500]}",
+            is_error=True,
+            metadata={
+                "code": "program_runtime_context_invalid",
+                "outcome_certainty": "known",
+            },
+        )
+
+
+async def handle_python_kernel_status(arguments: dict[str, Any], context: Any) -> Any:
+    """Return only the state and generation of the current scoped kernel."""
+    del arguments
+    from cognis import json_codec as json
+    from cognis.models.tool import ToolResult
+
+    try:
+        runtime, _rpc_call, _program_context = _program_runtime_context(context)
+        status = await runtime.status(_program_context.scope_id)
+        return ToolResult(output=json.dumps(status, ensure_ascii=False), metadata=status)
+    except Exception as exc:
+        return ToolResult(
+            output=f"Kernel status unavailable: {str(exc)[:300]}",
+            is_error=True,
+            metadata={"code": "program_kernel_status_unavailable"},
+        )
+
+
+async def handle_python_kernel_reset(arguments: dict[str, Any], context: Any) -> Any:
+    """Explicitly discard an idle kernel and advance its generation."""
+    from cognis import json_codec as json
+    from cognis.executor.program_runtime import ProgramRuntimeError
+    from cognis.models.tool import ToolResult
+
+    try:
+        runtime, _rpc_call, _program_context = _program_runtime_context(context)
+        status = await runtime.reset(
+            _program_context.scope_id,
+            int(arguments["expected_generation"]),
+        )
+        return ToolResult(output=json.dumps(status, ensure_ascii=False), metadata=status)
+    except ProgramRuntimeError as exc:
+        return ToolResult(
+            output=str(exc),
+            is_error=True,
+            metadata={"code": exc.code},
+        )
+    except Exception as exc:
+        return ToolResult(
+            output=f"Kernel reset failed: {str(exc)[:300]}",
+            is_error=True,
+            metadata={"code": "program_kernel_reset_failed"},
+        )

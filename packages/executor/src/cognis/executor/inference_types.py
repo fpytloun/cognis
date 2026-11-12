@@ -8,6 +8,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from cognis.providers.llm.usage_binding import UsageBinding
+
 SENSITIVE_INFERENCE_KEYS = {
     "api_key",
     "authorization",
@@ -32,6 +34,7 @@ class CognisInferenceRequest:
     provider_id: str | None = None
     owner_email: str | None = None
     backend_metadata: dict[str, Any] = field(default_factory=dict)
+    usage_binding: UsageBinding | None = None
 
 
 def redact_inference_payload(value: Any) -> Any:

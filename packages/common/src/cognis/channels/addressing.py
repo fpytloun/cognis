@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 ADDRESS_KINDS: dict[str, tuple[str, ...]] = {
+    "web": ("cognis_user_email",),
     "signal": ("signal_e164", "signal_uuid", "signal_group_id"),
     "whatsapp": ("whatsapp_e164",),
     "telegram": ("telegram_chat_id", "telegram_public_username"),

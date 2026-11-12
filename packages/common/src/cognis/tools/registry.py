@@ -10,6 +10,8 @@ from typing import Any, Protocol
 
 from cognis.logging import get_logger
 from cognis.models.tool import ExecutorHandle, ToolDefinition, ToolResult, stable_tool_id
+from cognis.transfers.client import BinaryTransferClient
+from cognis.transfers.models import TransferGrant
 
 logger = get_logger(__name__)
 
@@ -85,6 +87,14 @@ class ToolExecutionContext:
     execution_scope_id: str | None = None
     output_chunk_callback: ToolOutputChunkCallback | None = None
     background_control: ToolBackgroundControl | None = None
+    binary_transfers: BinaryTransferClient = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        """Construct one typed transfer client owned by this execution context."""
+        raw = self.runtime_metadata.get("binary_transfer_grant")
+        self.binary_transfers = BinaryTransferClient(
+            TransferGrant.model_validate(raw) if raw else None
+        )
 
 
 type ToolHandlerResult = str | dict[str, Any] | list[Any] | ToolResult

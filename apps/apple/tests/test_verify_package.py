@@ -1,4 +1,5 @@
 import importlib.util
+import plistlib
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,13 @@ class PackageLayoutTests(unittest.TestCase):
             PRODUCER.write_info(contents / "Info.plist", recorded)
             self.assertTrue((contents / "Resources/BuildIdentity.json").is_file())
             MODULE.verify_package(app)
+            info_path = contents / "Info.plist"
+            info = plistlib.loads(info_path.read_bytes())
+            tampered = {**info, "CFBundleURLTypes": [{"CFBundleURLSchemes": ["cognisbundle"]}]}
+            info_path.write_bytes(plistlib.dumps(tampered))
+            with self.assertRaisesRegex(ValueError, "URL scheme"):
+                MODULE.verify_package(app)
+            info_path.write_bytes(plistlib.dumps(info))
             with (
                 patch.object(MODULE, "verify", return_value={"index.html": "changed"}),
                 self.assertRaises(ValueError),

@@ -17,6 +17,8 @@ ExecStart=/usr/bin/uvx cognis-executor
 # ExecStart=/usr/bin/uv run cognis-executor
 Restart=on-failure
 RestartSec=5
+# A tool/browser child OOM must not stop unrelated calls or the executor.
+OOMPolicy=continue
 
 # Hardening
 NoNewPrivileges=yes

@@ -139,6 +139,14 @@ def write_info(destination: Path, recorded: dict[str, object]) -> None:
         "SUVerifyUpdateBeforeExtraction": True,
         "SUSignedFeedFailureExpirationInterval": 0,
     }
+    if flavor != "acceptance":
+        info["CFBundleURLTypes"] = [
+            {
+                "CFBundleURLName": bundle_id,
+                "CFBundleURLSchemes": ["cognis" if flavor == "standard" else "cognis-preview"],
+                "CFBundleTypeRole": "Viewer",
+            }
+        ]
     # Human preview and automation have no publisher config, even if inherited
     # shell variables describe another distribution's feed/key.
     if flavor == "standard":

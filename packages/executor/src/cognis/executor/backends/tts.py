@@ -10,6 +10,8 @@ import httpx
 import litellm
 
 from cognis.models.config import TextToSpeechResult
+from cognis.providers.llm.usage_binding import UsageBinding, observed_sdk, take_binding
+from cognis.providers.llm.usage_http import observed_http
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +36,22 @@ async def run_synthesize_local(
     resolved_model: str,
     provider_preset: str,
     prefer_direct_http: bool = False,
+    usage_binding: UsageBinding | None = None,
 ) -> TextToSpeechResult:
     """Run text-to-speech without importing the controller provider stack."""
+    binding = usage_binding or take_binding(request_kwargs, model=resolved_model)
+    if provider_preset == "elevenlabs":
+        from cognis.providers.llm.elevenlabs import synthesize
+
+        return await synthesize(
+            text=text,
+            model=wire_model,
+            voice=voice,
+            response_format=response_format,
+            speed=speed,
+            request_kwargs=request_kwargs,
+            usage_binding=binding,
+        )
 
     content_type = _TTS_FORMAT_TO_CONTENT_TYPE.get(
         response_format.strip().lower(),
@@ -49,7 +65,7 @@ async def run_synthesize_local(
     aspeech = getattr(litellm, "aspeech", None)
     if callable(aspeech) and not direct_first:
         try:
-            result = await aspeech(
+            result = await observed_sdk(aspeech, binding, operation="native")(
                 model=wire_model,
                 input=text,
                 voice=voice,
@@ -89,16 +105,20 @@ async def run_synthesize_local(
     timeout = request_kwargs.get("timeout", 120)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(
-                f"{api_base.rstrip('/')}/v1/audio/speech",
-                headers=headers,
-                json={
-                    "model": wire_model,
-                    "input": text,
-                    "voice": voice,
-                    "response_format": response_format,
-                    "speed": speed,
-                },
+            response = await observed_http(
+                lambda: client.post(
+                    f"{api_base.rstrip('/')}/v1/audio/speech",
+                    headers=headers,
+                    json={
+                        "model": wire_model,
+                        "input": text,
+                        "voice": voice,
+                        "response_format": response_format,
+                        "speed": speed,
+                    },
+                ),
+                binding=binding,
+                parameters={"input_characters": len(text)},
             )
             response.raise_for_status()
     except Exception as exc:

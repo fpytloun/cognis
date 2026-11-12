@@ -64,6 +64,13 @@ class VideoRequest(VideoContract):
         allow_inf_nan=False,
         json_schema_extra=_portable_decimal_json_schema,
     )
+    inspect_provider_error: bool = Field(
+        default=False,
+        description=(
+            "Opt in to bounded redacted Interactions rejection messages for an owner-owned "
+            "controller provider in a private, non-project conversation. Does not retry a request."
+        ),
+    )
 
     @model_validator(mode="after")
     def check_source(self) -> VideoRequest:
@@ -103,12 +110,15 @@ class VideoCapabilities(VideoContract):
     source_policy: Literal["none", "same_provider_output", "uploaded"] = "none"
     extension_output: Literal["combined", "continuation", "provider_defined"] = "provider_defined"
     cancellation: bool = False
+    provider_error_messages: bool = False
     notes: list[str] = Field(default_factory=list)
 
     def validate_request(self, request: VideoRequest) -> None:
         """Reject unsupported options rather than dropping them at dispatch."""
         if request.operation not in self.operations:
             raise ValueError("The selected video adapter does not support this operation")
+        if request.inspect_provider_error and not self.provider_error_messages:
+            raise ValueError("The selected adapter does not expose provider error messages")
         for name, choices in (
             ("duration", self.durations),
             ("resolution", self.resolutions),
@@ -152,6 +162,7 @@ class VideoRemoteResult(VideoContract):
     state: Literal["running", "completed", "failed", "cancelled"]
     outputs: list[VideoOutput] = Field(default_factory=list)
     cost_usd: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
+    output_duration_ms: int | None = Field(default=None, strict=True, ge=0)
     retry_after: int = Field(default=15, ge=1, le=3600)
     error_code: str | None = None
 
@@ -173,6 +184,11 @@ class VideoJobView(VideoContract):
     error_code: str | None = None
     recovery_actions: list[str] = Field(default_factory=list)
     progress: int | None = None
+    provider_error_message: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Untrusted redacted provider data, only for explicitly requested private detail.",
+    )
 
 
 class VideoMutation(VideoContract):

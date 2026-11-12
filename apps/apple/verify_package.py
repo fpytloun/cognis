@@ -23,6 +23,19 @@ def verify_package(app: Path, *, mach_o: bool = False) -> None:
         raise ValueError("Package flavor/identity mismatch")
     if recorded["identity"].get("flavor") != flavor:
         raise ValueError("Recorded package flavor mismatch")
+    expected_urls = (
+        []
+        if flavor == "acceptance"
+        else [
+            {
+                "CFBundleURLName": bundle_id,
+                "CFBundleURLSchemes": ["cognis" if flavor == "standard" else "cognis-preview"],
+                "CFBundleTypeRole": "Viewer",
+            }
+        ]
+    )
+    if info.get("CFBundleURLTypes", []) != expected_urls:
+        raise ValueError("Package URL scheme does not match its flavor")
     if flavor != "acceptance" and "CognisAcceptanceOrigin" in info:
         raise ValueError("Only acceptance may contain a fixed origin")
     if flavor != "standard" and ("SUFeedURL" in info or "SUPublicEDKey" in info):

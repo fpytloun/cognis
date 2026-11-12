@@ -603,6 +603,18 @@ BLUEBUBBLES_META = ChannelMeta(
 # ---------------------------------------------------------------------------
 
 CHANNEL_REGISTRY: dict[str, ChannelMeta] = {
+    "web": ChannelMeta(
+        channel_type="web",
+        label="Cognis app",
+        description="Built-in app chat and native cross-user agent contact. No setup required.",
+        icon="message-circle",
+        capabilities=ChannelCapabilities(
+            chat_types=["direct"],
+            supports_markdown=True,
+            supports_media=True,
+            max_message_length=32000,
+        ),
+    ),
     "signal": SIGNAL_META,
     "whatsapp": WHATSAPP_META,
     "telegram": TELEGRAM_META,
@@ -626,7 +638,7 @@ _RECIPIENT_CREATION_CHANNELS = {
     "slack",
     "matrix",
 }
-_RECIPIENT_DIRECT_ONLY_CHANNELS = {"whatsapp"}
+_RECIPIENT_DIRECT_ONLY_CHANNELS = {"web", "whatsapp"}
 
 for _meta in CHANNEL_REGISTRY.values():
     _recipient_capabilities = _meta.capabilities.recipient_capabilities
@@ -638,7 +650,9 @@ for _meta in CHANNEL_REGISTRY.values():
         _meta.channel_type in _RECIPIENT_RESOLUTION_CHANNELS
     )
     _recipient_capabilities.supports_creation = _meta.channel_type in _RECIPIENT_CREATION_CHANNELS
-    if not any(field.name == "assistant_delivery_mode" for field in _meta.setting_fields):
+    if _meta.channel_type != "web" and not any(
+        field.name == "assistant_delivery_mode" for field in _meta.setting_fields
+    ):
         _meta.setting_fields.append(_ASSISTANT_DELIVERY_MODE_FIELD.model_copy())
 
 

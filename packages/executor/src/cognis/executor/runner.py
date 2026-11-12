@@ -9,24 +9,30 @@ import hashlib
 import logging
 import os
 import platform
+import sqlite3
 import threading
 import uuid
 from builtins import BaseExceptionGroup
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic, perf_counter
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlsplit
 
 from websockets.exceptions import ConnectionClosed
 
 from cognis import json_codec as json
+from cognis.executor.call_journal import CallJournal, JournalCapacityError
 from cognis.executor.component_registry import component_available, load_component
+from cognis.executor.config import get_config_paths
 from cognis.executor.inference_types import json_safe_inference_payload
+from cognis.executor.program_runtime import ProgramRuntime, ProgramRuntimeError
 from cognis.executor.resources import ExecutorResourceCollector
 from cognis.executor.runtime_capability_probe import collect_runtime_capabilities
+from cognis.executor.speech_streams import ExecutorSpeechStreams
 from cognis.executor.tool_definitions_runtime import (
     executor_tool_definitions,
     executor_tool_handlers,
@@ -34,6 +40,16 @@ from cognis.executor.tool_definitions_runtime import (
 )
 from cognis.executor.tool_resolution import filter_tools_by_executor
 from cognis.executor.unary_dedup import UnaryCallConflict, UnaryDedupCache
+from cognis.executor.usage_observer import (
+    ExecutorUsageCancelled,
+    ExecutorUsageObserver,
+    executor_observer,
+)
+from cognis.executor_transport import (
+    CHUNKED_JSON_PROTOCOL,
+    JSONMessageReceiver,
+    JSONMessageSender,
+)
 from cognis.models.config import ImageInput
 from cognis.models.executor_calls import EXECUTOR_CALL_SNAPSHOT_MAX_ACTIVE
 from cognis.models.executor_inference import resolve_executor_local_inference_config
@@ -43,8 +59,10 @@ from cognis.models.local_models import (
     OllamaRuntimeModelRequest,
     OllamaRuntimeStartRequest,
 )
+from cognis.models.program import PROGRAM_APPROVAL_RESULT_GRACE_SECONDS
 from cognis.models.runtime_capabilities import RuntimeCapabilityReport
 from cognis.models.tool import (
+    MCP_CREDENTIAL_BINDING_PROTOCOL,
     ExecutorConfig,
     MCPServerConfig,
     ToolCall,
@@ -91,6 +109,7 @@ from cognis.tools.executor.shell import (
 from cognis.tools.registry import ToolBackgroundControl, ToolBackgroundRequestOutcome
 
 logger = logging.getLogger("cognis.executor.runner")
+_PROGRAM_RPC_ACTIVE_TIMEOUT_SECONDS = 300.0
 
 # Resolve the common MCP runtime only when a configure request supplies servers.
 MCPClient = Any
@@ -101,6 +120,72 @@ class _UnavailableMCPError(RuntimeError):
 
 
 MCPClientError: Any = _UnavailableMCPError
+
+
+async def _invoke_with_timeout(
+    tool_name: str,
+    timeout_seconds: float | None,
+    invoke: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Let PTC's active-time runtime budget own Python cell deadlines."""
+    if tool_name == "python_execute" or not timeout_seconds:
+        return await invoke()
+    return await asyncio.wait_for(invoke(), timeout=timeout_seconds)
+
+
+@dataclass(slots=True)
+class _ProgramRPCWaiter:
+    """Per-child reverse RPC deadline, paused only for its live approval wait."""
+
+    future: asyncio.Future[dict[str, Any]]
+    connection_id: int
+    program_id: str
+    execution_id: str
+    sequence: int
+    active_remaining: float = _PROGRAM_RPC_ACTIVE_TIMEOUT_SECONDS
+    status: str = "running"
+    active_started_at: float = field(default_factory=monotonic)
+    approval_deadline: float | None = None
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+    disconnected: bool = False
+
+    def update_status(self, params: dict[str, Any]) -> None:
+        if (
+            params.get("program_id") != self.program_id
+            or params.get("execution_id") != self.execution_id
+            or params.get("sequence") != self.sequence
+        ):
+            return
+        status = params.get("status")
+        if status not in {"awaiting_approval", "running"} or status == self.status:
+            return
+
+        now = monotonic()
+        if self.status == "running":
+            self.active_remaining = max(0.0, self.active_remaining - (now - self.active_started_at))
+        self.status = status
+        if status == "awaiting_approval":
+            try:
+                approval_timeout = float(params["approval_timeout_seconds"])
+            except (KeyError, TypeError, ValueError):
+                self.approval_deadline = None
+            else:
+                self.approval_deadline = (
+                    now + max(0.0, approval_timeout) + PROGRAM_APPROVAL_RESULT_GRACE_SECONDS
+                )
+        else:
+            self.approval_deadline = None
+            self.active_started_at = now
+        self.changed.set()
+
+    def remaining_timeout(self) -> float | None:
+        if self.disconnected:
+            raise ConnectionError("Controller connection closed during program tool call")
+        if self.status == "awaiting_approval":
+            if self.approval_deadline is None:
+                return None
+            return max(0.0, self.approval_deadline - monotonic())
+        return max(0.0, self.active_remaining - (monotonic() - self.active_started_at))
 
 
 def _mcp_module() -> Any:
@@ -159,6 +244,7 @@ _OAUTH_LOOPBACK_CALLBACK_PATH = "/oauth/callback"
 _LOCAL_INFERENCE_START_METHODS = {
     "llm.complete",
     "llm.discover_models",
+    "llm.discover_voices",
     "llm.image_generate",
     "llm.video",
     "llm.transcribe",
@@ -492,7 +578,7 @@ class _ConnectionSender:
 
     def __init__(self, ws: Any) -> None:
         self.ws = ws
-        self.lock = asyncio.Lock()
+        self.transport = JSONMessageSender(self._send_frame)
         self.retired = False
 
     def retire(self) -> None:
@@ -501,22 +587,43 @@ class _ConnectionSender:
     async def send(self, payload: str) -> None:
         if self.retired:
             raise RuntimeError("executor connection sender retired")
-        async with self.lock:
-            if self.retired:
-                raise RuntimeError("executor connection sender retired")
-            await self.ws.send(payload)
+        send_started = False
+
+        def mark_started() -> None:
+            nonlocal send_started
+            send_started = True
+
+        try:
+            await self.transport.send(payload, on_send_started=mark_started)
+        except BaseException:
+            if send_started:
+                self.retire()
+                with contextlib.suppress(Exception):
+                    await self.ws.close(code=1011, reason="executor send interrupted")
+            raise
+
+    async def _send_frame(self, payload: str) -> None:
+        if self.retired:
+            raise RuntimeError("executor connection sender retired")
+        await self.ws.send(payload)
 
 
 class ExecutorRunner:
     """Thin remote hand for tool execution and inference proxying."""
 
-    def __init__(self, config: ExecutorConfig) -> None:
+    def __init__(self, config: ExecutorConfig, *, call_journal: CallJournal | None = None) -> None:
         self.config = config
+        self._call_journal = call_journal
         self.executor_instance_id = uuid.uuid4().hex
         self._call_snapshot_seq = 0
         self._call_records: dict[str, dict[str, Any]] = {}
         self._terminal_call_records: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._active_calls: dict[str, asyncio.Task[Any]] = {}
+        self._speech_streams = ExecutorSpeechStreams()
+        self._pending_program_rpcs: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._program_rpc_waiters: dict[str, _ProgramRPCWaiter] = {}
+        self._program_runtime = ProgramRuntime(executor_id=config.executor_id)
+        self._current_ws: Any | None = None
         self._background_controls: dict[str, ToolBackgroundControl] = {}
         # Tool executions outlive one websocket so an unstable network cannot
         # destroy work in progress. Results are retained briefly so the
@@ -541,6 +648,7 @@ class ExecutorRunner:
         self._connection_handler_tasks: set[asyncio.Task[Any]] = set()
         self._running = True
         self._configured = False
+        self._reconnect_delay = _RECONNECT_BASE
         self._runtime_state = "offline"
         self._config_version = 0
         self._tool_handlers: dict[str, Any] = {}
@@ -570,7 +678,13 @@ class ExecutorRunner:
         self._running = False
 
     async def run(self) -> None:
-        reconnect_delay = _RECONNECT_BASE
+        if self._call_journal is None:
+            namespace = hashlib.sha256(
+                f"{self.config.controller_url}\0{self.config.executor_id}".encode()
+            ).hexdigest()
+            self._call_journal = CallJournal.from_environment(
+                get_config_paths().data_dir / "receipts" / namespace / "calls.sqlite3"
+            )
         watchdog = _EventLoopWatchdog(
             asyncio.get_running_loop(),
             interval_seconds=_EVENT_LOOP_WATCHDOG_INTERVAL_SECONDS,
@@ -585,12 +699,12 @@ class ExecutorRunner:
                 try:
                     await self._connect_and_serve()
                 except Exception:
-                    logger.warning("Connection lost, reconnecting in %.1fs", reconnect_delay)
+                    logger.warning("Connection lost, reconnecting in %.1fs", self._reconnect_delay)
                     self._prune_retained_results()
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, _RECONNECT_MAX)
+                    await asyncio.sleep(self._reconnect_delay)
+                    self._reconnect_delay = min(self._reconnect_delay * 2, _RECONNECT_MAX)
                     continue
-                reconnect_delay = _RECONNECT_BASE
+                self._reconnect_delay = _RECONNECT_BASE
                 if not self._running:
                     break
                 logger.warning("Connection closed, reconnecting immediately")
@@ -605,6 +719,12 @@ class ExecutorRunner:
             if durable_tool_tasks:
                 await asyncio.gather(*durable_tool_tasks, return_exceptions=True)
             self._durable_tool_tasks.clear()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._program_runtime.close()
+            for pending_program_call in self._pending_program_rpcs.values():
+                if not pending_program_call.done():
+                    pending_program_call.set_exception(ConnectionError("Executor stopped"))
+            self._pending_program_rpcs.clear()
             self._completed_call_results.clear()
             self._retained_result_bytes.clear()
             self._retained_result_expiry.clear()
@@ -721,6 +841,19 @@ class ExecutorRunner:
                 self._running = False
                 return
 
+            # Only our accepted registration ends the previous failure streak.
+            registration = response.get("result")
+            if (
+                isinstance(registration, dict)
+                and response.get("id") == ready_id
+                and registration.get("status") == "registered"
+                and registration.get("executor_id") == self.config.executor_id
+            ):
+                self._current_ws = ws
+                self._reconnect_delay = _RECONNECT_BASE
+            self._connection_senders[id(ws)].transport.enabled = (
+                response.get("result", {}).get("message_transport") == CHUNKED_JSON_PROTOCOL
+            )
             logger.info(
                 "Registered with controller as %s",
                 response.get("result", {}).get("executor_id", "unknown"),
@@ -753,6 +886,9 @@ class ExecutorRunner:
                 await notify_pending_background_shell_completions(self._runtime_metadata)
                 await self._run_connection_loops(ws)
             finally:
+                if self._current_ws is ws:
+                    self._current_ws = None
+                self._fail_program_rpcs_for_connection(ws)
                 sender = self._connection_senders.pop(id(ws), None)
                 if sender is not None:
                     sender.retire()
@@ -845,16 +981,50 @@ class ExecutorRunner:
             await self._cancel_connection_handler_tasks()
 
     async def _message_loop(self, ws: Any) -> None:
+        receiver = JSONMessageReceiver()
+        sender = self._connection_senders.get(id(ws))
+        receiver.enabled = sender is not None and sender.transport.enabled
+        try:
+            await self._receive_messages(ws, receiver)
+        finally:
+            await receiver.close()
+
+    async def _receive_messages(self, ws: Any, receiver: JSONMessageReceiver) -> None:
         logger.info("Entering message loop, waiting for controller commands")
-        async for raw_message in ws:
+        async for raw_message in self._transport_messages(ws, receiver):
             try:
                 msg = json.loads(raw_message)
             except json.JSONDecodeError:
                 continue
 
+            msg = await receiver.feed(msg)
+            if msg is None:
+                continue
+
             method = msg.get("method")
             msg_id = msg.get("id")
             params = msg.get("params", {})
+            if (
+                not isinstance(method, str)
+                and isinstance(msg_id, str)
+                and msg_id in self._pending_program_rpcs
+                and ("result" in msg or "error" in msg)
+            ):
+                program_future = self._pending_program_rpcs.pop(msg_id)
+                if not program_future.done():
+                    if "error" in msg:
+                        error = msg.get("error")
+                        program_future.set_exception(
+                            RuntimeError(
+                                str(error.get("message", "Program tool call failed"))
+                                if isinstance(error, dict)
+                                else "Program tool call failed"
+                            )
+                        )
+                    else:
+                        result = msg.get("result")
+                        program_future.set_result(result if isinstance(result, dict) else {})
+                continue
             replay_owner = False
             replay_call_id = ""
             if (
@@ -867,6 +1037,7 @@ class ExecutorRunner:
                     "local_model.status",
                     "local_model.show",
                     "llm.discover_models",
+                    "llm.discover_voices",
                     "executor.mcp.reload_credentials",
                 }
                 and isinstance(params, dict)
@@ -951,6 +1122,19 @@ class ExecutorRunner:
                     method,
                     msg_id=msg_id,
                 )
+            elif method == "fs.digest":
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
+                    self._handle_file_digest(ws, msg_id, params),
+                    method,
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
+                    msg_id=msg_id,
+                )
             elif method == "tool.result_fetch":
                 if replay_owner:
                     self._create_replay_safe_handler_task(
@@ -966,6 +1150,80 @@ class ExecutorRunner:
                 tool_name = params.get("tool_name", params.get("name", "?"))
                 logger.debug("Received tool.execute: %s", tool_name)
                 call_id = str(params.get("call_id", msg_id or "unknown"))
+                params["call_id"] = call_id
+                if self._call_journal is not None:
+                    try:
+                        admitted = await self._call_journal.accept(
+                            params, self.executor_instance_id
+                        )
+                    except (OSError, ValueError, sqlite3.Error) as exc:
+                        reason = (
+                            "capacity"
+                            if isinstance(exc, JournalCapacityError)
+                            else "sqlite"
+                            if isinstance(exc, sqlite3.Error)
+                            else "filesystem"
+                            if isinstance(exc, OSError)
+                            else "identity_conflict"
+                        )
+                        capacity = exc.capacity if isinstance(exc, JournalCapacityError) else {}
+                        storage_error_code = getattr(exc, "sqlite_errorcode", None) or getattr(
+                            exc, "errno", None
+                        )
+                        logger.warning(
+                            "Executor receipt admission rejected call_id=%s operation=accept reason=%s "
+                            "error_type=%s storage_error_code=%s capacity=%s",
+                            call_id,
+                            reason,
+                            type(exc).__name__,
+                            storage_error_code,
+                            capacity,
+                        )
+                        detail = (
+                            "Receipt journal capacity is exhausted by unacknowledged calls; "
+                            "settle outstanding receipts or increase the executor receipt limits."
+                            if reason == "capacity"
+                            else "Receipt journal storage is unavailable; check executor logs, "
+                            "disk space and permissions."
+                            if reason in {"sqlite", "filesystem"}
+                            else "The call ID conflicts with an existing execution receipt."
+                        )
+                        await self._send_rpc_result(
+                            ws,
+                            msg_id,
+                            {
+                                "call_id": call_id,
+                                "is_error": True,
+                                "output": "Executor receipt admission failed; tool was not executed. "
+                                + detail,
+                                "metadata": {
+                                    "code": "executor_receipt_admission_failed",
+                                    "delivery_state": "not_sent",
+                                    "error_type": type(exc).__name__,
+                                    "reason": reason,
+                                    "storage_error_code": storage_error_code,
+                                    **capacity,
+                                },
+                            },
+                        )
+                        continue
+                    if not admitted:
+                        report = await self._call_journal.fetch(call_id, self.executor_instance_id)
+                        if report is not None and report.get("state") == "terminal":
+                            await self._send_rpc_result(ws, msg_id, report["result"])
+                        else:
+                            logger.warning(
+                                "Executor receipt unresolved call_id=%s operation=fetch state=%s",
+                                call_id,
+                                report.get("state") if report is not None else "missing",
+                            )
+                            await self._send_rpc_error(
+                                ws,
+                                msg_id,
+                                -32000,
+                                "Tool call already accepted; reconcile its outcome before retrying.",
+                            )
+                        continue
                 original_call_id = self._same_turn_tool_call_deduplicator.original_call_id(params)
                 if original_call_id is not None:
                     logger.warning(
@@ -980,9 +1238,10 @@ class ExecutorRunner:
                             }
                         },
                     )
-                    await self._send_rpc_result(
+                    await self._send_tool_execution_result(
                         ws,
                         msg_id,
+                        params,
                         {
                             "call_id": call_id,
                             "output": json.dumps(
@@ -1016,6 +1275,16 @@ class ExecutorRunner:
                     msg_id=msg_id,
                 )
                 self._active_calls[params.get("call_id", msg_id)] = task
+            elif method == "program.status":
+                updated = self._program_runtime.update_status(params)
+                if not updated:
+                    logger.debug(
+                        "Ignored stale program status",
+                        extra={"extra_data": {"executor_id": self.config.executor_id}},
+                    )
+                else:
+                    for waiter in tuple(self._program_rpc_waiters.values()):
+                        waiter.update_status(params)
             elif method == "tool.cancel":
                 call_id = params.get("call_id")
                 logger.debug("Received tool.cancel: %s", call_id)
@@ -1029,6 +1298,15 @@ class ExecutorRunner:
                         msg_id,
                         {"call_id": call_id, "cancelled": cancelled},
                     )
+            elif method == "tool.result_ack":
+                acknowledged = False
+                if self._call_journal is not None:
+                    acknowledged = await self._call_journal.acknowledge(
+                        str(params.get("call_id") or ""),
+                        scope=params.get("scope"),
+                        require_scope=True,
+                    )
+                await self._send_rpc_result(ws, msg_id, {"acknowledged": acknowledged})
             elif method == "tool.background":
                 call_id = params.get("call_id")
                 control = (
@@ -1073,19 +1351,35 @@ class ExecutorRunner:
                         self._active_calls.pop(key, None)
 
                 task.add_done_callback(_remove_active_inference)
-            elif method == "llm.cancel":
-                request_id = str(params.get("request_id") or "")
-                cancel_task = self._active_calls.get(f"llm:{request_id}")
-                cancelled = False
-                if cancel_task is not None:
-                    cancel_task.cancel()
-                    cancelled = True
-                if msg_id is not None:
-                    await self._send_rpc_result(
-                        ws,
-                        msg_id,
-                        {"request_id": request_id, "cancelled": cancelled},
+            elif method == "llm.speech_input":
+                try:
+                    self._speech_streams.feed(
+                        str(params["request_id"]),
+                        str(params.get("audio_base64", "")),
+                        params.get("final") is True,
                     )
+                    await self._send_rpc_result(ws, msg_id, {"accepted": True})
+                except (ValueError, asyncio.QueueFull):
+                    await self._send_rpc_error(ws, msg_id, -32602, "Invalid speech input")
+            elif method == "llm.cancel":
+                self._create_background_handler_task(
+                    self._handle_llm_cancel(ws, msg_id, params),
+                    method,
+                    msg_id=msg_id,
+                )
+            elif method == "llm.discover_voices":
+                creator = (
+                    self._create_replay_safe_handler_task
+                    if replay_owner
+                    else self._create_background_handler_task
+                )
+                creator(
+                    self._handle_llm_discover_voices(ws, msg_id, params),
+                    "llm.discover_voices",
+                    **({"call_id": replay_call_id} if replay_owner else {}),
+                    **({"owner_ws": ws} if replay_owner else {}),
+                    msg_id=msg_id,
+                )
             elif method == "llm.discover_models":
                 logger.debug("Received llm.discover_models")
                 creator = (
@@ -1383,6 +1677,18 @@ class ExecutorRunner:
             "call_id": call_id,
             "executor_instance_id": self.executor_instance_id,
         }
+        if self._call_journal is not None:
+            report = await self._call_journal.fetch(
+                call_id,
+                self.executor_instance_id,
+                scope=params.get("scope"),
+                require_scope=True,
+            )
+            if report is not None:
+                if report["state"] != "terminal" and call_id in self._durable_tool_tasks:
+                    report["state"] = "active"
+                await self._send_rpc_result(ws, msg_id, report)
+                return
         self._prune_retained_results()
         retained = self._completed_call_results.get(call_id)
         if retained is not None:
@@ -1505,6 +1811,9 @@ class ExecutorRunner:
 
     async def _handle_configure(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         async with self._runtime_config_lock:
+            await self._notify_tools_changed(ws)
+            # tool.list responses cannot opt into caching while this lock is
+            # held, so a pre-change invalidation also covers failed rollbacks.
             await self._handle_configure_unlocked(ws, msg_id, params)
 
     async def _handle_configure_unlocked(
@@ -1915,6 +2224,9 @@ class ExecutorRunner:
                     "runtime_state": runtime_state,
                     "observed_at": datetime.now(UTC).isoformat(),
                     "capabilities": {
+                        "durable_tool_receipts": self._call_journal is not None,
+                        "binary_transfers": True,
+                        "mcp_credential_bindings": True,
                         "tools": [tool.name for tool in self._configured_tool_definitions],
                         "inference": self._local_inference_enabled,
                         "local_inference": self._local_inference_enabled,
@@ -2038,6 +2350,7 @@ class ExecutorRunner:
                 self._runtime_metadata["observed_capabilities"] = (
                     self._capability_report.model_dump(mode="json")
                 )
+                await self._notify_tools_changed(ws)
                 await self._send_rpc_result(
                     ws,
                     msg_id,
@@ -2407,6 +2720,18 @@ class ExecutorRunner:
         )
         await self._send_rpc_result(ws, msg_id, {"shells": statuses})
 
+    async def _handle_file_digest(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        from cognis.executor.file_digest import file_digests
+
+        try:
+            result = await file_digests(params)
+        except (ValueError, TypeError) as exc:
+            await self._send_rpc_error(ws, msg_id, -32602, f"File digest failed: {exc}")
+            return
+        await self._send_rpc_result(ws, msg_id, result)
+
     async def _handle_skill_assets_prepare(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
     ) -> None:
@@ -2424,13 +2749,24 @@ class ExecutorRunner:
             return
         await self._send_rpc_result(ws, msg_id, result)
 
+    async def _notify_tools_changed(self, ws: Any) -> None:
+        await self._send_ws(
+            ws,
+            json.dumps({"jsonrpc": "2.0", "method": "executor.tools_changed", "params": {}}),
+        )
+
     async def _handle_tool_list(self, ws: Any, msg_id: str | None) -> None:
         if msg_id is None:
             return
         await self._send_rpc_result(
             ws,
             msg_id,
-            {"tools": [tool.model_dump(mode="json") for tool in self._configured_tool_definitions]},
+            {
+                "tools": [
+                    tool.model_dump(mode="json") for tool in self._configured_tool_definitions
+                ],
+                "catalog_notifications": not self._runtime_config_lock.locked(),
+            },
         )
 
     async def _handle_deduplicated_tool_execute(
@@ -2447,9 +2783,10 @@ class ExecutorRunner:
         call_id = params.get("call_id", msg_id or uuid.uuid4().hex)
         if not self._configured or self._runtime_state not in {"active", "degraded"}:
             try:
-                await self._send_rpc_result(
+                await self._send_tool_execution_result(
                     ws,
                     msg_id,
+                    params,
                     {
                         "call_id": call_id,
                         "output": (
@@ -2525,9 +2862,10 @@ class ExecutorRunner:
                             "local_hash": local_hash,
                         },
                     )
-                    await self._send_rpc_result(
+                    await self._send_tool_execution_result(
                         ws,
                         msg_id,
+                        params,
                         {
                             "call_id": call_id,
                             **result.model_dump(mode="json"),
@@ -2545,9 +2883,10 @@ class ExecutorRunner:
                         is_error=True,
                         metadata={"code": "invalid_tool_arguments"},
                     )
-                    await self._send_rpc_result(
+                    await self._send_tool_execution_result(
                         ws,
                         msg_id,
+                        params,
                         {
                             "call_id": call_id,
                             **result.model_dump(mode="json"),
@@ -2573,6 +2912,12 @@ class ExecutorRunner:
                         or f"{self.config.executor_id}:{self._runtime_metadata.get('user_email', 'runtime')}"
                     ),
                 )
+                ctx.runtime_metadata["_program_runtime"] = self._program_runtime
+
+                async def _program_rpc_call(payload: dict[str, Any]) -> dict[str, Any]:
+                    return await self._call_controller_program_tool(payload)
+
+                ctx.runtime_metadata["_program_rpc_call"] = _program_rpc_call
 
                 async def _send_tool_chunk(delta: str, stream: str | None) -> None:
                     # Progress is advisory. Losing the socket mid-execution must
@@ -2601,13 +2946,17 @@ class ExecutorRunner:
                 self._background_controls[str(call_id)] = background_control
 
                 async def _invoke() -> Any:
-                    return await handler(tool_call.arguments, ctx)
+                    raw_result = await handler(tool_call.arguments, ctx)
+                    normalized = _normalize_result(raw_result, 0)
+                    return normalized.model_copy(
+                        update={
+                            "attachments": await ctx.binary_transfers.prepare_attachments(
+                                normalized.attachments
+                            )
+                        }
+                    )
 
-                raw = (
-                    await asyncio.wait_for(_invoke(), timeout=timeout_seconds)
-                    if timeout_seconds
-                    else await _invoke()
-                )
+                raw = await _invoke_with_timeout(tool_name, timeout_seconds, _invoke)
                 result = _normalize_result(raw, int((perf_counter() - start) * 1000))
                 terminal_state = "failed" if result.is_error else "completed"
         except TimeoutError:
@@ -2684,6 +3033,19 @@ class ExecutorRunner:
                     "metadata": result.metadata,
                     "attachments": result.attachments,
                 }
+                if self._call_journal is not None:
+                    receipt = await self._call_journal.fetch(
+                        str(call_id), self.executor_instance_id
+                    )
+                    if receipt is not None and receipt.get("state") == "terminal":
+                        result_payload = receipt["result"]
+                    else:
+                        await self._call_journal.complete(
+                            str(call_id),
+                            result_payload,
+                            params=params,
+                            instance_id=self.executor_instance_id,
+                        )
             self._active_calls.pop(call_id, None)
             self._background_controls.pop(str(call_id), None)
             self._settle_call(str(call_id), terminal_state, result=result_payload)
@@ -2705,11 +3067,6 @@ class ExecutorRunner:
         manager = self._runtime_metadata.get(BROWSER_MANAGER_KEY)
         retainer = self._browser_cleanup_retainer
         raw_owner = params.get("owner")
-        if not isinstance(manager, BrowserManager) and not isinstance(
-            retainer, BrowserManagerCleanupRetainer
-        ):
-            await self._send_rpc_result(ws, msg_id, {"closed": 0, "complete": True})
-            return
         if not isinstance(raw_owner, dict):
             await self._send_rpc_error(
                 ws,
@@ -2720,11 +3077,29 @@ class ExecutorRunner:
             return
         try:
             owner = BrowserSessionOwner.from_dict(raw_owner)
+            if not owner.execution_scope_id:
+                await self._send_rpc_error(
+                    ws,
+                    msg_id,
+                    -32602,
+                    "browser.session_terminal requires a non-empty execution scope",
+                )
+                return
             closed = 0
             if isinstance(manager, BrowserManager):
                 closed += await manager.mark_owner_terminal(owner)
             if isinstance(retainer, BrowserManagerCleanupRetainer):
                 closed += await retainer.mark_owner_terminal(owner)
+            for scope_id in {
+                owner.execution_scope_id,
+                owner.session_id,
+                owner.conversation_id,
+            }:
+                if scope_id:
+                    result = await self._program_runtime.terminate_scope(
+                        scope_id, reason="conversation_terminal"
+                    )
+                    closed += int(result["closed"])
         except BrowserLifecycleError as exc:
             await self._send_rpc_error(
                 ws,
@@ -2734,11 +3109,114 @@ class ExecutorRunner:
                 data={"code": exc.code, "retryable": True},
             )
             return
+        except ProgramRuntimeError as exc:
+            await self._send_rpc_error(
+                ws,
+                msg_id,
+                -32021,
+                str(exc),
+                data={"code": exc.code, "retryable": exc.retryable},
+            )
+            return
         await self._send_rpc_result(ws, msg_id, {"closed": closed, "complete": True})
 
-    async def _handle_llm_complete(
-        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    async def _handle_llm_cancel(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
     ) -> None:
+        """Reconcile cancellation without blocking the WebSocket reader."""
+        request_id = str(params.get("request_id") or "")
+        task = self._active_calls.get(f"llm:{request_id}")
+        result: dict[str, Any] = {"request_id": request_id, "cancelled": task is not None}
+        if task is not None:
+            task.cancel()
+            try:
+                done, _ = await asyncio.wait({task}, timeout=3)
+                if task in done:
+                    task.result()
+            except ExecutorUsageCancelled as exc:
+                metadata = exc.result.get("backend_metadata")
+                if isinstance(metadata, dict):
+                    result["backend_metadata"] = metadata
+            except (asyncio.CancelledError, TimeoutError):
+                pass
+        if msg_id is not None:
+            await self._send_rpc_result(ws, msg_id, result)
+
+    async def _handle_llm_complete(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Keep observation state request-owned through cancellation acknowledgement."""
+        observer = executor_observer(params.get("backend_metadata"))
+        try:
+            await self._run_llm_complete(ws, msg_id, params, usage_observer=observer)
+        except asyncio.CancelledError:
+            if observer is not None:
+                raise ExecutorUsageCancelled(observer.attach({})) from None
+            raise
+        return None
+
+    async def _run_llm_complete(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+        *,
+        usage_observer: ExecutorUsageObserver | None,
+    ) -> None:
+        if params.get("speech_operation"):
+            await self._send_rpc_result(ws, msg_id, {"status": "streaming"})
+            request_id = str(params["request_id"])
+            cancelled = False
+            try:
+                async with contextlib.aclosing(
+                    self._speech_streams.stream(
+                        params, usage_binding=usage_observer.binding if usage_observer else None
+                    )
+                ) as events:
+                    async for event in events:
+                        speech_chunk = {
+                            "request_id": request_id,
+                            "speech": event.model_dump(mode="json", exclude_none=True),
+                        }
+                        if usage_observer is not None and event.type == "start":
+                            speech_chunk = usage_observer.attach(speech_chunk)
+                        await self._send_ws(
+                            ws,
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "method": "llm.chunk",
+                                    "params": speech_chunk,
+                                }
+                            ),
+                        )
+                speech_terminal = {"request_id": request_id}
+            except asyncio.CancelledError:
+                cancelled = True
+                speech_terminal = {"request_id": request_id, "error": "Speech streaming cancelled"}
+            except Exception:
+                speech_terminal = {"request_id": request_id, "error": "Speech streaming failed"}
+            if usage_observer is not None:
+                speech_terminal = usage_observer.attach(speech_terminal)
+            await self._send_ws(
+                ws,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "llm.done",
+                        "params": speech_terminal,
+                    }
+                ),
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            return
         if self._inference_handler is None:
             await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
             return
@@ -2755,11 +3233,14 @@ class ExecutorRunner:
                     provider_id=params.get("provider_id"),
                     owner_email=params.get("owner_email"),
                     backend_metadata=params.get("backend_metadata"),
+                    usage_observer=usage_observer,
                 )
             except Exception as exc:
                 from cognis.providers.llm.errors import build_mid_stream_error_chunk
 
                 response = build_mid_stream_error_chunk(exc)
+                if usage_observer is not None:
+                    response = usage_observer.attach(response)
             await self._send_rpc_result(ws, msg_id, json_safe_inference_payload(response))
             return
         if msg_id is not None:
@@ -2782,6 +3263,7 @@ class ExecutorRunner:
             backend_metadata=params.get("backend_metadata")
             if isinstance(params.get("backend_metadata"), dict)
             else None,
+            usage_observer=usage_observer,
         ):
             safe_chunk = json_safe_inference_payload(chunk)
             if not isinstance(safe_chunk, dict):
@@ -2825,6 +3307,7 @@ class ExecutorRunner:
                 # markers) — required for executor-routed inference to match
                 # controller-direct behavior.
                 for extra_key in (
+                    "backend_metadata",
                     "anthropic_native_events",
                     "reasoning_part_boundary",
                     "tool_progress",
@@ -2847,6 +3330,25 @@ class ExecutorRunner:
                         }
                     ),
                 )
+
+    async def _handle_llm_discover_voices(
+        self, ws: Any, msg_id: str | None, params: dict[str, Any]
+    ) -> None:
+        if self._inference_handler is None:
+            await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
+            return
+        try:
+            if params.get("preset") != "elevenlabs":
+                raise ValueError("Voice discovery is not supported for this provider")
+            from cognis.providers.llm.elevenlabs import discover_voices
+
+            voices = await discover_voices(
+                base_url=str(params.get("base_url") or ""),
+                api_key=str(params.get("api_key") or ""),
+            )
+            await self._send_rpc_result(ws, msg_id, {"voices": voices})
+        except Exception:
+            await self._send_rpc_error(ws, msg_id, -32000, "Voice discovery failed")
 
     async def _handle_llm_discover_models(
         self, ws: Any, msg_id: str | None, params: dict[str, Any]
@@ -3022,6 +3524,7 @@ class ExecutorRunner:
             await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
             return
 
+        observer = executor_observer(params.get("backend_metadata"))
         try:
             encoding = str(params.get("audio_encoding", "hex"))
             audio_payload = str(params.get("audio_base64", ""))
@@ -3039,20 +3542,45 @@ class ExecutorRunner:
                 request_kwargs=request_kwargs,
                 prompt=params.get("prompt"),
                 language=params.get("language"),
+                usage_binding=observer.binding if observer is not None else None,
             )
+            if observer is not None:
+                result = observer.attach(result)
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
+            if observer is not None:
+                from cognis.providers.llm.errors import build_mid_stream_error_chunk
+
+                await self._send_rpc_result(
+                    ws, msg_id, observer.attach(build_mid_stream_error_chunk(exc))
+                )
+                return
             await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
 
     async def _handle_video(self, ws: Any, msg_id: str | None, params: dict[str, Any]) -> None:
         from cognis.executor.video import video_rpc
 
+        observer = executor_observer(params.get("backend_metadata"))
         try:
             if self._inference_handler is None:
                 raise ValueError("Inference handler unavailable")
-            await self._send_rpc_result(ws, msg_id, await video_rpc(params))
+            result = await video_rpc(params, usage_observer=observer)
+            await self._send_rpc_result(
+                ws,
+                msg_id,
+                observer.attach(result) if observer is not None else result,
+            )
         except Exception:
             # No prompts, credential values, upstream bodies, or transfer tokens in RPC errors.
+            if observer is not None:
+                await self._send_rpc_result(
+                    ws,
+                    msg_id,
+                    observer.attach(
+                        {"error": "Video operation failed; submission may be uncertain"}
+                    ),
+                )
+                return
             await self._send_rpc_error(
                 ws, msg_id, -32000, "Video operation failed; submission may be uncertain"
             )
@@ -3064,6 +3592,7 @@ class ExecutorRunner:
             await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
             return
 
+        observer = executor_observer(params.get("backend_metadata"))
         try:
             request_kwargs = dict(params.get("request_kwargs") or {})
             result = await self._inference_handler.image_generate(
@@ -3085,9 +3614,19 @@ class ExecutorRunner:
                     else None
                 ),
                 request_kwargs=request_kwargs,
+                usage_binding=observer.binding if observer is not None else None,
             )
+            if observer is not None:
+                result = observer.attach(result)
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
+            if observer is not None:
+                from cognis.providers.llm.errors import build_mid_stream_error_chunk
+
+                await self._send_rpc_result(
+                    ws, msg_id, observer.attach(build_mid_stream_error_chunk(exc))
+                )
+                return
             await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
 
     async def _handle_llm_synthesize(
@@ -3097,6 +3636,7 @@ class ExecutorRunner:
             await self._send_rpc_error(ws, msg_id, -32601, "Inference handler unavailable")
             return
 
+        observer = executor_observer(params.get("backend_metadata"))
         try:
             request_kwargs = dict(params.get("request_kwargs") or {})
             speed = params.get("speed", 1.0)
@@ -3111,9 +3651,19 @@ class ExecutorRunner:
                 speed=float(speed),
                 request_kwargs=request_kwargs,
                 low_latency=bool(params.get("low_latency", False)),
+                usage_binding=observer.binding if observer is not None else None,
             )
+            if observer is not None:
+                result = observer.attach(result)
             await self._send_rpc_result(ws, msg_id, result)
         except Exception as exc:
+            if observer is not None:
+                from cognis.providers.llm.errors import build_mid_stream_error_chunk
+
+                await self._send_rpc_result(
+                    ws, msg_id, observer.attach(build_mid_stream_error_chunk(exc))
+                )
+                return
             await self._send_rpc_error(ws, msg_id, -32000, str(exc)[:500])
 
     async def _handle_channel_start(
@@ -3409,6 +3959,10 @@ class ExecutorRunner:
             runtime_metadata=self._runtime_metadata,
         )
         return {
+            "message_transport": CHUNKED_JSON_PROTOCOL,
+            "durable_tool_receipts": self._call_journal is not None,
+            "binary_transfer_protocol": "http-binary-v1",
+            "mcp_credential_binding_protocol": MCP_CREDENTIAL_BINDING_PROTOCOL,
             "token": self.config.controller_token,
             "environment": _build_environment_payload(),
             "platform": _build_platform_payload(),
@@ -3422,6 +3976,18 @@ class ExecutorRunner:
             "mcp_credential_revisions": dict(self._mcp_credential_revisions),
             "observed_capabilities": capability_report.model_dump(mode="json"),
         }
+
+    async def _transport_messages(
+        self, ws: Any, receiver: JSONMessageReceiver
+    ) -> AsyncIterator[str | bytes]:
+        iterator = ws.__aiter__()
+        while True:
+            try:
+                async with asyncio.timeout(receiver.receive_timeout):
+                    raw_message = await anext(iterator)
+            except StopAsyncIteration:
+                return
+            yield raw_message
 
     async def _refresh_resource_snapshot(
         self,
@@ -3627,9 +4193,20 @@ class ExecutorRunner:
         return discovered
 
     def _build_mcp_handler(self, tool: ToolDefinition) -> Any:
-        async def _handler(arguments: dict[str, Any], _: Any) -> Any:
+        async def _handler(arguments: dict[str, Any], context: Any) -> Any:
             server_key = runtime_mcp_server_key(tool.source)
             client = self._mcp_clients[server_key]
+            revision = self._mcp_credential_revisions.get(str(tool.source.server_id))
+            if (
+                isinstance(revision, dict)
+                and str(revision.get("token_id", "")).startswith("credential:")
+                and context.runtime_metadata.get("mcp_binding_revision") != revision
+            ):
+                return ToolResult(
+                    output="MCP credential binding changed or is unauthorized; reconfigure the executor before retrying.",
+                    is_error=True,
+                    metadata={"code": "mcp_credential_revision_mismatch"},
+                )
             raw_tool_name = tool.source.raw_tool_name or tool.name
             self._mcp_client_active_calls[server_key] = (
                 self._mcp_client_active_calls.get(server_key, 0) + 1
@@ -3878,6 +4455,121 @@ class ExecutorRunner:
     async def _close_oauth_loopback_listeners(self) -> None:
         for listener_id in list(self._oauth_loopback_listeners):
             await self._close_oauth_loopback_listener(listener_id)
+
+    async def _call_controller_program_tool(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Await one reverse RPC while the executor message loop stays live."""
+        ws = self._current_ws
+        if ws is None or id(ws) in self._retired_sender_ids:
+            raise ConnectionError(
+                "No validated controller connection is available for program RPC."
+            )
+        request_id = uuid.uuid4().hex
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending_program_rpcs[request_id] = future
+        self._program_rpc_waiters[request_id] = _ProgramRPCWaiter(
+            future=future,
+            connection_id=id(ws),
+            program_id=str(params.get("program_id") or ""),
+            execution_id=str(params.get("execution_id") or ""),
+            sequence=int(params.get("sequence") or 0),
+        )
+        try:
+            await self._send_ws(
+                ws,
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "program.tool_call",
+                        "params": params,
+                        "id": request_id,
+                    }
+                ),
+            )
+            return await self._wait_program_rpc(self._program_rpc_waiters[request_id])
+        except (asyncio.CancelledError, TimeoutError):
+            cancel_task = asyncio.create_task(
+                self._send_ws(
+                    ws,
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "program.tool_cancel",
+                            "params": {
+                                "request_id": request_id,
+                                "program_id": params.get("program_id"),
+                                "execution_id": params.get("execution_id"),
+                                "sequence": params.get("sequence"),
+                            },
+                        }
+                    ),
+                )
+            )
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await asyncio.shield(cancel_task)
+            if not future.done():
+                future.cancel()
+            raise
+        finally:
+            self._pending_program_rpcs.pop(request_id, None)
+            self._program_rpc_waiters.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+
+    async def _wait_program_rpc(self, waiter: _ProgramRPCWaiter) -> dict[str, Any]:
+        """Wait on active RPC time; approval waits use their own controller deadline."""
+        while True:
+            if waiter.future.done():
+                return await waiter.future
+            waiter.changed.clear()
+            timeout = waiter.remaining_timeout()
+            if timeout == 0:
+                raise TimeoutError("Program child tool call timed out")
+            status_changed = asyncio.create_task(waiter.changed.wait())
+            try:
+                waiting: set[asyncio.Future[Any]] = {
+                    cast(asyncio.Future[Any], waiter.future),
+                    status_changed,
+                }
+                done, _pending = await asyncio.wait(
+                    waiting,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not status_changed.done():
+                    status_changed.cancel()
+                await asyncio.gather(status_changed, return_exceptions=True)
+            if waiter.future in done:
+                return await waiter.future
+            if not done:
+                raise TimeoutError("Program child tool call timed out")
+
+    def _fail_program_rpcs_for_connection(self, ws: Any) -> None:
+        for request_id, waiter in tuple(self._program_rpc_waiters.items()):
+            if waiter.connection_id != id(ws):
+                continue
+            waiter.disconnected = True
+            waiter.changed.set()
+            future = self._pending_program_rpcs.get(request_id)
+            if future is not None and not future.done():
+                future.set_exception(ConnectionError("Controller connection closed"))
+
+    async def _send_tool_execution_result(
+        self,
+        ws: Any,
+        msg_id: str | None,
+        params: dict[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Only the accepting handler can commit a terminal execution receipt."""
+        if self._call_journal is not None:
+            await self._call_journal.complete(
+                str(params["call_id"]),
+                result,
+                params=params,
+                instance_id=self.executor_instance_id,
+            )
+        await self._send_rpc_result(ws, msg_id, result)
 
     async def _send_rpc_result(self, ws: Any, msg_id: str | None, result: dict[str, Any]) -> None:
         if msg_id is None:

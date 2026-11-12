@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.18.3"
+version = "0.19.0"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
@@ -29,7 +29,8 @@ dependencies = [
     "pyyaml>=6.0.0",
     "email-validator>=2.0.0",
     "sqlalchemy[asyncio]>=2.0.0",
-    "aiosqlite>=0.20.0",
+    # Lift the cap once upstream worker stop/close handles overlapping cleanup.
+    "aiosqlite>=0.20.0,<0.22",
     "alembic>=1.13.0",
     "litellm>=1.82.0",
     "typer>=0.12.0",
@@ -61,7 +62,7 @@ dependencies = [
     "psutil>=6.1.0",
     "youtube-transcript-api>=1.2.0",
     "pyotp>=2.9.0",
-    "cognis-common==0.18.3",
+    "cognis-common==0.19.0",
 ]
 
 [project.optional-dependencies]
@@ -131,6 +132,8 @@ path = "build.py"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Remove each passing test's tmp_path at teardown so full runs fit in a RAM-backed TMPDIR.
+tmp_path_retention_policy = "failed"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
@@ -236,4 +239,4 @@ name = "Upgrade notes"
 showcontent = true
 
 [tool.cognis.changelog]
-next_version = "0.18.4"
+next_version = "0.19.1"

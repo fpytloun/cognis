@@ -14,11 +14,14 @@ REPLAY_SAFE_UNARY_METHODS = frozenset(
     {
         "tool.list",
         "tool.result_fetch",
+        "tool.result_ack",
         "lsp.status",
         "shell.background_status",
+        "fs.digest",
         "local_model.status",
         "local_model.show",
         "llm.discover_models",
+        "llm.discover_voices",
         "executor.mcp.reload_credentials",
     }
 )

@@ -939,7 +939,6 @@ def _upload_file_payloads(arguments: dict[str, Any], context: ToolExecutionConte
         path = resolve_path(raw_path, context=context)
         if not path.is_file():
             raise ValueError(f"Upload file does not exist or is not a file: {path}")
-        total_bytes += path.stat().st_size
         files.append(str(path))
     source_artifacts = arguments.get("source_artifacts")
     if isinstance(source_artifacts, list):
@@ -1560,6 +1559,23 @@ async def handle_browser_upload(
 ) -> ToolResult:
     manager = _get_manager(context)
     session = await _get_owned_session(manager, context, str(arguments.get("session_id", "")))
+    if descriptors := arguments.get("source_artifact_downloads"):
+        import tempfile
+
+        from cognis.transfers.models import DownloadDescriptor
+
+        with tempfile.TemporaryDirectory(prefix="cognis-browser-upload-") as directory:
+            prepared = {
+                key: value for key, value in arguments.items() if key != "source_artifact_downloads"
+            }
+            paths = list(_coerce_string_list(arguments.get("file_paths")))
+            for index, raw in enumerate(descriptors):
+                descriptor = DownloadDescriptor.model_validate(raw)
+                target = Path(directory) / str(index) / Path(descriptor.filename).name
+                await context.binary_transfers.download_file(descriptor, target)
+                paths.append(str(target))
+            prepared["file_paths"] = paths
+            return await handle_browser_upload(prepared, context)
     mode = str(arguments.get("mode", "input") or "input").lower()
     if mode not in {"input", "file_chooser"}:
         raise ValueError("browser_upload mode must be 'input' or 'file_chooser'")
@@ -1648,7 +1664,7 @@ async def handle_browser_download_wait(
                 "kind": "file",
                 "mime_type": mime_type,
                 "filename": filename,
-                "content_b64": base64.b64encode(content).decode("ascii"),
+                **context.binary_transfers.attachment_content(content),
             }
         ],
     )
@@ -1849,7 +1865,7 @@ async def handle_browser_screenshot(
                 "kind": "image",
                 "mime_type": "image/png",
                 "filename": f"{session.session_id}.png",
-                "content_b64": base64.b64encode(content).decode("ascii"),
+                **context.binary_transfers.attachment_content(content),
             }
         ],
     )

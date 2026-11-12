@@ -96,6 +96,7 @@ class AnthropicMessagesExecutorBackend:
             bundle,
             provider_fingerprint=context.chain_id,
             model_fingerprint=request.model,
+            usage_binding=request.usage_binding,
         ):
             envelope = chunk.get("anthropic_native_envelope")
             if isinstance(envelope, dict):
@@ -150,6 +151,7 @@ class AnthropicMessagesExecutorBackend:
             bundle,
             provider_fingerprint=context.chain_id,
             model_fingerprint=request.model,
+            usage_binding=request.usage_binding,
             max_retries=max_retries,
             operation=f"executor.anthropic_messages({request.model})",
         )

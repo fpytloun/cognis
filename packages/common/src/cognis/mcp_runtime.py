@@ -217,7 +217,7 @@ class _SessionMCPClient:
             if late_error is None or not late_error.authorization_required:
                 late_error = await self._probe_timeout_authorization()
             if late_error is not None and late_error.authorization_required:
-                raise late_error from exc
+                raise self._client_error("initialize", late_error) from None
             raise MCPClientError(
                 self.config.name,
                 "initialize",
@@ -228,6 +228,8 @@ class _SessionMCPClient:
         except asyncio.CancelledError:
             await self.close(suppress_cancelled=True)
             raise
+        except Exception as exc:
+            raise self._client_error("initialize", exc) from None
 
     async def list_tools(self) -> list[dict[str, Any]]:
         """Discover tools exposed by the MCP server."""
@@ -254,7 +256,7 @@ class _SessionMCPClient:
                     ),
                 }
             )
-            tools.append(payload)
+            tools.append(self._redact_bearer(payload))
         for t in tools:
             name = t["name"]
             input_schema = t.get("inputSchema", {})
@@ -272,7 +274,41 @@ class _SessionMCPClient:
         schema = self._tool_schemas.get(tool_name, {})
         sanitized = _strip_empty_optionals(arguments, schema)
         result = await self._submit("call_tool", tool_name, sanitized)
-        return _normalize_call_result(result)
+        return self._redact_bearer(_normalize_call_result(result))
+
+    def _redact_bearer(self, value: Any) -> Any:
+        """Keep an HTTP peer from reflecting its bearer into discovery or results."""
+        headers = getattr(self, "headers", {})
+        authorization = next(
+            (item for key, item in headers.items() if key.lower() == "authorization"), ""
+        )
+        token = authorization[7:] if authorization.lower().startswith("bearer ") else ""
+        if not token:
+            return value
+        if isinstance(value, str):
+            return value.replace(token, "[REDACTED]")
+        if isinstance(value, dict):
+            return {
+                self._redact_bearer(key): self._redact_bearer(item) for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._redact_bearer(item) for item in value]
+        return value
+
+    def _client_error(self, phase: str, exc: BaseException) -> MCPClientError:
+        error = _coerce_client_error(self.config.name, phase, exc)
+        return MCPClientError(
+            self.config.name,
+            phase,
+            self._redact_bearer(str(error)),
+            error_class=error.error_class,
+            timed_out=error.timed_out,
+            safe_stderr=self._redact_bearer(error.safe_stderr),
+            status_code=error.status_code,
+            auth_error=self._redact_bearer(error.auth_error),
+            www_authenticate=self._redact_bearer(error.www_authenticate),
+            authorization_challenge=self._redact_bearer(error.authorization_challenge),
+        )
 
     async def close(self, *, suppress_cancelled: bool = False) -> None:
         """Close the transport and client session."""
@@ -337,6 +373,8 @@ class _SessionMCPClient:
         except asyncio.CancelledError:
             future.add_done_callback(self._consume_future_result)
             raise
+        except Exception as exc:
+            raise self._client_error(operation, exc) from None
 
     async def _run_session_owner(self) -> None:
         exit_stack = AsyncExitStack()
@@ -360,10 +398,10 @@ class _SessionMCPClient:
             await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
             raise
         except Exception as exc:
-            self._last_owner_error = exc
+            self._last_owner_error = self._client_error("initialize", exc)
             await _close_exit_stack_after_connect_failure(exit_stack, self.config.name)
             if not self._ready.done():
-                self._ready.set_exception(_coerce_client_error(self.config.name, "initialize", exc))
+                self._ready.set_exception(self._last_owner_error)
             return
         if not self._ready.done():
             self._ready.set_result(None)
@@ -389,7 +427,7 @@ class _SessionMCPClient:
                 except Exception as exc:
                     phase = operation if operation == "list_tools" else "call_tool"
                     if not future.done():
-                        future.set_exception(_coerce_client_error(self.config.name, phase, exc))
+                        future.set_exception(self._client_error(phase, exc))
                 else:
                     if not future.done():
                         future.set_result(result)

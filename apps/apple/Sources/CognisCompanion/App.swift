@@ -1,5 +1,6 @@
 import AppKit
 import WebKit
+import Carbon
 import CompanionContract
 
 @MainActor
@@ -35,6 +36,8 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var compactConversation: String?
     private var compactAgent: String?
     private var compactDirect = false
+    private var compactFocusRequest: String?
+    private var previousApplication: NSRunningApplication?
     private var resident = false
     private var ready = false
     private var desktopVisible = true
@@ -59,7 +62,67 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var compatibilityTask: Task<Void, Never>?
     private var configuration: PackageConfiguration?
     private var servers: ServerSelectionCoordinator!
+    private var launchURL: URL?
+    private var pendingLink: AppLink.Destination?
+    private lazy var hotKey = GlobalHotKey { [weak self] in self?.toggleLastPanel() }
     private var appName: String { configuration?.displayName ?? "Cognis (Invalid Package)" }
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleURL(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kInternetEventClass), andEventID: AEEventID(kAEGetURL))
+    }
+
+    @objc private func handleURL(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        guard let text = event.paramDescriptor(forKeyword: AEKeyword(keyDirectObject))?.stringValue,
+              text.utf8.count <= 1024, let url = URL(string: text) else { return }
+        guard configuration != nil, profile != nil else { launchURL = url; return }
+        receiveURL(url)
+    }
+
+    private func receiveURL(_ url: URL) {
+        guard let profile, let configuration else { return }
+        do {
+            pendingLink = try AppLink(url: url, profile: profile, flavor: configuration.flavor).destination
+            drainPendingLink()
+            if snapshot?.authenticated == false { openMain() }
+        } catch AppLink.LinkError.serverMismatch {
+            showError("This link belongs to another server (\(url.host ?? "")). Connected to \(profile.origin.absoluteString). No server was switched.")
+        } catch { showError("This Cognis link is not supported or is malformed.") }
+    }
+
+    private func drainPendingLink() {
+        guard ready, snapshot?.authenticated == true, let destination = pendingLink else { return }
+        // Authentication publishes before workspace restoration and agent discovery.
+        if case .panel = destination, snapshot?.panelTargets?.ready != true { return }
+        pendingLink = nil
+        open(destination)
+    }
+
+    private func open(_ destination: AppLink.Destination) {
+        guard snapshot?.authenticated == true else { return }
+        switch destination {
+        case .main(let route): openMain(); navigate(route)
+        case .window(let target): openStandaloneWindow(target)
+        case .panel(let requested, let conversation, let direct):
+            guard let snapshot, let profile else { return }
+            switch PanelTarget.presentation(requested: requested, conversation: conversation, direct: direct,
+                lastAgent: defaults.string(forKey: PanelTarget.historyKey(profile: profile)), snapshot: snapshot) {
+            case .pending: pendingLink = destination
+            case .unavailable: showError("No available agent. Create or enable an agent in Cognis first.")
+            case .unretainedConversation:
+                showError("This conversation is not a retained tab for this agent. Open its /chat/ link, or pin the conversation first.")
+            case .open(let agent, let conversation, let direct):
+                openAgent(agent, conversation: conversation, direct: direct)
+            }
+        }
+    }
+
+    @objc private func toggleLastPanel() {
+        guard profile != nil else { openMain(); return }
+        pendingLink = .panel(agent: nil, conversation: nil, direct: false)
+        drainPendingLink()
+        if snapshot?.authenticated == false { openMain() }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -68,6 +131,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
         self.configuration = configuration
+        hotKey.register(configuration.flavor == .acceptance ? nil : HotKeyPreference.load(from: defaults))
         servers = ServerSelectionCoordinator(configuration: configuration, defaults: defaults)
         updates = UpdateCoordinator()
         login = LoginCoordinator()
@@ -122,6 +186,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let pid = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.processIdentifier
             MainActor.assumeIsolated {
                 guard let pid, pid != ProcessInfo.processInfo.processIdentifier else { return }
+                self?.previousApplication = nil
                 self?.outsideClick(nil)
             }
         }
@@ -171,9 +236,11 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in MainActor.assumeIsolated { self?.clampAll() } })
         updateMenu()
-        if let value = servers.initialSelection(background: launchPolicy.background) {
-            loadProfile(value, background: launchPolicy.background)
+        let panelLaunch = launchURL?.path == "/native-pinned"
+        if let value = servers.initialSelection(background: launchPolicy.background || panelLaunch) {
+            loadProfile(value, background: launchPolicy.background || panelLaunch)
         }
+        if let url = launchURL, profile != nil { launchURL = nil; receiveURL(url) }
         updateMenu()
     }
 
@@ -228,6 +295,8 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func loadProfile(_ value: ServerProfile, background: Bool = false, restoringPath: String? = nil) {
         guard let allowed = try? configuration?.profile(value.origin.absoluteString), allowed == value else { return }
         clearProjection()
+        pendingLink = nil
+        previousApplication = nil
         notifications.invalidate()
         compatibilityTask?.cancel()
         bundleWeb?.invalidate()
@@ -254,7 +323,9 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             host.onReady = { [weak self, weak host] in
                 guard let self, let host, self.bundleWeb === host else { return }
                 self.ready = true; self.publishVisibility()
+                self.drainPendingLink()
             }
+            host.onOpenLink = { [weak self] destination in self?.open(destination) }
             host.onReload = { [weak self, weak host] in
                 guard let self, let host, self.bundleWeb === host else { return }
                 self.reloadBundle()
@@ -319,6 +390,9 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             openMain(); navigate("/notifications")
         case .openMain(let path): openMain(); navigate(path)
         case .openWindow(let id): openConversationWindow(id)
+        case .openResourceWindow(let target): openStandaloneWindow(target)
+        case .saveDiagnostic, .openReference:
+            break // File saves belong to the trusted originating WebView.
         case .avatar, .rail, .railSize, .panelState:
             break // Rail/panel capabilities are accepted only from their own documents.
         case .appearance(let theme, let background):
@@ -349,6 +423,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             snapshot = value
             if !value.authenticated {
                 invalidateSecondaryDocuments()
+                if pendingLink != nil { openMain() }
             } else if compactDirect, !value.agents.contains(where: { $0.agentId == compactAgent }) {
                 dismissCompact()
             } else if !compactDirect, let id = compactConversation, !value.pins.contains(where: { $0.conversationId == id }) {
@@ -361,6 +436,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             stateLabel = value.authenticated ? value.connection.capitalized : "Sign in"
             rebuildIcons()
             updateMenu()
+            drainPendingLink()
         case .route(let path):
             currentPath = path
             mainPath = path
@@ -402,15 +478,22 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
     static func shouldTogglePinnedPopup(visible: Bool, currentAgent: String?, targetAgent: String,
                                        explicitConversation: String?) -> Bool {
-        visible && currentAgent == targetAgent && explicitConversation == nil
+        PanelTarget.shouldDismiss(visible: visible, currentAgent: currentAgent, targetAgent: targetAgent,
+            explicitConversation: explicitConversation, ownedInteraction: false)
     }
     static func railDragY(frameY: CGFloat, pointerStartY: CGFloat, currentPointerY: CGFloat) -> CGFloat {
         frameY + currentPointerY - pointerStartY
     }
     private func openAgent(_ agentId: String, conversation: String? = nil, direct: Bool = false) {
         guard ready, snapshot?.authenticated == true, validIdentifier(agentId) else { return }
-        if !direct && Self.shouldTogglePinnedPopup(visible: compactWindow.isVisible, currentAgent: compactAgent,
-                                       targetAgent: agentId, explicitConversation: conversation) {
+        if compactWindow.isVisible,
+           interactionDepth > 0 || compactWindow.attachedSheet != nil || NSApp.modalWindow != nil {
+            compactWindow.orderFrontRegardless()
+            return
+        }
+        if PanelTarget.shouldDismiss(visible: compactWindow.isVisible, currentAgent: compactAgent,
+            targetAgent: agentId, explicitConversation: conversation,
+            ownedInteraction: interactionDepth > 0 || compactWindow.attachedSheet != nil || NSApp.modalWindow != nil) {
             dismissCompact()
             return
         }
@@ -430,16 +513,29 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             compactWeb?.send(["type": "navigate", "path": path])
         }
         compactWindow.title = "Pinned conversation — " + appName
+        if !NSApp.isActive { previousApplication = NSWorkspace.shared.frontmostApplication }
         if let icon = railWindow, let visible = icon.screen?.visibleFrame {
             compactWindow.setFrame(anchoredFrame(icon: icon.frame, size: compactWindow.frame.size,
                                                 visible: visible), display: true)
         } else { clamp(compactWindow) }
         compactWindow.makeKeyAndOrderFront(nil)
+        compactWindow.makeFirstResponder(compactWeb?.web)
         NSApp.activate()
+        compactFocusRequest = UUID().uuidString
+        if let profile { defaults.set(agentId, forKey: PanelTarget.historyKey(profile: profile)) }
         publishRailState()
         publishVisibility()
+        focusCompactComposer()
+    }
+    private func focusCompactComposer() {
+        guard compactWindow?.isVisible == true, interactionDepth == 0,
+              let agent = compactAgent, let request = compactFocusRequest else { return }
+        compactWeb?.send(["type": "focus-composer", "agentId": agent, "request": request])
     }
     private func dismissCompact() {
+        let previous = previousApplication
+        previousApplication = nil
+        compactFocusRequest = nil
         compactWindow.orderOut(nil)
         publishVisibility()
         // The independent main document stays exactly where the user left it.
@@ -449,6 +545,8 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         compactAgent = nil
         compactDirect = false
         publishRailState()
+        if NSApp.isActive, !mainWindow.isVisible, !conversationWindows.values.contains(where: \.isVisible),
+           settings?.window?.isVisible != true { previous?.activate() }
     }
     private func outsideClick(_ clickedWindow: NSWindow?) {
         guard compactWindow.isVisible else { return }
@@ -497,7 +595,9 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         host.onReady = { [weak self, weak host] in
             guard let self, let host, self.activeDocuments.contains(where: { $0 === host }) else { return }
             self.publishVisibility()
+            if self.compactWeb === host { self.focusCompactComposer() }
         }
+        host.onOpenLink = { [weak self] destination in self?.open(destination) }
         (host.web as? RailWebView)?.onPointerChange = { [weak self, weak host] in
             guard let self, let host, self.railWeb === host else { return }
             self.publishRailState()
@@ -512,7 +612,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else if let id = self.conversationWeb.first(where: { $0.value === host })?.key {
                 self.failedDocuments.insert(id)
                 host.invalidate()
-                let label = NSTextField(wrappingLabelWithString: message + " Close and reopen this conversation to recover. Saved drafts are retained.")
+                let label = NSTextField(wrappingLabelWithString: message + " Close and reopen this window to recover. Saved drafts are retained.")
                 self.conversationWindows[id]?.contentView = label
             }
         }
@@ -525,8 +625,8 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             } else if self.railWeb === host {
                 self.dismissCompact(); self.retireRail(); self.rebuildIcons()
             } else if let id = self.conversationWeb.first(where: { $0.value === host })?.key,
-                      let window = self.conversationWindows[id] {
-                _ = self.windowShouldClose(window); window.close(); self.openConversationWindow(id)
+                      let window = self.conversationWindows[id], let target = self.standalone.target(id: id) {
+                _ = self.windowShouldClose(window); window.close(); self.openStandaloneWindow(target)
             }
         }
         host.onMessage = { [weak self, weak host] message in
@@ -536,6 +636,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             switch message {
             case .workspace(let frame): self.relayWorkspace(frame, from: host)
             case .openWindow(let id): self.openConversationWindow(id)
+            case .openResourceWindow(let target): self.openStandaloneWindow(target)
             case .notificationSettings(let action): self.receive(.notificationSettings(action))
             case .openMain(let path): self.openMain(); self.navigate(path)
             case .rail(let action, let agentId, let delta):
@@ -548,8 +649,10 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 if self.desktopVisible { self.railWindow?.orderFrontRegardless() }
             case .panelState(let agentId, let conversationId):
                 guard self.compactWeb === host, self.compactWindow.isVisible else { return }
-                self.compactAgent = agentId; self.compactConversation = conversationId
+                guard agentId == self.compactAgent else { return }
+                self.compactConversation = conversationId
                 self.publishRailState()
+                self.focusCompactComposer()
             case .dismiss:
                 if self.compactWeb === host || self.railWeb === host { self.dismissCompact() }
                 else { host.web.window?.performClose(nil) }
@@ -563,33 +666,37 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return host
     }
     private func openConversationWindow(_ id: String) {
-        guard validIdentifier(id), snapshot?.authenticated == true else { return }
+        openStandaloneWindow(StandaloneTarget(kind: .conversation, id: id))
+    }
+    private func openStandaloneWindow(_ target: StandaloneTarget) {
+        guard target.isValid, snapshot?.authenticated == true else { return }
+        let id = target.key
         NSApp.setActivationPolicy(.regular)
         if let window = conversationWindows[id] {
             if failedDocuments.contains(id) {
                 _ = windowShouldClose(window); window.close()
-                openConversationWindow(id); return
+                openStandaloneWindow(target); return
             }
             window.deminiaturize(nil); window.makeKeyAndOrderFront(nil); NSApp.activate()
             publishVisibility(); return
         }
         guard conversationWindows.count < 10 else {
-            showError("Close a conversation window before opening another (limit 10)."); return
+            showError("Close a window before opening another (limit 10)."); return
         }
-        guard let host = makeSecondaryDocument(surface: "conversation") else { return }
+        guard let host = makeSecondaryDocument(surface: target.surface) else { return }
         let window = NSWindow(contentRect: NSRect(x: 140, y: 140, width: 900, height: 780),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                               backing: .buffered, defer: false)
-        window.title = "Conversation — " + appName
+        window.title = target.title + " — " + appName
         window.titleVisibility = .hidden; window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = false
         window.appearance = mainWindow.appearance; window.backgroundColor = mainWindow.backgroundColor
         window.isReleasedWhenClosed = false; window.delegate = self
-        guard standalone.insert(id: id, window: window, host: host) else { host.invalidate(); return }
+        guard standalone.insert(target: target, window: window, host: host) else { host.invalidate(); return }
         let surface = WindowSurface(web: host.web, main: true)
         surface.layer?.backgroundColor = mainWindow.backgroundColor.cgColor
         window.contentView = surface
-        host.start(path: "/chat/\(id)?window=1")
+        host.start(path: target.path)
         clamp(window); window.makeKeyAndOrderFront(nil); NSApp.activate()
         publishVisibility()
     }
@@ -599,6 +706,7 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         compactWindow?.contentView = nil; compactWindow?.orderOut(nil)
         compactConversation = nil
         compactAgent = nil
+        compactFocusRequest = nil
         standalone.retireAll()
         failedDocuments.removeAll()
     }
@@ -674,9 +782,14 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             railDragOrigin = railPointerDown
         case "drag-move":
             guard let origin = railDragOrigin else { return }
-            positionRail(y: Self.railDragY(frameY: origin.frameY, pointerStartY: origin.pointerY,
-                                          currentPointerY: NSEvent.mouseLocation.y))
-        case "drag-end": railDragOrigin = nil; railPointerDown = nil
+            let pointer = NSEvent.mouseLocation
+            railPlacement.drag(pointer: pointer,
+                y: Self.railDragY(frameY: origin.frameY, pointerStartY: origin.pointerY, currentPointerY: pointer.y),
+                displays: railDisplays, size: railSize)
+            layoutRail()
+        case "drag-end":
+            if railDragOrigin != nil { handleRail("drag-move", agentId: nil, delta: nil) }
+            railDragOrigin = nil; railPointerDown = nil
         case "step":
             dismissCompact()
             if let y = railWindow?.frame.minY, let delta { positionRail(y: y - delta) }
@@ -684,28 +797,17 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
     private var railKey: String { "CognisRail-\(profile?.storageIdentifier.uuidString ?? "")" }
-    private func railScreen() -> NSScreen? {
-        let saved = defaults.string(forKey: railKey + "-display")
-        return NSScreen.screens.first { String(describing: $0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] ?? "") == saved }
-            ?? NSScreen.main ?? NSScreen.screens.first
-    }
+    private var railPlacement: DesktopRailPlacement { DesktopRailPlacement(defaults: defaults, key: railKey) }
+    private var railDisplays: [DesktopRailPlacement.Display] { NSScreen.screens.map(DesktopRailPlacement.display) }
     private func layoutRail() {
-        guard let screen = railScreen(), let railWindow else { return }
-        let visible = screen.visibleFrame
-        let ratio = defaults.object(forKey: railKey + "-vertical") as? Double ?? 0.5
-        let left = defaults.string(forKey: railKey + "-side") == "left"
-        let height = min(railSize.height, max(48, visible.height - 16))
-        let frame = NSRect(x: left ? visible.minX : visible.maxX - railSize.width,
-            y: visible.minY + 8 + max(0, visible.height - height - 16) * min(max(ratio, 0), 1),
-            width: railSize.width, height: height)
+        guard let screen = railPlacement.selected(in: railDisplays), let railWindow else { return }
+        let frame = railPlacement.frame(on: screen, size: railSize)
         if frame != railWindow.frame { railWindow.setFrame(frame, display: true) }
-        defaults.set(String(describing: screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] ?? ""), forKey: railKey + "-display")
         publishRailState()
     }
     private func positionRail(y: CGFloat) {
-        guard let screen = railScreen(), let railWindow else { return }
-        let range = max(1, screen.visibleFrame.height - railWindow.frame.height - 16)
-        defaults.set(min(max((y - screen.visibleFrame.minY - 8) / range, 0), 1), forKey: railKey + "-vertical")
+        guard let screen = railPlacement.selected(in: railDisplays) else { return }
+        railPlacement.move(y: y, on: screen, size: railSize)
         layoutRail()
     }
     @objc private func dockLeft() { dismissCompact(); defaults.set("left", forKey: railKey + "-side"); layoutRail() }
@@ -738,6 +840,16 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         settings?.close()
         settings = NativeSettingsWindow(railVisible: desktopVisible,
             left: defaults.string(forKey: railKey + "-side") == "left",
+            displays: NSScreen.screens.map { screen in
+                (id: DesktopRailPlacement.display(screen).id, name: screen.localizedName)
+            },
+            selectedDisplay: railPlacement.selected(in: railDisplays)?.id,
+            displayChanged: { [weak self] id in
+                guard let self, let display = self.railDisplays.first(where: { $0.id == id }) else { return }
+                self.dismissCompact()
+                self.railPlacement.select(display)
+                self.layoutRail()
+            },
             previews: defaults.object(forKey: "notificationPreviews") as? Bool ?? true,
             rail: { [weak self] in self?.toggleDesktop() },
             side: { [weak self] left in
@@ -746,7 +858,19 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
             },
             tuck: { [weak self] in self?.toggleRailTuck() },
             preview: { [weak self] in self?.toggleNotificationPreviews() },
-            notifications: { [weak self] in self?.showNotificationOptions() }, startup: login.menu())
+            notifications: { [weak self] in self?.showNotificationOptions() }, startup: login.menu(),
+            shortcut: HotKeyPreference.load(from: defaults), shortcutStatus: hotKey.status,
+            shortcutChanged: { [weak self] value in
+                guard let self else { return }
+                do { try HotKeyPreference.save(value, to: self.defaults) }
+                catch { self.showError("Could not save keyboard shortcut."); return }
+            },
+            shortcutRecording: { [weak self] recording in
+                guard let self else { return }
+                if recording { self.hotKey.unregister() }
+                else { self.hotKey.register(HotKeyPreference.load(from: self.defaults)) }
+                self.settings?.updateShortcutStatus(recording ? "Recording…" : self.hotKey.status)
+            })
         settings?.showWindow(nil)
         NSApp.activate()
     }
@@ -758,6 +882,9 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let menu = NSMenu()
         let quick = menu.addItem(withTitle: "New conversation", action: #selector(quickChat), keyEquivalent: "")
         quick.isEnabled = snapshot?.authenticated == true
+        let toggle = menu.addItem(withTitle: "Toggle panel — " + GlobalHotKey.label(HotKeyPreference.load(from: defaults)),
+            action: #selector(toggleLastPanel), keyEquivalent: "")
+        toggle.isEnabled = snapshot?.authenticated == true
         menu.addItem(.separator())
         for agent in snapshot?.agents ?? [] {
             let item = menu.addItem(withTitle: agent.name, action: #selector(agentSelected(_:)), keyEquivalent: "")
@@ -861,6 +988,9 @@ final class CompanionApp: NSObject, NSApplicationDelegate, NSWindowDelegate {
         openMain(); return true
     }
     func applicationWillTerminate(_ notification: Notification) {
+        hotKey.unregister()
+        NSAppleEventManager.shared().removeEventHandler(forEventClass: AEEventClass(kInternetEventClass),
+                                                       andEventID: AEEventID(kAEGetURL))
         guard statusItem != nil else { return }
         terminating = true
         notifications.invalidate()

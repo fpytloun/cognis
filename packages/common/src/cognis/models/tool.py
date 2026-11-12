@@ -724,7 +724,11 @@ class MCPOAuth2Config(BaseModel):
 class MCPAuthConfig(BaseModel):
     """MCP auth mode configuration."""
 
-    type: Literal["none", "static_headers", "oauth2"] = "none"
+    type: Literal["none", "static_headers", "oauth2", "credential_bearer"] = "none"
+    credential_ref: str | None = Field(
+        default=None, pattern=r"^\$credential:[A-Za-z0-9_-]+\.token$"
+    )
+    credential_agent_id: str | None = Field(default=None, min_length=1)
     issuer: str | None = None
     authorization_server: str | None = None
     resource: str | None = None
@@ -738,6 +742,17 @@ class MCPAuthConfig(BaseModel):
     dynamic_client_registration: bool = False
     client_metadata_document_url: str | None = None
     authorization_params: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_credential_binding(self) -> MCPAuthConfig:
+        if self.type == "credential_bearer":
+            if not self.credential_ref or not self.credential_agent_id:
+                raise ValueError(
+                    "Credential bearer auth requires credential_ref and credential_agent_id"
+                )
+        elif self.credential_ref is not None or self.credential_agent_id is not None:
+            raise ValueError("Credential binding fields require credential_bearer auth")
+        return self
 
 
 def effective_mcp_auth_config(
@@ -801,6 +816,8 @@ class MCPServerConfig(BaseModel):
                     "mcp_oauth_http_transport_required",
                     "OAuth is only supported for HTTP MCP transports",
                 )
+            if self.auth_config.type == "credential_bearer":
+                raise ValueError("Credential bearer auth requires an HTTP MCP transport")
             self.url = None
         elif self.transport in ("sse", "streamable_http"):
             if not self.url:
@@ -825,6 +842,21 @@ class MCPServerConfig(BaseModel):
                 "mcp_oauth_authorization_header_forbidden",
                 "Authorization headers are not allowed when OAuth is enabled",
             )
+        if self.auth_config.type == "credential_bearer":
+            from urllib.parse import urlsplit
+
+            parsed = urlsplit(self.url or "")
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                raise ValueError("Credential bearer auth requires an HTTPS URL without userinfo")
+            if mcp_headers_have_authorization(self.headers):
+                raise ValueError(
+                    "Authorization headers are not allowed with credential bearer auth"
+                )
         if self.auth_config.type == "oauth2":
             forbidden_params = _RESERVED_OAUTH_AUTHORIZATION_PARAMS.intersection(
                 {str(key).lower() for key in self.auth_config.authorization_params}
@@ -844,11 +876,15 @@ class MCPServerConfig(BaseModel):
 
 # Key used in executor config JSON for MCP server ID references.
 MCP_SERVER_IDS_KEY = "mcp_server_ids"
+MCP_CREDENTIAL_BINDING_PROTOCOL = "credential-bearer-v1"
 
 
 class ExecutorCapabilities(BaseModel):
     """Capabilities advertised by an executor."""
 
+    binary_transfers: bool = False
+    durable_tool_receipts: bool = False
+    mcp_credential_bindings: bool = False
     tools: list[str] = Field(default_factory=list)
     inference: bool = False
     local_inference: bool = False
@@ -881,6 +917,7 @@ class ExecutorConfig(BaseModel):
     """Configuration passed to an executor at spawn time."""
 
     executor_id: str
+    program_runtime_executor_id: str | None = None
     tools: list[ToolDefinition] = Field(default_factory=list)
     tool_handlers: dict[str, Any] = Field(default_factory=dict, exclude=True)
     mcp_servers: list[MCPServerConfig] = Field(default_factory=list)

@@ -26,6 +26,20 @@ class IdentityTests(unittest.TestCase):
                 info = plistlib.loads(path.read_bytes())
                 self.assertEqual(info["CFBundleName"], name)
                 self.assertEqual(info["CFBundleIdentifier"], bundle_id)
+                self.assertEqual(
+                    info.get("CFBundleURLTypes", []),
+                    []
+                    if flavor == "acceptance"
+                    else [
+                        {
+                            "CFBundleURLName": bundle_id,
+                            "CFBundleURLSchemes": [
+                                "cognis" if flavor == "standard" else "cognis-preview"
+                            ],
+                            "CFBundleTypeRole": "Viewer",
+                        }
+                    ],
+                )
                 self.assertEqual(info["CognisBuildIdentity"]["flavor"], flavor)
                 self.assertEqual("CognisAcceptanceOrigin" in info, flavor == "acceptance")
             for flavor in ("preview", "acceptance"):

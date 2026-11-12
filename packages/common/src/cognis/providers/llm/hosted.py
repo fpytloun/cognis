@@ -8,7 +8,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
+from cognis.models.speech import speech_streaming_capabilities
+
 PROVIDER_BASES = {
+    "elevenlabs": "https://api.elevenlabs.io",
     "groq": "https://api.groq.com/openai/v1",
     "openrouter": "https://openrouter.ai/api/v1",
     "gemini": "https://generativelanguage.googleapis.com",
@@ -128,6 +131,41 @@ async def discover_hosted_models(
 ) -> list[dict[str, Any]]:
     """Return provider model records; Gemini catalogs are paginated."""
     base = base_url or PROVIDER_BASES[preset]
+    if preset == "elevenlabs":
+        transcription_models = (
+            ("scribe_v1", "Scribe v1"),
+            ("scribe_v2", "Scribe v2"),
+            ("scribe_v2_realtime", "Scribe v2 Realtime"),
+        )
+        transcription_ids = {model_id for model_id, _ in transcription_models}
+        response = await client.get(api_endpoint(base, "models"), headers={"xi-api-key": api_key})
+        response.raise_for_status()
+        return [
+            {
+                "id": item["model_id"],
+                "display_name": item.get("name", item["model_id"]),
+                "supports_speech_synthesis": True,
+                "model_mode": "audio_speech",
+                "supports_tools": False,
+                "supports_streaming": False,
+            }
+            for item in response.json()
+            if item.get("can_do_text_to_speech")
+            and item.get("model_id")
+            and item["model_id"] not in transcription_ids
+        ] + [
+            {
+                "id": model_id,
+                "display_name": display_name,
+                "supports_transcription": True,
+                "supports_speech_synthesis": False,
+                "supports_audio_input": True,
+                "model_mode": "audio_transcription",
+                "supports_tools": False,
+                "supports_streaming": speech_streaming_capabilities("elevenlabs", model_id).stt,
+            }
+            for model_id, display_name in transcription_models
+        ]
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     if preset == "gemini":
         headers = {"x-goog-api-key": api_key} if api_key else {}

@@ -8,6 +8,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from cognis.providers.llm.hosted import PROVIDER_BASES, api_endpoint, systemone_provider_preset
+from cognis.providers.llm.usage_binding import UsageBinding
 
 
 class SystemOneResponseError(ValueError):
@@ -155,6 +156,7 @@ async def request_systemone(
     api_key: str,
     timeout: float,
     extra_headers: dict[str, str] | None = None,
+    usage_binding: UsageBinding | None = None,
 ) -> dict[str, Any]:
     """Evaluate once without text-generation fallbacks or implicit retries."""
     transport_preset = systemone_provider_preset(preset, base_url)
@@ -164,10 +166,35 @@ async def request_systemone(
         raise ValueError("System One credentials unavailable")
     headers = {**(extra_headers or {}), "Authorization": f"Bearer {api_key}"}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(
-            api_endpoint(base_url or PROVIDER_BASES[transport_preset], "systemone"),
-            headers=headers,
-            json=payload.model_dump(mode="json", exclude_none=True),
+        attempt = (
+            usage_binding.begin(
+                operation="systemone",
+                streaming=False,
+                parameters={"model": payload.model},
+                # System One reports OpenAI-shaped usage counters.
+                semantic_profile="openai",
+            )
+            if usage_binding is not None
+            else None
         )
-        response.raise_for_status()
-        return validate_systemone_response(response.json(), payload)
+        try:
+            response = await client.post(
+                api_endpoint(base_url or PROVIDER_BASES[transport_preset], "systemone"),
+                headers=headers,
+                json=payload.model_dump(mode="json", exclude_none=True),
+            )
+            response.raise_for_status()
+            data = response.json()
+            if attempt is not None:
+                attempt.observe(data, generated=False)
+            result = validate_systemone_response(data, payload)
+            if usage_binding is not None:
+                usage_binding.request.mark_generated()
+            return result
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.finish(error=exc)
+            raise
+        finally:
+            if attempt is not None:
+                attempt.finish()

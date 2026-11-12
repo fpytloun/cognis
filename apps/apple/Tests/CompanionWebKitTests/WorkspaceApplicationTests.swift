@@ -435,16 +435,22 @@ final class WorkspaceApplicationTests: XCTestCase {
             let host = try BundleWebView(profile: profile, root: root, surface: "conversation")
             let window = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false; window.contentView = host.web
-            XCTAssertTrue(registry.insert(id: "conversation-\(i)", window: window, host: host))
+            let kind: StandaloneTarget.Kind = i == 1 ? .project : i == 2 ? .deliverable : .conversation
+            let target = StandaloneTarget(kind: kind, id: "conversation-\(i)")
+            XCTAssertTrue(registry.insert(target: target, window: window, host: host))
+            XCTAssertEqual(registry.target(id: target.key), target)
+            XCTAssertFalse(registry.insert(target: target, window: window, host: host))
         }
         let host = try BundleWebView(profile: profile, root: root, surface: "conversation")
         let window = NSWindow(contentRect: .zero, styleMask: [], backing: .buffered, defer: false)
-        XCTAssertFalse(registry.insert(id: "overflow", window: window, host: host))
+        XCTAssertFalse(registry.insert(target: StandaloneTarget(kind: .project, id: "overflow"), window: window, host: host))
         host.invalidate()
         let retired = registry.hosts["conversation-0"]!
         registry.retire(id: "conversation-0")?.close()
         XCTAssertNil(retired.web.superview); XCTAssertNil(retired.web.navigationDelegate)
         XCTAssertNil(retired.onMessage); XCTAssertEqual(registry.count, 9)
         registry.retireAll(); XCTAssertEqual(registry.count, 0)
+        XCTAssertNil(registry.target(id: "project:conversation-1"))
+        XCTAssertNil(registry.target(id: "deliverable:conversation-2"))
     }
 }

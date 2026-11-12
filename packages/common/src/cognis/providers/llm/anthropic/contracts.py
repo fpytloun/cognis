@@ -24,7 +24,7 @@ MAX_ENVELOPE_BLOCKS = 256
 # `cognis.providers.llm.anthropic_subscription.CLAUDE_CODE_VERSION`;
 # `tests/unit/providers/llm/anthropic/test_integration.py` enforces that both
 # produce the same user agent.
-CLAUDE_CODE_VERSION = "2.1.293"
+CLAUDE_CODE_VERSION = "2.1.321"
 
 
 class AnthropicProtocol(StrEnum):

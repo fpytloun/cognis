@@ -25,6 +25,7 @@ class MidStreamErrorCategory(StrEnum):
     IDLE_TIMEOUT_ACTIVITY = "idle_timeout_activity"
     IDLE_TIMEOUT_REASONING = "idle_timeout_reasoning"
     CONTENT_POLICY = "content_policy"
+    AUTHENTICATION = "authentication"
     REASONING_SUMMARY_REJECTED = "reasoning_summary_rejected"
     PROTOCOL = "protocol"
     OTHER = "other"
@@ -75,6 +76,7 @@ class MidStreamErrorPayload(TypedDict, total=False):
     artifact_urls: list[str]
     artifact_ids: list[str]
     param: str | None
+    provider_id: str | None
 
 
 class LLMStreamFailure(RuntimeError):
@@ -111,6 +113,42 @@ class LLMStreamIdleTimeout(TimeoutError, LLMStreamFailure):
 
 class LLMStreamProviderError(LLMStreamFailure):
     """Raised when an LLM stream fails at the provider layer."""
+
+
+REAUTHORIZATION_REQUIRED_CODE = "reauthorization_required"
+
+
+class ProviderReauthorizationRequired(LLMStreamProviderError):
+    """Provider credentials were rejected and only the user can renew them.
+
+    Retrying cannot succeed until the user completes the provider OAuth flow
+    again, so recovery must surface this instead of retrying the same target.
+    """
+
+    def __init__(
+        self,
+        *,
+        provider_id: str,
+        provider_label: str | None = None,
+        never_authorized: bool = False,
+    ) -> None:
+        self.provider_id = provider_id
+        label = provider_label or provider_id
+        message = (
+            f"{label} is not authorized yet. Authorize the provider in Settings > Providers."
+            if never_authorized
+            else f"{label} sign-in expired or was revoked. Reauthorize the provider in "
+            "Settings > Providers."
+        )
+        super().__init__(
+            message,
+            payload={
+                "category": MidStreamErrorCategory.AUTHENTICATION.value,
+                "code": REAUTHORIZATION_REQUIRED_CODE,
+                "message": message,
+                "provider_id": provider_id,
+            },
+        )
 
 
 class OpenAIToolSearchFallbackRequired(RuntimeError):

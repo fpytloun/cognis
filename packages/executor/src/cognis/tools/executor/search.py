@@ -210,9 +210,12 @@ async def _glob_with_fd(base: Path, pattern: str) -> ToolResult | None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
     except OSError:
         return None
+    try:
+        stdout, stderr = await process.communicate()
+    finally:
+        await _stop_search_process(process)
 
     if process.returncode not in {0, 1}:
         error = stderr.decode("utf-8", errors="replace").strip()
@@ -224,6 +227,19 @@ async def _glob_with_fd(base: Path, pattern: str) -> ToolResult | None:
         if line and Path(line).is_file()
     ]
     return _format_glob_results(base, matches)
+
+
+async def _stop_search_process(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.terminate()
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=1)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await process.communicate()
 
 
 async def _glob_with_python(base: Path, pattern: str) -> ToolResult:
@@ -298,9 +314,12 @@ async def _grep_with_rg(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
     except OSError:
         return None
+    try:
+        stdout, stderr = await process.communicate()
+    finally:
+        await _stop_search_process(process)
 
     if process.returncode not in {0, 1}:
         error = stderr.decode("utf-8", errors="replace").strip()

@@ -353,21 +353,6 @@ class LSPManager:
                 client = None
 
             if client is None:
-                # Check concurrent server limit
-                if len(self._clients) >= self.max_concurrent_servers:
-                    logger.debug(
-                        "lsp: concurrent server limit reached",
-                        extra={
-                            "extra_data": {
-                                "server_id": server_def.server_id,
-                                "active": len(self._clients),
-                                "max": self.max_concurrent_servers,
-                            }
-                        },
-                    )
-                    LSP_SPAWN_REJECTED.inc()
-                    continue
-
                 # Dedup concurrent spawns
                 if client_key in self._spawning:
                     spawn_task = self._spawning[client_key]
@@ -376,6 +361,22 @@ class LSPManager:
                         extra={"extra_data": {"client_key": client_key}},
                     )
                 else:
+                    # Reserve starts before their first await; reuse needs no new slot.
+                    occupied_slots = len(self._clients.keys() | self._spawning.keys())
+                    if occupied_slots >= self.max_concurrent_servers:
+                        logger.debug(
+                            "lsp: concurrent server limit reached",
+                            extra={
+                                "extra_data": {
+                                    "server_id": server_def.server_id,
+                                    "active": len(self._clients),
+                                    "starting": len(self._spawning),
+                                    "max": self.max_concurrent_servers,
+                                }
+                            },
+                        )
+                        LSP_SPAWN_REJECTED.inc()
+                        continue
                     spawn_task = asyncio.create_task(
                         self._spawn_client(server_def, root_path, client_key)
                     )

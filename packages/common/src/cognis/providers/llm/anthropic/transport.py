@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -40,6 +41,8 @@ from cognis.providers.llm.errors import (
     is_deterministic_client_error_status,
     retry_after_seconds_from_headers,
 )
+from cognis.providers.llm.usage_binding import UsageBinding
+from cognis.providers.llm.usage_capture import UsageAttempt
 from cognis.tools.argument_aliases import reverse_tool_argument_aliases
 
 CredentialResolver = Callable[[str], Awaitable[str]]
@@ -887,35 +890,48 @@ class AnthropicMessagesClient:
         *,
         provider_fingerprint: str,
         model_fingerprint: str,
+        usage_binding: UsageBinding | None = None,
     ) -> dict[str, Any]:
         """Execute a non-streaming request and produce native-compatible chat data."""
 
         payload = _payload(context, request, bundle, stream=False)
-        response, owned_client = await self._request(
+        response, owned_client, attempt = await self._request(
             context,
             payload,
             request=request,
+            usage_binding=usage_binding,
         )
         try:
             await response.aread()
             data = response.json()
+            if attempt is not None:
+                attempt.observe(data, generated=False)
+            if not isinstance(data, dict):
+                raise AnthropicTransportError("Anthropic Messages response must be an object")
+            if data.get("type") == "error":
+                raise _provider_error(data, event_type="response")
+            envelope = _envelope_from_message(
+                data,
+                bundle=bundle,
+                provider_fingerprint=provider_fingerprint,
+                model_fingerprint=model_fingerprint,
+                thinking_fingerprint=context.thinking_fingerprint,
+            )
+            envelope = seal_thinking_replay(envelope, context, payload)
+            result = _chat_response(data, context.model, envelope, bundle)
+            if usage_binding is not None:
+                usage_binding.request.mark_generated()
+            return result
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.finish(error=exc)
+            raise
         finally:
             await response.aclose()
             if owned_client is not None:
                 await owned_client.aclose()
-        if not isinstance(data, dict):
-            raise AnthropicTransportError("Anthropic Messages response must be an object")
-        if data.get("type") == "error":
-            raise _provider_error(data, event_type="response")
-        envelope = _envelope_from_message(
-            data,
-            bundle=bundle,
-            provider_fingerprint=provider_fingerprint,
-            model_fingerprint=model_fingerprint,
-            thinking_fingerprint=context.thinking_fingerprint,
-        )
-        envelope = seal_thinking_replay(envelope, context, payload)
-        return _chat_response(data, context.model, envelope, bundle)
+            if attempt is not None:
+                attempt.finish()
 
     async def stream(
         self,
@@ -925,14 +941,16 @@ class AnthropicMessagesClient:
         *,
         provider_fingerprint: str,
         model_fingerprint: str,
+        usage_binding: UsageBinding | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Execute a streaming request, closing response/client on cancellation."""
 
         payload = _payload(context, request, bundle, stream=True)
-        response, owned_client = await self._request(
+        response, owned_client, attempt = await self._request(
             context,
             payload,
             request=request,
+            usage_binding=usage_binding,
         )
         decoder = AnthropicStreamDecoder(
             bundle=bundle,
@@ -942,6 +960,8 @@ class AnthropicMessagesClient:
         )
         try:
             async for event in decode_sse(response.aiter_lines()):
+                if attempt is not None:
+                    attempt.observe(event)
                 for chunk in decoder.feed(event):
                     yield chunk
             envelope = seal_thinking_replay(decoder.envelope(), context, payload)
@@ -949,10 +969,16 @@ class AnthropicMessagesClient:
                 "anthropic_native_envelope": envelope.to_dict(),
                 "anthropic_native_events": [{"type": "message_stop"}],
             }
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.finish(error=exc)
+            raise
         finally:
             await response.aclose()
             if owned_client is not None:
                 await owned_client.aclose()
+            if attempt is not None:
+                attempt.finish()
 
     async def _request(
         self,
@@ -960,7 +986,8 @@ class AnthropicMessagesClient:
         payload: Mapping[str, Any],
         *,
         request: Mapping[str, Any],
-    ) -> tuple[Any, Any | None]:
+        usage_binding: UsageBinding | None = None,
+    ) -> tuple[Any, Any | None, UsageAttempt | None]:
         if context.credential_ref is None:
             raise ValueError("Anthropic Messages transport requires credential_ref")
         credential = await self._credential_resolver(context.credential_ref)
@@ -971,15 +998,27 @@ class AnthropicMessagesClient:
             )
         owned_client = self._http_client if self._close_http_client else None
         client = self._http_client
+        attempt: UsageAttempt | None = None
         try:
             http_request = client.build_request(
                 "POST", _request_endpoint(context), headers=headers, json=payload
             )
+            if usage_binding is not None:
+                attempt = usage_binding.begin(
+                    operation="native",
+                    streaming=payload.get("stream") is True,
+                    parameters=payload,
+                    semantic_profile="anthropic",
+                )
             response = await client.send(http_request, stream=True)
+            if attempt is not None:
+                attempt.observe({"request_id": response.headers.get("request-id")}, generated=False)
             if self._on_response_headers is not None:
                 # Rate-limit headers are non-secret and arrive on every
                 # response, including 429s, so report them before raising.
-                self._on_response_headers(dict(response.headers))
+                # Observation failure must not become an inference retry.
+                with suppress(Exception):
+                    self._on_response_headers(dict(response.headers))
             if response.status_code >= 400:
                 body: dict[str, Any] = {}
                 try:
@@ -997,12 +1036,16 @@ class AnthropicMessagesClient:
                     status_code=response.status_code,
                     retry_after_seconds=retry_after_seconds_from_headers(response.headers),
                 )
-            return response, owned_client
-        except Exception as exc:
-            if isinstance(exc, AnthropicTransportError):
-                raise
+            return response, owned_client, attempt
+        except BaseException as exc:
+            if attempt is not None:
+                attempt.finish(error=exc)
             if owned_client is not None:
                 await owned_client.aclose()
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, AnthropicTransportError):
+                raise
             raise AnthropicTransportError(
                 "Anthropic Messages transport request failed",
                 payload=classify_llm_exception(exc),
