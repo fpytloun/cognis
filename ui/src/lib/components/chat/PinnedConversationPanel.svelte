@@ -8,14 +8,25 @@
   import Search from 'lucide-svelte/icons/search';
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
   import ChatWorkspace from '$lib/components/chat-v2/ChatWorkspace.svelte';
+  import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
   import PinnedConversationPicker from './PinnedConversationPicker.svelte';
   import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import type { PinnedPanel } from './pinned-panel.svelte';
 
-  let { panel, controls, onMinimize, onOpenFull }:
-    { panel: PinnedPanel; controls?: Snippet; onMinimize: () => void; onOpenFull?: (path: string) => void } = $props();
+  let { panel, controls, onMinimize, onOpenFull, composerFocusRequest = null }:
+    { panel: PinnedPanel; controls?: Snippet; onMinimize: () => void; onOpenFull?: (path: string) => void;
+      composerFocusRequest?: string | null } = $props();
   const net = useSectionConnectivity({ hasError: () => Boolean(panel.error),
     retry: () => panel.selected ? panel.select(panel.selected) : undefined });
+  let workspace: ChatWorkspace | undefined = $state();
+  let inspectorToggleContainer: HTMLSpanElement | undefined = $state();
+  const inspectorState = $derived(workspace?.getInspectorState());
+
+  function inspectorStateChanged(open: boolean): void {
+    if (!open && document.activeElement?.closest('[data-dashboard-conversation-inspector-overlay]')) {
+      void tick().then(() => inspectorToggleContainer?.querySelector('button')?.focus({ preventScroll: true }));
+    }
+  }
 </script>
 
 <div class="flex h-full min-h-0 flex-col overflow-hidden rounded-2xl border border-control-border bg-surface text-foreground shadow-2xl"
@@ -36,8 +47,8 @@
     <button type="button" class="rounded-lg p-2 text-muted hover:bg-danger-subtle hover:text-danger"
       aria-label="Unpin agent" title="Unpin agent and all its chats" onclick={panel.unpinAgent}><X class="h-4 w-4" /></button>
   </header>
-  <div class="flex shrink-0 border-b border-separator">
-    <div class="flex min-w-0 flex-1 gap-1 overflow-x-auto p-2" role="tablist" aria-label="Pinned conversations">
+  <div class="chat-header-shell flex shrink-0 border-b border-separator">
+    <div class="flex min-w-0 gap-1 overflow-x-auto p-2" role="tablist" aria-label="Pinned conversations">
       {#each panel.group?.entries ?? [] as entry (entry.window.key)}
         {@const home = entry.window.key.startsWith('home:')}
         <div class="flex max-w-[220px] shrink-0 items-center rounded-lg border border-transparent" class:bg-accent-subtle={entry.window.key === panel.selectedKey && !panel.picker}>
@@ -70,6 +81,13 @@
       <button type="button" id="pinned-search-action" aria-controls="pinned-chat-content" aria-label="Find conversation" title="Recent conversations" aria-pressed={panel.picker}
         class="rounded-lg p-2 text-muted hover:bg-surface-hover hover:text-strong" class:bg-accent-subtle={panel.picker} onclick={() => { panel.picker = !panel.picker; }}><Search class="h-4 w-4" /></button>
     </div>
+    {#if panel.selectedId && panel.conversation && !panel.picker}
+      <span bind:this={inspectorToggleContainer} class="ml-auto mr-2 inline-flex shrink-0 items-center">
+        <SessionDetailsButton open={inspectorState?.open ?? false}
+          ariaControls={inspectorState?.controlsId ?? ''} testId="pinned-chat-inspector-toggle"
+          onclick={() => { void workspace?.toggleInspector(); }} />
+      </span>
+    {/if}
   </div>
   <div id="pinned-chat-content" role="tabpanel" aria-labelledby={panel.picker ? 'pinned-search-action' : `pinned-tab-${panel.selectedKey}`}
     class="flex min-h-0 flex-1 flex-col">
@@ -79,7 +97,9 @@
     {:else if panel.error}<div class="m-auto p-4 text-sm text-danger" role="alert">{panel.error}<button class="ml-2 text-accent hover:text-accent-hover" onclick={() => { if (panel.selected) void panel.select(panel.selected); }}>Retry</button></div>
     {:else if panel.selectedId && panel.conversation}
       {#key panel.selectedId}
-        <ChatWorkspace conversationId={panel.selectedId} agent={panel.group?.agent ?? null} inspectorOpen={false}
+        <ChatWorkspace bind:this={workspace} conversationId={panel.selectedId} agent={panel.group?.agent ?? null} inspectorOpen={false}
+          inspectorControlInHeader {composerFocusRequest}
+          onInspectorStateChange={inspectorStateChanged}
           sessionId={panel.conversation.active_session_id ?? ''} agents={panel.group?.agent ? [panel.group.agent] : []}
           conversation={panel.conversation} readOnly={Boolean(panel.conversation.is_readonly_for_caller)}
           onInitialLoaded={panel.loaded} onSent={() => { if (panel.selectedId) void panel.refresh(panel.selectedId); }} onCommandResponse={panel.command} />

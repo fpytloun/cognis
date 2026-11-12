@@ -6,7 +6,7 @@
   import Button from '$lib/components/ui/Button.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import { api, asApiError } from '$lib/api/client';
-  import { confirmAction } from '$lib/stores/confirm';
+  import { confirmCancel, confirmNewRun, confirmPause } from '$lib/task-actions';
   import type { QuestionSetAnswer, TaskComment, TaskDetail } from '$lib/types/api';
 
   type ActivePause = NonNullable<TaskDetail['pending_pause']>;
@@ -99,6 +99,7 @@
 
   async function pause(): Promise<void> {
     if (!canMutate || busyAction || !['running', 'evaluating'].includes(task.status)) return;
+    if (!(await confirmPause())) return;
     const startedTask = task;
     const startedRevision = taskRevision();
     begin('pause');
@@ -135,13 +136,7 @@
 
   async function cancel(): Promise<void> {
     if (!canMutate || busyAction || !cancellable) return;
-    const confirmed = await confirmAction({
-      title: 'Cancel task?',
-      message: 'The current task run will stop. Completed task output remains available.',
-      confirmLabel: 'Cancel task',
-      variant: 'danger'
-    });
-    if (!confirmed) return;
+    if (!(await confirmCancel())) return;
     const startedTask = task;
     const startedRevision = taskRevision();
     begin('cancel');
@@ -160,6 +155,7 @@
 
   async function rerun(): Promise<void> {
     if (!canMutate || busyAction || !rerunnable) return;
+    if (task.status !== 'paused' && !(await confirmNewRun(task.status))) return;
     const startedTask = task;
     const startedRevision = taskRevision();
     begin('rerun');
@@ -307,14 +303,14 @@
         {:else if task.status === 'paused' && task.pending_pause}
           <Button size="sm" disabled>Resolve the pending request to resume</Button>
         {/if}
-        {#if cancellable}
-          <Button size="sm" variant="danger" disabled={busyAction !== null} onclick={() => void cancel()}>
-            {busyAction === 'cancel' ? 'Cancelling…' : 'Cancel task'}
+        {#if rerunnable && task.status !== 'paused'}
+          <Button size="sm" variant="secondary" disabled={busyAction !== null} onclick={() => void rerun()}>
+            {busyAction === 'rerun' ? 'Starting…' : 'Start a new run'}
           </Button>
         {/if}
-        {#if rerunnable}
-          <Button size="sm" disabled={busyAction !== null} onclick={() => void rerun()}>
-            {busyAction === 'rerun' ? 'Starting…' : 'Re-run task'}
+        {#if cancellable}
+          <Button class="ml-auto" size="sm" variant="ghost" disabled={busyAction !== null} onclick={() => void cancel()}>
+            <span class="text-danger">{busyAction === 'cancel' ? 'Cancelling…' : 'Cancel task'}</span>
           </Button>
         {/if}
       </div>

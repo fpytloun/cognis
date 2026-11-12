@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { WorkstreamRef } from '$lib/chat-v2/types';
 import type { ChatSnapshot } from '$lib/chat-v2/types';
+import type { Conversation } from '$lib/types/api';
 import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
 import ChildChatView from './ChildChatView.svelte';
 
@@ -39,6 +40,9 @@ describe('ChildChatView', () => {
               id: 'todo:child', kind: 'todo_state', sort_key: '0001',
               source_refs: [], stable: true,
               todos: [{ content: 'Inspect child output', status: 'in_progress', priority: 'normal' }],
+            }, {
+              id: 'message:child', kind: 'message', sort_key: '0002',
+              source_refs: [], stable: true, role: 'assistant', content: 'Child content',
             }],
             has_more_before: false, before_cursor: null,
           },
@@ -77,11 +81,21 @@ describe('ChildChatView', () => {
     expect(onBack).toHaveBeenCalledOnce();
     expect(screen.getByRole('link', { name: 'Back to parent conversation' })).toHaveAttribute('href', '/chat/root');
     expect(screen.getByRole('link', { name: 'Back to parent conversation' })).not.toHaveTextContent('Parent');
-    await fireEvent.click(screen.getByRole('button', { name: 'Close child conversation' }));
-    expect(onClose).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: 'Close child conversation' })).not.toBeInTheDocument();
+    await screen.findByText('Child content');
+    await fireEvent.click(screen.getByRole('button', { name: 'Search in conversation' }));
+    const search = await screen.findByPlaceholderText('Search loaded subsession history');
+    await fireEvent.input(search, { target: { value: 'Child content' } });
+    await fireEvent.keyDown(search, { key: 'Escape' });
+    expect(screen.queryByPlaceholderText('Search loaded subsession history')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Search in conversation' })).toHaveFocus();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(onBack).toHaveBeenCalledOnce();
     await waitFor(() => expect(screen.getByRole('button', { name: /Ongoing work/ })).toBeTruthy());
     await fireEvent.click(screen.getByRole('button', { name: /Ongoing work/ }));
-    expect(screen.getAllByText('Inspect child output').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Inspect child output')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: /Ongoing work/ }).closest('footer'))
+      .toBe(screen.getByTestId('child-footer'));
   });
 
   it('forwards runtime activity and clears it on unmount', async () => {
@@ -166,7 +180,7 @@ describe('ChildChatView', () => {
     expect(screen.queryByText('Following latest')).toBeNull();
   });
 
-  it('renders a managed new-window link without changing existing child controls', async () => {
+  it('shows the conversation title, inline agent identity and only Search/Info actions', () => {
     const onViewSession = vi.fn();
     render(ChildChatView, {
       view: {
@@ -177,6 +191,7 @@ describe('ChildChatView', () => {
         nodeKey: 'child',
       },
       node: { ...node, kind: 'managed', conversation_id: 'managed/conversation' },
+      managedConversation: { conversation_id: 'managed/conversation', title: 'Actual target conversation title' } as Conversation,
       preferences: DEFAULT_USER_PREFERENCES,
       inspectorOpen: true,
       onBack: vi.fn(),
@@ -184,14 +199,38 @@ describe('ChildChatView', () => {
       onToggleInspector: vi.fn(),
       onViewSession,
     });
-    const link = screen.getByRole('link', { name: 'Open Child session in new window' });
-    expect(link).toHaveAttribute('href', '/chat/managed%2Fconversation');
-    expect(link).toHaveAttribute('target', '_blank');
-    expect(link).toHaveAttribute('rel', 'noopener noreferrer');
-    await fireEvent.click(link);
+    expect(screen.getByRole('heading', { name: 'Actual target conversation title' })).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /in new window/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy canonical session ID' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('child-header').querySelectorAll('button')).toHaveLength(2);
     expect(onViewSession).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Toggle session details' })).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByRole('button', { name: 'Close child conversation' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Search in conversation' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Close child conversation' })).not.toBeInTheDocument();
+  });
+
+  it('restores the root parent through the host and keeps running progress in the footer', async () => {
+    const onClose = vi.fn();
+    const onBack = vi.fn();
+    render(ChildChatView, {
+      view: {
+        kind: 'managed', conversationId: 'managed-child', sessionId: 'session-child',
+        controllerRootConversationId: 'root', nodeKey: 'child',
+      },
+      node: { ...node, kind: 'managed', conversation_id: 'managed-child', execution_state: 'running' },
+      managedConversation: {
+        conversation_id: 'managed-child', has_active_turn: true,
+        managed_agent: { controller_conversation_id: 'root', conversation_state: 'open', turn_state: 'running' },
+      } as Conversation,
+      preferences: DEFAULT_USER_PREFERENCES, inspectorOpen: false,
+      onBack, onClose, onToggleInspector: vi.fn(), onViewSession: vi.fn(),
+      onManagedStop: vi.fn(), onManagedSend: vi.fn(), onManagedTakeControl: vi.fn(),
+    });
+    expect(screen.getByTestId('managed-running-indicator')).toHaveTextContent(/^running$/);
+    expect(screen.queryByTestId('timeline-running-indicator')).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('link', { name: 'Parent conversation' }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onBack).not.toHaveBeenCalled();
   });
 
   it('does not render a new-window link for a delegate child', () => {

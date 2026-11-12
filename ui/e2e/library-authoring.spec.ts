@@ -7,20 +7,21 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
   let current: LibraryItem = { ...libraryCatalog[7], id: 'art_authoring_config', title: mime === 'text/html' ? 'page.html' : mime === 'text/markdown' ? 'report.md' : 'config.json', format: mime, revision: 1 };
   if (filename) current.title = filename;
   let content = source ?? (mime === 'text/html' ? '<h1>Page preview</h1>' : '{"ready":true}');
-  const htmlPreviewPath = '/api/v1/artifacts/view/art_authoring_config/authoring/page.html';
-  const previewUrl = mime === 'text/html'
-    ? `${htmlPreviewPath}?exp=4102444800&sig=${'a'.repeat(64)}`
-    : '/authoring-preview';
   let explicit = false;
+  let explicitWrite = false;
   await page.route('**/api/v1/library/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const method = route.request().method();
     if (path.endsWith('/agents')) return route.fulfill({ json: [{ agent_id: 'agent_authoring', name: 'LaForge', explicit: false, inherited: false }, { agent_id: 'agent_mira', name: 'Mira', explicit: false, inherited: false }] });
     if (path.endsWith('/sharing')) {
-      if (method === 'PUT') explicit = route.request().postDataJSON().agent_ids.includes('agent_mira');
+      if (method === 'PUT') {
+        const body = route.request().postDataJSON();
+        explicit = body.agent_ids.includes('agent_mira');
+        explicitWrite = body.write_agent_ids.includes('agent_mira');
+      }
       return route.fulfill({ json: { agents: [
-        { agent_id: 'agent_authoring', name: 'LaForge', explicit: false, inherited: true },
-        { agent_id: 'agent_mira', name: 'Mira', explicit, inherited: false },
+        { agent_id: 'agent_authoring', name: 'LaForge', explicit: false, inherited: true, inherited_permission: 'write', inherited_sources: ['owner'] },
+        { agent_id: 'agent_mira', name: 'Mira', explicit, inherited: false, explicit_permission: explicit ? explicitWrite ? 'write' : 'read' : null },
       ], project_id: null, owner_agent_id: 'agent_authoring' } });
     }
     if (path.endsWith('/public-link')) return route.fulfill({ json: { url: 'https://cognis.test/shared/config', mode: route.request().postDataJSON().mode, expires_at: '2026-11-01T00:00:00Z' } });
@@ -46,7 +47,7 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
   });
   await page.route('**/api/v1/artifacts/**', (route) => {
     const path = new URL(route.request().url()).pathname;
-    if (path.endsWith('/signed-url')) return route.fulfill({ json: { url: previewUrl, mode: 'view' } });
+    if (path.endsWith('/signed-url')) return route.fulfill({ json: { url: '/authoring-preview', mode: 'view' } });
     if (path.endsWith('/text-preview')) {
       if (mime === 'text/html') return route.fulfill({ status: 415, json: { error: { message: 'HTML cannot be previewed as text' } } });
       return route.fulfill({ json: { content, truncated: false, rich_payload: richPayload } });
@@ -55,8 +56,6 @@ async function authoringFixture(page: Page, mime = 'application/json', source?: 
     return route.fallback();
   });
   await page.route('**/authoring-preview', (route) => route.fulfill({ contentType: mime, body: content }));
-  await page.route((url) => url.pathname === htmlPreviewPath, (route) =>
-    route.fulfill({ contentType: mime, body: content }));
 }
 
 test('Markdown renders on open, after cancel and after saving without entering preview mode', async ({ page }) => {
@@ -185,21 +184,59 @@ test('edit JSON in the same pane, validate, preview, cancel and save a new revis
   const access = page.getByRole('dialog', { name: 'Share with agents', exact: true });
   await expect(access.getByRole('button', { name: 'Share with LaForge' })).toBeDisabled();
   await access.getByRole('button', { name: 'Share with Mira' }).click();
+  await access.getByRole('combobox', { name: 'Explicit permission for Mira' }).selectOption('write');
   await page.screenshot({ path: test.info().outputPath('agent-avatar-selection.png'), fullPage: true });
   await access.getByRole('button', { name: 'Save agent access' }).click();
   await expect(access).toHaveCount(0);
-  await expect(modal.getByLabel('Mira · Shared', { exact: true })).toBeVisible();
-  const share = modal.getByRole('button', { name: 'Share public link' });
+  await expect(modal.getByLabel('Mira · Explicit: read + write', { exact: true })).toBeVisible();
+  await modal.getByRole('button', { name: 'Manage agent access' }).click();
+  await expect(access.getByRole('combobox', { name: 'Explicit permission for Mira' })).toHaveValue('write');
+  await access.getByRole('combobox', { name: 'Explicit permission for Mira' }).selectOption('read');
+  await access.getByRole('button', { name: 'Save agent access' }).click();
+  await expect(modal.getByLabel('Mira · Explicit: read', { exact: true })).toBeVisible();
+  const share = modal.getByRole('button', { name: 'Share link' });
   const before = await share.evaluate((node) => getComputedStyle(node).color);
   await share.hover();
   await expect.poll(() => share.evaluate((node) => getComputedStyle(node).color)).not.toBe(before);
   await share.click();
-  const publicDialog = page.getByRole('dialog', { name: 'Public link', exact: true });
+  const publicDialog = page.getByRole('dialog', { name: 'Share link', exact: true });
+  await expect(publicDialog.getByRole('combobox', { name: 'Link access and expiration' })).toHaveValue('private');
+  await publicDialog.getByRole('combobox', { name: 'Link access and expiration' }).selectOption('7');
   await expect(publicDialog.getByRole('combobox', { name: 'Link behavior' })).toHaveValue('view');
   await expect(publicDialog.getByText('Agent access', { exact: true })).toHaveCount(0);
   await publicDialog.getByRole('button', { name: 'Create public link' }).click();
   await expect(publicDialog.getByRole('textbox', { name: 'Public link URL', exact: true })).toHaveValue('https://cognis.test/shared/config');
   await page.screenshot({ path: test.info().outputPath('artifact-sharing.png'), fullPage: true });
+});
+
+test.describe('phone document permissions', () => {
+  test.use({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+
+  test('write access persists and can be downgraded to read', async ({ page }, info) => {
+    await authoringFixture(page);
+    await page.goto('/library?lib_item=art_authoring_config&lib_item_kind=artifact');
+    const modal = page.getByTestId('library-resource-modal');
+    await modal.getByRole('button', { name: 'Show details', exact: true }).tap();
+    const manage = modal.getByRole('button', { name: 'Manage agent access' });
+    await expect(manage).toBeEnabled();
+    await manage.tap();
+    const access = page.getByRole('dialog', { name: 'Share with agents', exact: true });
+    await access.getByRole('button', { name: 'Share with Mira' }).tap();
+    const permission = access.getByRole('combobox', { name: 'Explicit permission for Mira' });
+    const permissionBounds = await permission.boundingBox();
+    expect(permissionBounds?.height).toBeGreaterThanOrEqual(44);
+    await permission.selectOption('write');
+    await expect(permission).toHaveValue('write');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await page.screenshot({ path: info.outputPath('phone-write-permission.png') });
+    await access.getByRole('button', { name: 'Save agent access' }).tap();
+    await expect(modal.getByLabel('Mira · Explicit: read + write', { exact: true })).toBeVisible();
+    await manage.tap();
+    await expect(permission).toHaveValue('write');
+    await permission.selectOption('read');
+    await access.getByRole('button', { name: 'Save agent access' }).tap();
+    await expect(modal.getByLabel('Mira · Explicit: read', { exact: true })).toBeVisible();
+  });
 });
 
 test('HTML opens successfully and editing preview remains sandboxed', async ({ page }) => {
@@ -290,10 +327,14 @@ test('mobile reader separates metadata from public sharing and restores focus', 
   await modal.getByRole('button', { name: 'Show details' }).click();
   await expect(modal.getByRole('heading', { name: 'Details', exact: true })).toBeVisible();
   await page.screenshot({ path: test.info().outputPath('artifact-mobile-details.png'), fullPage: true });
-  const share = modal.getByRole('button', { name: 'Share public link' });
+  const share = modal.getByRole('button', { name: 'Share link' });
   await share.click();
-  const publicDialog = page.getByRole('dialog', { name: 'Public link', exact: true });
+  const publicDialog = page.getByRole('dialog', { name: 'Share link', exact: true });
   await expect(publicDialog).toBeVisible();
+  await expect(modal.getByRole('button', { name: 'Copy internal link' })).toHaveCount(0);
+  await expect(publicDialog.getByRole('combobox', { name: 'Link access and expiration' })).toHaveValue('private');
+  await expect(publicDialog.getByRole('button', { name: 'Copy private link', exact: true })).toBeVisible();
+  await expect(publicDialog.getByRole('button', { name: 'Create public link' })).toHaveCount(0);
   await expect(publicDialog.getByRole('button', { name: 'Manage agent access' })).toHaveCount(0);
   const bounds = await publicDialog.boundingBox();
   expect(bounds?.x).toBeGreaterThanOrEqual(0);
@@ -318,11 +359,12 @@ test('chat full-view public dialog stacks above the viewer and closes independen
   await page.getByRole('button', { name: 'Open full view' }).click();
   const viewer = page.getByTestId('rich-deliverable-full-view');
   await expect(viewer).toBeVisible();
-  await expect(viewer.getByRole('button', { name: 'Copy internal link' })).toBeVisible();
-  const share = viewer.getByRole('button', { name: 'Share public link' });
+  await expect(viewer.getByRole('button', { name: 'Copy internal link' })).toHaveCount(0);
+  const share = viewer.getByRole('button', { name: 'Share link' });
   await share.click();
-  const dialog = page.getByRole('dialog', { name: 'Public link', exact: true });
+  const dialog = page.getByRole('dialog', { name: 'Share link', exact: true });
   await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('combobox', { name: 'Link access and expiration' })).toHaveValue('private');
   expect(await dialog.evaluate(node => {
     const rect = node.getBoundingClientRect();
     return node.contains(document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2));

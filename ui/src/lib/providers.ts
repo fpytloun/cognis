@@ -2,7 +2,7 @@ import { slugify } from '$lib/agents';
 import type { LLMProvider, ModelEntry, ProviderMonitoringOptions } from '$lib/types/api';
 import { defaultModelEntry } from '$lib/types/api';
 
-export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt' | 'groq' | 'openrouter' | 'gemini' | 'systemone' | 'bedrock';
+export type ProviderPreset = 'openai' | 'openai_compatible' | 'anthropic' | 'ollama' | 'litellm_proxy' | 'chatgpt' | 'groq' | 'openrouter' | 'gemini' | 'systemone' | 'bedrock' | 'elevenlabs';
 export type AuthMode = 'env' | 'secret' | 'oauth' | 'none';
 export type ProviderOwnerScope = 'user' | 'system';
 export type CodexTransport = 'litellm' | 'direct';
@@ -47,6 +47,7 @@ export interface ProviderModelOption {
 
 /** Default env var names by preset. */
 const PRESET_ENV_VARS: Record<string, string> = {
+  elevenlabs: 'ELEVENLABS_API_KEY',
   openai: 'OPENAI_API_KEY',
   openai_compatible: 'OPENAI_API_KEY',
   anthropic: 'ANTHROPIC_API_KEY',
@@ -59,6 +60,7 @@ const PRESET_ENV_VARS: Record<string, string> = {
 };
 
 export const PRESET_BASE_URLS: Partial<Record<ProviderPreset, string>> = {
+  elevenlabs: 'https://api.elevenlabs.io',
   ollama: 'http://localhost:11434',
   litellm_proxy: 'http://localhost:4000',
   groq: 'https://api.groq.com/openai/v1',
@@ -69,6 +71,7 @@ export const PRESET_BASE_URLS: Partial<Record<ProviderPreset, string>> = {
 
 /** Display names for presets. */
 export const PRESET_LABELS: Record<ProviderPreset, string> = {
+  elevenlabs: 'ElevenLabs',
   openai: 'OpenAI',
   openai_compatible: 'OpenAI Compatible',
   anthropic: 'Anthropic',
@@ -95,6 +98,7 @@ const DEFAULT_CODEX_TRANSPORT: CodexTransport = 'direct';
 export const MODEL_ENTRY_KEYS: Array<keyof ModelEntry> = [
   'model_id', 'display_name', 'context_window', 'max_input_tokens', 'max_context_window', 'max_output_tokens',
   'supports_tools', 'supports_streaming', 'supports_vision', 'supports_audio_input',
+  'supports_transcription', 'supports_speech_synthesis',
   'supports_pdf_input', 'supports_file_input', 'supports_embedding', 'supports_reasoning', 'supports_fast_mode', 'fast_mode_tier', 'fast_mode_parameter', 'reasoning_efforts',
   'supports_prompt_caching', 'supports_tool_search', 'supports_defer_loading',
   'primary_cache_ttl', 'auxiliary_cache_ttl', 'supported_cache_ttls',
@@ -410,6 +414,24 @@ export function providerFormToUpdatePayload(form: ProviderFormState): Record<str
     config: payload.config,
     status: payload.status
   };
+}
+
+/** Match speech routing capabilities before using legacy name-only hints. */
+export function isSpeechModelForRoute(
+  route: 'speech_to_text' | 'text_to_speech', entry: ModelEntry | null | undefined, modelRef: string
+): boolean {
+  const transcription = route === 'speech_to_text';
+  if (transcription ? entry?.supports_transcription : entry?.supports_speech_synthesis) return true;
+  if (entry?.model_mode) {
+    return entry.model_mode === (transcription ? 'audio_transcription' : 'audio_speech');
+  }
+  const hints = transcription
+    ? ['transcribe', 'whisper', 'speech-to-text']
+    : ['tts', 'text-to-speech', 'speech-1', 'eleven', 'elevenlabs', 'piper'];
+  return [modelRef, entry?.display_name ?? ''].some(value => {
+    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
+    return hints.some(hint => normalized.includes(hint));
+  });
 }
 
 export function collectModelOptions(providers: LLMProvider[], includeNonChatModels = false): ProviderModelOption[] {

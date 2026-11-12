@@ -1,4 +1,5 @@
 export interface FileDiff {
+  feedback_source?: Extract<import('$lib/feedback/types').FeedbackSourceRef, { kind: 'work_diff' }> | null;
   path: string;
   diff: string;
   additions?: number | null;
@@ -155,6 +156,8 @@ export function normalizeFileDiffs(value: unknown): FileDiff[] {
       return {
         path,
         diff,
+        ...(record.feedback_source && typeof record.feedback_source === 'object'
+          ? { feedback_source: record.feedback_source as FileDiff['feedback_source'] } : {}),
         ...(typeof record.additions === 'number' ? { additions: record.additions } : {}),
         ...(typeof record.deletions === 'number' ? { deletions: record.deletions } : {}),
         ...(record.content_truncated === true ? { content_truncated: true } : {}),

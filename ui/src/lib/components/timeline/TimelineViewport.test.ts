@@ -132,7 +132,6 @@ describe('TimelineViewport user scroll intent', () => {
       await fireEvent.click(screen.getByRole('button', { name: 'Programmatic bottom' }));
       expect(viewport.scrollTop).toBe(800);
       expect(frames.length).toBeGreaterThan(0);
-
       await armIntent(viewport);
       viewport.scrollTop = 400;
       await fireEvent.scroll(viewport);
@@ -172,7 +171,6 @@ describe('TimelineViewport user scroll intent', () => {
       resizes.forEach(resize => resize());
       frames.splice(0).forEach(frame => frame(0));
       expect(frames.length).toBeGreaterThan(0);
-
       await fireEvent.wheel(viewport, { deltaY: -120 });
       viewport.scrollTop = 400;
       await fireEvent.scroll(viewport);
@@ -199,5 +197,63 @@ describe('TimelineViewport user scroll intent', () => {
 
     expect(viewport.scrollTop).toBe(800);
     expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('following');
+  });
+
+  it.each(['resize', 'explicit jump', 'unmount'] as const)(
+    'does not follow a queued %s after newer reader input or teardown', async queued => {
+    const originalObserver = globalThis.ResizeObserver;
+    const originalFrame = globalThis.requestAnimationFrame;
+    const resizeCallbacks: Array<() => void> = [];
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(callback: () => void) { resizeCallbacks.push(callback); }
+      observe() {}
+      disconnect() {}
+    });
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      frames.push(callback);
+      return frames.length;
+    });
+    const { unmount } = render(TimelineViewportFixture, { autoScrollOnResize: queued !== 'explicit jump' });
+    let mounted = true;
+    try {
+      const viewport = screen.getByTestId('timeline-intent-viewport');
+      Object.defineProperties(viewport, {
+        scrollHeight: { configurable: true, value: 1000 },
+        clientHeight: { configurable: true, value: 200 },
+      });
+      while (frames.length) frames.splice(0).forEach(frame => frame(0));
+      viewport.scrollTop = 500;
+      await fireEvent.scroll(viewport);
+      if (queued === 'explicit jump') {
+        await fireEvent.wheel(viewport, { deltaY: -120 });
+        viewport.scrollTop = 450;
+        await fireEvent.scroll(viewport);
+        await fireEvent.click(screen.getByRole('button', { name: 'Scroll to latest' }));
+        expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('following');
+      } else {
+        resizeCallbacks.forEach(callback => callback());
+        frames.splice(0).forEach(frame => frame(0));
+      }
+      if (queued === 'unmount') {
+        await unmount();
+        mounted = false;
+        while (frames.length) frames.splice(0).forEach(frame => frame(0));
+        expect(viewport.scrollTop).toBe(500);
+        return;
+      }
+
+      await fireEvent.wheel(viewport, { deltaY: -120 });
+      viewport.scrollTop = 400;
+      await fireEvent.scroll(viewport);
+      expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('paused');
+      while (frames.length) frames.splice(0).forEach(frame => frame(0));
+      expect(viewport.scrollTop).toBe(400);
+      expect(screen.getByTestId('timeline-intent-state')).toHaveTextContent('paused');
+    } finally {
+      if (mounted) await unmount();
+      vi.stubGlobal('ResizeObserver', originalObserver);
+      vi.stubGlobal('requestAnimationFrame', originalFrame);
+    }
   });
 });

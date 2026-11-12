@@ -85,6 +85,15 @@ vi.mock('$lib/components/chat-v2/ChatV2Composer.svelte', async () => (
 ));
 
 describe('CompactConversationChat auxiliary content', () => {
+  it('does not report execution stopped when its active view is destroyed', async () => {
+    const observed = vi.fn();
+    const view = render(CompactConversationChat, { conversationId: 'runtime-retained-conversation', onRuntimeActiveChange: observed });
+    await fireEvent.click(screen.getByRole('button', { name: 'Activate fixture turn' }));
+    expect(observed).toHaveBeenLastCalledWith(true);
+    observed.mockClear();
+    view.unmount();
+    expect(observed).not.toHaveBeenCalled();
+  });
   afterEach(cleanup);
   beforeEach(loginFixtureAccount);
   afterEach(async () => { await auth.clear(); });
@@ -168,6 +177,7 @@ describe('CompactConversationChat auxiliary content', () => {
   beforeAll(() => {
     vi.stubGlobal('ResizeObserver', class {
       observe() {}
+      unobserve() {}
       disconnect() {}
     });
   });

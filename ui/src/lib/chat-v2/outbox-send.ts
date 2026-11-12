@@ -15,6 +15,7 @@ import { isRetryableSendError } from './outbox-retry';
 import type { AttachmentRef } from '$lib/types/api';
 import { documentCoordination, StaleDocumentError, CoordinationUnavailableError } from '$lib/document-coordination';
 import { recordPerf } from '$lib/perf-log';
+import { feedbackApi } from '$lib/feedback/api';
 
 async function measureSend<T>(
   path: 'attachments' | 'admission' | 'receipt',
@@ -89,6 +90,20 @@ export async function sendOutboxEntry(
       clientTxnId: entry.client_txn_id, clientMessageId: entry.client_message_id };
   }
   if (entry.status === 'acked') throw new Error('Admission receipt unavailable; transaction retained for recovery');
+  // Reconcile a response-loss packet before replaying its existing admission.
+  if (entry.feedback && (entry.status === 'sending' || entry.status === 'failed')) {
+    try {
+      const receipt = await feedbackApi.receipt(entry.feedback.creation_key);
+      await lease.validate();
+      if (receipt.delivery !== 'accepted') {
+        throw new Error(receipt.delivery === 'rejected'
+          ? 'Feedback was rejected. Review it again before sending a new message.'
+          : 'Feedback delivery is unresolved. Check delivery before retrying.');
+      }
+    } catch (error) {
+      if (!(error && typeof error === 'object' && 'status' in error && error.status === 404)) throw error;
+    }
+  }
   try {
    const attachments = await measureSend('attachments', () => resolveOutboxAttachments(outbox, entry));
   await lease.validate();
@@ -100,6 +115,7 @@ export async function sendOutboxEntry(
     attachments,
     client_message_id: entry.client_message_id,
     chat_mode: entry.chat_mode ?? undefined,
+    ...(entry.feedback ? { feedback: entry.feedback } : {}),
    }));
   await lease.validate();
    await measureSend('receipt', () => outbox.update(entry.client_txn_id, { status: 'acked', admitted: response }));
@@ -116,6 +132,11 @@ export async function sendOutboxEntry(
     await lease.validate();
     await recordOutboxFailure(outbox, entry.client_txn_id, error);
     throw error;
+  } finally {
+    try {
+      lease.assertCurrent();
+      if (entry.feedback && typeof window !== 'undefined') window.dispatchEvent(new Event('feedback-changed'));
+    } catch { /* An old account must not notify a new document. */ }
   }
   });
 }
@@ -129,7 +150,7 @@ async function recordOutboxFailure(
   if (error instanceof StaleDocumentError) return false;
   const current = await outbox.get(clientTxnId);
   if (current?.status === 'acked' || current?.admitted) return false;
-  const retryable = isRetryableSendError(error);
+  const retryable = !current?.feedback && isRetryableSendError(error);
   await outbox.update(clientTxnId, {
     status: 'failed',
     updated_at: new Date().toISOString(),

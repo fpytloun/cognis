@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { collectModelOptions, createProviderForm, deriveProviderId, detectProviderPreset, formatTokenCount, presetHasBaseUrl, providerExecutorTargetError, providerFormToPayload, providerRequiresExecutorLocation } from '$lib/providers';
+import { collectModelOptions, createProviderForm, deriveProviderId, detectProviderPreset, formatTokenCount, isSpeechModelForRoute, modelEntryFromMetadata, presetHasBaseUrl, providerExecutorTargetError, providerFormToPayload, providerRequiresExecutorLocation } from '$lib/providers';
 import { defaultModelEntry, type LLMProvider } from '$lib/types/api';
 import { applyProviderPresetDefaults, isDecisionModel, presetNeedsAuth, PROVIDER_PRESETS } from '$lib/providers';
 
@@ -19,6 +19,52 @@ describe('provider presets', () => {
     models: [defaultModelEntry('gpt-4o-mini')],
     last_test: null
   };
+
+  it.each(['scribe_v1', 'scribe_v2', 'scribe_v2_realtime'])('offers saved %s discovery metadata in STT routing only', (modelId) => {
+    const entry = modelEntryFromMetadata({
+      ...defaultModelEntry(modelId), display_name: modelId, model_mode: 'audio_transcription',
+      supports_transcription: true, supports_speech_synthesis: false, supports_tools: false,
+      supports_streaming: modelId === 'scribe_v2_realtime',
+    });
+    const form = createProviderForm({
+      ...provider, provider_id: 'elevenlabs',
+      config: { preset: 'elevenlabs', default_model: modelId, models: [] }, models: [],
+    });
+    form.models = [entry];
+    const config = providerFormToPayload(form).config as { models: Record<string, unknown>[] };
+    const saved = config.models[0];
+    expect(saved.supports_transcription).toBe(true);
+    expect(saved.supports_speech_synthesis).toBe(false);
+    expect(saved.model_mode).toBe('audio_transcription');
+    const reloaded = createProviderForm({
+      ...provider, provider_id: 'elevenlabs', config,
+      models: [],
+    });
+    const available = [{ ...provider, provider_id: 'elevenlabs', config, models: reloaded.models }];
+    const options = collectModelOptions(available, true);
+    expect(options.filter(option => isSpeechModelForRoute('speech_to_text', reloaded.models[0], option.value))
+      .map(option => option.value)).toEqual([modelId]);
+    expect(isSpeechModelForRoute('text_to_speech', reloaded.models[0], `elevenlabs/${modelId}`)).toBe(false);
+    expect(collectModelOptions(available)).toEqual([]);
+  });
+
+  it('preserves a transcription capability without a model-name or mode hint', () => {
+    const form = createProviderForm(provider);
+    form.models = [modelEntryFromMetadata({
+      ...defaultModelEntry('dictation-model'), supports_transcription: true,
+    })];
+    const config = providerFormToPayload(form).config as { models: Record<string, unknown>[] };
+    const entry = createProviderForm({ ...provider, config, models: [] }).models[0];
+    expect(entry.supports_transcription).toBe(true);
+    expect(isSpeechModelForRoute('speech_to_text', entry, entry.model_id)).toBe(true);
+  });
+
+  it('keeps legacy speech name hints without overriding an explicit non-speech mode', () => {
+    expect(isSpeechModelForRoute('speech_to_text', null, 'whisper-1')).toBe(true);
+    expect(isSpeechModelForRoute('text_to_speech', null, 'piper/voice')).toBe(true);
+    expect(isSpeechModelForRoute('speech_to_text', { ...defaultModelEntry('whisper-chat'), model_mode: 'chat' }, 'whisper-chat')).toBe(false);
+    expect(isSpeechModelForRoute('text_to_speech', { ...defaultModelEntry('eleven-chat'), model_mode: 'chat' }, 'eleven-chat')).toBe(false);
+  });
 
   it('detects preset and builds form state', () => {
     expect(detectProviderPreset(provider)).toBe('openai');
@@ -47,6 +93,7 @@ describe('provider presets', () => {
   });
 
   it.each([
+    ['elevenlabs', 'ELEVENLABS_API_KEY', 'https://api.elevenlabs.io'],
     ['groq', 'GROQ_API_KEY', 'https://api.groq.com/openai/v1'],
     ['openrouter', 'OPENROUTER_API_KEY', 'https://openrouter.ai/api/v1'],
     ['gemini', 'GEMINI_API_KEY', 'https://generativelanguage.googleapis.com'],
@@ -338,7 +385,7 @@ describe('provider presets', () => {
         default_model: 'claude-opus-4-7',
         models: [{ model_id: 'claude-opus-4-7', supports_tools: true }],
         auth_config: { mode: 'none' },
-        executor_id: 'exec-linux',
+        executor_id: 'sample-desktop',
         base_url: 'http://127.0.0.1:8090',
         api_base: 'http://127.0.0.1:8090'
       },
@@ -353,7 +400,7 @@ describe('provider presets', () => {
     expect(detectProviderPreset(meridianProvider)).toBe('anthropic');
     const form = createProviderForm(meridianProvider);
     expect(form.location).toBe('executor');
-    expect(form.executor_id).toBe('exec-linux');
+    expect(form.executor_id).toBe('sample-desktop');
     expect(form.backend).toBe('litellm');
     expect(form.auth_mode).toBe('none');
     expect(form.base_url).toBe('http://127.0.0.1:8090');
@@ -362,7 +409,7 @@ describe('provider presets', () => {
     expect(payload.backend).toBe('litellm');
     const config = payload.config as Record<string, unknown>;
     expect(config.auth_config).toEqual({ mode: 'none' });
-    expect(config.executor_id).toBe('exec-linux');
+    expect(config.executor_id).toBe('sample-desktop');
     expect(config.base_url).toBe('http://127.0.0.1:8090');
     expect(config.api_base).toBe('http://127.0.0.1:8090');
   });
@@ -370,12 +417,12 @@ describe('provider presets', () => {
   it('supports explicit executor targets for executor-routed providers', () => {
     const form = createProviderForm(provider);
     form.location = 'executor';
-    form.executor_id = 'exec-linux';
+    form.executor_id = 'sample-desktop';
     form.executor_selector = 'location=local';
 
     const payload = providerFormToPayload(form);
     const config = payload.config as Record<string, unknown>;
-    expect(config.executor_id).toBe('exec-linux');
+    expect(config.executor_id).toBe('sample-desktop');
     expect(config.executor_labels).toBeUndefined();
     form.executor_selector = '';
     expect(providerExecutorTargetError(form)).toBeNull();
@@ -389,7 +436,7 @@ describe('provider presets', () => {
     form.executor_selector = 'location=local';
     expect(providerExecutorTargetError(form)).toBeNull();
 
-    form.executor_id = 'exec-linux';
+    form.executor_id = 'sample-desktop';
     expect(providerExecutorTargetError(form)).toContain('either one executor');
     expect(providerRequiresExecutorLocation('anthropic')).toBe(false);
   });

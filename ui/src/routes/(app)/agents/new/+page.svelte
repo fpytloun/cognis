@@ -57,7 +57,7 @@
     selectedTemplate = id;
     modelChoice = '';
     managementConfirmed = false;
-    form = agentFormFromTemplate(template, workflows, skills);
+    form = agentFormFromTemplate(template, skills);
     form.executorId = readyExecutors[0]?.executor_id ?? '';
   }
   const preview = createEffectiveToolsPreviewScheduler({
@@ -99,10 +99,6 @@
       try { intarisMcpServers = await api.tools.intarisMcpServers(); } catch { intarisMcpServers = []; }
       try { agents = await api.agents.listAll(); } catch { agents = []; }
 
-      // Update form with system workflows pre-selected
-      const systemWorkflowIds = workflows.filter((w) => w.is_system).map((w) => w.workflow_id);
-      form.availableWorkflowIds = systemWorkflowIds;
-      form.defaultWorkflowId = 'system:direct';
       form.systemPrompt = defaultSystemPrompt('');
       const templateId = page.url.searchParams.get('template');
       if (templateId) applyTemplate(templateId);

@@ -43,6 +43,7 @@ export function hydrateComposer(drafts: DocumentDrafts, conversationId: string):
     input: canonical.consumed ? emptyComposerInput() : snapshotPersistedMetadata({
       input_revision: canonical.input_revision, text: canonical.text,
       attachments: canonical.attachments, chat_mode: canonical.chat_mode,
+      ...(canonical.feedback ? { feedback: canonical.feedback } : {}),
     }), legacy: [],
   };
   const full = drafts.read(`cognis-chat-draft:${conversationId}`) ?? '';

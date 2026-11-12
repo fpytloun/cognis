@@ -22,6 +22,8 @@ export interface LibraryItem {
   title: string | null;
   format: string;
   owner_email: string | null;
+  author_email?: string | null;
+  author_agent_id?: string | null;
   agent_id: string | null;
   agent_name: string | null;
   project_id: string | null;
@@ -41,6 +43,8 @@ export interface LibraryItem {
   origin: 'user' | 'agent' | 'other';
   is_readonly: boolean;
   is_favorite?: boolean;
+  /** Open comments on any revision; only reported to the owner. */
+  open_comments?: number;
 }
 export interface LibraryGroup { id: string; label: string; count: number }
 export interface LibraryPage { items: LibraryItem[]; next_cursor: string | null }

@@ -44,6 +44,22 @@ describe('Apple safe-area contract', () => {
     expect(styles).not.toContain(":root[data-keyboard='open'] .app-viewport-frame");
   });
 
+  it('reserves a bounded non-scrolling shell slot before app content for connectivity notices', () => {
+    const layout = readFileSync('src/routes/(app)/+layout.svelte', 'utf8');
+    const banner = readFileSync('src/lib/components/ConnectionBanner.svelte', 'utf8');
+    const frame = layout.indexOf('app-shell-viewport app-viewport-frame fixed inset-x-0');
+    const slot = layout.indexOf('data-testid="connection-notice-slot"', frame);
+    const notice = layout.indexOf('<ConnectionBanner />', slot);
+    const content = layout.indexOf('flex min-h-0 flex-1 w-full', notice);
+    expect(frame).toBeGreaterThanOrEqual(0);
+    expect(slot).toBeGreaterThan(frame);
+    expect(notice).toBeGreaterThan(slot);
+    expect(content).toBeGreaterThan(notice);
+    expect(layout.slice(frame, slot)).toContain('max-h-[50%] shrink-0 overflow-y-auto');
+    expect(banner).toContain('var(--app-safe-area-top, 0px)');
+    expect(banner).not.toContain('pointer-events-none fixed inset-x-0');
+  });
+
   it('uses the iOS-managed standalone viewport without translucent or cover offsets', () => {
     const appHtml = readFileSync('src/app.html', 'utf8');
 
@@ -72,7 +88,7 @@ describe('Apple safe-area contract', () => {
     expect(tabBar).toContain('padding-bottom: var(--app-bottom-control-inset)');
     expect(chat).toContain('padding-bottom: var(--app-bottom-control-inset)');
     expect(compactChat).toContain('padding-bottom: var(--app-bottom-control-inset)');
-    expect(taskChat).toContain('padding-bottom: var(--app-bottom-control-inset)');
+    expect(taskChat).toContain('<CompactConversationChat');
   });
 
   it('keeps managed mobile headers compact and color-matched', () => {
@@ -137,14 +153,14 @@ describe('Apple safe-area contract', () => {
     expect(chat).toContain('use:keyboardAvoidance');
     expect(compactChat).toContain('app-keyboard-avoiding-chat relative');
     expect(compactChat).toContain('use:keyboardAvoidance');
-    expect(taskChat).toContain('app-keyboard-avoiding-chat flex');
-    expect(taskChat).toContain('use:keyboardAvoidance');
+    expect(taskChat).toContain('<CompactConversationChat');
     expect(viewport).toContain('const offsetTop = keyboardOpen ? visualOffsetTop : 0');
     expect(viewport).toContain("root.style.setProperty('--app-viewport-offset-top', '0px')");
     expect(viewport).toContain("'--app-visual-viewport-offset-top'");
     expect(styles).toContain(":root[data-keyboard='open'] .app-keyboard-stable-header");
     expect(chat).toContain('app-keyboard-stable-header chat-header-shell relative z-20');
-    expect(layout).toContain('app-keyboard-stable-header fixed inset-x-0 top-0');
+    expect(layout).toContain('app-keyboard-stable-header fixed inset-x-0');
+    expect(layout).toContain('top: var(--app-shell-notice-height, 0px)');
     expect(workspaceWindow).toContain('app-keyboard-stable-header relative z-20 flex min-h-[40px]');
   });
 });

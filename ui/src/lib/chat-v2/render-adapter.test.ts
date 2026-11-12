@@ -38,6 +38,12 @@ function message(overrides: Partial<MessageTimelineItem> = {}): MessageTimelineI
 }
 
 describe('assistant text streaming state', () => {
+  it.each(['failed', 'cancelled'] as const)('labels retained user input with its confirmed %s outcome', status => {
+    const item = toRenderItem(message({ role: 'user', stable: false, source_refs: [], status }));
+    expect(item?.kind).toBe('message');
+    if (item?.kind === 'message') expect(item.deliveryStatus).toBe(status);
+  });
+
   it('distinguishes live arrival from paginated historical partial content', () => {
     const live = toRenderItem(message({ stable: false, status: 'running', partial: true }));
     const old = toRenderItem(message({ stable: true, status: 'cancelled', partial: true }));
@@ -182,6 +188,22 @@ function userInteraction(
 }
 
 describe('render-adapter', () => {
+  it('preserves optional python program linkage in the leaf tool-call model', () => {
+    const rendered = toRenderItem(toolCall({
+      tool_name: 'read',
+      parent_call_id: 'call-program',
+      program_id: 'program-1',
+      kernel_generation: 4
+    }));
+
+    expect(rendered).toMatchObject({
+      kind: 'tool_call',
+      parentCallId: 'call-program',
+      programId: 'program-1',
+      kernelGeneration: 4
+    });
+  });
+
   it('renders canonical user interaction answers as a user-side row model', () => {
     const rendered = toRenderItem(userInteraction());
 
@@ -233,6 +255,8 @@ describe('render-adapter', () => {
       task_id: 't1',
       title: 'Background task',
       status: 'failed',
+      attempt_number: 1,
+      attachments: [],
       deliverable_ids: []
     } as TaskTimelineItem);
 
@@ -361,11 +385,11 @@ describe('render-adapter', () => {
           notice_kind: 'model_error',
           notice_scope: 'failed_turn',
           reason_class: 'rate_limit',
-          provider_id: 'anthropic-fixture1',
-          model: 'claude-fixture-1',
+          provider_id: 'anthropic-demo',
+          model: 'claude-fable-5',
           retry_after_seconds: 23,
           provider_retry_after_seconds: 23,
-          retry_at: '2026-01-01T00:00:23+00:00',
+          retry_at: '2026-07-09T13:28:00+00:00',
           attempt: 1,
           max_attempts: 3,
           recoverable: true,
@@ -382,11 +406,11 @@ describe('render-adapter', () => {
         noticeKind: 'model_error',
         noticeScope: 'failed_turn',
         reasonClass: 'rate_limit',
-        providerId: 'anthropic-fixture1',
-        model: 'claude-fixture-1',
+        providerId: 'anthropic-demo',
+        model: 'claude-fable-5',
         retryAfterSeconds: 23,
         providerRetryAfterSeconds: 23,
-        retryAt: '2026-01-01T00:00:23+00:00',
+        retryAt: '2026-07-09T13:28:00+00:00',
         attempt: 1,
         maxAttempts: 3,
         recoverable: true
@@ -571,6 +595,17 @@ describe('render-adapter', () => {
         title: 'Rich report',
         orderKey: '0000:000000000000004:000000:03:000000000',
         sourceRefs: ['intaris:sess-1:4']
+      });
+    });
+    it('preserves authorized inline rendering data across the timeline adapter', () => {
+      const document = {
+        deliverable_id: 'dlv-rich', step_run_id: null, version: 1, attempt_number: 1,
+        format: 'rich', title: 'Rich report', content: 'Full fallback', rich_payload: { blocks: [] },
+        target: null, outputs: {}, status: 'approved', evaluator_feedback: null,
+        created_at: null, updated_at: null,
+      };
+      expect(toRenderItem(assistantDeliverable({ deliverable: document }))).toMatchObject({
+        deliverable: document,
       });
     });
   });

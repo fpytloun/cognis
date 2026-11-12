@@ -52,4 +52,33 @@ describe('overlay scroll ownership', () => {
     expect(scroller.dataset.overlayScrollLocked).toBeUndefined();
     expect(scroller.scrollTop).toBe(137);
   });
+
+  it('keeps non-modal popovers in the overlay stack without touching scroll styles', () => {
+    const popover = registerOverlay({ kind: 'sheet', blocksChrome: false, locksScroll: false });
+    expect(scroller.dataset.overlayScrollLocked).toBeUndefined();
+    expect(scroller.style.overflowY).toBe('auto');
+    scroller.scrollTop = 180;
+    popover.unregister();
+    expect(scroller.scrollTop).toBe(180);
+  });
+
+  it('keeps modal scroll ownership independent of nested non-modal popovers', () => {
+    const modal = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    const popover = registerOverlay({ kind: 'sheet', blocksChrome: false, locksScroll: false });
+    expect(scroller.dataset.overlayScrollLocked).toBe('true');
+    popover.unregister();
+    expect(scroller.dataset.overlayScrollLocked).toBe('true');
+    modal.unregister();
+    expect(scroller.dataset.overlayScrollLocked).toBeUndefined();
+  });
+
+  it('unlocks when the last modal closes even if a non-modal popover remains', () => {
+    const modal = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    const popover = registerOverlay({ kind: 'sheet', blocksChrome: false, locksScroll: false });
+    modal.unregister();
+    expect(scroller.dataset.overlayScrollLocked).toBeUndefined();
+    scroller.scrollTop = 180;
+    popover.unregister();
+    expect(scroller.scrollTop).toBe(180);
+  });
 });

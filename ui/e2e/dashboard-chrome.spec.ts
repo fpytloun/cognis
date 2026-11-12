@@ -19,8 +19,8 @@ for (const width of [1440, 390]) {
       generated_at: new Date().toISOString(), summary: { total: 2, warning: 1, critical: 1, info: 0, truncated: false },
       issues: [
         { id: 'runtime-warning', severity: 'warning', kind: 'executor_degraded',
-          title: 'Fixture Linux is degraded', detail: 'The executor reported a degraded runtime state.',
-          resource: { type: 'executor', id: 'fixture-linux', label: 'Fixture Linux' },
+          title: 'Sample desktop is degraded', detail: 'The executor reported a degraded runtime state.',
+          resource: { type: 'executor', id: 'sample-desktop', label: 'Sample desktop' },
           observed_at: null, action_url: '/settings?tab=executors', action_label: 'View' },
         { id: 'quota-critical', severity: 'critical', kind: 'provider_quota',
           title: 'Codex usage limit reached', detail: 'Weekly usage is exhausted until the next reset.',
@@ -57,7 +57,7 @@ for (const width of [1440, 390]) {
       await expect.poll(() => logo.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
       await logo.hover();
       const hoverColor = await logo.evaluate(() =>
-        `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--color-raised').trim().split(/\s+/).join(', ')}, 0.6)`);
+        `rgba(${getComputedStyle(document.documentElement).getPropertyValue('--color-inset').trim().split(/\s+/).join(', ')}, 0.6)`);
       await expect(logo).toHaveCSS('background-color', hoverColor);
       await logo.screenshot({ path: test.info().outputPath('sidebar-brand-hover.png') });
       await logo.focus();

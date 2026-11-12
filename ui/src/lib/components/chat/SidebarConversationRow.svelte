@@ -3,6 +3,7 @@
   import ConversationProjectBadge from '$lib/components/projects/ConversationProjectBadge.svelte';
 
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
+  import ManagedChannelBadge from '$lib/components/ManagedChannelBadge.svelte';
   import TodoProgressPopover from '$lib/components/TodoProgressPopover.svelte';
   import { isAttentionActionQuickAction } from '$lib/attention/actions';
   import type { ActivityAvatarState } from '$lib/conversation-activity';
@@ -119,9 +120,12 @@
         state={avatarState}
         class="h-7 w-7 shrink-0"
       />
+      <div class="min-w-0 flex-1">
       <p class={`min-w-0 overflow-x-auto whitespace-nowrap text-xs [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${unread ? 'font-semibold text-strong' : 'font-medium text-strong'}`}>
         {conversation.title ?? 'Untitled conversation'}
       </p>
+      <ManagedChannelBadge {conversation} />
+      </div>
     </a>
     {@render attentionActions(true)}
     <div class="relative z-10 flex shrink-0 items-center gap-0.5" data-testid="sidebar-dense-indicators">
@@ -146,6 +150,7 @@
       <p
         class={`line-clamp-2 break-words text-sm leading-5 ${unread ? 'font-semibold text-strong' : 'font-medium text-strong'}`}
       >{conversation.title ?? 'Untitled conversation'}</p>
+      <ManagedChannelBadge {conversation} />
       {#if contextBadge || waitingReason}
       <div class="mt-0.5 flex items-center gap-2">
         {#if contextBadge}

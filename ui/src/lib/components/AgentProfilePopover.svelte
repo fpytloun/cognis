@@ -1,6 +1,7 @@
 <script lang="ts">
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
-  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
+  import DeferredPrivateView from './ui/DeferredPrivateView.svelte';
+  import { imageLightbox } from './ui/private-view-definitions';
   import { keepInViewport } from '$lib/actions/keep-in-viewport';
   import type { Agent } from '$lib/types/api';
 
@@ -10,6 +11,8 @@
   }>();
 
   let showLightbox = $state(false);
+  let requestedAvatar = $state<string | null>(null);
+  $effect(() => { if (showLightbox && agent.avatar_url !== requestedAvatar) showLightbox = false; });
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') onClose();
@@ -25,7 +28,7 @@
 <div class="absolute left-0 top-full z-50 mt-2 w-72 rounded-2xl border border-control-border bg-elevated p-4 shadow-2xl" use:keepInViewport>
   <div class="flex items-start gap-3">
     {#if agent.avatar_url}
-      <button type="button" class="shrink-0 cursor-pointer" onclick={() => { showLightbox = true; }}>
+      <button type="button" class="shrink-0 cursor-pointer" onclick={() => { requestedAvatar = agent.avatar_url ?? null; showLightbox = true; }}>
         <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} class="h-14 w-14" />
       </button>
     {:else}
@@ -44,5 +47,6 @@
 </div>
 
 {#if showLightbox && agent.avatar_url}
-  <ImageLightbox src={agent.avatar_url} alt="{agent.name} avatar" onClose={() => { showLightbox = false; }} />
+  <DeferredPrivateView definition={imageLightbox} label="avatar preview" modal onClose={() => { showLightbox = false; }}
+    viewProps={{ src: agent.avatar_url, alt: `${agent.name} avatar`, onClose: () => { showLightbox = false; } }} />
 {/if}

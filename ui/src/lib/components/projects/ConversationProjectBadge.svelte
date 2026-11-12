@@ -2,14 +2,13 @@
   import { userPreferences } from '$lib/stores/userPreferences';
   import type { Conversation } from '$lib/types/api';
   import ProjectAvatar from './ProjectAvatar.svelte';
-  import { projectIcon } from '$lib/projects/icons';
+  import ProjectGlyph from './ProjectGlyph.svelte';
   let { conversation, selected = false, onToggle } = $props<{
     conversation: Pick<Conversation, 'project_id' | 'project_name' | 'project_color' | 'project_avatar_url' | 'project_icon'>; selected?: boolean; onToggle?: () => void;
   }>();
   const mode = $derived($userPreferences.display.conversation_project_badge ?? 'name');
   const color = $derived(/^#[0-9a-f]{6}$/i.test(conversation.project_color ?? '')
     ? conversation.project_color : '#38bdf8');
-  const Icon = $derived(projectIcon(conversation.project_icon) ?? projectIcon('briefcase')!);
 </script>
 
 {#if conversation.project_name && mode !== 'hidden'}
@@ -28,7 +27,7 @@
     {#if mode === 'icon'}
       <ProjectAvatar name={conversation.project_name} avatarUrl={conversation.project_avatar_url} icon={conversation.project_icon} color={conversation.project_color} class="h-4 w-4" />
     {:else if mode === 'monochrome'}
-      <Icon class="h-4 w-4" strokeWidth={1.8} />
+      <ProjectGlyph icon={conversation.project_icon ?? 'briefcase'} class="h-4 w-4" />
     {/if}
     {#if mode === 'name'}<span class="truncate">{conversation.project_name}</span>{/if}
   </button>

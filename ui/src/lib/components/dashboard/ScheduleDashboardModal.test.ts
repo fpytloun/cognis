@@ -64,7 +64,7 @@ function schedule(workflowId: string | null): Schedule {
 }
 
 describe('ScheduleDashboardModal', () => {
-  it('explains a synthetic blank-description workflow and its alternative outcomes', async () => {
+  it('explains the actual blank-description sync workflow and its alternative outcomes', async () => {
     scheduleDetail.mockResolvedValue(schedule('wf_synthetic_catalog_health'));
     workflowDetail.mockResolvedValue(syncHealthWorkflow());
     render(ScheduleDashboardModal, { scheduleId: 'schedule-1', onClose: vi.fn() });

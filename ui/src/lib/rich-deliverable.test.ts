@@ -43,8 +43,8 @@ describe('rich deliverables', () => {
   it('preserves absolute publication links and rejects local paths at a file origin', () => {
     vi.stubGlobal('window', { location: { origin: 'null' } });
     try {
-      expect(safeUrl('https://cognis.example.com/research')).toBe('https://cognis.example.com/research');
-      expect(safeUrl('mailto:research@cognis.example.com')).toBe('mailto:research@cognis.example.com');
+      expect(safeUrl('https://cognis.fpy.cz/research')).toBe('https://cognis.fpy.cz/research');
+      expect(safeUrl('mailto:research@cognis.fpy.cz')).toBe('mailto:research@cognis.fpy.cz');
       expect(safeUrl('/api/v1/deliverables')).toBe('');
       expect(safeUrl('relative.html')).toBe('');
       expect(safeUrl('file:///etc/passwd')).toBe('');
@@ -417,7 +417,7 @@ describe('rich deliverables', () => {
     const source = readFileSync(resolve(process.cwd(), 'src/lib/components/rich/RichDeliverable.svelte'), 'utf8');
     const blockSource = readFileSync(resolve(process.cwd(), 'src/lib/components/rich/blocks/UnsupportedBlock.svelte'), 'utf8');
 
-    expect(source).toContain('Open full view');
+    expect(source).toContain('Open fullscreen');
     expect(source).not.toContain('Raw/debug');
     expect(blockSource).toContain('Unsupported block: {type}');
   });

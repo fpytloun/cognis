@@ -2,10 +2,11 @@
   import '../app.css';
 
   import type { Snippet } from 'svelte';
-  import { onMount } from 'svelte';
-  import { goto, afterNavigate } from '$app/navigation';
+  import { onMount, untrack } from 'svelte';
+  import { page } from '$app/stores';
+  import { goto, afterNavigate, beforeNavigate } from '$app/navigation';
   import { installNativeRuntime } from '$lib/native/runtime';
-  import { isNativeHost, isWorkspaceReplica, postNative } from '$lib/native/host';
+  import { isNativeHost, isWorkspaceReplica, postNative, forwardNativeReference } from '$lib/native/host';
   import { installWorkspaceBridge } from '$lib/native/workspace-runtime';
   import { startConversationWorkspace } from '$lib/dashboard/conversation-workspace-runtime';
   import { auth } from '$lib/stores/auth';
@@ -14,8 +15,6 @@
   import { wsClient } from '$lib/ws/client';
   import { startInbox } from '$lib/stores/inbox';
   import { installOfflineSession } from '$lib/offline/session';
-
-  if (isNativeHost()) installOfflineSession();
 
   import PwaBanner from '$lib/components/PwaBanner.svelte';
   import { installSelectionCopy } from '$lib/selection-copy';
@@ -27,12 +26,28 @@
   import { viewportMetrics } from '$lib/stores/viewport';
 
   let { children }: { children: Snippet } = $props();
+  const publicFeedback = $derived($page.url.pathname === '/feedback');
+  let mounted = $state(false);
+  onMount(() => { mounted = true; });
+  beforeNavigate((navigation) => {
+    if (navigation.type === 'link' && navigation.to && forwardNativeReference(navigation.to.url)) navigation.cancel();
+  });
   afterNavigate(({ to }) => {
     invalidateFindContext();
     if (to) postNative('route', { path: to.url.pathname + to.url.search });
   });
 
-  onMount(() => {
+  $effect(() => {
+    if (!mounted) return;
+    if (publicFeedback) {
+      // Public hydration does not depend on private session setup or source loading.
+      (window as Window & { __cognisStartupRecoverySuccess?: () => void }).__cognisStartupRecoverySuccess?.();
+      const uninstall = installSelectionCopy();
+      const stopViewport = viewportMetrics.subscribe(() => {});
+      return () => { uninstall(); stopViewport(); };
+    }
+    return untrack(() => {
+    if (isNativeHost()) installOfflineSession();
     (window as Window & { __cognisStartupRecoverySuccess?: () => void }).__cognisStartupRecoverySuccess?.();
     if (!isNativeHost()) void registerServiceWorker();
     const stopAppearance = startAppearance();
@@ -65,8 +80,9 @@
       uninstallCodeHighlighting();
       unsub();
     };
+    });
   });
 </script>
 
-{#if !isNativeHost()}<PwaBanner />{/if}
+{#if !isNativeHost() && !publicFeedback}<PwaBanner />{/if}
 {@render children()}

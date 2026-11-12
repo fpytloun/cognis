@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "include": [
+    ".svelte-kit/ambient.d.ts",
+    ".svelte-kit/non-ambient.d.ts",
+    ".svelte-kit/env.d.ts",
+    "src/test/setup.ts",
+    "src/lib/components/inspector/conversation-usage.ts",
+    "src/lib/components/inspector/conversation-usage-source.ts",
+    "src/lib/components/inspector/conversation-usage.test.ts",
+    "src/lib/components/inspector/conversation-usage-source.test.ts",
+    "src/lib/components/inspector/ConversationUsagePanel.test.ts"
+  ]
+}

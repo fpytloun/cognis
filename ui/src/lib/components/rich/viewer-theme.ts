@@ -1,15 +1,35 @@
 import { writable } from 'svelte/store';
+import type { UserPreferences } from '$lib/types/api';
+import { normalizeUserPreferences } from '$lib/user-preferences';
 
 export type ViewerTheme = 'light' | 'dark' | 'system' | 'app';
+export type ViewerAppearance = Pick<UserPreferences['display'], 'theme' | 'theme_family'>;
 export const viewerTheme = writable<ViewerTheme | null>(null);
 const storageKey = 'cognis-rich-viewer-theme';
+
+/** Read appearance from the browser's own session, never from a public capability. */
+export async function fetchHostedAppearance(signal: AbortSignal): Promise<ViewerAppearance | null> {
+  const response = await fetch('/api/v1/user-preferences', {
+    credentials: 'same-origin', cache: 'no-store', signal,
+  });
+  if (!response.ok) return null;
+  const { theme, theme_family } = normalizeUserPreferences(await response.json()).display;
+  return { theme, theme_family };
+}
 
 export function resolveViewerTheme(
   preference: ViewerTheme | null,
   surface: 'embedded' | 'standalone',
   appTheme: string | null,
   systemDark: boolean,
+  accountAppearance: ViewerAppearance | null = null,
 ): 'light' | 'dark' {
+  if (surface === 'standalone' && preference && preference !== 'app') {
+    return preference === 'system' ? (systemDark ? 'dark' : 'light') : preference;
+  }
+  if (surface === 'standalone' && accountAppearance) {
+    return accountAppearance.theme === 'system' ? (systemDark ? 'dark' : 'light') : accountAppearance.theme;
+  }
   // In-app documents belong to account appearance, never the external reader preference.
   if (surface === 'embedded'
     && (appTheme === 'light' || appTheme === 'dark')) return appTheme;

@@ -1,4 +1,5 @@
 import type { AttachmentRef } from '$lib/types/api';
+import type { IncludedFeedback } from '$lib/feedback/types';
 import type { ChatMode } from './types';
 import type { SendMessageV2Response } from './types';
 import { documentCoordination, CoordinationUnavailableError, StaleDocumentError, type DocumentCoordination, type DocumentLease } from '$lib/document-coordination';
@@ -20,6 +21,7 @@ export interface OutboxEntry {
   content: string;
   attachments: AttachmentRef[];
   chat_mode?: ChatMode | null;
+  feedback?: IncludedFeedback | null;
   status: OutboxStatus;
   created_at: string;
   updated_at: string;
@@ -97,7 +99,7 @@ export class IndexedDbChatV2Outbox implements ChatV2Outbox {
   ): Promise<void> {
     patch = snapshotPersistedMetadata(patch);
     if ('submission' in patch || 'client_message_id' in patch || 'conversation_id' in patch
-      || 'content' in patch || 'chat_mode' in patch || patch.status === 'preparing') {
+      || 'content' in patch || 'chat_mode' in patch || 'feedback' in patch || patch.status === 'preparing') {
       throw new Error('Immutable outbox input cannot be updated');
     }
     await this.withFallback(

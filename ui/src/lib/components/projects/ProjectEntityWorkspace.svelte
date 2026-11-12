@@ -14,18 +14,22 @@
   import { DashboardConversationReadTracker } from '$lib/dashboard/conversation-read';
   import { api, asApiError } from '$lib/api/client';
   import { blockingOverlayActive } from '$lib/stores/overlays';
+  import { auth } from '$lib/stores/auth';
+  import { registerDashboardLauncher, type DashboardLaunchInput } from '$lib/dashboard/launcher';
+  import ResourceModal from '$lib/components/library/ResourceModal.svelte';
+  import { libraryHref } from '$lib/library';
 
   let { projectId, userEmail, kind, entityId, agents, onClose, onRefresh, onContinueConversation, onNavigate, canMutateSchedule = true } = $props<{
     projectId: string;
     canMutateSchedule?: boolean;
     userEmail: string;
-    kind: 'conversation' | 'task' | 'schedule' | null;
+    kind: DashboardLaunchInput['kind'] | null;
     entityId: string | null;
     agents: Agent[];
     onClose: () => void;
     onRefresh: () => Promise<void>;
     onContinueConversation?: (conversation: Conversation) => void;
-    onNavigate: (kind: 'conversation' | 'task' | 'schedule', id: string) => void;
+    onNavigate: (kind: DashboardLaunchInput['kind'], id: string) => void | Promise<void>;
   }>();
   let ready = $state(false);
   let windowsEnabled = $state(false);
@@ -64,6 +68,21 @@
     else void onRefresh();
   });
   const useWindows = $derived(windowsEnabled && device !== 'phone');
+  $effect(() => {
+    if (!$auth.user || $auth.user.email !== userEmail) return;
+    const owner = userEmail;
+    const scope = projectId;
+    return registerDashboardLauncher({
+      projectId: scope,
+      async open(input) {
+        if (!alive || auth.getSnapshot().user?.email !== owner ||
+          projectId !== scope || input.project_id !== scope) {
+          throw new Error('Project workspace is no longer active.');
+        }
+        await onNavigate(input.kind, input.id);
+      },
+    });
+  });
   $effect(() => {
     const visible = useWindows && documentVisible && !$blockingOverlayActive
       ? $manager.filter((item) => !item.minimized).flatMap((item) => item.kind === 'conversation'
@@ -145,14 +164,21 @@
     };
   });
 
-  $effect(() => {
-    if (!ready || !useWindows || !kind || !entityId) return;
+  export function activate(nextKind: DashboardLaunchInput['kind'], nextId: string): void {
+    if (!ready || !useWindows) return;
     const result = manager.open({
-      kind, entityId, title: kind === 'conversation' ? 'Conversation' : kind === 'task' ? 'Task' : 'Schedule',
-      canonicalHref: `/${kind === 'conversation' ? 'chat' : kind === 'task' ? 'tasks' : 'schedules'}/${encodeURIComponent(entityId)}`
+      kind: nextKind, entityId: nextId,
+      title: nextKind === 'conversation' ? 'Conversation' : nextKind === 'task' ? 'Task' : nextKind === 'schedule' ? 'Schedule' : 'Resource',
+      canonicalHref: nextKind === 'artifact' || nextKind === 'deliverable'
+        ? libraryHref({ kind: nextKind, id: nextId })
+        : `/${nextKind === 'conversation' ? 'chat' : nextKind === 'task' ? 'tasks' : 'schedules'}/${encodeURIComponent(nextId)}`
     });
     if (result.status === 'opened' || result.status === 'focused') urlWindowKey = result.key;
     else if (result.status === 'failed' || result.status === 'capped') addToast(workspaceOpenFailureMessage(result), 'info');
+  }
+  $effect(() => {
+    if (!kind || !entityId) return;
+    activate(kind, entityId);
   });
 </script>
 
@@ -161,7 +187,10 @@
     onConversationInitialLoaded={(id) => { loadedChats = new Set([...loadedChats, id]); void refreshConversation(id); }} />
 {:else if ready && kind && entityId}
   {#key `${kind}:${entityId}`}
-    <DashboardEntityModal
+    {#if kind === 'artifact' || kind === 'deliverable'}
+      <ResourceModal {kind} ref={entityId} {onClose} />
+    {:else}
+      <DashboardEntityModal
       {kind} {agents} {onClose} {onContinueConversation}
       {canMutateSchedule}
       onOpenTask={(id) => onNavigate('task', id)}
@@ -169,6 +198,7 @@
       taskId={kind === 'task' ? entityId : null}
       scheduleId={kind === 'schedule' ? entityId : null}
       onTaskMutationSettled={onRefresh}
-    />
+      />
+    {/if}
   {/key}
 {/if}

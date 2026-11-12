@@ -12,7 +12,7 @@
 <div class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
   <div>
     <p class="text-xs uppercase tracking-[0.28em] text-accent/80">Channels</p>
-    <h1 class="mt-2 text-3xl font-semibold text-strong">External messaging connections</h1>
+    <h1 class="mt-2 text-3xl font-semibold text-strong">Messaging channels</h1>
     <p class="mt-2 max-w-3xl text-sm text-secondary">
       Connect agents to chat platforms, review pending sender approvals, and manage trusted channel identities without leaving Cognis.
     </p>

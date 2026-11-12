@@ -1,6 +1,5 @@
 <script lang="ts">
   import { blockType, type RichBlock, type RichMediaUrlFor } from '$lib/rich-deliverable';
-  import './rich-blocks.css';
   import CalloutBlock from './blocks/CalloutBlock.svelte';
   import CardBlock from './blocks/CardBlock.svelte';
   import ChartBlock from './blocks/ChartBlock.svelte';

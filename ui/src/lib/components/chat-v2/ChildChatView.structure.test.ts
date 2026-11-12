@@ -74,7 +74,7 @@ describe('ChildChatView shell ownership', () => {
     expect(pageSource).toContain('updateRuntimeActiveSessions(');
     expect(pageSource).toContain('if (!timelineEl || childView) return;');
     expect(pageSource).toContain(
-      'if (!timelineEl || childView || programmaticScroll || !timelineInitialPositionSettled) return;',
+      'if (!timelineEl || childView || programmaticScroll || timelineWindowPending || !timelineInitialPositionSettled) return;',
     );
     expect(pageSource).toContain('parentSurfaceScrollTop = timelineEl?.scrollTop');
     expect(pageSource).toContain('writeProgrammaticScrollTop(parentSurfaceScrollTop);');
@@ -344,9 +344,13 @@ describe('ChildChatView PWA-safe theme and layout', () => {
     expect(appCss).toMatch(/\.touch-target-compact\s*\{[^}]*height: 2rem/s);
   });
 
-  it('keeps Copy accessible without raw session ID text in the compact header', () => {
+  it('keeps only Search and Info actions and puts the avatar in the metadata line', () => {
     const header = childSource.slice(childSource.indexOf('<SessionLogHeader'), childSource.indexOf('</SessionLogHeader>'));
-    expect(header).toContain('aria-label="Copy canonical session ID"');
+    expect(header).not.toContain('Copy canonical session ID');
+    expect(header).not.toContain('ExternalLink');
+    const metadata = header.slice(header.indexOf('{#snippet metadata()}'), header.indexOf('{#snippet actions()}'));
+    expect(metadata).toContain('<AgentAvatar');
+    expect(metadata).toContain('class="h-4 w-4 shrink-0"');
     expect(header).not.toContain('view.sessionId.slice');
   });
 

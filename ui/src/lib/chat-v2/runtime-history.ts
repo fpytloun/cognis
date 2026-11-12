@@ -1,4 +1,15 @@
-import type { TimelineItem } from './types';
+import type { MessageTimelineItem, TimelineItem } from './types';
+
+export const CARRIED_LINEAGE_PREFIX = '9996:';
+
+export function isCarriedAssistant(item: TimelineItem): item is MessageTimelineItem & {
+  stable: false;
+  role: 'assistant';
+  sort_key: `${typeof CARRIED_LINEAGE_PREFIX}${string}`;
+} {
+  return item.stable === false && item.kind === 'message' && item.role === 'assistant'
+    && item.sort_key.startsWith(CARRIED_LINEAGE_PREFIX);
+}
 
 interface TurnProgress {
   turnId: string;
@@ -34,6 +45,8 @@ export function runtimeHistoryVisibility(canonicalItems: TimelineItem[]): (item:
   }
   return item => {
     if (canonicalIds.has(item.id)) return true;
+    // Advancing coordinates do not confirm an unsaved assistant phase.
+    if (isCarriedAssistant(item)) return true;
     if (
       item.status !== 'complete' && item.status !== 'failed'
       && item.status !== 'cancelled' && item.status !== 'denied'

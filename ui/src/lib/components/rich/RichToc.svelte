@@ -76,7 +76,7 @@
     await tick();
     if (open && isNarrow) focusCloseButton();
     window.setTimeout(() => {
-      if (open && isNarrow) focusCloseButton();
+      if (open && isNarrow && !panel?.contains(document.activeElement)) focusCloseButton();
     }, 200);
   }
 

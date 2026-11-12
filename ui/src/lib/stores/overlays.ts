@@ -6,6 +6,7 @@ interface OverlayEntry {
   id: string;
   kind: OverlayKind;
   blocksChrome: boolean;
+  locksScroll: boolean;
   root?: () => HTMLElement | null;
 }
 
@@ -71,7 +72,7 @@ function unlockAppScroll(): void {
 }
 
 function syncScrollLock(): void {
-  if (entries.length > 0) {
+  if (entries.some(entry => entry.locksScroll)) {
     lockAppScroll();
     return;
   }
@@ -91,12 +92,12 @@ export const blockingOverlayActive = readable(false, (set) => {
   return () => listeners.delete(listener);
 });
 
-export function registerOverlay(options: { kind: OverlayKind; blocksChrome: boolean; root?: () => HTMLElement | null }): {
+export function registerOverlay(options: { kind: OverlayKind; blocksChrome: boolean; locksScroll?: boolean; root?: () => HTMLElement | null }): {
   id: string;
   unregister: () => void;
 } {
   const id = `ov_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  entries = [...entries, { id, ...options }];
+  entries = [...entries, { id, ...options, locksScroll: options.locksScroll ?? true }];
   syncScrollLock();
   emit();
   let active = true;

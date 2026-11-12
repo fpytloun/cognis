@@ -1,0 +1,6 @@
+/* Keep list semantics and nested ordinary markers; suppress only task markers.
+   Loose Markdown lists wrap their checkbox in the first paragraph. */
+:is(.prose, .rich-markdown) li:has(> input[type="checkbox"]:first-child)::marker,
+:is(.prose, .rich-markdown) li:has(> p:first-child > input[type="checkbox"]:first-child)::marker {
+  content: '';
+}

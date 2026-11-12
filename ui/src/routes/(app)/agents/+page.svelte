@@ -79,11 +79,6 @@
     }
   }
 
-  function defaultWorkflowLabel(agent: Agent): string {
-    const workflowId = typeof agent.execution?.default_workflow_id === 'string' ? agent.execution.default_workflow_id : null;
-    return workflows.find((workflow) => workflow.workflow_id === workflowId)?.name ?? workflowId ?? 'automatic';
-  }
-
   function displayName(agent: Agent): string {
     return agent.display_name ?? agent.name;
   }
@@ -280,10 +275,6 @@
     <div class="mt-4 flex flex-wrap items-start justify-between gap-4">
       {#if agent.agent_type === 'primary'}
         <dl class="grid min-w-0 flex-1 gap-3 text-sm text-secondary md:grid-cols-2">
-          <div class="min-w-0">
-            <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Default workflow</dt>
-            <dd class="mt-1 truncate">{defaultWorkflowLabel(agent)}</dd>
-          </div>
           <div class="min-w-0">
             <dt class="text-xs uppercase tracking-[0.2em] text-quiet">Model</dt>
             <dd class="mt-1 truncate">{typeof agent.llm_config?.model === 'string' ? agent.llm_config.model : 'inherit'}</dd>

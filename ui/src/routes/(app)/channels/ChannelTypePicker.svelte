@@ -9,7 +9,7 @@
 </script>
 
 <div class="grid gap-3 sm:grid-cols-2">
-  {#each channelTypes as meta (meta.channel_type)}
+  {#each channelTypes.filter((meta) => meta.channel_type !== 'web') as meta (meta.channel_type)}
     <button
       class={`rounded-2xl border p-4 text-left transition ${selectedType?.channel_type === meta.channel_type ? 'border-accent bg-accent-subtle' : 'border-control-border bg-canvas/60 hover:border-border-strong'}`}
       onclick={() => onSelect(meta)}

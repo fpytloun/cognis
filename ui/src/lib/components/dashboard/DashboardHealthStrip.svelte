@@ -142,9 +142,9 @@
             class="relative flex min-w-0 snap-x snap-mandatory gap-6 overflow-x-auto overscroll-x-contain sm:snap-none"
             aria-label="Provider cards" data-testid="provider-card-scroller">
             {#each cards as card (card.map((provider) => provider.provider_id).join(':'))}
-              <div class="min-w-0 basis-full shrink-0 snap-start snap-always sm:min-w-56 sm:flex-1 sm:basis-56"
+              <div class="min-w-0 basis-full shrink-0 snap-start snap-always sm:w-80 sm:basis-auto"
                 data-provider-card data-testid="provider-card">
-                <div class="flex flex-col gap-0.5">
+                <div class="flex flex-col gap-1">
                   {#each card as provider (provider.provider_id)}
                     <ProviderHealthLine providerId={provider.provider_id} />
                   {/each}

@@ -24,7 +24,7 @@
         "icon": "activity",
         "eyebrow": "Image-forward",
         "title": "Visual card with media",
-        "summary": "The image becomes a full-bleed background with a legibility gradient behind the title and summary.",
+        "summary": "The image appears behind the title and summary with a contrast overlay; it may be letterboxed.",
         "media": {
           "artifact_id": "fixture-docs-card-visual",
           "href": "/docs/rich-deliverables/pulse-editorial-river.jpg",

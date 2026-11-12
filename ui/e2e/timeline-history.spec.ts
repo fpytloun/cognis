@@ -12,11 +12,33 @@ interface HistoryFixture {
   counts(): { entries: number; retained: number };
   owner(): string | null;
   unexpectedRequests: string[];
+  syncRequests: number;
+  releaseSync: (() => void) | null;
 }
 declare global { interface Window {
   historyFixture: HistoryFixture;
   releaseRestorationFrames: () => void;
 } }
+
+test('cached managed history stays visible during catch-up and reconciles only delegate compactions', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route('**/*', route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== 'http://127.0.0.1:4193' || url.pathname.startsWith('/api/')) return route.abort();
+    return route.continue();
+  });
+  await page.goto('/history.html?cached-managed&hold-sync');
+  const viewport = page.getByTestId('scoped-timeline-viewport');
+  await expect(viewport).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.historyFixture.syncRequests)).toBe(1);
+  await expect(viewport).not.toHaveClass(/invisible/);
+  expect(await page.evaluate(() => window.historyFixture.releaseSync !== null)).toBe(true);
+  await page.evaluate(() => window.historyFixture.releaseSync?.());
+  await expect(viewport.locator('[data-timeline-item-id="compaction:cached-own"]')).toBeVisible();
+  await expect(viewport.locator('[data-timeline-item-id="compaction:leaked-one"]')).toHaveCount(0);
+  await expect(viewport.locator('[data-timeline-item-id="compaction:leaked-two"]')).toHaveCount(0);
+  expect(await page.evaluate(() => window.historyFixture.unexpectedRequests)).toEqual([]);
+});
 
 async function anchor(viewport: Locator) {
   return viewport.evaluate(async v => {
@@ -59,6 +81,7 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
   const scoped = page.getByTestId('scoped-surface').getByTestId('scoped-timeline-viewport');
   await expect(full.getByText('Synthetic history 199', { exact: true })).toBeAttached();
   await expect(scoped.getByText('Synthetic history 199', { exact: true })).toBeAttached();
+  await expect(scoped).toBeVisible();
   await expect.poll(() => full.evaluate(e => e.scrollHeight - e.scrollTop - e.clientHeight)).toBeLessThanOrEqual(2);
   // First boot constructs the tail window; it must not retain the empty
   // pre-snapshot range as if it were an established reading position.
@@ -78,8 +101,11 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
     rows.map(row => (row as HTMLElement).dataset.timelineRowKey));
   const retainedKeys = await keys();
   if (hidden) {
+    await full.locator('[aria-label="Background hook"]').evaluate(element => {
+      element.querySelector<HTMLButtonElement>('button')!.click();
+    });
     parentAnchor = await anchor(full);
-    await full.locator('[aria-label="Background hook"]').getByRole('button', { name: 'Open session', exact: true })
+    await full.locator('[aria-label="Background hook"]').getByRole('button', { name: 'Open session' })
       .evaluate(element => (element as HTMLButtonElement).click());
     await expect(page.getByTestId('child-header')).toBeVisible();
   }
@@ -98,7 +124,7 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
         queued.clear();
       };
     });
-    await page.getByRole('link', { name: 'Back to parent conversation', exact: true }).evaluate(e => (e as HTMLAnchorElement).click());
+    await page.getByRole('button', { name: 'Back to parent conversation' }).evaluate(e => (e as HTMLButtonElement).click());
     await expect(page.getByTestId('child-header')).not.toBeAttached();
   }
   for (let pageIndex = 1; pageIndex <= 2; pageIndex++) {
@@ -143,7 +169,7 @@ test(`shared non-null-owner full/scoped history preserves independent anchors; p
     await page.evaluate(() => window.releaseRestorationFrames());
     await expectAnchor(full, parentAnchor!);
   } else if (hidden) {
-    await page.getByRole('link', { name: 'Back to parent conversation', exact: true }).click();
+    await page.getByRole('button', { name: 'Back to parent conversation' }).click();
     await expect(page.getByTestId('child-header')).not.toBeAttached();
     await expectAnchor(full, parentAnchor!);
     await expect(full.getByText('Synthetic live update 2', { exact: true })).toBeAttached();

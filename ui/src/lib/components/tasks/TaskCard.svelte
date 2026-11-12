@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Badge from '$lib/components/ui/Badge.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
   import type { Task, TaskBoardItem } from '$lib/types/api';
 
   let {
@@ -12,17 +14,6 @@
     selected?: boolean;
     onclick?: ((event: MouseEvent) => void) | null;
   }>();
-
-  const statusColors: Record<string, string> = {
-    draft: 'border-control-border text-muted',
-    queued: 'border-accent text-accent',
-    ready: 'border-accent text-accent',
-    running: 'border-accent text-accent',
-    paused: 'border-warning-border text-warning',
-    completed: 'border-success-border text-success',
-    failed: 'border-danger-border text-danger',
-    cancelled: 'border-control-border text-quiet'
-  };
 
   function handleKeydown(event: KeyboardEvent): void {
     if (event.key === 'Enter' && onclick) {
@@ -47,15 +38,13 @@
     >
       {task.title}
     </a>
-    <span class="shrink-0 rounded-full border border-control-border bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-secondary">
-      P{task.priority}
-    </span>
+    {#if task.priority !== 0}
+      <span class="shrink-0" title="Priority"><Badge>P{task.priority}</Badge></span>
+    {/if}
   </div>
 
   <div class="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
-    <span class="rounded-full border px-2 py-0.5 {statusColors[task.status] ?? 'border-control-border text-muted'}">
-      {task.status}
-    </span>
+    <StatusBadge status={task.status} />
     <span class="text-quiet">{task.agent_id}</span>
     <span class="text-quiet">{workflowName}</span>
   </div>

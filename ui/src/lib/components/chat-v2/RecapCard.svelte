@@ -1,6 +1,9 @@
 <script lang="ts">
-  import AssistantDeliverableBlock from '$lib/components/AssistantDeliverableBlock.svelte';
+  import DeferredPrivateView from '$lib/components/ui/DeferredPrivateView.svelte';
+  import { assistantDeliverable } from '$lib/components/ui/private-view-definitions';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import DocumentCommentCount from '$lib/components/DocumentCommentCount.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
   import { renderMarkdown } from '$lib/markdown';
   import type { RecapTimelineItem, WorkCategory } from '$lib/chat-v2/types';
 
@@ -23,28 +26,29 @@
   );
 </script>
 
-<section class="recap-paint w-full max-h-[300px] overflow-y-auto rounded-2xl border px-5 py-4 text-foreground" aria-label="Conversation recap">
-  <div class="mb-2 flex items-center justify-between gap-3">
+<section class="recap-paint flex w-full max-h-[300px] flex-col overflow-hidden rounded-2xl border px-5 py-4 text-foreground" aria-label="Conversation recap">
+  <header class="mb-2 flex shrink-0 items-center justify-between gap-3">
     <h3 class="legacy-recap-title text-xs font-semibold uppercase tracking-[0.18em] text-blue-tone">Recap</h3>
     <span class="legacy-quiet text-xs text-quiet">{item.scope === 'recent_window' ? 'Recent work' : 'Earlier recap'} · {item.auto ? 'Automatic' : 'On request'}</span>
-  </div>
-  <div class="legacy-recap-prose chat-markdown prose prose-sm max-w-none break-words text-foreground prose-p:my-1 prose-a:text-accent hover:prose-a:text-accent-hover prose-a:underline prose-a:underline-offset-2">
+  </header>
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex (the scrollable region needs keyboard access) -->
+  <div class="legacy-recap-prose chat-markdown prose prose-sm min-h-0 max-w-none overflow-y-auto overscroll-contain break-words text-foreground prose-p:my-1 prose-a:text-accent hover:prose-a:text-accent-hover prose-a:underline prose-a:underline-offset-2" role="region" aria-label="Recap content" tabindex="0">
     {@html renderMarkdown(item.text)}
   </div>
   {#if item.deliverables.length || item.artifacts.length || item.files.length}
-    <div class="mt-3 flex flex-wrap items-center gap-2 border-t border-separator pt-3 text-xs">
+    <footer class="mt-3 flex shrink-0 flex-nowrap items-center gap-2 overflow-x-auto whitespace-nowrap border-t border-separator pt-3 text-xs">
       {#each item.deliverables as deliverable (deliverable.id)}
-        <button type="button" class="legacy-recap-control max-w-[220px] truncate rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" title={deliverable.title} onclick={() => selectedDeliverable = deliverable}>
-          {deliverable.title}
-        </button>
+        <Button variant="ghost" size="sm" class="legacy-recap-control flex max-w-[280px] shrink-0 items-center gap-2 rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" title={deliverable.title} onclick={() => selectedDeliverable = deliverable}>
+          <span class="truncate">{deliverable.title}</span><DocumentCommentCount id={deliverable.id} />
+        </Button>
       {/each}
       {#if item.artifacts.length}
-        <button type="button" class="legacy-recap-control rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" onclick={() => showArtifacts = true}>
+        <button type="button" class="legacy-recap-control shrink-0 rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" onclick={() => showArtifacts = true}>
           {item.artifacts.length} artifact{item.artifacts.length === 1 ? '' : 's'} ↗
         </button>
       {/if}
       {#if item.files.length}
-        <button type="button" class="legacy-recap-control rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" onclick={() => onOpenWork?.('files', item.source_session_id, item.files[0].path, item.id)}>
+        <button type="button" class="legacy-recap-control shrink-0 rounded-lg border border-control-border px-2.5 py-1.5 text-foreground hover:border-accent" onclick={() => onOpenWork?.('files', item.source_session_id, item.files[0].path, item.id)}>
           {item.files.length}{item.file_diffs_omitted ? '+' : ''} file{item.files.length === 1 && !item.file_diffs_omitted ? '' : 's'}
           {#if hasCompleteFileStats}
             <span class="legacy-additions text-success">+{totalAdditions}</span> <span class="legacy-code-deletion text-danger">−{totalDeletions}</span>
@@ -54,20 +58,14 @@
           ↗
         </button>
       {/if}
-    </div>
+    </footer>
   {/if}
 </section>
 
 {#if selectedDeliverable}
-  <div class="fixed inset-0 z-[100] flex items-center justify-center bg-scrim/75 p-4" role="presentation" onclick={() => selectedDeliverable = null}>
-    <div role="dialog" tabindex="-1" aria-modal="true" aria-label={selectedDeliverable.title} class="max-h-[90vh] w-full max-w-5xl overflow-auto rounded-2xl bg-elevated p-5 text-foreground shadow-2xl" onclick={(event) => event.stopPropagation()} onkeydown={(event) => { if (event.key === 'Escape') selectedDeliverable = null; }}>
-      <div class="mb-3 flex items-center justify-between gap-3">
-        <h3 class="text-lg font-semibold">{selectedDeliverable.title}</h3>
-        <button type="button" class="text-sm text-accent hover:text-accent-hover" onclick={() => selectedDeliverable = null}>Close</button>
-      </div>
-      <AssistantDeliverableBlock item={{ ...item, kind: 'assistant_deliverable', deliverable_id: selectedDeliverable.id, format: 'markdown', title: selectedDeliverable.title }} />
-    </div>
-  </div>
+  <DeferredPrivateView definition={assistantDeliverable}
+    viewProps={{ item: { ...item, kind: 'assistant_deliverable', deliverable_id: selectedDeliverable.id, format: 'markdown', title: selectedDeliverable.title }, fullscreenOnly: true, onClose: () => { selectedDeliverable = null; } }}
+    label="document" modal onClose={() => { selectedDeliverable = null; }} />
 {/if}
 
 {#if showArtifacts}

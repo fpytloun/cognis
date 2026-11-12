@@ -6,12 +6,11 @@ const neutral: ActivityAvatarState = { active: false, background: false, attenti
   unread: false, error: false, tone: 'default', label: 'Idle' };
 
 describe('pinned dock', () => {
-  it.each([36, 42, 48, 60])('centers a tucked %ipx face on either viewport edge', (size) => {
+  it.each([36, 42, 48, 54, 60])('centers a tucked %ipx avatar on its target edge', (size) => {
     const targetWidth = size * 4 / 3;
     expect(-targetWidth + size / 2 + pinnedAvatarTuckOffset(size)).toBeCloseTo(0);
     expect(size / 3 + size / 2 - pinnedAvatarTuckOffset(size)).toBeCloseTo(0);
   });
-
   it('uses message time rather than open/read/session metadata for activity ordering', () => {
     const base = { last_message_at: '2026-10-15T08:00:00Z', pending_notification_types: [] } as unknown as Conversation;
     expect(pinnedMessageActivityAt({ ...base, updated_at: '2099-01-01', active_session_updated_at: '2099-01-01' }))

@@ -204,10 +204,10 @@ sys.stdout.write(render_standalone_shell(
 ))
 `;
 
-const viewerContextPath = '/api/v1/deliverables/dlv_standalone_security/viewer-context';
 let server: Server;
 let origin = '';
 let shell = '';
+let audioShells: Record<string, string> = {};
 let observedRequests: string[] = [];
 
 test.beforeAll(async () => {
@@ -221,22 +221,35 @@ test.beforeAll(async () => {
     input: JSON.stringify(payload),
     maxBuffer: 16 * 1024 * 1024,
   });
+  audioShells = JSON.parse(execFileSync('uv', ['run', 'python', '-c', String.raw`
+import json
+from types import SimpleNamespace
+from cognis.rendering.deliverables import render_standalone_shell
+from cognis.api.routes.deliverables import _wrapped_standalone_rich_payload
+shells = {}
+for format_ in ("markdown", "plain", "html", "rich"):
+    row = SimpleNamespace(
+        deliverable_id="dlv_" + "1" * 32, format=format_, title="Listen fixture",
+        content="<p>HTML reading fixture.</p>" if format_ == "html" else "Document reading fixture.",
+        rich_payload={"blocks": [{"type": "markdown", "content": "Rich reading fixture."}]},
+    )
+    shells[format_] = render_standalone_shell(
+        row, media_base="", standalone_url="/audio-view/" + format_, pdf_url="",
+        rich_payload_override=None if format_ == "rich" else _wrapped_standalone_rich_payload(row, format_=format_),
+    )
+print(json.dumps(shells))
+`], { cwd: REPOSITORY_DIR, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }));
 
   server = createServer((request, response) => {
     const requestPath = new URL(request.url ?? '/', 'http://standalone.test').pathname;
     observedRequests.push(requestPath);
-    if (requestPath === viewerContextPath) {
-      response.writeHead(401, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ detail: 'Not authenticated' }));
-      return;
-    }
-    if (requestPath === '/view') {
+    if (requestPath === '/view' || requestPath.startsWith('/audio-view/')) {
       response.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Security-Policy': CSP,
         'Referrer-Policy': 'no-referrer',
       });
-      response.end(shell);
+      response.end(requestPath === '/view' ? shell : audioShells[requestPath.split('/').pop()!]);
       return;
     }
     if (requestPath.startsWith(ASSET_PREFIX)) {
@@ -314,9 +327,171 @@ test('keeps adversarial values inert in the generated production shell', async (
   }
 });
 
+for (const format of ['markdown', 'plain', 'html', 'rich']) {
+  test(`anonymous ${format} viewers never show a speaker or private-audio notice`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    const writes: string[] = [];
+    page.on('request', request => { if (request.method() !== 'GET') writes.push(request.url()); });
+    await page.goto(`${origin}/audio-view/${format}`, { waitUntil: 'networkidle' });
+    await expect(page.getByRole('button', { name: 'Listen to this document' })).toHaveCount(0);
+    await expect(page.getByRole('dialog', { name: 'Document audio' })).toHaveCount(0);
+    await expect(page.getByText(/Sign in with document access/)).toHaveCount(0);
+    expect(writes).toEqual([]);
+  });
+}
+
+for (const width of [390, 1280]) {
+  for (const theme of ['light', 'dark'] as const) {
+    test(`uses an opaque app-themed audio popup at ${width}px in ${theme} mode`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 844 });
+      await page.route('**/api/v1/audio/jobs/source?*', route => route.fulfill({ json: {
+        supported: true, can_generate: true, can_cancel: true, detail: null, jobs: [],
+      } }));
+      await page.goto(`${origin}/audio-view/markdown`, { waitUntil: 'networkidle' });
+      const trigger = page.getByRole('button', { name: 'Listen to this document' });
+      await expect(trigger).toHaveText('');
+      await trigger.evaluate((element, theme) => {
+        const button = element as HTMLElement;
+        button.style.setProperty('--rich-surface-raised', 'initial');
+        button.style.setProperty('--rich-text', 'initial');
+        button.style.setProperty('--color-elevated', theme === 'light' ? '255 255 255' : '38 38 35');
+        button.style.setProperty('--color-foreground', theme === 'light' ? '17 24 39' : '243 244 246');
+        button.style.backgroundColor = 'transparent';
+        button.style.color = theme === 'light' ? '#111827' : '#f3f4f6';
+      }, theme);
+      await trigger.click();
+      const panel = page.getByRole('dialog', { name: 'Document audio' });
+      await expect(panel).toBeVisible();
+      expect(await panel.evaluate(node => getComputedStyle(node).backgroundColor))
+        .toBe(theme === 'light' ? 'rgb(255, 255, 255)' : 'rgb(38, 38, 35)');
+      expect(await panel.evaluate(node => getComputedStyle(node).color))
+        .toBe(theme === 'light' ? 'rgb(17, 24, 39)' : 'rgb(243, 244, 246)');
+      const bounds = await panel.boundingBox();
+      expect(bounds!.x).toBeGreaterThanOrEqual(16);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(width - 16);
+      expect(bounds!.height).toBeLessThan(330);
+      expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+    });
+  }
+}
+
+test('signed-in public readers get their account palette and a non-modal, scroll-stable speaker menu', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 844 });
+  await page.context().addCookies([{ name: 'cognis_session', value: 'standalone-reader-session', url: origin }]);
+  const writes: string[] = [];
+  page.on('request', request => { if (request.method() !== 'GET') writes.push(request.url()); });
+  await page.route('**/api/v1/user-preferences', route => {
+    expect(route.request().headers().cookie).toContain('cognis_session=standalone-reader-session');
+    return route.fulfill({ json: { display: { theme: 'light', theme_family: 'paper' } } });
+  });
+  await page.route('**/api/v1/audio/jobs/source?*', route => {
+    expect(route.request().headers().cookie).toContain('cognis_session=standalone-reader-session');
+    return route.fulfill({ json: { supported: true, can_generate: true, can_cancel: true, detail: null, jobs: [] } });
+  });
+  await page.addInitScript(() => localStorage.setItem('cognis-rich-viewer-theme', 'dark'));
+  await page.goto(`${origin}/audio-view/markdown`, { waitUntil: 'networkidle' });
+  const documentRoot = page.locator('.rich-deliverable');
+  await expect(documentRoot).toHaveAttribute('data-theme-family', 'paper');
+  await expect(documentRoot).toHaveAttribute('data-viewer-theme', 'light');
+  const colors = await documentRoot.evaluate(node => ({
+    background: getComputedStyle(node).backgroundColor,
+    surface: getComputedStyle(node).getPropertyValue('--color-surface').trim(),
+  }));
+  expect(colors.surface).toMatch(/^\d+ \d+ \d+$/);
+  expect(colors.background).toBe(`rgb(${colors.surface.replace(/ /g, ', ')})`);
+  await page.evaluate(() => {
+    const filler = document.createElement('div');
+    filler.style.height = '2400px';
+    document.body.appendChild(filler);
+  });
+  const geometry = () => page.evaluate(() => ({
+    width: document.documentElement.clientWidth, x: scrollX, y: scrollY,
+    overflow: document.documentElement.style.overflow,
+    documentLeft: document.querySelector('.rich-document')?.getBoundingClientRect().left,
+  }));
+  const before = await geometry();
+  await page.getByRole('button', { name: 'Listen to this document' }).click();
+  const panel = page.getByRole('dialog', { name: 'Document audio' });
+  await expect(panel).toBeVisible();
+  expect(await geometry()).toEqual(before);
+  expect(await page.locator('html').getAttribute('data-overlay-scroll-locked')).toBeNull();
+  await page.evaluate(() => window.scrollTo(0, 160));
+  await expect.poll(() => page.evaluate(() => scrollY)).toBe(160);
+  await page.keyboard.press('Escape');
+  await expect(panel).toBeHidden();
+  expect(await page.evaluate(() => scrollY)).toBe(160);
+  expect(writes).toEqual([]);
+});
+
+test('shows the latest recording and inline controls with a discoverable playing/paused trigger', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const wav = Buffer.alloc(44 + 16000 * 2 * 30);
+  wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8);
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(16000, 24); wav.writeUInt32LE(32000, 28);
+  wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write('data', 36);
+  wav.writeUInt32LE(wav.length - 44, 40);
+  await page.route('**/test-recording-*.wav', route => route.fulfill({ contentType: 'audio/wav', body: wav }));
+  await page.route('**/api/v1/audio/jobs/source?*', route => route.fulfill({ json: {
+    supported: true, can_generate: true, can_cancel: true, detail: null,
+    jobs: [1, 3, 2].map(version => ({
+      job_id: `browser-recording-${version}`, mode: 'narration', status: 'completed',
+      deliverable_id: `dlv_${'1'.repeat(32)}`, completed_parts: 1, total_parts: 1,
+      created_at: `2026-01-0${version}T00:00:00Z`, warnings: [], error_code: null,
+      script_url: '/transcript.txt', script_artifact_id: null,
+      parts: [{ artifact_id: `browser-audio-${version}`, audio_url: `${origin}/test-recording-${version}.wav`, content_type: 'audio/wav' }],
+    })),
+  } }));
+  await page.route('**/api/v1/audio/jobs/estimates?*', route => route.fulfill({ json: [
+    { length: 'shorter', target_words: 180, seconds_min: 60, seconds_max: 120 },
+    { length: 'default', target_words: 300, seconds_min: 120, seconds_max: 180 },
+    { length: 'longer', target_words: 450, seconds_min: 180, seconds_max: 240 },
+  ] }));
+  const writes: string[] = [];
+  page.on('request', request => { if (request.method() !== 'GET') writes.push(request.url()); });
+  await page.goto(`${origin}/audio-view/markdown`, { waitUntil: 'networkidle' });
+  const trigger = page.getByRole('button', { name: 'Listen to this document' });
+  await trigger.click();
+  const panel = page.getByRole('dialog', { name: 'Document audio' });
+  await expect(panel.locator('audio')).toHaveAttribute('src', `${origin}/test-recording-3.wav`);
+  await expect(panel.getByRole('button', { name: 'Back 10 seconds' })).toBeVisible();
+  await expect(panel.getByRole('button', { name: 'Forward 10 seconds' })).toBeVisible();
+  await expect(panel.getByLabel('Playback speed')).toBeVisible();
+  await expect(panel.getByLabel('Recording version')).toHaveCount(0);
+  await expect(panel.getByRole('link', { name: /script/i })).toHaveCount(0);
+  await panel.getByLabel('Playback speed').selectOption('1.5');
+  await expect(panel.locator('audio')).toHaveJSProperty('playbackRate', 1.5);
+  await panel.getByRole('button', { name: 'Play audio' }).click();
+  await expect(trigger).toHaveAttribute('data-playback', 'playing');
+  await page.keyboard.press('Escape');
+  await expect(panel).toBeHidden();
+  await expect(trigger).toHaveAttribute('title', 'Document audio · playing');
+  await trigger.click();
+  await panel.getByRole('button', { name: 'Pause audio' }).click();
+  await expect(trigger).toHaveAttribute('data-playback', 'paused');
+  await expect(panel.getByRole('link', { name: 'Configure narrative and speech models' })).toHaveCount(0);
+  await panel.getByRole('tab', { name: 'Podcast' }).click();
+  await expect(panel.getByText('~1–2 min')).toBeVisible();
+  await expect(panel.getByText('~2–3 min')).toBeVisible();
+  await expect(panel.getByText('~3–4 min')).toBeVisible();
+  const defaultLength = panel.getByRole('radio', { name: /Default/ });
+  await expect(defaultLength).toBeChecked();
+  await defaultLength.focus();
+  await page.keyboard.press('ArrowRight');
+  await expect(panel.getByRole('radio', { name: /Longer/ })).toBeChecked();
+  expect(await panel.evaluate(node => node.scrollWidth <= node.clientWidth)).toBe(true);
+  await page.screenshot({ path: '/tmp/cognis-audio-followup-mobile.png' });
+  expect(writes).toEqual([]);
+});
+
 test('runs the production module without payload execution or DOM/network breakout', async ({ page }) => {
-  const browserRequests: { url: string; method: string }[] = [];
-  page.on('request', (request) => browserRequests.push({ url: request.url(), method: request.method() }));
+  const browserRequests: string[] = [];
+  const browserWrites: string[] = [];
+  const viewerContextPath = '/api/v1/deliverables/dlv_standalone_security/viewer-context';
+  page.on('request', (request) => {
+    browserRequests.push(request.url());
+    if (request.method() !== 'GET') browserWrites.push(request.url());
+  });
 
   await page.goto(`${origin}/view`, { waitUntil: 'networkidle' });
 
@@ -364,17 +539,28 @@ test('runs the production module without payload execution or DOM/network breako
     return false;
   }), JSON.stringify(renderedUrls, null, 2)).toBe(true);
 
-  const isExpectedPath = (pathname: string) => pathname === '/view'
-    || pathname.startsWith(ASSET_PREFIX)
-    || pathname === authorizedMediaPath
-    || pathname === viewerContextPath;
-  const unexpectedBrowserRequests = browserRequests.filter(({ url, method }) => {
+  const unexpectedBrowserRequests = browserRequests.filter((url) => {
     const parsed = new URL(url);
-    return method !== 'GET' || parsed.origin !== origin || !isExpectedPath(parsed.pathname);
+    return parsed.origin !== origin
+      || (
+        parsed.pathname !== '/view'
+        && !parsed.pathname.startsWith(ASSET_PREFIX)
+        && parsed.pathname !== authorizedMediaPath
+        && !(parsed.pathname === viewerContextPath && parsed.search === '')
+        && parsed.pathname !== '/api/v1/user-preferences'
+      );
   });
   expect(unexpectedBrowserRequests).toEqual([]);
-  expect(browserRequests.filter(({ url }) => new URL(url).pathname === viewerContextPath)).toHaveLength(1);
-  expect(observedRequests.every(isExpectedPath)).toBe(true);
+  expect(browserWrites).toEqual([]);
+  expect(observedRequests.every(
+    (requestPath) =>
+      requestPath === '/view'
+      || requestPath.startsWith(ASSET_PREFIX)
+      // The trusted shell may probe read-only sharing context; never a mutation.
+      || requestPath === authorizedMediaPath
+      || requestPath === viewerContextPath
+      || requestPath === '/api/v1/user-preferences',
+  )).toBe(true);
 });
 
 test('renders authorized accordion item media once inside the standalone disclosure body', async ({ page }) => {

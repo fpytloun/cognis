@@ -1,4 +1,16 @@
+import { confirmAction } from '$lib/stores/confirm';
 import type { Schedule } from '$lib/types/api';
+
+/** Running a schedule now creates a task immediately; the regular schedule is unchanged. */
+export function confirmScheduleRunNow(name: string): Promise<boolean> {
+  return confirmAction({
+    title: `Run "${name}" now?`,
+    message: 'This creates a task now. The regular schedule is unchanged.',
+    confirmLabel: 'Run now',
+    cancelLabel: 'Not now',
+    variant: 'primary'
+  });
+}
 
 export type ScheduleVisibilityFilter = 'active' | 'expired' | 'all';
 

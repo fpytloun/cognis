@@ -72,6 +72,41 @@ function mergeDeliverables(
   return newestFirst([...merged.values()]);
 }
 
+/**
+ * Work lists one artifact per document: the newest revision it saw, with how many revisions of
+ * that document the work produced. Older revisions stay reachable from the viewer's switcher.
+ * Documents are ordered by their most recent revision, newest first; equal or missing times
+ * keep the input order.
+ */
+export function latestWorkArtifacts<T extends {
+  artifact_id: string; lineage_id?: string | null; revision?: number | null;
+  created_at?: string | null; updated_at?: string | null;
+}>(
+  items: T[],
+): Array<T & { revisions_here: number }> {
+  const latest = new Map<string, T & { revisions_here: number }>();
+  const newest = new Map<string, number>();
+  const order = new Map<string, number>();
+  items.forEach((item, index) => {
+    const key = item.lineage_id || item.artifact_id;
+    if (!order.has(key)) order.set(key, index);
+    newest.set(key, Math.max(newest.get(key) ?? 0, activityTime(item)));
+    const current = latest.get(key);
+    const count = (current?.revisions_here ?? 0) + 1;
+    if (!current || (item.revision ?? 1) > (current.revision ?? 1)) latest.set(key, { ...item, revisions_here: count });
+    else current.revisions_here = count;
+  });
+  return [...latest.entries()]
+    .sort(([a], [b]) => (newest.get(b)! - newest.get(a)!) || (order.get(a)! - order.get(b)!))
+    .map(([, item]) => item);
+}
+
+/** Milliseconds of the last change of a Work item, or 0 when unknown. */
+export function activityTime(item: { created_at?: string | null; updated_at?: string | null }): number {
+  const value = Date.parse(item.updated_at ?? item.created_at ?? '');
+  return Number.isFinite(value) ? value : 0;
+}
+
 export function orderedWorkDeliverables(
   items: WorkDeliverable[],
   primary: WorkDeliverable | null | undefined,
@@ -82,8 +117,12 @@ export function orderedWorkDeliverables(
     const key = workDeliverableLineageKey(item);
     if (newerRevision(merged.get(key), item, true)) merged.set(key, item);
   }
+  // Newest change first; deliverables without a timestamp fall back to their sort key.
+  // An item with neither keeps its place, so an unkeyed primary stays where it was put.
   return [...merged.values()].sort((left, right) => {
-    if (!left.sort_key || !right.sort_key) return 0;
+    const byTime = activityTime(right) - activityTime(left);
+    if (byTime && activityTime(right) && activityTime(left)) return byTime;
+    if (!left.sort_key || !right.sort_key) return byTime;
     return right.sort_key.localeCompare(left.sort_key);
   });
 }

@@ -30,4 +30,21 @@ describe('agent avatar selection', () => {
     expect(target).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText('Inherited access')).toBeInTheDocument();
   });
+  it('edits explicit permissions independently of inherited project write', async () => {
+    render(AgentAccessPicker, { permissions: true, selected: ['project'], writers: ['project'], agents: [
+      { agent_id: 'project', name: 'LaForge', inherited: true, explicit: true,
+        explicit_permission: 'write', inherited_permission: 'write', inherited_sources: ['project'] },
+    ] });
+    expect(screen.getByText('Project · read + write')).toBeVisible();
+    const permission = screen.getByRole('combobox', { name: 'Explicit permission for LaForge' });
+    expect(permission).toHaveValue('write');
+    await fireEvent.change(permission, { target: { value: 'read' } });
+    expect(permission).toHaveValue('read');
+    const target = screen.getByRole('button', { name: 'Share with LaForge' });
+    await fireEvent.click(target);
+    expect(target).not.toBeDisabled();
+    expect(target).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByText('Project · read + write')).toBeVisible();
+    expect(screen.queryByRole('combobox')).not.toBeInTheDocument();
+  });
 });

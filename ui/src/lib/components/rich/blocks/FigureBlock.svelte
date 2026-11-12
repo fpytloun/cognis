@@ -72,6 +72,6 @@
 {/if}
 
 <style>
-  .figure-preview { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; text-align: inherit; }
+  .figure-preview { display: block; width: fit-content; max-width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; text-align: inherit; }
   .figure-preview:focus-visible { outline: 2px solid var(--rich-accent, rgb(var(--color-accent))); outline-offset: 4px; }
 </style>

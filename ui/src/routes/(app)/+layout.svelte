@@ -1,13 +1,21 @@
 <script lang="ts">
+  import { request } from '$lib/api/client';
+  import { installFeedbackTransport } from '$lib/feedback/transport';
+  installFeedbackTransport(request);
+  import { provideDocumentPeopleLoader } from '$lib/document-sharing-context';
+  provideDocumentPeopleLoader(() => import('$lib/components/rich/DocumentPeopleAccess.svelte'));
+  import { provideConversationChooser } from '$lib/feedback/conversation-chooser';
+  provideConversationChooser(() => import('$lib/components/feedback/ConversationChooser.svelte'));
   import CognisLogo from '$lib/components/CognisLogo.svelte';
   import PaletteHost from '$lib/components/palette/PaletteHost.svelte';
   import Search from 'lucide-svelte/icons/search';
   let commandPalette = $state<PaletteHost>();
   import { goto } from '$app/navigation';
   import { page } from '$app/stores';
+  import { provideUsageHistory } from '$lib/usage/history.svelte';
   import type { Snippet } from 'svelte';
   import { onMount, tick } from 'svelte';
-  import { navigationItems } from '$lib/navigation';
+  import { availableNavigationItems, navigationItems } from '$lib/navigation';
 import ChevronsLeft from 'lucide-svelte/icons/chevrons-left';
 import ChevronsRight from 'lucide-svelte/icons/chevrons-right';
 import Menu from 'lucide-svelte/icons/menu';
@@ -33,6 +41,7 @@ import X from 'lucide-svelte/icons/x';
     }).finally(() => { dockLoading = false; });
   });
   import ConnectionBanner from '$lib/components/ConnectionBanner.svelte';
+  import { observeConnectionNotice } from '$lib/connection-notice-layout';
   import { deviceDataReady, deviceDataError, installOfflineSession } from '$lib/offline/session';
 
   // Before child pages mount: they read the per-user offline cache on open.
@@ -49,11 +58,14 @@ import X from 'lucide-svelte/icons/x';
   import { auth } from '$lib/stores/auth';
   import { mobileNavOpen as mobileNavOpenStore, mobileNavOpenSignal } from '$lib/stores/mobileNav';
    import { resetOverlayState } from '$lib/stores/overlays';
-  import { workspaceHealth } from '$lib/system';
+  import { usageAnalyticsEnabled, workspaceHealth } from '$lib/system';
+  const visibleNavigation = $derived(availableNavigationItems($usageAnalyticsEnabled));
   import { wsClient, wsState } from '$lib/ws/client';
   import { invalidateAllWorkScopes, invalidateWorkFromSocket } from '$lib/work/workViewState';
 
   let { children }: { children: Snippet } = $props();
+  const usageHistory = provideUsageHistory(() => $page.state);
+  export const snapshot = usageHistory;
 
   function navigationItemActive(href: string, pathname: string): boolean {
     return href === '/' ? pathname === '/' : pathname.startsWith(href);
@@ -63,6 +75,7 @@ import X from 'lucide-svelte/icons/x';
   let mobileNavOpen = $state(false);
   let sidebarCollapsed = $state(false);
   let mobileHeaderEl = $state<HTMLElement | null>(null);
+  let connectionNoticeSlotEl = $state<HTMLElement | null>(null);
   let workspaceRunning = false;
   let workspaceLoadingSlow = $state(false);
   let workspaceLoadingSlowTimer: number | null = null;
@@ -149,12 +162,23 @@ import X from 'lucide-svelte/icons/x';
     setShellOffsetVariable('--app-shell-top-offset', shouldReserve ? mobileHeaderEl?.offsetHeight ?? 0 : 0);
   }
 
+  $effect(() => {
+    const element = connectionNoticeSlotEl;
+    if (!element) return;
+    return observeConnectionNotice(element, (height) => {
+      setShellOffsetVariable('--app-shell-notice-height', height);
+    });
+  });
+
   let isChatRoute = $derived($page.url.pathname.startsWith('/chat'));
   let isChatDetailRoute = $derived(/^\/chat\/[^/]+/.test($page.url.pathname));
   let isChatWindowMode = $derived(isChatDetailRoute && $page.url.searchParams.get('window') === '1');
+  let isProjectWindowMode = $derived(/^\/projects\/[^/]+\/?$/.test($page.url.pathname) && $page.url.searchParams.get('window') === '1');
+  let isDeliverableWindowMode = $derived(/^\/library\/deliverable\/[^/]+\/?$/.test($page.url.pathname) && $page.url.searchParams.get('window') === '1');
+  let isWindowMode = $derived(isChatWindowMode || isProjectWindowMode || isDeliverableWindowMode);
   let isDashboardRoute = $derived($page.url.pathname === '/');
-  let showMobileHeader = $derived(!isChatDetailRoute);
-  let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute && !isChatWindowMode);
+  let showMobileHeader = $derived(!isChatDetailRoute && !isWindowMode);
+  let shouldReserveBottomTabSpace = $derived(!isChatDetailRoute && !isWindowMode);
   let contentShellClass = $derived.by(() => {
     if (isChatWindowMode) {
       return 'min-h-0 min-w-0 flex-1 overflow-hidden';
@@ -173,7 +197,7 @@ import X from 'lucide-svelte/icons/x';
     // so it still degrades safely if content ever exceeds the viewport, and
     // narrow/phone widths keep the natural page-scroll behavior below md.
     const dashboardMdLayout = isDashboardRoute ? 'md:flex md:h-full md:min-h-0 md:flex-col' : '';
-    return `min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 lg:px-0 ${dashboardMdLayout} pt-[calc(var(--app-shell-top-offset,0px)+0.75rem)] lg:pt-0`;
+    return `min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-3 sm:px-4 lg:px-0 ${dashboardMdLayout} pt-3 lg:pt-0`;
   });
 
   // Non-chat routes drop the shell's right padding so the data-app-content
@@ -246,7 +270,7 @@ import X from 'lucide-svelte/icons/x';
     if ($wsState.status === 'connected') return 'Connected';
     if ($wsState.offline) return 'Offline';
     if ($wsState.status === 'stalled') return 'Disconnected';
-    if ($wsState.status === 'reconnecting') return `Reconnecting (${$wsState.attempts})`;
+    if ($wsState.status === 'reconnecting') return 'Reconnecting';
     if ($wsState.status === 'connecting') return 'Connecting';
     return 'Idle';
   }
@@ -336,8 +360,9 @@ import X from 'lucide-svelte/icons/x';
       return;
     }
 
-    stopWorkspace();
-    const returnTo = `${$page.url.pathname}${$page.url.search}`;
+     stopWorkspace();
+     if ($auth.status !== 'anonymous') return;
+     const returnTo = `${$page.url.pathname}${$page.url.search}`;
     void goto(`/login?returnTo=${encodeURIComponent(returnTo)}`, { replaceState: true });
   });
 
@@ -371,13 +396,15 @@ import X from 'lucide-svelte/icons/x';
   <ToastViewport />
   <ConfirmDialog />
   <PaletteHost bind:this={commandPalette} />
-  {#if PinnedDock && $auth.status === 'authenticated' && $deviceDataReady}<PinnedDock />{/if}
-  {#if $auth.status === 'authenticated'}
-    <ConnectionBanner />
-  {/if}
-  <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-chrome">
-    <div class={`flex h-full w-full min-w-0 overflow-hidden ${shellSpacingClass}`}>
-      {#if !isChatWindowMode}
+  {#if PinnedDock && !isProjectWindowMode && $auth.status === 'authenticated' && $deviceDataReady}<PinnedDock />{/if}
+  <div class="app-shell-viewport app-viewport-frame fixed inset-x-0 overflow-hidden overscroll-none bg-chrome flex flex-col">
+    <div bind:this={connectionNoticeSlotEl} class="max-h-[50%] shrink-0 overflow-y-auto" data-testid="connection-notice-slot">
+      {#if $auth.status === 'authenticated'}
+        <ConnectionBanner />
+      {/if}
+    </div>
+    <div class={`flex min-h-0 flex-1 w-full min-w-0 overflow-hidden ${shellSpacingClass}`}>
+      {#if !isWindowMode}
       <aside
         class={`mb-3 hidden min-h-0 shrink-0 overflow-hidden whitespace-nowrap rounded-3xl border border-separator/80 bg-chrome shadow-card transition-all duration-200 ease-in-out lg:flex lg:flex-col lg:justify-between ${sidebarExpanded ? 'w-64 p-4' : 'w-14 p-2'}`}
       >
@@ -406,7 +433,7 @@ import X from 'lucide-svelte/icons/x';
             scrollbar on the nav column.
           -->
           <nav class={`space-y-1 ${sidebarExpanded ? 'mt-6 space-y-2' : 'mt-4'}`}>
-            {#each navigationItems as item}
+            {#each visibleNavigation as item}
               {#if sidebarExpanded}
                 <a
                   aria-label={`Open ${item.label}`}
@@ -445,29 +472,23 @@ import X from 'lucide-svelte/icons/x';
             <InboxBell expanded={sidebarExpanded} />
           </div>
           {#if sidebarExpanded}
-            <div class="space-y-1">
-              <p class="text-sm font-medium text-strong">{$auth.user?.name ?? $auth.user?.email}</p>
-              <p class="text-xs text-muted">{$auth.user?.email}</p>
+            <!-- Compact footer keeps the navigation visible on short screens. -->
+            <div class="flex items-center gap-2" data-testid="sidebar-account">
+              <div class="min-w-0 flex-1">
+                <p class="truncate text-sm font-medium text-strong">{$auth.user?.name ?? $auth.user?.email}</p>
+                <p class="flex items-center gap-1.5 text-xs text-muted">
+                  <span class={`inline-flex h-2 w-2 shrink-0 rounded-full ${websocketStatusTone()}`} aria-hidden="true"></span>
+                  <span class="truncate">{websocketStatusLabel()}</span>
+                </p>
+              </div>
+              <Button size="sm" variant="ghost" onclick={handleLogout}>Sign out</Button>
             </div>
-            <div class="space-y-2 rounded-2xl border border-separator/80 bg-chrome/60 px-3 py-3 text-sm text-secondary">
-              <div class="flex items-center justify-between gap-3">
-                <span class="text-xs font-medium uppercase tracking-[0.2em] text-muted">Workspace</span>
-                <span class={`inline-flex h-2.5 w-2.5 rounded-full ${websocketStatusTone()}`} aria-label={`WebSocket ${$wsState.status}`}></span>
-              </div>
-              <div class="flex items-center justify-between gap-3 text-xs text-muted">
-                <span>WebSocket</span>
-                <span class="text-right">{websocketStatusLabel()}</span>
-              </div>
-              <div class="flex gap-2">
-                {#if $wsState.status === 'stalled'}
-                  <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => wsClient.reconnectNow()}>
-                    <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
-                    Reconnect
-                  </Button>
-                {/if}
-              </div>
-            </div>
-            <Button class="w-full justify-center" variant="secondary" onclick={handleLogout}>Sign out</Button>
+            {#if $wsState.status === 'stalled'}
+              <Button class="w-full justify-center" size="sm" variant="secondary" onclick={() => wsClient.reconnectNow()}>
+                <RefreshCw class="mr-1.5 h-3.5 w-3.5" />
+                Reconnect
+              </Button>
+            {/if}
           {:else}
             <!--
               Collapsed footer icons. Each icon uses the same
@@ -524,12 +545,12 @@ import X from 'lucide-svelte/icons/x';
         principle: content sits directly on the page background, and
         sections rely on subtle dividers and typography for hierarchy.
       -->
-      <main class="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent" id="main-content">
+      <main class={`flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-transparent ${!isChatRoute ? 'pt-[var(--app-shell-top-offset,0px)] pb-[var(--app-shell-bottom-offset,0px)] lg:pt-0 lg:pb-0' : ''}`} id="main-content">
         {#if showMobileHeader}
         <!-- The iOS-managed viewport already starts below the status area. -->
-        <header bind:this={mobileHeaderEl} class="app-keyboard-stable-header fixed inset-x-0 top-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-separator/80 bg-chrome px-3 py-1 sm:gap-3 sm:px-4 sm:py-1 lg:hidden" style="padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
+        <header bind:this={mobileHeaderEl} class="app-keyboard-stable-header fixed inset-x-0 z-[70] flex shrink-0 items-center justify-between gap-2 border-b border-separator/80 bg-chrome px-3 py-1 sm:gap-3 sm:px-4 sm:py-1 lg:hidden" style="top: var(--app-shell-notice-height, 0px); padding-left: max(0.75rem, env(safe-area-inset-left)); padding-right: max(0.75rem, env(safe-area-inset-right));">
           <div class="flex min-w-0 flex-1 items-center gap-2 lg:hidden">
-            <Button aria-label="Open navigation" class="h-10 w-10 lg:hidden md:h-9 md:w-9" size="icon" variant="secondary" onclick={openMobileNav}>
+            <Button aria-label="Open navigation" class="h-10 w-10 lg:hidden md:h-9 md:w-9 min-h-[44px] min-w-[44px]" size="icon" variant="secondary" onclick={openMobileNav}>
               <Menu class="h-5 w-5" />
             </Button>
             <div class="min-w-0">
@@ -571,13 +592,13 @@ import X from 'lucide-svelte/icons/x';
           class={contentShellClass}
           data-app-content="true"
           role="presentation"
-          use:adaptiveBottomInset={{ disabled: !shouldReserveBottomTabSpace }}
+          use:adaptiveBottomInset={{ disabled: !isChatRoute || !shouldReserveBottomTabSpace }}
           use:scrollPersist={{ key: $page.url.pathname, disabled: isChatDetailRoute }}
-          use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen || isChatWindowMode }}
+          use:edgeSwipe={{ edge: 'left', onTrigger: handleLeftEdgeSwipe, disabled: isChatDetailRoute || mobileNavOpen || isWindowMode }}
           use:edgeSwipe={{ edge: 'right', onTrigger: handleRightEdgeSwipe, disabled: !mobileNavOpen }}
         >
             {#if $deviceDataReady}
-              {@render children()}
+        {@render children()}
              {:else if $deviceDataError}
                <p class="p-6 text-sm text-warning" role="alert">{$deviceDataError} Local data remains preserved; sending is disabled.</p>
              {:else}
@@ -618,7 +639,7 @@ import X from 'lucide-svelte/icons/x';
     {/snippet}
 
     <nav class="space-y-2">
-      {#each navigationItems as item}
+      {#each visibleNavigation as item}
         <a
            class={`flex min-h-[48px] items-center gap-3 rounded-2xl px-4 py-3 text-base transition ${navigationItemActive(item.href, $page.url.pathname) ? 'bg-accent-subtle text-strong' : 'text-secondary hover:bg-surface hover:text-strong'}`}
           href={item.href}
@@ -656,5 +677,5 @@ import X from 'lucide-svelte/icons/x';
 
   <!-- Mobile bottom tab bar: primary navigation on small screens. Hidden inside
        chat detail views so the composer owns the bottom safe-area. -->
-  <BottomTabBar hidden={isChatDetailRoute || isChatWindowMode} />
+  <BottomTabBar hidden={isChatDetailRoute || isWindowMode} />
 {/if}

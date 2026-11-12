@@ -2,13 +2,16 @@
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ActivityLabel from './ActivityLabel.svelte';
   import { chatDisclosure } from '$lib/chat-v2/motion';
+  import { getContext, untrack } from 'svelte';
+  import { timelineDisclosureContext, timelineRowItemIds, TimelineDisclosureState } from '$lib/chat-v2/presentation-state';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
+  import MessageAttachments from '$lib/components/MessageAttachments.svelte';
   import type { ToolCallTimelineItem as RenderToolCallTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
   import type { ActivitySegmentEntry, ActivitySegmentRow, ToolGroupRow } from '$lib/chat-v2/tool-groups';
-  import type { Agent } from '$lib/types/api';
+  import type { Agent, AttachmentRef } from '$lib/types/api';
 
   let {
     row,
@@ -34,20 +37,26 @@
     scope?: TimelineScope | undefined;
   }>();
 
-  let expanded = $state(false);
+  const disclosures = getContext<TimelineDisclosureState | undefined>(timelineDisclosureContext);
+  const memberIds = $derived(timelineRowItemIds(row));
+  const restored = untrack(() => disclosures?.read('activity_segment', memberIds));
+  let instantDisclosure = $state(true);
+  let expanded = $state(restored ?? untrack(() => row.defaultExpanded));
   let initializedGroupId = $state<string | null>(null);
   // Tracks whether the user has manually toggled this segment. Until they do,
   // expansion follows `row.defaultExpanded` — expanded while the assistant text
   // is live (so streamed content stays visible through the fold), then collapsed
   // when it completes. A manual toggle pins the state and stops auto-follow, so
   // the tidy-up never overrides a deliberate user choice.
-  let userToggled = $state(false);
+  let userToggled = $state(restored !== undefined);
   let lastDefaultExpanded = $state<boolean | null>(null);
   let liveNow = $state(Date.now());
 
   function toggleExpanded(): void {
+    instantDisclosure = false;
     expanded = !expanded;
     userToggled = true;
+    disclosures?.remember('activity_segment', memberIds, expanded);
   }
 
   function groupItems(group: ToolGroupRow): ToolCallTimelineItem[] {
@@ -63,6 +72,10 @@
   }
 
   const tools = $derived(row.toolGroups.flatMap(groupItems));
+  const assistantAttachments = $derived([...new Map<string, AttachmentRef>(
+    row.entries.flatMap((entry: ActivitySegmentEntry) => entry.kind === 'assistant' ? entry.item.attachments : [])
+      .map((attachment: AttachmentRef) => [attachment.artifact_id, attachment] as const)
+  ).values()]);
   const selectedChildVisible = $derived.by(() =>
       searchSelectedId !== null
       && (
@@ -73,18 +86,22 @@
 
   $effect(() => {
     if (initializedGroupId !== row.id) {
-      expanded = row.defaultExpanded;
+      const remembered = untrack(() => disclosures?.read('activity_segment', memberIds));
+      expanded = remembered ?? row.defaultExpanded;
+      if (remembered !== undefined) disclosures?.remember('activity_segment', memberIds, remembered);
       initializedGroupId = row.id;
-      userToggled = false;
+      userToggled = remembered !== undefined;
       lastDefaultExpanded = row.defaultExpanded;
     } else if (!userToggled && row.defaultExpanded !== lastDefaultExpanded) {
       // Auto-follow defaultExpanded transitions while the user hasn't taken
       // control. This is what collapses a segment when its live assistant text
       // completes (defaultExpanded true -> false) even though the segment id is
       // now stable across that transition.
+      instantDisclosure = false;
       expanded = row.defaultExpanded;
       lastDefaultExpanded = row.defaultExpanded;
     }
+    if (userToggled) disclosures?.remember('activity_segment', memberIds, expanded);
     // A selected search hit always forces the segment open regardless of state.
     if (selectedChildVisible) {
       expanded = true;
@@ -168,8 +185,14 @@
     />
   </button>
 
+  {#if !expanded && assistantAttachments.length}
+    <div class="mx-3 mb-2" data-testid="collapsed-assistant-attachments">
+      <MessageAttachments attachments={assistantAttachments} />
+    </div>
+  {/if}
+
   {#if expanded}
-    <div transition:chatDisclosure
+    <div transition:chatDisclosure={{ instant: instantDisclosure }}
       onoutrostart={(event) => { event.currentTarget.inert = true; }}
       onintrostart={(event) => { event.currentTarget.inert = false; }}
       class="mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-control-border bg-inset/20 px-2 py-2">

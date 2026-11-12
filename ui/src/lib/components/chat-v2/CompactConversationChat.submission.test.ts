@@ -32,7 +32,7 @@ describe('compact durable submission', () => {
   beforeEach(async () => {
     localStorage.clear();
     await loginFixtureAccount();
-    vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} });
     mocks.send.mockReset().mockImplementation(async (conversationId: string, id: string, body: { client_message_id: string }) => ({
       status: 'accepted', conversation_id: conversationId, client_txn_id: id, client_message_id: body.client_message_id,
       server_time: '2026-10-20T00:00:00Z',
@@ -55,22 +55,6 @@ describe('compact durable submission', () => {
     return { ...component, conversationId, pending, prepare };
   }
 
-  it('persists each text-only edit with a distinct input intent', async () => {
-    const conversationId = crypto.randomUUID(), drafts = new DocumentDrafts();
-    const key = `cognis-chat-draft:${conversationId}`;
-    render(CompactConversationChat, { conversationId });
-    const input = screen.getByLabelText('Composer text');
-    await fireEvent.input(input, { target: { value: 'first compact edit' } });
-    await waitFor(() => expect(drafts.readComposite(key)?.text).toBe('first compact edit'));
-    const revision = drafts.readComposite(key)!.input_revision;
-    await fireEvent.input(input, { target: { value: 'newer compact edit' } });
-    await waitFor(() => {
-      const next = drafts.readComposite(key);
-      expect(next?.text).toBe('newer compact edit');
-      expect(next?.input_revision).not.toBe(revision);
-    });
-  });
-
   it('sends an attachment from dashboard with an untouched pinned composer open', async () => {
     const conversationId = crypto.randomUUID();
     const dashboard = render(CompactConversationChat, { conversationId });
@@ -88,6 +72,21 @@ describe('compact durable submission', () => {
     expect(screen.queryByText(/Draft changed/)).toBeNull();
     expect(await createIndexedDbChatV2Outbox().list(conversationId)).toHaveLength(1);
     dashboard.unmount(); pinned.unmount();
+  });
+
+  it('sends local input despite a delayed empty draft from a sibling document', async () => {
+    const conversationId = crypto.randomUUID();
+    render(CompactConversationChat, { conversationId });
+    await new DocumentDrafts().writeComposite(`cognis-chat-draft:${conversationId}`, {
+      input_revision: crypto.randomUUID(), text: '', attachments: [], chat_mode: null,
+    });
+    await fireEvent.input(screen.getByLabelText('Composer text'), { target: { value: 'send my local input' } });
+    vi.spyOn(attachmentUploads, 'prepare').mockResolvedValue();
+    await fireEvent.click(screen.getByTestId('compact-composer-fixture'));
+    await waitFor(() => expect(mocks.send).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/Draft changed/)).toBeNull();
+    expect(screen.getByLabelText('Composer text')).toHaveValue('');
+    expect(await createIndexedDbChatV2Outbox().list(conversationId)).toHaveLength(1);
   });
 
   it('shares edits with a view opened during preparation and preserves newer input after send', async () => {

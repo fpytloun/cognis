@@ -33,25 +33,18 @@ describe('agent model capabilities', () => {
     expect(agentModelCapabilities(providers.slice(0, 1), routes, 'cognis', 'cognis/chat')).toBeNull();
   });
   it('preserves direct-provider and default-model lookup', () => {
-    expect(agentModelCapabilities(providers, routes, 'first', '')).toMatchObject({
-      reasoning_efforts: ['default', 'low', 'high', 'max'], supports_fast_mode: true
-    });
+    expect(agentModelCapabilities(providers, routes, 'first', '')).toBe(providers[0].models[0]);
   });
-  it('normalizes direct-provider metadata with no advertised capabilities', () => {
-    const partial = structuredClone(providers);
-    Reflect.deleteProperty(partial[0].models[0], 'reasoning_efforts');
-    Reflect.deleteProperty(partial[0].models[0], 'supports_fast_mode');
-    expect(agentModelCapabilities(partial, [], 'first', '')).toEqual({
-      reasoning_efforts: ['default'], supports_fast_mode: false
-    });
-    expect(agentModelCapabilities(partial, [], 'first', 'unknown')).toBeNull();
-  });
-  it('uses the same default efforts for partial routed metadata', () => {
-    const partial = structuredClone(providers);
-    Reflect.deleteProperty(partial[0].models[0], 'reasoning_efforts');
-    Reflect.deleteProperty(partial[0].models[0], 'supports_fast_mode');
-    expect(agentModelCapabilities(partial, routes, '', 'cognis/chat')).toEqual({
-      reasoning_efforts: ['default'], supports_fast_mode: false
-    });
+  it('normalizes sparse saved model metadata without mutating provider configuration', () => {
+    const model = { ...providers[0].models[0], model_id: 'custom-model' };
+    Reflect.deleteProperty(model, 'reasoning_efforts');
+    Reflect.deleteProperty(model, 'supports_fast_mode');
+    const sparseProviders = [{
+      ...providers[0], config: { default_model: 'custom-model' }, models: [model]
+    }];
+    const expected = { reasoning_efforts: [], supports_fast_mode: false };
+    expect(agentModelCapabilities(sparseProviders, [], 'first', '')).toEqual(expected);
+    expect(agentModelCapabilities(sparseProviders, [], 'first', 'custom-model')).toEqual(expected);
+    expect(model).toEqual({ model_id: 'custom-model' });
   });
 });

@@ -10,6 +10,7 @@
   import { portal } from '$lib/actions/portal';
   import { api } from '$lib/api/client';
   import { auth } from '$lib/stores/auth';
+  import { usageAnalyticsEnabled } from '$lib/system';
   import { overlayStack, isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import { wsClient, isMetadataRefreshOnlyScope } from '$lib/ws/client';
   import { formatRelativeTime, formatAbsoluteTime } from '$lib/time';
@@ -17,6 +18,8 @@
   import { addToast } from '$lib/stores/toasts';
   import { PaletteSearch } from '$lib/palette/search';
   import { PaletteThumbnails } from '$lib/palette/thumbnails';
+  import { PaletteHistory } from '$lib/palette/history';
+  import { numberedResultIndex } from '$lib/palette/shortcuts';
   import { identity, labels, localItems, highlighted, destinationLabel, shouldOpenWindow, normalize, resultTypes, isEntityKind, isWindowKind, type PaletteItem } from '$lib/palette/model';
   import ResultIcon from './ResultIcon.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
@@ -39,8 +42,11 @@
   let previousFocus: HTMLElement | null = null;
   let overlay: ReturnType<typeof registerOverlay> | null = null;
   let activating = false;
+  const history = new PaletteHistory();
+  let hasHistory = $state(false), browsingHistory = $state(false);
+  let rememberOnClose = true;
   const mod = $state({ label: '⌘' });
-  const suggestions = $derived(localItems(query, $auth.user?.role === 'admin', $auth.user?.role !== 'viewer')
+  const suggestions = $derived(localItems(query, $auth.user?.role === 'admin', $auth.user?.role !== 'viewer', $usageAnalyticsEnabled)
     .filter(item => selectedTypes.includes(item.kind)));
   const metadataItems = $derived($search.items);
   const items = $derived.by(() => {
@@ -69,14 +75,17 @@
     if (get(overlayStack).length > 0 && !overlay) return;
     if (closeTimer) clearTimeout(closeTimer);
     previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    history.open($auth.user.email);
+    hasHistory = history.size > 0; browsingHistory = false; rememberOnClose = true;
     query = ''; selected = ''; scroll = 0; leaving = false; open = true;
     overlay ??= registerOverlay({ kind: 'blocking', blocksChrome: true, root: () => panel ?? null });
     search.setQuery('', entityTypes);
     await tick();
     input?.focus({ preventScroll: true });
   }
-  function close(restore = true) {
+  function close(restore = true, remember = true) {
     if (!open || leaving) return;
+    if (remember && rememberOnClose) history.remember(query);
     search.close(); leaving = true;
     overlay?.unregister(); overlay = null;
     if (restore && previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
@@ -87,6 +96,14 @@
     selected = ''; scroll = 0;
     if (results) results.scrollTop = 0;
     search.setQuery(query, entityTypes);
+  }
+  function onInput() {
+    history.reset(); browsingHistory = false; rememberOnClose = true;
+    updateQuery();
+  }
+  function clearHistory() {
+    history.clear(); hasHistory = false; browsingHistory = false; rememberOnClose = false;
+    input?.focus();
   }
   function changeTypes(types: PaletteItem['kind'][]) {
     selectedTypes = types;
@@ -125,9 +142,9 @@
     } finally { activating = false; }
   }
   function handleKey(event: KeyboardEvent) {
-    if (event.isComposing || event.altKey || event.repeat) return;
+    if (event.isComposing || event.repeat) return;
     const modifier = event.metaKey || event.ctrlKey;
-    if (modifier && event.key.toLowerCase() === 'k' && !event.shiftKey) {
+    if (modifier && !event.altKey && event.key.toLowerCase() === 'k' && !event.shiftKey) {
       if (get(overlayStack).length > 0 && !isTopOverlay(overlay?.id ?? null)) return;
       event.preventDefault(); event.stopImmediatePropagation();
       if (open && !leaving) close(); else void show();
@@ -136,9 +153,25 @@
     if (!open || leaving || !isTopOverlay(overlay?.id ?? null)) return;
     const filter = event.target instanceof Element ? event.target.closest('[data-palette-filter]') : null;
     if (filter && event.key !== 'Tab' && (event.key !== 'Escape' || filter.getAttribute('data-open') === 'true')) return;
-    if (modifier && /^[1-9]$/.test(event.key)) {
+    if (event.target === input && ['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+      history.reset(); browsingHistory = false;
+    }
+    if (event.target === input && !modifier && !event.shiftKey &&
+      (event.key === 'ArrowUp' || event.key === 'ArrowDown') &&
+      (event.altKey || history.browsing || (event.key === 'ArrowUp' && !query.trim()))) {
+      const value = event.key === 'ArrowUp' ? history.previous(query) : history.next();
+      if (value !== null || event.altKey) {
+        event.preventDefault(); event.stopImmediatePropagation();
+        browsingHistory = history.browsing;
+        if (value !== null && value !== query) { query = value; updateQuery(); }
+        return;
+      }
+    }
+    if (event.altKey) return;
+    const numberedIndex = numberedResultIndex(event);
+    if (numberedIndex !== null) {
       event.preventDefault(); event.stopImmediatePropagation();
-      void activate(items[Number(event.key) - 1]); return;
+      void activate(items[numberedIndex]); return;
     }
     if (event.key === 'Escape') {
       event.preventDefault(); event.stopImmediatePropagation(); close(); return;
@@ -176,7 +209,11 @@
     let user = $auth.status === 'authenticated' ? $auth.user?.email ?? '' : '';
     const stopAuth = auth.subscribe((state) => {
       const next = state.status === 'authenticated' ? state.user?.email ?? '' : '';
-      if (next !== user) { search.clear(); thumbnails.clear(); close(); user = next; }
+      if (next !== user) {
+        search.clear(); thumbnails.clear(); close(true, false); user = next;
+        history.open(next || null); hasHistory = history.size > 0;
+        browsingHistory = false; query = '';
+      }
     });
     const stopSocket = wsClient.subscribe((event) => {
       if (event.type === 'scope_invalidated' && (isMetadataRefreshOnlyScope(event.reason, event.metadata_only) || event.reason === 'event_store_session_invalidated')) search.invalidate();
@@ -199,7 +236,7 @@
       <div bind:this={panel} class="palette-panel" role="dialog" aria-modal="true" aria-label="Command palette" tabindex="-1">
         <div class="palette-input-row">
           <Search class="search-icon" size={26} strokeWidth={1.7} />
-          <input bind:this={input} bind:value={query} oninput={updateQuery}
+          <input bind:this={input} bind:value={query} oninput={onInput}
             role="combobox" aria-label="Search Cognis" aria-autocomplete="list" aria-expanded="true"
             aria-controls="palette-results" aria-activedescendant={activeOption}
             placeholder="Search anything…" autocomplete="off" spellcheck="false" maxlength="160" />
@@ -239,7 +276,7 @@
                     {#if item.updated_at}<time class="result-updated" datetime={item.updated_at} title={formatAbsoluteTime(item.updated_at)}>Updated {formatRelativeTime(item.updated_at)}</time>{/if}
                   </span>
                 </button>
-                {#if index < 9}<kbd class="number-hint">{mod.label}{index + 1}</kbd>{/if}
+                {#if index < 9}<kbd class="number-hint">{mod.label === '⌘' ? '⌃⇧' : 'Ctrl+Shift+'}{index + 1}</kbd>{/if}
                 {#if item.kind !== 'action'}
                   <a class="redirect-button" href={item.href} aria-label={`Open ${item.title} in ${destinationLabel(item)}`}
                     title={`Open in ${destinationLabel(item)} (${mod.label}↵)`}
@@ -265,8 +302,9 @@
           {#if $search.loading && !items.length}<p class="palette-notice">Searching names across Cognis…</p>{/if}
         </div>
         <div class="palette-footer">
-          <div><kbd>↑</kbd><kbd>↓</kbd><span>navigate</span><kbd><CornerDownLeft size={11} /></kbd><span>open</span></div>
+          <div><kbd>↑</kbd><kbd>↓</kbd><span>{browsingHistory ? 'history · → results' : !query.trim() && hasHistory ? 'history / results' : 'navigate'}</span><kbd><CornerDownLeft size={11} /></kbd><span>open</span></div>
           <div class="footer-redirect"><kbd>{mod.label}<CornerDownLeft size={11} /></kbd><span>go to page</span></div>
+          {#if hasHistory}<button type="button" class="history-clear" onclick={clearHistory} aria-label="Clear search history">Clear history</button>{/if}
           <Command size={14} strokeWidth={1.5} class="footer-brand" />
         </div>
         <span class="sr-only" role="status" aria-live="polite">{statusText}</span>
@@ -309,7 +347,9 @@
   .redirect-button{display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:6px;margin:0 8px 0 3px;color:var(--muted);opacity:.45;}
   .selected .redirect-button,.redirect-button:focus-visible{opacity:1;}
   .redirect-button:hover{background:color-mix(in srgb,var(--foreground) 9%,transparent);color:var(--foreground);}
-  .palette-footer{display:flex;align-items:center;gap:20px;padding:13px 23px;border-top:1px solid var(--separator);border-radius:0 0 20px 20px;font-size:10px;color:var(--muted);background:color-mix(in srgb,var(--foreground) 2%,transparent);flex:none;}
+  .palette-footer{display:flex;flex-wrap:wrap;align-items:center;gap:10px 16px;padding:13px 23px;border-top:1px solid var(--separator);border-radius:0 0 20px 20px;font-size:10px;color:var(--muted);background:color-mix(in srgb,var(--foreground) 2%,transparent);flex:none;}
+  .history-clear{padding:4px 2px;line-height:16px;text-decoration:underline;text-underline-offset:2px;}
+  .history-clear:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
   .palette-footer>div{display:flex;align-items:center;gap:4px;}
   .palette-footer span{margin:0 10px 0 3px;opacity:.8;}
   .palette-footer kbd{display:flex;align-items:center;justify-content:center;gap:2px;height:17px;min-width:17px;padding:0 3px;border-radius:4px;border:1px solid var(--separator);font-size:10px;}

@@ -10,7 +10,6 @@
 
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import { preferredNewChatAgentId } from '$lib/chat/new-chat-agent';
-  import InboxBell from '$lib/components/InboxBell.svelte';
   import AttentionActionDialog from '$lib/components/attention/AttentionActionDialog.svelte';
   import CreateTaskModal from '$lib/components/tasks/CreateTaskModal.svelte';
   import AgentQuickChatModal from '$lib/components/dashboard/AgentQuickChatModal.svelte';
@@ -253,6 +252,7 @@
   let newChatError = $state('');
   let newChatAgentId = $state('');
   let newChatAgentProfileId = $state('');
+  let newChatAgentProfileMode = $state<'auto' | 'default' | null>(null);
   let creatingTask = $state(false);
   let createTaskDeps = $state<{ workflows: Workflow[]; projects: Project[]; skills: Skill[]; conversations: Conversation[] } | null>(null);
 
@@ -283,7 +283,7 @@
   async function loadAgents(): Promise<void> {
     agentsLoading = true;
     try {
-      const items = await api.agents.listAll({ include_system: false });
+      const items = await api.agents.listAll({ include_system: false, include_contacts: true });
       agents = items.filter((agent) => !agent.hidden && !agent.disabled && !agent.is_system);
       agentsError = null;
     } catch (caught) {
@@ -1028,6 +1028,10 @@
   }
 
   async function selectAgent(agent: Agent): Promise<void> {
+    if (agent.is_contact_only && agent.contact_conversation_id) {
+      await openConversation(agent.contact_conversation_id);
+      return;
+    }
     if (useWorkspaceWindows()) {
       const result = await workspaceManager.requestOpen({
         kind: 'agent',
@@ -1088,6 +1092,7 @@
       : focused?.agentId ?? conversations?.find((item) => item.conversation_id === focused?.entityId)?.agent_id;
     newChatAgentId = preferredNewChatAgentId(agents ?? [], [focusedAgentId, newChatAgentId], defaultNewChatAgentId(agents) ?? undefined);
     newChatAgentProfileId = '';
+    newChatAgentProfileMode = null;
     newChatError = '';
     showNewChatModal = true;
   }
@@ -1109,6 +1114,7 @@
       const conversation = await api.conversations.create({
         agent_id: newChatAgentId,
         agent_profile_id: newChatAgentProfileId || null,
+        agent_profile_mode: newChatAgentProfileMode,
         context: {
           type: 'web',
           ref: null,
@@ -1254,14 +1260,13 @@
   </div>
 
   <div class="flex shrink-0 items-center gap-2" data-testid="dashboard-search-filters">
-    <InboxBell />
     <div class="relative min-w-0 flex-1">
       <Search class="pointer-events-none absolute left-3 top-2.5 h-4 w-4 text-quiet" />
       <Input
         bind:value={searchInput}
         find={{ dashboardPrimary: true }}
         class="pl-9 pr-9"
-        placeholder="Search tasks and conversations"
+        placeholder="Search"
         aria-label="Search tasks and conversations"
         oninput={scheduleSearch}
       />
@@ -1380,6 +1385,7 @@
     {agents}
     bind:selectedAgentId={newChatAgentId}
     bind:selectedAgentProfileId={newChatAgentProfileId}
+    bind:selectedAgentProfileMode={newChatAgentProfileMode}
     title="Start a new chat"
     description="Choose the primary agent and profile for this new web conversation."
     busy={newChatCreating}

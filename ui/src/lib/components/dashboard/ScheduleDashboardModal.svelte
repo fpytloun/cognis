@@ -8,7 +8,8 @@
   import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';
   import WorkflowPlanPreview from '$lib/components/workflows/WorkflowPlanPreview.svelte';
   import { api, asApiError } from '$lib/api/client';
-  import { formatAbsoluteTime } from '$lib/time';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { auth } from '$lib/stores/auth';
   import type { Agent, Schedule, Workflow } from '$lib/types/api';
 
@@ -78,10 +79,11 @@
     finally { mutating = false; }
   }
 
-  function activityStatus(detail: Schedule): string | null {
-    if (detail.consecutive_errors > 0 || detail.last_run_status === 'failed') return 'failed';
-    if (detail.last_run_status === 'running') return 'running';
-    return detail.enabled ? detail.last_run_status : 'disabled';
+  /** The schedule's own state; the last run's outcome is shown separately. */
+  function activityStatus(detail: Schedule): string {
+    if (!detail.enabled) return 'disabled';
+    if (detail.consecutive_errors > 0) return 'failed';
+    return 'scheduled';
   }
 
   async function load(): Promise<void> {
@@ -212,28 +214,33 @@
     <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 sm:p-6" data-testid={`dashboard-schedule-modal-panel-${activeTab}`}>
     {#if activeTab === 'description'}
       <div class="space-y-5">
-        {#if $auth.user && $auth.user.role !== 'viewer'}
-          <Button size="sm" variant="secondary" disabled={mutating} onclick={() => void toggleEnabled()}>
-            {schedule.enabled ? 'Pause schedule' : 'Enable schedule'}
-          </Button>
-        {/if}
         <div class="flex items-center gap-3">
           <AgentAvatar name={agent?.display_name ?? agent?.name ?? schedule.agent_id} avatarUrl={agent?.avatar_url ?? null} class="h-10 w-10" />
-          <div class="min-w-0">
+          <div class="min-w-0 flex-1">
             <p class="truncate font-medium text-strong">{agent?.display_name ?? agent?.name ?? schedule.agent_id}</p>
-            <p class="text-xs text-muted">{schedule.human_schedule ?? schedule.schedule_type}</p>
+            <p class="text-xs text-muted">{schedule.human_schedule ?? schedule.cron_expr ?? schedule.schedule_type} · {schedule.timezone}</p>
           </div>
         </div>
+        <dl class="grid gap-4 rounded-2xl border border-separator p-4 text-xs sm:grid-cols-2">
+          <div><dt class="text-quiet">Next run</dt><dd class="mt-1 text-foreground">{schedule.next_fire_at ? `${formatAbsoluteTime(schedule.next_fire_at)} (${formatRelativeTime(schedule.next_fire_at)})` : 'Not scheduled'}</dd></div>
+          <div data-testid="dashboard-schedule-last-run"><dt class="text-quiet">Last run</dt><dd class="mt-1 flex flex-wrap items-center gap-1.5 text-foreground">{#if schedule.last_run_status}<StatusBadge status={schedule.last_run_status === 'success' ? 'completed' : schedule.last_run_status} />{#if schedule.last_fired_at}<span>{formatRelativeTime(schedule.last_fired_at)}</span>{/if}{:else}Not run yet{/if}</dd></div>
+          <div><dt class="text-quiet">Workflow</dt><dd class="mt-1 text-foreground">{workflow?.name ?? (schedule.workflow_id ? 'See planned steps' : 'Ad-hoc task')}</dd></div>
+          {#if schedule.project_id}
+            <div><dt class="text-quiet">Project</dt><dd class="mt-1"><a class="text-accent hover:underline" href={`/projects/${schedule.project_id}`}>Open project</a></dd></div>
+          {/if}
+          {#if schedule.skill_id}
+            <div><dt class="text-quiet">Skill</dt><dd class="mt-1 break-all text-foreground">{schedule.skill_id}</dd></div>
+          {/if}
+        </dl>
         <section class="rounded-2xl border border-separator bg-surface/60 p-4">
           <h3 class="font-medium text-strong">{templateTitle}</h3>
-          <p class="mt-2 whitespace-pre-wrap text-sm leading-6 text-secondary">{templateDescription ?? 'No task description was provided.'}</p>
+          <p class="mt-2 line-clamp-[12] whitespace-pre-wrap text-sm leading-6 text-secondary">{templateDescription ?? 'No task description was provided.'}</p>
         </section>
-        <dl class="grid gap-4 rounded-2xl border border-separator p-4 text-xs sm:grid-cols-2">
-          <div><dt class="text-quiet">Next run</dt><dd class="mt-1 text-foreground">{schedule.next_fire_at ? formatAbsoluteTime(schedule.next_fire_at) : 'Not scheduled'}</dd></div>
-          <div><dt class="text-quiet">Workflow</dt><dd class="mt-1 break-all text-foreground">{schedule.workflow_id ?? 'Ad hoc'}</dd></div>
-          <div><dt class="text-quiet">Project</dt><dd class="mt-1 break-all text-foreground">{schedule.project_id ?? 'None'}</dd></div>
-          <div><dt class="text-quiet">Skill</dt><dd class="mt-1 break-all text-foreground">{schedule.skill_id ?? 'None'}</dd></div>
-        </dl>
+        {#if $auth.user && $auth.user.role !== 'viewer'}
+          <Button size="sm" variant="secondary" disabled={mutating} onclick={() => void toggleEnabled()}>
+            {schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
+          </Button>
+        {/if}
       </div>
     {:else if !schedule.workflow_id}
       <div class="rounded-2xl border border-dashed border-control-border p-8 text-center" data-testid="dashboard-schedule-ad-hoc">

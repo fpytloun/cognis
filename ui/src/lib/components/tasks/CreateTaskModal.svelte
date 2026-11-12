@@ -1,15 +1,18 @@
 <script lang="ts">
+  import AgentSelect from '$lib/components/AgentSelect.svelte';
   import { untrack } from 'svelte';
+  import TaskFinishInstructions from './TaskFinishInstructions.svelte';
   import Button from '$lib/components/ui/Button.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import { api } from '$lib/api/client';
+  import { COMPLETION_MODE_OPTIONS } from '$lib/task-delivery';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { DEFAULT_INTARIS_EVALUATION, policyFromText } from '$lib/session-policy';
   import { buildWorkflowSourceOptions, decodeWorkflowSourceValue } from '$lib/workflow-sources';
-  import type { Agent, Conversation, Project, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, CompletionModeFamily, Conversation, Project, Skill, Workflow } from '$lib/types/api';
 
   let {
     agents,
@@ -40,8 +43,9 @@
       expected_output: string | null;
       delivery_mode: string;
       delivery_target: string | null;
-      completion_mode_family: 'default' | 'direct';
+      completion_mode_family: CompletionModeFamily;
       allow_silent_completion: boolean;
+      on_finish_instructions: string | null;
       interaction_mode_override: 'none' | 'explicit_gates' | 'step_requests' | null;
       escalation_timeout_seconds: number | null;
       session_policy: ReturnType<typeof policyFromText>;
@@ -72,8 +76,9 @@
     priority: 0,
     delivery_mode: 'preferred_channel',
     delivery_target: '',
-    completion_mode_family: 'default' as 'default' | 'direct',
+    completion_mode_family: 'auto' as CompletionModeFamily,
     allow_silent_completion: false,
+    on_finish_instructions: '',
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
     escalation_timeout_seconds: '',
     allow_policy_text: '',
@@ -99,6 +104,7 @@
       delivery_target: form.delivery_mode === 'specific_conversation' ? form.delivery_target : null,
       completion_mode_family: form.completion_mode_family,
       allow_silent_completion: form.allow_silent_completion,
+      on_finish_instructions: form.completion_mode_family !== 'direct' ? form.on_finish_instructions.trim() || null : null,
       interaction_mode_override: form.interaction_mode_override || null,
       escalation_timeout_seconds: form.escalation_timeout_seconds
         ? Number(form.escalation_timeout_seconds)
@@ -169,11 +175,11 @@
   {#snippet children()}
     <div class="space-y-4">
       <div class="space-y-1">
-        <label for="task-title" class="text-xs font-medium uppercase tracking-widest text-muted">Title</label>
+        <label for="task-title" class="text-sm font-medium text-foreground">Title</label>
         <Input id="task-title" bind:value={form.title} placeholder="Task title" />
       </div>
       <div class="space-y-1">
-        <label for="task-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Description</label>
+        <label for="task-desc" class="text-sm font-medium text-foreground">Description</label>
         <textarea
           id="task-desc"
           bind:value={form.description}
@@ -183,7 +189,7 @@
       </div>
 
       <div class="space-y-1">
-        <label for="task-expected" class="text-xs font-medium uppercase tracking-widest text-muted">Expected output</label>
+        <label for="task-expected" class="text-sm font-medium text-foreground">Expected output</label>
         <textarea
           id="task-expected"
           bind:value={form.expected_output}
@@ -194,19 +200,14 @@
 
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1">
-          <label for="task-agent" class="text-xs font-medium uppercase tracking-widest text-muted">Agent</label>
-          <select id="task-agent" bind:value={form.agent_id} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-            <option value="" disabled>Select an agent</option>
-            {#each primaryAgents as agent}
-              <option value={agent.agent_id}>{agent.display_name ?? agent.name}</option>
-            {/each}
-          </select>
+          <label for="task-agent" class="block text-sm font-medium text-foreground">Agent</label>
+          <AgentSelect id="task-agent" agents={primaryAgents} value={form.agent_id} onchange={(next) => { form.agent_id = next; }} />
         </div>
 
         <div class="space-y-1">
-          <label for="task-workflow" class="text-xs font-medium uppercase tracking-widest text-muted">Workflow</label>
+          <label for="task-workflow" class="text-sm font-medium text-foreground">Workflow</label>
           <select id="task-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-            <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
+            <option value="">General task</option>
             {#each workflowSourceOptions as option}
               <option value={option.value}>{option.label}</option>
             {/each}
@@ -218,7 +219,7 @@
           bind:value={form.agent_profile_id}
         />
         <div class="space-y-1">
-          <label for="task-project" class="text-xs font-medium uppercase tracking-widest text-muted">Project</label>
+          <label for="task-project" class="text-sm font-medium text-foreground">Project</label>
           <select id="task-project" bind:value={form.project_id} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">None</option>
             {#each projects as project}
@@ -230,14 +231,15 @@
 
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1">
-          <label for="task-priority" class="text-xs font-medium uppercase tracking-widest text-muted">Priority</label>
+          <label for="task-priority" class="text-sm font-medium text-foreground">Priority</label>
           <Input id="task-priority" bind:value={form.priority} type="number" />
         </div>
 
         <div class="space-y-1">
-          <label for="task-delivery" class="text-xs font-medium uppercase tracking-widest text-muted">Delivery</label>
+          <label for="task-delivery" class="text-sm font-medium text-foreground">Delivery</label>
           <select id="task-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="preferred_channel">Preferred channel</option>
+            <option value="in_app_notifications">In-app notifications (direct only)</option>
             <option value="specific_conversation">Specific conversation</option>
             <option value="latest_active_for_agent">Latest active</option>
           </select>
@@ -246,7 +248,7 @@
 
       {#if form.delivery_mode === 'specific_conversation'}
         <div class="space-y-1">
-          <label for="task-target" class="text-xs font-medium uppercase tracking-widest text-muted">Target conversation</label>
+          <label for="task-target" class="text-sm font-medium text-foreground">Target conversation</label>
           <select id="task-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">Select conversation</option>
             {#each conversations as conversation}
@@ -257,22 +259,23 @@
       {/if}
 
       <div class="space-y-1">
-        <label for="task-completion-family" class="text-xs font-medium uppercase tracking-widest text-muted">Completion notification behavior</label>
-        <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-          <select id="task-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-            <option value="default">Default delivery</option>
-            <option value="direct">Direct channel delivery</option>
+        <label for="task-completion-family" class="text-sm font-medium text-foreground">Completion notification behavior</label>
+        <div class="grid gap-3">
+          <select id="task-completion-family" bind:value={form.completion_mode_family} disabled={form.delivery_mode === 'in_app_notifications'} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
+            {#each COMPLETION_MODE_OPTIONS as option}
+              <option value={option.value}>{option.name} — {option.description}</option>
+            {/each}
           </select>
           <label class="inline-flex items-center gap-2 rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground">
             <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-control-border bg-raised" />
             <span>Allow silent completion</span>
           </label>
         </div>
-        <p class="text-xs text-quiet">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+        <TaskFinishInstructions deliveryMode={form.delivery_mode} bind:completionMode={form.completion_mode_family} bind:instructions={form.on_finish_instructions} />
       </div>
 
       <div class="space-y-1">
-        <label for="task-interaction" class="text-xs font-medium uppercase tracking-widest text-muted">Interaction policy</label>
+        <label for="task-interaction" class="text-sm font-medium text-foreground">Interaction policy</label>
         <select id="task-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
           <option value="">Workflow default</option>
           <option value="step_requests">Allow planning questions</option>
@@ -313,7 +316,7 @@
     <div class="flex justify-end gap-3">
       <Button variant="secondary" onclick={onclose}>Cancel</Button>
       <Button disabled={!form.title.trim() || !form.agent_id || creating} onclick={handleSubmit}>
-        {creating ? 'Creating...' : 'Create draft'}
+        {creating ? 'Creating…' : 'Create task'}
       </Button>
     </div>
   {/snippet}

@@ -1,7 +1,8 @@
 import YAML from 'yaml';
 
 import { GENERIC_THINKING_EFFORTS } from '$lib/thinking';
-import type { StepProfileDefinition, Workflow } from '$lib/types/api';
+import type { CompletionModeFamily, StepProfileDefinition, Workflow } from '$lib/types/api';
+import { resolveCompletionMode } from '$lib/task-delivery';
 import { isRecord } from '$lib/utils';
 
 type OutcomeAction = 'none' | 'fail' | 'gate' | 'continue' | 'cancel' | 'revise';
@@ -123,7 +124,7 @@ export interface WorkflowFormState {
   defaultEvaluate: boolean;
   defaultMaxAttempts: number;
   defaultOnExhausted: string;
-  defaultCompletionModeFamily: 'default' | 'direct';
+  defaultCompletionModeFamily: CompletionModeFamily;
   defaultAllowSilentCompletion: boolean;
   allowPolicyText: string;
   denyPolicyText: string;
@@ -263,7 +264,7 @@ export function createEmptyWorkflowForm(): WorkflowFormState {
     defaultEvaluate: true,
     defaultMaxAttempts: 3,
     defaultOnExhausted: 'gate',
-    defaultCompletionModeFamily: 'default',
+    defaultCompletionModeFamily: 'auto',
     defaultAllowSilentCompletion: false,
     allowPolicyText: '',
     denyPolicyText: '',
@@ -612,7 +613,7 @@ export function workflowToFormState(
     defaultMaxAttempts: typeof workflowDefaults.max_attempts === 'number' ? workflowDefaults.max_attempts : 3,
     defaultOnExhausted: typeof workflowDefaults.on_exhausted === 'string' ? workflowDefaults.on_exhausted : 'gate',
     defaultCompletionModeFamily:
-      deliveryDefaults?.completion_mode_family === 'direct' ? 'direct' : 'default',
+      resolveCompletionMode(deliveryDefaults?.completion_mode_family),
     defaultAllowSilentCompletion: deliveryDefaults?.allow_silent_completion === true,
     allowPolicyText: policyText(workflowDefaults, 'allow_policies'),
     denyPolicyText: policyText(workflowDefaults, 'deny_policies'),

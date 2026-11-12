@@ -1,13 +1,25 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { getContext, onMount } from 'svelte';
+  import { readable, type Readable } from 'svelte/store';
+  import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
+  import { api } from '$lib/api/client';
+  import type { ArtifactRevisionSummary } from '$lib/types/api';
 
   import { portal } from '$lib/actions/portal';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import ChevronLeft from 'lucide-svelte/icons/chevron-left';
   import ChevronRight from 'lucide-svelte/icons/chevron-right';
   import AttachmentSaveButton from './AttachmentSaveButton.svelte';
+  import CompactHeaderActions from './CompactHeaderActions.svelte';
   import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
+  import DocumentLinkActions from './rich/DocumentLinkActions.svelte';
+  import type { ShareLinkOptions } from './rich/share-options';
   import X from 'lucide-svelte/icons/x';
+  import ImageAnnotations from './feedback/annotations/ImageAnnotations.svelte';
+  import FeedbackIndicator from './feedback/FeedbackIndicator.svelte';
+  import FeedbackWorkspace from './feedback/FeedbackWorkspace.svelte';
+  import { getFeedbackSurface } from '$lib/feedback/context';
+  const feedback = getFeedbackSurface();
 
   /**
    * Full-screen image lightbox.
@@ -29,6 +41,8 @@
     alt?: string;
     filename?: string | null;
     artifact_id?: string;
+    /** Revisions of this document; more than one shows a revision menu. */
+    revisions?: number;
   };
 
   let { src, alt = 'Image', filename = null, images = null, index = 0, onIndexChange = undefined, onClose } = $props<{
@@ -61,10 +75,51 @@
   let pinchStartTranslateX = 0;
   let pinchStartTranslateY = 0;
 
-  const items = $derived.by(() => (images && images.length > 0 ? images : [{ src, alt, filename }]));
-  const active = $derived(items[Math.min(currentIndex, items.length - 1)] ?? { src, alt, filename });
+  const items = $derived.by((): LightboxImage[] => (images && images.length > 0 ? images : [{ src, alt, filename }]));
+  // An older revision picked from the menu replaces only the image currently shown.
+  let revisionView = $state<{ index: number; artifact_id: string; src: string } | null>(null);
+  const listed = $derived(items[Math.min(currentIndex, items.length - 1)] ?? { src, alt, filename });
+  const active = $derived(revisionView && revisionView.index === currentIndex
+    ? { ...listed, src: revisionView.src, artifact_id: revisionView.artifact_id } : listed);
+  const revisionSwitcher = () => import('./RevisionSwitcher.svelte');
+  let revisions = $state<ArtifactRevisionSummary[]>([]);
+  let revisionError = $state('');
+  let revisionGeneration = 0;
+  $effect(() => {
+    const id = listed.artifact_id;
+    let disposed = false;
+    revisionGeneration++;
+    revisionView = null;
+    revisionError = '';
+    revisions = [];
+    if (id) {
+      void Promise.resolve().then(() => api.artifacts.revisions(id))
+        .then(history => { if (!disposed) revisions = history.revisions; })
+        .catch(() => {});
+    }
+    return () => { disposed = true; revisionGeneration++; };
+  });
+  async function showRevision(id: string) {
+    const index = currentIndex;
+    const generation = ++revisionGeneration;
+    revisionError = '';
+    if (id === listed.artifact_id) { revisionView = null; return; }
+    try {
+      const { url } = await api.artifacts.signedUrl(id, 3600, 'download');
+      if (generation === revisionGeneration && index === currentIndex) {
+        revisionView = { index, artifact_id: id, src: url }; resetTransform();
+      }
+    } catch {
+      if (generation === revisionGeneration) revisionError = 'That revision could not be loaded.';
+    }
+  }
   const canNavigate = $derived(items.length > 1);
   const favoriteId = $derived('artifact_id' in active ? active.artifact_id : null);
+  const sharingPermission = getContext<Readable<boolean>>(DELIVERABLE_SHARING_CONTEXT) ?? readable(true);
+  async function createPublicLink(options: ShareLinkOptions): Promise<string> {
+    if (!favoriteId) throw new Error('This image has no saved artifact.');
+    return (await api.artifactDocuments.publicLink('artifact', favoriteId, { ...options, mode: 'download' })).url;
+  }
 
   $effect(() => {
     if (index >= 0 && index < items.length && index !== currentIndex) {
@@ -127,6 +182,7 @@
     if (!canNavigate) return;
     const next = (currentIndex + delta + items.length) % items.length;
     currentIndex = next;
+    revisionView = null;
     onIndexChange?.(next);
     resetTransform();
   }
@@ -142,6 +198,7 @@
   }
 
   function handlePointerDown(event: PointerEvent): void {
+    if (feedback?.binding?.mode !== 'view' && feedback?.binding) return;
     if (event.pointerType === 'mouse' && event.button !== 0) return;
     event.preventDefault();
     pointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -226,6 +283,7 @@
   }
 
   function handleDoubleClick(event: MouseEvent): void {
+    if (feedback?.binding && feedback.binding.mode !== 'view') return;
     event.stopPropagation();
     if (scale > 1) {
       resetTransform();
@@ -260,24 +318,49 @@
     class="app-safe-fullscreen__toolbar flex items-center justify-between gap-2 rounded-2xl border border-separator bg-elevated/90 px-3 py-2.5 shadow-lg backdrop-blur sm:px-4 sm:py-3"
     onclick={(event) => event.stopPropagation()}
   >
-    <p class="min-w-0 flex-1 truncate text-sm text-foreground">
-      {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-quiet">{currentIndex + 1}/{items.length}</span>{/if}
-    </p>
-    <div class="flex shrink-0 items-center gap-2">
+    <div class="flex min-w-0 flex-1 items-center gap-2">
+      <p class="min-w-0 truncate text-sm text-foreground">
+        {active.filename ?? active.alt ?? 'Image'}{#if canNavigate}<span class="ml-2 text-quiet">{currentIndex + 1}/{items.length}</span>{/if}
+      </p>
+      {#if revisionError}<p role="alert" class="text-xs text-danger">{revisionError}</p>{/if}
       {#if favoriteId && !favoriteId.startsWith('local:')}<DocumentFavoriteButton kind="artifact" id={favoriteId} />{/if}
-      {#key active.src}
-      <AttachmentSaveButton
-        filename={active.filename ?? 'image'}
-        resolveUrl={() => Promise.resolve(active.src)}
-        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-raised text-foreground transition hover:bg-surface-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-      />
-      {/key}
+    </div>
+    <div class="flex shrink-0 items-center gap-2">
+      <FeedbackIndicator />
+      {#if listed.artifact_id && revisions.length > 1}
+        {#await revisionSwitcher() then { default: RevisionSwitcher }}
+          {#key `${currentIndex}:${active.artifact_id}`}
+            <RevisionSwitcher testid="image-revision" currentId={active.artifact_id ?? ''}
+              label={`Revision ${revisions.find(revision => revision.artifact_id === active.artifact_id)?.revision ?? 1} of ${Math.max(...revisions.map(revision => revision.revision))}`}
+              load={async () => revisions.map(revision => ({
+                id: revision.artifact_id, revision: revision.revision, created_at: revision.created_at, is_latest: revision.is_latest,
+                author_email: revision.author_email, author_agent_id: revision.author_agent_id,
+              }))}
+              onSelect={(revision) => void showRevision(revision.id)} />
+          {/key}
+        {/await}
+      {/if}
+      <CompactHeaderActions>
+        {#snippet children(menu: boolean)}
+          {#key active.src}
+          <AttachmentSaveButton
+            filename={active.filename ?? 'image'}
+            resolveUrl={() => Promise.resolve(active.src)}
+            class="document-icon-action"
+            label={menu ? 'Download' : ''}
+          />
+          {/key}
+          {#if favoriteId && !favoriteId.startsWith('local:')}
+            <DocumentLinkActions internalUrl={`/library/artifact/${encodeURIComponent(favoriteId)}`} createLink={$sharingPermission ? createPublicLink : undefined} allowModeChoice={false} defaultMode="download" shareLabel={menu ? 'Share link' : ''} />
+          {/if}
+        {/snippet}
+      </CompactHeaderActions>
       <button
         aria-label="Close image viewer"
         title="Close"
         type="button"
         onclick={onClose}
-        class="inline-flex h-11 w-11 items-center justify-center rounded-full bg-accent text-on-accent shadow-lg transition hover:bg-accent-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        class="document-icon-action"
       >
         <X class="h-5 w-5" />
       </button>
@@ -290,7 +373,7 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
-    class="app-safe-fullscreen__content flex items-center justify-center overflow-hidden rounded-[1.75rem] bg-scrim/30"
+    class="app-safe-fullscreen__content flex items-center justify-center overflow-hidden rounded-[1.75rem] bg-scrim/30" data-image-stage
     onclick={handleStageClick}
     onpointerdown={handlePointerDown}
     onpointermove={handlePointerMove}
@@ -298,6 +381,16 @@
     onpointercancel={handlePointerUp}
     ondblclick={handleDoubleClick}
   >
+    <FeedbackWorkspace contentClass="flex items-center justify-center">
+    <!-- Keep one image element while comments load or change mode, so enabling comments never
+         swaps and resizes it. The annotation layer itself appears only once the source binds. -->
+    {#if feedback && (items.length === 1 || favoriteId && (!feedback.binding || feedback.binding.source.source.kind === 'document' && feedback.binding.source.source.content_ref === favoriteId))}
+      <div data-feedback-image-transform class="max-h-full max-w-full"
+        style={`transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'};`}>
+        <ImageAnnotations src={active.src} alt={active.alt ?? alt} />
+      </div>
+    {:else}
+    {#if !active.src}<p class="text-sm text-quiet" role="status">Loading image…</p>{:else}
     <img
       src={active.src}
       alt={active.alt ?? 'Image'}
@@ -306,6 +399,9 @@
       style={`transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); transition: ${dragging ? 'none' : 'transform 180ms cubic-bezier(.32,.72,0,1)'};`}
       onclick={(event) => event.stopPropagation()}
     />
+    {/if}
+    {/if}
+    </FeedbackWorkspace>
   </div>
 
   {#if canNavigate}

@@ -15,6 +15,7 @@
     onReselect,
     sticky = false,
     edgeFade = true,
+    divider = true,
     testIdPrefix = 'tab',
   } = $props<{
     tabs: AccessibleTab[];
@@ -25,6 +26,7 @@
     onReselect?: (id: string) => void;
     sticky?: boolean;
     edgeFade?: boolean;
+    divider?: boolean;
     testIdPrefix?: string;
   }>();
 
@@ -47,9 +49,9 @@
   }
 </script>
 
-<div class={`${sticky ? 'sticky top-0 z-20 bg-chrome/95 material-chrome' : ''} relative border-b border-separator`}>
+<div class={`${sticky ? 'sticky top-0 z-20 bg-chrome/95 material-chrome' : ''} relative ${divider ? 'border-b border-separator' : ''}`}>
   <div class="tabs-scroll overflow-x-auto [scrollbar-width:none]" role="tablist" aria-label={ariaLabel}>
-    <div class="flex min-w-max gap-1 pr-8">
+    <div class={`flex min-w-max gap-1 ${edgeFade ? 'pr-8' : ''}`}>
       {#each tabs as tab, index (tab.id)}
         <button
           id={`${idPrefix}-tab-${tab.id}`}

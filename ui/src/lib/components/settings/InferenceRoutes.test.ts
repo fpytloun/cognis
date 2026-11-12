@@ -8,7 +8,7 @@ const routes = vi.hoisted(() => ({
 }));
 vi.mock('$lib/api/client', () => ({ api: { inferenceRoutes: routes } }));
 const providers = [{
-  provider_id: 'anthropic-demo', display_name: 'Demo provider', config: {},
+  provider_id: 'anthropic-demo', display_name: 'Anthropic demo', config: {},
   models: [{ model_id: 'claude-opus-5-5' }, { model_id: 'claude-sonnet-4-5' }]
 }, {
   provider_id: 'openai', display_name: 'OpenAI', config: {},

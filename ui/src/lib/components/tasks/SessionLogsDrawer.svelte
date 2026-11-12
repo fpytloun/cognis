@@ -11,8 +11,11 @@
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import SessionLogHeader from '$lib/components/chat-v2/SessionLogHeader.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
+  import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
+  import StepResultView from '$lib/components/tasks/StepResultView.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
-  import type { Agent, Escalation, Notification, StepRun } from '$lib/types/api';
+  import type { Agent, Escalation, Notification, StepRun, TaskDeliverableFreshness } from '$lib/types/api';
   import type { TimelineScope } from '$lib/chat-v2/types';
 
   let {
@@ -23,6 +26,9 @@
     stepName = '',
     agent = null,
     stepRun = null,
+    deliverableFreshness,
+    initialTab = 'transcript',
+    visibleStatus = null,
     attempts = [],
     agents = [],
     backLabel = 'Parent session',
@@ -37,6 +43,11 @@
     stepName?: string;
     agent?: Agent | null;
     stepRun?: StepRun | null;
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
+    /** Step viewer tab to open on; the Result tab exists only for a step run. */
+    initialTab?: 'result' | 'transcript';
+    /** Task-aware step status (for example paused while the task is paused). */
+    visibleStatus?: string | null;
     attempts?: StepRun[];
     agents?: Agent[];
     backLabel?: string;
@@ -73,6 +84,17 @@
     .filter((item: StepRun) => item.step_name === displayedStepRun?.step_name && item.session_id)
     .toSorted((left: StepRun, right: StepRun) =>
       (left.attempt_number ?? 1) - (right.attempt_number ?? 1) || left.attempt - right.attempt));
+  const hasTranscript = $derived(Boolean(displayedSessionId));
+  // One step viewer: Result shows what the step produced, Transcript the session.
+  let activeTab = $state<'result' | 'transcript'>(untrack(() => initialTab));
+  const shownTab = $derived(!displayedStepRun ? 'transcript' : !hasTranscript ? 'result' : activeTab);
+  const viewerTabs = $derived([
+    { id: 'result', label: 'Result' },
+    ...(hasTranscript ? [{ id: 'transcript', label: 'Transcript' }] : []),
+  ]);
+  const resultStatus = $derived(
+    chosenAttempt || !visibleStatus ? displayedStepRun?.status ?? '' : visibleStatus
+  );
   const displayedAttemptNumber = $derived(
     stepAttempts.findIndex((item: StepRun) => item.step_run_id === displayedStepRunId) + 1
       || displayedStepRun?.attempt_number || displayedStepRun?.attempt || 1);
@@ -130,7 +152,8 @@
     }
     if (event.key !== 'Tab' || !panel) return;
     const elements = Array.from(panel.querySelectorAll<HTMLElement>('button, select, [href], [tabindex]:not([tabindex="-1"])'))
-      .filter((element) => !element.hasAttribute('disabled'));
+      // The hidden tab panel stays mounted; its controls are not reachable.
+      .filter((element) => !element.hasAttribute('disabled') && !element.closest('.hidden'));
     if (elements.length === 0) return;
     const first = elements[0];
     const last = elements[elements.length - 1];
@@ -237,6 +260,8 @@
     escalationBusy = null;
     escalationError = '';
     escalations = [];
+    // A step without a recorded session (Result only) has nothing to approve.
+    if (!interactionSessionId) return;
     untrack(() => { void refreshEscalations().catch(() => {}); });
   });
 </script>
@@ -257,8 +282,8 @@
     class={`app-safe-side-panel ml-auto flex h-full min-h-0 w-full flex-col overflow-hidden overscroll-contain border-l border-control-border bg-elevated shadow-overlay ${fullscreen ? 'max-w-none' : 'max-w-6xl'}`}
     role="dialog"
     aria-modal="true"
-    aria-label={`Session logs: ${stepName || sessionId}`}
-    data-testid="session-logs-panel"
+    aria-label={displayedStepRun ? `Step: ${stepName || displayedStepRun.step_name}` : `Session logs: ${stepName || sessionId}`}
+    data-testid="session-logs-panel" data-find-container
     data-fullscreen={fullscreen}
   >
     <SessionLogHeader title={stepName || sessionId} testId="session-logs-header">
@@ -280,6 +305,8 @@
                 <option value={attempt.step_run_id}>Attempt {index + 1} of {stepAttempts.length} · {attempt.status}</option>
               {/each}
             </select>
+          {:else if displayedStepRun && shownTab === 'result'}
+            <span class="inline-flex items-center gap-2">Attempt {displayedAttemptNumber} <StatusBadge status={resultStatus} /></span>
           {:else}
             {#if displayedStepRun}Attempt {displayedAttemptNumber} · {/if}{activityLabel}
           {/if}
@@ -287,7 +314,7 @@
       {/snippet}
       {#snippet actions()}
         <button
-          class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong"
+          class="touch-target-compact hidden shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong sm:inline-flex"
           onclick={() => { fullscreen = !fullscreen; }}
           aria-label={fullscreen ? 'Exit fullscreen logs' : 'Open fullscreen logs'}
           aria-pressed={fullscreen}
@@ -295,17 +322,46 @@
         >
           {#if fullscreen}<Minimize2 class="h-4 w-4" />{:else}<Maximize2 class="h-4 w-4" />{/if}
         </button>
+        {#if shownTab === 'transcript'}
         <SessionDetailsButton
           open={sessionDetailsOpen}
           ariaControls={workspace?.getInspectorState().controlsId ?? `dashboard-conversation-inspector-${displayedConversationId}`}
           testId="session-logs-header-info"
           onclick={() => { void workspace?.toggleInspector(); }}
         />
+        {/if}
         <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-raised hover:text-strong" onclick={onclose} aria-label="Close" type="button"><X class="h-4 w-4" /></button>
       {/snippet}
     </SessionLogHeader>
+    {#if displayedStepRun}
+      <div class="shrink-0 px-4">
+        <AccessibleTabs
+          tabs={viewerTabs}
+          activeId={shownTab}
+          idPrefix="step-viewer"
+          ariaLabel="Step viewer"
+          testIdPrefix="step-viewer-tab"
+          onChange={(id) => { activeTab = id as 'result' | 'transcript'; }}
+        />
+      </div>
+    {/if}
     {#if attemptError}<p class="px-4 py-2 text-xs text-danger" role="alert">{attemptError}</p>{/if}
     {#if escalationError}<p class="px-4 py-2 text-xs text-danger" role="alert">{escalationError}</p>{/if}
+    {#if shownTab === 'result' && displayedStepRun}
+      <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-5 sm:px-6" role="tabpanel" id="step-viewer-panel-result" aria-labelledby="step-viewer-tab-result">
+        {#key displayedStepRun.step_run_id}
+          <StepResultView stepRun={displayedStepRun} {deliverableFreshness} visibleStatus={resultStatus} />
+        {/key}
+      </div>
+    {/if}
+    {#if hasTranscript}
+    <!-- Stays mounted while Result is shown so switching back keeps the timeline position. -->
+    <div
+      class={shownTab === 'transcript' ? 'flex min-h-0 flex-1 flex-col' : 'hidden'}
+      role={displayedStepRun ? 'tabpanel' : undefined}
+      id={displayedStepRun ? 'step-viewer-panel-transcript' : undefined}
+      aria-labelledby={displayedStepRun ? 'step-viewer-tab-transcript' : undefined}
+    >
     {#if escalations.length > 0}
       {@const escalation = escalations[0]}
       <div class="shrink-0 border-b border-separator px-4 py-3">
@@ -327,6 +383,7 @@
       agent={displayedAgent}
       agents={agents.length ? agents : agent ? [agent] : []}
       stepRun={displayedStepRun}
+      {deliverableFreshness}
       readOnly
       inspectorOpen={false}
       inspectorControlInHeader
@@ -340,5 +397,7 @@
       }}
       emptyLabel="No events recorded yet."
     />
+    </div>
+    {/if}
   </div>
 </div>

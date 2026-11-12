@@ -1,28 +1,18 @@
-/* Chat is a reading flow, not a nested publication. Fullscreen and standalone
-   readers deliberately retain rich-publication.css and their own chrome. */
+/* Hosts adapt placement only. Typography, colors, and block rendering stay in
+   rich-publication.css so the same document does not change between readers. */
 .rich-deliverable.conversational.embedded[data-presentation][data-rich-density][data-viewer-theme] {
-  --rich-text: var(--message-assistant-fg);
-  --rich-text-secondary: rgb(var(--color-secondary));
-  --rich-density-gap: 1.25rem;
-  --chat-assistant-measure: 70ch;
   border: 0;
   border-radius: 0;
   background: transparent;
   box-shadow: none;
   overflow: visible;
-  font-family: var(--chat-prose-font);
-  font-size: var(--chat-message-font-size);
-  line-height: 1.65;
-  color: var(--rich-text);
 
   & .rich-document.rich-inline-document {
     display: block; padding: 0; margin: 0; max-width: none;
   }
-  & .rich-document.rich-inline-document.inline-toc-sidebar {
-    display: grid;
-  }
+  &.hosted .rich-document.rich-inline-document { padding: 18px 16px 40px; }
   & .rich-document.rich-inline-document.chat-toc-enabled {
-    display: grid; grid-template-columns: minmax(0, 1fr) 1.75rem; gap: .5rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) 2rem; gap: .5rem;
   }
   & .rich-document.rich-inline-document.chat-toc-enabled.inline-toc-sidebar {
     grid-template-columns: minmax(0, 1fr) minmax(11rem, 14rem); gap: 1.4rem;
@@ -34,7 +24,7 @@
     align-self: start; justify-self: end;
   }
   & .chat-toc-rail > button {
-    width: 1.75rem; height: 2rem; padding: .25rem;
+    width: 2rem; height: 2rem; padding: .25rem;
   }
   @media (pointer: coarse) {
     & .rich-document.rich-inline-document.chat-toc-enabled:not(.inline-toc-sidebar) {
@@ -42,90 +32,16 @@
     }
     & .chat-toc-rail > button { min-width: 44px; min-height: 44px; }
   }
-  & .rich-body { padding: 0; }
-  & :is(.rich-markdown, .rich-fallback, .rich-lede, .document-lede) {
-    font: inherit; color: var(--rich-text-secondary); max-width: none;
-  }
-  & :is(.rich-markdown, .rich-fallback) > :not(.markdown-table-wrap, table, pre),
-  & :is(.rich-lede, .document-lede) { max-width: var(--chat-assistant-measure); }
-  & :is(.rich-markdown, .rich-fallback) > p { margin: 0 0 1em; }
-  & :is(h1, h2, h3, h4, .rich-hero-content) { font-family: inherit; }
-  & :is(.document-title, .rich-hero h1, .rich-hero h2, .rich-markdown h1) {
-    font-family: inherit; font-size: 1.35em; font-weight: 600;
-    line-height: 1.3; letter-spacing: -.015em; text-wrap: pretty;
-    max-width: var(--chat-assistant-measure); margin: 0 0 .65em;
-  }
-  & :is(.rich-markdown h2, .rich-section-heading h3, .rich-section-header h3) {
-    font-family: inherit; font-size: 1.15em; line-height: 1.4;
-    letter-spacing: 0; margin: 0 0 .6em;
-  }
-  & :is(.rich-markdown h3, .rich-markdown h4, .rich-table-card h4) {
-    font-family: inherit; font-size: 1em; line-height: 1.5; margin: 0 0 .6em;
-  }
-  & [data-rich-block-type="section"].rich-panel {
-    margin: 0; padding: .5rem 0 0; border: 0;
-  }
-  & .rich-section-heading { margin-bottom: .75em; }
-  & .rich-section-header { margin: 0; padding: 0; border: 0; }
-  & .rich-table-card table { font-family: inherit; font-size: .93em; }
-  & .rich-table-card :is(th, td) { padding: .65em .8em; }
-  & .rich-table-card th { text-transform: none; letter-spacing: 0; font-size: .86em; }
-  & .rich-callout { box-shadow: none; }
-
   & .chat-document-summary { margin: 0; font-weight: 600; }
   & .chat-document-footer {
     display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem;
-    margin-top: .85rem; font: 12px/1.5 ui-sans-serif, system-ui, sans-serif;
-    color: rgb(var(--color-muted));
-    --rich-action-size: 1.5rem;
-    --rich-action-radius: .375rem;
-  }
-  & .chat-document-actions {
-    position: relative;
-    display: flex; justify-content: flex-end; align-items: center; gap: .25rem; margin-left: auto;
-  }
-  & .chat-document-actions > .sr-only { left: 0; top: 0; }
-  & .chat-document-actions > button,
-  & .chat-document-actions > details > summary {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 1.5rem; min-width: 1.5rem; height: 1.5rem; padding: 0;
-    border: 1px solid rgb(var(--color-separator)); border-radius: .375rem;
-    background: rgb(var(--color-surface) / .95);
-    color: var(--quiet-control-fg, rgb(var(--color-muted)));
-    box-shadow: none; transform: none; cursor: pointer;
-  }
-  & .chat-document-actions > button:hover,
-  & .chat-document-actions > details > summary:hover {
-    border-color: rgb(var(--color-control-border));
-    background: rgb(var(--color-surface-hover)); color: rgb(var(--color-foreground));
-  }
-  & .chat-document-actions svg { width: .875rem; height: .875rem; }
-  & .chat-document-more { position: relative; }
-  & .chat-document-more > summary { list-style: none; }
-  & .chat-document-more > summary::-webkit-details-marker { display: none; }
-  & .chat-document-menu {
-    position: absolute; right: 0; bottom: calc(100% + .5rem); z-index: 30;
-    width: max-content; min-width: 12rem; max-width: calc(100vw - 2rem);
-    padding: .35rem; border: 1px solid rgb(var(--color-control-border)); border-radius: .6rem;
-    background: rgb(var(--color-surface)); box-shadow: 0 .5rem 1.5rem rgb(0 0 0 / .15);
-    color: rgb(var(--color-foreground));
-  }
-  & .chat-document-menu :is(button, a) {
-    display: flex; align-items: center; justify-content: flex-start; gap: .5rem;
-    width: 100%; min-height: 2.25rem; height: auto; padding: .4rem .6rem;
-    border: 0; border-radius: .3rem; background: transparent; color: inherit;
-    font: inherit; text-align: left; text-decoration: none; cursor: pointer;
-  }
-  & .chat-document-menu :is(button, a):hover {
-    background: rgb(var(--color-surface-hover));
-  }
-  & .chat-document-footer :is(button, summary, a):focus-visible {
-    outline: 2px solid var(--rich-accent); outline-offset: 2px;
+    min-height: 2.75rem;
+    margin: .5rem 0 .85rem;
   }
   & .chat-document-footer .revision-bar { margin: 0; }
+  /* Keep desktop icons compact while reserving a stable search row and touch targets. */
+  & .chat-document-footer .chat-document-actions { --rich-action-size: 1.5rem; --rich-action-icon-size: .875rem; --rich-action-radius: .375rem; }
   @media (pointer: coarse) {
-    & .chat-document-actions > button,
-    & .chat-document-actions > details > summary { min-height: 44px; min-width: 44px; }
-    & .chat-document-menu :is(button, a) { min-height: 44px; }
+    & .chat-document-footer .chat-document-actions { --rich-action-size: 2.75rem; }
   }
 }

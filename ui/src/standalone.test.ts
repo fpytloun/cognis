@@ -38,6 +38,7 @@ describe('standalone client', () => {
       instanceId: 'dlv_test',
       payload: { blocks: [{ type: 'card', title: 'Safe' }] },
       title: 'Report',
+      themeFamily: 'gruvbox',
     });
     const root = document.createElement('div');
     root.id = 'cognis-deliverable-root';
@@ -56,6 +57,7 @@ describe('standalone client', () => {
         markdownUrl: '/api/report.md',
         surface: 'standalone',
         title: 'Report',
+        publicationThemeFamily: 'gruvbox',
       } },
     });
     // Never passed: "Open standalone page" from the standalone page itself

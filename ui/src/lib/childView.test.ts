@@ -4,7 +4,7 @@ import type { BackgroundWorkItem, Conversation } from '$lib/types/api';
 import {
   canonicalChildView, childViewForWorkstream, childViewScope,
   controllerRootConversationId, enrichChildWorkstream, eventNeedsTreeRefresh,
-  fallbackWorkstream, parentChildView,
+  fallbackWorkstream, parentChildView, resolveChildWorkstreamIdentity,
 } from './childView';
 
 function node(overrides: Partial<WorkstreamRef>): WorkstreamRef {
@@ -18,6 +18,32 @@ function node(overrides: Partial<WorkstreamRef>): WorkstreamRef {
 }
 
 describe('child view navigation', () => {
+  it('resolves a delegate missing from the root graph to its managed conversation before selecting a scope', async () => {
+    const fallback = fallbackWorkstream('nested-delegate', 'main-conversation');
+    let release!: (value: WorkstreamRef) => void;
+    const pending = resolveChildWorkstreamIdentity(fallback, () => new Promise((resolve) => { release = resolve; }));
+    release(node({
+      session_id: 'nested-delegate', conversation_id: 'managed-conversation',
+      agent_id: 'system:implement', title: 'Implementation',
+    }));
+    const resolved = await pending;
+    expect(resolved).toMatchObject({
+      key: fallback.key, root_key: fallback.root_key, parent_key: fallback.parent_key,
+      agent_id: 'system:implement',
+    });
+    expect(childViewScope(childViewForWorkstream(resolved!, 'main-conversation'))).toMatchObject({
+      key: 'session:nested-delegate', conversation_id: 'managed-conversation',
+    });
+  });
+
+  it('does not guess ownership when session identity is unavailable or mismatched', async () => {
+    const fallback = fallbackWorkstream('nested-delegate', 'main-conversation');
+    expect(await resolveChildWorkstreamIdentity(fallback, async () => null)).toBeNull();
+    expect(await resolveChildWorkstreamIdentity(fallback, async () => node({
+      conversation_id: 'managed-conversation',
+    }))).toBeNull();
+  });
+
   it('canonicalizes delegate backing identity once and uses its owning conversation', () => {
     const view = canonicalChildView([node({
       conversation_id: 'owning-conversation',

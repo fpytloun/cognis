@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '$lib/api/client';
-  import { resolveHtmlPreviewUrl, type SignedHtmlPreview } from '$lib/attachments/html-preview';
+  import { resolveHtmlPreviewUrl } from '$lib/attachments/html-preview-private';
+  import type { SignedHtmlPreview } from '$lib/attachments/html-preview';
   import AttachmentPreviewModal from '$lib/components/AttachmentPreviewModal.svelte';
   import AssistantDeliverableBlock from '$lib/components/AssistantDeliverableBlock.svelte';
   import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';

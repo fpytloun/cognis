@@ -15,7 +15,7 @@ describe('Modal backdrop policy', () => {
       agents: [{ agent_id: 'agent_task_editor', agent_type: 'primary', status: 'active', name: 'Task editor' } as Agent],
       workflows: [], projects: [], skills: [], conversations: [], onclose, oncreate: vi.fn(),
     });
-    await waitFor(() => expect(screen.getByLabelText('Agent')).toHaveValue('agent_task_editor'));
+    await waitFor(() => expect(screen.getByLabelText('Agent')).toHaveTextContent('Task editor'));
     const backdrop = screen.getByRole('button', { name: 'Dismiss Create task' });
     await fireEvent.click(backdrop);
     expect(onclose).toHaveBeenCalledTimes(1);

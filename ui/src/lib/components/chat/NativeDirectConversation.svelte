@@ -1,7 +1,7 @@
 <script lang="ts">
   import { auth } from '$lib/stores/auth';
   import { api, asApiError } from '$lib/api/client';
-  import { postNative, nativeVisibility } from '$lib/native/host';
+  import { postNative, nativeVisibility, nativeComposerFocus } from '$lib/native/host';
   import CompactConversationChat from '$lib/components/chat-v2/CompactConversationChat.svelte';
   import type { Agent, Conversation } from '$lib/types/api';
 
@@ -43,6 +43,8 @@
   {#if error}<p role="alert" class="p-4 text-danger">{error}</p>
   {:else if conversation && agent}
     {#key conversation.conversation_id}<CompactConversationChat conversationId={conversation.conversation_id} {agent} {conversation}
+      composerFocusRequest={$nativeVisibility.visible && $nativeVisibility.focused && $nativeComposerFocus?.agentId === agentId
+        ? $nativeComposerFocus?.request : null}
       embedded readOnly={Boolean(conversation.is_readonly_for_caller)} />{/key}
   {:else}<p class="p-4 text-muted">Opening conversation…</p>{/if}
 </section>

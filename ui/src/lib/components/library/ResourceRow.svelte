@@ -4,6 +4,7 @@
   import Upload from 'lucide-svelte/icons/upload';
   import Bot from 'lucide-svelte/icons/bot';
   import ArrowUpRight from 'lucide-svelte/icons/arrow-up-right';
+  import DocumentCommentCount from '../DocumentCommentCount.svelte';
   import DocumentFavoriteButton from '../DocumentFavoriteButton.svelte';
   import { formatLabel, libraryHref, originLabel, type LibraryItem } from '$lib/library';
   let { item, onOpen }: { item: LibraryItem; onOpen?: (item: LibraryItem) => void } = $props();
@@ -27,6 +28,7 @@
       {#if item.project_name}<span>· {item.project_name}</span>{/if}
       {#if item.source_title || item.task_title || item.conversation_title}<span class="max-w-64 truncate">· {item.source_title || (item.task_title ? `Task: ${item.task_title}` : item.conversation_title)}</span>{/if}
       {#if item.is_readonly}<span class="text-quiet">· Read only</span>{/if}
+      {#if !item.is_readonly}<DocumentCommentCount id={item.id} />{/if}
     </span>
     <span class="mt-1 block text-xs text-quiet sm:hidden">{formatLabel(item.format)} · {date}{item.revision > 1 ? ` · Rev ${item.revision}` : ''}</span>
   </span>

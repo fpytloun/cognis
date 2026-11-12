@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { emptyChatV2State } from './sync-engine';
-import { conversationTimelineScope, type ChatRealtimeFrame, type ChatSnapshot, type ChatSyncResponse, type TimelineBackfillResponse } from './types';
+import { ApiError } from '$lib/api/client';
+import { conversationTimelineScope, type ChatRealtimeFrame, type ChatSnapshot, type ChatSyncResponse, type MessageAdmissionV2Response, type TimelineBackfillResponse } from './types';
 
 const device = vi.hoisted(() => ({
   owner: 'timeline-fixture@cognis.test' as string | null,
@@ -17,8 +18,9 @@ vi.mock('$lib/offline/cache', () => ({
     }),
   },
 }));
-import { acquireTimeline, clearTimelineMemory, timelineResourceCounts, TimelineProviderConflictError } from './timeline-controller.svelte';
+import { acquireTimeline, clearTimelineMemory, timelineResourceCounts, TimelineOwnershipError, TimelineProviderConflictError } from './timeline-controller.svelte';
 import { offlineCache } from '$lib/offline/cache';
+import type { ActivityOverviewResponse, CompactionTimelineItem, MessageTimelineItem, WorkstreamRef } from './types';
 
 const scope = conversationTimelineScope('timeline-fixture');
 function snapshot(): ChatSnapshot {
@@ -53,6 +55,501 @@ function deferred<T>() {
 }
 
 describe('canonical timeline ownership', () => {
+  it.each(['projection_version_changed', 'cursor_expired', 'unsupported_cursor', 'cursor_invalid'])(
+    'recovers a rejected %s history cursor with one shared canonical snapshot',
+    async code => {
+      const client = api();
+      const initial = { ...snapshot(), timeline: { ...snapshot().timeline, has_more_before: true, before_cursor: 'cursor:old-before' } };
+      const fresh = { ...snapshot(), projection_version: 'updated', cursor: 'cursor:updated' };
+      client.snapshot.mockResolvedValueOnce(initial).mockResolvedValue(fresh);
+      client.timeline.mockRejectedValue(new ApiError('Chat cursor was issued for a different projection version', { code, status: 409 }));
+      const view = acquireTimeline(scope, client);
+      await view.controller.load();
+      const result = await Promise.all([
+        view.controller.older('cursor:old-before'),
+        view.controller.older('cursor:old-before'),
+      ]);
+      expect(result).toEqual([null, null]);
+      expect(client.timeline).toHaveBeenCalledTimes(1);
+      expect(client.snapshot).toHaveBeenCalledTimes(2);
+      expect(client.sync).not.toHaveBeenCalled();
+      expect(view.controller.store.snapshot.projectionVersion).toBe('updated');
+      expect(view.controller.store.snapshot.cursor).toBe('cursor:updated');
+      expect(view.controller.phase).toBe('ready');
+      view.release();
+    },
+  );
+
+  it('recovers a compacted session immediately when navigating away and back', async () => {
+    const client = api();
+    const first = acquireTimeline(scope, client);
+    await first.controller.load();
+    const cached = orphanState();
+    first.controller.store.restoreState(cached);
+    const controller = first.controller;
+    first.release();
+
+    const elsewhere = acquireTimeline(conversationTimelineScope('other-chat'), client);
+    elsewhere.release();
+    const fresh = {
+      ...snapshot(),
+      projection_version: 'compaction-replay-fixed',
+      cursor: 'cursor:rotated',
+      conversation: { ...snapshot().conversation, active_session_id: 'session:rotated' },
+      timeline: {
+        ...snapshot().timeline,
+        items: [{
+          ...childCompaction, id: 'compaction:manual', stable: true,
+          session_id: 'session:rotated', previous_session_id: 'session:old',
+          source_refs: [{ store: 'intaris', session_id: 'session:rotated', seq: 3, event_type: 'compaction_summary' }],
+        }, {
+          ...cached.localItems[0], stable: true, id: 'user:processing-input',
+          status: 'complete',
+          source_refs: [{ store: 'intaris', session_id: 'session:rotated', seq: 804, event_type: 'user_message' }],
+        }],
+      },
+    } satisfies ChatSnapshot;
+    client.sync.mockResolvedValueOnce({ ...delta(), reset_required: true, reset_reason: 'lineage_changed' });
+    client.snapshot.mockResolvedValueOnce(fresh);
+    const returned = acquireTimeline(scope, client);
+    expect(returned.controller).toBe(controller);
+    await returned.controller.load();
+    expect(client.sync).toHaveBeenCalledWith(scope, cached.cursor, expect.anything());
+    expect(returned.controller.store.snapshot.cursor).toBe('cursor:rotated');
+    expect(returned.controller.store.snapshot.conversation?.active_session_id).toBe('session:rotated');
+    expect(returned.controller.store.visibleItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'compaction:manual', status: 'compacted', session_id: 'session:rotated' }),
+      expect.objectContaining({
+        id: 'user:processing-input',
+        source_refs: [expect.objectContaining({ session_id: 'session:rotated' })],
+      }),
+    ]));
+    expect(returned.controller.reconciled).toBe(true);
+    expect(returned.controller.phase).toBe('ready');
+    returned.release();
+  });
+
+  it('allows one backfill caller to cancel without cancelling shared scope recovery', async () => {
+    const client = api();
+    const recovery = deferred<ChatSnapshot>();
+    client.snapshot.mockResolvedValueOnce(snapshot()).mockReturnValueOnce(recovery.promise);
+    client.timeline.mockRejectedValue(new ApiError('Projection changed', { code: 'projection_version_changed', status: 409 }));
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const caller = new AbortController();
+    const cancelled = view.controller.older('cursor:before', caller.signal).catch(error => error);
+    const surviving = view.controller.older('cursor:before');
+    await vi.waitFor(() => expect(client.snapshot).toHaveBeenCalledTimes(2));
+    caller.abort();
+    expect((await cancelled).name).toBe('AbortError');
+    recovery.resolve({ ...snapshot(), projection_version: 'recovered', cursor: 'cursor:recovered' });
+    expect(await surviving).toBeNull();
+    expect(view.controller.store.snapshot.cursor).toBe('cursor:recovered');
+    view.release();
+  });
+
+  it('rejects an in-flight recovery when its scope owner is invalidated', async () => {
+    const client = api();
+    const recovery = deferred<ChatSnapshot>();
+    client.snapshot.mockResolvedValueOnce(snapshot()).mockReturnValueOnce(recovery.promise);
+    client.timeline.mockRejectedValue(new ApiError('Projection changed', { code: 'projection_version_changed', status: 409 }));
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const pending = view.controller.older('cursor:before').catch(error => error);
+    await vi.waitFor(() => expect(client.snapshot).toHaveBeenCalledTimes(2));
+    view.controller.invalidate();
+    recovery.resolve({ ...snapshot(), cursor: 'cursor:stale-recovery' });
+    expect(await pending).toBeInstanceOf(TimelineOwnershipError);
+    expect(view.controller.store.snapshot.cursor).not.toBe('cursor:stale-recovery');
+    view.release();
+  });
+
+  it('surfaces a recovery failure without retrying indefinitely', async () => {
+    const client = api();
+    const unavailable = new ApiError('Controller unavailable', { code: 'service_unavailable', status: 503 });
+    client.snapshot.mockResolvedValueOnce(snapshot()).mockRejectedValue(unavailable);
+    client.timeline.mockRejectedValue(new ApiError('Projection changed', { code: 'projection_version_changed', status: 409 }));
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    await expect(view.controller.older('cursor:before')).rejects.toBe(unavailable);
+    expect(client.snapshot).toHaveBeenCalledTimes(2);
+    expect(client.timeline).toHaveBeenCalledTimes(1);
+    view.release();
+  });
+
+  it.each(['unauthorized', 'forbidden', 'request_timeout'])('does not treat %s as a history reset', async code => {
+    const client = api();
+    const error = new ApiError('History request failed', { code, status: 403 });
+    client.timeline.mockRejectedValue(error);
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    await expect(view.controller.older('cursor:before')).rejects.toBe(error);
+    expect(client.snapshot).toHaveBeenCalledTimes(1);
+    view.release();
+  });
+
+  const childCompaction: CompactionTimelineItem = {
+    id: 'compaction:delegate-child', kind: 'compaction', stable: false, source_refs: [],
+    sort_key: '9997:delegate-child', status: 'compacted', session_id: 'delegate-child-next',
+    previous_session_id: 'delegate-child',
+    summary_preview: '', method: 'llm', turns_compacted: 3,
+  };
+  const childGraph = {
+    scope,
+    workstreams: [{
+      key: 'delegate:child', parent_key: scope.key, root_key: scope.key, kind: 'delegate',
+      conversation_id: scope.conversation_id, session_id: 'delegate-child',
+      backing_session_ids: ['delegate-child', 'delegate-child-next'],
+      event_store_session_id: 'delegate-child', edge_kind: 'delegate', ordinal: 1,
+      title: 'Delegate', agent_id: 'fixture', status: 'completed', current: true, superseded: false,
+    } satisfies WorkstreamRef],
+  } as ActivityOverviewResponse;
+
+  it('repairs leaked delegate compaction from a device cache after ordinary cursor sync', async () => {
+    const cached = { ...orphanState(), localItems: [...orphanState().localItems, childCompaction] };
+    await offlineCache.put('timeline', scope.key, { state: cached }, device.owner);
+    const client = { ...api(), activityOverview: vi.fn(async () => childGraph) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    await vi.waitFor(() => expect(view.controller.store.snapshot.localItems).toHaveLength(1));
+    expect(view.controller.store.snapshot.localItems[0].id).toBe('user:processing-input');
+    expect(client.snapshot).not.toHaveBeenCalled();
+    expect(client.activityOverview).toHaveBeenCalledWith(scope, { detail: 'lightweight', signal: view.controller.ownerSignal });
+    expect(cached.localItems).toHaveLength(2);
+    view.release();
+  });
+
+  it('retries unknown compaction metadata on a later successful load and coalesces reads', async () => {
+    const pending = deferred<ActivityOverviewResponse>();
+    const client = { ...api(), activityOverview: vi.fn()
+      .mockImplementationOnce(() => pending.promise).mockResolvedValue(childGraph) };
+    const view = acquireTimeline(scope, client);
+    view.controller.store.restoreState({
+      ...orphanState(), localItems: [childCompaction],
+    });
+    const first = view.controller.reconcileCompactions();
+    await view.controller.load();
+    expect(client.activityOverview).toHaveBeenCalledTimes(1);
+    pending.resolve({ ...childGraph, workstreams: [] });
+    await first;
+    await vi.waitFor(() => expect(client.activityOverview).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(view.controller.store.snapshot.localItems).toHaveLength(0));
+    view.release();
+  });
+
+  it('does not apply delayed compaction ownership after the account changes', async () => {
+    const pending = deferred<ActivityOverviewResponse>();
+    const client = { ...api(), activityOverview: vi.fn(() => pending.promise) };
+    const view = acquireTimeline(scope, client);
+    view.controller.store.restoreState({ ...orphanState(), localItems: [childCompaction] });
+    const resolving = view.controller.reconcileCompactions();
+    device.owner = 'another-owner@cognis.test';
+    device.ownerChanged();
+    const invalidated = view.controller.store.snapshot;
+    pending.resolve(childGraph);
+    await resolving;
+    expect(view.controller.store.snapshot).toBe(invalidated);
+    expect(view.controller.store.snapshot.localItems).toEqual([]);
+    view.release();
+  });
+
+  function orphanState(placement: 'timeline' | 'queue' = 'timeline') {
+    return {
+      ...emptyChatV2State(), conversationId: scope.conversation_id!, scope, scopeKey: scope.key,
+      cursor: 'cursor:initial',
+      projectionVersion: 'test', syncStatus: 'ready' as const,
+      localItems: [{
+        id: 'user:processing-input', kind: 'message' as const, role: 'user' as const,
+        message_id: 'client:processing-input', client_message_id: 'processing-input',
+        client_txn_id: 'processing-txn', turn_id: 'turn-failed', content: 'Preserved input',
+        attachments: [], partial: false, status: 'complete' as const, stable: false, source_refs: [],
+        sort_key: '9996:999999999999999:000000:00:000000000',
+      }],
+      admissionPlacements: {
+        'processing-input': {
+          placement, status: 'complete' as const, clientTxnId: 'processing-txn',
+        },
+      },
+    };
+  }
+  const failedAdmission = {
+    conversation_id: scope.conversation_id!, client_txn_id: 'processing-txn',
+    client_message_id: 'processing-input', turn_id: 'turn-failed',
+    status: 'failed' as const, started: false, admission_order: 7, before_client_message_id: null,
+  };
+
+  it('confirms persisted input even when a successor already placed its cancelled echo', async () => {
+    const client = { ...api(), messageAdmission: vi.fn(async () => ({
+      ...failedAdmission, status: 'cancelled' as const, started: true, input_persisted: true,
+    })) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const state = orphanState();
+    const next: MessageTimelineItem = {
+      ...state.localItems[0], id: 'user:later-input', client_message_id: 'later-input',
+      client_txn_id: undefined, turn_id: 'later-turn', stable: true,
+      source_refs: [{ store: 'intaris', session_id: 'session-a', seq: 200, event_type: 'user_message' }],
+      sort_key: '0000:000000000000200:000000:00:000000000',
+    };
+    view.controller.store.restoreState({
+      ...state, timelineItems: [next], admissionPlacements: {
+        'processing-input': {
+          ...state.admissionPlacements['processing-input'],
+          processingOutcome: { status: 'cancelled', turnId: 'turn-failed',
+            admissionOrder: 7, beforeClientMessageId: 'later-input' },
+        },
+      },
+    });
+    await view.controller.reconcileAdmissions();
+    expect(view.controller.store.visibleItems.map(item => item.id)).toEqual([next.id]);
+    expect(view.controller.store.snapshot.localItems).toEqual(state.localItems);
+    const cached = await offlineCache.get<{ state: ReturnType<typeof emptyChatV2State> }>('timeline', scope.key);
+    expect(cached?.state.admissionPlacements['processing-input'].historyConfirmed).toBe(true);
+    view.release();
+  });
+
+  it.each(['completed', 'failed'] as const)('recovers legacy input without inventing a transaction (%s)', async status => {
+    const pending = deferred<MessageAdmissionV2Response>();
+    const client = { ...api(), messageAdmissionByClient: vi.fn(() => pending.promise) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const state = orphanState();
+    const legacy = { ...state.localItems[0], client_txn_id: undefined, turn_id: undefined };
+    const unsent = { ...legacy, id: 'user:unsent', client_message_id: 'unsent', status: 'pending' as const };
+    view.controller.store.restoreState({ ...state, admissionPlacements: {}, localItems: [legacy, unsent] });
+    const resolving = view.controller.reconcileAdmissions();
+    expect(view.controller.store.visibleItems.map(item => item.id)).toEqual([legacy.id, unsent.id]);
+    pending.resolve({ ...failedAdmission, status, started: status === 'completed' });
+    await resolving;
+    expect(view.controller.store.visibleItems.map(item => item.id)).toEqual(
+      status === 'completed' ? [unsent.id] : [legacy.id, unsent.id],
+    );
+    expect(view.controller.store.snapshot.localItems).toEqual([legacy, unsent]);
+    const cached = await offlineCache.get<{ state: ReturnType<typeof emptyChatV2State> }>('timeline', scope.key);
+    expect(cached?.state.admissionPlacements['processing-input'].clientTxnId).toBe('processing-txn');
+    view.release();
+  });
+
+  it.each(['timeline', 'queue'] as const)('reconciles accepted-but-failed %s entries without resending input', async placement => {
+    const client = { ...api(), messageAdmission: vi.fn(async () => failedAdmission) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    view.controller.store.restoreState(orphanState(placement));
+    await view.controller.reconcileAdmissions();
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).toHaveBeenCalledTimes(1);
+    expect(view.controller.store.visibleItems[0]).toMatchObject({ status: 'failed', content: 'Preserved input' });
+    expect(view.controller.store.snapshot.localItems[0].status).toBe('complete');
+    view.release();
+  });
+
+  it.each(['timeline', 'queue'] as const)('recovers a missed asynchronous %s failure from device cache', async placement => {
+    await offlineCache.put('timeline', scope.key, { state: orphanState(placement) }, device.owner);
+    const client = { ...api(), messageAdmission: vi.fn(async () => failedAdmission) };
+    const reopened = acquireTimeline(scope, client);
+    await reopened.controller.load();
+    await vi.waitFor(() => expect(client.messageAdmission).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(reopened.controller.store.visibleItems[0]?.status).toBe('failed'));
+    reopened.release();
+  });
+
+  it('waits for authoritative queue removal, then reconciles without a cursor change', async () => {
+    const client = { ...api(), messageAdmission: vi.fn(async () => failedAdmission) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const state = orphanState('queue');
+    view.controller.store.restoreState({
+      ...state, queue: { queued_count: 1, messages: [{
+        queue_id: 'processing-queue', client_message_id: 'processing-input',
+        client_txn_id: 'processing-txn', content: 'Preserved input', attachments: [], position: 0,
+      }] },
+    });
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).not.toHaveBeenCalled();
+    view.controller.store.applySync({
+      ...delta(), ops: [{ op: 'replace_queue', queue: { queued_count: 0, messages: [] } }],
+    });
+    expect(view.controller.store.snapshot.cursor).toBe(state.cursor);
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).toHaveBeenCalledOnce();
+    expect(view.controller.store.visibleItems[0]).toMatchObject({ status: 'failed', content: 'Preserved input' });
+    expect(view.controller.store.snapshot.queue).toEqual({ queued_count: 0, messages: [] });
+    view.release();
+  });
+
+  it.each(['test', 'rebuilt-projection'])('manual refresh rebuilds cached history and retains input (%s)', async projection => {
+    const client = api();
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const state = orphanState('queue');
+    const unsent = { ...state.localItems[0], id: 'user:unsent', client_message_id: 'unsent', turn_id: undefined, status: 'pending' as const };
+    const activity: MessageTimelineItem = {
+      ...state.localItems[0], id: 'message:cached-activity', role: 'assistant', client_message_id: undefined,
+      content: 'Unconfirmed cached activity', sort_key: '9996:999999999999999:000001:02:000000000',
+    };
+    view.controller.store.restoreState({
+      ...state, localItems: [...state.localItems, unsent, activity],
+      timelineItems: [{ ...activity, id: 'message:cached-history', stable: true, sort_key: '0000:000000000000001:000001:02:000000000' }],
+    });
+    const fresh: ChatSnapshot = {
+      ...snapshot(), projection_version: projection, cursor: 'cursor:rebuilt',
+      timeline: { items: [{
+        ...activity, id: 'message:fresh', stable: true, sort_key: '0001:000000000000300:000001:02:000000000',
+        message_id: 'fresh-message', client_txn_id: undefined, turn_id: 'fresh-turn',
+        source_refs: [{ store: 'intaris', session_id: 'fresh-session', seq: 300, event_type: 'message' }],
+      }], has_more_before: true, before_cursor: 'rebuilt:before' },
+    };
+    client.snapshot.mockResolvedValueOnce(fresh);
+    await view.controller.load({ discardCachedHistory: true });
+    expect(client.sync).not.toHaveBeenCalled();
+    expect(view.controller.store.snapshot.timelineItems).toEqual(fresh.timeline.items);
+    expect(view.controller.store.snapshot.localItems).toEqual([...state.localItems, unsent]);
+    expect(view.controller.store.snapshot.admissionPlacements).toEqual(state.admissionPlacements);
+    expect(view.controller.store.snapshot.projectionVersion).toBe(projection);
+    const cached = await offlineCache.get<{ state: ReturnType<typeof orphanState> }>('timeline', scope.key, device.owner);
+    expect(cached?.state.localItems).toEqual([...state.localItems, unsent]);
+    view.release();
+  });
+
+  it('never clears cached history or input when a manual snapshot fails', async () => {
+    const client = api();
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    view.controller.store.restoreState(orphanState('queue'));
+    const before = view.controller.store.serializeState();
+    client.snapshot.mockRejectedValueOnce(new Error('Unavailable'));
+    await expect(view.controller.load({ discardCachedHistory: true })).rejects.toThrow('Unavailable');
+    expect(view.controller.store.serializeState()).toEqual(before);
+    view.release();
+  });
+
+  it('does not downgrade manual recovery to an already-running ordinary snapshot', async () => {
+    const client = api();
+    const view = acquireTimeline(scope, client);
+    const initial = deferred<ChatSnapshot>();
+    const manual = deferred<ChatSnapshot>();
+    client.snapshot.mockReturnValueOnce(initial.promise).mockReturnValueOnce(manual.promise);
+    const opening = view.controller.load({ forceSnapshot: true });
+    await vi.waitFor(() => expect(client.snapshot).toHaveBeenCalledOnce());
+    const recovery = view.controller.load({ discardCachedHistory: true });
+    initial.resolve(snapshot());
+    await opening;
+    await vi.waitFor(() => expect(client.snapshot).toHaveBeenCalledTimes(2));
+    const shared = view.controller.load({ discardCachedHistory: true });
+    manual.resolve({ ...snapshot(), cursor: 'cursor:rebuilt' });
+    await Promise.all([recovery, shared]);
+    expect(client.snapshot).toHaveBeenCalledTimes(2);
+    view.release();
+  });
+
+  it.each(['local', 'runtime', 'canonical', 'scope'] as const)('fences manual recovery against concurrent %s changes', async kind => {
+    const client = api();
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const held = deferred<ChatSnapshot>();
+    client.snapshot.mockReturnValueOnce(held.promise);
+    const loading = view.controller.load({ discardCachedHistory: true });
+    const result = kind === 'canonical' || kind === 'scope'
+      ? expect(loading).rejects.toThrow(kind === 'scope' ? 'Refresh scope changed' : 'History changed during refresh')
+      : expect(loading).resolves.toBeTruthy();
+    await vi.waitFor(() => expect(client.snapshot).toHaveBeenCalledTimes(2));
+    if (kind === 'local') view.controller.store.addOptimisticUser({ clientMessageId: 'during-refresh', content: 'New unsent input' });
+    if (kind === 'canonical') view.controller.store.applySync({ ...delta(), cursor_after: 'cursor:new-canonical' });
+    if (kind === 'runtime') view.controller.store.applyRealtime({
+      type: 'chat_v2_frame', ...delta(), runtime: {
+        runtime_epoch: 'live', runtime_revision: 1, generated_at: '',
+        has_active_turn: false, active_turn: null, volatile_items: [], cycle_states: [],
+      },
+    } as ChatRealtimeFrame);
+    const before = view.controller.store.serializeState();
+    held.resolve({ ...snapshot(), scope: kind === 'scope' ? conversationTimelineScope('other-conversation') : scope });
+    await result;
+    if (kind === 'local') expect(view.controller.store.visibleItems.some(item => item.id === 'user:during-refresh')).toBe(true);
+    if (kind === 'runtime') expect(view.controller.store.snapshot.runtime?.runtime_epoch).toBe('live');
+    if (kind === 'canonical' || kind === 'scope') expect(view.controller.store.serializeState()).toEqual(before);
+    view.release();
+  });
+
+  it('does not announce durable recovery if the refreshed cache cannot be saved', async () => {
+    const client = api();
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    view.controller.store.restoreState(orphanState('queue'));
+    const saving = vi.spyOn(offlineCache, 'put').mockResolvedValueOnce(false);
+    try {
+      await expect(view.controller.load({ discardCachedHistory: true })).rejects.toThrow('Could not save refreshed history');
+      expect(view.controller.store.snapshot.localItems.map(item => item.id)).toContain('user:processing-input');
+    } finally {
+      saving.mockRestore();
+      view.release();
+    }
+  });
+
+  it.each([false, true])('does not apply an admission response after an account/context switch (legacy=%s)', async legacy => {
+    const pending = deferred<typeof failedAdmission>();
+    const client = { ...api(), messageAdmission: vi.fn(() => pending.promise),
+      messageAdmissionByClient: vi.fn(() => pending.promise) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    const state = orphanState();
+    view.controller.store.restoreState(legacy ? {
+      ...state, admissionPlacements: {},
+      localItems: state.localItems.map(item => ({ ...item, client_txn_id: undefined, turn_id: undefined })),
+    } : state);
+    const resolving = view.controller.reconcileAdmissions();
+    device.owner = 'another-owner@cognis.test';
+    device.ownerChanged();
+    pending.resolve(failedAdmission);
+    await resolving;
+    expect(view.controller.store.snapshot.admissionPlacements['processing-input']?.processingOutcome).toBeUndefined();
+    view.release();
+  });
+
+  it.each(['running', 'failed'] as const)('drains one newer intent after an in-flight %s receipt', async status => {
+    const pending = deferred<MessageAdmissionV2Response>();
+    const latest = { ...failedAdmission, before_client_message_id: 'later-input' };
+    const client = {
+      ...api(),
+      messageAdmission: vi.fn<() => Promise<MessageAdmissionV2Response>>()
+        .mockReturnValueOnce(pending.promise).mockResolvedValue(latest),
+    };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    view.controller.store.restoreState(orphanState());
+    const resolving = view.controller.reconcileAdmissions();
+    view.controller.store.applySync({ ...delta(), cursor_after: 'cursor:later' });
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).toHaveBeenCalledTimes(1);
+    pending.resolve({ ...failedAdmission, status });
+    await resolving;
+    await vi.waitFor(() => expect(client.messageAdmission).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(view.controller.store.snapshot.admissionPlacements['processing-input']
+      .processingOutcome?.beforeClientMessageId).toBe('later-input'));
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).toHaveBeenCalledTimes(2);
+    view.release();
+  });
+
+  it('treats an unavailable admission lookup as unknown, not failed or unsent', async () => {
+    let available = false;
+    const client = { ...api(), messageAdmission: vi.fn(async () => {
+      if (!available) throw new Error('Unavailable');
+      return failedAdmission;
+    }) };
+    const view = acquireTimeline(scope, client);
+    await view.controller.load();
+    view.controller.store.restoreState(orphanState());
+    await view.controller.reconcileAdmissions();
+    await view.controller.reconcileAdmissions();
+    expect(client.messageAdmission).toHaveBeenCalledTimes(1);
+    expect(view.controller.store.visibleItems[0]).toMatchObject({ status: 'complete', content: 'Preserved input' });
+    available = true;
+    await view.controller.load();
+    await vi.waitFor(() => expect(view.controller.store.visibleItems[0].status).toBe('failed'));
+    expect(client.messageAdmission).toHaveBeenCalledTimes(2);
+    view.release();
+  });
+
   it('crosses event-only pages in one upward action until visible history arrives', async () => {
     const client = api();
     const page = (before_cursor: string | null, items: TimelineBackfillResponse['items'] = []): TimelineBackfillResponse => ({

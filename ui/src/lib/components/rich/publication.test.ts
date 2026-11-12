@@ -13,6 +13,30 @@ import {
 } from './publication';
 
 describe('rich publication helpers', () => {
+  it('keeps Markdown hierarchy when prose is split across sibling blocks', () => {
+    const blocks = ['## Overview', '### Verification', '#### Browser checks', '## Rollout']
+      .map(content => ({ type: 'markdown', content }));
+    const options = publicationOptions({}, blocks);
+    expect(options.tocDepth).toBe(4);
+    const items = buildTocItems(blocks, options.tocDepth);
+    expect(items.map(({ label, level }) => [label, level])).toEqual([
+      ['Overview', 2], ['Verification', 3], ['Browser checks', 4], ['Rollout', 2],
+    ]);
+    expect(nestTocItems(items)[0].children[0].children[0].item.label).toBe('Browser checks');
+    const decorated = decorateBlocks(blocks, items);
+    expect(decorated.map(block => block.__publication_level)).toEqual([2, 3, 4, 2]);
+    expect(buildTocItems(blocks, 2).map(item => item.label)).toEqual(['Overview', 'Rollout']);
+  });
+  it('does not let code sample headings change sibling navigation levels', () => {
+    const blocks = [
+      { type: 'markdown', content: '```sh\n# A shell comment\n```' },
+      { type: 'markdown', content: '## Overview\n\n~~~md\n# Example heading\n~~~\n\n### Verification' },
+      { type: 'markdown', content: '## Rollout' },
+    ];
+    expect(buildTocItems(blocks, 4).map(({ label, level }) => [label, level])).toEqual([
+      ['Overview', 2], ['Verification', 3], ['Rollout', 2],
+    ]);
+  });
   it('counts same-level headings inside one markdown block as document sections', () => {
     const content = [{ type: 'markdown', content: Array.from({ length: 11 }, (_, index) =>
       `## ${index + 1}. Section\n\n${'Substantial design details. '.repeat(20)}`
@@ -84,7 +108,7 @@ describe('rich publication helpers', () => {
     }, content);
     const decorated = decorateBlocks(content, buildTocItems(content), options);
 
-    expect(options).toEqual({ showToc: false, tocDepth: 2, numberFigures: false, numberTables: false });
+    expect(options).toEqual({ showToc: false, tocDepth: 4, numberFigures: false, numberTables: false });
     expect(decorated.at(-2)?.__figure_number).toBeUndefined();
     expect(decorated.at(-1)?.__table_number).toBeUndefined();
   });

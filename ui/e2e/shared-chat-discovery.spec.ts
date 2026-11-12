@@ -31,8 +31,8 @@ for (const canContinue of [false, true]) {
     const items = [
       { ...conversation, conversation_id: 'conv-own', is_readonly_for_caller: false, starred_at: '2026-10-16T19:00:00Z', title: 'Cognis project CRUD & extended usage' },
       conversation,
-      { ...conversation, conversation_id: 'conv-gallery', title: 'Compare fictional exhibit captions', project_id: 'proj_gallery', project_name: 'Gallery', project_color: '#fbbf24' },
-      { ...conversation, conversation_id: 'conv-catalog', title: 'Prepare a museum catalogue sample', project_id: 'proj_museum', project_name: 'Museum', project_color: '#a78bfa' },
+      { ...conversation, conversation_id: 'conv-home', title: 'Find prior rope lighting discussion', project_id: 'proj_home', project_name: 'Home', project_color: '#fbbf24' },
+      { ...conversation, conversation_id: 'conv-mfg', title: 'Exhibit deployment plan', project_id: 'proj_museum', project_name: 'Museum demo', project_color: '#a78bfa' },
       { ...conversation, conversation_id: 'conv-free', is_readonly_for_caller: false, title: 'Provider fallback design and project routing' },
     ];
     let includeShared = true;
@@ -85,11 +85,11 @@ for (const canContinue of [false, true]) {
     await expect.poll(() => projectFilter).toBe('proj_cognis');
     await expect(badge).toHaveAttribute('aria-pressed', 'true');
     await expect(badge).not.toHaveClass(/ring-1|ring-sky-400/);
-    await expect(page.getByTestId('sidebar-conversation-row-conv-gallery')).toHaveCount(0);
+    await expect(page.getByTestId('sidebar-conversation-row-conv-home')).toHaveCount(0);
     expect(new URL(page.url()).pathname).toBe('/chat/conv-task-chat');
     await badge.click();
     await expect.poll(() => projectFilter).toBeNull();
-    await expect(page.getByTestId('sidebar-conversation-row-conv-gallery')).toBeVisible();
+    await expect(page.getByTestId('sidebar-conversation-row-conv-home')).toBeVisible();
     await page.getByRole('button', { name: 'Expand conversation filters' }).click();
     await page.getByLabel('Shared with me', { exact: true }).uncheck();
     await expect.poll(() => includeShared).toBe(false);

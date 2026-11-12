@@ -1,9 +1,7 @@
 <script lang="ts">
   import ParentChatLink from './ParentChatLink.svelte';
-  import Check from 'lucide-svelte/icons/check';
-  import Copy from 'lucide-svelte/icons/copy';
-  import X from 'lucide-svelte/icons/x';
-  import ExternalLink from 'lucide-svelte/icons/external-link';
+  import Search from 'lucide-svelte/icons/search';
+  import { findTarget } from '$lib/find';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import SessionLogHeader from './SessionLogHeader.svelte';
   import SessionDetailsButton from '$lib/components/session/SessionDetailsButton.svelte';
@@ -21,7 +19,7 @@
     isTerminalSessionStatus,
   } from '$lib/session-status';
 
-  let { view, node, agent = null, preferences, work = [], workTruncated = false, managedConversation = null, managedBusy = null, managedError = '', inspectorOpen, userScrolledUp = $bindable(false), todos = $bindable([]), timelineApi, timelineRealtime, onBack, onClose, onToggleInspector, onViewSession, onRuntimeActiveChange, onManagedStop, onManagedSend, onManagedTakeControl } = $props<{
+  let { view, node, agent = null, preferences, work = [], workTruncated = false, managedConversation = null, managedBusy = null, managedError = '', inspectorOpen, userScrolledUp = $bindable(false), todos = $bindable([]), timelineApi, timelineRealtime, onBack, onClose, onToggleInspector, onViewSession, onRuntimeActiveChange, onManagedStop, onManagedSend, onManagedTakeControl, onManagedTerminate } = $props<{
     view: ChildView; node: WorkstreamRef; agent?: Agent | null; preferences: UserPreferences;
     work?: BackgroundWorkItem[]; workTruncated?: boolean;
     managedConversation?: Conversation | null; managedBusy?: string | null; managedError?: string;
@@ -32,18 +30,17 @@
     onViewSession: (sessionId: string, node?: WorkstreamRef) => void;
     onRuntimeActiveChange?: (active: boolean) => void;
     onManagedStop?: () => void; onManagedSend?: (message: string) => void; onManagedTakeControl?: () => void;
+    onManagedTerminate?: () => void;
   }>();
-  let copied = $state(false);
   let ongoingWorkOpen = $state(false);
+  let timeline = $state<{ openSearch: (opener?: HTMLElement) => Promise<HTMLInputElement | null> } | null>(null);
+  let searchButton = $state<HTMLButtonElement | undefined>(undefined);
   const scope = $derived(childViewScope(view));
   const displayName = $derived(node.agent_display_name ?? agent?.display_name ?? agent?.name ?? node.agent_id);
   const avatarUrl = $derived(node.agent_avatar_url ?? agent?.avatar_url ?? null);
+  const title = $derived(managedConversation?.title || node.title);
+  const showManagedControls = $derived(view.kind === 'managed' && managedConversation && onManagedStop && onManagedSend && onManagedTakeControl);
   const normalizedStatus = $derived(displaySessionStatus(node.status, node.activity_state, false, node.execution_state));
-  async function copySessionId(): Promise<void> {
-    await navigator.clipboard?.writeText(view.sessionId);
-    copied = true;
-    window.setTimeout(() => { copied = false; }, 1200);
-  }
   function handleTodosChange(next: TodoSnapshotItem[]): void {
     todos = next;
   }
@@ -53,45 +50,44 @@
 <section
   class="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-transparent"
   style="padding-bottom: var(--app-bottom-control-inset);"
-  data-testid="child-chat-view"
+  data-testid="child-chat-view" data-find-container
 >
-  <SessionLogHeader title={node.title} testId="child-header">
+  <SessionLogHeader {title} testId="child-header">
     {#snippet leading()}
       <ParentChatLink conversationId={view.controllerRootConversationId} {onBack} />
-      <AgentAvatar name={displayName} {avatarUrl} class="h-8 w-8 shrink-0" />
     {/snippet}
     {#snippet metadata()}
-      <div class="flex min-w-0 gap-1 text-xs text-muted">
+      <div class="flex min-w-0 items-center gap-1 text-xs text-muted">
+        <AgentAvatar name={displayName} {avatarUrl} class="h-4 w-4 shrink-0" />
         <span class="truncate text-foreground">{displayName}</span>
         <span aria-hidden="true">·</span><span class="shrink-0">{normalizedStatus}</span>
       </div>
     {/snippet}
     {#snippet actions()}
-      <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground" type="button" aria-label="Copy canonical session ID" title="Copy canonical session ID" onclick={() => void copySessionId()}>
-        {#if copied}<Check class="h-4 w-4 text-success" />{:else}<Copy class="h-4 w-4" />{/if}
+      <button class="touch-target-compact inline-flex items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-foreground"
+        bind:this={searchButton} type="button" aria-label="Search in conversation" title="Search in conversation"
+        use:findTarget={{ primary: true, identity: () => scope.key, open: () => timeline?.openSearch(searchButton) ?? Promise.resolve(null) }}
+        onclick={() => { void timeline?.openSearch(searchButton); }}>
+        <Search class="h-4 w-4" />
       </button>
-      {#if view.kind === 'managed'}
-        <a
-          class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
-          href={`/chat/${encodeURIComponent(view.conversationId)}`}
-          target="_blank"
-          rel="noopener noreferrer"
-          aria-label={`Open ${node.title} in new window`}
-        ><ExternalLink class="h-4 w-4" /></a>
-      {/if}
       <SessionDetailsButton open={inspectorOpen} ariaControls="conversation-info-drawer" testId="child-header-inspector" onclick={(event) => onToggleInspector(event.currentTarget as HTMLElement)} />
-      <button class="touch-target-compact inline-flex shrink-0 items-center justify-center rounded-lg border border-control-border text-muted hover:bg-surface-hover hover:text-strong" type="button" aria-label="Close child conversation" onclick={onClose}><X class="h-4 w-4" /></button>
     {/snippet}
   </SessionLogHeader>
-  {#if work.length || todos.length}
-    <div class="shrink-0 px-4 pt-3">
-      <TimelineOngoingWorkDrawer {todos} {work} truncated={workTruncated} bind:open={ongoingWorkOpen} {onViewSession} />
-    </div>
-  {/if}
-  <ScopedChatV2Timeline {scope} {agent} {preferences} bind:userScrolledUp {onViewSession} {onRuntimeActiveChange} onTodosChange={handleTodosChange} api={timelineApi} realtime={timelineRealtime} activityStatus={node.execution_state ?? (isTerminalSessionStatus(node.status) ? node.status : node.activity_state === 'ongoing' ? 'running' : node.status)} emptyLabel="No events recorded yet." />
-  {#if view.kind === 'managed' && managedConversation && onManagedStop && onManagedSend && onManagedTakeControl}
-    <div class="shrink-0 p-3">
-      <ManagedConversationControls conversation={managedConversation} busy={managedBusy} error={managedError} onStop={onManagedStop} onSend={onManagedSend} onTakeControl={onManagedTakeControl} />
-    </div>
+  <ScopedChatV2Timeline bind:this={timeline} {scope} {agent} {preferences} bind:userScrolledUp {onViewSession} {onRuntimeActiveChange} onTodosChange={handleTodosChange} showTodoDrawer={false} showLiveIndicator={view.kind !== 'managed'} api={timelineApi} realtime={timelineRealtime} activityStatus={node.execution_state ?? (isTerminalSessionStatus(node.status) ? node.status : node.activity_state === 'ongoing' ? 'running' : node.status)} emptyLabel="No events recorded yet." />
+  {#if work.length || todos.length || showManagedControls}
+    <footer class="flex max-h-[75%] shrink-0 flex-col gap-3 px-3 py-3" data-testid="child-footer">
+      {#if work.length || todos.length}
+        <TimelineOngoingWorkDrawer {todos} {work} truncated={workTruncated} bind:open={ongoingWorkOpen} {onViewSession} />
+      {/if}
+      {#if showManagedControls && managedConversation && onManagedStop && onManagedSend && onManagedTakeControl}
+        <ManagedConversationControls conversation={managedConversation} busy={managedBusy} error={managedError} onStop={onManagedStop} onSend={onManagedSend} onTakeControl={onManagedTakeControl}
+          onTerminate={onManagedTerminate}
+          onNavigateParent={(parentId) => {
+            if (parentId !== view.controllerRootConversationId) return false;
+            onClose();
+            return true;
+          }} />
+      {/if}
+    </footer>
   {/if}
 </section>

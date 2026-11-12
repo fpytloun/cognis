@@ -1,9 +1,16 @@
 // @ts-nocheck -- retired history response metadata is ignored.
 import { fireEvent, render, screen } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import RecentWorkActivity from './RecentWorkActivity.svelte';
 import type { ActivityOverviewResponse } from '$lib/chat-v2/types';
 import { chatV2Api } from '$lib/chat-v2/api';
+
+beforeAll(async () => {
+  // Compile actual deferred modules outside DOM query deadlines, without warming definitions.
+  await import('./feedback/FeedbackDiffViewer.svelte');
+  await import('./FileDiffViewer.svelte');
+  await import('./ToolCallDetails.svelte');
+});
 
 describe('RecentWorkActivity', () => {
   beforeEach(() => window.localStorage.clear());
@@ -40,7 +47,7 @@ describe('RecentWorkActivity', () => {
     expect(screen.getByText('npm test')).toBeTruthy();
     expect(screen.getByText('4.2s')).toBeTruthy();
     await fireEvent.click(screen.getByText('npm test').closest('button')!);
-    expect(screen.getByTestId('tool-execution-status')).toHaveTextContent('Success');
+    expect(await screen.findByTestId('tool-execution-status')).toHaveTextContent('Success');
     expect(screen.getByText('src/app.ts')).toBeTruthy();
     expect(screen.queryByText('old')).toBeNull();
     const fileDisclosure = screen.getByText('src/app.ts').closest('button')!;
@@ -48,7 +55,8 @@ describe('RecentWorkActivity', () => {
     expect(fileDisclosure).toHaveAttribute('aria-controls');
     await fireEvent.click(fileDisclosure);
     expect(fileDisclosure).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByText('old')).toBeTruthy();
+    expect(await screen.findByText('old')).toBeTruthy();
+    expect(screen.getByText('new')).toBeTruthy();
     expect(screen.getByText('report.txt')).toBeTruthy();
     expect(screen.getByText('See all deliverables')).toBeTruthy();
     expect(document.querySelector('.assistant-deliverable-wrapper')).toHaveAttribute('data-collapsed-by-default', 'true');

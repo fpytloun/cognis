@@ -4,6 +4,13 @@ import { auth } from '$lib/stores/auth';
 import type { ProviderMonitor } from '$lib/types/api';
 
 export const providerMonitoring = writable<Record<string, ProviderMonitor>>({});
+
+/** Monitor error published when provider OAuth was rejected and needs the user. */
+export const REAUTHORIZATION_REQUIRED_ERROR = 'Reauthorization required';
+
+export function needsReauthorization(value: ProviderMonitor | null | undefined): boolean {
+  return value?.error === REAUTHORIZATION_REQUIRED_ERROR;
+}
 const pending = new Map<string, Promise<ProviderMonitor>>();
 let owner: string | undefined;
 const generations = new Map<string, number>();

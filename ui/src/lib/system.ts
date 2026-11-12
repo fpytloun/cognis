@@ -1,4 +1,4 @@
-import { get, writable } from 'svelte/store';
+import { derived, get, writable } from 'svelte/store';
 
 import { api, asApiError } from '$lib/api/client';
 import type { HealthResponse } from '$lib/types/api';
@@ -18,6 +18,11 @@ const state = writable<WorkspaceHealthState>({
   error: null,
   lastUpdatedAt: null
 });
+
+export const usageAnalyticsEnabled = derived(
+  state,
+  (current) => current.health?.usage_analytics_enabled !== false
+);
 
 let pollTimer: number | null = null;
 

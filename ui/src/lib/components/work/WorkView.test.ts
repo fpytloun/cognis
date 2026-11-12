@@ -1,5 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { conversationTimelineScope, type WorkProjectionResponse } from '$lib/chat-v2/types';
 import { ChatV2ApiError, chatV2Api } from '$lib/chat-v2/api';
@@ -10,6 +10,10 @@ import {
   saveWorkViewState,
 } from '$lib/work/workViewState';
 import WorkView from './WorkView.svelte';
+
+beforeAll(async () => {
+  await import('../ToolCallDetails.svelte');
+});
 
 afterEach(() => {
   cleanup();
@@ -475,20 +479,48 @@ describe('WorkView', () => {
     await fireEvent.change(screen.getByLabelText('Workstream'), {
       target: { value: child.key },
     });
+    // Tab counts follow the filter: the child produced the file change and the command, while
+    // the generic mutation belongs to the root workstream.
     expect(screen.getByRole('tab', { name: /Files 1/ })).toBeTruthy();
     expect(screen.getByRole('tab', { name: /Commands 1/ })).toBeTruthy();
-    expect(screen.getByRole('tab', { name: /Mutations 2/ })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /Mutations 0/ })).toBeTruthy();
     await fireEvent.click(screen.getByTestId('work-tab-commands'));
     expect(screen.queryByText('worker · UI implementation · running')).toBeNull();
     await fireEvent.click(screen.getByText('npm test'));
-    expect(screen.getByText('worker · UI implementation · running')).toBeTruthy();
+    expect(await screen.findByText('worker · UI implementation · running')).toBeVisible();
     await fireEvent.change(screen.getByLabelText('Status'), {
       target: { value: 'completed' },
     });
-    expect(screen.getByRole('tab', { name: /Commands 1/ })).toBeTruthy();
+    // The running child does not match "completed", so nothing remains.
+    expect(screen.getByRole('tab', { name: /Commands 0/ })).toBeTruthy();
   });
 
-  it('hides lineage filter chrome when the graph has one source', async () => {
+  it('counts this conversation\'s own deliverables under the root filter', async () => {
+    const next = projection();
+    const root = {
+      key: 'session:root', kind: 'root', root_key: 'session:root', edge_kind: 'root', ordinal: 0,
+      conversation_id: 'conversation-1', session_id: 'root', event_store_session_id: 'store-root',
+      title: 'Root', agent_id: 'architect', status: 'completed', current: true, superseded: false,
+    };
+    next.workstreams = [root, { ...root, key: 'session:child', kind: 'delegate', parent_key: root.key,
+      edge_kind: 'delegate', ordinal: 1, session_id: 'child', event_store_session_id: 'store-child', title: 'Child' }];
+    next.deliverables = [{ deliverable_id: 'dlv_root', format: 'markdown', title: 'Root report', content: '# Report',
+      created_at: '2026-11-01T10:00:00Z' }];
+    next.summary = { ...next.summary, deliverables: 1 };
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-1'),
+      loadWork: vi.fn().mockResolvedValue(next),
+      refreshIntervalMs: 0,
+    });
+    await waitFor(() => expect(screen.getByTestId('workstream-filters')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('work-filter-toggle'));
+    await fireEvent.change(screen.getByLabelText('Workstream'), { target: { value: 'root' } });
+    expect(screen.getByRole('tab', { name: /Deliverables 1/ })).toBeTruthy();
+    await fireEvent.change(screen.getByLabelText('Workstream'), { target: { value: 'session:child' } });
+    expect(screen.getByRole('tab', { name: /Deliverables 0/ })).toBeTruthy();
+  });
+
+  it('keeps search available when the graph has one source', async () => {
     const next = projection();
     next.workstreams = [{
       key: 'session:root',
@@ -511,7 +543,65 @@ describe('WorkView', () => {
       refreshIntervalMs: 0,
     });
     await waitFor(() => expect(screen.getByTestId('work-view')).toBeTruthy());
-    expect(screen.queryByTestId('workstream-filters')).toBeNull();
+    await fireEvent.click(screen.getByTestId('work-filter-toggle'));
+    expect(screen.getByLabelText('Search')).toBeTruthy();
+  });
+
+  it('searches output names without provenance and preserves the output tab on time changes', async () => {
+    const next = {
+      ...projection(),
+      artifacts: [
+        { artifact_id: 'art_report', filename: 'report-04.csv', revision: 4, created_at: '2026-01-01T00:00:00Z' },
+        { artifact_id: 'art_notes', filename: 'notes.md', revision: 1 },
+      ],
+      deliverables: [
+        { deliverable_id: 'dlv_report', title: 'Report 04', content: 'Quarterly analysis', format: 'markdown', revision: 4, created_at: '2026-01-01T00:00:00Z' },
+        { deliverable_id: 'dlv_notes', title: 'Notes', content: 'Other work', format: 'markdown' },
+      ],
+    };
+    const loadWork = vi.fn().mockResolvedValue(next);
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-1'),
+      initialTab: 'artifacts',
+      forceInitialTab: true,
+      loadWork,
+      refreshIntervalMs: 0,
+    });
+    await waitFor(() => expect(screen.getByText('report-04.csv')).toBeTruthy());
+    expect(screen.getByText('v4')).toBeTruthy();
+    expect(document.querySelector('time')?.getAttribute('datetime')).toBe('2026-01-01T00:00:00Z');
+    await fireEvent.click(screen.getByTestId('work-filter-toggle'));
+    await fireEvent.input(screen.getByLabelText('Search'), { target: { value: '04' } });
+    expect(screen.queryByText('notes.md')).toBeNull();
+    expect(screen.getByText('report-04.csv')).toBeTruthy();
+    await fireEvent.click(screen.getByTestId('work-time-range-picker'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Last 1h' }));
+    await waitFor(() => expect(screen.getByTestId('work-tab-artifacts').getAttribute('aria-selected')).toBe('true'));
+    expect(loadWork.mock.lastCall?.[3]).toMatchObject({ category: 'artifacts', from: expect.any(String) });
+    await fireEvent.click(screen.getByTestId('work-tab-results'));
+    await waitFor(() => expect(screen.getByTestId('work-deliverable-dlv_report')).toBeTruthy());
+    expect(screen.queryByTestId('work-deliverable-dlv_notes')).toBeNull();
+    await fireEvent.input(screen.getByLabelText('Search'), { target: { value: 'Quarterly' } });
+    expect(screen.getByTestId('work-deliverable-dlv_report')).toBeTruthy();
+  });
+
+  it('searches older artifact pages without requiring viewport intersection', async () => {
+    const first = { ...projection(), artifacts: [{ artifact_id: 'art_recent', filename: 'recent.csv' }], has_more_before: true, before_cursor: 'older-artifacts' };
+    const older = { ...projection(), artifacts: [{ artifact_id: 'art_older', filename: 'archive-04.csv' }] };
+    const loadWork = vi.fn().mockImplementation((_scope, _signal, before) => Promise.resolve(before ? older : first));
+    render(WorkView, {
+      scope: conversationTimelineScope('conversation-1'),
+      initialTab: 'artifacts',
+      forceInitialTab: true,
+      loadWork,
+      refreshIntervalMs: 0,
+    });
+    await waitFor(() => expect(screen.getByText('recent.csv')).toBeTruthy());
+    await fireEvent.click(screen.getByTestId('work-filter-toggle'));
+    await fireEvent.input(screen.getByLabelText('Search'), { target: { value: '04' } });
+    await waitFor(() => expect(loadWork.mock.calls.some((call) => call[2] === 'older-artifacts')).toBe(true));
+    await waitFor(() => expect(screen.getByText('archive-04.csv')).toBeTruthy());
+    expect(screen.queryByText('recent.csv')).toBeNull();
   });
 
   it('clears only invalid lineage filters when a selected child disappears', async () => {
@@ -567,8 +657,11 @@ describe('WorkView', () => {
       target: { value: 'useful query' },
     });
     await fireEvent.click(screen.getByRole('button', { name: 'Refresh work' }));
-    await waitFor(() => expect(screen.queryByTestId('workstream-filters')).toBeNull());
-    expect(screen.getByRole('tab', { name: /Files 1/ })).toBeTruthy();
+    await waitFor(() => expect(screen.getByLabelText('Workstream')).toHaveValue('all'));
+    // The still-valid search is kept and tab counts follow it; clearing it restores the total.
+    expect(screen.getByLabelText('Search')).toHaveValue('useful query');
+    await fireEvent.input(screen.getByLabelText('Search'), { target: { value: '' } });
+    await waitFor(() => expect(screen.getByRole('tab', { name: /Files 1/ })).toBeTruthy());
   });
 
   it('uses counted tabs and canonical compact tool rows without duplicate file trees', async () => {
@@ -736,7 +829,8 @@ describe('WorkView', () => {
     await waitFor(() => expect(screen.getByTestId('work-file-src/app.ts')).toBeTruthy());
     expect(screen.getAllByText('@@ -1 +1 @@')).toHaveLength(2);
     const combined = screen.getByTestId('work-combined-diff');
-    expect(combined.querySelectorAll('section')).toHaveLength(1);
+    // Separate recorded events retain distinct anchor authorities for one path.
+    expect(combined.querySelectorAll('[data-feedback-file]')).toHaveLength(2);
     expect(combined.textContent?.indexOf('old')).toBeLessThan(combined.textContent?.indexOf('new') ?? 0);
     await fireEvent.change(screen.getByRole('combobox', { name: 'Filter by file status' }), {
       target: { value: 'added' },
@@ -976,7 +1070,7 @@ describe('WorkView', () => {
     globalThis.IntersectionObserver = OriginalIntersectionObserver;
   });
 
-  it('resets every category and reloads Files when the Work range changes', async () => {
+  it('resets every category and preserves the selected tab when the Work range changes', async () => {
     const loadWork = vi.fn().mockImplementation((_scope, _signal, _before, options?: { category: string }) => {
       const next = projection();
       next.commands = options?.category === 'commands' ? next.commands : [];
@@ -992,7 +1086,7 @@ describe('WorkView', () => {
     await fireEvent.click(screen.getByTestId('work-time-range-picker'));
     await fireEvent.click(screen.getByRole('button', { name: 'Last 1h' }));
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(3));
-    expect(loadWork.mock.calls[2][3]).toMatchObject({ category: 'files' });
+    expect(loadWork.mock.calls[2][3]).toMatchObject({ category: 'commands' });
     expect(loadWork.mock.calls[2][3].from).toMatch(/Z$/);
   });
 
@@ -1291,7 +1385,7 @@ describe('WorkView', () => {
       expect(screen.getByTestId('work-diff-partial-history')).toHaveTextContent(
         '1 change without a text preview is not included in the combined diff.'
       );
-      expect(screen.getByTestId('work-combined-diff').querySelectorAll('section')).toHaveLength(1);
+      expect(screen.getByTestId('work-combined-diff').querySelectorAll('[data-feedback-file]')).toHaveLength(2);
     }
   });
 
@@ -1506,7 +1600,8 @@ describe('WorkView', () => {
     resolveRevision1(revision1);
 
     await waitFor(() => expect(loadWork).toHaveBeenCalledTimes(2));
-    expect(await screen.findByText('revision-2.ts')).toBeTruthy();
+    // The file appears in both the file list and the diff header.
+    expect((await screen.findAllByText('revision-2.ts')).length).toBeGreaterThan(0);
     expect(screen.queryByText('revision-1.ts')).toBeNull();
     const cached = getWorkResponseCache<{
       state: { projection: WorkProjectionResponse };

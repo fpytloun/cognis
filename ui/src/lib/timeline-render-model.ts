@@ -30,6 +30,7 @@ export interface AssistantDeliverableTimelineItem {
   createdAt?: string;
   updatedAt?: string;
   deliverableId: string;
+  deliverable?: import('$lib/types/api').Deliverable | null;
   lineageId?: string | null;
   revision?: number | null;
   format: string;
@@ -86,6 +87,7 @@ export interface ThinkingTimelineItem {
 }
 
 export interface MessageTimelineItem {
+  commentReplies?: import('$lib/feedback/agent-replies').AgentCommentReply[];
   id: string;
   kind: 'message';
   sessionId?: string | null;
@@ -101,8 +103,9 @@ export interface MessageTimelineItem {
   arrivalEligible?: boolean;
   attachments?: AttachmentRef[];
   optimistic?: boolean;
-  deliveryStatus?: 'sending' | 'queued' | 'failed';
+  deliveryStatus?: 'sending' | 'queued' | 'failed' | 'cancelled';
   clientMessageId?: string | null;
+  messageMetadata?: import('$lib/types/api').MessageMetadata | null;
   queueId?: string | null;
   streamChunkCount?: number;
   streamContentOffset?: number;
@@ -136,6 +139,10 @@ export interface ToolCallTimelineItem {
   kind: 'tool_call';
   callId: string;
   toolName: string;
+  parentCallId?: string | null;
+  programId?: string | null;
+  kernelGeneration?: string | number | null;
+  programChildren?: ToolCallTimelineItem[];
   displayToolName?: string;
   canonicalToolName?: string;
   status: string;

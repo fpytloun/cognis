@@ -22,7 +22,7 @@ vi.mock('$lib/native/host', async () => {
   const { writable } = await import('svelte/store');
   return { isNativeHost: () => true, isWorkspaceReplica: () => false, nativeConfiguration: () => null,
     hostAllowsObservation: () => true, postNative: mocks.bridge,
-    nativeVisibility: writable({ visible: true, focused: true }) };
+    nativeVisibility: writable({ visible: true, focused: true }), nativeComposerFocus: writable(null) };
 });
 vi.mock('$lib/api/client', async (original) => {
   const module = await original<typeof import('$lib/api/client')>();
@@ -40,7 +40,7 @@ import { DocumentDrafts } from '$lib/offline/document-drafts';
 import { documentCoordination } from '$lib/document-coordination';
 import { page } from '$app/stores';
 import { auth } from '$lib/stores/auth';
-import { nativeVisibility } from '$lib/native/host';
+import { nativeVisibility, nativeComposerFocus } from '$lib/native/host';
 
 const route = page as unknown as Writable<{ url: URL }>;
 const session = auth as unknown as Writable<{ status: string; user: { email: string } }>;
@@ -62,6 +62,7 @@ beforeEach(async () => {
   vi.resetAllMocks(); localStorage.clear();
   session.set({ status: 'authenticated', user: { email: 'native@fixture.invalid' } });
   visible.set({ visible: true, focused: true });
+  nativeComposerFocus.set(null);
   conversationWorkspace.setCommand((intent) => conversationWorkspace.reduce(intent,
     async (id) => conversation(id)));
   conversationWorkspace.setOwner('native@fixture.invalid', null);
@@ -117,6 +118,43 @@ it('retires real pinned A before direct B, ignores A activity/unpin, and preserv
   expect(mocks.bridge).toHaveBeenCalledWith('dismiss', {});
   mocks.bridge.mockClear(); view.unmount(); await tick();
   expect(mocks.bridge).not.toHaveBeenCalledWith('dismiss', {});
+});
+it('retains focus intent before load and gates it by agent and native visibility', async () => {
+  await conversationWorkspace.unpinAgent('agent_a');
+  await conversationWorkspace.pinAgent('agent_a');
+  await go('agent=agent_a');
+  const home: Conversation = {
+    ...conversation('conv_a'),
+    context: { ...conversation('conv_a').context, type: 'web', platform_data: { kind: 'agent_direct' } },
+  };
+  mocks.detail.mockImplementation(async (id) => id === home.conversation_id ? home : conversation(id));
+  conversationWorkspace.setCommand((intent) => conversationWorkspace.reduce(intent, (id) => mocks.detail(id)));
+  let finish!: (value: Conversation) => void;
+  mocks.resolve.mockImplementationOnce(() => new Promise((done) => { finish = done; }));
+  nativeComposerFocus.set({ agentId: 'agent_a', request: 'open-a' });
+  visible.set({ visible: false, focused: false });
+  render(Page);
+  await waitFor(() => expect(mocks.resolve).toHaveBeenCalled());
+  expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument();
+  finish(home);
+  await waitFor(() => expect(conversationWorkspace.snapshot().agents.find((agent) => agent.agentId === 'agent_a')?.homeConversationId).toBe('conv_a'));
+  const composer = await screen.findByRole('textbox', { name: 'Message' });
+  expect(composer).not.toHaveFocus();
+  visible.set({ visible: true, focused: true });
+  await waitFor(() => expect(composer).toHaveFocus());
+  composer.blur();
+  nativeComposerFocus.set({ agentId: 'agent_b', request: 'open-b' });
+  await tick();
+  expect(composer).not.toHaveFocus();
+  await go('direct=1&agent=agent_b');
+  await waitFor(() => expect(screen.getByRole('textbox', { name: 'Message' })).toHaveFocus());
+});
+it('does not focus a read-only panel', async () => {
+  pinnedConversations.set({ conv_a: { ...conversation('conv_a'), is_readonly_for_caller: true } });
+  nativeComposerFocus.set({ agentId: 'agent_a', request: 'open-readonly' });
+  render(Page);
+  expect(await screen.findByTestId('fixture-conv_a')).toBeInTheDocument();
+  expect(screen.queryByRole('textbox', { name: 'Message' })).not.toBeInTheDocument();
 });
 it('invalidates deferred pinned Home resolution on switch and never auto-pins direct agents', async () => {
   await conversationWorkspace.unpinAgent('agent_a'); await conversationWorkspace.pinAgent('agent_a');

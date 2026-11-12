@@ -60,6 +60,58 @@ function snapshot(items: TimelineItem[]): ChatSnapshot {
 }
 
 describe('ChatV2Store serialize/restore (conversation-view cache)', () => {
+  it('keeps copied compaction-tail identities unique across repeated snapshot recovery', () => {
+    const store = new ChatV2Store();
+    const older = message({ id: 'older', sort_key: '0022:0001' });
+    const copied = message({ id: 'copied', sort_key: '0022:0002', content: 'original' });
+    store.replaceFromSnapshot(snapshot([older, copied]));
+    const rotated = snapshot([
+      {
+        id: 'compaction:rotation', kind: 'compaction', sort_key: '0023:0001',
+        stable: true, source_refs: [], status: 'compacted',
+        session_id: 'sess-2', previous_session_id: 'sess-1',
+        summary_preview: 'Recap', method: 'summary', turns_compacted: 1,
+      },
+      message({
+        id: copied.id, sort_key: '0023:0002', content: 'canonical copy',
+        source_refs: [{ store: 'intaris', session_id: 'sess-2', seq: 2, event_type: 'assistant_message' }],
+      }),
+    ]);
+    rotated.timeline.has_more_before = true;
+    rotated.timeline.before_cursor = 'older-page';
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      store.replaceFromSnapshot(rotated);
+      expect(store.snapshot.timelineItems.map(item => item.id)).toEqual([
+        older.id, copied.id, 'compaction:rotation',
+      ]);
+      expect(store.visibleItems.map(item => item.id)).toEqual([
+        older.id, copied.id, 'compaction:rotation',
+      ]);
+      expect(store.snapshot.timelineItems[1]).toMatchObject({
+        content: 'canonical copy', sort_key: copied.sort_key,
+        source_refs: [{ store: 'intaris', session_id: 'sess-2', seq: 2, event_type: 'assistant_message' }],
+      });
+    }
+  });
+
+  it('repairs duplicate identities in an old cached view before publishing its idle timeline', () => {
+    const original = message({ id: 'copied', sort_key: '0022:0002', content: 'original' });
+    const duplicate = message({ id: original.id, content: 'canonical copy', sort_key: '0022:0002' });
+    const cached: ChatV2ClientState = {
+      ...emptyChatV2State(), conversationId: 'conv-1',
+      timelineItems: [original, duplicate],
+    };
+    const store = new ChatV2Store();
+    store.restoreState(cached);
+    expect(store.snapshot.timelineItems).toHaveLength(1);
+    expect(store.visibleItems).toEqual([expect.objectContaining({ id: original.id, content: 'canonical copy' })]);
+    expect(cached.timelineItems).toHaveLength(2);
+    store.addOptimisticUser({ content: 'draft', clientMessageId: 'local-admission' });
+    const restored = new ChatV2Store();
+    restored.restoreState(store.serializeState());
+    expect(restored.visibleItems.map(item => item.id)).toEqual([original.id, 'user:local-admission']);
+  });
+
   it('prepares all retained views before one membership projection and unregisters on teardown', () => {
     const store = new ChatV2Store();
     store.replaceFromSnapshot(snapshot([message()]));

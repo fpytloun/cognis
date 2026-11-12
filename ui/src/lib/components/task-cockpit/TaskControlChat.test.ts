@@ -8,6 +8,9 @@ import type {
   TimelineScope
 } from '$lib/chat-v2/types';
 import type { TaskControlChatResponse } from '$lib/types/api';
+import { loginFixtureAccount } from '../../../test/verified-account';
+import { auth } from '$lib/stores/auth';
+import { createIndexedDbChatV2Outbox } from '$lib/chat-v2/outbox';
 
 const api = vi.hoisted(() => ({
   snapshot: vi.fn(),
@@ -35,10 +38,13 @@ vi.mock('$lib/ws/client', () => ({
   wsState: { subscribe: (run: (value: unknown) => void) => { run({ status: 'connected', attempts: 0, lastError: null }); return () => undefined; } }
 }));
 
-vi.mock('$lib/api/client', () => ({
+vi.mock('$lib/api/client', async (importOriginal) => ({
+  ...await importOriginal<typeof import('$lib/api/client')>(),
   api: {
+    notifications: { list: vi.fn(async () => []) },
     conversations: {
       slashCommandSuggestions,
+      backgroundWork: vi.fn(async () => ({ background_work_changed: true, background_work: { items: [], truncated: false } })),
     },
     artifacts: {
       upload: api.upload,
@@ -46,6 +52,16 @@ vi.mock('$lib/api/client', () => ({
     },
   },
 }));
+vi.mock('$lib/feedback/api', async (importOriginal) => {
+  const original = await importOriginal<typeof import('$lib/feedback/api')>();
+  return { ...original, feedbackApi: { ...original.feedbackApi,
+    staging: vi.fn(async (conversation_id: string) => ({ conversation_id, version: 1, items: [], receipts: [] })),
+  } };
+});
+vi.mock('$lib/chat-v2/attachment-uploads', async (importOriginal) => {
+  const original = await importOriginal<typeof import('$lib/chat-v2/attachment-uploads')>();
+  return { ...original, attachmentUploads: new original.AttachmentUploadManager(undefined, blob => api.upload(blob)) };
+});
 
 import TaskControlChat from './TaskControlChat.svelte';
 
@@ -139,6 +155,8 @@ beforeAll(() => {
     disconnect() {}
   };
 });
+beforeEach(loginFixtureAccount);
+afterEach(async () => { await auth.clear(); });
 
 beforeEach(() => {
   localStorage.clear();
@@ -212,15 +230,19 @@ describe('TaskControlChat', () => {
     }
   );
 
-  it('marks admission failure and preserves the draft', async () => {
+  it('retains network-failed admission under the original durable transaction', async () => {
     api.sendMessage.mockRejectedValue(new Error('Controller unavailable'));
     render(TaskControlChat, { chat: chat('task-a') });
     const composer = screen.getByTestId('task-control-composer');
     await fireEvent.input(composer, { target: { value: 'Keep this draft' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Controller unavailable');
-    expect(composer).toHaveValue('Keep this draft');
+    expect(await screen.findByText('Message saved. It will be sent automatically when the connection recovers.')).toBeVisible();
+    const rows = (await createIndexedDbChatV2Outbox().list('conv-task-a'))
+      .filter(row => row.client_message_id === api.sendMessage.mock.calls[0][2].client_message_id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ content: 'Keep this draft', client_txn_id: api.sendMessage.mock.calls[0][1] });
+    expect(composer).toHaveValue('');
   });
 
   it('keeps a failed post-admission cursor sync unreconciled until explicit snapshot recovery', async () => {
@@ -265,6 +287,7 @@ describe('TaskControlChat', () => {
     const composer = screen.getByTestId('task-control-composer');
     await fireEvent.input(composer, { target: { value: 'Task A message' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
+    await waitFor(() => expect(captured).toBeDefined());
     await rerender({ chat: chat('task-b') });
     await fireEvent.input(composer, { target: { value: 'Task B draft' } });
 
@@ -289,7 +312,7 @@ describe('TaskControlChat', () => {
     await fireEvent.paste(composer, { clipboardData });
 
     await waitFor(() => expect(api.upload).toHaveBeenCalledWith(file));
-    expect(await screen.findByText('pasted.png')).toBeInTheDocument();
+    expect(await screen.findByRole('img', { name: 'pasted.png' })).toBeInTheDocument();
     await fireEvent.click(screen.getByRole('button', { name: 'Send task control message' }));
 
     await waitFor(() => expect(api.sendMessage).toHaveBeenCalledWith(

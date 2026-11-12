@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Atlas — design review fixture</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px; background: #eef1f5; color: #17212f; font: 15px/1.5 system-ui, sans-serif; }
+    button { font: inherit; cursor: pointer; }
+    #wireframe { width: 1060px; max-width: 100%; min-height: 670px; margin: 0 auto; background: white; border: 1px solid #cbd3dd; border-radius: 8px; overflow: hidden; }
+    header { display: flex; align-items: center; gap: 20px; padding: 20px 28px; border-bottom: 1px solid #dfe4eb; }
+    header strong { font-size: 19px; }
+    .fixture { margin-left: auto; color: #687586; font-size: 12px; }
+    .layout { display: grid; grid-template-columns: 180px 1fr; min-height: 586px; }
+    nav { padding: 26px 16px; background: #f7f9fb; border-right: 1px solid #dfe4eb; }
+    nav a { display: block; padding: 10px 14px; margin-bottom: 8px; color: #526175; border-radius: 5px; text-decoration: none; }
+    nav a[aria-current] { background: #e5edf9; color: #24528b; font-weight: 600; }
+    main { padding: 28px; }
+    .heading { display: flex; align-items: flex-start; gap: 20px; }
+    h1 { margin: 0; font-size: 25px; font-weight: 650; }
+    .subheading { margin: 4px 0 24px; color: #687586; }
+    #follow { margin-left: auto; padding: 8px 15px; border: 1px solid #b9c8dd; border-radius: 5px; color: #24528b; background: #f4f8fd; }
+    .summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+    .summary section { padding: 18px; border: 1px solid #dce2e9; border-radius: 6px; }
+    .label { margin: 0; color: #687586; font-size: 13px; }
+    .value { margin: 4px 0 0; font-size: 25px; font-weight: 650; }
+    h2 { margin: 28px 0 12px; font-size: 17px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; text-align: left; }
+    th { color: #687586; font-size: 12px; font-weight: 550; background: #f7f9fb; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid #e4e8ee; }
+    .status { color: #24528b; }
+    footer { margin-top: 26px; padding-top: 14px; border-top: 1px solid #e4e8ee; color: #687586; font-size: 12px; }
+    @media (max-width: 640px) { body { padding: 0; } .layout { grid-template-columns: 1fr; } nav { display: none; } .summary { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div id="wireframe">
+    <header><strong>Atlas</strong><span>Project workspace</span><span class="fixture">Synthetic design review fixture</span></header>
+    <div class="layout">
+      <nav aria-label="Project navigation">
+        <a href="#overview" aria-current="page">Overview</a>
+        <a href="#projects">Projects</a>
+        <a href="#activity">Activity</a>
+        <a href="#settings">Settings</a>
+      </nav>
+      <main>
+        <div class="heading">
+          <div><h1>Workspace overview</h1><p class="subheading">Make the next action easy to find.</p></div>
+          <button id="follow" type="button" aria-pressed="false">Follow updates</button>
+        </div>
+        <div class="summary">
+          <section id="active-projects"><p class="label">Active projects</p><p class="value">8</p></section>
+          <section id="awaiting-review"><p class="label">Awaiting review</p><p class="value">3</p></section>
+          <section id="completed"><p class="label">Completed this week</p><p class="value">12</p></section>
+        </div>
+        <h2>Needs your attention</h2>
+        <table>
+          <thead><tr><th>Project</th><th>Next step</th><th>Status</th></tr></thead>
+          <tbody>
+            <tr><td>Customer portal</td><td>Review navigation wireframe</td><td class="status">Ready for feedback</td></tr>
+            <tr><td>Staging upgrade</td><td>Approve the test plan</td><td>Waiting for review</td></tr>
+            <tr><td>Documentation</td><td>Clarify the release checklist</td><td>Draft prepared</td></tr>
+          </tbody>
+        </table>
+        <footer>No live project data. Select an element, quote text, or annotate a captured region to review this layout.</footer>
+      </main>
+    </div>
+  </div>
+  <script>
+    document.getElementById('follow').addEventListener('click', (event) => {
+      const button = event.currentTarget;
+      const following = button.getAttribute('aria-pressed') !== 'true';
+      button.setAttribute('aria-pressed', String(following));
+      button.textContent = following ? 'Following updates' : 'Follow updates';
+    });
+  </script>
+</body>
+</html>

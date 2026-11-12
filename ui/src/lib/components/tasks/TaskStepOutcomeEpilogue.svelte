@@ -1,15 +1,25 @@
 <script lang="ts">
   import AssistantDeliverableBlock from '$lib/components/AssistantDeliverableBlock.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
   import { api } from '$lib/api/client';
   import { renderMarkdown } from '$lib/markdown';
   import type { AssistantDeliverableTimelineItem } from '$lib/timeline-render-model';
-  import type { Deliverable, StepRun } from '$lib/types/api';
+  import type { Deliverable, StepRun, TaskDeliverableFreshness } from '$lib/types/api';
 
-  let { stepRun } = $props<{ stepRun: StepRun }>();
+  let { stepRun, timelineDeliverableIds = [], deliverableFreshness } = $props<{
+    stepRun: StepRun;
+    timelineDeliverableIds?: string[];
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
+  }>();
 
   const deliverable = $derived(stepRun.deliverables?.[0] ?? null);
+  const freshness = $derived(deliverable
+    ? deliverableFreshness?.[deliverable.deliverable_id] ?? stepRun.deliverable_freshness?.[deliverable.deliverable_id] ?? deliverable.task_freshness ?? null
+    : null);
   const deliverableItem = $derived.by<AssistantDeliverableTimelineItem | null>(() => {
-    if (!deliverable) return null;
+    // Compatibility for pre-change task histories without canonical document events.
+    // Remove when pre-change task histories are no longer supported.
+    if (!deliverable || timelineDeliverableIds.includes(deliverable.deliverable_id)) return null;
     return {
       id: `step-deliverable:${stepRun.step_run_id}:${deliverable.deliverable_id}`,
       kind: 'assistant_deliverable',
@@ -57,7 +67,7 @@
   }
 </script>
 
-{#if deliverableItem || hasMetadata}
+{#if deliverableItem || hasMetadata || (freshness && freshness.state !== 'current')}
   <section
     class="mt-8 space-y-4 border-t border-separator/80 pt-6"
     data-testid="task-step-outcome"
@@ -66,19 +76,23 @@
     <div class="flex flex-wrap items-center justify-between gap-2">
       <p class="text-xs font-semibold uppercase tracking-[0.2em] text-quiet">Task outcome</p>
       <div class="flex flex-wrap gap-2 text-[11px] uppercase tracking-wide">
-        <span class="rounded-full border border-control-border bg-surface/70 px-2.5 py-1 text-secondary">{stepRun.status}</span>
+        <StatusBadge status={stepRun.status} />
         {#if deliverable}
           <span class="rounded-full border border-accent/30 bg-accent-subtle px-2.5 py-1 text-accent">
-            Draft {deliverable.version} {deliverable.status}
+            Document v{deliverable.version} · {deliverable.status}
           </span>
         {/if}
       </div>
     </div>
+    {#if !deliverableItem && freshness && freshness.state !== 'current'}
+      <p class="text-sm text-muted" role="status">{freshness.label}</p>
+    {/if}
 
     {#if deliverableItem}
       {#key deliverableItem.deliverableId}
         <div data-kind="assistant_deliverable">
-          <AssistantDeliverableBlock item={deliverableItem} loadDeliverable={loadStepDeliverable} />
+          <AssistantDeliverableBlock item={deliverableItem} loadDeliverable={loadStepDeliverable}
+            taskFreshness={freshness} />
         </div>
       {/key}
     {/if}

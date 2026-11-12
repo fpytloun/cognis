@@ -10,6 +10,7 @@ import type {
   QueueState,
   RuntimeOverlaySnapshot,
   SendMessageV2Response,
+  MessageAdmissionV2Response,
   TimelineBackfillResponse,
   TimelineItem,
   TimelineItemStatus,
@@ -17,7 +18,7 @@ import type {
 } from './types';
 import type { AttachmentRef } from '$lib/types/api';
 import { conversationTimelineScope, type TimelineScope } from './types';
-import { runtimeHistoryVisibility } from './runtime-history';
+import { CARRIED_LINEAGE_PREFIX, isCarriedAssistant, runtimeHistoryVisibility } from './runtime-history';
 import { localHistoryPlacement } from './local-history-placement';
 
 export type ChatV2SyncOutcome =
@@ -39,6 +40,7 @@ export interface ChatV2ClientState {
   projectionVersion: string | null;
   cursor: string | null;
   hasMoreBefore: boolean;
+  historyWindowReduced?: boolean;
   beforeCursor: string | null;
   conversation: ConversationSummary | null;
   timelineItems: TimelineItem[];
@@ -61,6 +63,19 @@ export interface LocalAdmissionPlacement {
   attachments?: AttachmentRef[];
   createdAt?: string | null;
   updatedAt?: string | null;
+  historyConfirmed?: boolean;
+  processingOutcome?: {
+    status: 'failed' | 'cancelled' | 'completed' | 'absorbed';
+    turnId: string;
+    admissionOrder: number;
+    beforeClientMessageId: string | null;
+  };
+}
+
+export function isConfirmedUserEcho(admission: LocalAdmissionPlacement | undefined): boolean {
+  return admission?.historyConfirmed === true
+    || admission?.processingOutcome?.status === 'completed'
+    || admission?.processingOutcome?.status === 'absorbed';
 }
 
 function responseScope(scope: TimelineScope | undefined, conversationId: string): TimelineScope {
@@ -104,6 +119,7 @@ export function emptyChatV2State(): ChatV2ClientState {
     projectionVersion: null,
     cursor: null,
     hasMoreBefore: false,
+    historyWindowReduced: false,
     beforeCursor: null,
     conversation: null,
     timelineItems: [],
@@ -227,11 +243,11 @@ export function applySnapshot(
           projectionVersion: snapshot.projection_version,
         }
       : undefined;
-  const timelineItems = mergeBackfilledHistory(
+  const timelineItems = normalizeTimelineItems(mergeBackfilledHistory(
     mergeSnapshotWithExisting(sortTimelineItems(snapshot.timeline.items), snapshot, scopedPrevious),
     snapshot,
     scopedPrevious
-  );
+  ));
   // Route the snapshot runtime through the same acceptance rules as live
   // frames. maybeApplyRuntime now handles epoch change, turn change, and
   // settle as authoritative, while still guarding against a stale snapshot
@@ -259,6 +275,7 @@ export function applySnapshot(
     projectionVersion: snapshot.projection_version,
     cursor: snapshot.cursor,
     hasMoreBefore: snapshot.timeline.has_more_before && Boolean(snapshot.timeline.before_cursor),
+    historyWindowReduced: snapshot.timeline.history_window_reduced ?? false,
     beforeCursor: snapshot.timeline.before_cursor ?? null,
     conversation: snapshot.conversation,
     timelineItems,
@@ -287,6 +304,11 @@ export function applySnapshot(
  * beyond; items strictly OLDER than the snapshot's first item are kept when
  * the server confirms more history exists before the page
  * (`has_more_before`) and the conversation/projection identity is unchanged.
+ *
+ * Kept rows must be contiguous with the snapshot. A cached window that shares
+ * no item with the snapshot (for example, a device that last synced several
+ * compactions ago) ends before an unloaded gap. Keeping it would leave a hole
+ * that the snapshot's before-cursor can only fill from the middle of the list.
  */
 function mergeBackfilledHistory(
   snapshotItems: TimelineItem[],
@@ -298,8 +320,13 @@ function mergeBackfilledHistory(
   if (previous.projectionVersion !== snapshot.projection_version) return snapshotItems;
   if (snapshotItems.length === 0 || !snapshot.timeline.has_more_before) return snapshotItems;
   const earliest = snapshotItems[0];
+  const snapshotIds = new Set(snapshotItems.map(item => item.id));
+  if (!previous.timelineItems.some(item => snapshotIds.has(item.id))) return snapshotItems;
   const olderItems = previous.timelineItems.filter(
     (item) =>
+      // Copied compaction tails retain their original position when merged.
+      // Being older than the page boundary does not make an ID absent from it.
+      !snapshotIds.has(item.id) &&
       (compareCodepoints(item.sort_key, earliest.sort_key) ||
         compareCodepoints(item.id, earliest.id)) < 0
   );
@@ -368,6 +395,7 @@ export function applyBackfillResult(
       ...state,
       timelineItems,
       hasMoreBefore: response.has_more_before && Boolean(response.before_cursor),
+      historyWindowReduced: state.historyWindowReduced || (response.history_window_reduced ?? false),
       beforeCursor: response.before_cursor ?? null,
       cycleStates: mergeCycleStates(state.cycleStates ?? [], response.cycle_states ?? []),
       localItems,
@@ -396,6 +424,42 @@ export function applyRealtimeFrame(state: ChatV2ClientState, frame: ChatRealtime
     return { outcome: 'cursor_mismatch', state: markGapped(state, 'lineage_changed', 'Realtime scope does not match local state') };
   }
   return applySyncLike(state, frame);
+}
+
+export function applyMessageAdmission(
+  state: ChatV2ClientState, response: MessageAdmissionV2Response,
+): ChatV2ClientState {
+  const prior = state.admissionPlacements[response.client_message_id];
+  // Older completed requests can lack start metadata. Their owned terminal
+  // receipt still confirms processing, unlike an HTTP acceptance.
+  if (response.conversation_id !== state.conversationId
+    || (prior?.clientTxnId && prior.clientTxnId !== response.client_txn_id)
+    || (prior && (prior.placement !== 'timeline' && prior.placement !== 'queue'))
+    || (response.status !== 'failed' && response.status !== 'cancelled'
+      && response.status !== 'completed' && response.status !== 'absorbed')
+    || !Number.isSafeInteger(response.admission_order) || response.admission_order < 0
+    || canonicalUserClientMessageIds(state.timelineItems).has(response.client_message_id)) return state;
+  const item = state.localItems.find(item => item.kind === 'message' && item.role === 'user'
+    && item.client_message_id === response.client_message_id);
+  if (!item || item.stable !== false || (prior ? prior.status : item.status) !== 'complete'
+    || (response.status !== 'absorbed' && itemTurnIdOf(item) && itemTurnIdOf(item) !== response.turn_id)
+    || (item.kind === 'message' && item.client_txn_id && item.client_txn_id !== response.client_txn_id)) return state;
+  const processingOutcome = {
+    status: response.status, turnId: response.turn_id, admissionOrder: response.admission_order,
+    beforeClientMessageId: !response.started && response.before_client_message_id !== response.client_message_id
+      ? response.before_client_message_id : null,
+  };
+  return cacheClientState({
+    ...state,
+    admissionPlacements: {
+      ...state.admissionPlacements,
+      [response.client_message_id]: {
+        ...(prior ?? { placement: 'timeline', status: 'complete' }),
+        historyConfirmed: prior?.historyConfirmed === true || response.input_persisted === true,
+        clientTxnId: response.client_txn_id, processingOutcome,
+      },
+    },
+  }, getTimelineById(state));
 }
 
 export function applySendResponse(state: ChatV2ClientState, response: SendMessageV2Response): ChatV2ClientState {
@@ -981,6 +1045,16 @@ export function sortTimelineItems(items: TimelineItem[]): TimelineItem[] {
   return [...items].sort(compareTimelineItems);
 }
 
+/** Reconcile canonical identities before exposing snapshots or legacy cached history. */
+export function normalizeTimelineItems(items: readonly TimelineItem[]): TimelineItem[] {
+  const byId = new Map<string, TimelineItem>();
+  for (const item of items) {
+    const existing = byId.get(item.id);
+    byId.set(item.id, existing ? mergeTimelineItem(existing, item) : item);
+  }
+  return sortTimelineItems([...byId.values()]);
+}
+
 function sortedInsertionIndex(items: readonly TimelineItem[], item: TimelineItem): number {
   let low = 0;
   let high = items.length;
@@ -1067,14 +1141,17 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   // state.localItems is reconciled at transition sites; the visible derive
   // trusts it and only merges it into the already-sorted canonical array.
   for (const item of state.localItems) {
+    if (isCarriedAssistant(item) && canonicalIds.has(item.id)) continue;
     if (!keepRuntimeHistory(item)) continue;
     if (
       item.kind === 'message'
       && item.role === 'user'
       && item.client_message_id
       && (
-        (state.admissionPlacements[item.client_message_id]?.placement === 'queue' && !itemTurnIdOf(item))
+        (state.admissionPlacements[item.client_message_id]?.placement === 'queue' && !itemTurnIdOf(item)
+          && !state.admissionPlacements[item.client_message_id]?.processingOutcome)
         || canonicalClientMessageIds.has(item.client_message_id)
+        || (item.stable === false && isConfirmedUserEcho(state.admissionPlacements[item.client_message_id]))
       )
     ) {
       continue;
@@ -1083,12 +1160,16 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
   }
   for (const item of runtimeItems) {
     if (!keepRuntimeHistory(item)) continue;
+    // A persisted system notice is final; a sentinel fallback must not replace
+    // its exact canonical position or provenance after backfill.
+    if (item.kind === 'message' && item.role === 'system' && canonicalIds.has(item.id)) continue;
     if (isConfirmedLegacyAdmission(item, canonicalIds)) continue;
     if (item.kind === 'message' && item.role === 'user' && item.client_message_id) {
-      if (canonicalClientMessageIds.has(item.client_message_id)) continue;
+      if (canonicalClientMessageIds.has(item.client_message_id)
+        || (item.stable === false && isConfirmedUserEcho(state.admissionPlacements[item.client_message_id]))) continue;
       // Older controllers marked admitted input pending; only authoritative
       // runtime input, not a local send, proves server acknowledgement.
-      upsertVisibleTimelineItem(visible, visibleById, { ...item, status: 'complete' });
+      upsertVisibleTimelineItem(visible, visibleById, placeLocalHistory({ ...item, status: 'complete' }));
       continue;
     }
     if (
@@ -1103,7 +1184,7 @@ export function visibleTimelineItems(state: ChatV2ClientState): TimelineItem[] {
       continue;
     }
     if (visibleById.has(item.id) && isIncompleteApplyPatchPreparation(item)) continue;
-    upsertVisibleTimelineItem(visible, visibleById, item);
+    upsertVisibleTimelineItem(visible, visibleById, placeLocalHistory(item));
   }
   derived.visibleItems = visible;
   return visible;
@@ -1145,7 +1226,8 @@ export function visibleQueueMessages(state: ChatV2ClientState): QueueState {
     )
   );
   for (const [clientMessageId, admission] of Object.entries(state.admissionPlacements)) {
-    if (admission.placement !== 'queue' || canonicalTimelineClientIds.has(clientMessageId)) continue;
+    if (admission.placement !== 'queue' || admission.processingOutcome
+      || isConfirmedUserEcho(admission) || canonicalTimelineClientIds.has(clientMessageId)) continue;
     const localItem = localByClientId.get(clientMessageId);
     const existing = visibleByClientId.get(clientMessageId);
     const content = admission.content ?? localItem?.content ?? existing?.content;
@@ -1465,6 +1547,15 @@ function applyAuthoritativeRuntime(
   ) {
     return current;
   }
+  // Request and fence already match. Checkpoint-only frames can omit the
+  // immutable primary identity, but cannot transfer it to a different turn.
+  if (current.has_active_turn && incoming.has_active_turn
+    && current.active_turn?.primary_client_message_id && incoming.active_turn
+    && !incoming.active_turn.primary_client_message_id
+    && current.active_turn.turn_id === incoming.active_turn.turn_id) {
+    incoming = { ...incoming, active_turn: { ...incoming.active_turn,
+      primary_client_message_id: current.active_turn.primary_client_message_id } };
+  }
   if (!current.has_active_turn && incoming.has_active_turn) return current;
   if (current.has_active_turn && !incoming.has_active_turn) return incoming;
   if (
@@ -1584,6 +1675,9 @@ function reconcileLocalItems(localItems: TimelineItem[], canonicalItems: Timelin
       return false;
     }
     if (item.kind === 'message' && item.role === 'assistant' && item.message_id) {
+      // A later phase cannot prove that interrupted text was ever persisted.
+      // Exact canonical identity above is the only confirmation for a carry.
+      if (isCarriedAssistant(item)) return true;
       const maxPhase = canonicalAssistantMaxPhase.get(item.message_id);
       const localPhase =
         typeof item.assistant_phase_index === 'number' ? item.assistant_phase_index : 0;
@@ -1655,7 +1749,6 @@ function admissionClientMessageIdByQueueId(
 
 /** Sentinel band for carried (settled-but-unconfirmed) prior-turn items. */
 const CARRIED_PRE_TURN_LINEAGE_PREFIX = '9995:';
-const CARRIED_LINEAGE_PREFIX = '9996:';
 const PRE_TURN_LINEAGE_PREFIX = '9997:';
 const ACTIVE_LINEAGE_PREFIX = '9998:';
 

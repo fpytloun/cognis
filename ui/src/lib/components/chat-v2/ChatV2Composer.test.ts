@@ -27,6 +27,20 @@ describe('ChatV2Composer', () => {
     expect(screen.getByTestId('observed-input')).toHaveTextContent('["first edit","newer edit"]');
   });
 
+  it('focuses once per open request, waits until editable, and leaves ordinary web focus alone', async () => {
+    const { rerender } = render(ChatV2Composer, props());
+    const composer = screen.getByRole('textbox');
+    expect(composer).not.toHaveFocus();
+    await rerender(props({ focusRequest: 'open-one' }));
+    await waitFor(() => expect(composer).toHaveFocus());
+    composer.blur();
+    await rerender(props({ focusRequest: 'open-one', value: 'Still editing' }));
+    expect(composer).not.toHaveFocus();
+    await rerender(props({ focusRequest: 'open-two', disabled: true }));
+    expect(composer).not.toHaveFocus();
+    await rerender(props({ focusRequest: 'open-two', disabled: false }));
+    await waitFor(() => expect(composer).toHaveFocus());
+  });
   it('hides settings during an active turn and restores them when idle', async () => {
     const { rerender } = render(SettingsFixture, { active: false });
     expect(screen.getByRole('button', { name: 'Chat settings' })).toBeVisible();

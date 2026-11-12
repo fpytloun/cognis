@@ -4,9 +4,12 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import type { Agent, TaskControlChatResponse, TaskDetail } from '$lib/types/api';
 import { resetOverlayState } from '$lib/stores/overlays';
 import { taskAgentDock } from '$lib/stores/taskAgentDock.svelte';
+import { loginFixtureAccount } from '../../../test/verified-account';
+import { auth } from '$lib/stores/auth';
 
-const { controlChat, conversationDetail, conversationSidebar, markRead } = vi.hoisted(() => ({
+const { controlChat, existingControlChat, conversationDetail, conversationSidebar, markRead } = vi.hoisted(() => ({
   controlChat: vi.fn(),
+  existingControlChat: vi.fn(),
   conversationDetail: vi.fn(),
   conversationSidebar: vi.fn(),
   markRead: vi.fn(),
@@ -17,7 +20,7 @@ const { websocketListeners } = vi.hoisted(() => ({
 
 vi.mock('$lib/api/client', () => ({
   api: {
-    tasks: { controlChat },
+    tasks: { controlChat, existingControlChat },
     conversations: {
       detail: conversationDetail,
       sidebar: conversationSidebar,
@@ -52,6 +55,8 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
+  // Most scenarios use a task whose control chat already exists.
+  existingControlChat.mockImplementation((taskId: string) => controlChat(taskId));
   conversationDetail.mockImplementation(async (conversationId: string) => ({
     conversation_id: conversationId,
     has_active_turn: false,
@@ -66,6 +71,7 @@ beforeEach(() => {
   markRead.mockResolvedValue({ ok: true });
   websocketListeners.clear();
 });
+beforeEach(loginFixtureAccount);
 
 function task(taskId: string, title: string): TaskDetail {
   return {
@@ -98,6 +104,7 @@ function chat(taskId: string): TaskControlChatResponse {
 afterEach(() => {
   cleanup();
   controlChat.mockReset();
+  existingControlChat.mockReset();
   conversationDetail.mockReset();
   conversationSidebar.mockReset();
   markRead.mockReset();
@@ -106,12 +113,38 @@ afterEach(() => {
   document.body.classList.remove('task-agent-dock-modal');
   websocketListeners.clear();
 });
+afterEach(async () => { await auth.clear(); });
 
 function emit(event: Record<string, unknown>): void {
   for (const listener of websocketListeners) listener(event);
 }
 
 describe('TaskAgentDock', () => {
+  it('only looks up the control chat while the dock is closed and creates it when opened', async () => {
+    existingControlChat.mockResolvedValue(null);
+    controlChat.mockResolvedValue(chat('task-a'));
+    render(TaskAgentDock, { task: task('task-a', 'Task A'), agent, onGate: vi.fn(), onQuestion: vi.fn() });
+
+    await waitFor(() => expect(existingControlChat).toHaveBeenCalledWith('task-a'));
+    expect(controlChat).not.toHaveBeenCalled();
+
+    taskAgentDock.open();
+    await waitFor(() => expect(controlChat).toHaveBeenCalledWith('task-a'));
+  });
+
+  it('creates the control chat when the dock opens during the initial lookup', async () => {
+    let finishLookup: (value: TaskControlChatResponse | null) => void = () => {};
+    existingControlChat.mockReturnValue(new Promise((resolve) => { finishLookup = resolve; }));
+    controlChat.mockResolvedValue(chat('task-a'));
+    render(TaskAgentDock, { task: task('task-a', 'Task A'), agent, onGate: vi.fn(), onQuestion: vi.fn() });
+    await waitFor(() => expect(existingControlChat).toHaveBeenCalledWith('task-a'));
+
+    taskAgentDock.open();
+    finishLookup(null);
+
+    await waitFor(() => expect(controlChat).toHaveBeenCalledWith('task-a'));
+  });
+
   it('generation-scopes chat loading across a delayed task rebind and renders only the new task', async () => {
     let resolveA: (value: TaskControlChatResponse) => void = () => {};
     const delayedA = new Promise<TaskControlChatResponse>((resolve) => { resolveA = resolve; });

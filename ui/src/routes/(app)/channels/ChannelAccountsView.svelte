@@ -15,6 +15,14 @@
   export let onEdit: (account: ChannelAccount) => void;
   export let onToggle: (account: ChannelAccount) => void;
   export let onDelete: (account: ChannelAccount) => void;
+
+  $: groups = [...new Set(accounts.map((account) => account.channel_type))]
+    .sort((a, b) => (metas[a]?.label ?? a).localeCompare(metas[b]?.label ?? b))
+    .map((type) => ({
+      type,
+      label: type === 'web' ? 'Cognis' : metas[type]?.label ?? type,
+      accounts: accounts.filter((account) => account.channel_type === type),
+    }));
 </script>
 
 <div class="space-y-4">
@@ -32,7 +40,11 @@
     </Card>
   {/if}
 
-  {#each accounts as account (account.account_id)}
+  {#each groups as group (group.type)}
+    <section class="space-y-3" aria-label={`${group.label} channels`}>
+      <h3 class="pt-3 text-base font-semibold text-strong">{group.label} <span class="font-normal text-muted">({group.accounts.length})</span></h3>
+      <div class="grid gap-3 xl:grid-cols-2">
+      {#each group.accounts as account (account.account_id)}
     <ChannelAccountCard
       {account}
       meta={metas[account.channel_type] ?? null}
@@ -44,5 +56,8 @@
       onToggle={() => onToggle(account)}
       onDelete={() => onDelete(account)}
     />
+      {/each}
+      </div>
+    </section>
   {/each}
 </div>

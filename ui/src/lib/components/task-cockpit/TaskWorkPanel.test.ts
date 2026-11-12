@@ -8,7 +8,7 @@ import type {
   WorkProjectionResponse,
 } from '$lib/chat-v2/types';
 import { conversationTimelineScope } from '$lib/chat-v2/types';
-import type { StepRun } from '$lib/types/api';
+import type { StepRun, TaskOutputPresentation } from '$lib/types/api';
 import TaskWorkPanel from './TaskWorkPanel.svelte';
 import {
   clearActivityOverview,
@@ -20,8 +20,9 @@ import {
   invalidateWorkFromSocket,
   invalidateWorkScope,
 } from '$lib/work/workViewState';
-// Lazily imported by the component under test; load it during collection.
-import '$lib/components/rich/RichDeliverable.svelte';
+// Activity lifecycle assertions run with its module ready. Cold result
+// rendering is qualified separately while activity loading is blocked.
+import './TaskWorkPanelBody.svelte';
 
 afterEach(cleanup);
 beforeEach(() => {
@@ -87,6 +88,79 @@ function activityOverview(changedFiles: number): ActivityOverviewResponse {
 }
 
 describe('TaskWorkPanel', () => {
+  it('collapses stale output once, preserves manual expansion, and presents a written replacement', async () => {
+    const document = {
+      deliverable_id: 'deliverable-1', step_run_id: 'run-1', version: 1, attempt_number: 1,
+      format: 'markdown', title: 'Revision report', content: 'Previous output body.',
+      target: 'none', outputs: {}, status: 'ready', evaluator_feedback: null,
+      created_at: null, updated_at: null,
+    };
+    const output: TaskOutputPresentation = {
+      deliverable_id: document.deliverable_id, step_run_id: document.step_run_id,
+      format: document.format, title: document.title,
+      freshness: { state: 'current', replacement_status: null, label: 'Current output' },
+    };
+    const props = {
+      stepRuns: [run], finalDeliverable: document, outputPresentation: output,
+      view: 'deliverable' as const, deliverableCollapsedByDefault: false,
+    };
+    const { rerender } = render(TaskWorkPanel, props);
+    expect(await screen.findByText('Previous output body.')).toBeVisible();
+    const stale: TaskOutputPresentation = { ...output, freshness: {
+      state: 'stale', replacement_status: 'running',
+      label: 'Stale — revision 1, new revision in progress',
+    } };
+    await rerender({ ...props, outputPresentation: stale });
+    expect(await screen.findByText('Stale — revision 1, new revision in progress')).toBeVisible();
+    expect(screen.queryByText('Previous output body.')).toBeNull();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Expand document' }));
+    expect(await screen.findByText('Previous output body.')).toBeVisible();
+    await rerender({ ...props, outputPresentation: {
+      ...stale, freshness: { state: 'stale', replacement_status: 'paused', label: 'Stale — revision 1, revision paused' },
+    } });
+    expect(await screen.findByText('Stale — revision 1, revision paused')).toBeVisible();
+    expect(screen.getByText('Previous output body.')).toBeVisible();
+    await rerender({
+      ...props,
+      finalDeliverable: { ...document, deliverable_id: 'deliverable-2', content: 'New output body.' },
+      outputPresentation: { ...output, deliverable_id: 'deliverable-2' },
+    });
+    expect(await screen.findByText('New output body.')).toBeVisible();
+    expect(screen.queryByText('Previous output body.')).toBeNull();
+    expect(screen.queryByText(/Stale — revision/)).toBeNull();
+  });
+
+  it('uses the backend selection and leaves unknown ownership unselected', async () => {
+    const loadWork = vi.fn();
+    const loadDeliverableForStepRun = vi.fn().mockResolvedValue({
+      deliverable_id: 'previous-output', step_run_id: 'run-1', version: 1, attempt_number: 1,
+      format: 'markdown', title: 'Previous output', content: 'Retained output content.',
+      target: 'none', outputs: {}, status: 'rejected', evaluator_feedback: null,
+      created_at: null, updated_at: null,
+    });
+    const props = {
+      stepRuns: [run], view: 'deliverable' as const, deliverableCollapsedByDefault: false,
+      loadWork, loadDeliverableForStepRun,
+      outputPresentation: {
+        deliverable_id: 'previous-output', step_run_id: 'run-1', format: 'markdown', title: 'Previous output',
+        freshness: { state: 'stale' as const, replacement_status: 'failed', label: 'Stale — revision 1, revision failed' },
+      },
+    };
+    const { rerender } = render(TaskWorkPanel, props);
+    expect(await screen.findByText('Stale — revision 1, revision failed')).toBeVisible();
+    expect(screen.queryByText('Retained output content.')).toBeNull();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Expand document' }));
+    expect(await screen.findByText('Retained output content.')).toBeVisible();
+    await rerender({ ...props, outputPresentation: {
+      ...props.outputPresentation,
+      freshness: { state: 'stale', replacement_status: 'cancelled', label: 'Stale — revision 1, revision cancelled' },
+    } });
+    expect(await screen.findByText('Stale — revision 1, revision cancelled')).toBeVisible();
+    expect(screen.getByText('Retained output content.')).toBeVisible();
+    await rerender({ ...props, outputPresentation: { deliverable_id: null, step_run_id: null, freshness: null, format: 'markdown', title: null } });
+    await waitFor(() => expect(screen.queryByTestId('task-final-result')).toBeNull());
+  });
+
   it('includes the task identity in every task-step Work scope', async () => {
     const loadWork = vi.fn().mockResolvedValue(projection(4));
     const loadOverview = vi.fn().mockResolvedValue(activityOverview(4));
@@ -365,12 +439,36 @@ describe('TaskWorkPanel', () => {
 
     await waitFor(() => expect(loadDeliverableForStepRun).toHaveBeenCalledWith('run-1', 'deliverable-1'));
     await screen.findByTestId('rich-deliverable');
-    expect(screen.getByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
+    expect(await screen.findByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByRole('button', { name: 'Explore' })).toBeNull();
     expect(loadOverview).not.toHaveBeenCalled();
     expect(screen.queryByText('Loaded through the step.')).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
     expect(await screen.findByText('Loaded through the step.')).toBeInTheDocument();
+  });
+
+  it('renders a task-detail result without waiting for work or document reads', async () => {
+    const loadWork = vi.fn();
+    const loadOverview = vi.fn();
+    const loadDeliverableForStepRun = vi.fn();
+    render(TaskWorkPanel, {
+      stepRuns: [run],
+      canonicalDeliverableId: 'deliverable-1',
+      finalDeliverable: {
+        deliverable_id: 'deliverable-1', step_run_id: 'run-1',
+        version: 1, attempt_number: 1, format: 'markdown',
+        title: 'Immediate result', content: '# Immediate result\n\nReady with task detail.',
+        target: 'none', outputs: {}, status: 'approved', evaluator_feedback: null,
+        created_at: null, updated_at: null,
+      },
+      loadWork, loadOverview, loadDeliverableForStepRun,
+      view: 'deliverable', deliverableCollapsedByDefault: false,
+    });
+    expect(screen.queryByText('Loading deliverable…')).toBeNull();
+    await screen.findByText('Ready with task detail.');
+    expect(loadWork).not.toHaveBeenCalled();
+    expect(loadOverview).not.toHaveBeenCalled();
+    expect(loadDeliverableForStepRun).not.toHaveBeenCalled();
   });
 
   it('auto-expands the canonical deliverable only when explicitly requested', async () => {

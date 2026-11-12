@@ -11,7 +11,7 @@ vi.mock('$lib/api/client', () => ({ api: { agents: { listAll: mocks.list } } }))
 vi.mock('$lib/ws/client', () => ({ wsState: { subscribe: (...args: Parameters<typeof socket.subscribe>) => socket.subscribe(...args) }, wsClient: { subscribe(callback: typeof mocks.event) {
   mocks.event = callback; return () => { mocks.event = null; };
 } } }));
-import { installAgentCatalogue, nativeAgents } from './catalogue';
+import { installAgentCatalogue, nativeAgents, nativeAgentsReady } from './catalogue';
 
 let stop: (() => void) | undefined;
 const user = (email: string) => state.set({ status: 'authenticated', initialized: true,
@@ -28,7 +28,9 @@ describe('resident agent catalogue', () => {
     stop = installAgentCatalogue();
     expect(mocks.list).not.toHaveBeenCalled();
     user('catalogue@fixture.invalid');
+    expect(get(nativeAgentsReady)).toBe(false);
     await vi.waitFor(() => expect(get(nativeAgents)).toHaveLength(75));
+    expect(get(nativeAgentsReady)).toBe(true);
     expect(mocks.list).toHaveBeenCalledWith({ include_hidden: true });
     mocks.list.mockResolvedValue(agents.slice(1));
     mocks.event?.({ type: 'scope_invalidated', reason: 'sidebar_changed', revision: 'changed' });
@@ -41,8 +43,10 @@ describe('resident agent catalogue', () => {
     state.set({ status: 'anonymous', initialized: true, user: null, expiresAt: null, error: null });
     finish([{ agent_id: 'old_agent' } as Agent]); await Promise.resolve();
     expect(get(nativeAgents)).toEqual([]);
+    expect(get(nativeAgentsReady)).toBe(false);
     mocks.list.mockResolvedValue([{ agent_id: 'new_agent' } as Agent]);
     user('next@fixture.invalid');
     await vi.waitFor(() => expect(get(nativeAgents)[0]?.agent_id).toBe('new_agent'));
+    expect(get(nativeAgentsReady)).toBe(true);
   });
 });

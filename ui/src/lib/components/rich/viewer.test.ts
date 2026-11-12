@@ -35,7 +35,7 @@ describe('viewer chrome', () => {
     const root = screen.getByTestId('rich-deliverable');
     await waitFor(() => expect(root).toHaveAttribute('data-viewer-theme', 'dark'));
     expect(root).toHaveAttribute('data-theme-family', 'paper');
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
     const full = document.querySelector('.rich-full');
     expect(full).toHaveAttribute('data-viewer-theme', 'dark');
     expect(screen.queryByRole('button', { name: /^Theme:/ })).toBeNull();
@@ -66,8 +66,10 @@ describe('viewer chrome', () => {
   });
   it('uses trusted SVG controls in reference order and exposes selection', async () => {
     const { container } = render(RichViewerChrome, { title: 'Report', onCopy: vi.fn(), pdfUrl: '/report.pdf', htmlUrl: '/report.html', markdownUrl: '/report.md' });
-    expect(Array.from(container.querySelectorAll('[data-viewer-icon]')).map(el => el.getAttribute('data-viewer-icon')))
-      .toEqual(['system', 'download', 'copy']);
+    await screen.findByTitle('Download document');
+    expect(Array.from(container.querySelectorAll('nav[aria-label="Viewer controls"] button, nav[aria-label="Viewer controls"] summary')).map(el => el.getAttribute('aria-label')))
+      .toEqual(['Theme: system. Switch to light theme', 'Download document', 'Copy document']);
+    expect(screen.getByTitle('Download document').querySelector('svg')).toHaveClass('lucide-download');
     expect(container.querySelector('select')).toBeNull();
     const theme = container.querySelector('.theme-control') as HTMLButtonElement;
     expect(theme).toHaveAttribute('data-theme-mode', 'system');

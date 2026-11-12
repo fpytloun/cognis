@@ -43,6 +43,17 @@ export function childViewWorkstream(nodes: WorkstreamRef[], view: ChildView | nu
   return nodes.find((node) => node.key === view.nodeKey) ?? workstreamForSession(nodes, view.sessionId);
 }
 
+export async function resolveChildWorkstreamIdentity(
+  node: WorkstreamRef,
+  loadIdentity: (sessionId: string) => Promise<WorkstreamRef | null>,
+): Promise<WorkstreamRef | null> {
+  if (node.conversation_id) return node;
+  const identity = await loadIdentity(node.session_id);
+  if (!identity?.conversation_id || identity.session_id !== node.session_id) return null;
+  // Keep navigation topology while replacing guessed ownership and presentation.
+  return { ...node, ...identity, key: node.key, root_key: node.root_key, parent_key: node.parent_key };
+}
+
 export function fallbackWorkstream(
   sessionId: string,
   controllerRootId: string,

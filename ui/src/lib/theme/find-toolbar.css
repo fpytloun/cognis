@@ -1,0 +1,25 @@
+/* Find replaces controls in their existing row, never the reading viewport. */
+[data-find-toolbar][data-find-open] {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+[data-find-toolbar][data-find-open] [data-find-actions] {
+  display: none;
+}
+[data-find-toolbar][data-find-open] > [data-find-bar] {
+  flex-shrink: 1;
+}
+[data-find-toolbar][data-find-open] > :not(button):not(nav):not([data-find-bar]) {
+  min-width: 0;
+  flex: 1;
+}
+@media (max-width: 639px) {
+  [data-find-toolbar][data-find-open] > :not([data-find-bar]) {
+    display: none;
+  }
+  [data-find-toolbar][data-find-open] > [data-find-bar] {
+    flex: 1;
+  }
+}

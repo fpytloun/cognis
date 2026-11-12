@@ -120,6 +120,86 @@ const SEPARATE_ASSISTANT_MESSAGES_PREFERENCES = {
 };
 
 describe('prepareTimelineRows', () => {
+  it('nests contiguous linked tool calls under the python execution without changing call ids', () => {
+    const parent = tool('tool:program', 'python_execute', {
+      call_id: 'program-call',
+      arguments: { description: 'Read a report', code: 'print(1)' },
+      program_id: 'program-id',
+      kernel_generation: 2
+    });
+    const child = tool('tool:child', 'read', {
+      call_id: 'child-call',
+      parent_call_id: 'program-call',
+      program_id: 'program-id',
+      kernel_generation: 2
+    });
+
+    const rows = prepareTimelineRows([parent, child], DEFAULT_USER_PREFERENCES);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kind: 'tool_group', summary: { kind: 'code', label: 'Running code…' },
+      items: [{ id: parent.id, call_id: parent.call_id, program_children: [child] }]
+    });
+  });
+
+  it('keeps Python code separate from shell commands with stable live and terminal grouping', () => {
+    const shell = tool('shell-call', 'bash');
+    const python = tool('python-call', 'python_execute', { status: 'running' });
+    const followingShell = tool('following-shell', 'bash');
+    const live = prepareTimelineRows([shell, python, followingShell], DEFAULT_USER_PREFERENCES);
+    const terminal = prepareTimelineRows([
+      shell, { ...python, status: 'complete', result_preview: '{"protocol_version":"cognis.program.v1"}' }, followingShell
+    ], DEFAULT_USER_PREFERENCES);
+    expect(rowShape(live)).toEqual(rowShape(terminal));
+    expect(live.map(row => row.kind === 'tool_group' ? row.summary.kind : row.kind))
+      .toEqual(['command', 'code', 'command']);
+    expect(live[1]).toMatchObject({ defaultExpanded: true });
+    expect(terminal[1]).toMatchObject({ defaultExpanded: false });
+  });
+
+  it('keeps interleaved unrelated events and later children at their canonical positions', () => {
+    const parent = tool('tool:program', 'python_execute', {
+      call_id: 'program-call',
+      arguments: { description: 'Read a report', code: 'print(1)' }
+    });
+    const firstChild = tool('tool:first-child', 'read', {
+      call_id: 'first-child',
+      parent_call_id: 'program-call'
+    });
+    const interleaved = message('message:interleaved', {
+      content: 'Unrelated event',
+      sort_key: 'middle'
+    });
+    const laterChild = tool('tool:later-child', 'grep', {
+      call_id: 'later-child',
+      parent_call_id: 'program-call'
+    });
+
+    const rows = prepareTimelineRows(
+      [parent, firstChild, interleaved, laterChild],
+      { ...DEFAULT_USER_PREFERENCES, chat: { ...DEFAULT_USER_PREFERENCES.chat, group_tool_calls: false } }
+    );
+
+    expect(rows.map((row) => row.kind)).toEqual(['item', 'item', 'item']);
+    if (rows[0].kind !== 'item' || rows[0].item.kind !== 'tool_call') return;
+    expect(rows[0].item.program_children).toEqual([firstChild]);
+    expect(rows[1]).toMatchObject({ kind: 'item', item: interleaved });
+    expect(rows[2]).toMatchObject({ kind: 'item', item: laterChild });
+  });
+
+  it('leaves linked calls visible when their parent is outside a partial history window', () => {
+    const child = tool('tool:orphan-child', 'read', {
+      call_id: 'orphan-child',
+      parent_call_id: 'program-outside-window'
+    });
+
+    const rows = prepareTimelineRows([child], DEFAULT_USER_PREFERENCES);
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ kind: 'tool_group', items: [child] });
+  });
+
   it('keeps same-target managed conversation activity together through typed recovery', () => {
     const rows = prepareTimelineRows([
       tool('before', 'agent_conversation_wait', {

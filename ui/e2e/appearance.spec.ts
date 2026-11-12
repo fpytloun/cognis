@@ -13,8 +13,7 @@ for (const mode of ['light', 'dark']) {
     await page.getByRole('combobox', { name: /^Appearance\b/ }).selectOption(mode);
     await page.goto('/chat/conv-task-chat');
     await page.getByRole('button', { name: 'Open conversations', exact: true }).click();
-    const overlay = page.getByRole('button', { name: 'Close conversation list', exact: true })
-      .and(page.locator('[data-edge-swipe-surface="true"]'));
+    const overlay = page.getByRole('button', { name: 'Close conversation list', exact: true });
     await expect(overlay).toBeVisible();
     await expect(overlay).toHaveCSS('background-color', mode === 'dark' ? 'rgba(20, 19, 18, 0.8)' : 'rgba(32, 32, 31, 0.8)');
     await expect(page.getByRole('dialog', { name: 'Conversation list' })).toBeVisible();
@@ -142,7 +141,7 @@ for (const width of [1440, 390]) {
           await expect.poll(() => root.evaluate((node) =>
             getComputedStyle(node).getPropertyValue('--color-canvas').trim())).toBe('251 241 199');
         }
-        // Classic uses its restored palette, not the generic fallback roles.
+        // Classic is the accepted pre-family semantic palette, not a recoloring.
         if (family === 'classic') {
           const roles = await root.evaluate((node) => {
             const css = getComputedStyle(node);
@@ -150,8 +149,8 @@ for (const width of [1440, 390]) {
               css.getPropertyValue(`--color-${role}`).trim());
           });
           expect(roles).toEqual(mode === 'light'
-            ? ['248 250 252', '255 255 255', '15 23 42', '3 111 159']
-            : ['2 6 23', '15 23 42', '226 232 240', '14 165 233']);
+            ? ['244 247 249', '255 255 255', '20 40 50', '3 111 159']
+            : ['2 6 23', '15 23 42', '241 245 249', '56 189 248']);
         }
         await page.goto('/');
         const search = page.getByRole('textbox', { name: 'Search tasks and conversations' });
@@ -265,8 +264,7 @@ test('family changes preserve a live task chat draft and mounted message nodes',
 });
 
 async function textContrast(locator: Locator, minimum = 4.5, property = 'color') {
-  // Theme attributes update before finite foreground/background transitions settle.
-  await expect.poll(() => locator.evaluate((node, colorProperty) => {
+  const ratio = await locator.evaluate((node, colorProperty) => {
     const rgba = (value: string) => {
       const parts = value.match(/[\d.]+/g)?.map(Number) ?? [];
       return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0, parts[3] ?? 1];
@@ -289,15 +287,16 @@ async function textContrast(locator: Locator, minimum = 4.5, property = 'color')
     const a = luminance(foreground);
     const b = luminance(background);
     return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
-  }, property)).toBeGreaterThanOrEqual(minimum);
+  }, property);
+  expect(ratio).toBeGreaterThanOrEqual(minimum);
 }
 
 test('tool output stays legible in each family and mode through real account refresh', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   const fixture = await installAppearanceFixture(page);
   await page.goto(`/tasks/${TASK_ID}`);
-  await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Output' }).click();
-  const output = page.getByRole('dialog', { name: 'Step output: fetch', exact: true });
+  await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Result' }).click();
+  const output = page.getByRole('dialog', { name: 'Step: fetch', exact: true });
   await expect(output).toContainText('Fetched release evidence');
   const settings = await page.context().newPage();
   const settingsFixture = await installAppearanceFixture(settings);
@@ -315,7 +314,7 @@ test('tool output stays legible in each family and mode through real account ref
       // A task foreground refresh may close the output overlay. Reopen it
       // through its real action before checking rendered output colors.
       if (!await output.isVisible()) {
-        await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Output' }).click();
+        await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Result' }).click();
       }
       await expect(output).toBeVisible();
       await textContrast(output.getByRole('heading').first());

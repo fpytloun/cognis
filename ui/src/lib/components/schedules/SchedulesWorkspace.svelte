@@ -5,11 +5,14 @@
   import { onMount, onDestroy, untrack } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
+  import { COMPLETION_MODE_OPTIONS, completionModeLabel } from '$lib/task-delivery';
+  import type { CompletionModeFamily } from '$lib/types/api';
   import {
     buildWorkflowSourceOptions,
     decodeWorkflowSourceValue
   } from '$lib/workflow-sources';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
+  import TaskFinishInstructions from '$lib/components/tasks/TaskFinishInstructions.svelte';
   import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
@@ -19,9 +22,11 @@
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText } from '$lib/session-policy';
-  import { matchesScheduleFilters, type ScheduleVisibilityFilter } from '$lib/schedules';
+  import { confirmScheduleRunNow, matchesScheduleFilters, type ScheduleVisibilityFilter } from '$lib/schedules';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, Conversation, Project, Schedule, Skill, Workflow } from '$lib/types/api';
@@ -46,7 +51,10 @@ import Zap from 'lucide-svelte/icons/zap';
     canMutate?: boolean;
   }>();
   let alive = true;
-  onDestroy(() => { alive = false; });
+  onDestroy(() => {
+    alive = false;
+    if (urlSyncTimer !== null) window.clearTimeout(urlSyncTimer);
+  });
 
   let loading = $state(true);
   let error = $state('');
@@ -121,8 +129,9 @@ import Zap from 'lucide-svelte/icons/zap';
     expected_output: '',
     delivery_mode: 'preferred_channel',
     delivery_target: '',
-    completion_mode_family: 'default' as 'default' | 'direct',
+    completion_mode_family: 'auto' as CompletionModeFamily,
     allow_silent_completion: false,
+    on_finish_instructions: '',
     interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
     allow_policy_text: '',
     intaris_evaluation: '' as '' | 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy',
@@ -139,18 +148,6 @@ import Zap from 'lucide-svelte/icons/zap';
     cron: 'Cron',
     interval: 'Interval',
     one_shot: 'One-shot'
-  };
-
-  const statusColors: Record<string, string> = {
-    success: 'bg-success-subtle text-success',
-    completed: 'bg-success-subtle text-success',
-    failed: 'bg-danger-subtle text-danger',
-    skipped: 'bg-accent-subtle text-accent',
-    running: 'bg-accent-subtle text-accent',
-    paused: 'bg-cyan-subtle text-cyan-tone',
-    queued: 'bg-muted/20 text-muted',
-    ready: 'bg-cyan-subtle text-cyan-tone',
-    cancelled: 'bg-muted/20 text-muted'
   };
 
   let filtered = $derived(
@@ -174,10 +171,8 @@ import Zap from 'lucide-svelte/icons/zap';
   let lastLoadedProjectId: string | null = null;
 
   function hydrateProjectFilterFromUrl(): void {
-    const next = projectId ?? $page.url.searchParams.get('project_id') ?? $page.url.searchParams.get('project') ?? '';
-    if (next !== filterProjectId) {
-      filterProjectId = next;
-    }
+    // Track only navigation inputs, not the selection this effect hydrates.
+    filterProjectId = projectId ?? $page.url.searchParams.get('project_id') ?? $page.url.searchParams.get('project') ?? '';
   }
 
   function scheduleFilterUrlSync(): void {
@@ -340,6 +335,7 @@ import Zap from 'lucide-svelte/icons/zap';
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
+        on_finish_instructions: form.completion_mode_family !== 'direct' ? form.on_finish_instructions.trim() || null : null,
         interaction_mode_override: form.interaction_mode_override
       });
       addToast('Schedule created', 'success');
@@ -372,8 +368,9 @@ import Zap from 'lucide-svelte/icons/zap';
       expected_output: '',
       delivery_mode: 'preferred_channel',
       delivery_target: '',
-      completion_mode_family: 'default',
+      completion_mode_family: 'auto',
       allow_silent_completion: false,
+      on_finish_instructions: '',
       interaction_mode_override: 'none',
       allow_policy_text: '',
       intaris_evaluation: '',
@@ -424,14 +421,12 @@ import Zap from 'lucide-svelte/icons/zap';
 
   async function triggerNow(schedule: Schedule): Promise<void> {
     if (!canMutate || !alive) return;
+    if (!(await confirmScheduleRunNow(schedule.name)) || !alive) return;
     try {
       const result = await api.schedules.trigger(schedule.schedule_id);
-      addToast(`${schedule.name} triggered`, 'success');
+      // Stay on the list; the new task is one click away.
+      addToast('', 'success', 6000, `${schedule.name} started`, result.task_id ? { label: 'Open task', href: `/tasks/${result.task_id}` } : null);
       if (!alive) return;
-      if (result.task_id) {
-        onOpenTask(result.task_id);
-        return;
-      }
       await loadData();
     } catch (e) {
       addToast(asApiError(e).message, 'error');
@@ -473,10 +468,10 @@ import Zap from 'lucide-svelte/icons/zap';
     const d = new Date(iso);
     const now = new Date();
     const diffMs = d.getTime() - now.getTime();
-    if (diffMs < 0) return 'Overdue';
-    if (diffMs < 60_000) return 'Less than a minute';
-    if (diffMs < 3_600_000) return `${Math.round(diffMs / 60_000)}m`;
-    if (diffMs < 86_400_000) return `${Math.round(diffMs / 3_600_000)}h`;
+    if (diffMs < 0) return 'overdue';
+    if (diffMs < 60_000) return 'in less than a minute';
+    if (diffMs < 3_600_000) return `in ${Math.round(diffMs / 60_000)}m`;
+    if (diffMs < 86_400_000) return `in ${Math.round(diffMs / 3_600_000)}h`;
     return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
   }
 
@@ -582,6 +577,7 @@ import Zap from 'lucide-svelte/icons/zap';
       </select>
       <select
         bind:value={filterProjectId}
+        aria-label="Project filter"
         disabled={Boolean(projectId)}
         class="rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
       >
@@ -628,8 +624,8 @@ import Zap from 'lucide-svelte/icons/zap';
                     {#if schedule.is_expired}
                       <Badge class="bg-warning-subtle text-warning">Expired</Badge>
                     {/if}
-                    {#if schedule.completion_mode_family === 'direct'}
-                      <Badge class="bg-cyan-subtle text-cyan-tone">Direct delivery</Badge>
+                    {#if schedule.completion_mode_family !== 'auto'}
+                      <Badge class="bg-cyan-subtle text-cyan-tone">{completionModeLabel(schedule.completion_mode_family)} delivery</Badge>
                     {/if}
                     {#if schedule.allow_silent_completion}
                       <Badge class="bg-cyan-subtle text-cyan-tone">Silent allowed</Badge>
@@ -658,53 +654,43 @@ import Zap from 'lucide-svelte/icons/zap';
               <div class="flex shrink-0 flex-col gap-3 sm:items-end">
                 <div class="text-xs text-quiet sm:text-right">
                   {#if schedule.last_run_status}
-                    <span class={`inline-block rounded-full px-2 py-0.5 text-xs ${statusColors[schedule.last_run_status] ?? 'bg-inset/50 text-muted'}`}>
-                      {schedule.last_run_status}
-                    </span>
+                    <div class="inline-flex flex-wrap items-center gap-1.5" data-testid={`schedule-last-run-${schedule.schedule_id}`}>
+                      <span>Last run</span>
+                      <StatusBadge status={schedule.last_run_status === 'success' ? 'completed' : schedule.last_run_status} />
+                      {#if schedule.last_fired_at}<span title={formatAbsoluteTime(schedule.last_fired_at)}>{formatRelativeTime(schedule.last_fired_at)}</span>{/if}
+                    </div>
                   {/if}
                   {#if schedule.is_expired}
                     <div class="mt-1">Expired</div>
                   {:else if !schedule.next_fire_at && schedule.expiration_grace_until}
                     <div class="mt-1">Visible until: {formatDateTime(schedule.expiration_grace_until)}</div>
                   {:else if schedule.next_fire_at && schedule.enabled}
-                    <div class="mt-1">Next: {formatNextFire(schedule.next_fire_at)}</div>
+                    <div class="mt-1" title={formatAbsoluteTime(schedule.next_fire_at)}>Next run {formatNextFire(schedule.next_fire_at)}</div>
                   {/if}
                 </div>
 
                 <!-- Quick actions stay in normal flow so they cannot overlap
                      the status badges or next-run summary. -->
-                  {#if canMutate}<div class="flex gap-1 opacity-100 transition-opacity lg:opacity-60 lg:group-hover:opacity-100">
-                  <Tooltip text={schedule.enabled ? 'Disable' : 'Enable'}>
+                  {#if canMutate}<div class="flex flex-wrap gap-1">
                     <button
-                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-secondary hover:bg-raised hover:text-strong md:h-8 md:w-8"
-                      aria-label={schedule.enabled ? 'Disable schedule' : 'Enable schedule'}
+                      class="inline-flex min-h-8 items-center gap-1.5 rounded-xl px-2.5 text-xs text-secondary hover:bg-raised hover:text-strong"
                       onclick={(e: MouseEvent) => { e.stopPropagation(); toggleEnabled(schedule); }}
                     >
-                      {#if schedule.enabled}
-                        <Pause class="h-4 w-4" />
-                      {:else}
-                        <Play class="h-4 w-4" />
-                      {/if}
+                      {#if schedule.enabled}<Pause class="h-3.5 w-3.5" />Disable{:else}<Play class="h-3.5 w-3.5" />Enable{/if}
                     </button>
-                  </Tooltip>
-                  <Tooltip text="Trigger now">
                     <button
-                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-secondary hover:bg-raised hover:text-strong md:h-8 md:w-8"
-                      aria-label="Trigger schedule now"
+                      class="inline-flex min-h-8 items-center gap-1.5 rounded-xl px-2.5 text-xs text-secondary hover:bg-raised hover:text-strong"
                       onclick={(e: MouseEvent) => { e.stopPropagation(); triggerNow(schedule); }}
                     >
-                      <Zap class="h-4 w-4" />
+                      <Zap class="h-3.5 w-3.5" />Run now
                     </button>
-                  </Tooltip>
-                  <Tooltip text="Delete">
                     <button
-                      class="inline-flex h-10 w-10 items-center justify-center rounded-xl text-secondary hover:bg-danger-subtle hover:text-danger md:h-8 md:w-8"
-                      aria-label="Delete schedule"
+                      class="inline-flex min-h-8 items-center gap-1.5 rounded-xl px-2.5 text-xs text-secondary hover:bg-danger-subtle hover:text-danger"
+                      aria-label={`Delete ${schedule.name}`}
                       onclick={(e: MouseEvent) => { e.stopPropagation(); deleteSchedule(schedule); }}
                     >
-                      <Trash2 class="h-4 w-4" />
+                      <Trash2 class="h-3.5 w-3.5" />Delete
                     </button>
-                  </Tooltip>
                   </div>{/if}
               </div>
             </div>
@@ -734,13 +720,13 @@ import Zap from 'lucide-svelte/icons/zap';
       <div class="space-y-4">
         <!-- Name -->
         <div class="space-y-1">
-          <label for="sched-name" class="text-xs font-medium uppercase tracking-widest text-muted">Name</label>
+          <label for="sched-name" class="text-sm font-medium text-foreground">Name</label>
           <Input id="sched-name" bind:value={form.name} placeholder="e.g. Daily review, Email check" />
         </div>
 
         <!-- Description -->
         <div class="space-y-1">
-          <label for="sched-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Description</label>
+          <label for="sched-desc" class="text-sm font-medium text-foreground">Description</label>
           <textarea
             id="sched-desc"
             bind:value={form.description}
@@ -751,7 +737,7 @@ import Zap from 'lucide-svelte/icons/zap';
 
         <!-- Schedule type -->
         <div class="space-y-1">
-          <p class="text-xs font-medium uppercase tracking-widest text-muted">Schedule type</p>
+          <p class="text-sm font-medium text-foreground">Schedule type</p>
           <div class="flex gap-2">
             {#each [['cron', 'Cron'], ['interval', 'Interval'], ['one_shot', 'One-shot']] as [value, label]}
               <button
@@ -767,7 +753,7 @@ import Zap from 'lucide-svelte/icons/zap';
         <!-- Type-specific fields -->
         {#if form.schedule_type === 'cron'}
           <div class="space-y-1">
-            <label for="sched-cron" class="text-xs font-medium uppercase tracking-widest text-muted">Cron expression</label>
+            <label for="sched-cron" class="text-sm font-medium text-foreground">Cron expression</label>
             <Input id="sched-cron" bind:value={form.cron_expr} placeholder="0 9 * * *" />
             <div class="flex flex-wrap gap-2 pt-1">
               {#each cronPresets as preset}
@@ -782,7 +768,7 @@ import Zap from 'lucide-svelte/icons/zap';
             </div>
           </div>
           <div class="space-y-1">
-            <label for="sched-tz" class="text-xs font-medium uppercase tracking-widest text-muted">Timezone</label>
+            <label for="sched-tz" class="text-sm font-medium text-foreground">Timezone</label>
             <select id="sched-tz" bind:value={form.timezone} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               {#each timezoneOptions as tz}
                 <option value={tz}>{tz}{tz === localTimezone ? ' (local)' : ''}</option>
@@ -791,7 +777,7 @@ import Zap from 'lucide-svelte/icons/zap';
           </div>
         {:else if form.schedule_type === 'interval'}
           <div class="space-y-1">
-            <p class="text-xs font-medium uppercase tracking-widest text-muted">Interval</p>
+            <p class="text-sm font-medium text-foreground">Interval</p>
             <div class="flex flex-wrap gap-2">
               {#each intervalPresets as preset}
                 <button
@@ -807,7 +793,7 @@ import Zap from 'lucide-svelte/icons/zap';
           </div>
         {:else}
           <div class="space-y-1">
-            <label for="sched-at" class="text-xs font-medium uppercase tracking-widest text-muted">Run at</label>
+            <label for="sched-at" class="text-sm font-medium text-foreground">Run at</label>
             <Input id="sched-at" bind:value={form.one_shot_at} type="datetime-local" />
           </div>
         {/if}
@@ -815,7 +801,7 @@ import Zap from 'lucide-svelte/icons/zap';
         <!-- Agent + Workflow. Stacks on narrow phones; two columns at sm+. -->
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <span class="block text-xs font-medium uppercase tracking-widest text-muted">Agent</span>
+            <span class="block text-sm font-medium text-foreground">Agent</span>
             <AgentSelect
               id="sched-agent"
               agents={agents}
@@ -824,9 +810,9 @@ import Zap from 'lucide-svelte/icons/zap';
             />
           </div>
           <div class="space-y-1">
-            <label for="sched-workflow" class="text-xs font-medium uppercase tracking-widest text-muted">Workflow</label>
+            <label for="sched-workflow" class="text-sm font-medium text-foreground">Workflow</label>
             <select id="sched-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-              <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
+              <option value="">General task</option>
               {#each workflowSourceOptions as option}
                 <option value={option.value}>{option.label}</option>
               {/each}
@@ -838,7 +824,7 @@ import Zap from 'lucide-svelte/icons/zap';
             bind:value={form.agent_profile_id}
           />
           <div class="space-y-1 sm:col-span-2">
-            <label for="sched-project" class="text-xs font-medium uppercase tracking-widest text-muted">Project</label>
+            <label for="sched-project" class="text-sm font-medium text-foreground">Project</label>
             <select id="sched-project" bind:value={form.project_id} disabled={Boolean(projectId)} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="">None</option>
               {#each projects as project}
@@ -850,11 +836,11 @@ import Zap from 'lucide-svelte/icons/zap';
 
         <!-- Task template -->
         <div class="space-y-1">
-          <label for="sched-task-title" class="text-xs font-medium uppercase tracking-widest text-muted">Task title</label>
+          <label for="sched-task-title" class="text-sm font-medium text-foreground">Task title</label>
           <Input id="sched-task-title" bind:value={form.task_title} placeholder="Title for created tasks (defaults to schedule name)" />
         </div>
         <div class="space-y-1">
-          <label for="sched-task-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Task prompt</label>
+          <label for="sched-task-desc" class="text-sm font-medium text-foreground">Task prompt</label>
           <textarea
             id="sched-task-desc"
             bind:value={form.task_description}
@@ -866,13 +852,14 @@ import Zap from 'lucide-svelte/icons/zap';
         <!-- Task options. Stacks on narrow phones. -->
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <label for="sched-priority" class="text-xs font-medium uppercase tracking-widest text-muted">Priority</label>
+            <label for="sched-priority" class="text-sm font-medium text-foreground">Priority</label>
             <Input id="sched-priority" bind:value={form.priority} type="number" />
           </div>
           <div class="space-y-1">
-            <label for="sched-delivery" class="text-xs font-medium uppercase tracking-widest text-muted">Delivery</label>
+            <label for="sched-delivery" class="text-sm font-medium text-foreground">Delivery</label>
             <select id="sched-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="preferred_channel">Preferred channel</option>
+              <option value="in_app_notifications">In-app notifications (direct only)</option>
               <option value="latest_active_for_agent">Latest active conversation</option>
               <option value="specific_conversation">Specific conversation</option>
             </select>
@@ -881,7 +868,7 @@ import Zap from 'lucide-svelte/icons/zap';
 
         {#if form.delivery_mode === 'specific_conversation'}
           <div class="space-y-1">
-            <label for="sched-target" class="text-xs font-medium uppercase tracking-widest text-muted">Target conversation</label>
+            <label for="sched-target" class="text-sm font-medium text-foreground">Target conversation</label>
             <select id="sched-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="">Select conversation</option>
               {#each conversations as conv}
@@ -892,7 +879,7 @@ import Zap from 'lucide-svelte/icons/zap';
         {/if}
 
         <div class="space-y-1">
-          <label for="sched-expected" class="text-xs font-medium uppercase tracking-widest text-muted">Expected output <span class="normal-case tracking-normal text-quiet">(optional)</span></label>
+          <label for="sched-expected" class="text-sm font-medium text-foreground">Expected output <span class="normal-case tracking-normal text-quiet">(optional)</span></label>
           <textarea
             id="sched-expected"
             bind:value={form.expected_output}
@@ -902,22 +889,23 @@ import Zap from 'lucide-svelte/icons/zap';
         </div>
 
         <div class="space-y-1">
-          <label for="sched-completion-family" class="text-xs font-medium uppercase tracking-widest text-muted">Completion notification behavior</label>
+          <label for="sched-completion-family" class="text-sm font-medium text-foreground">Completion notification behavior</label>
           <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <select id="sched-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-              <option value="default">Default delivery</option>
-              <option value="direct">Direct channel delivery</option>
+            <select id="sched-completion-family" bind:value={form.completion_mode_family} disabled={form.delivery_mode === 'in_app_notifications'} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
+              {#each COMPLETION_MODE_OPTIONS as option}
+                <option value={option.value}>{option.name} — {option.description}</option>
+              {/each}
             </select>
             <label class="inline-flex items-center gap-2 rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground">
               <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-control-border bg-raised" />
               <span>Allow silent completion</span>
             </label>
           </div>
-          <p class="text-xs text-quiet">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+          <TaskFinishInstructions deliveryMode={form.delivery_mode} bind:completionMode={form.completion_mode_family} bind:instructions={form.on_finish_instructions} />
         </div>
 
         <div class="space-y-1">
-          <label for="sched-interaction" class="text-xs font-medium uppercase tracking-widest text-muted">Interaction policy</label>
+          <label for="sched-interaction" class="text-sm font-medium text-foreground">Interaction policy</label>
           <select id="sched-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="none">Fully autonomous</option>
             <option value="step_requests">Allow planning questions</option>

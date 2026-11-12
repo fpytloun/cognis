@@ -1,6 +1,6 @@
 import { beforeEach, expect, it } from 'vitest';
 import 'fake-indexeddb/auto';
-import { DocumentDrafts } from './document-drafts';
+import { DocumentDrafts, type CompositeInput } from './document-drafts';
 import { documentCoordination } from '$lib/document-coordination';
 
 beforeEach(async () => {
@@ -11,6 +11,94 @@ beforeEach(async () => {
 });
 const input = () => ({ input_revision: crypto.randomUUID(), text: 'text',
   attachments: [], chat_mode: null });
+const empty = (): CompositeInput => ({ ...input(), text: '' });
+
+for (const pin of [false, true]) {
+  it(`recovers stale ${pin ? 'submission' : 'autosave'} against an unconsumed empty draft`, async () => {
+    const drafts = new DocumentDrafts(), sibling = new DocumentDrafts();
+    drafts.readComposite('draft');
+    await sibling.writeComposite('draft', empty());
+    const value = input();
+    const saved = await (pin ? drafts.persistComposite('draft', value) : drafts.writeComposite('draft', value));
+    expect(saved).toMatchObject({ ...value, consumed: false });
+    expect(new DocumentDrafts().readComposite('draft')).toMatchObject(value);
+    expect(Object.keys(localStorage).some((key) => key.includes(':retained:'))).toBe(false);
+    const submitted = await drafts.persistComposite('draft', value);
+    expect(await drafts.consumeComposite(submitted!, () => true)).toBe(true);
+  });
+}
+
+const meaningful: [string, () => CompositeInput][] = [
+  ['text', input],
+  ['whitespace', () => ({ ...empty(), text: ' ' })],
+  ['attachment', () => ({ ...empty(), attachments: [{ artifact_id: crypto.randomUUID(),
+    filename: 'draft.txt', kind: 'file', mime_type: 'text/plain', size_bytes: 1 }] })],
+  ['feedback', () => ({ ...empty(), feedback: { creation_key: crypto.randomUUID(),
+    preflight_id: crypto.randomUUID(), manifest_hash: 'a'.repeat(64) } })],
+  ['mode', () => ({ ...empty(), chat_mode: 'plan' })],
+];
+
+for (const [label, competitor] of meaningful) {
+  for (const pin of [false, true]) {
+    it(`preserves ${label}-bearing competitors against stale ${pin ? 'submission' : 'autosave'}`, async () => {
+      const drafts = new DocumentDrafts(), sibling = new DocumentDrafts();
+      drafts.readComposite('draft');
+      const winner = competitor(), loser = input();
+      await sibling.writeComposite('draft', winner);
+      expect(await (pin ? drafts.persistComposite('draft', loser) : drafts.writeComposite('draft', loser))).toBeNull();
+      expect(new DocumentDrafts().readComposite('draft')).toMatchObject(winner);
+      const retainedKey = Object.keys(localStorage).find((key) => key.endsWith(`:retained:${loser.input_revision}`));
+      expect(JSON.parse(localStorage.getItem(retainedKey!)!)).toMatchObject(loser);
+    });
+  }
+}
+
+it('does not overwrite a queued local clear when pinning older input', async () => {
+  const drafts = new DocumentDrafts(), value = input();
+  await drafts.writeComposite('draft', value);
+  const cleared = empty();
+  const saving = drafts.writeComposite('draft', cleared);
+  const pinning = drafts.persistComposite('draft', value);
+  await saving;
+  expect(await pinning).toBeNull();
+  expect(new DocumentDrafts().readComposite('draft')).toMatchObject(cleared);
+});
+
+it('does not rebase a stale edit over an empty consumed tombstone', async () => {
+  const drafts = new DocumentDrafts(), sibling = new DocumentDrafts();
+  drafts.readComposite('draft');
+  const submitted = await sibling.persistComposite('draft', empty());
+  await sibling.consumeComposite(submitted!, () => true);
+  expect(await drafts.writeComposite('draft', input())).toBeNull();
+  expect(new DocumentDrafts().readComposite('draft')).toMatchObject({
+    input_revision: submitted!.input_revision, text: '', consumed: true,
+  });
+});
+
+it('does not treat a missing canonical draft as empty initialization', async () => {
+  const drafts = new DocumentDrafts();
+  await drafts.writeComposite('draft', input());
+  localStorage.removeItem(documentCoordination().storageName('composer-v3:draft'));
+  expect(await drafts.persistComposite('draft', input())).toBeNull();
+});
+
+it('does not reuse one input revision for different content while rebasing empty initialization', async () => {
+  const drafts = new DocumentDrafts(), blank = empty();
+  drafts.readComposite('draft');
+  await new DocumentDrafts().writeComposite('draft', blank);
+  await expect(drafts.writeComposite('draft', { ...blank, text: 'changed' })).rejects.toThrow('Composite input revision mismatch');
+});
+
+it('allows only the first meaningful writer to replace empty initialization', async () => {
+  const first = new DocumentDrafts(), second = new DocumentDrafts();
+  first.readComposite('draft'); second.readComposite('draft');
+  await new DocumentDrafts().writeComposite('draft', empty());
+  const a = input(), b = input();
+  const saved = await Promise.all([first.writeComposite('draft', a), second.writeComposite('draft', b)]);
+  expect(saved.filter(Boolean)).toHaveLength(1);
+  expect(new DocumentDrafts().readComposite('draft')?.input_revision)
+    .toBe(saved.find(Boolean)!.input_revision);
+});
 
 it('keeps exact intent across reopen and tombstones it without stale-save resurrection', async () => {
   const drafts = new DocumentDrafts(), value = input();

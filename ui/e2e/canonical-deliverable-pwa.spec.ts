@@ -5,13 +5,13 @@ import { expect, test, type Page } from '@playwright/test';
 const build = resolve('standalone-build');
 const entry = JSON.parse(readFileSync(resolve(build, '.vite/manifest.json'), 'utf8'))['src/standalone.ts'];
 const document = {
-  title: 'Museum catalogue: fictional exhibits and accessible captions',
+  title: 'Sample inventory: what changes and how it works',
   instanceId: 'dlv_owner',
   content: '',
   payload: {
     metadata: { toc: { enabled: true, depth: 4 } },
-    blocks: [{ type: 'markdown', content: '# Museum catalogue\n\n' + Array.from({ length: 11 }, (_, i) =>
-      `## Section ${i + 1}\n\n${'Fictional exhibit descriptions and sample captions. '.repeat(10)}`
+    blocks: [{ type: 'markdown', content: '# Sample inventory\n\n' + Array.from({ length: 11 }, (_, i) =>
+      `## Section ${i + 1}\n\n${'Inventory design and operation details. '.repeat(10)}`
     ).join('\n\n') }],
   },
 };
@@ -45,7 +45,7 @@ async function setup(page: Page, { installed = true, owner = true, expired = fal
   }));
   await page.route('**/api/v1/deliverables/dlv_owner/share-link', route => {
     created.push(route.request().postDataJSON());
-    return route.fulfill({ json: { url: 'https://assistant.example.test/created-share-link' } });
+    return route.fulfill({ json: { url: 'https://cognis.fpy.cz/created-share-link' } });
   });
   await page.route('**/app-return', route => route.fulfill({
     contentType: 'text/html', body: `<a href="${viewUrl}">Open document</a>`,
@@ -68,34 +68,25 @@ for (const width of [390, 1440]) {
     await page.getByRole('button', { name: 'Section 11', exact: true }).click();
     await expect(page.getByRole('heading', { name: 'Section 11', exact: true })).toBeFocused();
     await page.evaluate(() => scrollTo(0, 0));
-    const share = page.getByRole('button', { name: 'Share public link', exact: true });
+    const share = page.getByRole('button', { name: 'Share deliverable' });
     await expect(share).toBeEnabled();
     await share.click();
-    const dialog = page.getByRole('dialog', { name: 'Public link', exact: true });
-    const validity = dialog.getByRole('combobox', { name: 'Public link validity' });
     for (const label of ['1 day', '7 days (default)', '30 days', '90 days']) {
-      await expect(validity.getByRole('option', { name: label, exact: true })).toHaveCount(1);
+      await expect(page.getByRole('button', { name: label, exact: true })).toBeVisible();
     }
-    await expect(validity).toHaveValue('7');
-    await validity.selectOption('90');
-    await dialog.getByRole('button', { name: 'Create public link', exact: true }).click();
-    await expect(dialog.getByText('Public link · Copied', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: '90 days', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Share link copied' })).toBeVisible();
     expect(created).toEqual([{ ttl_seconds: 90 * 86400 }]);
-    await validity.selectOption('custom');
+    await page.getByRole('button', { name: 'Share link copied' }).click();
+    await page.getByRole('button', { name: 'Custom…' }).click();
     const date = new Date(Date.now() + 2 * 86400000);
     const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-    const expiration = dialog.getByLabel('Expiration date and time');
-    await expiration.fill(local);
-    expect(await expiration.evaluate(node => {
+    await page.getByLabel('Expiration date and time').fill(local);
+    expect(await page.getByRole('group', { name: 'Share link expiration' }).evaluate(node => {
       const rect = node.getBoundingClientRect(); return rect.left >= 0 && rect.right <= innerWidth;
     })).toBe(true);
-    expect(await validity.evaluate(node => {
-      const rect = node.getBoundingClientRect(); return rect.left >= 0 && rect.right <= innerWidth;
-    })).toBe(true);
-    await dialog.getByRole('button', { name: 'Create another link', exact: true }).click();
-    await expect(dialog.getByRole('button', { name: 'Create another link', exact: true })).toBeEnabled();
+    await page.getByRole('button', { name: 'Create link', exact: true }).click();
     expect(created[1]).toEqual({ expires_at: new Date(local).toISOString() });
-    await dialog.getByRole('button', { name: 'Done', exact: true }).click();
     await page.getByRole('button', { name: 'Close preview' }).click();
     await expect(page).toHaveURL(/\/$/);
     await expect(page.getByText('App home')).toBeVisible();
@@ -115,7 +106,7 @@ test('browser and anonymous preview keep canonical TOC without owner/PWA control
   await setup(page, { installed: false, owner: false });
   await page.goto(viewUrl);
   await expect(page.getByRole('button', { name: 'Section 11', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'Share public link', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Share deliverable' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Close preview' })).toHaveCount(0);
 });
 

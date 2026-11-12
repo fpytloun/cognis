@@ -8,6 +8,7 @@
   import ToolCallGroupBlock from '$lib/components/chat-v2/ToolCallGroupBlock.svelte';
   import { prepareTimelineRows } from '$lib/chat-v2/tool-groups';
   import { activeActivityGroupId } from '$lib/chat-v2/activity-progress';
+  import { TimelineDisclosureState, timelineDisclosureContext, timelineRowItemIds } from '$lib/chat-v2/presentation-state';
   import type { RuntimeOverlaySnapshot } from '$lib/chat-v2/types';
   import type { CommandV2Response } from '$lib/chat-v2/types';
   import { toRenderItem } from '$lib/chat-v2/render-adapter';
@@ -15,9 +16,10 @@
   import { DEFAULT_USER_PREFERENCES } from '$lib/user-preferences';
   import type { ToolCallTimelineItem as RenderToolCallTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineItem as ChatV2TimelineItem, TimelineScope, TurnCycleState, WorkCategory } from '$lib/chat-v2/types';
-  import type { Agent, UserPreferences } from '$lib/types/api';
+  import type { Agent, TaskDeliverableFreshness, UserPreferences } from '$lib/types/api';
   import { setContext, untrack } from 'svelte';
   import { chatArrivalContext, ChatArrivalRegistry } from '$lib/chat-v2/motion';
+  import { commentReplyPresentation } from '$lib/feedback/agent-replies';
 
   let {
     items,
@@ -33,9 +35,11 @@
     onOpenWork,
     onHandoffConversation,
     scope,
-    onProviderSwitchResponse
+    onProviderSwitchResponse,
+    deliverableFreshness,
   } = $props<{
     items: ChatV2TimelineItem[];
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
     cycleStates?: TurnCycleState[];
     runtime?: RuntimeOverlaySnapshot | null;
     agent?: Agent | null;
@@ -54,6 +58,8 @@
   // Initial/restored rows are a baseline, not new-message arrivals.
   const arrivals = new ChatArrivalRegistry(untrack(() => items.map((item: ChatV2TimelineItem) => item.id)));
   setContext(chatArrivalContext, arrivals);
+  const disclosures = new TimelineDisclosureState(() => scope?.key ?? '');
+  setContext(timelineDisclosureContext, disclosures);
   let arrivalConversation = untrack(() => scope?.conversation_id);
   $effect.pre(() => {
     if (scope?.conversation_id !== arrivalConversation) {
@@ -90,6 +96,12 @@
   }
 
   const renderableItems = $derived(selectRenderableTimeline(items));
+  const commentReplies = $derived(commentReplyPresentation(renderableItems));
+  const commentCompletionKey = $derived(commentReplies.completionKey);
+  $effect(() => {
+    // Tool completion is canonical on every connected client, unlike browser-local mutations.
+    if (commentCompletionKey !== '[]') window.dispatchEvent(new Event('feedback-changed'));
+  });
   const rows = $derived(prepareTimelineRows(renderableItems, preferences, cycleStates));
   const activeGroupId = $derived(activeActivityGroupId(rows, runtime));
 
@@ -102,11 +114,12 @@
   }
 </script>
 
-{#each rows as row (rowRenderKey(row))}
+{#each rows as row (`${scope?.key ?? ''}:${rowRenderKey(row)}`)}
   <!-- Rows always render at their real size. Do not defer off-screen rows
        with placeholder heights: they resolve while scrolling up and shift the
-       content being read; iOS Safari's scroll anchoring does not correct it. -->
-  <div class="mb-8 last:mb-0" data-timeline-row-key={rowRenderKey(row)}>
+        content being read. Window changes preserve canonical item anchors. -->
+  <div class="mb-8 last:mb-0" data-timeline-row-key={rowRenderKey(row)}
+    data-timeline-item-ids={JSON.stringify(timelineRowItemIds(row))}>
     {#if row.kind === 'item'}
       {@const item = row.item}
       {@const searchMatched = searchMatchedIds.has(item.id)}
@@ -119,6 +132,8 @@
       {:else}
         <ChatV2TimelineItemRenderer
         {item}
+        taskFreshness={item.kind === 'assistant_deliverable' ? deliverableFreshness?.[item.deliverable_id] : null}
+        commentReplies={commentReplies.byMessage.get(item.id)}
         {agent}
         {compact}
         {searchQuery}

@@ -22,13 +22,23 @@ export function canShareFile(file: File): boolean {
 }
 
 export function downloadFile(file: File): void {
-  const url = URL.createObjectURL(file);
+  downloadBlob(file, file.name);
+}
+
+/** Explicit downloads stay in the current app window, including WKWebView. */
+export function downloadUrl(url: string, filename = ''): void {
   const anchor = document.createElement('a');
   anchor.href = url;
-  anchor.download = file.name;
+  anchor.download = filename;
+  anchor.referrerPolicy = 'no-referrer';
   document.body.append(anchor);
-  anchor.click();
-  anchor.remove();
-  // Safari may consume the blob asynchronously after the click.
-  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  try { anchor.click(); } finally { anchor.remove(); }
+}
+
+export function downloadBlob(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob);
+  try { downloadUrl(url, filename); } finally {
+    // Safari/WKWebView may consume the blob after this handler returns.
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  }
 }

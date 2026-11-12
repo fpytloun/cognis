@@ -18,4 +18,5 @@
   onClose={() => {}}
 >
   <p>Inspector content</p>
+  <label>Inspector draft<input /></label>
 </ConversationInfoDrawer>

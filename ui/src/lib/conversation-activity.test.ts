@@ -29,6 +29,21 @@ function taskControlConversation(overrides: Partial<Conversation> = {}): Convers
 }
 
 describe('conversationActivityState', () => {
+  it.each([false, true])('keeps shared activity informational while active=%s', (active) => {
+    const state = conversationActivityState(conversation({
+      is_readonly_for_caller: true,
+      has_active_turn: active,
+      has_unread: true,
+      active_session_status: 'failed',
+      active_session_updated_at: '2026-01-01T00:01:00Z',
+      pending_notification_types: ['credential_request', 'step_question'],
+    }));
+    expect(state).toMatchObject({
+      active, attention: false, error: false, unread: !active, tone: 'default',
+      label: active ? 'Control chat is working' : 'Unread control chat activity',
+    });
+  });
+
   it('uses control-chat activity instead of task lifecycle state', () => {
     expect(conversationActivityState(conversation()).active).toBe(false);
     expect(conversationActivityState(conversation({ has_active_turn: true })).active).toBe(true);
@@ -125,6 +140,37 @@ describe('conversationActivityState', () => {
     expect(conversationActivityState(conversation({
       has_active_turn: true,
       pending_notification_types: ['step_question'],
+    }))).toMatchObject({
+      active: false,
+      attention: true,
+      label: 'Waiting for answer',
+    });
+  });
+
+  it('does not treat informational completion notifications as pending input', () => {
+    const completedNotification = conversation({
+      pending_notification_types: ['managed_conversation_completed'],
+    });
+    expect(conversationActivityState(completedNotification)).toMatchObject({
+      active: false,
+      attention: false,
+      error: false,
+      label: 'No new activity',
+    });
+    expect(conversationActivityState({
+      ...completedNotification, has_active_turn: true,
+    })).toMatchObject({
+      active: true,
+      attention: false,
+      error: false,
+      label: 'Control chat is working',
+    });
+  });
+
+  it('preserves actionable waits alongside informational completion notifications', () => {
+    expect(conversationActivityState(conversation({
+      has_active_turn: true,
+      pending_notification_types: ['managed_conversation_completed', 'step_question'],
     }))).toMatchObject({
       active: false,
       attention: true,

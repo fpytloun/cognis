@@ -47,6 +47,65 @@ import type {
 const CONV = 'conv-inv';
 const PV = 'chat-v2-inv-test';
 
+describe('bounded relay overlay canonical recovery', () => {
+  it.each([false, true])('restores whole omitted content after terminal (reconnected=%s)', (reconnected) => {
+    const turnId = 'bounded-turn';
+    const fullText = 'é'.repeat(350_000);
+    const activeTurn = { turn_id: turnId, session_id: 'sess-1', status: 'running' as const };
+    const authority = {
+      protocol: 'runtime_authority_v1' as const,
+      direct_request_id: 'bounded-request',
+      turn_id: turnId,
+      fencing_token: 7,
+      lifecycle: 'active' as const,
+      source_epoch: 'epoch-inv-test',
+      source_revision: 1
+    };
+    let state = applySnapshot(snapshot([], overlay(0), 'bounded-cursor'), emptyChatV2State());
+    if (!reconnected) {
+      state = applyRealtimeFrame(state, frame('bounded-cursor', overlay(1, {
+        authority,
+        has_active_turn: true,
+        active_turn: activeTurn,
+        volatile_items_complete: true,
+        volatile_items: [assistantStreamItem(turnId, 0, 'earlier admitted prefix')]
+      }))).state;
+    }
+    const recent = assistantStreamItem(turnId, 1, 'current small update');
+    state = applyRealtimeFrame(state, frame('bounded-cursor', overlay(2, {
+      authority: { ...authority, source_revision: 2 },
+      has_active_turn: true,
+      active_turn: activeTurn,
+      volatile_items_complete: false,
+      volatile_items: [recent]
+    }))).state;
+    expect(visibleTimelineItems(state).some((item) => item.id === recent.id)).toBe(true);
+    if (!reconnected) {
+      expect(visibleTimelineItems(state).find((item) => item.id === `message:${turnId}:phase:0`))
+        .toMatchObject({ content: 'earlier admitted prefix' });
+    }
+    const terminal = overlay(3, {
+      authority: { ...authority, lifecycle: 'terminal', source_revision: 3 },
+      volatile_items_complete: false,
+      volatile_items: []
+    });
+    state = applyRealtimeFrame(state, frame('bounded-cursor', terminal)).state;
+    expect(state.runtime?.has_active_turn).toBe(false);
+    state = applySyncResponse(state, syncWith('bounded-cursor', 'canonical-cursor', [
+      assistantCanonicalItem(turnId, 0, 10, fullText),
+      assistantCanonicalItem(turnId, 1, 11, 'current small update')
+    ], terminal)).state;
+    const visible = visibleTimelineItems(state);
+    expect(visible.map((item) => item.id)).toEqual([
+      `message:${turnId}:phase:0`,
+      `message:${turnId}:phase:1`
+    ]);
+    expect(visible[0]).toMatchObject({ content: fullText, stable: true, partial: false });
+    expect(visible[1]).toMatchObject({ content: 'current small update', stable: true });
+    expect(visible.every((item) => item.status === 'complete')).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Builders
 // ---------------------------------------------------------------------------

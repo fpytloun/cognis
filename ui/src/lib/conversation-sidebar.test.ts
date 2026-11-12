@@ -17,6 +17,30 @@ function conversation(
 }
 
 describe('partitionSidebarConversationLanes', () => {
+  it.each([[], ['step_question'], ['approval_required'], ['auth_request']])(
+    'keeps unread shared readers in Recent, including stale source actions (%s)',
+    (...pending_notification_types) => {
+      const shared = conversation('shared', {
+        is_readonly_for_caller: true, has_unread: true,
+        pending_notification_types,
+      });
+      expect(partitionSidebarConversationLanes([shared])).toEqual({
+        active: [], waiting: [], recent: [shared],
+      });
+      expect(shared.has_unread).toBe(true);
+    },
+  );
+
+  it('keeps genuinely running shared conversations in Active without source input requests', () => {
+    const shared = conversation('shared', {
+      is_readonly_for_caller: true, has_active_turn: true, has_unread: true,
+      pending_notification_types: ['step_question'],
+    });
+    expect(partitionSidebarConversationLanes([shared])).toEqual({
+      active: [shared], waiting: [], recent: [],
+    });
+  });
+
   it.each([false, true])('puts attached running work in Active (unread=%s)', (has_unread) => {
     const owner = conversation('owner', { has_unread });
     const work = { kind: 'managed_conversation', status: 'running', controller_conversation_id: 'owner' } as BackgroundWorkItem;

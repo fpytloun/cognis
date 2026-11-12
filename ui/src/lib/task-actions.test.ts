@@ -23,4 +23,14 @@ describe('task action priority', () => {
     expect(action).toBe('revise');
     expect(taskPrimaryActionLabel(action)).toBe('Revise result');
   });
+
+  it('offers a retry from the failed step, not a revision, for a failed task', () => {
+    const action = taskPrimaryAction('failed', { hasAttention: false, hasWorkflow: true, rerunnable: true, editable: false });
+    expect(taskPrimaryActionLabel(action)).toBe('Retry from failed step');
+  });
+
+  it('resumes a paused task that has no pending question', () => {
+    const action = taskPrimaryAction('paused', { hasAttention: false, hasWorkflow: true, rerunnable: true, editable: true });
+    expect(taskPrimaryActionLabel(action)).toBe('Resume task');
+  });
 });

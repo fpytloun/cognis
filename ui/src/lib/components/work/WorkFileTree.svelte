@@ -13,6 +13,7 @@
   import Minimize2 from 'lucide-svelte/icons/minimize-2';
 
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
+  import type { FeedbackSurfaceBinding } from '$lib/feedback/types';
   import { chatV2Api } from '$lib/chat-v2/api';
   import type { TimelineScope, WorkFileHistoryRequest } from '$lib/chat-v2/types';
   import {
@@ -42,6 +43,8 @@
       chatV2Api.fileHistory(request, { signal }),
     refreshMissingIdentity,
     initialFocus = null,
+    feedbackBindingForDiff,
+    activateFeedbackForDiff,
   } = $props<{
     diffs: WorkFileDiff[];
     cacheKey?: string;
@@ -49,6 +52,8 @@
     loadFileHistory?: FileHistoryLoader;
     refreshMissingIdentity?: (() => Promise<void>) | undefined;
     initialFocus?: WorkInitialFocus | null;
+    feedbackBindingForDiff?: (diff: WorkFileDiff, ordinal: number) => FeedbackSurfaceBinding | null;
+    activateFeedbackForDiff?: (diff: WorkFileDiff) => void;
   }>();
 
   const ROW_HEIGHT = 36;
@@ -558,6 +563,23 @@
   </span>
 {/snippet}
 
+{#snippet eventDiff(event: WorkFileDiff, ordinal: number, expanded = false)}
+  <div data-testid="work-event-diff" data-source-item-id={event.source_item_id}>
+    {#if event.feedback_source && activateFeedbackForDiff}
+      <div class="mb-1 flex items-center justify-between gap-2 px-1">
+        <span class="text-[11px] font-medium uppercase tracking-wide text-quiet">Change {ordinal + 1}</span>
+        {#if feedbackBindingForDiff?.(event, ordinal)?.source.capabilities.comment !== false}<button type="button" class="feedback-icon text-muted hover:text-accent" data-testid="work-event-feedback"
+          aria-label={`Feedback on ${event.path} change ${ordinal + 1}`}
+          title="Comment on this change" onclick={() => { focusedDiffOpen = false; activateFeedbackForDiff?.(event); }}>
+          <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M21 15a3 3 0 0 1-3 3H8l-5 4V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3zM12 7v7m-3.5-3.5h7" stroke-linecap="round" stroke-linejoin="round" /></svg>
+        </button>{/if}
+      </div>
+    {/if}
+    <FileDiffViewer diffs={[event]} annotationBindings={[feedbackBindingForDiff?.(event, ordinal) ?? null]} collapsible={false}
+      onExpand={expanded ? undefined : () => { focusedDiffOpen = true; }} />
+  </div>
+{/snippet}
+
 {#snippet diffHistory(file: FileTreeFile)}
   <div class="space-y-3" data-testid="work-combined-diff">
     {#if sourceLabels(file).length}
@@ -586,11 +608,14 @@
           {unavailablePreviewCount(file)} change{unavailablePreviewCount(file) === 1 ? '' : 's'} without a text preview {unavailablePreviewCount(file) === 1 ? 'is' : 'are'} not included in the combined diff.
         </p>
       {/if}
-      <FileDiffViewer
-        diffs={[combineFileDiffHistory(file)!]}
-        collapsible={false}
-        onExpand={() => { focusedDiffOpen = true; }}
-      />
+      {#if feedbackBindingForDiff}
+        <p class="px-1 text-xs text-quiet">Each change is shown separately so comments stay attached to it.</p>
+        {#each file.diffs as event, ordinal}
+          {@render eventDiff(event, ordinal)}
+        {/each}
+      {:else}
+        <FileDiffViewer diffs={[combineFileDiffHistory(file)!]} collapsible={false} onExpand={() => { focusedDiffOpen = true; }} />
+      {/if}
     {:else if identityRefreshLoading}
       <!-- The loading status below replaces stale missing-identity copy. -->
     {:else if omittedPreviewCount(file)}
@@ -733,7 +758,13 @@
       </button>
     </header>
     <div class="min-h-0 flex-1 overflow-auto p-4">
-      <FileDiffViewer diffs={[combineFileDiffHistory(selectedHistoryFile)!]} collapsible={false} />
+      {#if feedbackBindingForDiff}
+        {#each selectedHistoryFile.diffs as event, ordinal}
+          {@render eventDiff(event, ordinal, true)}
+        {/each}
+      {:else}
+        <FileDiffViewer diffs={[combineFileDiffHistory(selectedHistoryFile)!]} collapsible={false} />
+      {/if}
     </div>
   </div>
 {/if}

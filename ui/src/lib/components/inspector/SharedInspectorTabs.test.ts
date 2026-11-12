@@ -13,7 +13,9 @@ import {
 const mocks = vi.hoisted(() => ({
   activityOverview: vi.fn(),
   intarisDetail: vi.fn(),
+  summaries: vi.fn(),
 }));
+vi.mock('$lib/usage/conversation-api', () => ({ fetchUsageSummaries: mocks.summaries }));
 
 vi.mock('$lib/chat-v2/api', () => ({
   chatV2Api: {
@@ -29,8 +31,20 @@ vi.mock('$lib/api/client', () => ({
 }));
 
 import SharedInspectorTabs from './SharedInspectorTabs.svelte';
+// Controlled loader promises below own readiness, not fixture compilation time.
+import WorkView from '$lib/components/work/WorkView.svelte';
+import SessionDetailsBody from '$lib/components/session/SessionDetailsBody.svelte';
 import * as workLoader from '$lib/components/work/work-view-loader';
 import * as sessionLoader from '$lib/components/session/session-details-loader';
+vi.mock('$lib/stores/auth', () => ({
+  auth: {
+    getSnapshot: () => ({ initialized: true, status: 'authenticated', user: { email: 'usage-owner@cognis.test' } }),
+    subscribe: (run) => {
+      run({ initialized: true, status: 'authenticated', user: { email: 'usage-owner@cognis.test' } });
+      return () => {};
+    },
+  },
+}));
 
 const scope: TimelineScope = {
   key: 'task_step:run-1',
@@ -108,6 +122,11 @@ describe('SharedInspectorTabs', () => {
 
   beforeEach(() => {
     clearActivityOverview();
+    mocks.summaries.mockReset().mockImplementation(async (body) => ({
+      meta: {}, items: body.items.map((selector) => ({
+        selector, inclusion: body.inclusion, available: false, metrics: null,
+      })),
+    }));
     mocks.activityOverview.mockReset().mockResolvedValue(overview());
     mocks.intarisDetail.mockReset().mockResolvedValue({
       session_id: 'session-1',
@@ -146,13 +165,16 @@ describe('SharedInspectorTabs', () => {
     const overviewTab = screen.getByRole('tab', { name: 'Overview' });
     overviewTab.focus();
     await fireEvent.keyDown(overviewTab, { key: 'End' });
+    const usageTab = screen.getByRole('tab', { name: 'Usage' });
+    await waitFor(() => expect(usageTab).toHaveFocus());
+    await fireEvent.keyDown(usageTab, { key: 'ArrowLeft' });
     const sessionTab = screen.getByRole('tab', { name: 'Session' });
     await waitFor(() => expect(sessionTab).toHaveFocus());
     expect(await screen.findByRole('status')).toHaveTextContent('Loading session details');
     expect(load).toHaveBeenCalledOnce();
     await fireEvent.keyDown(sessionTab, { key: 'Home' });
     await waitFor(() => expect(overviewTab).toHaveFocus());
-    pending.resolve((await import('$lib/components/session/SessionDetailsBody.svelte')).default);
+    pending.resolve(SessionDetailsBody);
     await pending.promise;
     await Promise.resolve();
     expect(screen.queryByTestId('session-details-content')).not.toBeInTheDocument();
@@ -177,7 +199,7 @@ describe('SharedInspectorTabs', () => {
     await fireEvent.keyDown(workTab, { key: 'ArrowRight' });
     const sessionTab = screen.getByRole('tab', { name: 'Session' });
     await waitFor(() => expect(sessionTab).toHaveFocus());
-    pending.resolve((await import('$lib/components/work/WorkView.svelte')).default);
+    pending.resolve(WorkView);
     await screen.findAllByText('Session summary');
     expect(screen.queryByText('Loading Work inspector…')).toBeNull();
     expect(sessionTab).toHaveAttribute('aria-selected', 'true');
@@ -197,6 +219,59 @@ describe('SharedInspectorTabs', () => {
     expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument();
     expect(mocks.activityOverview).not.toHaveBeenCalled();
     expect(mocks.intarisDetail).not.toHaveBeenCalled();
+  });
+
+  it('provides the fourth Usage tab with keyboard navigation and matching panel ARIA', async () => {
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1' });
+    const overviewTab = screen.getByRole('tab', { name: 'Overview' });
+    overviewTab.focus();
+    await fireEvent.keyDown(overviewTab, { key: 'End' });
+    const usageTab = screen.getByRole('tab', { name: 'Usage' });
+    await waitFor(() => expect(usageTab).toHaveFocus());
+    expect(usageTab).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', 'shared-inspector-tab-usage');
+    expect(await screen.findByText('Usage is unavailable for this selected scope.')).toBeInTheDocument();
+    expect(mocks.intarisDetail).not.toHaveBeenCalled();
+    await fireEvent.keyDown(usageTab, { key: 'ArrowRight' });
+    await waitFor(() => expect(overviewTab).toHaveFocus());
+  });
+
+  it('renders a Usage header only without mounting any data panel', () => {
+    render(SharedInspectorTabs, { scope, sessionId: 'session-1', activeTab: 'usage', headerOnly: true });
+    expect(screen.getByRole('tab', { name: 'Usage' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('region', { name: 'Usage accounting' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('tabpanel')).not.toBeInTheDocument();
+    expect(mocks.activityOverview).not.toHaveBeenCalled();
+    expect(mocks.intarisDetail).not.toHaveBeenCalled();
+    expect(mocks.summaries).not.toHaveBeenCalled();
+  });
+
+  it('loads the default API source only on the active Usage body, never the header', async () => {
+    render(SharedInspectorTabs, { scope: conversationTimelineScope('retained-conversation'), sessionId: 'active-physical-session' });
+    await waitFor(() => expect(mocks.activityOverview).toHaveBeenCalledOnce());
+    expect(mocks.summaries).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('tab', { name: 'Usage' }));
+    await waitFor(() => expect(mocks.summaries).toHaveBeenCalledOnce());
+    expect(mocks.summaries).toHaveBeenLastCalledWith({
+      items: [{ kind: 'conversation', id: 'retained-conversation' }],
+      inclusion: 'direct', pricing_basis: 'historical',
+    }, { signal: expect.any(AbortSignal) });
+    expect(await screen.findByText('Accounting is unavailable for this selection or its lineage.')).toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+    expect(mocks.summaries).toHaveBeenCalledOnce();
+  });
+
+  it('keeps Usage selected when inspecting a different scope or a rotated session', async () => {
+    const view = render(SharedInspectorTabs, { scope, sessionId: 'session-1', initialTab: 'usage' });
+    await screen.findByText('Usage is unavailable for this selected scope.');
+    await view.rerender({
+      scope: conversationTimelineScope('selected-managed-conversation'),
+      sessionId: 'rotated-session',
+    });
+    expect(screen.getByRole('tab', { name: 'Usage' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByRole('region', { name: 'Usage accounting' })).toBeInTheDocument();
+    expect(mocks.intarisDetail).not.toHaveBeenCalled();
+    expect(mocks.activityOverview).not.toHaveBeenCalled();
   });
 
   it('loads one lightweight overview without an automatic exact follow-up', async () => {

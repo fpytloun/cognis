@@ -1,7 +1,7 @@
 import { documentCoordination, type DocumentLease } from '$lib/document-coordination';
 import { DocumentDrafts, type CompositeInput } from '$lib/offline/document-drafts';
 import { emptyComposerInput, hydrateComposer, type ComposerHydration } from './composer-hydration';
-import { sameSubmissionInput } from './submission-input';
+import { isEmptySubmissionInput, sameSubmissionInput } from './submission-input';
 import { snapshotPersistedMetadata } from './persisted-metadata';
 
 interface Channel {
@@ -66,6 +66,7 @@ export class ConversationComposer {
     const channel = this.channel(id);
     const previous = channel.hydration.input;
     // Hydration, mounting and upload progress do not mint a new user intent.
+    if (isEmptySubmissionInput(previous) && isEmptySubmissionInput(input)) return;
     if (previous.input_revision === input.input_revision && sameSubmissionInput(previous, input)) return;
     channel.hydration = { input: snapshotPersistedMetadata(input), legacy: [] };
     channel.dirty = true;

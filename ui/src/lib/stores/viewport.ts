@@ -27,6 +27,18 @@ export const isMobile = readable(readIsMobile(), (set) => {
   return () => window.removeEventListener('resize', update);
 });
 
+/** Phone-width viewports (< 640px), where document headers fold secondary actions into ⋯. */
+const COMPACT_BREAKPOINT = 640;
+function readIsCompact(): boolean {
+  return typeof window !== 'undefined' && window.innerWidth < COMPACT_BREAKPOINT;
+}
+export const isCompactViewport = readable(readIsCompact(), (set) => {
+  if (typeof window === 'undefined') return;
+  const update = () => set(readIsCompact());
+  window.addEventListener('resize', update, { passive: true });
+  return () => window.removeEventListener('resize', update);
+});
+
 export function isTouch(): boolean {
   if (typeof window === 'undefined') return false;
   return window.matchMedia?.('(any-pointer: coarse)').matches ?? false;

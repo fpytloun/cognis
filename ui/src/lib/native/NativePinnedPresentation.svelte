@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { auth } from '$lib/stores/auth';
-  import { nativeVisibility, postNative } from './host';
+  import { nativeVisibility, nativeComposerFocus, postNative } from './host';
   import { createPinnedPanel } from '$lib/components/chat/pinned-panel.svelte';
   import PinnedConversationPanel from '$lib/components/chat/PinnedConversationPanel.svelte';
 
@@ -37,4 +37,6 @@
 </script>
 
 <PinnedConversationPanel {panel} onMinimize={panel.close}
+  composerFocusRequest={current() && $nativeVisibility.visible && $nativeVisibility.focused
+    && $nativeComposerFocus?.agentId === panel.group?.id ? $nativeComposerFocus?.request : null}
   onOpenFull={(path) => postNative('open-window', { conversationId: new URL(path, location.origin).pathname.split('/').pop() })} />

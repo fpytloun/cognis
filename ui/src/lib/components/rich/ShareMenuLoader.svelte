@@ -2,7 +2,9 @@
   import { onMount } from 'svelte';
   import ViewerIcon from './ViewerIcon.svelte';
   import type { ShareLinkOptions } from './share-options';
-  export let createLink: (options: ShareLinkOptions) => Promise<string>;
+  import './document-actions.css';
+  export let createLink: ((options: ShareLinkOptions) => Promise<string>) | null | undefined = undefined;
+  export let internalUrl = '';
   export let allowModeChoice = false;
   export let defaultMode: 'view' | 'download' = 'view';
   export let label = '';
@@ -18,12 +20,8 @@
 </script>
 
 {#if menu}
-  <svelte:component this={menu} {createLink} {allowModeChoice} {defaultMode} {label} />
+  <svelte:component this={menu} {internalUrl} {createLink} {allowModeChoice} {defaultMode} {label} />
 {:else}
-  <button type="button" aria-label="Share public link" disabled><ViewerIcon name="share" />{#if label}<span>{label}</span>{/if}</button>
+  <button class="document-icon-action" type="button" aria-label="Share link" disabled><ViewerIcon name="share" />{#if label}<span>{label}</span>{/if}</button>
   {#if error}<span role="status">{error}</span>{/if}
 {/if}
-
-<style>
-  button { display: inline-grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 0; border-radius: 6px; background: transparent; color: inherit; opacity: .5; }
-</style>

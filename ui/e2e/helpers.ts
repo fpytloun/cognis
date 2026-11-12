@@ -15,18 +15,21 @@ export const ADMIN_PASSWORD =
   process.env.COGNIS_LOCAL_ADMIN_PASSWORD ?? process.env.COGNIS_E2E_ADMIN_PASSWORD ?? 'cognis-local-admin';
 export const MOCK_LLM_URL = process.env.MOCK_LLM_URL ?? 'http://localhost:8090';
 
-async function safeLoginFailure(response: Response): Promise<string> {
+async function safeLoginFailure(response: Response, password: string): Promise<string> {
   const body = (await response.text().catch(() => ''))
-    .split(ADMIN_PASSWORD).join('[redacted]')
+    .split(password).join('[redacted]')
     .slice(0, 500)
     .trim();
   return `Login failed: HTTP ${response.status()}${body ? ` ${body}` : ''}`;
 }
 
-export async function login(page: Page): Promise<void> {
+export async function login(
+  page: Page,
+  credentials = { email: ADMIN_EMAIL, password: ADMIN_PASSWORD },
+): Promise<void> {
   await page.goto('/');
 
-  const loginSubmit = page.locator('[data-testid="login-submit"], button[type="submit"]').first();
+  const loginSubmit = page.getByRole('button', { name: 'Sign in', exact: true });
   const controlCenter = page.getByTestId('control-center');
   await Promise.race([
     loginSubmit.waitFor({ state: 'visible' }),
@@ -37,7 +40,7 @@ export async function login(page: Page): Promise<void> {
     const sessionResponse = await page.request.get('/api/auth/me');
     if (sessionResponse.ok()) {
       await expect(controlCenter).toBeVisible();
-      await expect(page.locator('[data-testid="login-submit"], button[type="submit"]')).toHaveCount(0);
+      await expect(page.locator('button[type="submit"]')).toHaveCount(0);
       await expect(page).toHaveURL((url) => url.pathname === '/');
       return;
     }
@@ -45,8 +48,8 @@ export async function login(page: Page): Promise<void> {
     loginRequired = true;
   }
   if (loginRequired) {
-    await page.fill('[data-testid="email"], input[type="email"]', ADMIN_EMAIL);
-    await page.fill('[data-testid="password"], input[type="password"]', ADMIN_PASSWORD);
+    await page.getByLabel('Email', { exact: true }).fill(credentials.email);
+    await page.getByLabel('Password', { exact: true }).fill(credentials.password);
     const loginResponsePromise = page.waitForResponse((response) => (
       response.request().method() === 'POST'
       && new URL(response.url()).pathname === '/api/auth/login'
@@ -54,11 +57,11 @@ export async function login(page: Page): Promise<void> {
     await loginSubmit.click();
     const loginResponse = await loginResponsePromise;
     if (!loginResponse.ok()) {
-      throw new Error(await safeLoginFailure(loginResponse));
+      throw new Error(await safeLoginFailure(loginResponse, credentials.password));
     }
     await expect(controlCenter).toBeVisible();
     await expect(loginSubmit).toBeHidden();
-    await expect(page.locator('[data-testid="login-submit"], button[type="submit"]')).toHaveCount(0);
+    await expect(page.locator('button[type="submit"]')).toHaveCount(0);
     await expect(page).toHaveURL((url) => url.pathname === '/');
   }
 }

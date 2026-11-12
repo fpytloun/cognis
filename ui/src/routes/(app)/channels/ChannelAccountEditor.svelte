@@ -25,6 +25,7 @@
   export let busy = false;
   export let mobile = false;
   export let isDirty = false;
+  export let onlyChannel = false;
   export let onClose: () => void;
   export let onSelectType: (meta: ChannelMeta) => void;
   export let onSave: () => void;
@@ -63,9 +64,11 @@
   <Card class="p-5">
     <div class="flex items-start justify-between gap-3">
       <div>
-        <h2 class="text-lg font-semibold text-strong">{mode === 'edit' ? 'Edit channel account' : 'Create channel account'}</h2>
+        <h2 id="channel-editor-title" class="text-lg font-semibold text-strong">{mode === 'edit' ? 'Edit channel account' : 'Create channel account'}</h2>
         <p class="mt-1 text-sm text-muted">
-          {mode === 'edit'
+          {selectedType?.channel_type === 'web'
+            ? 'Built into Cognis and always available for this agent.'
+            : mode === 'edit'
             ? 'Update settings, policies, executor placement, or rotate stored credentials.'
             : 'Choose a platform, then follow the adapter-specific setup steps.'}
         </p>
@@ -73,7 +76,7 @@
       {#if mobile || mode !== 'closed'}
         <!-- On mobile the editor is a full-screen overlay; the Close button
              needs a generous tap target. On desktop it stays compact. -->
-        <Button aria-label="Close channel editor" variant="secondary" size={mobile ? 'default' : 'sm'} onclick={onClose}>
+        <Button aria-label="Close channel editor" variant="secondary" size={mobile ? 'default' : 'sm'} onclick={onClose} disabled={busy}>
           <ArrowLeft class="mr-2 h-4 w-4" /> Close
         </Button>
       {/if}
@@ -81,12 +84,25 @@
 
     {#if mode !== 'edit'}
       <div class="mt-5">
-        <ChannelTypePicker {channelTypes} {selectedType} onSelect={onSelectType} />
+        <ChannelTypePicker channelTypes={channelTypes.filter((meta) => meta.channel_type !== 'web')} {selectedType} onSelect={onSelectType} />
       </div>
     {/if}
   </Card>
 
-  {#if selectedType}
+  {#if selectedType?.channel_type === 'web'}
+    <Card class="space-y-4 p-5">
+      <p class="text-sm text-secondary">Cognis app is always enabled. This channel uses the agent's main app chat.</p>
+      <label class="flex items-start gap-3 text-sm text-secondary">
+        <input bind:checked={draft.preferred_for_task_delivery} disabled={onlyChannel || busy} type="checkbox" class="mt-0.5 h-4 w-4" />
+        Use Cognis app as this agent's preferred channel.
+      </label>
+      <p class="text-sm text-muted">Managed by Cognis; it cannot be added, removed, or disabled.</p>
+      {#if onlyChannel}
+        <p class="text-sm text-muted">Selected automatically because this agent has no other channels.</p>
+      {/if}
+      <Button onclick={onSave} disabled={busy || !isDirty}>Save preference</Button>
+    </Card>
+  {:else if selectedType}
     <ChannelSetupGuide {guide} docsUrl={selectedType.docs_url} />
 
     <Card class="p-5">
@@ -174,7 +190,7 @@
           <textarea
             bind:value={draft.allowed_senders}
             rows="3"
-            placeholder="@alice:matrix.example.com, @bob:matrix.example.com"
+            placeholder="@filip:fpy.cz, @teammate:matrix.org"
             class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground"
           ></textarea>
           <span class="text-xs text-quiet">
@@ -190,7 +206,7 @@
         <label class="flex items-start gap-3 rounded-2xl border border-accent/20 bg-accent-subtle px-4 py-3 text-sm text-accent">
           <input bind:checked={draft.preferred_for_task_delivery} type="checkbox" class="mt-0.5 h-4 w-4 rounded border-control-border bg-surface" />
           <span>
-            Use this account as the preferred task delivery channel.
+            Use this account as the preferred channel for this agent.
             <span class="mt-1 block text-xs text-accent/75">Only one channel account per agent is preferred; saving this will replace the previous preference.</span>
           </span>
         </label>

@@ -77,6 +77,7 @@ export interface SourceRef {
 }
 
 export interface FileDiffRef {
+  feedback_source?: Extract<import('$lib/feedback/types').FeedbackSourceRef, { kind: 'work_diff' }> | null;
   path: string;
   diff: string;
   occurred_at?: string | null;
@@ -155,6 +156,8 @@ export interface WorkstreamRef {
 
 export interface WorkDeliverable {
   deliverable_id: string;
+  created_at?: string | null;
+  updated_at?: string | null;
   lineage_id?: string | null;
   revision?: number | null;
   sort_key?: string;
@@ -244,6 +247,11 @@ export interface WorkCommandEvent {
 
 export interface WorkArtifact {
   artifact_id: string;
+  lineage_id?: string | null;
+  revision?: number | null;
+  latest_revision?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
   sort_key?: string;
   filename: string;
   mime_type?: string | null;
@@ -418,12 +426,21 @@ interface TimelineItemBase {
   stable: boolean;
 }
 
+export interface TaskOutcomeReference {
+  task_id: string;
+  title: string;
+  status: string;
+  attempt_number: number;
+}
+
 export interface MessageTimelineItem extends TimelineItemBase {
   kind: 'message';
   role: 'user' | 'assistant' | 'system';
   content: string;
   message_id: string;
+  task_outcome?: TaskOutcomeReference | null;
   client_message_id?: string | null;
+  message_metadata?: import('$lib/types/api').MessageMetadata | null;
   client_txn_id?: string | null;
   turn_id?: string | null;
   assistant_phase_index?: number | null;
@@ -478,6 +495,11 @@ export interface ToolCallTimelineItem extends TimelineItemBase {
   kind: 'tool_call';
   call_id: string;
   tool_name: string;
+  parent_call_id?: string | null;
+  program_id?: string | null;
+  kernel_generation?: string | number | null;
+  /** Timeline-only children derived from parent_call_id; never sent by the API. */
+  program_children?: ToolCallTimelineItem[];
   display_name?: string | null;
   turn_id?: string | null;
   assistant_phase_index?: number | null;
@@ -541,6 +563,10 @@ export interface TaskTimelineItem extends TimelineItemBase {
   status: TimelineItemStatus;
   result_summary?: string | null;
   deliverable_ids: string[];
+  attempt_number: number;
+  failure_reason?: string | null;
+  partial_result?: import('$lib/types/api').TaskOutputPresentation | null;
+  attachments: AttachmentRef[];
 }
 
 export interface QuestionSetTimelineItem extends TimelineItemBase {
@@ -641,6 +667,8 @@ export interface RecapTimelineItem extends TimelineItemBase {
 
 export interface AssistantDeliverableTimelineItem extends TimelineItemBase {
   kind: 'assistant_deliverable';
+  task_outcome?: TaskOutcomeReference | null;
+  turn_id?: string | null;
   deliverable_id: string;
   lineage_id?: string | null;
   revision?: number | null;
@@ -649,6 +677,7 @@ export interface AssistantDeliverableTimelineItem extends TimelineItemBase {
   content?: string | null;
   render_metadata?: Record<string, unknown> | null;
   export_metadata?: Record<string, unknown> | null;
+  deliverable?: import('$lib/types/api').Deliverable | null;
 }
 
 export interface NoticeTimelineItem extends TimelineItemBase {
@@ -732,6 +761,7 @@ export interface TurnCycleState {
 
 export interface TimelineWindow {
   items: TimelineItem[];
+  history_window_reduced?: boolean;
   cycle_states?: TurnCycleState[];
   has_more_before: boolean;
   before_cursor?: string | null;
@@ -739,6 +769,7 @@ export interface TimelineWindow {
 
 export interface RuntimeActiveTurn {
   turn_id: string;
+  primary_client_message_id?: string | null;
   session_id: string;
   status: 'starting' | 'running' | 'waiting' | 'cancelling';
   chat_mode?: ChatMode | null;
@@ -884,6 +915,7 @@ export interface SendMessageV2Request {
   content: string;
   attachments: AttachmentRef[];
   chat_mode?: ChatMode | null;
+  feedback?: import('$lib/feedback/types').IncludedFeedback | null;
 }
 
 export interface CommandV2Response {
@@ -894,6 +926,19 @@ export interface CommandV2Response {
   text: string;
   data: Record<string, unknown>;
   server_time: string;
+}
+
+export interface MessageAdmissionV2Response {
+  conversation_id: string;
+  client_txn_id: string;
+  client_message_id: string;
+  turn_id: string;
+  status: 'queued' | 'claimed' | 'running' | 'absorbing' | 'recoverable'
+    | 'completed' | 'failed' | 'cancelled' | 'absorbed' | 'ambiguous';
+  started: boolean;
+  input_persisted?: boolean;
+  admission_order: number;
+  before_client_message_id: string | null;
 }
 
 export interface SendMessageV2Response {
@@ -952,6 +997,7 @@ export interface RetryTurnV2Response {
 }
 
 export interface TimelineBackfillResponse {
+  history_window_reduced?: boolean;
   schema_version: ChatV2SchemaVersion;
   projection_version: string;
   scope?: TimelineScope;

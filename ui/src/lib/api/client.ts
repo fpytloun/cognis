@@ -1,6 +1,8 @@
 import { apiUrl } from '$lib/config';
+import type { SpeechCapabilities, SpeechStreamEvent } from '$lib/speech';
 import type { EntityKind, PalettePage } from '$lib/palette/model';
 import type { VideoJob, VideoPolicy } from '$lib/video';
+import type { AudioJob } from '$lib/types/api';
 import { libraryQuery, type LibraryFilters, type LibraryKind, type LibraryItem, type LibraryPage, type LibraryGroupsPage } from '$lib/library';
 import type { AgentHook, HookAssignment, HookDefinition, HookRun } from '$lib/hooks';
 import { documentCoordination, StaleDocumentError } from '$lib/document-coordination';
@@ -119,6 +121,7 @@ import type {
   ProviderTestResult,
   PairingRequest,
   AgentProjectAssignment,
+  AgentSkillUsage,
   ResourceVisibility,
   ExecutorScope,
   Project,
@@ -234,7 +237,7 @@ async function readError(response: Response, signal?: AbortSignal | null): Promi
   return new ApiError(`Request failed with status ${response.status}`, { status: response.status });
 }
 
-async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+export async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { coalesceMetadata, invalidationOwner = 'transport', ...requestOptions } = options;
   if (coalesceMetadata) {
     const lease = documentCoordination().capture();
@@ -440,6 +443,44 @@ function rememberExecutorConfigVersion(executor: ExecutorConfig): ExecutorConfig
 }
 
 export const api = {
+  appContacts: {
+    get(id: string, options: { signal?: AbortSignal } = {}): Promise<import('$lib/app-contacts').AppContactView> {
+      return request(`/api/v1/app-contacts/${encodeURIComponent(id)}`, options);
+    },
+    reply(id: string, content: string, clientMessageId: string): Promise<{ status: 'accepted' }> {
+      return request(`/api/v1/app-contacts/${encodeURIComponent(id)}/replies`, {
+        method: 'POST', body: JSON.stringify({ content, client_message_id: clientMessageId }),
+      });
+    },
+    end(id: string, blockSender: boolean): Promise<{ status: 'ended' }> {
+      return request(`/api/v1/app-contacts/${encodeURIComponent(id)}/end`, {
+        method: 'POST', body: JSON.stringify({ block_sender: blockSender }),
+      });
+    },
+    attachment(href: string): Promise<{ url: string }> {
+      return request(href);
+    },
+  },
+  audioJobs: {
+    estimates(contentRef: string, options: { signal?: AbortSignal } = {}): Promise<import('$lib/types/api').PodcastLengthEstimate[]> {
+      return request(`/api/v1/audio/jobs/estimates?${new URLSearchParams({ content_ref: contentRef })}`, options);
+    },
+    context(contentRef: string, options: { signal?: AbortSignal } = {}): Promise<import('$lib/types/api').DocumentAudioContext> {
+      return request(`/api/v1/audio/jobs/source?${new URLSearchParams({ content_ref: contentRef })}`, options);
+    },
+    list(deliverableId: string, options: { signal?: AbortSignal } = {}): Promise<AudioJob[]> {
+      return request(`/api/v1/audio/jobs?deliverable_id=${encodeURIComponent(deliverableId)}`, options);
+    },
+    create(payload: import('$lib/types/api').AudioJobCreateRequest, options: { signal?: AbortSignal } = {}): Promise<AudioJob> {
+      return request('/api/v1/audio/jobs', { ...options, method: 'POST', body: JSON.stringify(payload) });
+    },
+    get(jobId: string, options: { signal?: AbortSignal } = {}): Promise<AudioJob> {
+      return request(`/api/v1/audio/jobs/${encodeURIComponent(jobId)}`, options);
+    },
+    cancel(jobId: string): Promise<AudioJob> {
+      return request(`/api/v1/audio/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+    }
+  },
   artifactDocuments: {
     source(ref: string): Promise<import('$lib/artifact-authoring').EditableArtifact> {
       return request(`/api/v1/library/artifacts/${encodeURIComponent(ref)}/edit`);
@@ -460,14 +501,23 @@ export const api = {
     sharing(kind: string, ref: string): Promise<import('$lib/artifact-authoring').DocumentAccess> {
       return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/sharing`);
     },
-    setSharing(kind: string, ref: string, agentIds: string[]): Promise<import('$lib/artifact-authoring').DocumentAccess> {
-      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/sharing`, { method: 'PUT', body: JSON.stringify({ agent_ids: agentIds }) });
+    people(kind: 'artifact' | 'deliverable', ref: string): Promise<import('$lib/document-people').DocumentPeople> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/people`);
+    },
+    setPerson(kind: 'artifact' | 'deliverable', ref: string, body: import('$lib/document-people').DocumentPersonRequest): Promise<import('$lib/document-people').DocumentPeople> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/people`, { method: 'PUT', body: JSON.stringify(body) });
+    },
+    setSharing(kind: string, ref: string, agentIds: string[], writeAgentIds: string[] = []): Promise<import('$lib/artifact-authoring').DocumentAccess> {
+      return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/sharing`, { method: 'PUT', body: JSON.stringify({ agent_ids: agentIds, write_agent_ids: writeAgentIds }) });
     },
     publicLink(kind: string, ref: string, options: import('$lib/artifact-authoring').PublicLinkOptions): Promise<import('$lib/artifact-authoring').PublicLink> {
       return request(`/api/v1/library/items/${kind}/${encodeURIComponent(ref)}/public-link`, { method: 'POST', body: JSON.stringify(options) });
     },
   },
   library: {
+    commentCounts(refs: string[]): Promise<{ counts: Record<string, number> }> {
+      return request('/api/v1/library/comment-counts', { method: 'POST', body: JSON.stringify({ refs }) });
+    },
     favorite(kind: LibraryKind, id: string, favorite: boolean): Promise<LibraryItem> {
       return request(`/api/v1/library/items/${kind}/${encodeURIComponent(id)}/favorite`, { method: 'PUT', body: JSON.stringify({ favorite }) });
     },
@@ -623,7 +673,7 @@ export const api = {
       const params = new URLSearchParams({ q: query, limit: '24' });
       for (const type of types ?? []) params.append('types', type);
       if (cursor) params.set('cursor', cursor);
-      return request(`/api/v1/search/palette?${params}`, { signal, timeoutMs: 5000 });
+      return request(`/api/v1/search/palette?${params}`, { signal, timeoutMs: 20_000 });
     },
     health(): Promise<SearchHealth> {
       return request<SearchHealth>('/api/v1/search/health');
@@ -794,6 +844,7 @@ export const api = {
     create(payload: {
       agent_id: string;
       agent_profile_id?: string | null;
+      agent_profile_mode?: 'auto' | 'default' | null;
       title?: string | null;
       context?: Record<string, unknown>;
       project_id?: string | null;
@@ -880,6 +931,7 @@ export const api = {
     resolve(payload: {
       agent_id: string;
       agent_profile_id?: string | null;
+      agent_profile_mode?: 'auto' | 'default' | null;
       context_type?: string;
       scope?: 'latest' | 'agent_direct';
     }): Promise<Conversation> {
@@ -923,7 +975,7 @@ export const api = {
 
     list(
       cursor: string | null = null,
-      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean }
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean; include_contacts?: boolean }
     ): Promise<CursorPage<Agent>> {
       return request<CursorPage<Agent>>(
         `/api/v1/agents${encodeQuery({ cursor, limit: 100, ...params })}`,
@@ -932,7 +984,7 @@ export const api = {
     },
 
     async listAll(
-      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean }
+      params?: { agent_type?: string; include_hidden?: boolean; include_system?: boolean; include_disabled?: boolean; include_contacts?: boolean }
     ): Promise<Agent[]> {
       return collectCursorPages((cursor) => this.list(cursor, params));
     },
@@ -1008,6 +1060,10 @@ export const api = {
 
     listBindings(agentId: string): Promise<string[]> {
       return request<string[]>(`/api/v1/agents/${agentId}/bindings`);
+    },
+
+    skillUsage(agentId: string): Promise<AgentSkillUsage[]> {
+      return request<AgentSkillUsage[]>(`/api/v1/agents/${encodeURIComponent(agentId)}/skill-usage`);
     },
 
     replaceBindings(agentId: string, secondaryAgentIds: string[]): Promise<{ ok: boolean }> {
@@ -1957,10 +2013,21 @@ export const api = {
       });
     },
 
+    /** Get or create the task's control chat. */
     controlChat(taskId: string): Promise<TaskControlChatResponse> {
       return request<TaskControlChatResponse>(`/api/v1/tasks/${taskId}/control-chat`, {
         method: 'POST'
       });
+    },
+
+    /** The existing control chat, or null when none was opened yet. Never creates one. */
+    async existingControlChat(taskId: string): Promise<TaskControlChatResponse | null> {
+      try {
+        return await request<TaskControlChatResponse>(`/api/v1/tasks/${taskId}/control-chat`);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 'control_chat_not_created') return null;
+        throw error;
+      }
     },
 
     stepChat(taskId: string, stepRunId: string): Promise<TaskChatResponse> {
@@ -2562,12 +2629,87 @@ export const api = {
   },
 
   tts: {
-    synthesize(payload: TtsSynthesizeRequest, opts: { signal?: AbortSignal } = {}): Promise<TtsSynthesizeResponse> {
+    voices(target?: { provider_id?: string; model?: string }): Promise<{ provider_id: string; model: string; default_voice: string; voices: Array<{ voice_id: string; name: string }> }> {
+      const query = new URLSearchParams();
+      if (target?.provider_id) query.set('provider_id', target.provider_id);
+      if (target?.model) query.set('model', target.model);
+      return request(`/api/v1/tts/voices${query.size ? `?${query}` : ''}`);
+    },
+    capabilities(agentId?: string): Promise<SpeechCapabilities> {
+      const query = agentId ? `?${new URLSearchParams({ agent_id: agentId })}` : '';
+      return request(`/api/v1/tts/capabilities${query}`);
+    },
+    async *stream(payload: TtsSynthesizeRequest, opts: { signal?: AbortSignal; timeoutMs?: number } = {}): AsyncGenerator<SpeechStreamEvent> {
+      const lease = documentCoordination().capture();
+      const controller = new AbortController();
+      const signal = AbortSignal.any([controller.signal, lease.signal]);
+      const abort = () => controller.abort();
+      opts.signal?.addEventListener('abort', abort, { once: true });
+      if (opts.signal?.aborted) controller.abort();
+      const timer = setTimeout(abort, opts.timeoutMs ?? 600_000);
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      let releaseResponse: (() => void) | undefined;
+      const cancelRead = () => { void reader?.cancel(signal.reason).catch(() => {}); };
+      try {
+        await lease.validate();
+        signal.throwIfAborted();
+        const response = await fetchWithTimeout(apiUrl('/api/v1/tts/stream'), {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload), signal,
+        }, { timeoutMs: 0 });
+        releaseResponse = cancelResponseOnAbort(response, signal);
+        await lease.validate();
+        signal.throwIfAborted();
+        if (!response.ok || !response.body) throw new Error('Speech streaming failed');
+        reader = response.body.getReader();
+        releaseResponse();
+        releaseResponse = undefined;
+        signal.addEventListener('abort', cancelRead, { once: true });
+        signal.throwIfAborted();
+        const decoder = new TextDecoder();
+        let pending = '';
+        let complete = false;
+        while (true) {
+          const { value, done } = await reader.read();
+          await lease.validate();
+          signal.throwIfAborted();
+          pending += done ? decoder.decode() : decoder.decode(value, { stream: true });
+          let boundary: number;
+          while ((boundary = pending.indexOf('\n')) >= 0) {
+            const line = pending.slice(0, boundary);
+            pending = pending.slice(boundary + 1);
+            if (line.length > 131_072 || complete) throw new Error('Invalid speech stream');
+            if (!line) continue;
+            const event = JSON.parse(line) as SpeechStreamEvent;
+            await lease.validate();
+            signal.throwIfAborted();
+            if (event.type === 'error') throw new Error('Speech streaming failed');
+            complete = event.type === 'complete';
+            yield event;
+          }
+          if (pending.length > 131_072) throw new Error('Speech frame is too large');
+          if (done) {
+            if (pending.trim() || !complete) throw new Error('Speech ended before completion');
+            return;
+          }
+        }
+      } finally {
+        clearTimeout(timer);
+        opts.signal?.removeEventListener('abort', abort);
+        signal.removeEventListener('abort', cancelRead);
+        await reader?.cancel().catch(() => {});
+        reader?.releaseLock();
+        releaseResponse?.();
+        controller.abort();
+      }
+    },
+    synthesize(payload: TtsSynthesizeRequest, opts: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<TtsSynthesizeResponse> {
       return request<TtsSynthesizeResponse>('/api/v1/tts/synthesize', {
         method: 'POST',
         body: JSON.stringify(payload),
         signal: opts.signal,
-        timeoutMs: DISABLE_API_REQUEST_TIMEOUT_MS
+        timeoutMs: opts.timeoutMs ?? DISABLE_API_REQUEST_TIMEOUT_MS
       });
     }
   },

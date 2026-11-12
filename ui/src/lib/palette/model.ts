@@ -1,5 +1,5 @@
 import { settingsTabVisible, type SettingsTab } from '$lib/settings-navigation';
-import { navigationItems } from '$lib/navigation';
+import { availableNavigationItems } from '$lib/navigation';
 
 export const entityKinds = ['agent', 'project', 'conversation', 'task', 'schedule', 'deliverable', 'artifact'] as const;
 export type EntityKind = typeof entityKinds[number];
@@ -70,12 +70,12 @@ const settingTabs: readonly (readonly [SettingsTab, string, string])[] = [
   ['system', 'System', 'configuration'],
   ['users', 'Users', 'accounts permissions'],
 ] as const;
-export function localItems(query: string, admin: boolean, canCreate = true): PaletteItem[] {
+export function localItems(query: string, admin: boolean, canCreate = true, usageEnabled = true): PaletteItem[] {
   const common = { project_id: null, agent_id: null, status: null, format: null, updated_at: '' };
   const actions: PaletteItem[] = canCreate ? [{
     ...common, kind: 'action', id: 'new-conversation', title: 'New conversation', href: '/chat/new',
   }] : [];
-  const pages: PaletteItem[] = query.trim() ? navigationItems
+  const pages: PaletteItem[] = query.trim() ? availableNavigationItems(usageEnabled)
     .filter(item => matches(`${item.label} ${item.aliases}`, query))
     .map(item => ({ ...common, kind: 'page', id: item.href, title: item.label, href: item.href })) : [];
   const settings: PaletteItem[] = settingTabs

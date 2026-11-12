@@ -1,13 +1,17 @@
 <script lang="ts">
   import Eye from 'lucide-svelte/icons/eye';
+  import DocumentCommentCount from './DocumentCommentCount.svelte';
+  import FeedbackHost from '$lib/components/feedback/FeedbackHost.svelte';
   import FileText from 'lucide-svelte/icons/file-text';
 
   import { api } from '$lib/api/client';
-  import { resolveHtmlPreviewUrl, type SignedHtmlPreview } from '$lib/attachments/html-preview';
+  import type { SignedHtmlPreview } from '$lib/attachments/html-preview';
+  import { documentCoordination, type DocumentLease } from '$lib/document-coordination';
   import { onDestroy } from 'svelte';
   import { previewKind } from '$lib/attachments/preview';
   import { attachmentUploads } from '$lib/chat-v2/attachment-uploads';
-  import ImageLightbox from '$lib/components/ImageLightbox.svelte';
+  import DeferredPrivateView from './ui/DeferredPrivateView.svelte';
+  import { imageLightbox } from './ui/private-view-definitions';
   import AttachmentSaveButton from './AttachmentSaveButton.svelte';
   import type { AttachmentRef } from '$lib/types/api';
 
@@ -149,16 +153,29 @@
   async function openPreview(attachment: AttachmentRef): Promise<void> {
     const request = ++previewRequest;
     previewController?.abort();
-    previewController = new AbortController();
+    const controller = new AbortController();
+    previewController = controller;
     const kind = previewKind(attachment);
     previewAttachment = null;
-    const htmlSource = kind === 'html'
-      ? await resolveHtmlPreviewUrl(attachment.artifact_id, previewController.signal).catch(() => null)
-      : null;
+    let htmlSource: SignedHtmlPreview | null = null;
+    if (kind === 'html') {
+      let lease: DocumentLease | null = null;
+      try {
+        lease = documentCoordination().capture();
+        const { resolveHtmlPreviewUrl } = await import('$lib/attachments/html-preview-private');
+        if (request !== previewRequest || controller.signal.aborted) return;
+        await lease.validate();
+        lease.signal.throwIfAborted();
+        controller.signal.throwIfAborted();
+        htmlSource = await resolveHtmlPreviewUrl(attachment.artifact_id, controller.signal);
+      } catch {
+        if (lease?.signal.aborted || controller.signal.aborted) return;
+      }
+    }
     const mediaUrl = ['pdf', 'video', 'audio'].includes(kind ?? '')
         ? await resolveAttachmentUrl(attachment, 'download')
         : null;
-    if (request !== previewRequest) return;
+    if (request !== previewRequest || controller.signal.aborted) return;
     previewHtmlSource = htmlSource;
     previewMediaUrl = mediaUrl;
     previewAttachment = attachment;
@@ -176,6 +193,7 @@
 {#if imageAttachments.length > 0}
   <div class="mt-3 flex flex-wrap gap-2">
     {#each imageAttachments as image, index (image.artifact_id)}
+      <div class="flex shrink-0 flex-col items-center gap-1">
       <button
         type="button"
         class="group relative h-24 w-24 shrink-0 overflow-hidden rounded-2xl border border-separator bg-inset transition hover:border-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent sm:h-28 sm:w-28"
@@ -208,6 +226,8 @@
           </span>
         {/if}
       </button>
+      <DocumentCommentCount id={image.artifact_id} />
+      </div>
     {/each}
   </div>
 {/if}
@@ -222,17 +242,21 @@
           <FileText class="h-4 w-4" />
         </span>
         <div class="min-w-0 flex-1">
-          {#if kind}
-            <button
-              type="button"
-              onclick={() => { void openPreview(attachment); }}
-              class="block truncate text-sm font-medium text-accent hover:text-accent-hover"
-            >
-              {attachment.filename}
-            </button>
-          {:else}
-            <p class="truncate text-sm font-medium text-foreground">{attachment.filename}</p>
-          {/if}
+          <!-- Long names scroll sideways without a visible scrollbar instead of overflowing the card.
+               A button shrinks to its text rather than stretching, so it sits inside the scroller. -->
+          <div class="scrollbar-hidden-x">
+            {#if kind}
+              <button
+                type="button"
+                onclick={() => { void openPreview(attachment); }}
+                class="text-left text-sm font-medium text-accent hover:text-accent-hover"
+              >
+                {attachment.filename}
+              </button>
+            {:else}
+              <p class="text-sm font-medium text-foreground">{attachment.filename}</p>
+            {/if}
+          </div>
           <p class="truncate text-xs text-secondary">
             {attachment.mime_type ?? 'file'}{sizeText ? ` · ${sizeText}` : ''}
             {#if isUploading(attachment)}
@@ -241,6 +265,7 @@
               <span class="text-danger" title={attachment.upload_error ?? 'Upload failed'}> · Upload paused</span>
             {/if}
           </p>
+          <DocumentCommentCount id={attachment.artifact_id} />
           {#if isUploading(attachment)}
             <span class="mt-1 block h-0.5 w-full overflow-hidden rounded bg-raised">
               <span class="block h-full bg-info transition-[width]" style={`width: ${uploadPercent(attachment)}%`}></span>
@@ -293,13 +318,11 @@
 
 {#if lightboxIndex !== null && imageAttachments[lightboxIndex]}
   {@const current = imageAttachments[lightboxIndex]}
-  <ImageLightbox
-    src={resolvedUrl(current, 'download') ?? ''}
-    alt={current.filename}
-    filename={current.filename}
-    images={lightboxImages}
-    index={lightboxIndex}
-    onIndexChange={(nextIndex) => { lightboxIndex = nextIndex; }}
-    onClose={closeLightbox}
-  />
+  <FeedbackHost source={current.artifact_id ? { kind: 'document', content_ref: current.artifact_id } : null}>
+  <DeferredPrivateView definition={imageLightbox} label="image preview" modal onClose={closeLightbox} viewProps={{
+    src: resolvedUrl(current, 'download') ?? '', alt: current.filename, filename: current.filename,
+    images: lightboxImages, index: lightboxIndex,
+    onIndexChange: (nextIndex) => { lightboxIndex = nextIndex; }, onClose: closeLightbox,
+  }} />
+  </FeedbackHost>
 {/if}

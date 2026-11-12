@@ -18,6 +18,8 @@ export interface DocumentLease {
   validate(): Promise<void>;
 }
 
+export type DocumentInvalidationReason = 'changed' | 'unavailable';
+
 export interface CoordinationEnvironment {
   storage?: Storage;
   indexedDB?: IDBFactory;
@@ -40,7 +42,7 @@ export class DocumentCoordination {
   private metadataQueue: Promise<unknown> = Promise.resolve();
   private controller = new AbortController();
   private verifiedAccount: string | null = null;
-  private readonly listeners = new Set<() => void>();
+  private readonly listeners = new Set<(reason: DocumentInvalidationReason) => void>();
   private readonly unsubscribe: () => void;
 
   constructor(private readonly environment: CoordinationEnvironment) {
@@ -63,7 +65,10 @@ export class DocumentCoordination {
         if (this.initialized || raw !== undefined) throw new StaleDocumentError();
         return { ...this.current, revision: 1 };
       });
-    } catch (error) { this.revoke(); throw error; }
+    } catch (error) {
+      this.revoke(error instanceof CoordinationUnavailableError ? 'unavailable' : 'changed');
+      throw error;
+    }
   }
 
   private checkEnvironment(): void {
@@ -71,14 +76,14 @@ export class DocumentCoordination {
       || this.environment.generation() !== this.generation) throw new StaleDocumentError();
   }
 
-  private revoke(): void {
+  private revoke(reason: DocumentInvalidationReason = 'changed'): void {
     this.controller.abort(new StaleDocumentError());
     this.controller = new AbortController();
     this.verifiedAccount = null;
     if (typeof navigator !== 'undefined') {
       navigator.serviceWorker?.controller?.postMessage({ type: 'REVOKE_MEDIA_SCOPE' });
     }
-    for (const listener of this.listeners) listener();
+    for (const listener of this.listeners) listener(reason);
   }
 
   private transaction(change: (raw: unknown) => ProfileIntent): Promise<ProfileIntent> {
@@ -104,7 +109,7 @@ export class DocumentCoordination {
       return state;
     } catch (error) {
       if (error instanceof StaleDocumentError) throw error;
-      this.revoke();
+      this.revoke('unavailable');
       throw new CoordinationUnavailableError();
     }
   }
@@ -115,7 +120,10 @@ export class DocumentCoordination {
         if (!validIntent(raw)) throw new StaleDocumentError();
         return raw;
       });
-    } catch (error) { this.revoke(); throw error; }
+    } catch (error) {
+      this.revoke(error instanceof CoordinationUnavailableError ? 'unavailable' : 'changed');
+      throw error;
+    }
   }
 
   private async update(lease: DocumentLease, change: (state: ProfileIntent) => ProfileIntent): Promise<void> {
@@ -189,7 +197,7 @@ export class DocumentCoordination {
     });
   }
 
-  onInvalidated(listener: () => void): () => void {
+  onInvalidated(listener: (reason: DocumentInvalidationReason) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }

@@ -1,10 +1,11 @@
 import { fireEvent, render as renderComponent, screen, within, waitFor } from '@testing-library/svelte';
 import { tick } from 'svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SUPPORTED_RICH_BLOCK_TYPES, type RichBlock } from '$lib/rich-deliverable';
 import { requireRichScenario } from '$lib/rich-scenarios/registry';
 import RichDeliverable from './RichDeliverable.svelte';
+import { installFind } from '$lib/find';
 
 const dailyPulseScenario = requireRichScenario('daily-pulse-v2');
 const richDeliverableVisualFixture = requireRichScenario('research-answer');
@@ -21,7 +22,58 @@ function render(_: typeof RichDeliverable, props: { payload: unknown; surface?: 
   return renderComponent(RichDeliverable, { surface: 'standalone', ...props });
 }
 
+class WideResizeObserver {
+  constructor(private readonly callback: ResizeObserverCallback) {}
+  observe() {
+    this.callback([{ contentRect: { width: 1280 } } as ResizeObserverEntry], this as unknown as ResizeObserver);
+  }
+  unobserve() {}
+  disconnect() {}
+}
+
+afterEach(() => vi.unstubAllGlobals());
+
 describe('RichDeliverable component rendering', () => {
+  it('opens fullscreen document find from Close, then dismisses find before the fullscreen view', async () => {
+    const rects = vi.spyOn(HTMLElement.prototype, 'getClientRects').mockReturnValue([
+      { width: 100, height: 30, top: 0, left: 0, right: 100, bottom: 30 },
+    ] as unknown as DOMRectList);
+    const stop = installFind();
+    try {
+      render(RichDeliverable, { surface: 'embedded', title: 'Searchable report', payload: { blocks: [{ type: 'markdown', content: 'Visible document text.' }] } });
+      await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
+      const modal = await screen.findByRole('dialog', { name: 'Searchable report' });
+      const close = within(modal).getByRole('button', { name: /^Close$/ });
+      close.focus();
+      await fireEvent.keyDown(close, { key: 'f', metaKey: true });
+      const field = await within(modal).findByRole('searchbox', { name: 'Find in document' });
+      await waitFor(() => expect(field).toHaveFocus());
+      expect(modal.querySelector('[data-find-toolbar]')).toContainElement(field);
+      await fireEvent.keyDown(field, { key: 'Escape' });
+      await waitFor(() => expect(within(modal).queryByRole('searchbox')).toBeNull());
+      expect(modal).toBeInTheDocument();
+      await waitFor(() => expect(close).toHaveFocus());
+      await fireEvent.keyDown(close, { key: 'Escape' });
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Searchable report' })).toBeNull());
+    } finally { stop(); rects.mockRestore(); }
+  });
+
+  it.each(['markdown', 'hero', 'section_header'])('uses an H2 for an inline document title (%s)', (type) => {
+    render(RichDeliverable, {
+      surface: 'embedded',
+      title: 'Step result',
+      content: 'Fallback',
+      payload: {
+        ...(type === 'section_header' ? { metadata: { presentation: 'dashboard' } } : {}),
+        blocks: [type === 'markdown'
+          ? { type, content: 'Result body.' }
+          : { type, title: 'Step result' }],
+      },
+    });
+    expect(screen.getByRole('heading', { name: 'Step result', level: 2 }).tagName).toBe('H2');
+    expect(screen.queryByRole('heading', { level: 1 })).toBeNull();
+  });
+
   it.each([false, true])('only applies the wide inline sidebar layout while the TOC is open (conversational=%s)', async (conversational) => {
     const resizeObserverDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'ResizeObserver');
     class WideResizeObserver {
@@ -81,12 +133,13 @@ describe('RichDeliverable component rendering', () => {
         shareLinkCallback,
       });
 
-      await waitFor(() => expect(screen.getByRole('button', { name: 'Share public link' })).toBeEnabled());
-      const share = screen.getByRole('button', { name: 'Share public link' });
+      await vi.dynamicImportSettled();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Share link' })).toBeEnabled());
+      const share = screen.getByRole('button', { name: 'Share link' });
       await fireEvent.click(share);
       expect(shareLinkCallback).not.toHaveBeenCalled();
-      expect(screen.getByRole('dialog', { name: 'Public link' })).toBeInTheDocument();
-      expect(screen.getByRole('combobox', { name: 'Public link validity' })).toHaveValue('7');
+      expect(screen.getByRole('dialog', { name: 'Share document' })).toBeInTheDocument();
+      expect(screen.getByRole('combobox', { name: 'Link access and expiration' })).toHaveValue('7');
       await fireEvent.click(screen.getByRole('button', { name: 'Create public link' }));
       await waitFor(() => expect(writeText).toHaveBeenCalledWith('https://cognis.example/share'));
 
@@ -98,7 +151,7 @@ describe('RichDeliverable component rendering', () => {
       expect(screen.getByTestId('rich-share-copied-icon')).toBeTruthy();
       expect(screen.queryByTestId('rich-share-icon')).toBeNull();
       await fireEvent.click(screen.getByRole('button', { name: 'Done' }));
-      expect(screen.queryByRole('dialog', { name: 'Public link' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('dialog', { name: 'Share link' })).not.toBeInTheDocument();
       await fireEvent.click(share);
       expect(screen.getByTestId('rich-share-icon')).toBeTruthy();
       expect(screen.queryByTestId('rich-share-copied-icon')).toBeNull();
@@ -194,15 +247,15 @@ describe('RichDeliverable component rendering', () => {
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(screen.queryByTestId('rich-deliverable-toc')).toBeNull();
     expect(screen.queryByText(/Figure 1\./)).toBeNull();
-    const image = screen.getByRole('img', { name: /Abstraktní ilustrace fiktivního města/ });
+    const image = screen.getByRole('img', { name: 'Abstraktní ilustrace fiktivního města' });
     expect(image).toHaveAttribute('width', '1600');
     expect(image).toHaveAttribute('height', '900');
-    expect(screen.getByText(/Cognis synthetic acceptance specimen/)).toBeTruthy();
+    expect(screen.getByText('Cognis synthetic acceptance specimen')).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Ukázkový den 16. dubna' })).toBeTruthy();
-    expect(screen.getByText('Kontrola demonstračních popisků')).toBeTruthy();
+    expect(screen.getByText('Zkontrolovat ukázkové popisky')).toBeTruthy();
     expect(screen.getByLabelText('Aktuální čas 08:20')).toBeTruthy();
     expect(screen.getByLabelText('Todoist úkoly')).toHaveTextContent('Vybrat demonstrační popisek');
-    expect(screen.getByText('Ověřit ukázkový katalog a pak pokračovat ve fiktivní expozici.')).toBeTruthy();
+    expect(screen.getByText('Fiktivní den předvádí přípravu a jednu bodovou kontrolu.')).toBeTruthy();
     expect(screen.getAllByText('Chart data table').length).toBeGreaterThan(0);
     expect(screen.getAllByRole('link', { name: 'Syntetický průběh teplot' })).toSatisfy(
       (links: HTMLElement[]) => links.every((link) => link.getAttribute('href') === 'https://example.org/pulse/weather'),
@@ -439,14 +492,14 @@ describe('RichDeliverable component rendering', () => {
       payload: richDeliverableVisualFixture.payload,
       content: richDeliverableVisualFixture.content,
       title: richDeliverableVisualFixture.title,
-      // "Open full view" is only shown for surface="embedded" (see below);
+      // "Open fullscreen" is only shown for surface="embedded" (see below);
       // this test asserts on that button so it must set surface explicitly.
       surface: 'embedded',
     });
 
     expect(screen.queryByText(richDeliverableVisualFixture.title)).toBeNull();
     expect(screen.getByRole('heading', {
-      level: 1,
+      level: 2,
       name: 'Managed, policy-driven agent tools beat naïve MCP for production workflows',
     })).toBeTruthy();
     expect(screen.getAllByText('Format comparison').length).toBeGreaterThan(0);
@@ -456,7 +509,7 @@ describe('RichDeliverable component rendering', () => {
     expect(screen.getByText('Confidence')).toBeTruthy();
     expect(screen.getAllByText('Sources used').length).toBeGreaterThan(0);
     expect(screen.queryByText(/Unsupported block:/)).toBeNull();
-    expect(screen.getByRole('button', { name: 'Open full view' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open fullscreen' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Copy document' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Raw/debug' })).toBeNull();
   });
@@ -594,7 +647,7 @@ describe('RichDeliverable component rendering', () => {
     expect(screen.getByText('Scope')).toBeTruthy();
     expect(screen.getByText('conversation')).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
     expect(screen.getByTestId('rich-deliverable-full-view')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
     expect(screen.queryByTestId('rich-deliverable-full-view')).toBeNull();
@@ -887,7 +940,7 @@ describe('RichDeliverable component rendering', () => {
         surface: 'embedded',
       });
 
-      await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+      await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
       await fireEvent.keyDown(screen.getByTestId('rich-deliverable-full-view'), { key: 'Escape' });
 
       expect(screen.queryByTestId('rich-deliverable-full-view')).toBeNull();
@@ -914,7 +967,7 @@ describe('RichDeliverable component rendering', () => {
       surface: 'embedded',
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
 
     const fullView = screen.getByTestId('rich-deliverable-full-view');
     expect(within(fullView).getByText('Visible fallback markdown')).toBeTruthy();
@@ -945,7 +998,7 @@ describe('RichDeliverable component rendering', () => {
     expect(container.querySelector(`#${namespace}-overview-2`)).toBeTruthy();
     expect(container.querySelector(`#${namespace}-rich-section-0`)).toBeTruthy();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
 
     // The full-view overlay is portaled to document.body (see `use:portal`
     // in RichDeliverable.svelte) so it can escape the component's isolated
@@ -1020,7 +1073,7 @@ describe('RichDeliverable component rendering', () => {
     const namespace = container.querySelector<HTMLElement>('[data-rich-instance]')?.dataset.richInstance;
 
     expect(container.querySelector(`h2#${namespace}-primary-markdown`)?.textContent).toBe('Primary Markdown');
-    expect(container.querySelector(`h2#${namespace}-tertiary-markdown`)?.textContent).toBe('Tertiary Markdown');
+    expect(container.querySelector(`h4#${namespace}-tertiary-markdown`)?.textContent).toBe('Tertiary Markdown');
     expect(container.querySelector(`h3#${namespace}-nested-markdown`)?.textContent).toBe('Nested Markdown');
     expect(container.querySelectorAll(`#${namespace}-primary-markdown`)).toHaveLength(1);
     expect(container.querySelector(`#${namespace}-primary-markdown`)?.getAttribute('tabindex')).toBe('-1');
@@ -1089,6 +1142,7 @@ describe('RichDeliverable component rendering', () => {
   });
 
   it('namespaces two identical deliverables and keeps controls local to each instance', async () => {
+    vi.stubGlobal('ResizeObserver', WideResizeObserver);
     const payload = {
       metadata: { toc: true },
       sources: [{ id: 'source', title: 'Source' }],
@@ -1105,6 +1159,7 @@ describe('RichDeliverable component rendering', () => {
     };
     const first = render(RichDeliverable, { payload, content: 'Fallback', instanceId: 'same-deliverable' });
     const second = render(RichDeliverable, { payload, content: 'Fallback', instanceId: 'same-deliverable' });
+    await tick();
     const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-rich-instance]'));
     const namespaces = roots.map((root) => root.dataset.richInstance);
     const ids = Array.from(document.querySelectorAll<HTMLElement>('[id]')).map((element) => element.id);
@@ -1127,6 +1182,7 @@ describe('RichDeliverable component rendering', () => {
   });
 
   it('keeps desktop TOC navigation instance-local', async () => {
+    vi.stubGlobal('ResizeObserver', WideResizeObserver);
     const payload = {
       metadata: { toc: true },
       blocks: [
@@ -1137,6 +1193,7 @@ describe('RichDeliverable component rendering', () => {
     };
     const first = render(RichDeliverable, { payload, content: 'Fallback', instanceId: 'same-deliverable' });
     const second = render(RichDeliverable, { payload, content: 'Fallback', instanceId: 'same-deliverable' });
+    await tick();
     const roots = Array.from(document.querySelectorAll<HTMLElement>('[data-rich-instance]'));
     const secondToc = within(roots[1]).getByTestId('rich-deliverable-toc');
 
@@ -1149,7 +1206,7 @@ describe('RichDeliverable component rendering', () => {
     second.unmount();
   });
 
-  it('mounts compact desktop TOCs with one hamburger trigger per embedded deliverable, no duplicates', () => {
+  it('mounts compact TOCs with one hamburger trigger per embedded deliverable, no duplicates', async () => {
     const payload = {
       metadata: { toc: true },
       blocks: [
@@ -1166,8 +1223,13 @@ describe('RichDeliverable component rendering', () => {
     }));
 
     expect(screen.queryAllByTestId('rich-deliverable-toc')).toHaveLength(5);
-    expect(screen.queryAllByRole('navigation', { name: 'Table of contents' })).toHaveLength(5);
-    expect(screen.getAllByText('Contents')).toHaveLength(5);
+    for (const trigger of screen.getAllByRole('button', { name: 'Open table of contents' })) {
+      await fireEvent.click(trigger);
+      const drawer = screen.getByRole('dialog', { name: 'Table of contents' });
+      expect(screen.getAllByRole('dialog', { name: 'Table of contents' })).toHaveLength(1);
+      expect(within(drawer).getByText('Contents')).toBeVisible();
+      await fireEvent.click(within(drawer).getByRole('button', { name: 'Close table of contents' }));
+    }
     // The hamburger trigger is no longer restricted to surface="standalone"
     // (that restriction was the bug: embedded chat deliverables had no way
     // to open their TOC at all). It is width-driven via CSS, not surface --
@@ -1177,7 +1239,8 @@ describe('RichDeliverable component rendering', () => {
     mounted.forEach((component) => component.unmount());
   });
 
-  it('renders title-only hierarchical TOC and a safe inline figure', () => {
+  it('renders title-only hierarchical TOC and a safe inline figure', async () => {
+    vi.stubGlobal('ResizeObserver', WideResizeObserver);
     const safeSvg = 'data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 320 100%22%3E%3Crect width=%22320%22 height=%22100%22 fill=%22%23eee%22/%3E%3C/svg%3E';
     const { container } = render(RichDeliverable, {
       payload: {
@@ -1201,6 +1264,7 @@ describe('RichDeliverable component rendering', () => {
       },
       content: 'Fallback',
     });
+    await tick();
     const desktopToc = container.querySelector('[data-testid="rich-deliverable-toc"] nav');
     const image = screen.getByRole('img', { name: 'Three-stage renderer pipeline' });
 
@@ -1213,7 +1277,8 @@ describe('RichDeliverable component rendering', () => {
     expect(screen.getByText(/Canonical payload reaches chat and PDF/)).toBeTruthy();
   });
 
-  it('renders one document identity and one TOC navigation for a long report', () => {
+  it('renders one document identity and one TOC navigation for a long report', async () => {
+    vi.stubGlobal('ResizeObserver', WideResizeObserver);
     render(RichDeliverable, {
       title: 'Outer publication title',
       content: 'Fallback',
@@ -1230,6 +1295,7 @@ describe('RichDeliverable component rendering', () => {
       },
     });
 
+    await tick();
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(screen.queryByText('Outer publication title')).toBeNull();
     expect(screen.getAllByRole('navigation', { name: 'Table of contents' })).toHaveLength(1);
@@ -1265,6 +1331,7 @@ describe('RichDeliverable component rendering', () => {
   });
 
   it('keeps the canonical desktop TOC mounted after repeated navigation', async () => {
+    vi.stubGlobal('ResizeObserver', WideResizeObserver);
     render(RichDeliverable, {
       title: 'Contextual lifecycle report',
       content: 'Fallback',
@@ -1362,7 +1429,7 @@ describe('RichDeliverable component rendering', () => {
     expect(container.querySelector('.rich-hero img')).toBeNull();
   });
 
-  it('shows "Open full view" and "Open standalone page" only for surface="embedded"', () => {
+  it('shows "Open fullscreen" and "Open standalone page" only for surface="embedded"', () => {
     const { unmount } = render(RichDeliverable, {
       title: 'Standalone surface',
       content: 'Fallback',
@@ -1371,7 +1438,7 @@ describe('RichDeliverable component rendering', () => {
       payload: { blocks: [{ type: 'markdown', content: 'Body' }] },
     });
 
-    expect(screen.queryByRole('button', { name: 'Open full view' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Open fullscreen' })).toBeNull();
     expect(screen.queryByRole('link', { name: 'Open standalone page' })).toBeNull();
     unmount();
 
@@ -1383,7 +1450,7 @@ describe('RichDeliverable component rendering', () => {
       payload: { blocks: [{ type: 'markdown', content: 'Body' }] },
     });
 
-    expect(screen.getByRole('button', { name: 'Open full view' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open fullscreen' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'Open standalone page' })).toBeTruthy();
   });
 });

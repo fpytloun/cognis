@@ -1,5 +1,88 @@
 import { expect, test } from '@playwright/test';
 
+for (const surface of ['inline', 'inline-task']) {
+  test(`${surface} paints the styled body on the first frame with optional scripts blocked`, async ({ page }) => {
+    await page.goto(`/chat-deliverable-fixture?${surface}&client&activity`);
+    await expect(page.getByRole('button', { name: 'Show deliverable' })).toBeEnabled();
+    await page.evaluate(() => document.fonts.ready);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const heldScripts: string[] = [];
+    await page.route(/\.js(?:\?|$)/, async route => {
+      heldScripts.push(route.request().url());
+      await gate;
+      await route.continue();
+    });
+    try {
+      const first = await page.evaluate(async () => {
+        document.querySelector<HTMLButtonElement>('[data-testid="show-client-deliverable"]')!.click();
+        await new Promise(requestAnimationFrame);
+        const body = document.querySelector<HTMLElement>('.rich-inline-document');
+        if (!body) return null;
+        (window as typeof window & { firstPaintBody?: HTMLElement }).firstPaintBody = body;
+        const root = body.closest<HTMLElement>('.rich-deliverable')!;
+        return {
+          text: body.textContent,
+          height: body.getBoundingClientRect().height,
+          densityGap: getComputedStyle(root).getPropertyValue('--rich-density-gap').trim(),
+        };
+      });
+      expect(first).not.toBeNull();
+      expect(first!.text).toContain('Queued messages delivered once');
+      expect(first!.height).toBeGreaterThan(250);
+      expect(first!.densityGap).not.toBe('');
+      if (surface === 'inline-task') {
+        await expect(page.getByText('Loading task activity…')).toBeVisible();
+        await expect.poll(() => heldScripts.length).toBeGreaterThan(0);
+      }
+      release();
+      await page.unrouteAll({ behavior: 'wait' });
+      if (surface === 'inline-task') {
+        await expect(page.getByText('Loading task activity…')).toHaveCount(0);
+      }
+      await page.evaluate(() => document.fonts.ready);
+      const settled = await page.evaluate(() => {
+        const body = document.querySelector<HTMLElement>('.rich-inline-document')!;
+        return {
+          sameNode: body === (window as typeof window & { firstPaintBody?: HTMLElement }).firstPaintBody,
+          height: body.getBoundingClientRect().height,
+        };
+      });
+      expect(settled.sameNode).toBe(true);
+      expect(settled.height).toBeCloseTo(first!.height, 0);
+    } finally {
+      release();
+      await page.unrouteAll({ behavior: 'wait' });
+    }
+  });
+}
+
+for (const surface of ['inline', 'inline-task']) {
+  test(`${surface} renders the supplied result without document or activity requests`, async ({ page }) => {
+    const requests: string[] = [];
+    await page.route(/\/api\/v1\/(?:deliverables|chat\/v2)\//, async route => {
+      requests.push(route.request().url());
+      await route.abort();
+    });
+    await page.addInitScript(() => {
+      const state = window as typeof window & { sawDeliverableLoading?: boolean };
+      state.sawDeliverableLoading = false;
+      new MutationObserver(() => {
+        if (document.body?.textContent?.includes('Loading deliverable…')) {
+          state.sawDeliverableLoading = true;
+        }
+      }).observe(document, { childList: true, subtree: true });
+    });
+    await page.goto(`/chat-deliverable-fixture?${surface}`);
+    await expect(page.getByText('Queued messages delivered once')).toBeVisible();
+    await expect(page.getByTestId('rich-deliverable')).toBeVisible();
+    expect(requests).toEqual([]);
+    expect(await page.evaluate(() =>
+      (window as typeof window & { sawDeliverableLoading?: boolean }).sawDeliverableLoading
+    )).toBe(false);
+  });
+}
+
 for (const family of ['classic', 'paper'] as const) {
   for (const mode of ['light', 'dark'] as const) {
     test(`${family} ${mode} chat deliverable`, async ({ page }) => {
@@ -22,27 +105,24 @@ for (const family of ['classic', 'paper'] as const) {
       const styles = await rich.evaluate(element => {
         const style = getComputedStyle(element);
         const prose = getComputedStyle(element.querySelector('.rich-markdown')!);
-        const assistant = getComputedStyle(document.querySelector('.chat-markdown')!);
         return {
           background: style.backgroundColor, border: style.borderTopWidth,
           prose: [prose.fontFamily, prose.fontSize, prose.color],
-          assistant: [assistant.fontFamily, assistant.fontSize, assistant.color],
           left: element.querySelector('.rich-markdown')!.getBoundingClientRect().left,
-          assistantLeft: document.querySelector('.chat-markdown')!.getBoundingClientRect().left,
+          documentLeft: element.getBoundingClientRect().left,
           overflow: element.scrollWidth > element.clientWidth,
         };
       });
       expect(styles.background).toBe('rgba(0, 0, 0, 0)');
       expect(styles.border).toBe('0px');
-      expect(styles.prose).toEqual(styles.assistant);
-      expect(Math.abs(styles.left - styles.assistantLeft)).toBeLessThan(1);
+      expect(styles.left).toBeGreaterThanOrEqual(styles.documentLeft);
       expect(styles.overflow).toBe(false);
       const footer = page.getByTestId('chat-document-footer');
       expect(await footer.evaluate(element => element.previousElementSibling?.classList.contains('rich-inline-document'))).toBe(true);
       const actions = footer.getByRole('navigation', { name: 'Document actions' });
       expect(Math.abs((await actions.boundingBox())!.x + (await actions.boundingBox())!.width - (await rich.boundingBox())!.x - (await rich.boundingBox())!.width)).toBeLessThan(1);
       await expect(actions.getByRole('button', { name: 'Open fullscreen' })).toHaveText('');
-      await expect(actions.getByRole('button', { name: 'Share public link' })).toBeVisible();
+      await expect(actions.getByRole('button', { name: 'Share link' })).toBeVisible();
       await expect(footer.getByRole('link', { name: 'Open in Library ↗' })).toHaveCount(0);
       await footer.getByTitle('More document actions').click();
       await expect(footer.getByRole('button', { name: 'Copy document' })).toBeVisible();
@@ -52,6 +132,10 @@ for (const family of ['classic', 'paper'] as const) {
       await footer.getByRole('button', { name: 'Open fullscreen' }).click();
       const full = page.getByTestId('rich-deliverable-full-view');
       await expect(full.getByTestId('rich-viewer-chrome')).toBeVisible();
+      expect(await full.locator('[data-rich-block-type="markdown"]').evaluate(element => {
+        const style = getComputedStyle(element);
+        return [style.fontFamily, style.fontSize, style.color];
+      })).toEqual(styles.prose);
       await expect(full).not.toHaveClass(/conversational/);
       await full.getByRole('button', { name: 'Close', exact: true }).click();
       await expect(rich.getByRole('heading', { name: 'Release readiness' })).toHaveCount(1);
@@ -64,8 +148,10 @@ test('chat document actions and tables remain contained on a narrow screen', asy
   await page.goto('/chat-deliverable-fixture');
   await expect(page.getByTestId('chat-document-footer')).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
-  await page.getByTitle('Download document').click();
-  await expect(page.getByRole('link', { name: 'PDF', exact: true })).toBeVisible();
+  await page.getByTitle('More document actions').click();
+  const pdf = page.getByRole('link', { name: 'Download PDF', exact: true });
+  await expect(pdf).toBeVisible();
+  await expect(pdf).toHaveAttribute('download', '');
 });
 
 test('chat contents uses a collapsible area sidebar and adapts to host width', async ({ page }) => {

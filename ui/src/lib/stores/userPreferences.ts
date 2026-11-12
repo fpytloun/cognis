@@ -45,9 +45,12 @@ function current(scope: PreferenceOwner): boolean {
   try { scope.lease.assertCurrent(); return true; } catch { reset(); return false; }
 }
 
-function readCache(key: string): UserPreferences {
-  try { return normalizeUserPreferences(JSON.parse(localStorage.getItem(key) || 'null')); }
-  catch { return defaults(); }
+function readCache(key: string): UserPreferences | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || 'null');
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? normalizeUserPreferences(value) : null;
+  } catch { return null; }
 }
 
 function cache(value: UserPreferences, scope: PreferenceOwner): void {
@@ -71,11 +74,11 @@ function bind(userEmail?: string | null): PreferenceOwner | null {
     reset();
     const key = coordination.storageName(STORAGE_KEY_PREFIX, lease);
     const cached = readCache(key);
-    owner = { lease, key, mutation: 0, saves: 0, confirmed: cached, load: null,
+    owner = { lease, key, mutation: 0, saves: 0, confirmed: cached ?? defaults(), load: null,
       saveTail: Promise.resolve(), refreshRequested: false };
-    store.set(cached);
+    store.set(cached ?? defaults());
     // After the value, so owned subscribers never observe the reset defaults.
-    ownedStore.set(true);
+    ownedStore.set(cached !== null);
     return owner;
   } catch { reset(); return null; }
 }
@@ -109,6 +112,7 @@ export async function loadUserPreferences(userEmail?: string | null): Promise<Us
       if (current(scope) && mutation === scope.mutation) {
         scope.confirmed = value;
         store.set(value);
+        ownedStore.set(true);
         cache(value, scope);
         readyStore.set(true);
       }
@@ -147,6 +151,7 @@ export async function saveUserPreferences(next: UserPreferences): Promise<UserPr
         cache(saved, scope);
         if (mutation === scope.mutation) {
           store.set(saved);
+          ownedStore.set(true);
           readyStore.set(true);
         }
       }

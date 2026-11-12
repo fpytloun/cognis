@@ -640,6 +640,20 @@ export function renderMarkdown(markdown: string, context?: MarkdownRenderContext
   return html;
 }
 
+/** On-intent provenance uses the same parser, renderer, sanitizer and preprocessor as normal chat. */
+export async function mapRenderedMarkdown(markdown: string): Promise<import('./markdown-provenance').MarkdownSourceMap> {
+  const { MarkdownProvenance } = await import('./markdown-provenance');
+  const source = markdown.replace(/\r\n?/g, '\n');
+  const normalized = normalizeMarkdownForRender(source);
+  const tokens = marked.lexer(normalized);
+  const provenance = new MarkdownProvenance(source, normalized, tokens);
+  const state: MarkdownRenderState = { youtubeVideoIds: [] };
+  const renderer = createLinkRenderer(state);
+  provenance.wrap(renderer);
+  const parsed = marked.parser(tokens, { renderer });
+  return provenance.finish(postProcessMarkdownHtml(renderYoutubeEmbeds(sanitizeHtml(parsed), state.youtubeVideoIds)));
+}
+
 const inlineMarkdownCacheLimit = 1000;
 const inlineMarkdownCache = new Map<string, string>();
 

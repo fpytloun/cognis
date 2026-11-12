@@ -1,8 +1,12 @@
 <script lang="ts">
+  import { settledActivityLabel } from '$lib/chat-v2/tool-groups';
+
   let { label, active = false } = $props<{ label: string; active?: boolean }>();
+  // Finished activity states what happened instead of reading as still in progress.
+  const shown = $derived(active ? label : settledActivityLabel(label));
 </script>
 
-<span class:running-label={active}>{label}</span>
+<span class:running-label={active}>{shown}</span>
 
 <style>
   @supports (background-clip: text) {

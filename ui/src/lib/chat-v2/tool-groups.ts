@@ -10,6 +10,7 @@ import type { UserPreferences } from '$lib/types/api';
 export type ToolGroupKind =
   | 'explore'
   | 'command'
+  | 'code'
   | 'edit'
   | 'delegate'
   | 'web'
@@ -96,7 +97,11 @@ export interface ActivitySegmentRow {
   defaultExpanded: boolean;
 }
 
-export type TimelineRow = TimelineItemRow | ToolGroupRow | ThinkingGroupRow | ActivitySegmentRow;
+export type TimelineRow =
+  | TimelineItemRow
+  | ToolGroupRow
+  | ThinkingGroupRow
+  | ActivitySegmentRow;
 
 type FileActivityRole = 'none' | 'file_read' | 'file_edit';
 type ActivityRunKey = ToolGroupKind;
@@ -108,6 +113,7 @@ const INTERNAL_TOOL_NAMES = new Set([
   'describe_tool',
   'validate_tool_call',
   'skill_load',
+  'skill_search',
   'skill_asset_materialize',
   'todo_write',
   'step_todo_write',
@@ -177,6 +183,7 @@ const EXPLORATION_TOOLS = new Set([
   'skill_get',
   'skill_list',
   'skill_load',
+  'skill_search',
   'skill_versions',
   'office_read',
   'office_get',
@@ -256,6 +263,7 @@ function classifyTool(item: ToolCallTimelineItem): ToolGroupKind {
   const name = normalizedToolName(item);
   const fileRole = fileActivityRole(item);
   if (name === 'bash') return 'command';
+  if (name === 'python_execute') return 'code';
   if (fileRole === 'file_edit') return 'edit';
   if (WEB_TOOLS.has(name)) return 'web';
   if (name.startsWith('browser_')) return 'browser';
@@ -428,7 +436,7 @@ function appendFailureDetail(label: string, failedCount: number, deniedCount: nu
 }
 
 function shouldShowFailureDetail(kind: ToolGroupKind): boolean {
-  return kind === 'command' || kind === 'mixed' || kind === 'web';
+  return kind === 'command' || kind === 'code' || kind === 'mixed' || kind === 'web';
 }
 
 function earliestTimestamp(items: ToolCallTimelineItem[]): string | null {
@@ -464,6 +472,26 @@ function summaryCacheKey(items: ToolCallTimelineItem[]): string | null {
     parts.push(item.id, item.status ?? '', item.updated_at);
   }
   return parts.join('\u001f');
+}
+
+const SETTLED_ACTIVITY_LABELS: Record<string, string> = {
+  'Exploring…': 'Explored',
+  'Running code…': 'Ran code',
+  'Running commands…': 'Ran commands',
+  'Editing files…': 'Edited files',
+  'Delegating work…': 'Delegated work',
+  'Searching web…': 'Searched web',
+  'Using browser…': 'Used browser',
+  'Generating images…': 'Generated images',
+  'Accessing memory…': 'Accessed memory',
+  'Querying knowledgebase…': 'Queried knowledgebase',
+  'Using tools…': 'Used tools',
+  'Thinking…': 'Thought'
+};
+
+/** Past-tense label for an activity group that is no longer running. */
+export function settledActivityLabel(label: string): string {
+  return SETTLED_ACTIVITY_LABELS[label] ?? label;
 }
 
 function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
@@ -517,7 +545,8 @@ function summarizeToolGroup(items: ToolCallTimelineItem[]): ToolGroupSummary {
       summary = { ...common, label: 'Exploring…', icon: 'search', accentClass: 'border-blue-border text-blue-tone' };
       break;
     case 'command':
-      summary = { ...common, label: 'Running commands…', icon: 'terminal', accentClass: 'border-violet-border text-violet-tone' };
+    case 'code':
+      summary = { ...common, label: kind === 'code' ? 'Running code…' : 'Running commands…', icon: 'terminal', accentClass: 'border-violet-border text-violet-tone' };
       break;
     case 'edit':
       summary = { ...common, label: 'Editing files…', icon: 'edit', accentClass: 'border-teal-border text-teal-tone' };
@@ -1050,7 +1079,7 @@ function collectActivityRun(
   return { entries, runKey, nextIndex };
 }
 
-function visibleItem(item: TimelineItem, preferences: UserPreferences): boolean {
+export function isVisibleTimelineItem(item: TimelineItem, preferences: UserPreferences): boolean {
   if (item.kind === 'thinking') {
     return preferences.chat.show_thinking_blocks;
   }
@@ -1106,7 +1135,7 @@ export function prepareTimelineRows(
   preferences: UserPreferences,
   cycleStates: readonly TurnCycleState[] = []
 ): TimelineRow[] {
-  const visibleItems = dedupeVisibleToolCalls(items.filter((item) => visibleItem(item, preferences)));
+  const visibleItems = dedupeVisibleToolCalls(items.filter((item) => isVisibleTimelineItem(item, preferences)));
   const renderedToolCallIds = new Set(
     visibleItems
       .filter((item): item is ToolCallTimelineItem => item.kind === 'tool_call')
@@ -1119,8 +1148,9 @@ export function prepareTimelineRows(
           || !renderedToolCallIds.has(item.origin_call_id)
       )
     : visibleItems;
+  const programItems = programExecutionItems(interactionFilteredItems);
   if (!preferences.chat.group_tool_calls) {
-    return interactionFilteredItems.map((item) => ({ kind: 'item', item }));
+    return programItems.map((item) => ({ kind: 'item', item }));
   }
 
   const rows: TimelineRow[] = [];
@@ -1135,7 +1165,7 @@ export function prepareTimelineRows(
       id: toolGroupId(pendingTools),
       items: pendingTools,
       summary,
-      defaultExpanded: false
+      defaultExpanded: summary.kind === 'code' && summary.status !== 'complete'
     });
     pendingTools = [];
   }
@@ -1166,7 +1196,7 @@ export function prepareTimelineRows(
     pendingThinking = [];
   }
 
-  for (const item of interactionFilteredItems) {
+  for (const item of programItems) {
     if (item.kind === 'thinking') {
       flushPendingTools();
       const previous = pendingThinking[pendingThinking.length - 1];
@@ -1200,6 +1230,34 @@ export function prepareTimelineRows(
     return mergeAdjacentToolGroupsAcrossCycles(rows);
   }
   return foldActivitySegments(rows, buildCycleStateLookup(cycleStates));
+}
+
+function programExecutionItems(items: TimelineItem[]): TimelineItem[] {
+  const rows: TimelineItem[] = [];
+  for (let index = 0; index < items.length; index += 1) {
+    const item = items[index];
+    if (item.kind !== 'tool_call' || normalizedToolName(item) !== 'python_execute') {
+      rows.push(item);
+      continue;
+    }
+
+    const children: ToolCallTimelineItem[] = [];
+    let nextIndex = index + 1;
+    while (nextIndex < items.length) {
+      const candidate = items[nextIndex];
+      if (
+        candidate.kind !== 'tool_call'
+        || candidate.parent_call_id !== item.call_id
+      ) {
+        break;
+      }
+      children.push(candidate);
+      nextIndex += 1;
+    }
+    rows.push({ ...item, program_children: children });
+    index = nextIndex - 1;
+  }
+  return rows;
 }
 
 function foldActivitySegments(rows: TimelineRow[], cycleStates: CycleStateLookup): TimelineRow[] {

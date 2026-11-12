@@ -245,9 +245,9 @@ test('task recovery retries the saved task rather than cloning it and clears the
     await route.fulfill({ status: 409, json: { detail: 'Recovery must not clone the task' } });
   });
   await page.goto(`/tasks/${TASK_ID}`);
-  const banner = page.getByTestId('recovery-banner');
+  const banner = page.getByTestId('task-stopped');
   await expect(banner).toContainText('Provider connection reset after 3 attempts.');
-  await banner.getByRole('button', { name: 'Retry task', exact: true }).click();
+  await banner.getByRole('button', { name: 'Retry from failed step', exact: true }).click();
   await expect.poll(() => retryCount).toBe(1);
   await expect(banner).toHaveCount(0);
   expect(rerunCount).toBe(0);

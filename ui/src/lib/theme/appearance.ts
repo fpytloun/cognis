@@ -1,5 +1,5 @@
 import { userPreferences, userPreferencesOwned } from '$lib/stores/userPreferences';
-import { readStartupAppearance, rememberStartupAppearance } from './startup-appearance';
+import { readStartupAppearance, rememberStartupAppearance, STARTUP_APPEARANCE_KEY } from './startup-appearance';
 import type { UserPreferences } from '$lib/types/api';
 import { DEFAULT_THEME_FAMILY, type ThemeFamily } from './catalog';
 
@@ -31,29 +31,33 @@ export function projectAppearance(family: ThemeFamily, theme: ResolvedTheme): vo
 
 /**
  * Projection only: the preference store owns account binding, persistence and
- * rollback. Until an account first binds in this document, keep the device's
- * startup hint (what app.html already painted) instead of flashing defaults.
- * After a revocation the defaults apply; the prior account is never replayed.
+ * rollback. Unowned preferences never project account data; retain only the
+ * cosmetic startup hint until verified preferences bind. Explicit logout
+ * removes that hint, so the defaults apply immediately.
  */
 export function startAppearance(): () => void {
   const system = window.matchMedia('(prefers-color-scheme: dark)');
   let preference: AppearancePreference = 'system';
   let family: ThemeFamily = DEFAULT_THEME_FAMILY;
   let owned = false;
-  let bound = false;
-  const hint = readStartupAppearance();
   const apply = () => {
     if (owned) {
-      bound = true;
       rememberStartupAppearance(family, preference);
-    } else if (!bound && hint) {
-      const mode = resolveTheme(hint.theme, system.matches);
-      projectAppearance(hint[mode].family, mode);
-      return;
+    } else {
+      const hint = readStartupAppearance();
+      if (hint) {
+        const mode = resolveTheme(hint.theme, system.matches);
+        projectAppearance(hint[mode].family, mode);
+        return;
+      }
     }
     projectAppearance(family, resolveTheme(preference, system.matches));
   };
   system.addEventListener('change', apply);
+  const storage = (event: StorageEvent) => {
+    if (!owned && event.storageArea === localStorage && (event.key === STARTUP_APPEARANCE_KEY || event.key === null)) apply();
+  };
+  window.addEventListener('storage', storage);
   const stopPreferences = userPreferences.subscribe((value) => {
     preference = value.display.theme;
     family = value.display.theme_family;
@@ -67,5 +71,6 @@ export function startAppearance(): () => void {
     stopPreferences();
     stopOwned();
     system.removeEventListener('change', apply);
+    window.removeEventListener('storage', storage);
   };
 }

@@ -5,7 +5,8 @@
 
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import type { AttentionActionDetail } from '$lib/types/api';
-  import FocusedAttentionAction from './FocusedAttentionAction.svelte';
+  import DeferredPrivateView from '$lib/components/ui/DeferredPrivateView.svelte';
+  import { focusedAttentionAction } from './focused-definition';
 
   let { actionId, title, onClose, onSettled, onUnavailable } = $props<{
     actionId: string;
@@ -119,6 +120,12 @@
     </div>
   {/snippet}
   {#snippet children()}
-    <FocusedAttentionAction {actionId} onSettled={settle} {onUnavailable} onDismiss={dismiss} />
+    {#key actionId}
+      <DeferredPrivateView
+        definition={focusedAttentionAction}
+        viewProps={{ actionId, onSettled: settle, onUnavailable, onDismiss: dismiss }}
+        label="attention action"
+      />
+    {/key}
   {/snippet}
 </BlockingDialog>

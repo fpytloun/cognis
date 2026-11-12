@@ -17,7 +17,7 @@
   } from '$lib/channels';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import Card from '$lib/components/ui/Card.svelte';
-  import Sheet from '$lib/components/ui/Sheet.svelte';
+  import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import type { Agent, ChannelAccount, ChannelContact, ChannelMeta, ExecutorConfig, PairingRequest } from '$lib/types/api';
@@ -60,7 +60,6 @@
   });
   let credentialOverrides = $state<Record<string, string>>({});
   let initialDraftSnapshot = $state('');
-  let mobileEditorOpen = $state(false);
   let editorPreviouslyFocused = $state<HTMLElement | null>(null);
 
   let webhookInfo = $state<{ url: string; secret: string | null; channelType: string } | null>(null);
@@ -113,16 +112,8 @@
     initialDraftSnapshot = JSON.stringify(draft);
   }
 
-  function usesMobileEditorOverlay(): boolean {
-    // Aligns with Tailwind's `lg` breakpoint (1024px) and the new app-wide
-    // mobile/desktop pivot.
-    return typeof window !== 'undefined' && window.innerWidth < 1024;
-  }
-
   function openEditor(): void {
     editorPreviouslyFocused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    mobileEditorOpen = usesMobileEditorOverlay();
-    // Desktop editor opens inline (no overlay state needed).
   }
 
   function closeEditor(): void {
@@ -131,7 +122,6 @@
     selectedType = null;
     draft = emptyDraft();
     credentialOverrides = {};
-    mobileEditorOpen = false;
     initialDraftSnapshot = '';
     editorPreviouslyFocused?.focus();
     editorPreviouslyFocused = null;
@@ -139,7 +129,7 @@
 
   function handleTabChange(tab: ChannelsTab): void {
     activeTab = tab;
-    if (tab !== 'accounts' && mobileEditorOpen) {
+    if (tab !== 'accounts' && editorMode !== 'closed') {
       closeEditor();
     }
     if (tab === 'pairing') {
@@ -148,6 +138,7 @@
   }
 
   function beginCreate(meta: ChannelMeta): void {
+    if (meta.channel_type === 'web') return;
     selectedAccountId = null;
     selectedType = meta;
     editorMode = 'create';
@@ -160,8 +151,22 @@
     openEditor();
   }
 
+  async function requestCloseEditor(): Promise<void> {
+    if (busy) return;
+    if (isDirty || Object.values(credentialOverrides).some(Boolean)) {
+      const discard = await confirmAction({
+        title: 'Discard channel changes?',
+        message: 'Your unsaved channel settings will be lost.',
+        confirmLabel: 'Discard changes',
+      });
+      if (!discard) return;
+    }
+    closeEditor();
+  }
+
   function beginCreateDefault(): void {
-    const fallback = selectedType ?? channelTypes[0] ?? null;
+    const fallback = (selectedType?.channel_type !== 'web' ? selectedType : null)
+      ?? channelTypes.find((meta) => meta.channel_type !== 'web') ?? null;
     if (fallback) {
       beginCreate(fallback);
     }
@@ -322,6 +327,15 @@
       const current = accounts.find((account) => account.account_id === selectedAccountId);
       if (!current) {
         throw new Error('Channel account no longer exists.');
+      }
+      if (current.channel_type === 'web') {
+        await api.channels.updateAccount(selectedAccountId, {
+          preferred_for_task_delivery: draft.preferred_for_task_delivery,
+        });
+        await loadData();
+        closeEditor();
+        addToast('App channel preference saved.', 'success');
+        return;
       }
 
       const updates: Record<string, unknown> = {
@@ -576,21 +590,15 @@
     </div>
 
     {#if activeTab === 'accounts'}
-      <!--
-        On mobile: account list is always visible; editor opens as a Sheet.
-        On desktop (lg+): side-by-side grid.
-      -->
-
-      <!-- Mobile sheet editor -->
-      {#if mobileEditorOpen && editorMode !== 'closed'}
-        <Sheet
-          open={mobileEditorOpen}
-          onClose={closeEditor}
+      {#if editorMode !== 'closed'}
+        <BlockingDialog
+          onClose={() => void requestCloseEditor()}
           backdropDismissible={!isDirty && !Object.values(credentialOverrides).some(Boolean)}
           dismissible={!busy}
-          side="bottom"
           label={editorMode === 'create' ? 'Create channel account' : 'Edit channel account'}
-          maxHeight="92dvh"
+          titleId="channel-editor-title"
+          panelClass="w-full max-w-3xl"
+          bodyClass="p-4 sm:p-6"
         >
           {#snippet children()}
             <ChannelAccountEditor
@@ -605,17 +613,15 @@
               {busy}
               mobile={true}
               {isDirty}
-              onClose={closeEditor}
+              onlyChannel={!accounts.some((account) => account.agent_id === draft.agent_id && account.channel_type !== 'web')}
+              onClose={() => void requestCloseEditor()}
               onSelectType={beginCreate}
               onSave={() => void (editorMode === 'edit' ? saveAccountChanges() : saveAccount())}
             />
           {/snippet}
-        </Sheet>
+        </BlockingDialog>
       {/if}
 
-      <div class="grid gap-6 lg:grid-cols-[1.15fr_0.85fr]">
-        <!-- Account list: always visible on mobile, always visible on desktop -->
-        <div>
           <ChannelAccountsView
             accounts={accounts}
             metas={metaMap}
@@ -628,37 +634,6 @@
             onToggle={(account) => void toggleAccount(account)}
             onDelete={(account) => void removeAccount(account)}
           />
-        </div>
-
-        <!-- Desktop-only inline editor -->
-        <div class="hidden lg:block">
-          {#if editorMode === 'closed'}
-            <Card class="p-6 text-sm text-secondary">
-              <p class="text-xs uppercase tracking-[0.24em] text-quiet">Account editor</p>
-              <h2 class="mt-2 text-lg font-semibold text-strong">Choose a platform or existing account</h2>
-              <p class="mt-2">Select an account to edit, or start a new account setup to see platform-specific guidance here.</p>
-              <button class="mt-4 rounded-xl bg-accent px-4 py-2 text-sm font-medium text-on-accent" onclick={beginCreateDefault} type="button">Add channel</button>
-            </Card>
-          {:else}
-            <ChannelAccountEditor
-              mode={editorMode}
-              {selectedType}
-              {channelTypes}
-              {draft}
-              {credentialOverrides}
-              {agents}
-              {executors}
-              guide={selectedGuide()}
-              {busy}
-              mobile={false}
-              {isDirty}
-              onClose={closeEditor}
-              onSelectType={beginCreate}
-              onSave={() => void (editorMode === 'edit' ? saveAccountChanges() : saveAccount())}
-            />
-          {/if}
-        </div>
-      </div>
     {:else if activeTab === 'pairing'}
       <PairingInboxView
         {pairingRequests}

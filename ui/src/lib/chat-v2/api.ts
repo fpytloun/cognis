@@ -17,6 +17,7 @@ import type {
   RetryProviderOptionsResponse,
   SendMessageV2Request,
   SendMessageV2Response,
+  MessageAdmissionV2Response,
   TimelineBackfillResponse,
   WorkProjectionResponse,
   ActivityOverviewResponse,
@@ -406,6 +407,30 @@ export class ChatV2ApiClient {
         signal: options.signal,
         timeoutMs: options.timeoutMs
       }
+    );
+  }
+
+  messageAdmission(
+    conversationId: string, clientTxnId: string, options: ChatV2TimelineRequestOptions = {},
+    canonicalClientMessageIds: readonly string[] = [],
+  ): Promise<MessageAdmissionV2Response> {
+    const query = new URLSearchParams(canonicalClientMessageIds.slice(0, 100)
+      .map(id => ['canonical_client_message_id', id]));
+    return request<MessageAdmissionV2Response>(
+      `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(clientTxnId)}/admission${query.size ? `?${query}` : ''}`,
+      { fetchImpl: this.fetchImpl, ...options },
+    );
+  }
+
+  messageAdmissionByClient(
+    conversationId: string, clientMessageId: string, options: ChatV2TimelineRequestOptions = {},
+    canonicalClientMessageIds: readonly string[] = [],
+  ): Promise<MessageAdmissionV2Response> {
+    const query = new URLSearchParams(canonicalClientMessageIds.slice(0, 100)
+      .map(id => ['canonical_client_message_id', id]));
+    return request<MessageAdmissionV2Response>(
+      `/api/v1/chat/v2/conversations/${encodeURIComponent(conversationId)}/message-admissions/${encodeURIComponent(clientMessageId)}${query.size ? `?${query}` : ''}`,
+      { fetchImpl: this.fetchImpl, ...options },
     );
   }
 

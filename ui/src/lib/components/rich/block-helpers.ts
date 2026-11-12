@@ -1,4 +1,5 @@
 import { blockType, type RichBlock } from '$lib/rich-deliverable';
+import { richIdentity, tableSource, withTableSource, type RichTableGrid } from '$lib/feedback/annotations/rich';
 
 export type ColumnDef = { key: string; label: string; align?: string };
 
@@ -16,6 +17,34 @@ export function sourceRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
 
+/** Range eligibility consumes the existing normalization and its authored provenance. */
+export function tableRangeGrid(block: RichBlock, rows: Record<string, unknown>[], columns: ColumnDef[]): RichTableGrid {
+  const grid: RichTableGrid = { identity: richIdentity(block), columns: columns.map(col => col.key), rows: new Map(), error: null };
+  const raw = block.rows ?? block.data;
+  if (!grid.identity || !['table', 'comparison_matrix', 'decision_matrix'].includes(blockType(block)))
+    grid.error = 'This derived table has no exact authored grid. Select its source text instead.';
+  else if (!Array.isArray(raw) || !raw.length || raw.length > 1000 || !columns.length || columns.length > 128)
+    grid.error = 'Table ranges support up to 1,000 authored rows and 128 columns.';
+  else if (new Set(grid.columns).size !== columns.length || Array.isArray(block.columns) && block.columns.some(col => {
+    const key = typeof col === 'string' ? col : col && typeof col === 'object' ? (col as Record<string, unknown>).key ?? (col as Record<string, unknown>).id ?? (col as Record<string, unknown>).label : null;
+    return typeof key !== 'string' || !key;
+  })) grid.error = 'Column identities are ambiguous. Select source text instead.';
+  if (!grid.error && Array.isArray(raw)) for (const row of rows) {
+    const source = tableSource(row), ordinal = Number(source?.row[1]);
+    if (!source || !Number.isInteger(ordinal) || ordinal < 0 || ordinal >= 1000 || grid.rows.has(ordinal)) {
+      grid.error = 'Row membership cannot be proven. Select source text instead.'; break;
+    }
+    const authored = raw[ordinal] as unknown;
+    const values = Array.isArray(authored) ? authored : authored && typeof authored === 'object' && 'values' in authored && Array.isArray(authored.values) ? authored.values : null;
+    if (values) {
+      const keys = values.map((_: unknown, index: number) => columns[index]?.key ?? String(index));
+      if (new Set(keys).size !== keys.length) { grid.error = 'Cell membership is ambiguous. Select source text instead.'; break; }
+    }
+    grid.rows.set(ordinal, source.cells);
+  }
+  return grid;
+}
+
 export function humanize(value: string): string {
   return value.replace(/[_-]/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
 }
@@ -31,16 +60,22 @@ export function tableRows(block: RichBlock): Record<string, unknown>[] {
   const rows = block.rows ?? block.data;
   if (!Array.isArray(rows)) return [];
   const columns = tableColumns(block, []);
-  return rows.flatMap((row): Record<string, unknown>[] => {
+  const sourceKey = block.rows !== undefined && block.rows !== null ? 'rows' : 'data';
+  return rows.flatMap((row, ordinal): Record<string, unknown>[] => {
+    const path = [sourceKey, String(ordinal)];
     if (Array.isArray(row)) {
-      return [Object.fromEntries(row.map((cell, index) => [columns[index]?.key ?? String(index), cell]))];
+      return [withTableSource(Object.fromEntries(row.map((cell, index) => [columns[index]?.key ?? String(index), cell])),
+        { row: path, cells: Object.fromEntries(row.map((_cell, index) => [columns[index]?.key ?? String(index), [...path, String(index)]])) })];
     }
     if (!row || typeof row !== 'object') return [];
     const record = row as Record<string, unknown>;
     const values = Array.isArray(record.values)
       ? Object.fromEntries(record.values.map((cell, index) => [columns[index]?.key ?? String(index), cell]))
       : {};
-    return [{ ...values, ...record }];
+    return [withTableSource({ ...values, ...record }, { row: path, cells: {
+      ...Object.fromEntries((Array.isArray(record.values) ? record.values : []).map((_, index) => [columns[index]?.key ?? String(index), [...path, 'values', String(index)]])),
+      ...Object.fromEntries(Object.keys(record).map(key => [key, [...path, key]])),
+    } })];
   });
 }
 

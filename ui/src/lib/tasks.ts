@@ -5,7 +5,8 @@ export const TASK_BOARD_COLUMNS = [
   { id: 'queued', label: 'Queued' },
   { id: 'running', label: 'Running' },
   { id: 'paused', label: 'Paused' },
-  { id: 'done', label: 'Done' }
+  // Completed, failed and cancelled; each card and group states its outcome.
+  { id: 'done', label: 'Finished' }
 ] as const;
 
 export type TaskBoardColumnId = (typeof TASK_BOARD_COLUMNS)[number]['id'];

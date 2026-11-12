@@ -1,4 +1,4 @@
-import { expect, test, type Locator, type Page, type WebSocketRoute } from '@playwright/test';
+import { expect, test, type Page, type WebSocketRoute } from '@playwright/test';
 import { Buffer } from 'node:buffer';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
 import type { NativeConfiguration } from '../src/lib/native/host';
@@ -34,7 +34,7 @@ test.describe('dashboard retained-capacity restore', () => {
     ];
     await page.addInitScript(({ storageKey, retained }) => {
       localStorage.setItem(storageKey, JSON.stringify({
-        version: 1, position: 0.6, migrated: [], tucked: false,
+        version: 1, position: 0.6, migrated: [],
         agents: [{ agentId: 'agent-stage39' }],
         entries: retained.map((chat, i) => ({
           projectId: chat.project_id, layouts: {},
@@ -58,8 +58,6 @@ test.describe('dashboard retained-capacity restore', () => {
     await page.goto('/');
     await expect(page.getByTestId(`dashboard-conversation-row-${target.conversation_id}`).first()).toBeVisible({ timeout: 20_000 });
     await expect(page.locator('[data-workspace-window][data-minimized="false"], .workspace-window[data-minimized="false"]')).toHaveCount(4);
-    await page.getByTestId('workspace-dismiss-backdrop').click({ position: { x: 20, y: 15 } });
-    await expect(page.locator('[data-workspace-window][data-minimized="false"], .workspace-window[data-minimized="false"]')).toHaveCount(0);
     // Calibrate the independent recorder against an actual browser request.
     // Route fulfillment and fixture conversation membership must not hide reads.
     await page.evaluate(async (id) => {
@@ -74,11 +72,8 @@ test.describe('dashboard retained-capacity restore', () => {
     const { state, target } = await capacityFixture(page);
     const row = page.getByTestId(`dashboard-conversation-row-${target.conversation_id}`).first();
     await row.click({ position: { x: 20, y: 15 } });
-    const panel = page.getByTestId(`workspace-window-conversation:${target.conversation_id}`);
-    await expect(panel).toHaveAttribute('data-minimized', 'false');
-    await page.getByTestId('workspace-dismiss-backdrop').click({ position: { x: 20, y: 15 } });
-    await expect(panel).toHaveAttribute('data-minimized', 'true');
     await row.click({ position: { x: 20, y: 15 } });
+    const panel = page.getByTestId(`workspace-window-conversation:${target.conversation_id}`);
     await expect(panel).toHaveAttribute('data-minimized', 'false');
     await expect(panel).toHaveAttribute('data-focused', 'true');
     await expect(page.getByText(/limit reached/i)).toHaveCount(0);
@@ -125,8 +120,7 @@ test.describe('dashboard retained-capacity restore', () => {
   });
 });
 
-async function fixture(page: Page, seed = true, windows = true, display: Record<string, boolean> = {}, chatCount = 3,
-  workspaceOptions: { tucked?: boolean } = {}) {
+async function fixture(page: Page, seed = true, windows = true, display: Record<string, boolean> = {}, chatCount = 3) {
   const errors: string[] = [];
   page.on('pageerror', (error) => { errors.push(error.message); console.error(error.message); });
   await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: windows });
@@ -211,10 +205,10 @@ async function fixture(page: Page, seed = true, windows = true, display: Record<
       : { project_id: 'proj_home', name: 'Home', description: '', status: 'active', instructions: '', sources: [], workflow_ids: [], agents: [], grants: [], caller_role: 'owner' };
     return route.fulfill({ json });
   });
-  if (seed) await page.addInitScript(({ storageKey, chats, homes, tucked }) => {
+  if (seed) await page.addInitScript(({ storageKey, chats, homes }) => {
     if (localStorage.getItem(storageKey)) return;
     localStorage.setItem(storageKey, JSON.stringify({
-      version: 1, position: 0.6, migrated: [], tucked,
+      version: 1, position: 0.6, migrated: [],
       agents: homes.map((home) => ({ agentId: home.agent_id, homeConversationId: home.conversation_id })),
       entries: chats.map((chat, index) => ({
         projectId: chat.project_id, layouts: {},
@@ -227,7 +221,7 @@ async function fixture(page: Page, seed = true, windows = true, display: Record<
         },
       })),
     }));
-  }, { storageKey, chats: chats.slice(0, chatCount), homes, tucked: workspaceOptions.tucked ?? false });
+  }, { storageKey, chats: chats.slice(0, chatCount), homes });
   return { errors, reads: () => readCalls, settle: () => { active = false; },
     readAll: () => { allRead = true; },
     opened: (id: string, time: string) => { openedTimes.set(id, time); },
@@ -328,7 +322,6 @@ test(`avatar selection persists through tabs and genuine dismissals (standalone=
   await page.goto('/notifications');
   const avatar = page.locator('[data-pinned-agent="agent-stage39"]');
   const panel = page.getByTestId('pinned-chat-panel');
-  await expect(avatar).toHaveAccessibleName('Open pinned chats with Butler');
   await avatar.click();
   await panel.getByRole('tab', { name: /Kitchen renovation/ }).click();
   await panel.locator('textarea').first().fill('Persistent avatar draft');
@@ -351,7 +344,7 @@ test('stack expands agents, tabs use native chat, drafts survive, click-away col
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher).toBeVisible();
   await expect(launcher.getByTestId('activity-avatar-orbit')).toBeVisible();
   const avatarButtons = page.locator('[data-pinned-agent]');
@@ -498,17 +491,64 @@ test('click-away consumes the first click without activating underlying backgrou
   expect(state.errors).toEqual([]);
 });
 
-async function settledStackLauncher(page: Page, expectedLauncherAgent = 'agent-second'): Promise<Locator> {
-  const launcher = page.getByTestId('pinned-chat-launcher');
-  await expect(launcher).toHaveAttribute('data-pinned-agent', expectedLauncherAgent);
-  return launcher;
-}
-
-async function openButler(page: Page, expectedLauncherAgent = 'agent-second'): Promise<void> {
-  const launcher = await settledStackLauncher(page, expectedLauncherAgent);
-  await launcher.click();
+async function openButler(page: Page): Promise<void> {
+  await page.getByTestId('pinned-chat-launcher').click();
   await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
   await expect(page.getByTestId('pinned-chat-panel')).toBeVisible();
+}
+
+for (const width of [1440, 900]) {
+test(`pinned inspector stays compact without chat leaking through at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  const state = await fixture(page);
+  let pendingRead = false;
+  await page.route('**/api/v1/notifications?*conversation_id=conv-task-chat*', route => {
+    pendingRead = true;
+    return route.fulfill({ json: [{
+      notification_id: 'notification-managed-completed',
+      conversation_id: 'conv-task-chat',
+      notification_type: 'managed_conversation_completed',
+      status: 'pending', payload: {},
+    }] });
+  });
+  await page.route('**/api/v1/feedback/conversations/conv-task-chat/staging', route => route.fulfill({
+    json: { conversation_id: 'conv-task-chat', version: 0, items: [], receipts: [], subject_ids: [] },
+  }));
+  await page.goto('/notifications');
+  await openButler(page);
+  const panel = page.getByTestId('pinned-chat-panel');
+  const toggle = panel.getByRole('button', { name: 'Toggle session details' });
+  await panel.getByRole('tab', { name: /Kitchen renovation/ }).click();
+  await expect(panel.getByRole('textbox', { name: 'Conversation message' })).toBeVisible();
+  await expect.poll(() => pendingRead).toBe(true);
+  await expect(panel.getByTestId('pending-interactions-loading')).toHaveCount(0);
+  await expect(panel.getByTestId('pending-conversation-interactions')).toHaveCount(0);
+  const toggleRect = await toggle.boundingBox();
+  const newRect = await panel.getByRole('button', { name: 'New conversation' }).boundingBox();
+  expect(toggleRect).not.toBeNull();
+  expect(newRect).not.toBeNull();
+  expect(Math.abs(toggleRect!.y - newRect!.y)).toBeLessThanOrEqual(1);
+  expect(Math.abs(toggleRect!.height - newRect!.height)).toBeLessThanOrEqual(1);
+  const tabsRect = await panel.getByRole('tablist', { name: 'Pinned conversations' }).boundingBox();
+  const searchRect = await panel.getByRole('button', { name: 'Find conversation' }).boundingBox();
+  expect(tabsRect!.x + tabsRect!.width).toBeLessThanOrEqual(newRect!.x + 1);
+  expect(searchRect!.x + searchRect!.width).toBeLessThan(toggleRect!.x);
+  await panel.screenshot({ path: test.info().outputPath('pinned-compact.png') });
+  await toggle.click();
+  await expect(panel.getByTestId('inspector-overview')).toBeVisible();
+  await expect(panel.getByTestId('dashboard-conversation-chat')).toBeHidden();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+  await panel.screenshot({ path: test.info().outputPath('pinned-inspector.png') });
+  await toggle.click();
+  await expect(panel.getByRole('textbox', { name: 'Conversation message' })).toBeVisible();
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+  await toggle.click();
+  await panel.getByRole('tab', { name: 'Overview', exact: true }).focus();
+  await page.keyboard.press('Escape');
+  await expect(toggle).toBeFocused();
+  await expect(panel.getByRole('textbox', { name: 'Conversation message' })).toBeVisible();
+  expect(state.errors).toEqual([]);
+});
 }
 
 for (const { block, tucked } of [
@@ -631,7 +671,7 @@ for (const surface of ['dashboard', 'full chat'] as const) {
     const peerState = peer === page ? state : await fixture(peer, true, true, {}, 1);
     if (peer !== page) {
       await peer.goto('/chat/conv-task-chat');
-    } else await openButler(peer, 'agent-stage39');
+    } else await openButler(peer);
     const pinned = peer === page ? peer.getByTestId('pinned-chat-panel')
       : peer.locator('form').filter({ has: peer.getByRole('textbox', { name: 'Chat message', exact: true }) });
     if (peer === page) await pinned.getByRole('tab', { name: /Kitchen renovation/ }).click();
@@ -700,7 +740,7 @@ for (const editDuringRequest of [false, true]) {
   });
 }
 
-test('saved tuck temporarily reveals on hover and chat opening, and toggle works both ways', async ({ page }, testInfo) => {
+test('saved tuck temporarily reveals on hover and chat opening, and toggle works both ways', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
@@ -709,33 +749,14 @@ test('saved tuck temporarily reveals on hover and chat opening, and toggle works
   await page.mouse.move(300, 100);
   const stack = page.getByTestId('pinned-agent-stack');
   await expect(stack).toHaveAttribute('data-tucked', 'true');
-  await testInfo.attach('tucked-avatar-geometry', {
-    contentType: 'application/json',
-    body: Buffer.from(JSON.stringify(await page.getByTestId('pinned-chat-launcher')
-      .getByTestId('pinned-avatar-face').evaluate(async (node) => {
-        const button = node.closest('button')!;
-        await Promise.all([...node.getAnimations(), ...button.getAnimations()]
-          .filter(animation => animation.effect?.getTiming().iterations !== Infinity)
-          .map(animation => animation.finished.catch(() => {})));
-        return {
-          viewportWidth: innerWidth, face: node.getBoundingClientRect().toJSON(),
-          button: button.getBoundingClientRect().toJSON(),
-          buttonBorder: getComputedStyle(button).borderLeftWidth,
-          faceTransform: getComputedStyle(node).transform,
-        };
-      }))),
-  });
   await expect.poll(async () => {
     const rect = (await page.getByTestId('pinned-chat-launcher').getByTestId('pinned-avatar-face').boundingBox())!;
     return Math.abs(rect.x + rect.width / 2 - 1440);
   }).toBeLessThan(2);
-  const tuckedPreview = testInfo.outputPath('tucked-avatars-synthetic-preview.png');
-  await page.screenshot({ path: tuckedPreview });
-  await testInfo.attach('tucked-avatars-synthetic-preview', { path: tuckedPreview });
   await page.reload();
   await expect(stack).toHaveAttribute('data-tucked', 'true');
   await page.keyboard.press('Tab');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await launcher.focus();
   await launcher.hover();
   await expect(stack).toHaveAttribute('data-tucked', 'true');
@@ -801,7 +822,7 @@ test('right-edge gutter stays an interactive, stable target and short swipes tuc
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher).toBeVisible();
   const before = (await launcher.boundingBox())!;
   await page.mouse.move(1438, before.y + before.height / 2);
@@ -876,7 +897,7 @@ for (const collapsed of [true, false]) {
 
 test('persistent block orders recent activity first, keeps tucked state and moves as a unit', async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
-  const state = await fixture(page, true, true, { pinned_agents_collapsed: false }, 3, { tucked: true });
+  const state = await fixture(page, true, true, { pinned_agents_collapsed: false });
   state.settle();
   await page.goto('/notifications');
   const block = page.getByTestId('pinned-agent-block');
@@ -1035,7 +1056,7 @@ test('rightward throw tucks the dock without opening it and tab strip scrolls in
   await page.setViewportSize({ width: 1024, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher).toBeVisible();
   const rect = (await launcher.boundingBox())!;
   await page.mouse.move(rect.x + rect.width / 2, rect.y + rect.height / 2);
@@ -1131,7 +1152,7 @@ test('collapsed stack animates latest activity to the front and nudges for new a
   const state = await fixture(page);
   await page.goto('/notifications');
   await expect.poll(state.details).toBeGreaterThanOrEqual(5);
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher).toHaveAttribute('data-pinned-agent', 'agent-second');
   state.settle();
   state.activity('conv-task-chat', '2026-10-15T08:00:00Z');
@@ -1153,7 +1174,7 @@ test('stack separates through transforms and animates back without a second laun
   const state = await fixture(page);
   await page.goto('/notifications');
   const avatars = page.locator('[data-pinned-agent]');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher.locator('img')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Open pinned chats with Butler' })).toHaveCount(0);
   const handles = await avatars.elementHandles();
@@ -1175,8 +1196,7 @@ test('expanded avatar image dragging moves the whole dock without opening a chat
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
-  await launcher.click();
+  await page.getByTestId('pinned-chat-launcher').click();
   const avatar = page.getByRole('button', { name: 'Open pinned chats with Butler' });
   await expect(avatar.locator('img')).toHaveAttribute('draggable', 'false');
   await expect.poll(() => avatar.evaluate((node) => node.getAnimations().length)).toBe(0);
@@ -1199,7 +1219,7 @@ test('reduced motion keeps expansion instant while preserving keyboard movement'
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await launcher.click();
   expect(await page.locator('[data-pinned-agent]').evaluateAll((nodes) => nodes.every((node) => !node.getAnimations().length))).toBe(true);
   const before = (await launcher.boundingBox())!;
@@ -1216,7 +1236,7 @@ test('touch dragging on the avatar does not cancel or expand the collapsed dock'
   try {
     const state = await fixture(page);
     await page.goto('/notifications');
-    const launcher = await settledStackLauncher(page);
+    const launcher = page.getByTestId('pinned-chat-launcher');
     await expect(launcher.locator('img')).toBeVisible();
     await launcher.tap();
     await expect(page.getByTestId('pinned-agent-strip')).toBeVisible();
@@ -1279,7 +1299,7 @@ test('removing or cancelling the captured avatar does not block the next interac
   await page.setViewportSize({ width: 1440, height: 900 });
   const state = await fixture(page);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
+  const launcher = page.getByTestId('pinned-chat-launcher');
   await expect(launcher.locator('img')).toBeVisible();
   const before = (await launcher.boundingBox())!;
   await page.mouse.move(before.x + before.width / 2, before.y + before.height / 2);
@@ -1315,11 +1335,9 @@ test('project windows do not create or remove global agent pins', async ({ page 
   await page.getByRole('tab', { name: /^Conversations/ }).click();
   await page.getByRole('button', { name: /Kitchen renovation/ }).first().click();
   await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toBeVisible();
-  await page.getByTestId('workspace-window-minimize-conversation:conv-task-chat').click();
   await page.getByRole('link', { name: 'Notifications', exact: true }).click();
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
   await page.goto('/projects/proj_home');
-  await page.getByTestId('workspace-dock-restore-conversation:conv-task-chat').click();
   await page.getByTestId('workspace-window-close-conversation:conv-task-chat').click();
   await page.goto('/notifications');
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
@@ -1331,13 +1349,13 @@ for (const width of [768, 2560]) {
     await page.setViewportSize({ width, height: 900 });
     const state = await fixture(page);
     await page.goto('/notifications');
-    const launcher = await settledStackLauncher(page);
+    const launcher = page.getByTestId('pinned-chat-launcher');
     await launcher.click();
     await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
     const panel = page.getByTestId('pinned-chat-panel');
     await expect(panel).toBeVisible();
     const usableWidth = await page.evaluate(() => document.documentElement.clientWidth);
-    const edgeInset = await panel.evaluate((node) => parseFloat(getComputedStyle(node.parentElement!).right));
+    const edgeInset = await panel.evaluate((node) => parseFloat(getComputedStyle(node).right));
     await expect.poll(async () => {
       const rect = (await panel.boundingBox())!;
       return Math.abs(rect.x + rect.width - (usableWidth - edgeInset));
@@ -1390,8 +1408,7 @@ test('global pins stay visible independently of project windows and share main d
   await expect(page.getByTestId('workspace-window-conversation:conv-task-chat-b')).toBeVisible();
   await expect(page.getByTestId('pinned-chat-launcher')).toHaveCount(0);
   await page.goto('/notifications');
-  const launcher = await settledStackLauncher(page);
-  await launcher.click();
+  await page.getByTestId('pinned-chat-launcher').click();
   await page.getByRole('button', { name: 'Open pinned chats with Butler' }).click();
   await page.getByRole('button', { name: 'Unpin Kitchen renovation' }).click();
   await page.goto('/projects/proj_home');

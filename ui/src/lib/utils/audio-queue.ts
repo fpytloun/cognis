@@ -1,3 +1,7 @@
+import { primeAudio } from './audio-priming';
+import { SpeechPlayback } from './speech-playback';
+import type { SpeechStreamEvent } from '$lib/speech';
+
 /**
  * Sequential audio queue for TTS conversation mode.
  *
@@ -9,28 +13,34 @@
  * cancels mid-playback.
  */
 
-export interface AudioQueueEntry {
+export type AudioQueueEntry = {
   /** URL of the audio to play (signed URL or Blob URL). */
   url: string;
   /** Optional caller-provided correlation id for diagnostics. */
   id?: string;
-}
+} | {
+  stream: (signal: AbortSignal) => AsyncIterable<SpeechStreamEvent>;
+  id?: string;
+};
 
 export class AudioQueue {
   private queue: AudioQueueEntry[] = [];
   private current: HTMLAudioElement | null = null;
   private playing = false;
+  private audible = false;
   private cancelled = false;
   private unlocked = false;
   private idleCallbacks: Array<() => void> = [];
   private playingCallbacks: Array<(playing: boolean) => void> = [];
   private playbackErrorCallbacks: Array<() => void> = [];
   private playbackTimeout: ReturnType<typeof setTimeout> | null = null;
+  private generation = 0;
+  private primeController: AbortController | null = null;
+  private speechPlayback: SpeechPlayback | null = null;
+  private streamController: AbortController | null = null;
+  private streamTask: Promise<unknown> | null = null;
 
   private static readonly PLAYBACK_TIMEOUT_MS = 60_000;
-
-  private readonly silentDataUrl =
-    'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA=';
 
   enqueue(entry: AudioQueueEntry): void {
     if (this.cancelled) {
@@ -43,6 +53,11 @@ export class AudioQueue {
   }
 
   clear(): void {
+    this.primeController?.abort();
+    this.primeController = null;
+    this.generation += 1;
+    this.streamController?.abort();
+    this.speechPlayback?.stop();
     this.cancelled = true;
     this.queue = [];
     if (this.current) {
@@ -53,10 +68,11 @@ export class AudioQueue {
       }
       this.current.onended = null;
       this.current.onerror = null;
+      this.current.onloadedmetadata = null;
       this.current.src = '';
     }
     this.clearPlaybackTimeout();
-    this.current = null;
+    // Keep the gesture-primed element across interruptions, including in PWAs.
     if (this.playing) {
       this.playing = false;
       this.notifyPlaying(false);
@@ -99,23 +115,35 @@ export class AudioQueue {
 
   /** Prime the reusable audio element from a user gesture when possible. */
   async unlock(): Promise<boolean> {
-    if (this.unlocked) return true;
+    let speechUnlock: Promise<void> = Promise.resolve();
+    if (SpeechPlayback.supported()) {
+      this.speechPlayback ??= new SpeechPlayback((playing) => this.notifyPlaying(playing));
+      speechUnlock = this.speechPlayback.unlock();
+    }
+    if (this.unlocked) {
+      try { await speechUnlock; return true; } catch { return false; }
+    }
     if (typeof Audio === 'undefined') return false;
     const audio = this.ensureAudio();
-    audio.src = this.silentDataUrl;
-    try {
-      await audio.play();
-      audio.pause();
-      audio.currentTime = 0;
-      this.unlocked = true;
-      if (this.queue.length > 0 && !this.playing) {
-        void this.playNext();
-      }
-      return true;
-    } catch {
-      this.unlocked = false;
-      return false;
+    this.primeController?.abort();
+    const controller = new AbortController();
+    this.primeController = controller;
+    const priming = primeAudio(audio, controller.signal);
+    let unlocked = false;
+    try { [unlocked] = await Promise.all([priming, speechUnlock]); } catch { return false; }
+    if (this.primeController !== controller) return false;
+    this.primeController = null;
+    this.unlocked = unlocked;
+    if (unlocked && this.queue.length > 0 && !this.playing) {
+      void this.playNext();
     }
+    return unlocked;
+  }
+
+  dispose(): void {
+    this.clear();
+    this.speechPlayback?.dispose();
+    this.speechPlayback = null;
   }
 
   private notifyIdle(): void {
@@ -129,6 +157,8 @@ export class AudioQueue {
   }
 
   private notifyPlaying(playing: boolean): void {
+    if (this.audible === playing) return;
+    this.audible = playing;
     for (const cb of [...this.playingCallbacks]) {
       try {
         cb(playing);
@@ -160,7 +190,9 @@ export class AudioQueue {
     if (this.current === audio) {
       audio.onended = null;
       audio.onerror = null;
+      audio.onloadedmetadata = null;
       audio.src = '';
+      this.notifyPlaying(false);
     }
   }
 
@@ -186,30 +218,64 @@ export class AudioQueue {
       this.notifyIdle();
       return;
     }
-    const audio = this.ensureAudio();
+    const generation = ++this.generation;
     if (!this.playing) {
       this.playing = true;
-      this.notifyPlaying(true);
     }
+    if ('stream' in entry) {
+      const controller = new AbortController();
+      this.streamController = controller;
+      try {
+        await this.streamTask?.catch(() => {});
+        if (generation !== this.generation) return;
+        if (!this.speechPlayback) throw new Error('Streaming audio is not unlocked');
+        const task = this.speechPlayback.play(entry.stream, controller.signal);
+        this.streamTask = task;
+        await task;
+      } catch {
+        if (generation === this.generation) this.notifyPlaybackError();
+      } finally {
+        if (generation === this.generation) {
+          this.streamTask = null;
+          this.streamController = null;
+          void this.playNext();
+        }
+      }
+      return;
+    }
+    const audio = this.ensureAudio();
     audio.onended = () => {
+      if (generation !== this.generation) return;
       this.finishCurrent(audio);
       void this.playNext();
     };
     audio.onerror = () => {
+      if (generation !== this.generation) return;
       this.finishCurrent(audio);
       this.notifyPlaybackError();
       void this.playNext();
     };
     this.clearPlaybackTimeout();
-    this.playbackTimeout = setTimeout(() => {
+    const expire = () => {
+      if (generation !== this.generation) return;
       this.finishCurrent(audio);
       this.notifyPlaybackError();
       void this.playNext();
-    }, AudioQueue.PLAYBACK_TIMEOUT_MS);
+    };
+    this.playbackTimeout = setTimeout(expire, AudioQueue.PLAYBACK_TIMEOUT_MS);
+    audio.onloadedmetadata = () => {
+      if (generation !== this.generation || !Number.isFinite(audio.duration)) return;
+      this.clearPlaybackTimeout();
+      this.playbackTimeout = setTimeout(expire, Math.max(
+        AudioQueue.PLAYBACK_TIMEOUT_MS, (audio.duration + 15) * 1000
+      ));
+    };
     audio.src = entry.url;
     try {
       await audio.play();
+      if (generation === this.generation) this.notifyPlaying(true);
     } catch {
+      if (generation !== this.generation) return;
       // Autoplay was blocked or playback failed. Drop this sentence and keep
       // draining so conversation mode never gets wedged in Speaking.
       this.unlocked = false;

@@ -1,6 +1,6 @@
 import type { Page, Request } from '@playwright/test';
 import type { ActivityOverviewResponse } from '../src/lib/chat-v2/types';
-import type { DashboardIssuesResponse, InboxPage, NavigationSummary, ProviderMonitor } from '../src/lib/types/api';
+import type { DashboardIssuesResponse, Deliverable, InboxPage, NavigationSummary, ProviderMonitor } from '../src/lib/types/api';
 import type { LibraryItem } from '../src/lib/library';
 
 export type CockpitStatus = 'draft' | 'running' | 'paused' | 'completed' | 'cancelled' | 'failed';
@@ -9,6 +9,7 @@ const NOW = '2026-07-30T12:00:00Z';
 export const TASK_ID = 'task-stage39-cockpit';
 export const HEAVY_STEP_RUN_ID = 'run-fetch-2';
 const RUNNING_FETCH_STEP_RUN_ID = 'run-fetch-1';
+const TASK_TITLE = 'Release safety review';
 
 function projectionSteps(status: CockpitStatus): Record<string, unknown>[] {
   const draft = status === 'draft';
@@ -148,8 +149,6 @@ function detailedRun(run: Record<string, unknown>): Record<string, unknown> {
     }
   };
 }
-
-const TASK_TITLE = 'Release safety review';
 
 function task(status: CockpitStatus): Record<string, unknown> {
   const draft = status === 'draft';
@@ -639,7 +638,13 @@ export interface CockpitFixture {
 
 export async function installTaskCockpitFixture(
   page: Page,
-  options: { dashboardWorkspaceWindows?: boolean; dashboardConversation?: boolean } = {},
+  options: {
+    dashboardWorkspaceWindows?: boolean;
+    dashboardConversation?: boolean;
+    conversationTimelineItems?: Array<Record<string, unknown>>;
+    conversationHistoryPages?: Array<Array<Record<string, unknown>>>;
+    taskOutput?: () => Deliverable;
+  } = {},
 ): Promise<CockpitFixture> {
   const dashboardConversation = {
     ...taskChatConversation,
@@ -647,6 +652,21 @@ export async function installTaskCockpitFixture(
     context: { type: 'web', ref: null, platform_data: {}, memory_labels: {} },
   };
   let status: CockpitStatus = 'paused';
+  const feedbackSubjects = new Set<string>();
+  const taskResponse = () => {
+    const document = options.taskOutput?.();
+    return {
+      ...task(status),
+      ...(document ? {
+        deliverable_freshness: document.task_freshness
+          ? { [document.deliverable_id]: document.task_freshness } : {},
+        output_presentation: {
+          deliverable_id: document.deliverable_id, step_run_id: document.step_run_id,
+          format: document.format, title: document.title, freshness: document.task_freshness,
+        },
+      } : {}),
+    };
+  };
   let heavyRequestCount = 0;
   const actionRequests: string[] = [];
   const navigationRequests: string[] = [];
@@ -667,6 +687,17 @@ export async function installTaskCockpitFixture(
       contentType: 'application/json',
       body: JSON.stringify(body)
     });
+    const dashboardSummary = { total: 0, critical: 0, warning: 0, info: 0, truncated: false };
+    if (method === 'GET' && path === '/api/v1/inbox') {
+      return json({ items: [], unread_count: 0, next_cursor: null } satisfies InboxPage);
+    }
+    if (path === '/api/v1/schedules' && method === 'GET') return json([]);
+    if (method === 'GET' && path === '/api/v1/dashboard/navigation-summary') {
+      return json({
+        chat_groups: [], schedules: 0, tasks: 1,
+        dashboard: dashboardSummary,
+      } satisfies NavigationSummary);
+    }
 
     if (path === '/api/v1/system/diagnostics') {
       return json({
@@ -686,20 +717,60 @@ export async function installTaskCockpitFixture(
     if (path === '/api/v1/chat/v2/client-performance' && method === 'POST') {
       return json({ accepted: true });
     }
-    const dashboardSummary = { total: 0, critical: 0, warning: 0, info: 0, truncated: false };
-    if (path === '/api/v1/inbox' && method === 'GET') {
-      return json({ items: [], unread_count: 0, next_cursor: null } satisfies InboxPage);
-    }
-    if (path === '/api/v1/schedules' && method === 'GET') return json([]);
-    if (path === '/api/v1/dashboard/navigation-summary' && method === 'GET') {
-      return json({
-        chat_groups: [], dashboard: dashboardSummary, schedules: 0, tasks: 1,
-      } satisfies NavigationSummary);
-    }
     if (path === '/api/v1/dashboard/issues' && method === 'GET') {
       return json({ generated_at: NOW, issues: [], summary: dashboardSummary } satisfies DashboardIssuesResponse);
     }
-    if (path === `/api/v1/tasks/${TASK_ID}/summary`) return json(task(status));
+    if (path === `/api/v1/tasks/${TASK_ID}/summary`) return json(taskResponse());
+    const output = options.taskOutput?.();
+    if (output && method === 'POST' && path === '/api/v1/feedback/sources/resolve') {
+      const body = request.postDataJSON();
+      if (body.source?.kind === 'document' && body.source.content_ref === output.deliverable_id) {
+        const subjectId = `task-output-feedback-${output.deliverable_id}`;
+        feedbackSubjects.add(subjectId);
+        return json({
+          subject_id: subjectId, source_token: `task-output-read-${output.deliverable_id}`,
+          source: body.source, context: body.context,
+          content_digest: 'a'.repeat(64), availability: 'available',
+          permitted_locator_kinds: ['rich'], lineage_id: output.lineage_id,
+          revision: output.revision, latest_content_ref: output.deliverable_id,
+          capabilities: { read: true, comment: true, moderate: false, dispatch: false, disclose: false },
+          title: output.title, format: output.format, canonical_text: output.content,
+        });
+      }
+    }
+    const feedbackThreads = path.match(/^\/api\/v1\/feedback\/subjects\/([^/]+)\/threads$/);
+    if (method === 'GET' && feedbackThreads && feedbackSubjects.has(feedbackThreads[1])) {
+      return json({ items: [], next_cursor: null });
+    }
+    if (output && method === 'GET' && path === `/api/v1/step-runs/${output.step_run_id}/deliverables/${output.deliverable_id}`) {
+      return json(output);
+    }
+    if (output && method === 'GET' && path === `/api/v1/deliverables/${output.deliverable_id}/revisions`) {
+      return json({
+        lineage_id: output.lineage_id, latest_deliverable_id: output.deliverable_id,
+        revisions: [{
+          deliverable_id: output.deliverable_id, revision: output.revision,
+          title: output.title, format: output.format, status: output.status,
+          step_run_id: output.step_run_id, task_id: TASK_ID, conversation_id: null,
+          created_at: output.created_at, is_latest: true,
+        }],
+      });
+    }
+    if (output && method === 'GET' && path === `/api/v1/library/items/deliverable/${output.deliverable_id}`) {
+      return json({
+        kind: 'deliverable', id: output.deliverable_id, lineage_id: output.lineage_id ?? null,
+        revision: output.revision ?? 1, title: output.title,
+        owner_email: taskChatConversation.user_email,
+        agent_id: 'agent-stage39', agent_name: null,
+        project_id: null, project_name: null,
+        conversation_id: null, conversation_title: null,
+        task_id: TASK_ID, task_title: TASK_TITLE,
+        size_bytes: new TextEncoder().encode(output.content).length, format: output.format,
+        status: output.status, origin: 'agent', is_readonly: false,
+        created_at: output.created_at ?? '2026-03-19T12:07:00Z',
+        updated_at: output.updated_at ?? NOW,
+      } satisfies LibraryItem);
+    }
     if (method === 'GET' && (
       path === '/api/v1/library/items/deliverable/dlv-stage39-final' ||
       path === '/api/v1/library/items/deliverable/dlv-child-supporting'
@@ -1170,6 +1241,21 @@ export async function installTaskCockpitFixture(
         last_generation: null
       });
     }
+    if (method === 'GET' && path === '/api/v1/chat/v2/conversations/conv-task-chat/timeline'
+      && options.conversationHistoryPages) {
+      const match = /^cold-window-(\d+)$/.exec(url.searchParams.get('before') ?? '');
+      const index = match ? Number(match[1]) : -1;
+      const items = options.conversationHistoryPages[index];
+      if (items) {
+        const hasOlder = index + 1 < options.conversationHistoryPages.length;
+        return json({
+          schema_version: 2, projection_version: 'stage39-cockpit-e2e',
+          scope: { key: 'conversation:conv-task-chat', kind: 'conversation', conversation_id: 'conv-task-chat' },
+          items, history_window_reduced: true, has_more_before: hasOlder,
+          before_cursor: hasOlder ? `cold-window-${index + 1}` : null, server_time: NOW,
+        });
+      }
+    }
     if (path === '/api/v1/chat/v2/conversations/conv-task-chat/snapshot') {
       return json({
         schema_version: 2,
@@ -1180,7 +1266,12 @@ export async function installTaskCockpitFixture(
           conversation_id: 'conv-task-chat'
         },
         conversation: taskChatConversation,
-        timeline: { items: taskChatTimeline, has_more_before: false, before_cursor: null },
+        timeline: {
+          items: options.conversationHistoryPages?.[0] ?? options.conversationTimelineItems ?? taskChatTimeline,
+          history_window_reduced: Boolean(options.conversationHistoryPages),
+          has_more_before: (options.conversationHistoryPages?.length ?? 0) > 1,
+          before_cursor: (options.conversationHistoryPages?.length ?? 0) > 1 ? 'cold-window-1' : null,
+        },
         state: {
           state_version: 1,
           snapshot_generated_at: NOW,
@@ -1319,7 +1410,7 @@ export async function installTaskCockpitFixture(
       if (path.endsWith('/cancel')) status = 'cancelled';
       return json({ ok: true, task_id: TASK_ID, status });
     }
-    if (path === `/api/v1/tasks/${TASK_ID}` && method === 'GET') return json(task(status));
+    if (path === `/api/v1/tasks/${TASK_ID}` && method === 'GET') return json(taskResponse());
     if (path === `/api/v1/tasks/${TASK_ID}` && method === 'PATCH') return json(task(status));
 
     unmockedRequests.push(`${method} ${path}`);

@@ -2,6 +2,8 @@
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ActivityLabel from './ActivityLabel.svelte';
   import { chatDisclosure } from '$lib/chat-v2/motion';
+  import { getContext, untrack } from 'svelte';
+  import { timelineDisclosureContext, TimelineDisclosureState } from '$lib/chat-v2/presentation-state';
 
   import ActivityGroupIcon from '$lib/components/chat-v2/ActivityGroupIcon.svelte';
   import ChatV2TimelineItemRenderer from '$lib/components/chat-v2/ChatV2TimelineItemRenderer.svelte';
@@ -34,7 +36,12 @@
     scope?: TimelineScope | undefined;
   }>();
 
-  let expanded = $state(false);
+  const disclosures = getContext<TimelineDisclosureState | undefined>(timelineDisclosureContext);
+  const memberIds = $derived(row.items.map((item: ToolGroupRow['items'][number]) => item.id));
+  const restored = untrack(() => disclosures?.read('tool_group', memberIds));
+  let instantDisclosure = $state(true);
+  let expanded = $state(restored ?? untrack(() => row.defaultExpanded));
+  let userChoice = $state(restored);
   let initializedGroupId = $state<string | null>(null);
   let liveNow = $state(Date.now());
 
@@ -44,13 +51,24 @@
 
   $effect(() => {
     if (initializedGroupId !== row.id) {
-      expanded = row.defaultExpanded;
+      const remembered = untrack(() => disclosures?.read('tool_group', memberIds));
+      userChoice = remembered;
+      expanded = remembered ?? row.defaultExpanded;
+      if (remembered !== undefined) disclosures?.remember('tool_group', memberIds, remembered);
       initializedGroupId = row.id;
     }
-    if (selectedChildVisible || row.defaultExpanded) {
+    if (userChoice !== undefined) disclosures?.remember('tool_group', memberIds, userChoice);
+    if (selectedChildVisible || (row.defaultExpanded && userChoice === undefined)) {
       expanded = true;
     }
   });
+
+  function toggleExpanded(): void {
+    instantDisclosure = false;
+    expanded = !expanded;
+    userChoice = expanded;
+    disclosures?.remember('tool_group', memberIds, expanded);
+  }
 
   $effect(() => {
     if (row.summary.status !== 'running') return;
@@ -94,7 +112,7 @@
 <div class="group relative my-0.5" data-kind="tool_group" data-tool-group-kind={row.summary.kind} data-tool-group-status={row.summary.status}>
   <button
     type="button"
-    onclick={() => (expanded = !expanded)}
+    onclick={toggleExpanded}
     class={`chat-state-handoff flex w-full items-start gap-2 rounded-xl px-3 py-2 text-left text-sm hover:bg-surface-hover focus-visible:outline-accent ${row.summary.accentClass}`}
     data-motion-state={row.summary.status}
     aria-expanded={expanded}
@@ -125,7 +143,7 @@
   </button>
 
   {#if expanded}
-    <div transition:chatDisclosure
+    <div transition:chatDisclosure={{ instant: instantDisclosure }}
       onoutrostart={(event) => { event.currentTarget.inert = true; }}
       onintrostart={(event) => { event.currentTarget.inert = false; }}
       class="tool-group-content mx-3 mb-2 space-y-2 overflow-hidden rounded-lg border border-separator/50 px-2 py-2">

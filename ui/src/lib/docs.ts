@@ -31,7 +31,7 @@ const overviewModules = import.meta.glob('../../../docs/README.md', {
   import: 'default'
 }) as Record<string, RawMarkdownLoader>;
 
-const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg,webp}', {
+const assetUrlModules = import.meta.glob('../../../docs/assets/**/*.{svg,png,jpg,jpeg,webp,gif}', {
   query: '?url',
   import: 'default',
   eager: true
@@ -61,6 +61,7 @@ const ALLOWED_APP_ROUTE_RE = /^\/(docs(\/[a-z0-9-]+)?|settings(\?.*)?|agents(\/.
 const MARKDOWN_LINK_RE = /!??\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 
 const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
+  'docs/guide/speech.md': '/docs/speech',
   'docs/README.md': '/docs',
   'docs/guide/getting-started.md': '/docs/getting-started',
   'docs/guide/local-compose.md': '/docs/local-compose',
@@ -72,6 +73,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/customizing-your-harness.md': '/docs/customizing-your-harness',
   'docs/guide/security-and-privacy.md': '/docs/security-and-privacy',
   'docs/guide/settings.md': '/docs/settings',
+  'docs/guide/usage-accounting.md': '/docs/usage-accounting',
   'docs/guide/using-chat.md': '/docs/using-chat',
   'docs/guide/chat-modes.md': '/docs/chat-modes',
   'docs/guide/context-management.md': '/docs/context-management',
@@ -81,6 +83,7 @@ const EMBEDDED_DOC_ROUTE_BY_SOURCE_PATH: Record<string, string> = {
   'docs/guide/workflows.md': '/docs/workflows',
   'docs/guide/tools-and-skills.md': '/docs/tools-and-skills',
   'docs/guide/content-and-sharing.md': '/docs/content-and-sharing',
+  'docs/guide/work-feedback.md': '/docs/work-feedback',
   'docs/guide/rich-deliverables.md': '/docs/rich-deliverables',
   'docs/guide/rich-deliverable-composition.md': '/docs/rich-deliverable-composition',
   'docs/guide/rich-deliverable-blocks-layout.md': '/docs/rich-deliverable-blocks-layout',

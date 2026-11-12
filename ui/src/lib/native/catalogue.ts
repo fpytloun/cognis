@@ -5,6 +5,7 @@ import { wsClient, wsState } from '$lib/ws/client';
 import type { Agent } from '$lib/types/api';
 
 export const nativeAgents = writable<Agent[]>([]);
+export const nativeAgentsReady = writable(false);
 
 /** Authenticated resident discovery, independent of workspace membership. */
 export function installAgentCatalogue(): () => void {
@@ -16,6 +17,7 @@ export function installAgentCatalogue(): () => void {
       const agents = await api.agents.listAll({ include_hidden: true });
       if (alive && epoch === generation && ticket === request && owner === account) {
         nativeAgents.set(agents.filter((agent) => !agent.is_system && !agent.disabled));
+        nativeAgentsReady.set(true);
       }
     } catch { /* Retry at the next authenticated invalidation. */ }
   };
@@ -23,7 +25,7 @@ export function installAgentCatalogue(): () => void {
     auth.subscribe((state) => {
       const next = state.status === 'authenticated' ? state.user?.email ?? null : null;
       if (next !== account) {
-        account = next; generation++; nativeAgents.set([]);
+        account = next; generation++; nativeAgents.set([]); nativeAgentsReady.set(false);
         if (next) void refresh();
       }
     }),
@@ -35,6 +37,6 @@ export function installAgentCatalogue(): () => void {
   window.addEventListener('focus', refresh);
   return () => {
     alive = false; generation++; stops.forEach((stop) => stop());
-    window.removeEventListener('focus', refresh); nativeAgents.set([]);
+    window.removeEventListener('focus', refresh); nativeAgents.set([]); nativeAgentsReady.set(false);
   };
 }

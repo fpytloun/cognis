@@ -17,7 +17,7 @@
   import { confirmAction } from '$lib/stores/confirm';
   import { addToast } from '$lib/stores/toasts';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
-  import type { Agent, AgentGrant, AgentProjectAssignment, CredentialMetadata, EffectiveToolItem, EffectiveToolsResponse, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, SecretMetadata, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, AgentGrant, AgentProjectAssignment, AgentSkillUsage, CredentialMetadata, EffectiveToolItem, EffectiveToolsResponse, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, SecretMetadata, Skill, Workflow } from '$lib/types/api';
 
   let { agentId } = $props<{ agentId: string }>();
   let loading = $state(true);
@@ -34,6 +34,7 @@
   let credentials = $state<CredentialMetadata[]>([]);
   let knowledgebases = $state<KnowledgebaseModel[]>([]);
   let skills = $state<Skill[]>([]);
+  let skillUsage = $state<AgentSkillUsage[]>([]);
   let intarisMcpServers = $state<IntarisMCPServer[]>([]);
   let agents = $state<Agent[]>([]);
   let secondaryAgents = $state<Agent[]>([]);
@@ -180,6 +181,9 @@
         api.agents.memoryBackends().then(result => result.items).catch(() => []),
       ]);
       secondaryAgents = agents.filter((candidate: Agent) => candidate.agent_type === 'secondary');
+      skillUsage = agent.is_system || agent.is_readonly_for_caller
+        ? []
+        : await api.agents.skillUsage(agentId).catch(() => []);
       await loadMyShare();
       optionsLoading = false;
       await tick();
@@ -709,6 +713,7 @@
       {credentials}
       {knowledgebases}
       {skills}
+      {skillUsage}
       {intarisMcpServers}
       {agents}
       {secondaryAgents}

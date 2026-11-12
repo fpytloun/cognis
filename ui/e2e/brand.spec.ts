@@ -1,7 +1,8 @@
 import { expect, test } from '@playwright/test';
 import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 
-// The app owns login/recovery; an isolated compiled fixture owns the gallery.
+// Local-only: run against Vite with COGNIS_E2E_URL=http://127.0.0.1:5197.
+// No credentials or backend required.
 test('static loading and recovery remain usable without application startup', async ({ browser, baseURL }) => {
   const context = await browser.newContext({ javaScriptEnabled: false, reducedMotion: 'reduce' });
   const page = await context.newPage();

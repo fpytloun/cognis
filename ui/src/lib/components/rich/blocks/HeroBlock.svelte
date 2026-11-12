@@ -37,7 +37,7 @@
     {/if}
     {#if blockText(block, 'eyebrow')}<div class="rich-eyebrow">{@html renderInlineMarkdown(blockText(block, 'eyebrow'))}</div>{/if}
     {#if blockTitle(block)}
-      {#if block.__document_h1}<h1>{@html renderInlineMarkdown(blockTitle(block))}</h1>{:else}<h2>{@html renderInlineMarkdown(blockTitle(block))}</h2>{/if}
+      {#if block.__document_heading_level === 1}<h1>{@html renderInlineMarkdown(blockTitle(block))}</h1>{:else}<h2>{@html renderInlineMarkdown(blockTitle(block))}</h2>{/if}
     {/if}
     {#if subtitle}<p class="rich-lede">{@html renderInlineMarkdown(subtitle)}</p>{/if}
     {#if children.length > 0}<div class="rich-stack"><RichBlockList blocks={children} {sources} {mediaUrlFor} /></div>{/if}

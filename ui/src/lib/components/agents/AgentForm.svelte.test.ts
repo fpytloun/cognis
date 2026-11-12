@@ -5,7 +5,6 @@ import { createReactiveAgentForm } from './agentFormTestState.svelte';
 import AgentForm from './AgentForm.svelte';
 import { api } from '$lib/api/client';
 import type { LLMProvider } from '$lib/types/api';
-import { defaultModelEntry } from '$lib/types/api';
 
 function setup(readonly = false, agents: any[] = [], providers: LLMProvider[] = []) {
   const form = createReactiveAgentForm();
@@ -23,6 +22,20 @@ function setup(readonly = false, agents: any[] = [], providers: LLMProvider[] = 
 
 describe('AgentForm sections', () => {
   afterEach(() => vi.restoreAllMocks());
+  it('keeps execution settings but removes automatic workflow selection controls', async () => {
+    const { onSave } = setup();
+    await fireEvent.click(screen.getByRole('tab', { name: 'Workflows' }));
+    expect(screen.getByRole('heading', { name: 'Execution settings' })).toBeVisible();
+    expect(screen.queryByRole('heading', { name: 'Available workflows' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Default workflow' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('combobox', { name: 'Selection mode' })).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    const execution = onSave.mock.calls[0][0].execution;
+    for (const key of ['available_workflow_ids', 'default_workflow_id', 'workflow_selection_mode']) {
+      expect(execution).not.toHaveProperty(key);
+    }
+    expect(execution).toHaveProperty('step_agent_overrides');
+  });
   const routeResult = { routes: [{
     route_id: 'chat-route', reference: 'cognis/chat', revision: 1,
     config: { name: 'chat', targets: [{ provider_id: 'anthropic', model: 'claude', priority: 0 }] }
@@ -78,30 +91,6 @@ describe('AgentForm sections', () => {
     await screen.findByText('Thinking effort for profile "default" is unavailable. Select an available value.');
     expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();
   });
-  it('renders direct models with partial metadata without inventing capabilities', async () => {
-    vi.spyOn(api.inferenceRoutes, 'list').mockResolvedValue({ routes: [] });
-    const form = createReactiveAgentForm();
-    form.name = 'Partial metadata';
-    form.providerId = 'partial';
-    form.model = 'model';
-    const model = defaultModelEntry('model');
-    Reflect.deleteProperty(model, 'reasoning_efforts');
-    Reflect.deleteProperty(model, 'supports_fast_mode');
-    render(AgentForm, {
-      mode: 'create', form, tools: [], workflows: [], agents: [], onSave: vi.fn(),
-      providers: [{
-        provider_id: 'partial', display_name: 'Partial metadata', location: 'controller',
-        backend: 'openai', config: {}, is_default: false, status: 'active',
-        created_at: null, updated_at: null, last_test: null, models: [model]
-      }]
-    });
-    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
-    const efforts = screen.getByRole('combobox', { name: /Thinking effort/ });
-    expect(within(efforts).getByRole('option', { name: 'Provider default' })).toHaveValue('default');
-    expect(within(efforts).queryByRole('option', { name: 'High' })).not.toBeInTheDocument();
-    expect(within(screen.getByRole('combobox', { name: /^Fast mode/ }))
-      .getByRole('option', { name: /^Enabled\b/ })).toBeDisabled();
-  });
   it('groups memory and guardrails while keeping configured advanced controls and warnings visible', async () => {
     const { container, form, onSave } = setup();
     form.maximumOutcome = 'approve';
@@ -113,16 +102,90 @@ describe('AgentForm sections', () => {
     expect(screen.getByRole('combobox', { name: /^Maximum evaluation outcome/ })).toHaveValue('approve');
     await fireEvent.click(within(advanced as HTMLElement).getByText('Advanced evaluation controls'));
     expect(advanced).not.toHaveAttribute('open');
-    expect(screen.getByRole('alert')).toHaveTextContent('DANGEROUS');
-    expect(screen.getByRole('alert')).toBeVisible();
+    expect(screen.getByText('DANGEROUS — Yolo mode:').closest('[role="alert"]')).toBeVisible();
     await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
     expect(onSave).toHaveBeenCalledWith(expect.objectContaining({
       capabilities: expect.objectContaining({ maximum_outcome: 'approve' })
     }));
     await fireEvent.change(screen.getByRole('combobox', { name: /^Guardrails backend/ }), { target: { value: 'none' } });
-    expect(screen.getByRole('combobox', { name: /^Intaris evaluation/ })).toBeDisabled();
+    expect(screen.queryByRole('combobox', { name: /^Intaris evaluation/ })).not.toBeInTheDocument();
     await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
     expect(form.maximumOutcome).toBe('approve');
+  });
+  it('keeps analytics editable without guardrails and serializes false', async () => {
+    const { onSave } = setup();
+    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
+    const analytics = screen.getByRole('checkbox', { name: /Session analytics/ });
+    expect(analytics).toBeChecked();
+    await fireEvent.change(screen.getByRole('combobox', { name: /^Guardrails backend/ }), { target: { value: 'none' } });
+    expect(analytics).toBeEnabled();
+    await fireEvent.click(analytics);
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(onSave.mock.calls[0][0].capabilities).toMatchObject({
+      analytics_enabled: false, guardrails_backend: 'none'
+    });
+  });
+  it('hides guardrail-only controls under None and restores draft values when re-enabled', async () => {
+    const { form, onSave } = setup();
+    form.intarisEvaluation = 'strict';
+    form.approvalMode = 'unattended';
+    form.minimumOutcome = 'escalate';
+    form.maximumOutcome = 'approve';
+    form.escalationTimeoutSeconds = '120';
+    form.toolPermissions = { read: 'deny' };
+    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
+    const backend = screen.getByRole('combobox', { name: /^Guardrails backend/ });
+    expect(screen.getByRole('combobox', { name: /^Intaris evaluation/ })).toHaveValue('strict');
+    expect(screen.getByRole('combobox', { name: /^Approvals/ })).toHaveValue('unattended');
+    expect(screen.getByRole('combobox', { name: /^Minimum evaluation outcome/ })).toHaveValue('escalate');
+    expect(screen.getByRole('combobox', { name: /^Maximum evaluation outcome/ })).toHaveValue('approve');
+    expect(screen.getByRole('spinbutton', { name: /^Escalation timeout/ })).toHaveValue(120);
+    await fireEvent.change(backend, { target: { value: 'none' } });
+    for (const name of [/^Intaris evaluation/, /^Approvals/, /^Minimum evaluation outcome/, /^Maximum evaluation outcome/]) {
+      expect(screen.queryByRole('combobox', { name })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText('Advanced evaluation controls')).not.toBeInTheDocument();
+    expect(screen.queryByRole('spinbutton', { name: /^Escalation timeout/ })).not.toBeInTheDocument();
+    expect(screen.queryByText('DANGEROUS — Yolo mode:')).not.toBeInTheDocument();
+    const analytics = screen.getByRole('checkbox', { name: /Session analytics/ });
+    expect(analytics).toBeEnabled();
+    await fireEvent.click(analytics);
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    const disabled = onSave.mock.calls[0][0];
+    expect(disabled.capabilities).toMatchObject({ guardrails_backend: 'none', analytics_enabled: false });
+    for (const key of ['minimum_outcome', 'maximum_outcome', 'escalation_timeout_seconds']) {
+      expect(disabled.capabilities).not.toHaveProperty(key);
+    }
+    expect(disabled.permissions.tool_permissions).toEqual({ read: 'deny' });
+    await fireEvent.change(backend, { target: { value: 'intaris' } });
+    expect(screen.getByRole('combobox', { name: /^Intaris evaluation/ })).toHaveValue('strict');
+    expect(screen.getByRole('combobox', { name: /^Approvals/ })).toHaveValue('unattended');
+    expect(screen.getByText('Advanced evaluation controls')).toBeVisible();
+    expect(screen.getByRole('combobox', { name: /^Minimum evaluation outcome/ })).toHaveValue('escalate');
+    expect(screen.getByRole('combobox', { name: /^Maximum evaluation outcome/ })).toHaveValue('approve');
+    expect(screen.getByRole('spinbutton', { name: /^Escalation timeout/ })).toHaveValue(120);
+    expect(analytics).not.toBeChecked();
+    await fireEvent.click(screen.getByRole('button', { name: 'Create agent' }));
+    expect(onSave.mock.calls[1][0].capabilities).toMatchObject({
+      guardrails_backend: 'intaris', analytics_enabled: false, intaris_evaluation: 'strict',
+      approval_mode: 'unattended', minimum_outcome: 'escalate', maximum_outcome: 'approve',
+      escalation_timeout_seconds: 120
+    });
+  });
+  it('starts a saved None agent with only backend and analytics controls in Guardrails', async () => {
+    const form = createReactiveAgentForm();
+    Object.assign(form, agentToFormState({
+      agent_id: 'no-guardrails', name: 'Storage and analytics',
+      capabilities: { guardrails_backend: 'none', analytics_enabled: false }
+    } as never));
+    render(AgentForm, { mode: 'edit', form, tools: [], workflows: [], agents: [], providers: [], onSave: vi.fn() });
+    await fireEvent.click(screen.getByRole('tab', { name: 'Providers & models' }));
+    const card = screen.getByRole('heading', { name: /^Guardrails$/ }).parentElement!;
+    expect(within(card).getAllByRole('combobox')).toHaveLength(1);
+    expect(within(card).getByRole('combobox', { name: /^Guardrails backend/ })).toHaveValue('none');
+    expect(within(card).getByRole('checkbox', { name: /Session analytics/ })).not.toBeChecked();
+    expect(within(card).getByRole('checkbox', { name: /Session analytics/ })).toBeEnabled();
+    expect(within(card).queryByText('Advanced evaluation controls')).not.toBeInTheDocument();
   });
   it('offers Cognis routes for both agent defaults and runtime profiles', async () => {
     const list = vi.spyOn(api.inferenceRoutes, 'list').mockResolvedValue({

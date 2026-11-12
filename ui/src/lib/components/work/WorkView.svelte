@@ -6,6 +6,7 @@
 
   import AssistantDeliverableBlock from '$lib/components/AssistantDeliverableBlock.svelte';
   import MessageAttachments from '$lib/components/MessageAttachments.svelte';
+  import DocumentFavoriteIndicator from '$lib/components/DocumentFavoriteIndicator.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import { asApiError } from '$lib/api/client';
@@ -22,12 +23,14 @@
   } from '$lib/chat-v2/types';
   import { ALL_TIME_RANGE, fromUtcIso, quickWorkRange, toUtcIso, workRangeOverlaps } from '$lib/work/workTimeRange';
   import type { AttachmentRef } from '$lib/types/api';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { commandToToolCall, mutationToToolCall } from '$lib/work/workEventAdapter';
   import {
     appendOlderWorkPage,
     applyExactWorkSummary,
     createAccumulatedWorkState,
     orderedWorkDeliverables,
+    latestWorkArtifacts,
     refreshNewestWorkPage,
     retainExactWorkSummary,
     restartAccumulatedWorkTraversal,
@@ -45,9 +48,40 @@
   import type { ActivityMaterialization } from '$lib/work/activityLifecycle';
   import ActivityLifecycleStatus from './ActivityLifecycleStatus.svelte';
   import WorkFileTree from './WorkFileTree.svelte';
+  import { getFeedbackContext } from '$lib/feedback/context';
+  import { FeedbackDiffRegistry } from '$lib/feedback/diff-registry';
+  import { getCommentWorkspace } from '$lib/feedback/comment-workspace';
+  import type { FileDiffRef } from '$lib/chat-v2/types';
+  import type { WorkFileDiff } from '$lib/work/fileTree';
+  import FeedbackDiffWorkspace from '$lib/components/feedback/FeedbackDiffWorkspace.svelte';
+  import WorkImageGrid from './WorkImageGrid.svelte';
+  import { get } from 'svelte/store';
   import type { WorkInitialFocus } from '$lib/work/workFocus';
 
   type WorkTab = WorkViewTab;
+  const feedbackOrigin = getFeedbackContext();
+  const commentWorkspace = getCommentWorkspace();
+  let feedbackRevision = $state(0);
+  let feedbackRegistry = $state<FeedbackDiffRegistry | null>(null);
+  const feedbackError = $derived(feedbackRegistry?.error);
+  const feedbackActivationStatus = $derived(feedbackRegistry?.activationStatus);
+  $effect(() => {
+    const context = feedbackOrigin.context;
+    const registry = new FeedbackDiffRegistry(context, () => { feedbackRevision++; }, () => feedbackOrigin.context,
+      owner => commentWorkspace?.register(owner));
+    feedbackRegistry = registry;
+    return () => registry.dispose();
+  });
+  function feedbackBindingForDiff(diff: WorkFileDiff, _ordinal: number) {
+    void feedbackRevision;
+    return feedbackRegistry?.binding((diff as WorkFileDiff & Pick<FileDiffRef, 'feedback_source'>).feedback_source) ?? null;
+  }
+  function activateFeedbackForDiff(diff: WorkFileDiff) {
+    const registry = feedbackRegistry;
+    if (diff.feedback_source) void registry?.activate(diff.feedback_source, owner => owner.binding(get(owner.state))?.onAnchorCandidate({
+      locator: { kind: 'diff', scope: 'file', side: null, start_line: null, end_line: null, hunk_digest: null, quote: null },
+    }));
+  }
   const PAGE_LIMIT = 100;
   const MAX_EMPTY_PAGE_REQUESTS_PER_TRIGGER = 12;
   const RECONCILIATION_BACKOFF_MS = [250, 500, 1_000, 2_000] as const;
@@ -63,6 +97,7 @@
     refreshIntervalMs = 120_000,
     live = true,
     onViewSession,
+    onSourceFocus,
     initialTab = 'files',
     forceInitialTab = false,
     sessionId,
@@ -91,6 +126,7 @@
     refreshIntervalMs?: number;
     live?: boolean;
     onViewSession?: ((sessionId: string) => void | Promise<void>) | undefined;
+    onSourceFocus?: () => void;
     initialTab?: WorkViewTab;
     forceInitialTab?: boolean;
     sessionId?: string | undefined;
@@ -188,6 +224,16 @@
   const workstreams = $derived(rawProjection?.workstreams ?? shellProjection?.workstreams ?? []);
   const agentOptions = $derived([...new Set(workstreams.map((item) => item.agent_id))].sort());
   const statusOptions = $derived([...new Set(workstreams.map((item) => item.status))].sort());
+  // Filtering must include older pages even when no matching row reaches the
+  // viewport sentinel. Requests remain serialized by loadOlder.
+  $effect(() => {
+    const filtering = workstreamFilter !== 'all' || agentFilter !== 'all'
+      || statusFilter !== 'all' || Boolean(workstreamSearch.trim());
+    if (!filtering || !workState || workState.exhausted || loading || refreshing
+      || loadingOlder || olderError) return;
+    const timer = window.setTimeout(() => { void untrack(() => loadOlder()); }, 150);
+    return () => window.clearTimeout(timer);
+  });
   $effect(() => {
     const fingerprint = rawProjection?.graph_fingerprint ?? '';
     if (!fingerprint || fingerprint === filterGraphFingerprint) return;
@@ -221,21 +267,29 @@
       && !workstreamSearch.trim()
     ) return rawProjection;
     const matches = (source: WorkstreamRef | null | undefined) => {
-      if (!source) return workstreamFilter === 'all' && agentFilter === 'all' && statusFilter === 'all';
+      // Items without a workstream belong to this conversation itself (the root).
+      if (!source) return (workstreamFilter === 'all' || workstreamFilter === 'root')
+        && agentFilter === 'all' && statusFilter === 'all';
       if (workstreamFilter === 'root' && source.key !== source.root_key) return false;
       if (workstreamFilter !== 'all' && workstreamFilter !== 'root' && source.key !== workstreamFilter) return false;
       if (agentFilter !== 'all' && source.agent_id !== agentFilter) return false;
       if (statusFilter !== 'all' && source.status !== statusFilter) return false;
-      if (workstreamSearch.trim()) {
-        const query = workstreamSearch.trim().toLowerCase();
-        if (!`${source.title} ${source.agent_id}`.toLowerCase().includes(query)) return false;
-      }
       return true;
     };
-    const mutations = rawProjection.mutations.filter((item) => matches(item.source_workstream));
-    const commands = rawProjection.commands.filter((item) => matches(item.source_workstream));
-    const artifacts = rawProjection.artifacts.filter((item) => matches(item.source_workstream));
-    const deliverables = (rawProjection.deliverables ?? []).filter((item) => matches(item.source_workstream));
+    const query = workstreamSearch.trim().toLowerCase();
+    const searchable = (source: WorkstreamRef | null | undefined, ...values: unknown[]) =>
+      !query || [source?.title, source?.agent_id, ...values]
+        .filter((value) => value != null)
+        .map((value) => typeof value === 'string' ? value : JSON.stringify(value))
+        .join(' ').toLowerCase().includes(query);
+    const mutations = rawProjection.mutations.filter((item) => matches(item.source_workstream)
+      && searchable(item.source_workstream, item.tool_name, item.display_name, item.paths, item.arguments, item.result_preview));
+    const commands = rawProjection.commands.filter((item) => matches(item.source_workstream)
+      && searchable(item.source_workstream, item.command, item.description, item.workdir, item.preview));
+    const artifacts = rawProjection.artifacts.filter((item) => matches(item.source_workstream)
+      && searchable(item.source_workstream, item.filename, item.title, item.mime_type, item.artifact_id));
+    const deliverables = (rawProjection.deliverables ?? []).filter((item) => matches(item.source_workstream)
+      && searchable(item.source_workstream, item.title, item.content, item.format, item.deliverable_id));
     const fileIds = new Set(mutations.flatMap((event) => [
       ...(event.file_stats?.map((stat) => stat.path_id) ?? []),
       ...event.file_diffs.map((diff) => diff.path_id ?? diff.path),
@@ -300,12 +354,23 @@
     );
   });
   const primaryResult = $derived(projection?.final_deliverable ?? null);
+  const latestArtifacts = $derived(latestWorkArtifacts(projection?.artifacts ?? []));
+  const imageArtifacts = $derived(latestArtifacts.filter((item) => item.mime_type?.startsWith('image/')));
+  const fileArtifacts = $derived(latestArtifacts.filter((item) => !item.mime_type?.startsWith('image/')));
   const activeFilterCount = $derived(
     Number(workstreamFilter !== 'all')
     + Number(agentFilter !== 'all')
     + Number(statusFilter !== 'all')
     + Number(Boolean(workstreamSearch.trim())),
   );
+  // Tab counts follow the filters: with filters they count the loaded matching items.
+  const countSummary = $derived(activeFilterCount && projection ? projection.summary : (rawProjection ?? shellProjection)?.summary);
+  // Count documents, not revisions, once every artifact of the work is loaded.
+  const artifactCount = $derived.by(() => {
+    if (activeFilterCount && projection) return latestArtifacts.length;
+    const total = (rawProjection ?? shellProjection)?.summary.artifacts ?? 0;
+    return projection && projection.artifacts.length >= total ? latestArtifacts.length : total;
+  });
   const omittedFileStats = $derived(
     projection?.mutations.reduce(
       (total, event) => total + (event.omitted_file_stat_count ?? 0),
@@ -316,15 +381,15 @@
     {
       id: 'files',
       label: 'Files',
-      count: (rawProjection ?? shellProjection)?.summary.changed_files ?? 0,
-      suffix: (rawProjection ?? shellProjection) && ((rawProjection ?? shellProjection)!.summary.additions || (rawProjection ?? shellProjection)!.summary.deletions)
-        ? `+${(rawProjection ?? shellProjection)!.summary.additions ?? 0}/-${(rawProjection ?? shellProjection)!.summary.deletions ?? 0}`
+      count: countSummary?.changed_files ?? 0,
+      suffix: countSummary && (countSummary.additions || countSummary.deletions)
+        ? `+${countSummary.additions ?? 0}/-${countSummary.deletions ?? 0}`
         : undefined,
     },
-    { id: 'commands', label: 'Commands', count: (rawProjection ?? shellProjection)?.summary.commands ?? 0 },
-    { id: 'mutations', label: 'Mutations', count: (rawProjection ?? shellProjection)?.summary.mutations ?? 0 },
-    { id: 'artifacts', label: 'Artifacts', count: (rawProjection ?? shellProjection)?.summary.artifacts ?? 0 },
-    { id: 'results', label: 'Deliverables', count: (rawProjection ?? shellProjection)?.summary.deliverables ?? 0 },
+    { id: 'commands', label: 'Commands', count: countSummary?.commands ?? 0 },
+    { id: 'mutations', label: 'Mutations', count: countSummary?.mutations ?? 0 },
+    { id: 'artifacts', label: 'Artifacts', count: artifactCount },
+    { id: 'results', label: 'Deliverables', count: activeFilterCount && projection ? deliverables.length : countSummary?.deliverables ?? 0 },
   ]);
 
   function deliverableItem(item: WorkDeliverable): AssistantDeliverableTimelineItem {
@@ -928,7 +993,6 @@
     clearWorkResponseCache(scope.key, sessionId ?? null);
     staleCategories.clear();
     workState = null;
-    activeTab = 'files';
     latestError = null;
     olderError = null;
     timeRangeOpen = false;
@@ -1122,6 +1186,9 @@
   });
 </script>
 
+{#if $feedbackError}<p role="alert">{$feedbackError}</p><button type="button" class="min-h-11 text-accent" onclick={() => feedbackRegistry?.retry()}>Retry feedback</button>{/if}
+{#if $feedbackActivationStatus}<p role="status">{$feedbackActivationStatus}</p>{/if}
+<FeedbackDiffWorkspace registry={feedbackRegistry} {onSourceFocus}>
 <section
   class="work-view min-w-0 max-w-full space-y-4 overflow-x-hidden"
   aria-label="Conversation work"
@@ -1133,7 +1200,7 @@
       <p class="scrollbar-hidden-x mt-0.5 text-xs text-quiet">Files, commands, mutations, artifacts, and deliverables.</p>
     </div>
     <div class="relative ml-auto flex max-w-full flex-wrap items-center justify-end gap-2" data-testid="work-toolbar">
-      {#if workstreams.length > 1}
+      {#if workstreams.length > 0 || activeTab === 'artifacts' || activeTab === 'results'}
         <button
           type="button"
           class="work-filter-toggle inline-flex h-9 items-center gap-1.5 rounded-lg border border-control-border px-2 text-xs text-foreground hover:bg-raised"
@@ -1183,7 +1250,7 @@
     </div>
   {/if}
 
-  {#if workstreams.length > 1}
+  {#if workstreams.length > 0 || activeTab === 'artifacts' || activeTab === 'results'}
     <div id="work-filter-panel" hidden={!filtersOpen} class="work-filters w-full min-w-0 gap-2 rounded-xl border border-separator/80 bg-transparent p-3" data-testid="workstream-filters">
       <div class="col-span-full flex items-center justify-between gap-2">
         <span class="text-xs font-medium text-secondary">Filters</span>
@@ -1197,7 +1264,7 @@
       </label>
       <label class="min-w-0 text-[10px] text-quiet">Agent<select bind:value={agentFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground"><option value="all">All agents</option>{#each agentOptions as agent}<option value={agent}>{agent}</option>{/each}</select></label>
       <label class="min-w-0 text-[10px] text-quiet">Status<select bind:value={statusFilter} class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground"><option value="all">All statuses</option>{#each statusOptions as status}<option value={status}>{status}</option>{/each}</select></label>
-      <label data-find-scope class="min-w-0 text-[10px] text-quiet">Search<input use:findTarget bind:value={workstreamSearch} placeholder="Workstream or agent" class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground" /></label>
+      <label data-find-scope class="min-w-0 text-[10px] text-quiet">Search<input use:findTarget bind:value={workstreamSearch} placeholder="Name, content, workstream, or agent" class="mt-1 h-9 w-full min-w-0 rounded-lg border border-control-border bg-canvas px-2 text-xs text-foreground" /></label>
     </div>
   {/if}
 
@@ -1232,13 +1299,14 @@
         </div>
       {:else if projection && activeTab === 'files'}
         {#if fileDiffs.length > 0}
-          <WorkFileTree
+           <WorkFileTree
+             {...{ feedbackBindingForDiff, activateFeedbackForDiff }}
             {scope}
             diffs={fileDiffs}
             cacheKey={`${scope.key}:${timeRange.from ?? ''}:${timeRange.to ?? ''}`}
-            refreshMissingIdentity={() => loadLatest(true)}
-            {initialFocus}
-          />
+             refreshMissingIdentity={() => loadLatest(true)}
+             {initialFocus}
+           />
           {#if projection.summary.omitted_files}
             <p class="mt-2 text-xs text-warning">{projection.summary.omitted_files} changed files do not have diff previews. Exact page totals and available bounded file metadata remain visible.</p>
           {/if}
@@ -1287,7 +1355,32 @@
           {/each}
         </ol>
       {:else if projection && activeTab === 'artifacts'}
-        <div class="work-evidence-list">{#each projection.artifacts as artifact (artifact.artifact_id)}<div class="mb-2">{#if artifact.source_workstream}<p class="mb-1 text-[10px] text-quiet">{artifact.source_workstream.agent_id} · {artifact.source_workstream.title}</p>{/if}<MessageAttachments attachments={[artifactAttachment(artifact)]} /></div>{/each}</div>
+        <div class="work-evidence-list">
+          {#if imageArtifacts.length}
+            <WorkImageGrid images={imageArtifacts.map((item) => ({
+              artifact_id: item.artifact_id, filename: item.filename || item.title || item.artifact_id,
+              revision: item.revision, revisions: Math.max(item.revisions_here, item.latest_revision ?? item.revision ?? 1),
+              updated_at: item.updated_at ?? item.created_at ?? null,
+            }))} />
+          {/if}
+          {#each fileArtifacts as artifact (artifact.artifact_id)}
+            <div class="mb-2">
+              {#if artifact.source_workstream}<p class="mb-1 text-[10px] text-quiet">{artifact.source_workstream.agent_id} · {artifact.source_workstream.title}</p>{/if}
+              <p class="mb-1 flex items-center gap-1 text-xs text-quiet">
+                <DocumentFavoriteIndicator kind="artifact" id={artifact.artifact_id} />
+                <span>v{artifact.revision ?? 1}</span>
+                {#if artifact.latest_revision && artifact.latest_revision !== artifact.revision}
+                  (latest v{artifact.latest_revision})
+                {/if}
+                {#if artifact.revisions_here > 1}· {artifact.revisions_here} revisions{/if}
+                {#if artifact.updated_at || artifact.created_at}
+                  · <time datetime={artifact.updated_at ?? artifact.created_at ?? ''} title={formatAbsoluteTime(artifact.updated_at ?? artifact.created_at ?? null)}>{formatRelativeTime(artifact.updated_at ?? artifact.created_at ?? null)}</time>
+                {/if}
+              </p>
+              <MessageAttachments attachments={[artifactAttachment(artifact)]} />
+            </div>
+          {/each}
+        </div>
       {:else if projection}
         <div class="space-y-4">
           {#if deliverables.length}
@@ -1301,6 +1394,13 @@
                   >
                     {#if item.deliverable_id === primaryResult?.deliverable_id}<span class="mb-1 inline-flex rounded bg-accent-subtle px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent">Primary</span>{/if}
                     {#if item.source_workstream}<p class="mb-1 text-[10px] text-quiet">{item.source_workstream.agent_id} · {item.source_workstream.title} · {item.source_workstream.status}</p>{/if}
+                    <p class="mb-1 flex items-center gap-1 text-xs text-quiet">
+                      <DocumentFavoriteIndicator kind="deliverable" id={item.deliverable_id} />
+                      <span>v{item.revision ?? 1}</span>
+                      {#if item.updated_at || item.created_at}
+                        · <time datetime={item.updated_at ?? item.created_at ?? ''} title={formatAbsoluteTime(item.updated_at ?? item.created_at ?? null)}>{formatRelativeTime(item.updated_at ?? item.created_at ?? null)}</time>
+                      {/if}
+                    </p>
                     <AssistantDeliverableBlock item={deliverableItem(item)} collapsedByDefault />
                   </div>
                 {/each}
@@ -1336,6 +1436,7 @@
     {#if projection && (!materialization || materialization.state === 'live') && !deliverables.length && fileDiffs.length === 0 && projection.commands.length === 0 && genericMutations.length === 0 && projection.artifacts.length === 0}<p class="text-center text-xs text-quiet" data-testid="work-empty">No activity yet.</p>{/if}
   {/if}
 </section>
+</FeedbackDiffWorkspace>
 
 <style>
   .work-view {

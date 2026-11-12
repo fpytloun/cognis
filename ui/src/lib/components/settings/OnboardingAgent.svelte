@@ -11,7 +11,7 @@
   import { loadSetupDraft, saveSetupDraft } from '$lib/onboarding-setup';
   import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
   import Button from '$lib/components/ui/Button.svelte';
-  import type { Agent, ExecutorConfig, LLMProvider, Skill, Workflow } from '$lib/types/api';
+  import type { Agent, ExecutorConfig, LLMProvider, Skill } from '$lib/types/api';
 
   let { onBack, selectedExecutorId = '' }: { onBack: () => void; selectedExecutorId?: string } = $props();
   let name = $state('Ari');
@@ -33,7 +33,6 @@
   let providers = $state<LLMProvider[]>([]);
   let executors = $state<ExecutorConfig[]>([]);
   let skills: Skill[] = [];
-  let workflows: Workflow[] = [];
   const readyExecutors = $derived(executors.filter(executorReady));
   const template = $derived(AGENT_TEMPLATES.find((entry) => entry.id === templateId) ?? AGENT_TEMPLATES[0]);
   const options = $derived(providers.filter((provider) => provider.status === 'active').flatMap((provider) =>
@@ -51,13 +50,12 @@
     model = provider && preferred ? modelReference(provider, preferred) : '';
   }
   async function load() {
-    const [providerList, list, skillList, workflowList, routes, agents] = await Promise.all([
-      api.llmProviders.list(), api.executor.list(), api.skills.list(), api.workflows.list(), api.modelRouting.get(), api.agents.listAll()
+    const [providerList, list, skillList, routes, agents] = await Promise.all([
+      api.llmProviders.list(), api.executor.list(), api.skills.list(), api.modelRouting.get(), api.agents.listAll()
     ]);
     providers = providerList.items;
     executors = list;
     skills = skillList;
-    workflows = workflowList.items;
     const owner = auth.getSnapshot().user?.email ?? '';
     const draft = loadSetupDraft(owner);
     executorId ||= selectedExecutorId || draft.executorId || list.find(executorReady)?.executor_id || '';
@@ -92,7 +90,7 @@
       }
       if (!created) {
         if (!name.trim() || !model) throw new Error('Enter a name and choose a model in Advanced options.');
-        const form = agentFormFromTemplate(template, workflows, skills);
+        const form = agentFormFromTemplate(template, skills);
         form.agentId = creationId;
         form.name = name.trim();
         const provider = providers.find((entry) => model.startsWith(`${entry.provider_id}/`));

@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "model_source_commit": "3520924c472de4ea20cc69e918f58015fbe475d6",
+  "model_source_tree": "ee87d2c4ed0a8b61ff10ac70d22ba5c0478802f0",
+  "sources": {
+    "cognis/core/usage/query_models.py": {
+      "git_blob": "2ecf5923a84474120cdd4b4b2057a0fea4f434b4",
+      "sha256": "528ad558b7f36b448ce1fc16aa9614fde9ae4889e5f9c5a1f249f70b03dd3517"
+    },
+    "packages/common/src/cognis/models/usage.py": {
+      "git_blob": "97eb2158c58218d763c2c59f0d08eb0669339eda",
+      "sha256": "763e08ef8f424f76033ffad058e884774c379e523ea013c841feb7eec7ff3828"
+    },
+    "docs/specs/usage-query-api.md": {
+      "git_blob": "93b2f2f21724bb269df9b36989aaca163a77dcf5",
+      "sha256": "e9f3dc83c4ab8f6f04e1b36e3d33ec3cb0eb0edc5b7c440860bf1efae548e480"
+    }
+  },
+  "generator": {
+    "path": "scripts/export_usage_query_contract.py",
+    "sha256": "a7f4444be232298c005339ed6bdf01086c1b7375ddb1006d1b7308688dcedf3a",
+    "pydantic_version": "2.12.5",
+    "request_mode": "validation",
+    "response_mode": "serialization"
+  },
+  "files": {
+    "usage-query-contract.json": "46df2086e8d39de72ebc31415d30eab0f0cb14fa1152067388795a9df1de3b23",
+    "usage-query-api.md": "e9f3dc83c4ab8f6f04e1b36e3d33ec3cb0eb0edc5b7c440860bf1efae548e480"
+  }
+}

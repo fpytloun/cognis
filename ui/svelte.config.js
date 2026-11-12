@@ -1,9 +1,13 @@
 import adapter from '@sveltejs/adapter-static';
 import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
+import { usesInjectedRichStyles, richDocumentStyles } from './build-plugins/rich-document-styles.js';
 
 /** @type {import('@sveltejs/kit').Config} */
 const config = {
-  preprocess: vitePreprocess(),
+  preprocess: [richDocumentStyles, vitePreprocess()],
+  vitePlugin: {
+    dynamicCompileOptions: ({ filename }) => usesInjectedRichStyles(filename) ? { css: 'injected' } : undefined,
+  },
   kit: {
     ...(process.env.COGNIS_APPLE_BUNDLE === '1' ? {
       paths: { assets: 'cognisbundle://app' },

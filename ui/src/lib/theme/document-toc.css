@@ -1,0 +1,74 @@
+/* Shared by rich publications and the knowledge reader. Indent the label,
+   never the row: hover, current location and focus span the whole outline. */
+.document-toc {
+  --toc-text: rgb(var(--color-secondary));
+  --toc-strong: rgb(var(--color-foreground));
+  --toc-accent: rgb(var(--color-accent));
+  --toc-highlight: rgb(var(--color-foreground) / .06);
+}
+
+.rich-document-toc {
+  --toc-text: var(--rich-muted);
+  --toc-strong: var(--rich-text);
+  --toc-accent: var(--rich-accent);
+  --toc-highlight: color-mix(in srgb, var(--rich-text) 6%, transparent);
+}
+
+[data-theme-family="paper"] .document-toc {
+  --toc-highlight: color-mix(in srgb, var(--toc-strong) 4%, transparent);
+}
+
+.document-toc, .document-toc :is(ol, ul) {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.document-toc button {
+  display: flex;
+  gap: .5rem;
+  align-items: center;
+  width: 100%;
+  min-height: 1.875rem;
+  border: 0;
+  border-radius: .25rem;
+  background: transparent;
+  color: var(--toc-text);
+  padding: .25rem .5rem .25rem calc(.5rem + var(--toc-depth, 0) * .875rem);
+  font: inherit;
+  font-size: .875rem;
+  font-weight: 500;
+  line-height: 1.5;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+[data-theme-family="paper"] .document-toc button { border-radius: 0; font-weight: 400; }
+
+.document-toc button[aria-current="location"] {
+  color: var(--toc-strong);
+  font-weight: 600;
+  box-shadow: inset 2px 0 var(--toc-accent);
+}
+
+@media (hover: hover) {
+  .document-toc button:hover {
+    background: var(--toc-highlight);
+    color: var(--toc-strong);
+  }
+}
+
+.document-toc button:focus-visible {
+  outline: 2px solid var(--toc-text);
+  outline-offset: -2px;
+  /* Replace the app's outer button ring rather than stacking two indicators. */
+  box-shadow: none;
+  color: var(--toc-strong);
+}
+
+.document-toc button > span { min-width: 0; }
+.rich-document-toc .toc-number { font-family: var(--rich-font-mono); font-size: .75rem; }
+
+@media (pointer: coarse), (max-width: 959.98px) {
+  .document-toc button { min-height: 44px; font-size: 1rem; }
+}

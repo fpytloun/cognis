@@ -1,8 +1,222 @@
 import { expect, test, type Page } from '@playwright/test';
 import { installTaskCockpitFixture, TASK_ID } from './task-cockpit-fixture';
 import { installLibraryRoutes, libraryCatalog } from './library-fixture';
+import type { PaletteItem } from '../src/lib/palette/model';
+
+// Keep deterministic HTTP fixtures authoritative against production preview builds.
+test.use({
+  serviceWorkers: 'block',
+  // Static preview lacks the controller's CSP hashes; these are mocked UI tests.
+  bypassCSP: process.env.COGNIS_E2E_STATIC_PREVIEW === '1',
+});
 
 const browserErrors = new WeakMap<Page, string[]>();
+
+for (const width of [390, 1440]) {
+  test(`project waiting lane follows pending input and unread completion at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await projectFixture(page);
+    let push: ((event: object) => void) | undefined;
+    await page.routeWebSocket('**/api/ws', socket => {
+      push = event => socket.send(JSON.stringify(event));
+      push({ type: 'authenticated' });
+      socket.onMessage(message => {
+        if (JSON.parse(String(message)).type === 'ping') push?.({ type: 'pong' });
+      });
+    });
+    let pending = true;
+    let unread = false;
+    let failWaitingOnce = width === 1440;
+    const conversation = () => ({
+      conversation_id: 'conv-task-chat', agent_id: 'agent-stage39', title: 'Kitchen renovation',
+      context: { type: 'web' }, status: 'active', project_id: 'proj_home',
+      has_active_turn: pending, has_unread: unread,
+      pending_notification_types: pending ? ['step_question'] : [],
+    });
+    await page.route('**/api/v1/projects/proj_home/conversations/page**', route =>
+      route.fulfill({ json: { items: [conversation()], cursor: null, has_more: false } }));
+    await page.route('**/api/v1/conversations/waiting**', route => {
+      expect(new URL(route.request().url()).searchParams.get('project_id')).toBe('proj_home');
+      if (failWaitingOnce) {
+        failWaitingOnce = false;
+        return route.fulfill({ status: 503, json: { detail: 'Waiting temporarily unavailable' } });
+      }
+      return route.fulfill({ json: {
+        conversations: { items: pending || unread ? [conversation()] : [], cursor: null, has_more: false },
+        active_conversation_ids: pending ? ['conv-task-chat'] : [], activity_complete: true,
+      } });
+    });
+    await page.goto('/projects/proj_home?tab=conversations');
+    const waiting = page.getByTestId('dashboard-conversations-waiting');
+    await expect(waiting.getByText('Kitchen renovation', { exact: true })).toBeVisible();
+    await expect(waiting.getByText('Question waiting', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('dashboard-conversations-active').getByText('Kitchen renovation')).toHaveCount(0);
+    await page.screenshot({ path: test.info().outputPath(`project-pending-${width}.png`) });
+    pending = false;
+    unread = true;
+    push!({ type: 'scope_invalidated', reason: 'notification_state_changed' });
+    await expect(waiting.getByText('Kitchen renovation', { exact: true })).toBeVisible();
+    await expect(waiting.getByText('Question waiting', { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: test.info().outputPath(`project-finished-waiting-${width}.png`) });
+    unread = false;
+    push!({ type: 'scope_invalidated', reason: 'sidebar_changed' });
+    await expect(waiting.getByText('Kitchen renovation', { exact: true })).toHaveCount(0);
+    await expect(page.getByTestId('dashboard-conversations-recent').getByText('Kitchen renovation', { exact: true })).toBeVisible();
+  });
+}
+
+test('project list reactivates the same minimized conversation and reconciles answered input on focus', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const fixture = await projectFixture(page, true);
+  await page.route('**/api/v1/feedback/conversations/conv-task-chat/staging', route => route.fulfill({ json: {
+    conversation_id: 'conv-task-chat', version: 1, items: [], receipts: [], subject_ids: [],
+  } }));
+  let pending = true;
+  await page.route('**/api/v1/notifications**', route => route.fulfill({ json: pending ? [{
+    notification_id: 'question-project', conversation_id: 'conv-task-chat',
+    notification_type: 'step_question', status: 'pending', payload: {
+      question: 'Choose a rollout mode.', questions: [{
+        id: 'rollout', question: 'Choose a rollout mode.',
+        options: [{ id: 'canary', label: 'Canary' }], allow_custom: false, required: true,
+      }],
+    },
+  }] : [] }));
+  await page.goto('/projects/proj_home?tab=conversations');
+  const row = page.getByRole('button', { name: /Kitchen renovation/ }).first();
+  await row.click();
+  const chat = page.getByTestId('workspace-window-conversation:conv-task-chat');
+  await expect(chat).toHaveAttribute('data-minimized', 'false');
+  await expect(chat.getByRole('button', { name: 'Send response' })).toBeVisible();
+  const selectedUrl = page.url();
+  await chat.getByRole('button', { name: 'Minimize', exact: true }).click();
+  await expect(chat).toHaveAttribute('data-minimized', 'true');
+  pending = false;
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+  await row.click();
+  await expect(chat).toHaveAttribute('data-minimized', 'false');
+  await expect(chat.getByRole('button', { name: 'Send response' })).toHaveCount(0);
+  expect(page.url()).toBe(selectedUrl);
+  await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toHaveCount(1);
+  expect(fixture.unmockedRequests()).toEqual([]);
+  await page.screenshot({ path: test.info().outputPath('project-reactivated-chat.png') });
+});
+
+for (const width of [390, 1440]) {
+test(`project lists refresh on pushes and child work remains in Active now at ${width}px`, async ({ page }) => {
+  await page.setViewportSize({ width, height: 900 });
+  await projectFixture(page);
+  let push: ((event: object) => void) | undefined;
+  await page.routeWebSocket('**/api/ws', (socket) => {
+    push = (event) => socket.send(JSON.stringify(event));
+    push({ type: 'authenticated' });
+    socket.onMessage((message) => {
+      if (JSON.parse(String(message)).type === 'ping') push?.({ type: 'pong' });
+    });
+  });
+  let title = 'Child work owner';
+  let running = true;
+  let conversationReads = 0;
+  let taskReads = 0;
+  let activityReads = 0;
+  let scheduleReads = 0;
+  await page.route('**/api/v1/projects/proj_home/conversations/page**', (route) => {
+    conversationReads++;
+    return route.fulfill({ json: { items: [{
+      conversation_id: 'conv-task-chat', agent_id: 'agent-stage39', title,
+      context: { type: 'web' }, status: 'active', project_id: 'proj_home',
+      has_active_turn: false, has_unread: true, pending_notification_types: [],
+    }], cursor: null, has_more: false } });
+  });
+  await page.route('**/api/v1/projects/proj_home/tasks/page**', (route) => {
+    taskReads++;
+    return route.fulfill({ json: { items: [], cursor: null, has_more: false } });
+  });
+  await page.route('**/api/v1/projects/proj_home/activity**', (route) => {
+    activityReads++;
+    return route.fulfill({ json: { deliverables: [], artifacts: [] } });
+  });
+  await page.route('**/api/v1/schedules?**', (route) => {
+    scheduleReads++;
+    return route.fulfill({ json: [] });
+  });
+  await page.route('**/api/v1/conversations/background-work**', (route) => route.fulfill({ json: {
+    background_work_changed: true, agent_direct_chats: [],
+    background_work: { items: running ? [{
+      kind: 'managed_conversation', status: 'running',
+      controller_conversation_id: 'conv-task-chat', work_id: 'child-work',
+    }] : [], active_count: running ? 1 : 0, truncated: false },
+  } }));
+  await page.goto('/projects/proj_home?tab=conversations');
+  const active = page.getByTestId('dashboard-conversations-active');
+  await expect(active.getByText(title, { exact: true })).toBeVisible();
+  await expect(active.getByLabel('Background work active', { exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath('project-child-work-active.png') });
+  await expect.poll(() => Boolean(push)).toBe(true);
+  const before = [conversationReads, taskReads, activityReads, scheduleReads];
+  title = 'Updated live without navigation';
+  push!({ type: 'scope_invalidated', reason: 'task_progress_changed' });
+  await expect(active.getByText(title, { exact: true })).toBeVisible();
+  await expect.poll(() => [conversationReads, taskReads, activityReads, scheduleReads]
+    .every((count, index) => count > before[index])).toBe(true);
+  running = false;
+  push!({ type: 'work_invalidated', revision: 2 });
+  await expect(page.getByTestId('dashboard-conversations-recent').getByText(title, { exact: true })).toBeVisible();
+  await expect(active.getByText(title, { exact: true })).toHaveCount(0);
+  await page.screenshot({ path: test.info().outputPath('project-live-state.png') });
+});
+}
+
+test('project pop-out opens the selected tab beside New chat', async ({ page }) => {
+  await projectFixture(page);
+  await page.goto('/projects/proj_home?tab=tasks');
+  const popout = page.getByRole('button', { name: 'Open project in separate window', exact: true });
+  const newChat = page.getByRole('button', { name: 'New chat in project', exact: true });
+  await expect(popout).toBeVisible();
+  const left = await popout.boundingBox();
+  const right = await newChat.boundingBox();
+  expect(left!.x + left!.width).toBeLessThanOrEqual(right!.x);
+  await page.evaluate(() => {
+    window.open = (...args: Parameters<typeof window.open>) => {
+      sessionStorage.setItem('project-popup', JSON.stringify(args));
+      return null;
+    };
+  });
+  await popout.click();
+  const [href, name, features] = await page.evaluate(() => JSON.parse(sessionStorage.getItem('project-popup')!));
+  const url = new URL(href);
+  expect(url.pathname).toBe('/projects/proj_home');
+  expect(url.searchParams.get('tab')).toBe('tasks');
+  expect(url.searchParams.get('window')).toBe('1');
+  expect(name).toBe('cognis-project-proj_home');
+  expect(features).toContain('noopener');
+  await expect(page.getByText('This device does not support separate project windows.')).toHaveCount(0);
+});
+
+test('window flag does not hide navigation on the project list', async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await projectFixture(page);
+  await page.goto('/projects?view=all&window=1');
+  await expect(page.getByRole('heading', { name: 'Projects', exact: true })).toBeVisible();
+  await expect(page.locator('aside')).toBeVisible();
+});
+
+for (const width of [1440, 390]) {
+  test(`project window stays focused and omits missing description at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await projectFixture(page, false, false, null);
+    await page.goto('/projects/proj_home?window=1');
+    await expect(page.getByRole('heading', { name: 'Home', exact: true })).toBeVisible();
+    await expect(page.getByRole('link', { name: '← All projects', exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Open project in separate window', exact: true })).toHaveCount(0);
+    await expect(page.getByText('No description', { exact: true })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Open navigation', exact: true })).toHaveCount(0);
+    await expect(page.locator('aside')).toHaveCount(0);
+    await page.getByRole('tab', { name: /^Conversations\b/ }).click();
+    await expect(page).toHaveURL(url => url.searchParams.get('window') === '1' && url.searchParams.get('tab') === 'conversations');
+    await expect(page.getByRole('button', { name: 'New chat in project', exact: true })).toBeVisible();
+  });
+}
+
 test('Projects resumes the last project tab and supports explicit list and revoked access', async ({ page }) => {
   await projectFixture(page);
   await page.goto('/projects/proj_home?tab=settings');
@@ -55,11 +269,21 @@ test.afterEach(({ page }) => {
   expect(browserErrors.get(page) ?? []).toEqual([]);
 });
 // Frontend integration against deterministic API fixtures, not a live controller.
-async function projectFixture(page: Page, windows = false, reader = false) {
+async function projectFixture(page: Page, windows = false, reader = false, description: string | null = 'Household and reconstruction') {
   const errors: string[] = [];
   browserErrors.set(page, errors);
   page.on('pageerror', (error) => errors.push(error.message));
-  await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: windows });
+  const cockpit = await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: windows });
+  await page.route('**/api/v1/inbox**', route => route.fulfill({ json: {
+    items: [], unread_count: 0, next_cursor: null,
+  } }));
+  await page.route('**/api/v1/dashboard/navigation-summary', route => route.fulfill({ json: {
+    chat_groups: [], dashboard: { total: 0, critical: 0, warning: 0, info: 0, truncated: false },
+    schedules: 0, tasks: 0,
+  } }));
+  await page.route('**/api/v1/conversations/waiting**', route => route.fulfill({ json: {
+    conversations: { items: [], cursor: null, has_more: false }, active_conversation_ids: [], activity_complete: true,
+  } }));
   await installLibraryRoutes(page, [
     { ...libraryCatalog[0], id: 'dlv_project_report', lineage_id: 'dlv_project_report', title: 'Renovation plan', project_id: 'proj_home', project_name: 'Home', conversation_id: 'conv-task-chat', conversation_title: 'Kitchen renovation' },
     { ...libraryCatalog[7], id: 'art_floor_plan', title: 'floor-plan.png', project_id: 'proj_home', project_name: 'Home', format: 'image/png' },
@@ -76,8 +300,8 @@ async function projectFixture(page: Page, windows = false, reader = false) {
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: { email: 'owner@cognis.test', role: 'user', name: 'Owner' } }));
   await page.route('**/api/health**', (route) => route.fulfill({ json: { status: 'ok', providers: {} } }));
   const project = {
-    project_id: 'proj_home', name: 'Home', description: 'Household and reconstruction',
-    status: 'active', instructions: '', sources: [], workflow_ids: [], metadata: {},
+    project_id: 'proj_home', name: 'Home', description,
+    status: 'active', instructions: '', sources: [], workflow_ids: [],
     agents: [{ agent_id: 'agent-stage39', project_id: 'proj_home', agent_name: 'Butler', enabled: true }],
     grants: [], caller_role: reader ? 'member' : 'owner', active_schedule_count: 1,
     is_readonly_for_caller: reader, is_shared_with_me: reader,
@@ -127,8 +351,88 @@ async function projectFixture(page: Page, windows = false, reader = false) {
   await page.route('**/api/v1/artifacts/art_floor_plan/signed-url**', (route) => route.fulfill({ json: {
     url: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jJ9kAAAAASUVORK5CYII='
   } }));
-  return { created: () => created };
+  return { created: () => created, unmockedRequests: cockpit.unmockedRequests };
 }
+
+const scopedResults = [
+  { kind: 'conversation', id: 'conv-task-chat' },
+  { kind: 'task', id: TASK_ID },
+  { kind: 'schedule', id: 'sch_home' },
+  { kind: 'deliverable', id: 'dlv_release_review' },
+  { kind: 'artifact', id: 'att_requirements' },
+] as const;
+
+async function projectSpotlight(page: Page, kind: PaletteItem['kind'], id: string, project_id: string | null = 'proj_home') {
+  const item: PaletteItem = {
+    kind, id, project_id, title: `Scoped ${kind}`, status: 'active',
+    agent_id: 'agent-stage39', agent_name: 'Butler', format: null, updated_at: '2026-10-04T05:00:00Z',
+    href: kind === 'artifact' || kind === 'deliverable' ? `/library/${kind}/${id}`
+      : `/${kind === 'conversation' ? 'chat' : kind === 'task' ? 'tasks' : 'schedules'}/${id}`,
+  };
+  await page.route('**/api/v1/search/palette?**', route => route.fulfill({ json: {
+    items: [item], next_cursor: null,
+  } }));
+  await expect(page.getByRole('tab', { name: 'Overview', exact: true })).toBeVisible();
+  await page.keyboard.press('Meta+k');
+  const input = page.getByRole('combobox', { name: 'Search Cognis' });
+  await expect(input).toBeFocused();
+  await input.fill(item.title);
+  await expect(page.getByRole('dialog', { name: 'Command palette', exact: true }).getByRole('option')).toHaveCount(1);
+  return input;
+}
+
+for (const windows of [false, true]) {
+  for (const { kind, id } of scopedResults) {
+    test(`Spotlight opens project ${kind} from Settings with windows ${windows ? 'enabled' : 'disabled'}`, async ({ page }) => {
+      await projectFixture(page, windows);
+      // These accessible documents/files deliberately are not in recent project activity.
+      await installLibraryRoutes(page, libraryCatalog.map(row => ({ ...row, project_id: 'proj_home', project_name: 'Home' })));
+      await page.goto('/projects/proj_home?tab=settings');
+      await expect(page.getByRole('tab', { name: 'Settings', exact: true })).toHaveAttribute('aria-selected', 'true');
+      const input = await projectSpotlight(page, kind, id);
+      await input.press('Enter');
+      await expect(page).toHaveURL(url => url.pathname === '/projects/proj_home'
+        && url.searchParams.get('tab') === 'settings'
+        && url.searchParams.get('view') === kind && url.searchParams.get('item') === id);
+      await expect(input).toBeHidden();
+      if (windows) await expect(page.getByTestId(`workspace-window-${kind}:${id}`)).toBeVisible();
+      else await expect(page.getByRole('dialog')).toBeVisible();
+      if (kind === 'deliverable' || kind === 'artifact') {
+        await expect(page.getByTestId('resource-reader')).toBeVisible();
+        await expect(page.getByTestId('resource-reader')).toContainText(kind === 'deliverable'
+          ? 'The October release is ready for final acceptance.' : 'Keep finished work easy to find.');
+        await expect(page.getByText('Resource unavailable', { exact: true })).toBeHidden();
+      }
+    });
+  }
+}
+
+for (const scope of ['proj_other', null]) {
+  test(`Spotlight redirects ${scope ? 'foreign-project' : 'unscoped'} results from an open project`, async ({ page }) => {
+    await projectFixture(page, true);
+    await page.goto('/projects/proj_home?tab=settings');
+    const input = await projectSpotlight(page, 'task', TASK_ID, scope);
+    await input.press('Enter');
+    await expect(page).toHaveURL(url => url.pathname === `/tasks/${TASK_ID}`);
+  });
+}
+
+test('Spotlight respects explicit redirects and phone project modal fallback', async ({ page }) => {
+  await projectFixture(page, true);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/projects/proj_home?tab=overview');
+  let input = await projectSpotlight(page, 'conversation', 'conv-task-chat');
+  await input.press('Enter');
+  await expect(page).toHaveURL(url => url.pathname === '/projects/proj_home' && url.searchParams.get('view') === 'conversation');
+  await expect(input).toBeHidden();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toBeHidden();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).toBeHidden();
+  input = await projectSpotlight(page, 'task', TASK_ID);
+  await input.press('Meta+Enter');
+  await expect(page).toHaveURL(url => url.pathname === `/tasks/${TASK_ID}`);
+});
 
 test('project icon picker saves theme-aware identity and can switch back to image', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
@@ -141,9 +445,11 @@ test('project icon picker saves theme-aware identity and can switch back to imag
     }
     return route.fulfill({ json: model });
   });
+  await expect(page.getByRole('button', { name: 'Save project', exact: true })).toBeEnabled();
   await page.getByRole('button', { name: 'Use Travel icon', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Use Travel icon', exact: true })).toHaveAttribute('aria-pressed', 'true');
   await page.getByRole('button', { name: 'Save project', exact: true }).click();
-  await expect.poll(() => model.metadata.icon).toBe('suitcase');
+  await expect.poll(() => model.metadata?.icon).toBe('suitcase');
   await expect(page.getByRole('button', { name: 'View project avatar' }).getByTestId('project-library-icon')).toBeVisible();
   await page.getByRole('group', { name: 'Project icon' }).scrollIntoViewIfNeeded();
   await page.screenshot({ path: test.info().outputPath('project-icon-picker.png') });
@@ -210,11 +516,11 @@ for (const width of [1440, 390]) {
     await expect(page.getByRole('link', { name: /Renovation plan/ })).toBeVisible();
     await page.screenshot({ path: test.info().outputPath(`project-resources-library-${width}.png`), fullPage: true });
     await page.getByRole('link', { name: /Renovation plan/ }).click();
-    if (width < 1024) await page.getByRole('button', { name: 'Show details', exact: true }).click();
-    await expect(page.getByRole('heading', { name: 'Details', exact: true })).toBeVisible();
     await expect(page.locator('p').getByText('Keep the original oak floor.', { exact: true })).toBeVisible();
+    if (width === 390) await page.getByRole('dialog').getByRole('button', { name: 'Show details', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'Details', exact: true })).toBeVisible();
+    if (width === 390) await page.getByRole('dialog').getByRole('button', { name: 'Hide details', exact: true }).click();
     await page.screenshot({ path: test.info().outputPath(`project-asset-${width}.png`) });
-    if (width < 1024) await page.getByRole('button', { name: 'Close details', exact: true }).click();
     await page.goBack();
     await page.getByRole('tab', { name: 'Files', exact: true }).click();
     await page.getByRole('link', { name: /floor-plan.png/ }).click();
@@ -302,12 +608,10 @@ for (const resource of ['conversations', 'tasks']) {
       await page.getByTestId(`dashboard-${resource}-recent-sentinel`).evaluateAll((nodes) => nodes.forEach((node) => node.scrollIntoView()));
       return requested.includes(30);
     }).toBe(true);
-    await expect.poll(async () => {
-      await list.evaluate((node) => { node.scrollTop = node.scrollHeight; });
-      // The sentinel already requested the next page; its pending response can
-      // remove the manual footer while a click is waiting for actionability.
-      return page.getByTestId(`dashboard-${prefix}-row-${prefix === 'task' ? 'task' : 'conv'}_page_59`).count();
-    }).toBe(1);
+    const last = page.getByTestId(`dashboard-${prefix}-row-${prefix === 'task' ? 'task' : 'conv'}_page_59`);
+    await expect(last).toBeVisible();
+    await last.scrollIntoViewIfNeeded();
+    await expect(last).toBeInViewport();
     expect(await section.evaluate((node) => node.getBoundingClientRect().height)).toBeCloseTo(initialHeight, 0);
     await page.screenshot({ path: test.info().outputPath(`project-${resource}-bounded-${width}.png`) });
     expect(requested).toContain(30);
@@ -488,8 +792,10 @@ test('unavailable asset links are explicit and schedules cannot break project ac
   await projectFixture(page);
   await page.route('**/api/v1/schedules**', (route) => route.fulfill({ status: 503, json: { detail: 'Temporarily unavailable' } }));
   await page.goto('/projects/proj_home?view=artifact&item=art_removed');
-  await expect(page.getByTestId('project-asset-unavailable')).toBeVisible();
-  await page.getByTestId('project-asset-unavailable-close').click();
+  const unavailable = page.getByRole('dialog', { name: 'Resource', exact: true });
+  await expect(unavailable.getByRole('alert')).toContainText('Item unavailable');
+  await page.keyboard.press('Escape');
+  await expect(unavailable).toBeHidden();
   await expect(page.getByRole('button', { name: /Kitchen renovation/ }).first()).toBeVisible();
   await page.getByTestId('project-tab-schedules').click();
   await expect(page.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
@@ -511,13 +817,15 @@ test('schedule editor and trigger stay in the project and ignore a late trigger 
     await route.fulfill({ json: { task_id: TASK_ID } });
   });
   await page.goto('/projects/proj_home?view=schedule&item=sch_home&tab=schedules');
+  await page.getByRole('button', { name: 'Edit schedule' }).click();
   await expect(page.getByRole('button', { name: 'Save changes' })).toBeVisible();
   await page.getByRole('button', { name: 'Save changes' }).click();
   await expect.poll(() => updated).toBe(true);
   const detail = page.getByTestId('dashboard-schedule-modal-scroll-shell');
   await expect.poll(() => detail.evaluate((node) => node.scrollWidth - node.clientWidth)).toBeLessThanOrEqual(1);
   // Accessible action labels are also usable without hover on phones.
-  await detail.getByRole('button', { name: 'Trigger now', exact: true }).click();
+  await detail.getByRole('button', { name: 'Run now', exact: true }).click();
+  await page.getByRole('dialog', { name: /^Run ".*" now\?$/ }).getByRole('button', { name: 'Run now' }).click();
   await page.getByTestId('dashboard-schedule-modal-close').click();
   release();
   await page.waitForTimeout(150);

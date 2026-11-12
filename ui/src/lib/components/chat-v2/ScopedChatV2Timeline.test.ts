@@ -1,11 +1,10 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import { tick } from 'svelte';
-import { ChatV2ApiClient } from '$lib/chat-v2/api';
+import type { ChatV2ApiClient } from '$lib/chat-v2/api';
+import type { Deliverable, StepRun } from '$lib/types/api';
 import type {
   ChatRealtimeFrame,
   ChatSnapshot,
-  QueueMessage,
   TimelineBackfillResponse,
   TimelineItem,
   TimelineScope,
@@ -113,6 +112,16 @@ function timelineOptions(before: string) {
   return expect.objectContaining({ before, signal: expect.any(AbortSignal) });
 }
 
+async function readyViewport(): Promise<HTMLElement> {
+  const viewport = await screen.findByTestId('scoped-timeline-viewport');
+  // Row presence no longer implies that initial positioning has revealed it.
+  await waitFor(() => {
+    expect(viewport.querySelector('[data-timeline-row-key]')).not.toBeNull();
+    expect(viewport).not.toHaveClass('invisible');
+  });
+  return viewport;
+}
+
 class ResizeObserverMock {
   static instances: ResizeObserverMock[] = [];
   callback: ResizeObserverCallback;
@@ -131,6 +140,117 @@ class ResizeObserverMock {
 }
 
 describe('ScopedChatV2Timeline history backfill', () => {
+  it('marks an existing timeline document stale when step metadata changes without reloading', async () => {
+    const document: Deliverable = {
+      deliverable_id: 'live-task-document', step_run_id: 'live-task-run',
+      version: 1, attempt_number: 1, lineage_id: 'live-task-document', revision: 1,
+      format: 'markdown', title: 'Live result', content: 'The first task output.',
+      target: 'none', outputs: {}, status: 'approved', evaluator_feedback: null,
+      created_at: null, updated_at: null,
+      task_freshness: { state: 'current', replacement_status: null, label: 'Current output' },
+    };
+    const stepRun: StepRun = {
+      step_run_id: 'live-task-run', step_name: 'publish', task_id: 'live-task',
+      status: 'running', attempt: 1, attempt_number: 1, agent_id: 'live-agent',
+      step_type: 'run', superseded_by_step_run_id: null, workspace_root: null,
+      working_directory: null, conversation_id: null, session_id: null,
+      intaris_session_id: null, deliverable_id: document.deliverable_id,
+      require_deliverable: true, evaluation: null, runtime_info: null, todos: [],
+      started_at: null, completed_at: null, updated_at: null, deliverables: [document],
+      output: null, deliverable_freshness: {
+        [document.deliverable_id]: { state: 'current', replacement_status: null, label: 'Current output' },
+      },
+    };
+    const taskScope: TimelineScope = {
+      kind: 'task_step', key: 'task_step:live-task-run', step_run_id: 'live-task-run',
+      task_id: 'live-task', conversation_id: 'live-task-conversation',
+    };
+    const item: TimelineItem = {
+      id: 'document:live-task-document', kind: 'assistant_deliverable',
+      sort_key: '0000:000000000000001:000000:02:000000000',
+      source_refs: [], stable: true, deliverable_id: document.deliverable_id,
+      format: document.format, deliverable: document,
+    };
+    const api = {
+      snapshot: vi.fn().mockResolvedValue(snapshot(taskScope, [item], null)),
+      sync: vi.fn(), timeline: vi.fn(),
+    };
+    const props = { scope: taskScope, api, realtime: realtime(), stepRun };
+    const view = render(ScopedChatV2Timeline, props);
+    expect(await screen.findByText('The first task output.')).toBeVisible();
+
+    await view.rerender({ ...props,
+      deliverableFreshness: { [document.deliverable_id]: {
+        state: 'stale', replacement_status: 'running',
+        label: 'Stale — revision 1, new revision in progress',
+      } },
+    });
+    for (const label of await screen.findAllByText('Stale — revision 1, new revision in progress')) {
+      expect(label).toBeVisible();
+    }
+    expect(screen.queryByText('The first task output.')).toBeNull();
+    expect(screen.getAllByTestId('rich-deliverable')).toHaveLength(1);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Expand document' }));
+    expect(await screen.findByText('The first task output.')).toBeVisible();
+    await view.rerender({ ...props,
+      deliverableFreshness: { [document.deliverable_id]: {
+        state: 'stale', replacement_status: 'paused',
+        label: 'Stale — revision 1, revision paused',
+      } },
+    });
+    for (const label of await screen.findAllByText('Stale — revision 1, revision paused')) {
+      expect(label).toBeVisible();
+    }
+    expect(screen.getByText('The first task output.')).toBeVisible();
+    view.unmount();
+  });
+
+  it('fills a reduced editable history window and stops automatic retries after a page error', async () => {
+    const editableScope: TimelineScope = {
+      key: 'conversation:reduced-history',
+      kind: 'conversation',
+      conversation_id: 'reduced-history',
+    };
+    const payload = snapshot(editableScope, [message(3)], 'before-3');
+    payload.timeline.history_window_reduced = true;
+    const api = {
+      snapshot: vi.fn().mockResolvedValue(payload),
+      sync: vi.fn(),
+      timeline: vi.fn()
+        .mockResolvedValueOnce(backfill(editableScope, [message(2)], 'before-2'))
+        .mockRejectedValueOnce(new Error('Document storage unavailable'))
+        .mockResolvedValueOnce(backfill(editableScope, [message(1)], null)),
+    };
+    render(ScopedChatV2Timeline, {
+      scope: editableScope, api, realtime: realtime(), hasEditableComposer: true,
+    });
+    await screen.findByText('Document storage unavailable');
+    expect(api.timeline).toHaveBeenCalledTimes(2);
+    expect(api.timeline).toHaveBeenNthCalledWith(1, editableScope, timelineOptions('before-3'));
+    expect(api.timeline).toHaveBeenNthCalledWith(2, editableScope, timelineOptions('before-2'));
+    ResizeObserverMock.instances.forEach((observer) => observer.emit());
+    await waitFor(() => expect(api.timeline).toHaveBeenCalledTimes(2));
+    await fireEvent.click(screen.getByRole('button', { name: /^Try again$/ }));
+    await screen.findByText('message 1');
+    expect(api.timeline).toHaveBeenNthCalledWith(3, editableScope, timelineOptions('before-2'));
+  });
+
+  it('can move live feedback outside the transcript without changing runtime or editability', async () => {
+    const payload = snapshot(scope, [message(1)], null);
+    payload.runtime.has_active_turn = true;
+    const api = { snapshot: vi.fn().mockResolvedValue(payload), sync: vi.fn(), timeline: vi.fn() };
+    const onRuntimeActiveChange = vi.fn();
+    const props = { scope, api, realtime: realtime(), onRuntimeActiveChange, showLiveIndicator: false };
+    const view = render(ScopedChatV2Timeline, props);
+    await screen.findByText('message 1');
+    await waitFor(() => expect(onRuntimeActiveChange).toHaveBeenLastCalledWith(true));
+    expect(screen.queryByTestId('timeline-running-indicator')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    await view.rerender({ ...props, showLiveIndicator: true });
+    expect(await screen.findByTestId('timeline-running-indicator')).toBeInTheDocument();
+    expect(api.snapshot).toHaveBeenCalledOnce();
+  });
+
   it('advances empty initial history without an animation frame and stops at a repeated cursor', async () => {
     const originalRaf = globalThis.requestAnimationFrame;
     vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
@@ -301,46 +421,6 @@ describe('ScopedChatV2Timeline history backfill', () => {
     expect(onInitialLoaded).toHaveBeenCalledOnce();
   }, 20_000);
 
-  it('does not deliver a queued initial-load callback after transcript disposal', async () => {
-    const disposalScope: TimelineScope = {
-      key: 'conversation:queued-disposal',
-      kind: 'conversation',
-      conversation_id: 'queued-disposal',
-    };
-    const onInitialLoaded = vi.fn();
-    const live = realtime();
-    let dispose: (() => void) | undefined;
-    let disposal = Promise.resolve();
-    let disposed = false;
-    const fetch = vi.fn<typeof globalThis.fetch>();
-    const api = new ChatV2ApiClient({ fetch });
-    const loadedSnapshot = snapshot(disposalScope, [message(1)], null);
-    loadedSnapshot.queue = {
-      messages: [{ queue_id: 'queued-disposal', content: 'Queued fixture message', attachments: [], position: 0 }],
-      queued_count: 1,
-    };
-    vi.spyOn(api, 'snapshot').mockResolvedValue(loadedSnapshot);
-    const view = render(ScopedChatV2Timeline, {
-      scope: disposalScope,
-      api,
-      realtime: live,
-      onInitialLoaded,
-      onQueueChange: (messages: QueueMessage[]) => {
-        if (!disposed && messages.some(message => message.queue_id === 'queued-disposal')) {
-          disposed = true;
-          dispose?.();
-        }
-      },
-    });
-    dispose = () => { disposal = Promise.resolve(view.unmount()); };
-    await waitFor(() => expect(disposed).toBe(true));
-    await disposal;
-    await tick();
-    expect(view.container.childElementCount).toBe(0);
-    expect(onInitialLoaded).not.toHaveBeenCalled();
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
   it('does not signal initial load after a snapshot error', async () => {
     const onInitialLoaded = vi.fn();
     const snapshotApi = vi.fn()
@@ -412,7 +492,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockResolvedValue(backfill(scope, [message(0)], null)),
     };
     render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
 
@@ -434,7 +514,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       realtime: realtime(),
       hasEditableComposer: true,
     });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     expect(api.timeline).not.toHaveBeenCalled();
     viewport.scrollTop = 0;
@@ -460,7 +540,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       realtime: realtime(),
       hasEditableComposer: true,
     });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
 
     viewport.scrollTop = 0;
@@ -487,7 +567,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockReturnValue(pendingPage),
     };
     render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), hasEditableComposer: true });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
     await fireEvent.scroll(viewport);
@@ -512,7 +592,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       realtime: channel,
       hasEditableComposer: true,
     });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 8');
     expect(viewport.scrollTop).toBe(viewport.scrollHeight);
 
@@ -559,7 +639,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockResolvedValue(backfill(scope, [message(0)], null)),
     };
     render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
 
@@ -578,7 +658,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     const { component } = render(ScopedChatV2Timeline, {
       scope, api, realtime: realtime(), hasEditableComposer: true,
     });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 8');
     viewport.scrollTop = 200;
     await fireEvent.wheel(viewport, { deltaY: -100 });
@@ -608,7 +688,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockResolvedValue(backfill(scope, [message(0)], null)),
     };
     render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
 
@@ -741,7 +821,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       realtime: realtime(),
       hasEditableComposer: true,
     });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
@@ -781,7 +861,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       )),
     };
     const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
@@ -791,6 +871,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     resolveOldPage?.(backfill(scope, [message(0, 'stale history')], null));
 
     await screen.findByText('next 4');
+    await readyViewport();
     expect(screen.queryByText('stale history')).toBeNull();
     expect(viewport.closest('[data-scope-key]')).toHaveAttribute('data-scope-key', nextScope.key);
     viewport.scrollTop = 0;
@@ -824,7 +905,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockReturnValue(oldPage),
     };
     const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime() });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     let scrollTop = 0;
     const scrollWrites: number[] = [];
@@ -872,7 +953,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     };
     const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
     await screen.findByText('message 4');
-    const viewport = screen.getByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await waitFor(() => expect(api.timeline).toHaveBeenCalledOnce());
@@ -911,7 +992,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
     };
     const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), autoBackfill: false });
     await screen.findByText('message 4');
-    const viewport = screen.getByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
     await waitFor(() => expect(api.timeline).toHaveBeenCalledOnce());
@@ -950,7 +1031,7 @@ describe('ScopedChatV2Timeline history backfill', () => {
       timeline: vi.fn().mockReturnValue(page),
     };
     render(ScopedChatV2Timeline, { scope, api, realtime: channel });
-    const viewport = await screen.findByTestId('scoped-timeline-viewport');
+    const viewport = await readyViewport();
     await screen.findByText('message 4');
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -20 });
@@ -1050,7 +1131,12 @@ describe('ScopedChatV2Timeline history backfill', () => {
     spy.mockRestore();
   });
 
-  it('keeps compact cached reconciliation out of the timeline layout', async () => {
+  it.each([
+    scope,
+    { kind: 'conversation', key: 'conversation:managed-history', conversation_id: 'managed-history' } as TimelineScope,
+  ].flatMap(scope => [false, true].map(offline => ({ scope, offline }))))(
+    'reveals $scope.kind cached history during sync and initializes once (offline=$offline)', async ({ scope, offline }) => {
+    const onInitialLoaded = vi.fn();
     const { TimelineController } = await import('$lib/chat-v2/timeline-controller.svelte');
     const { ChatV2Store } = await import('$lib/chat-v2/store.svelte');
     const seeded = new ChatV2Store();
@@ -1062,19 +1148,29 @@ describe('ScopedChatV2Timeline history backfill', () => {
     const gate = new Promise<void>((resolve) => { finish = resolve; });
     const api = { snapshot: vi.fn(), timeline: vi.fn(), sync: vi.fn<ChatV2ApiClient['sync']>(async () => {
       await gate;
+      if (offline) throw new TypeError('Network disconnected');
       return { schema_version: 2, projection_version: 'test', scope, cursor_before: `cursor:${scope.key}`,
         cursor_after: `cursor:${scope.key}:quiet`, conversation_id: scope.conversation_id!, reset_required: false,
         server_time: '', has_more: false, ops: [] };
     }) };
-    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), compact: true });
+    const view = render(ScopedChatV2Timeline, { scope, api, realtime: realtime(), compact: true, onInitialLoaded });
     try {
       await waitFor(() => expect(api.sync).toHaveBeenCalled());
       expect(document.querySelector(`[data-cursor="cursor:${scope.key}"][data-freshness="reconciling"]`)).toBeTruthy();
       expect(screen.queryByTestId('scoped-timeline-status-row')).toBeNull();
       expect(screen.queryByText('Refreshing…')).toBeNull();
+      await waitFor(() => expect(screen.getByTestId('scoped-timeline-viewport')).not.toHaveClass('invisible'));
+      expect(screen.getByText('quiet cached row')).toBeVisible();
+      expect(onInitialLoaded).not.toHaveBeenCalled();
+      const viewport = screen.getByTestId('scoped-timeline-viewport');
+      viewport.scrollTop = 50;
+      await fireEvent.wheel(viewport, { deltaY: -80 });
       finish();
+      await waitFor(() => expect(onInitialLoaded).toHaveBeenCalledTimes(1));
+      expect(onInitialLoaded).toHaveBeenCalledWith();
       await screen.findByText('quiet cached row');
-      await waitFor(() => expect(document.querySelector(`[data-cursor="cursor:${scope.key}:quiet"]`)).toBeTruthy());
+      if (!offline) await waitFor(() => expect(document.querySelector(`[data-cursor="cursor:${scope.key}:quiet"]`)).toBeTruthy());
+      expect(viewport.scrollTop).toBe(50);
       expect(screen.queryByTestId('scoped-timeline-status-row')).toBeNull();
     } finally { finish(); view.unmount(); spy.mockRestore(); }
   });

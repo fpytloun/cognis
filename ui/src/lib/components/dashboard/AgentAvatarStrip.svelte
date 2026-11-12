@@ -1,5 +1,6 @@
 <script lang="ts">
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
+  import MessageCircle from 'lucide-svelte/icons/message-circle';
   import type { Agent } from '$lib/types/api';
 
   let {
@@ -35,7 +36,11 @@
     >
       <span class="relative">
         <AgentAvatar name={agent.display_name ?? agent.name} avatarUrl={agent.avatar_url} class="h-12 w-12 transition group-hover:ring-2 group-hover:ring-accent" />
-        <span class={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-separator ${statusDotClass(agent)}`} aria-hidden="true"></span>
+        {#if agent.is_contact_only}
+          <span class="absolute -bottom-0.5 -right-0.5 rounded-full bg-surface p-0.5 text-accent" title="Incoming channel"><MessageCircle class="h-3.5 w-3.5" /></span>
+        {:else}
+          <span class={`absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-separator ${statusDotClass(agent)}`} aria-hidden="true"></span>
+        {/if}
       </span>
       <span class="max-w-[4.5rem] truncate text-[11px] text-secondary">{agent.display_name ?? agent.name}</span>
     </button>

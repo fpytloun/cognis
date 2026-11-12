@@ -4,7 +4,7 @@ import type { AuthState } from '$lib/stores/auth';
 
 const stores = vi.hoisted(() => ({ callbacks: [] as Array<() => void> }));
 vi.mock('./notifications', () => ({ installResidentNotifications: () => ({ review: vi.fn(), stop: vi.fn() }) }));
-vi.mock('./catalogue', () => ({ installAgentCatalogue: () => () => {}, nativeAgents: writable([]) }));
+vi.mock('./catalogue', () => ({ installAgentCatalogue: () => () => {}, nativeAgents: writable([]), nativeAgentsReady: writable(false) }));
 const authStore = writable<AuthState>({ status: 'anonymous', initialized: true, user: null, expiresAt: null, error: null });
 const workspace = writable<{
   owner: string | null;
@@ -28,11 +28,14 @@ vi.mock('$lib/dashboard/conversation-workspace-runtime', () => ({
 }));
 import { installNativeRuntime } from './runtime';
 import { wsClient } from '$lib/ws/client';
+import { nativeComposerFocus, forwardNativeReference } from './host';
+import { nativeAgentsReady } from './catalogue';
 
 const generation = '8d6feafb-2aac-4b41-ac82-42b2314563bb';
 afterEach(() => {
   stores.callbacks.forEach((stop) => stop());
   stores.callbacks.length = 0;
+  nativeAgentsReady.set(false);
   delete window.__cognisNative;
   delete window.webkit;
   workspace.set({ owner: null, entries: [], agents: [] });
@@ -43,6 +46,58 @@ afterEach(() => {
 });
 
 describe('native runtime lifecycle', () => {
+  it('only cancels SPA links whose unsupported-route reply can traverse the actual receiver', () => {
+    window.__cognisNative = { version: 1, generation, server: window.location.origin, surface: 'pinned' };
+    const send = vi.fn();
+    window.webkit = { messageHandlers: { cognis: { postMessage: send } } };
+    const navigate = vi.fn().mockResolvedValue(undefined);
+    stores.callbacks.push(installNativeRuntime(navigate));
+    for (const path of ['/settings?tab=appearance', '/chat?search=release_notes']) {
+      expect(forwardNativeReference(new URL(path, window.location.origin))).toBe(true);
+      const request = send.mock.calls.at(-1)?.[0];
+      expect(request.type).toBe('open-reference');
+      // The native parser's unsupported-route reply goes back to this document.
+      window.__cognisNativeReceive?.({ version: 1, generation, type: 'navigate', path: request.payload.path });
+      expect(navigate).toHaveBeenLastCalledWith(path);
+    }
+    for (const path of ['/chat?search=release+notes', '/chat?search=release.notes',
+      '/chat?search=src%2Fmain', '/chat?search=src%5cmain', '/chat?search=' + 'a'.repeat(512)]) {
+      expect(forwardNativeReference(new URL(path, window.location.origin))).toBe(false);
+    }
+  });
+  it('keeps panel targets pending until both catalogue and owner workspace hydrate', async () => {
+    vi.useFakeTimers();
+    window.__cognisNative = { version: 1, generation, server: window.location.origin };
+    const send = vi.fn();
+    window.webkit = { messageHandlers: { cognis: { postMessage: send } } };
+    stores.callbacks.push(installNativeRuntime(vi.fn().mockResolvedValue(undefined)));
+    authStore.set({ status: 'authenticated', user: { email: 'alice@example.com' } } as AuthState);
+    const latest = () => send.mock.calls.map(([message]) => message)
+      .filter((message) => message.type === 'snapshot').at(-1).payload.panelTargets;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(latest().ready).toBe(false);
+    nativeAgentsReady.set(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(latest().ready).toBe(false);
+    workspace.set({ owner: 'alice@example.com', entries: [], agents: [{ agentId: 'agent_a' }] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(latest()).toEqual({ ready: true, pinnedAgents: ['agent_a'] });
+  });
+  it('accepts composer focus only on the pinned surface and current generation', () => {
+    window.__cognisNative = { version: 1, generation, server: window.location.origin, surface: 'pinned' };
+    stores.callbacks.push(installNativeRuntime(vi.fn().mockResolvedValue(undefined)));
+    const command = { version: 1, generation, type: 'focus-composer', agentId: 'agent_a', request: generation };
+    window.__cognisNativeReceive?.({ ...command, generation: 'prior-generation' });
+    expect(get(nativeComposerFocus)).toBeNull();
+    window.__cognisNativeReceive?.({ ...command, agentId: '../agent_a' });
+    expect(get(nativeComposerFocus)).toBeNull();
+    window.__cognisNativeReceive?.(command);
+    expect(get(nativeComposerFocus)).toEqual({ agentId: 'agent_a', request: generation });
+    nativeComposerFocus.set(null);
+    window.__cognisNative.surface = 'main';
+    window.__cognisNativeReceive?.(command);
+    expect(get(nativeComposerFocus)).toBeNull();
+  });
   it('publishes literal chrome appearance on resolved-theme changes and deduplicates unchanged updates', async () => {
     window.__cognisNative = { version: 1, generation, server: window.location.origin };
     const send = vi.fn();

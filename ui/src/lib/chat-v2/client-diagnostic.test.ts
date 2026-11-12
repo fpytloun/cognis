@@ -30,6 +30,10 @@ function fixture(): ChatV2ClientState {
       accepted: {
         placement: 'timeline', status: 'complete', updatedAt: '2026-01-01T15:37:00Z',
         content: privateText, attachments: [], queueId: 'queued-admission',
+        clientTxnId: 'accepted-transaction', historyConfirmed: true,
+        processingOutcome: {
+          status: 'completed', turnId: 'old-turn', admissionOrder: 1, beforeClientMessageId: null,
+        },
       },
     },
     runtime: {
@@ -73,6 +77,10 @@ describe('metadata-only client diagnostic', () => {
     expect(capture.visible_items.map(item => item.id)).toEqual(visible.map(item => item.id));
     expect(capture.projection_version).toBe('diagnostic-projection');
     expect(capture.runtime?.authority?.fencing_token).toBe(4);
+    expect(capture.admission_placements[0]).toMatchObject({
+      client_txn_id: 'accepted-transaction', history_confirmed: true,
+      processing_outcome: { status: 'completed', turn_id: 'old-turn', admission_order: 1 },
+    });
     expect(capture.environment).toEqual(environment);
   });
 
@@ -84,6 +92,7 @@ describe('metadata-only client diagnostic', () => {
     Object.assign(state.timelineItems[0].source_refs[0], { future_secret: privateText });
     Object.assign(state.runtime!.authority!, { token: privateText });
     Object.assign(state.runtime!.active_turn!, { waiting_reason: privateText });
+    Object.assign(state.admissionPlacements.accepted.processingOutcome!, { future_secret: privateText });
     const result = JSON.stringify(captureClientDiagnostic(
       state, [...state.timelineItems, ...state.localItems, ...state.runtime!.volatile_items], environment,
     ));

@@ -10,7 +10,7 @@
   import { THEME_FAMILIES, type ThemeFamily } from '$lib/theme/catalog';
   import { deriveGettingStartedSteps } from '$lib/getting-started';
   import { formatMcpOAuthStatus, isMcpOAuthStatusCritical, type MCPOAuthStatus } from '$lib/mcp-oauth-status';
-  import { applyProviderPresetDefaults, PROVIDER_PRESETS, collectModelOptions, createProviderForm, deriveProviderId, isChatModel, modelEntryFromMetadata, parseExecutorSelector, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
+  import { applyProviderPresetDefaults, PROVIDER_PRESETS, collectModelOptions, createProviderForm, deriveProviderId, isChatModel, isSpeechModelForRoute, modelEntryFromMetadata, parseExecutorSelector, presetHasBaseUrl, presetNeedsAuth, PRESET_LABELS, providerExecutorTargetError, providerFormToPayload, providerFormToUpdatePayload, providerRequiresExecutorLocation, type ProviderFormState, type ProviderModelOption, type ProviderPreset } from '$lib/providers';
   import { STEP_PROFILE_CAPABILITIES, STEP_PROFILE_GROUPS } from '$lib/workflows';
   import { defaultModelEntry, type LocalModelDeployment, type LocalModelTargetStatus, type ModelEntry } from '$lib/types/api';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -180,8 +180,8 @@
     system: 'system',
     account: 'account'
   };
-  const ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator', 'speech_to_text', 'text_to_speech', 'image_generation', 'video_generation', 'video_editing', 'video_analysis', 'attachment_analysis', 'embedding'] as const;
-  const TEXT_ROUTING_KEYS = ['default', 'classifier', 'compaction', 'evaluator'] as const;
+  const ROUTING_KEYS = ['default', 'classifier', 'auxiliary_generation', 'compaction', 'evaluator', 'audio_narrative', 'speech_to_text', 'text_to_speech', 'image_generation', 'video_generation', 'video_editing', 'video_analysis', 'attachment_analysis', 'embedding'] as const;
+  const TEXT_ROUTING_KEYS = ['default', 'classifier', 'auxiliary_generation', 'compaction', 'evaluator', 'audio_narrative'] as const;
   const SAME_SESSION_MODEL_SENTINEL = '__same_session_model__';
   type RoutingKey = (typeof ROUTING_KEYS)[number];
   type RoutingFormEntry = { model: string; reasoningEffort: string };
@@ -192,11 +192,13 @@
     supportsThinking: boolean;
   }> = [
     { key: 'default', label: 'default', description: 'Main chat and task execution.', supportsThinking: true },
-    { key: 'classifier', label: 'classifier', description: 'Decision engine / fast model.', supportsThinking: true },
+    { key: 'classifier', label: 'classifier', description: 'Typed tool classification and skill-tool selection. Supports chat models and native System One / Jev decision models.', supportsThinking: true },
+    { key: 'auxiliary_generation', label: 'auxiliary_generation', description: 'Conversation recaps, workflow composition, and skill decomposition. Requires a chat model; falls back to default when unset.', supportsThinking: true },
     { key: 'compaction', label: 'compaction', description: 'Context compaction summaries. Defaults to the same model as the active agent session.', supportsThinking: true },
     { key: 'evaluator', label: 'evaluator', description: 'Workflow step evaluation. Falls back to default if not set.', supportsThinking: true },
     { key: 'speech_to_text', label: 'speech_to_text', description: 'Voice-note transcription. Use models like gpt-4o-transcribe, gpt-4o-mini-transcribe, or whisper.', supportsThinking: false },
-    { key: 'text_to_speech', label: 'text_to_speech', description: 'Voice synthesis for the speaker button and conversation mode. Use models like tts-1, tts-1-hd, gpt-4o-mini-tts, eleven_multilingual_v2, or a Piper-compatible HTTP server.', supportsThinking: false },
+    { key: 'text_to_speech', label: 'Speech / voice (text_to_speech)', description: 'Default speech provider and model for messages, document narration, podcasts, and conversation mode. Documents prefer their author agent’s accessible TTS provider, model, and voice.', supportsThinking: false },
+    { key: 'audio_narrative', label: 'Podcast writing (audio_narrative)', description: 'Text model for source-grounded podcast scripts and optional message adaptation. Narration does not use this model. Inherits the Lite companion model when unset. Choose podcast length in the document’s Listen panel.', supportsThinking: true },
     { key: 'image_generation', label: 'image_generation', description: 'Image-capable model for avatars and tools. Must support image generation.', supportsThinking: false },
     { key: 'video_generation', label: 'video_generation', description: 'Native video model: Google Veo/Omni or OpenRouter video API. Requires a video spending policy. No fallback to chat.', supportsThinking: false },
     { key: 'video_editing', label: 'video_editing', description: 'Optional edit/extension model; inherits video_generation when unset. Source-provider continuity is required.', supportsThinking: false },
@@ -213,10 +215,12 @@
     return {
       default: { model: null, reasoning_effort: null },
       classifier: { model: null, reasoning_effort: null },
+      auxiliary_generation: { model: null, reasoning_effort: null },
       compaction: { model: null, reasoning_effort: null },
       evaluator: { model: null, reasoning_effort: null },
       speech_to_text: { model: null, reasoning_effort: null },
       text_to_speech: { model: null, reasoning_effort: null },
+      audio_narrative: { model: null, reasoning_effort: null },
       image_generation: { model: null, reasoning_effort: null },
       video_generation: { model: null, reasoning_effort: null },
       video_editing: { model: null, reasoning_effort: null },
@@ -230,10 +234,12 @@
     return {
       default: emptyRoutingEntry(),
       classifier: emptyRoutingEntry(),
+      auxiliary_generation: emptyRoutingEntry(),
       compaction: emptyRoutingEntry(),
       evaluator: emptyRoutingEntry(),
       speech_to_text: emptyRoutingEntry(),
       text_to_speech: emptyRoutingEntry(),
+      audio_narrative: emptyRoutingEntry(),
       image_generation: emptyRoutingEntry(),
       video_generation: emptyRoutingEntry(),
       video_editing: emptyRoutingEntry(),
@@ -632,23 +638,6 @@
     return collectModelOptions(providers, true);
   }
 
-  function looksLikeTranscriptionModel(value: string): boolean {
-    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
-    return normalized.includes('transcribe') || normalized.includes('whisper') || normalized.includes('speech-to-text');
-  }
-
-  function looksLikeTtsModel(value: string): boolean {
-    const normalized = value.trim().toLowerCase().replaceAll('_', '-');
-    return (
-      normalized.includes('tts') ||
-      normalized.includes('text-to-speech') ||
-      normalized.includes('speech-1') ||
-      normalized.includes('eleven') ||
-      normalized.includes('elevenlabs') ||
-      normalized.includes('piper')
-    );
-  }
-
   function looksLikeEmbeddingModel(value: string): boolean {
     const normalized = value.trim().toLowerCase().replaceAll('_', '-');
     return (
@@ -812,17 +801,8 @@
     if (routeKey === 'embedding') {
       return options.filter((option) => modelSupportsEmbedding(findModelEntry(option.value)));
     }
-    if (routeKey === 'speech_to_text') {
-      return options.filter((option) => {
-        const entry = findModelEntry(option.value);
-        return entry?.model_mode === 'audio_transcription' || looksLikeTranscriptionModel(option.value) || looksLikeTranscriptionModel(entry?.display_name ?? '');
-      });
-    }
-    if (routeKey === 'text_to_speech') {
-      return options.filter((option) => {
-        const entry = findModelEntry(option.value);
-        return entry?.model_mode === 'audio_speech' || looksLikeTtsModel(option.value) || looksLikeTtsModel(entry?.display_name ?? '');
-      });
+    if (routeKey === 'speech_to_text' || routeKey === 'text_to_speech') {
+      return options.filter(option => isSpeechModelForRoute(routeKey, findModelEntry(option.value), option.value));
     }
     if (routeKey === 'compaction') {
       return [
@@ -835,7 +815,11 @@
         ...options.filter((option) => isChatModel(findModelEntry(option.value) ?? { model_id: option.value }))
       ];
     }
-    return options.filter((option) => isChatModel(findModelEntry(option.value) ?? { model_id: option.value }));
+    return options.filter((option) => {
+      const entry = findModelEntry(option.value);
+      return (routeKey === 'classifier' && entry?.model_mode === 'systemone') ||
+        isChatModel(entry ?? { model_id: option.value });
+    });
   }
 
   function defaultModelOptionLabel(routeKey: RoutingKey): string {
@@ -1765,6 +1749,10 @@
         model: modelRouting.classifier.model ?? '',
         reasoningEffort: modelRouting.classifier.reasoning_effort ?? ''
       },
+      auxiliary_generation: {
+        model: modelRouting.auxiliary_generation.model ?? '',
+        reasoningEffort: modelRouting.auxiliary_generation.reasoning_effort ?? ''
+      },
       compaction: {
         model: modelRouting.compaction.model ?? '',
         reasoningEffort: modelRouting.compaction.reasoning_effort ?? ''
@@ -1780,6 +1768,10 @@
       text_to_speech: {
         model: modelRouting.text_to_speech?.model ?? '',
         reasoningEffort: ''
+      },
+      audio_narrative: {
+        model: modelRouting.audio_narrative?.model ?? '',
+        reasoningEffort: modelRouting.audio_narrative?.reasoning_effort ?? ''
       },
       image_generation: {
         model: modelRouting.image_generation.model ?? '',
@@ -2169,6 +2161,8 @@
       await loadProviderMonitor(selectedProviderId);
       if (providerOAuthStatus.status === 'authorized') {
         addToast('ChatGPT OAuth is authorized.', 'success');
+      } else if (providerOAuthStatus.status === 'reauthorization_required') {
+        addToast('ChatGPT sign-in expired or was revoked. Start OAuth again.', 'error', 6_000, 'Reauthorization required');
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -2256,6 +2250,8 @@
       providerOAuthStatus = await api.llmProviders.anthropicOAuthStatus(selectedProviderId);
       if (providerOAuthStatus.status === 'authorized') {
         addToast('Claude subscription OAuth is authorized.', 'success');
+      } else if (providerOAuthStatus.status === 'reauthorization_required') {
+        addToast('Claude sign-in expired or was revoked. Start OAuth again.', 'error', 6_000, 'Reauthorization required');
       }
     } catch (caughtError) {
       error = asApiError(caughtError).message;
@@ -2299,6 +2295,10 @@
           model: routingForm.classifier.model || (routingForm.classifier.reasoningEffort ? effectiveRouteModelId('classifier') : '') || null,
           reasoning_effort: routingForm.classifier.reasoningEffort || null
         },
+        auxiliary_generation: {
+          model: routingForm.auxiliary_generation.model || (routingForm.auxiliary_generation.reasoningEffort ? effectiveRouteModelId('auxiliary_generation') : '') || null,
+          reasoning_effort: routingForm.auxiliary_generation.reasoningEffort || null
+        },
         compaction: {
           model: compactionModel,
           reasoning_effort: compactionModel === SAME_SESSION_MODEL_SENTINEL
@@ -2316,6 +2316,10 @@
         text_to_speech: {
           model: routingForm.text_to_speech.model || null,
           reasoning_effort: null
+        },
+        audio_narrative: {
+          model: routingForm.audio_narrative.model || null,
+          reasoning_effort: routingForm.audio_narrative.reasoningEffort || null
         },
         image_generation: {
           model: routingForm.image_generation.model || null,
@@ -3058,6 +3062,7 @@
   <Button onclick={loadSettings}>Retry settings</Button>
 {:else}
   <section class="space-y-5">
+    <h1 class="hidden text-2xl font-semibold text-strong md:block">Settings</h1>
     <div bind:this={settingsPanelAnchor}></div>
     <!--
       Mobile: horizontally scrollable pill strip rendered in normal flow
@@ -3292,6 +3297,9 @@
                       {#if providerOAuthStatus}
                         <div class="rounded-xl border border-control-border bg-canvas/70 p-3 text-xs text-secondary">
                           <p>Status: <span class="font-mono text-foreground">{providerOAuthStatus.status}</span></p>
+                          {#if providerOAuthStatus.status === 'reauthorization_required'}
+                            <p class="mt-2 text-danger" role="alert">Sign-in expired or was revoked. Requests to this provider fail until you start OAuth again.</p>
+                          {/if}
                           {#if isAnthropicSubscriptionOAuth() && (providerOAuthStatus.authorization_url || providerOAuthStatus.verification_url)}
                             <p class="mt-2">Open <a class="text-accent underline" href={providerOAuthStatus.authorization_url ?? providerOAuthStatus.verification_url ?? '#'} target="_blank" rel="noreferrer">Claude authorization</a>, then paste the final callback URL or <span class="font-mono">code#state</span> below.</p>
                           {/if}
@@ -3715,7 +3723,7 @@
         <div class="flex items-center justify-between gap-3">
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-muted">Model routing</p>
-            <h2 class="mt-1 text-lg font-semibold text-strong">Task-type routing</h2>
+            <h2 id="model-routing" class="mt-1 text-lg font-semibold text-strong">Task-type routing</h2>
           </div>
         </div>
 
@@ -4171,7 +4179,7 @@
                  onchange={(event) => void updateChatPreference('auto_recap', event.currentTarget.checked)}
                />
                <span>
-                 <span class="block font-medium text-foreground">Automatically recap web chats</span>
+                  <span class="block font-medium text-foreground">Automatically recap web chats</span>
                  <span class="mt-1 block text-xs leading-5 text-quiet">After meaningful work and a quiet period, add a short recap to the chat timeline. Never sends a notification.</span>
                </span>
              </label>
@@ -4296,6 +4304,15 @@
               <label class="space-y-1 text-sm text-secondary">
                 <span class="text-xs text-muted">Navigation timeout (seconds)</span>
                 <Input bind:value={webBrowserFetchNavigationTimeoutForm} type="number" min="5" max="300" step="5" />
+              </label>
+              <label class="flex items-start gap-3 rounded-2xl border border-separator bg-canvas/70 px-4 py-3 text-sm">
+                <input type="checkbox" checked={$userPreferences.chat.adapt_tts ?? false} disabled={busy}
+                  class="mt-1 rounded border-control-border bg-raised text-success focus:ring-success/30 disabled:opacity-40"
+                  onchange={(event) => void updateChatPreference('adapt_tts', event.currentTarget.checked)} />
+                <span>
+                  <span class="block font-medium text-foreground">Adapt assistant messages for listening</span>
+                  <span class="mt-1 block text-xs leading-5 text-quiet">Off by default: read the original message as is. When enabled, the audio narrative model rewrites messages into spoken prose before playback, including conversation mode. Adds model cost and a short delay. The original message is unchanged.</span>
+                </span>
               </label>
               <label class="space-y-1 text-sm text-secondary">
                 <span class="text-xs text-muted">Initial wait state</span>

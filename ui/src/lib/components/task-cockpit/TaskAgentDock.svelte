@@ -33,9 +33,13 @@
   }>();
   let chat = $state<TaskControlChatResponse | null>(null);
   let chatLoading = $state(false);
+  let createRequested = false;
   let chatError = $state<string | null>(null);
   // Hidden while the global connection banner applies; reopen on restore.
-  const net = useSectionConnectivity({ hasError: () => Boolean(chatError), retry: () => ensureChat() });
+  const net = useSectionConnectivity({
+    hasError: () => Boolean(chatError),
+    retry: () => ensureChat(createRequested || taskAgentDock.state !== 'minimized'),
+  });
   let conversation = $state<Conversation | null>(null);
   let backgroundWork = $state<BackgroundWorkItem[]>([]);
   let runtimeActive = $state<boolean | null>(null);
@@ -110,18 +114,30 @@
     sidebarState = null;
     chatLoading = false;
     chatError = null;
+    createRequested = false;
     taskAgentDock.reset();
   }
 
-  async function ensureChat(): Promise<void> {
-    if (chat || chatLoading) return;
+  /**
+   * Attach the task's control chat. Viewing a task only looks up an existing
+   * chat (`create: false`); opening the dock or sending creates it.
+   */
+  async function ensureChat(create = true): Promise<void> {
+    if (chat) return;
+    if (chatLoading) {
+      // Opening the dock during the mount lookup must still create the chat.
+      if (create) createRequested = true;
+      return;
+    }
     const currentTaskId = task.task_id;
     const current = generation;
     chatLoading = true;
     chatError = null;
     try {
-      const nextChat = await api.tasks.controlChat(currentTaskId);
-      if (current === generation && currentTaskId === task.task_id) {
+      const nextChat = create
+        ? await api.tasks.controlChat(currentTaskId)
+        : await api.tasks.existingControlChat(currentTaskId);
+      if (nextChat && current === generation && currentTaskId === task.task_id) {
         chat = nextChat;
         try {
           const nextConversation = await api.conversations.detail(
@@ -144,6 +160,10 @@
       }
     } finally {
       if (current === generation) chatLoading = false;
+    }
+    if (current === generation && !chat && !chatError && createRequested) {
+      createRequested = false;
+      await ensureChat(true);
     }
   }
 
@@ -415,7 +435,7 @@
 
   $effect(() => {
     resetForTask(task.task_id);
-    untrack(() => void ensureChat());
+    untrack(() => void ensureChat(taskAgentDock.state !== 'minimized'));
   });
 
   $effect(() => {

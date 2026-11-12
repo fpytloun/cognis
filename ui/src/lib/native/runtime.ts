@@ -4,12 +4,11 @@ import { wsClient, wsState } from '$lib/ws/client';
 import { conversationWorkspace, retainedConversationId } from '$lib/dashboard/conversation-workspace';
 import { pinnedAgents, pinnedConversations, pinnedBackgroundWork } from '$lib/dashboard/conversation-workspace-runtime';
 import { conversationActivityState } from '$lib/conversation-activity';
-import { isNativeHost, nativeConfiguration, postNative, receiveNativeVisibility } from './host';
+import { isNativeHost, isNativeRoute, nativeConfiguration, nativeComposerFocus, postNative, receiveNativeVisibility } from './host';
 import { installResidentNotifications } from './notifications';
 import { receiveNotificationStatus } from './notification-status';
-import { installAgentCatalogue, nativeAgents } from './catalogue';
+import { installAgentCatalogue, nativeAgents, nativeAgentsReady } from './catalogue';
 
-const route = /^\/(?:$|[a-zA-Z0-9/_%-]+(?:\?[a-zA-Z0-9_=&%-]*)?)$/;
 
 /** One shell/runtime and one web-owned pin collection per native profile. */
 export function installNativeRuntime(navigate: (path: string) => Promise<unknown>): () => void {
@@ -73,7 +72,11 @@ export function installNativeRuntime(navigate: (path: string) => Promise<unknown
       epoch, authenticated: Boolean(email), connection: get(wsState).status, pins,
       agents: email ? get(nativeAgents).map((agent) => ({
         agentId: agent.agent_id, name: (agent.display_name || agent.name).replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 80)
-      })) : []
+      })) : [],
+      panelTargets: {
+        ready: Boolean(email) && get(nativeAgentsReady) && workspace.owner === email,
+        pinnedAgents: email ? workspace.agents.map((agent) => agent.agentId) : [],
+      },
     });
     appearance();
   };
@@ -91,7 +94,7 @@ export function installNativeRuntime(navigate: (path: string) => Promise<unknown
       schedule();
     }), wsState.subscribe(schedule), conversationWorkspace.subscribe(schedule),
     pinnedAgents.subscribe(schedule), pinnedConversations.subscribe(schedule),
-    pinnedBackgroundWork.subscribe(schedule), nativeAgents.subscribe(schedule)
+     pinnedBackgroundWork.subscribe(schedule), nativeAgents.subscribe(schedule), nativeAgentsReady.subscribe(schedule)
   ];
   window.__cognisNativeReceive = (value: unknown) => {
     if (!value || typeof value !== 'object') return;
@@ -100,6 +103,10 @@ export function installNativeRuntime(navigate: (path: string) => Promise<unknown
     if (command.type === 'visibility' && typeof command.visible === 'boolean'
       && typeof command.focused === 'boolean') {
       receiveNativeVisibility(command.visible, command.focused);
+    } else if (command.type === 'focus-composer' && nativeConfiguration()?.surface === 'pinned'
+      && typeof command.agentId === 'string' && /^[A-Za-z0-9_-]{1,160}$/.test(command.agentId)
+      && typeof command.request === 'string' && /^[0-9a-f-]{36}$/i.test(command.request)) {
+      nativeComposerFocus.set({ agentId: command.agentId, request: command.request });
     } else if (command.type === 'notification-review') {
       notifications.review(command);
     } else if (command.type === 'notification-action') {
@@ -116,9 +123,7 @@ export function installNativeRuntime(navigate: (path: string) => Promise<unknown
       window.dispatchEvent(new CustomEvent('cognis-rail', { detail: command }));
     } else if (command.type === 'rail-tuck') {
       window.dispatchEvent(new Event('cognis-rail-tuck'));
-    } else if (command.type === 'navigate' && typeof command.path === 'string'
-      && command.path.length <= 512 && (route.test(command.path)
-        || /^\/native-pinned\?agent=[A-Za-z0-9_-]+&conversation=[A-Za-z0-9_-]+$/.test(command.path))) {
+    } else if (command.type === 'navigate' && isNativeRoute(command.path)) {
       void navigate(command.path);
     }
   };
@@ -135,6 +140,7 @@ export function installNativeRuntime(navigate: (path: string) => Promise<unknown
   publish();
   return () => {
     alive = false;
+    nativeComposerFocus.set(null);
     notifications.stop();
     stopCatalogue();
     stops.forEach((stop) => stop());

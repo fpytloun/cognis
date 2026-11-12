@@ -1,11 +1,13 @@
 <script lang="ts">
-  import { getContext } from 'svelte';
+  import { getContext, onDestroy } from 'svelte';
+  import FeedbackHost from '$lib/components/feedback/FeedbackHost.svelte';
+  import DocumentCommentCount from './DocumentCommentCount.svelte';
+  import ChatFeedbackIntent from '$lib/components/chat-v2/ChatFeedbackIntent.svelte';
   import { readable, type Readable } from 'svelte/store';
   import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
   import { api } from '$lib/api/client';
-  // Loaded on demand (in parallel with the deliverable fetch) to keep the
-  // rich renderer out of the chat startup bundle.
-  const richDeliverableModule = import('$lib/components/rich/RichDeliverable.svelte');
+  import { loadConversationDeliverable, peekConversationDeliverable, rememberConversationDeliverable } from '$lib/conversation-deliverables';
+  import RichDeliverable from '$lib/components/rich/RichDeliverable.svelte';
   import DeliverableRevisionBar from '$lib/components/DeliverableRevisionBar.svelte';
   import {
     isSupersededRevision,
@@ -17,17 +19,32 @@
   import { privateDeliverableMediaUrl } from '$lib/rich-deliverable';
   import type { AssistantDeliverableTimelineItem as RenderAssistantDeliverableTimelineItem } from '$lib/timeline-render-model';
   import type { AssistantDeliverableTimelineItem } from '$lib/chat-v2/types';
-  import type { Deliverable, DeliverableRevisionSummary } from '$lib/types/api';
+  import type { Agent, Deliverable, DeliverableRevisionSummary, TaskDeliverableFreshness } from '$lib/types/api';
+  import AgentAvatar from './AgentAvatar.svelte';
+  import { now as nowStore } from '$lib/stores/now';
+  import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
 
   import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
+  import DeferredPrivateView from './ui/DeferredPrivateView.svelte';
+  import { deliverableAudio } from './ui/private-view-definitions';
+  import { appDocumentAudioClient } from '$lib/app-document-audio';
+  import { portal } from '$lib/actions/portal';
+  import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   export let item: AssistantDeliverableTimelineItem | RenderAssistantDeliverableTimelineItem;
+  export let fullscreenOnly = false;
+  export let onClose: (() => void) | undefined = undefined;
+  export let conversationId = '';
   export let loadDeliverable: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
   export let loadRevision: ((deliverableId: string) => Promise<Deliverable>) | undefined = undefined;
   export let showLibraryLink = true;
   export let displayOnly = false;
   export let collapsedByDefault = false;
+  export let inlineDisclosure = false;
+  export let taskFreshness: TaskDeliverableFreshness | null = null;
   export let allowSharing = true;
-  export let conversational = false;
+  export let conversational = true;
+  export let agent: Agent | null = null;
+  export let showMessageIdentity = false;
   const sharingPermission = getContext<Readable<boolean>>(DELIVERABLE_SHARING_CONTEXT) ?? readable(true);
 
   // `baseDeliverable` is the revision this card represents; `revisionView` is a
@@ -35,17 +52,26 @@
   let baseDeliverable: Deliverable | null = null;
   let revisionView: Deliverable | null = null;
   let revisionError: string | null = null;
+  let viewerFullscreen = false;
+  let fullscreenReturnFocus: HTMLElement | null = null;
   let revisionGeneration = 0;
   let deliverable: Deliverable | null = null;
+  let feedbackBusy = false;
   $: deliverable = revisionView ?? baseDeliverable;
-  $: supersededCollapsed = !revisionView && isSupersededRevision(baseDeliverable);
+  $: supersededCollapsed = !feedbackBusy && !revisionView && isSupersededRevision(baseDeliverable);
+  $: effectiveTaskFreshness = taskFreshness ?? baseDeliverable?.task_freshness ?? null;
+  $: taskFreshnessCollapsed = !feedbackBusy && !revisionView && effectiveTaskFreshness !== null && effectiveTaskFreshness.state !== 'current';
   let loading = true;
   let error: string | null = null;
   let accessorConversationId = '';
   let loadGeneration = 0;
+  onDestroy(() => { loadGeneration += 1; revisionGeneration += 1; });
   $: deliverableId = 'deliverable_id' in item ? item.deliverable_id : item.deliverableId;
 
   $: deliverableTitle = deliverable?.title ?? item.title ?? 'Deliverable';
+  $: agentName = agent ? (agent.display_name ?? agent.name) : 'Assistant';
+  $: messageTimestamp = ('deliverable_id' in item ? item.created_at : item.createdAt) ?? baseDeliverable?.created_at ?? null;
+  $: nowDate = new Date($nowStore);
   $: standaloneUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/view` : '';
   $: pdfUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/download.pdf` : '';
   $: htmlUrl = deliverable ? `/api/v1/deliverables/${encodeURIComponent(deliverable.deliverable_id)}/download.html` : '';
@@ -84,8 +110,24 @@
   }
 
   function currentConversationId(): string {
+    if (conversationId) return conversationId;
     const match = typeof window !== 'undefined' ? window.location.pathname.match(/\/chat\/([^/]+)/) : null;
     return match?.[1] ? decodeURIComponent(match[1]) : '';
+  }
+
+  function pendingDialog(node: HTMLElement) {
+    const overlay = registerOverlay({ kind: 'fullscreen', blocksChrome: true });
+    node.querySelector<HTMLButtonElement>('button')?.focus();
+    const keydown = (event: KeyboardEvent) => {
+      if (!isTopOverlay(overlay.id)) return;
+      if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); onClose?.(); }
+      if (event.key === 'Tab') { event.preventDefault(); node.querySelector<HTMLButtonElement>('button')?.focus(); }
+    };
+    node.addEventListener('keydown', keydown);
+    return { destroy() {
+      node.removeEventListener('keydown', keydown);
+      overlay.unregister();
+    } };
   }
 
   async function createShareLink(options?: import('$lib/components/rich/share-options').ShareLinkOptions): Promise<string> {
@@ -100,6 +142,7 @@
     previewOnly: boolean,
   ): Promise<void> {
     const generation = ++loadGeneration;
+    revisionGeneration += 1;
     loading = true;
     error = null;
     if (baseDeliverable?.deliverable_id !== id) baseDeliverable = null;
@@ -110,10 +153,16 @@
       loading = false;
       return;
     }
+    const cached = !loaderOverride && peekConversationDeliverable(id, accessorConversationId);
+    if (cached) {
+      baseDeliverable = cached;
+      loading = false;
+      return;
+    }
     try {
       const result = await (loaderOverride
         ? loaderOverride(id)
-        : api.deliverables.get(id, { accessorConversationId }));
+        : loadConversationDeliverable(id, accessorConversationId));
       if (generation === loadGeneration && deliverableId === id) baseDeliverable = result;
     } catch (err) {
       if (generation === loadGeneration && deliverableId === id) {
@@ -124,7 +173,26 @@
     }
   }
 
-  $: void loadCurrent(deliverableId, loadDeliverable, displayOnly);
+  function resetInlineRevision(id: string): void {
+    if (baseDeliverable?.deliverable_id !== id) {
+      revisionGeneration += 1;
+      revisionView = null;
+      revisionError = null;
+    }
+  }
+
+  $: if (!displayOnly && item.deliverable?.deliverable_id === deliverableId) {
+    loadGeneration += 1;
+    accessorConversationId = currentConversationId();
+    // Reading baseDeliverable here would make its assignment self-reactive.
+    resetInlineRevision(deliverableId);
+    baseDeliverable = item.deliverable;
+    if (!loadDeliverable) rememberConversationDeliverable(item.deliverable, accessorConversationId);
+    error = null;
+    loading = false;
+  } else {
+    void loadCurrent(deliverableId, loadDeliverable, displayOnly);
+  }
 
   // Publish this card's revision, and refresh lineage facts when a newer
   // revision of the same lineage is rendered after this card loaded.
@@ -150,13 +218,17 @@
       const result = await (loadDeliverable
         ? loadDeliverable(id)
         : api.deliverables.get(id, { accessorConversationId }));
-      if (generation === loadGeneration && deliverableId === id) baseDeliverable = result;
+      if (generation === loadGeneration && deliverableId === id) {
+        baseDeliverable = result;
+        if (!loadDeliverable) rememberConversationDeliverable(result, accessorConversationId);
+      }
     } catch {
       // Keep the loaded revision; lineage facts refresh on the next load.
     }
   }
 
   async function openRevision(revision: DeliverableRevisionSummary): Promise<void> {
+    if (feedbackBusy) { revisionError = 'Finish or close feedback before switching revisions. Your private draft remains on its original revision.'; return; }
     const generation = ++revisionGeneration;
     revisionError = null;
     if (revision.deliverable_id === baseDeliverable?.deliverable_id) {
@@ -176,9 +248,25 @@
   }
 </script>
 
+{#if fullscreenOnly && !deliverable}
+  <div class="fullscreen-pending" role="dialog" aria-modal="true" aria-label={deliverableTitle} tabindex="-1" use:portal use:pendingDialog>
+    {#if error}<p role="alert">Could not load deliverable: {error}</p>
+    {:else}<p role="status">Loading deliverable…</p>{/if}
+    <button type="button" on:click={onClose}>Close document</button>
+  </div>
+{:else}
 <div class="assistant-deliverable-wrapper" class:conversational data-deliverable-id={deliverableId} data-collapsed-by-default={collapsedByDefault ? 'true' : undefined}>
+  {#if !fullscreenOnly && !displayOnly}
+    <div class="flex justify-end"><DocumentCommentCount id={deliverableId} /></div>
+  {/if}
   {#if loading && !deliverable}
-    <div class="text-sm text-muted">Loading deliverable…</div>
+    <div class="flex min-h-12 items-center gap-2 text-sm text-muted" role="status" aria-live="polite" aria-busy="true">
+      <svg class="h-4 w-4 shrink-0 animate-spin motion-reduce:animate-none" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" opacity=".25" />
+        <path d="M12 3a9 9 0 0 1 9 9" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+      </svg>
+      <span>Loading deliverable…</span>
+    </div>
   {:else if displayOnly && !deliverable}
     <div class="rounded-xl border border-control-border bg-surface/60 p-3" data-testid="display-only-deliverable">
       <p class="text-sm font-medium text-foreground">{deliverableTitle}</p>
@@ -199,16 +287,23 @@
     {#if showLibraryLink && !displayOnly && !conversational}
       <div class="mb-2 flex justify-end"><a class="inline-flex min-h-9 items-center text-xs text-accent hover:text-accent-hover hover:underline" href={`/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}>Open in Library ↗</a></div>
     {/if}
-    {#if !conversational}<DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />{/if}
-    {#if revisionError}<p class="mb-2 text-xs text-danger">{revisionError}</p>{/if}
+    {#if !conversational}<DeliverableRevisionBar part="notice" current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />{/if}
     <!-- Remount when the card becomes superseded so it applies the collapsed default. -->
-    {#key `${deliverable.deliverable_id}:${supersededCollapsed}`}
-    {#await richDeliverableModule then { default: RichDeliverable }}
+    {#if effectiveTaskFreshness && effectiveTaskFreshness.state !== 'current'}
+      <p class="mb-2 text-xs text-muted" role="status">{effectiveTaskFreshness.label}</p>
+    {/if}
+    {#key `${deliverable.deliverable_id}:${supersededCollapsed}:${taskFreshnessCollapsed}`}
+    <FeedbackHost source={{ kind: 'document', content_ref: deliverable.deliverable_id }} onBusyChange={(value) => { feedbackBusy = value; }}>
+    <ChatFeedbackIntent sourceKey={deliverable.deliverable_id} document>
     <RichDeliverable
+      bind:fullOpen={viewerFullscreen}
+      bind:lastFocusedElement={fullscreenReturnFocus}
       title={deliverableTitle}
+      {fullscreenOnly}
+      onCloseFullscreen={onClose}
       content={deliverable.content}
       payload={richPayload}
-      instanceId={deliverable.deliverable_id}
+       instanceId={deliverable.deliverable_id}
       internalUrl={conversational && (!showLibraryLink || displayOnly) ? '' : `/library/deliverable/${encodeURIComponent(deliverable.deliverable_id)}`}
       mediaUrlFor={authenticatedMediaUrlFor}
       standaloneUrl={standaloneUrl}
@@ -219,19 +314,42 @@
       surface="embedded"
       {conversational}
       compact
-      collapsedByDefault={collapsedByDefault || supersededCollapsed}
+       collapsedByDefault={collapsedByDefault || supersededCollapsed || taskFreshnessCollapsed}
+       inlineDisclosure={inlineDisclosure || (effectiveTaskFreshness !== null && effectiveTaskFreshness.state !== 'current')}
     >
-      {#snippet extraActions()}<DocumentFavoriteButton kind="deliverable" id={deliverable.deliverable_id} showLabel={conversational} />{/snippet}
+      {#snippet extraActions(showLabel = false)}
+        <DocumentFavoriteButton kind="deliverable" id={deliverable.deliverable_id} {showLabel} />
+      {/snippet}
+      {#snippet revisionControls()}
+        <DeliverableRevisionBar part="switcher" current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
+        {#if revisionError}<span role="alert" class="text-xs text-danger">{revisionError}</span>{/if}
+      {/snippet}
+      {#snippet audioControls()}
+        {#if !displayOnly}
+          <DeferredPrivateView definition={deliverableAudio} label="audio controls" viewProps={{ sourceRef: deliverable.deliverable_id, client: appDocumentAudioClient, rich: deliverable.format === 'rich' }} />
+        {/if}
+      {/snippet}
       {#snippet footer()}
-        <DeliverableRevisionBar current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
+        {#if showMessageIdentity}
+          <div class="flex min-w-0 items-center gap-1.5 text-[11px] opacity-80" data-testid="deliverable-message-identity">
+            <AgentAvatar name={agentName} avatarUrl={agent?.avatar_url ?? null} class="h-4 w-4 rounded-md text-[9px]" />
+            <span class="truncate font-medium text-foreground">{agentName}</span>
+            <span class="text-quiet">·</span>
+            <span class="whitespace-nowrap text-muted" title={formatAbsoluteTime(messageTimestamp)}>{formatCompactTime(messageTimestamp, nowDate)}</span>
+          </div>
+        {/if}
+        <DeliverableRevisionBar part="notice" current={deliverable} anchorId={baseDeliverable?.deliverable_id ?? deliverableId} onSelect={(revision) => void openRevision(revision)} />
       {/snippet}
     </RichDeliverable>
-    {/await}
+    </ChatFeedbackIntent>
+    </FeedbackHost>
     {/key}
   {/if}
 </div>
+{/if}
 
 <style>
+  .fullscreen-pending { position: fixed; inset: 0; z-index: 2147483000; display: grid; place-content: center; gap: 1rem; padding: 1.5rem; color: rgb(var(--color-foreground)); background: rgb(var(--color-canvas)); }
   .assistant-deliverable-wrapper {
     width: 100%;
     min-width: 0;

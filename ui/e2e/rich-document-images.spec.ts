@@ -5,14 +5,14 @@ import { expect, test } from '@playwright/test';
 const build = resolve('standalone-build');
 const entry = JSON.parse(readFileSync(resolve(build, '.vite/manifest.json'), 'utf8'))['src/standalone.ts'];
 const fixture = {
-  title: 'Sample release catalog — Design proposal',
+  title: 'Station operations via SCC and AWS SSM — Design proposal',
   content: '',
   instanceId: '',
   payload: { blocks: [
     { type: 'markdown', content: 'Draft design proposal.\n\n' + Array.from({ length: 11 }, (_, i) =>
       `## ${i + 1}. Section\n\n${'Design details and acceptance evidence. '.repeat(15)}`
     ).join('\n\n') },
-    { type: 'figure', src: '/authorized-diagram.svg', alt: 'Catalog architecture', title: 'Architecture' },
+    { type: 'figure', src: '/authorized-diagram.svg', alt: 'Station architecture', title: 'Architecture' },
   ] },
 };
 
@@ -21,7 +21,7 @@ for (const width of [390, 1440]) {
     await page.setViewportSize({ width, height: 900 });
     await page.route('**/authorized-diagram.svg', route => route.fulfill({
       contentType: 'image/svg+xml',
-      body: '<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900"><rect width="1800" height="900" fill="white"/><text x="40" y="60">Catalog architecture</text></svg>',
+      body: '<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="900"><rect width="1800" height="900" fill="white"/><text x="40" y="60">Station architecture</text></svg>',
     }));
     await page.route('**/standalone-assets/assets/*', route => {
       const file = basename(new URL(route.request().url()).pathname);
@@ -79,7 +79,7 @@ for (const width of [390, 1440]) {
     const section = page.getByRole('heading', { name: '11. Section', exact: true });
     await expect(section).toBeFocused();
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve())));
-    const trigger = page.getByRole('button', { name: 'Enlarge image: Catalog architecture' });
+    const trigger = page.getByRole('button', { name: 'Enlarge image: Station architecture' });
     await trigger.focus();
     await page.keyboard.press('Enter');
     const dialog = page.getByRole('dialog', { name: 'Architecture' });
@@ -120,4 +120,137 @@ for (const width of [390, 1440]) {
     await expect(trigger).toBeFocused();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
   });
+}
+
+for (const presentation of ['default', 'pulse']) {
+  for (const width of [390, 1440]) {
+    test.describe(`${presentation} ${width}px`, () => {
+      test.use({ isMobile: width === 390, hasTouch: width === 390 });
+    test(`inline images retain intrinsic size in ${presentation} at ${width}px`, async ({ page, browserName }, testInfo) => {
+      await page.setViewportSize({ width, height: 900 });
+      const errors: string[] = [];
+      page.on('pageerror', error => errors.push(error.message));
+      const images = [
+        { name: 'Small', width: 200, height: 100 },
+        { name: 'Large', width: 1800, height: 900 },
+        { name: 'Portrait', width: 200, height: 400 },
+      ];
+      const blocks = images.flatMap(image => [
+        { type: 'figure', src: `/inline-${image.name}.svg`, alt: `Figure ${image.name}`, caption: `Figure ${image.name}` },
+        { type: 'gallery', items: [{ src: `/inline-${image.name}.svg`, alt: `Gallery ${image.name}`, caption: `Gallery ${image.name}` }] },
+        { type: 'card', title: `Card ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Card ${image.name}` } },
+        { type: 'card', title: `Linked ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Linked ${image.name}`, link: 'https://cognis.test/image' } },
+        { type: 'card', title: `Leading ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Leading ${image.name}`, placement: 'leading' } },
+        { type: 'card', title: `Background ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Background ${image.name}`, placement: 'background' } },
+        { type: 'card', title: `Background linked ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Background linked ${image.name}`, placement: 'background', link: 'https://cognis.test/image' } },
+        { type: 'card', variant: 'visual', title: `Visual ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Visual ${image.name}` } },
+        { type: 'hero', title: `Hero ${image.name}`, media: { src: `/inline-${image.name}.svg`, alt: `Hero ${image.name}` } },
+      ]);
+      const sizedCards = [
+        { name: 'Oversized', width: 1000, height: 500, expectedWidth: 200 },
+        { name: 'Width cap', width: 120, expectedWidth: 120 },
+        { name: 'Height cap', height: 40, expectedWidth: 80 },
+        { name: 'Conflicting caps', width: 120, height: 40, expectedWidth: 80 },
+      ];
+      const payload = {
+        title: 'Synthetic image sizing regression',
+        content: '',
+        instanceId: '',
+        payload: {
+          metadata: { presentation, publication: false, show_toc: false },
+          blocks: [
+            ...blocks,
+            ...sizedCards.map(({ name, expectedWidth, ...dimensions }) => ({
+              type: 'card', title: name, media: { src: '/inline-Small.svg', alt: name, ...dimensions },
+            })),
+          ],
+        },
+      };
+      await page.route('**/inline-*.svg', route => {
+        const image = images.find(image => route.request().url().endsWith(`/inline-${image.name}.svg`))!;
+        return route.fulfill({
+          contentType: 'image/svg+xml',
+          body: `<svg xmlns="http://www.w3.org/2000/svg" width="${image.width}" height="${image.height}"><rect width="100%" height="100%" fill="#e0f2fe"/><rect x="1" y="1" width="${image.width - 2}" height="${image.height - 2}" fill="none" stroke="#0369a1"/><text x="12" y="30" fill="#0c4a6e">${image.name}: ${image.width} × ${image.height}</text></svg>`,
+        });
+      });
+      await page.route('**/standalone-assets/assets/*', route => {
+        const file = basename(new URL(route.request().url()).pathname);
+        return route.fulfill({ body: readFileSync(resolve(build, 'assets', file)), contentType: file.endsWith('.css') ? 'text/css' : file.endsWith('.woff2') ? 'font/woff2' : 'text/javascript' });
+      });
+      await page.route('**/inline-images', route => route.fulfill({
+        contentType: 'text/html; charset=utf-8',
+        body: `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${entry.css.map((file: string) => `<link rel="stylesheet" href="/standalone-assets/${file}">`).join('')}<style>#cognis-deliverable-root { max-width: 1000px; margin: auto; }</style></head><body><div id="cognis-deliverable-root"></div><template id="cognis-deliverable-payload">${JSON.stringify(payload)}</template><script type="module" src="/standalone-assets/${entry.file}"></script></body></html>`,
+      }));
+      await page.goto('/inline-images');
+      await expect(page.getByTestId('rich-deliverable')).toHaveAttribute('data-presentation', presentation);
+      for (const image of images) {
+        for (const surface of ['Figure', 'Gallery', 'Card', 'Linked', 'Leading', 'Background', 'Background linked', 'Visual', 'Hero']) {
+          const element = page.getByAltText(`${surface} ${image.name}`, { exact: true });
+          await element.scrollIntoViewIfNeeded();
+          await expect.poll(() => element.evaluate((node: HTMLImageElement) => node.complete && node.naturalWidth)).toBe(image.width);
+          const geometry = await element.evaluate((node: HTMLImageElement) => {
+            const box = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return {
+              width: box.width - parseFloat(style.borderLeftWidth) - parseFloat(style.borderRightWidth),
+              height: box.height - parseFloat(style.borderTopWidth) - parseFloat(style.borderBottomWidth),
+            };
+          });
+          expect(geometry.width).toBeGreaterThan(0);
+          expect(geometry.width).toBeLessThanOrEqual(image.width);
+          expect(geometry.height).toBeLessThanOrEqual(image.height);
+          expect(geometry.width / geometry.height).toBeCloseTo(image.width / image.height, 2);
+          if (image.name === 'Large') expect(geometry.width).toBeLessThan(image.width);
+          if (['Background', 'Background linked', 'Visual', 'Hero'].includes(surface)) {
+            const containment = await element.evaluate(node => {
+              const image = node.getBoundingClientRect();
+              const frame = node.closest('figure')!;
+              const owner = frame.closest('.rich-card, .rich-hero')!;
+              return [frame, owner].filter(container => container === frame
+                || ['hidden', 'clip'].includes(getComputedStyle(container).overflow)).flatMap(container => {
+                const bounds = container.getBoundingClientRect();
+                return image.left >= bounds.left - 1 && image.top >= bounds.top - 1
+                  && image.right <= bounds.right + 1 && image.bottom <= bounds.bottom + 1
+                  ? [] : [{ image: image.toJSON(), bounds: bounds.toJSON(), container: container.className }];
+              });
+            });
+            expect(containment, `${surface} ${image.name}`).toEqual([]);
+          }
+          if (surface === 'Background linked') {
+            const link = page.getByRole('link', { name: `${surface} ${image.name}`, exact: true });
+            await expect(link).toHaveAttribute('href', 'https://cognis.test/image');
+            await link.click({ trial: true });
+          }
+        }
+      }
+      for (const card of sizedCards) {
+        const image = page.getByAltText(card.name, { exact: true });
+        await image.scrollIntoViewIfNeeded();
+        const box = await image.boundingBox();
+        expect(box!.width).toBeCloseTo(card.expectedWidth, 0);
+        expect(box!.height).toBeCloseTo(card.expectedWidth / 2, 0);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+      for (const image of images.slice(0, 2)) {
+        const trigger = page.getByRole('button', { name: `Enlarge image: Figure ${image.name}`, exact: true });
+        await trigger.focus();
+        await page.keyboard.press('Enter');
+        const dialog = page.getByRole('dialog', { name: `Figure ${image.name}`, exact: true });
+        await expect(dialog).toBeVisible();
+        const fittedWidth = (await dialog.locator('img').boundingBox())!.width;
+        await dialog.getByRole('button', { name: 'Zoom in' }).click();
+        expect((await dialog.locator('img').boundingBox())!.width).toBe(Math.max(image.width, fittedWidth * 2));
+        await page.keyboard.press('Escape');
+        await expect(trigger).toBeFocused();
+      }
+      await page.getByAltText('Figure Portrait', { exact: true }).scrollIntoViewIfNeeded();
+      await page.evaluate(() => document.fonts.ready);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      if ((browserName === 'chromium' && width === 1440) || (browserName === 'webkit' && width === 390)) {
+        await page.screenshot({ path: testInfo.outputPath(`synthetic-${presentation}-${width}.png`) });
+      }
+      expect(errors).toEqual([]);
+    });
+    });
+  }
 }

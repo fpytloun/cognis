@@ -176,7 +176,7 @@
     requestAnimationFrame(() => {
       // A newer scroll write or user input supersedes this queued pin.
       if (viewportElement === viewport && generation === programmaticScrollGeneration
-        && (force || !userScrolledUp)) setProgrammaticScrollTop(viewport.scrollHeight);
+        && !userScrolledUp) setProgrammaticScrollTop(viewport.scrollHeight);
     });
   }
 

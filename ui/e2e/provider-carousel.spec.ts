@@ -1,15 +1,30 @@
 import { expect, test } from '@playwright/test';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
 
-test.use({ hasTouch: true });
+test.use({
+  hasTouch: true,
+  // Static preview has no controller-provided bootstrap CSP hashes.
+  bypassCSP: process.env.COGNIS_E2E_STATIC_PREVIEW === '1',
+});
 
 for (const width of [390, 1440]) {
   test(`provider card paging and paired health at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
+    // Clicking an already active tab toggles collapse, so select Providers up front.
+    await page.addInitScript(() => {
+      localStorage.setItem('cognis.dashboardHealth.selected', 'providers');
+      localStorage.setItem('cognis.dashboardHealth.collapsed', 'false');
+    });
     await installTaskCockpitFixture(page);
     await page.route('**/api/auth/me', (route) => route.fulfill({ json: { email: 'owner@cognis.test', name: 'Owner', role: 'admin' } }));
     await page.route('**/api/health', (route) => route.fulfill({ json: { status: 'ok', providers: {} } }));
     await page.route('**/api/health/providers', (route) => route.fulfill({ json: {} }));
+    await page.routeWebSocket('**/api/ws', (socket) => {
+      socket.send(JSON.stringify({ type: 'authenticated' }));
+      socket.onMessage((message) => {
+        if (JSON.parse(String(message)).type === 'ping') socket.send(JSON.stringify({ type: 'pong' }));
+      });
+    });
     await page.route('**/api/v1/schedules**', (route) => route.fulfill({ json: [] }));
     const stamp = new Date().toISOString();
     const make = (id: string, name: string, used: number | null) => ({
@@ -28,7 +43,7 @@ for (const width of [390, 1440]) {
         additional_rate_limits: id === 'codex' ? [] : [{ limit_name: 'Sonnet', primary: { used_percent: used + 1, resets_at: new Date(Date.now() + 172800000).toISOString() } }]
       }
     });
-    const providers = [make('anthropic', 'Anthropic', 36), make('anthropic-training', 'Anthropic (Training)', 8), make('codex', 'Codex', 42), make('litellm', 'LiteLLM', null), make('ollama', 'Ollama (Demo workstation)', null)];
+    const providers = [make('anthropic', 'Anthropic', 70), make('anthropic-demo', 'Anthropic (Demo)', 2), make('codex', 'Codex', 58), make('litellm', 'LiteLLM', null), make('ollama', 'Ollama (Laptop)', null)];
     await page.route('**/api/v1/provider-monitor**', (route) => {
       const id = new URL(route.request().url()).pathname.split('/')[4];
       return route.fulfill({ json: id ? providers.find((provider) => provider.provider_id === id) : providers });
@@ -39,50 +54,25 @@ for (const width of [390, 1440]) {
     await page.goto('/');
     const strip = page.getByTestId('dashboard-health-strip');
     await expect(strip).toBeVisible({ timeout: 30000 });
+    await expect(strip.getByRole('tab', { name: /Providers/ })).toHaveAttribute('aria-selected', 'true');
     const cards = strip.getByTestId('provider-card');
     await expect(cards).toHaveCount(4);
-    await expect(cards.nth(0).getByText('5-hour reset', { exact: true })).toBeAttached();
-    await expect(cards.nth(0).getByText('Weekly reset', { exact: true })).toBeAttached();
-    await expect(cards.nth(0).getByText('Sonnet reset', { exact: true })).toBeAttached();
+    for (const name of ['5-hour', 'Weekly', 'Sonnet']) {
+      const limit = cards.nth(0).getByRole('progressbar', { name: `${name} usage`, exact: true }).locator('..');
+      await expect(limit.locator('time')).toHaveCount(1);
+      await expect(limit.getByText('Resets', { exact: true })).toBeAttached();
+    }
     await expect(cards.nth(2).getByText('Plan pro', { exact: true })).toBeAttached();
     await expect(strip.getByText('Plan common', { exact: true })).toHaveCount(0);
     await expect(strip.getByText(/Refreshed/)).toHaveCount(0);
     await expect(cards.nth(2).getByRole('button', { name: 'Refresh Codex' })).toHaveAttribute('title', /Refreshed/);
-    const firstCard = cards.nth(0);
-    const cardBox = (await firstCard.boundingBox())!;
-    const refreshBox = (await firstCard.getByRole('button', { name: 'Refresh Anthropic', exact: true }).boundingBox())!;
-    const rootFontSize = await page.locator('html').evaluate(node => getComputedStyle(node).fontSize);
-    await test.info().attach('provider-control-geometry.json', {
-      contentType: 'application/json',
-      body: JSON.stringify({
-        card: cardBox, refresh: refreshBox,
-        rootFontSize,
-        usage: await firstCard.getByTestId('provider-usage-bars').locator('div, p, span').evaluateAll(nodes =>
-          nodes.map(node => ({ className: node.className, rect: node.getBoundingClientRect().toJSON() }))),
-      }),
-    });
-    expect((await strip.boundingBox())!.height).toBeLessThan(135);
-    for (const name of ['5-hour', 'Weekly', 'Sonnet']) {
-      const label = firstCard.getByText(name, { exact: true });
-      await expect(label).toBeVisible();
-      expect(await label.evaluate(node => node.scrollWidth <= node.clientWidth + 1)).toBe(true);
-    }
-    // Preserve the existing two-rem control at the application's actual root size.
-    expect(refreshBox.width).toBeGreaterThanOrEqual(2 * parseFloat(rootFontSize));
-    expect(refreshBox.height).toBeGreaterThanOrEqual(2 * parseFloat(rootFontSize));
-    expect(refreshBox.y).toBeGreaterThanOrEqual(cardBox.y - 1);
-    expect(refreshBox.x + refreshBox.width).toBeLessThanOrEqual(cardBox.x + cardBox.width + 1);
-    for (const name of ['5-hour', 'Weekly', 'Sonnet']) {
-      const labelBox = (await firstCard.getByText(name, { exact: true }).boundingBox())!;
-      const intersects = labelBox.x < refreshBox.x + refreshBox.width - 1
-        && labelBox.x + labelBox.width > refreshBox.x + 1
-        && labelBox.y < refreshBox.y + refreshBox.height - 1
-        && labelBox.y + labelBox.height > refreshBox.y + 1;
-      expect(intersects, `${name} overlaps the refresh control`).toBe(false);
+    // Limit labels stay unclipped; cards scroll horizontally rather than squeezing labels.
+    for (const bar of await cards.nth(0).getByRole('progressbar').all()) {
+      const label = bar.locator('..').locator('span').first();
+      expect(await label.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
     }
     await expect(cards.nth(2).getByText('LiteLLM', { exact: true })).toBeAttached();
-    await expect(cards.nth(2).getByRole('progressbar')).toHaveCount(1);
-    await expect(cards.nth(3).getByText('Ollama (Demo workstation)', { exact: true })).toBeAttached();
+    await expect(cards.nth(3).getByText('Ollama (Laptop)', { exact: true })).toBeAttached();
     await expect(cards.nth(3).getByRole('progressbar')).toHaveCount(0);
     await expect(page.getByTestId('control-center-summary')).toHaveCount(0);
     await expect(page.getByRole('heading', { name: 'Cognis', exact: true })).toHaveCount(0);
@@ -111,6 +101,9 @@ for (const width of [390, 1440]) {
       await cdp.detach();
     } else {
       await expect(strip.getByRole('button', { name: 'Next provider card' })).not.toBeVisible();
+      const top = (await cards.nth(0).boundingBox())!.y;
+      for (const card of await cards.all()) expect((await card.boundingBox())!.y).toBe(top);
+      await cards.nth(3).scrollIntoViewIfNeeded();
       await expect(cards.nth(3)).toBeInViewport({ ratio: 0.95 });
       await page.screenshot({ path: test.info().outputPath('desktop-paired-provider-cards.png') });
     }

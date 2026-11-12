@@ -31,6 +31,7 @@ describe('ConnectionBanner', () => {
     store.set({ level: 'unreachable', degraded: true, lastFailure: 'Request timed out after 30 seconds.', attempts: 0 });
     expect(await screen.findByText('Cognis is not responding. Retrying…')).toBeTruthy();
     expect(screen.getAllByTestId('connection-banner')).toHaveLength(1);
+    expect(screen.getByTestId('connection-banner').className).not.toContain('fixed');
 
     await fireEvent.click(screen.getByRole('button', { name: /retry/i }));
     expect(mocks.retry).toHaveBeenCalledTimes(1);
@@ -58,8 +59,11 @@ describe('ConnectionBanner', () => {
     store.set({ level: 'stalled', degraded: true, lastFailure: 'Failed to fetch', attempts: 4 });
     const expand = await screen.findByTestId('connection-banner-expand');
     expect(expand.getAttribute('aria-expanded')).toBe('false');
+    expect(expand.className).toContain('h-11');
+    expect(expand.className).toContain('w-11');
 
     await fireEvent.click(expand);
+    expect(expand.getAttribute('aria-expanded')).toBe('true');
     expect(screen.getByTestId('connection-banner-label').className).not.toContain('truncate');
     const details = screen.getByTestId('connection-banner-details').textContent ?? '';
     expect(details).toContain('Last error: Failed to fetch');

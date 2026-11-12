@@ -3,6 +3,8 @@
 
   import { keyboardAvoidance } from '$lib/actions/keyboard-avoidance';
   import ChatV2Composer from '$lib/components/chat-v2/ChatV2Composer.svelte';
+  import { getFeedbackContext, provideFeedbackContext } from '$lib/feedback/context';
+  import type { IncludedFeedback } from '$lib/feedback/types';
   import ProviderUnavailableNotices from '$lib/components/ProviderUnavailableNotices.svelte';
   import ConversationPendingInteractions from '$lib/components/chat-v2/ConversationPendingInteractions.svelte';
   import QueuedMessagesPanel from '$lib/components/chat-v2/QueuedMessagesPanel.svelte';
@@ -13,6 +15,7 @@
   import { DocumentDrafts } from '$lib/offline/document-drafts';
   import { conversationComposer } from '$lib/chat-v2/conversation-composer';
   import { sameSubmissionInput } from '$lib/chat-v2/submission-input';
+  import { COMPOSER_FEEDBACK_EVENT, type ComposerFeedbackDetail } from '$lib/feedback/staging';
   import { StaleDocumentError, documentCoordination } from '$lib/document-coordination';
   import { ComposerSubmission } from '$lib/chat-v2/composer-submission';
   import { hydrateComposer, selectLegacyInput, canSelectRecovery, type RecoveryScope, type LegacyComposerInput } from '$lib/chat-v2/composer-hydration';
@@ -39,7 +42,7 @@
    } from '$lib/chat-v2/unsent-recovery';
   import { conversationTimelineScope, type CommandV2Response, type QueueMessage, type QueueMutationResponse, type TimelineScope, type WorkstreamRef } from '$lib/chat-v2/types';
   import { handleClipboardFilePaste } from '$lib/clipboard';
-  import type { Agent, AttachmentRef, BackgroundWorkItem } from '$lib/types/api';
+  import type { Agent, AttachmentRef, BackgroundWorkItem, TaskDeliverableFreshness } from '$lib/types/api';
   import type { SendMessageV2Response } from '$lib/chat-v2/types';
   import type { TodoSnapshotItem } from '$lib/todos';
   import { directChildBackgroundWork, mergeCurrentCycleDelegations } from '$lib/ongoing-work';
@@ -91,11 +94,17 @@
     onCommandResponse,
     onRuntimeActiveChange,
     onInitialLoaded,
+    composerFocusRequest = null,
     timelineScope,
     controllerSessionIds = [],
     onViewSession,
     readOnly = false,
+    showLiveIndicator = true,
+    composerAriaLabel = 'Conversation message',
+    composerTestId = 'compact-chat-composer',
+    sendAriaLabel = 'Send message',
     stepRun = null,
+    deliverableFreshness,
     onOpenWork,
   } = $props<{
     conversationId: string;
@@ -108,14 +117,25 @@
     onCommandResponse?: (response: CommandV2Response) => void | Promise<void>;
     onRuntimeActiveChange?: (active: boolean) => void;
     onInitialLoaded?: () => void | Promise<void>;
+    composerFocusRequest?: string | null;
     timelineScope?: TimelineScope;
     controllerSessionIds?: string[];
     onViewSession?: (sessionId: string, node?: WorkstreamRef) => void;
     readOnly?: boolean;
+    showLiveIndicator?: boolean;
+    composerAriaLabel?: string;
+    composerTestId?: string;
+    sendAriaLabel?: string;
     stepRun?: import('$lib/types/api').StepRun | null;
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
     onOpenWork?: (category: import('$lib/chat-v2/types').WorkCategory, sessionId: string, path?: string, sourceItemId?: string) => void;
   }>();
 
+  const enclosingFeedback = getFeedbackContext();
+  provideFeedbackContext({ get context(): import('$lib/feedback/types').FeedbackContext {
+    return enclosingFeedback.context.kind === 'chat' ? enclosingFeedback.context
+      : { kind: 'chat', conversation_id: conversationId };
+  } });
   let message = $state('');
   let sending = $state(false);
   let error = $state('');
@@ -136,11 +156,12 @@
   let recoveryScope = $state.raw<RecoveryScope | null>(null);
   let hydratedScopeKey = '';
   let inputMode = $state<'default' | 'plan' | 'build' | null>(null);
+  let includedFeedback = $state<IncludedFeedback | null>(null);
   function editInput(): void { composerRevision++; inputRevision = crypto.randomUUID(); }
   function compositeInput() {
     return { input_revision: inputRevision, text: message,
       attachments: $state.snapshot(attachments) as AttachmentRef[],
-      chat_mode: inputMode };
+      chat_mode: inputMode, feedback: includedFeedback };
   }
   let activeConversationId = '';
   let userScrolledUp = $state(false);
@@ -273,6 +294,7 @@
     attachments = hydrated.input.attachments;
     inputRevision = hydrated.input.input_revision;
     inputMode = hydrated.input.chat_mode;
+    includedFeedback = hydrated.input.feedback ?? null;
     legacyCandidates = hydrated.legacy;
     recoveryScope = { conversationId: currentId, generation: scopeGeneration,
       lease: documentCoordination().capture(), candidates: legacyCandidates };
@@ -289,9 +311,26 @@
     return untrack(() => liveComposer.subscribe(id, (input) => {
       if (inputRevision === input.input_revision && sameSubmissionInput(compositeInput(), input)) return;
       message = input.text; attachments = input.attachments; inputMode = input.chat_mode;
+      includedFeedback = input.feedback ?? null;
       inputRevision = input.input_revision; composerRevision++;
       legacyRecovery = false; legacyCandidates = [];
     }));
+  });
+
+  // Comment inclusion changes only the feedback field; typed text stays as it is.
+  $effect(() => {
+    const id = conversationId;
+    if (!editableScope) return;
+    const apply = (event: Event) => {
+      const detail = (event as CustomEvent<ComposerFeedbackDetail>).detail;
+      if (detail.conversationId !== id || legacyRecovery) return;
+      event.preventDefault();
+      if (detail.expected !== undefined && includedFeedback?.creation_key !== detail.expected) return;
+      includedFeedback = detail.feedback;
+      editInput();
+    };
+    window.addEventListener(COMPOSER_FEEDBACK_EVENT, apply);
+    return () => window.removeEventListener(COMPOSER_FEEDBACK_EVENT, apply);
   });
 
   // Persist the composer's attachments with the active conversation's draft
@@ -367,7 +406,7 @@
   async function send(): Promise<void> {
     const submittedDraft = message;
     const content = message.trim();
-    if ((!content && attachments.length === 0) || sending || profileBusy || uploading) return;
+    if ((!content && attachments.length === 0 && !includedFeedback) || sending || profileBusy || uploading) return;
     const currentId = conversationId;
     const scopeKey = scope.key;
     const generation = ++sendGeneration;
@@ -379,12 +418,16 @@
       conversationId, generation: destroyed ? -1 : sendGeneration,
       draftKey, revision: composerRevision, text: message,
       attachments: $state.snapshot(attachments) as AttachmentRef[],
+      feedback: includedFeedback,
     });
     const submittedView = composerView();
     const sentAttachments = submittedView.attachments;
     commandResult = null;
     const normalized = normalizeChatComposerInput({ content });
     if (normalized.kind === 'command') {
+      if (submittedView.feedback) {
+        sending = false; error = 'Exclude included feedback before running a slash command.'; return;
+      }
       try {
         const result = await dispatchChatComposerMessage({ conversationId: currentId, content }, { outbox });
         if (generation !== sendGeneration || currentId !== conversationId) return;
@@ -420,6 +463,7 @@
       content: normalized.content,
       attachments: sentAttachments,
       chat_mode: normalized.chatMode ?? submittedView.chat_mode,
+      feedback: submittedView.feedback,
       status: 'pending',
       created_at: timestamp,
       updated_at: timestamp,
@@ -442,6 +486,7 @@
         message = '';
         attachments = [];
         inputMode = null;
+        includedFeedback = null;
         composerRevision += 1;
       });
     } catch (caught) {
@@ -470,6 +515,7 @@
   // dropping text typed since. Uses the latest stored copy so attachment
   // references resolved by the drain are kept.
   async function restoreUnsent(entry: OutboxEntry): Promise<void> {
+    if (entry.feedback) return; // Retain the immutable packet in its outbox; review explicitly.
     const latest = (await outbox.get(entry.client_txn_id).catch(() => null)) ?? entry;
     const text = composerTextForEntry(latest);
     const files = latest.attachments ?? [];
@@ -718,7 +764,6 @@
     }
     layoutObserver?.disconnect();
     if (typeof window !== 'undefined') window.removeEventListener('online', handleOnline);
-    onRuntimeActiveChange?.(false);
   });
 </script>
 
@@ -736,8 +781,10 @@
     {scope}
     {agent}
     {stepRun}
+    {deliverableFreshness}
     activityStatus={stepRun?.status ?? ''}
     hasEditableComposer={editableScope}
+    {showLiveIndicator}
     showQueuedMessages={false}
     showTodoDrawer={false}
     emptyLabel={emptyLabel}
@@ -802,14 +849,16 @@
         legacyCandidates = []; legacyRecovery = false; updateDraft();
       }} />
       <ChatV2Composer
+        focusRequest={composerFocusRequest}
+        feedback={includedFeedback}
         bind:value={() => message, (value) => { editInput(); message = value; }}
         bind:attachments={() => attachments, (value) => { editInput(); attachments = value; }}
         bind:textarea={composerTextarea}
         {conversationId}
         placeholder="Message"
-        ariaLabel="Conversation message"
-        textareaTestId="compact-chat-composer"
-        sendAriaLabel="Send message"
+         ariaLabel={composerAriaLabel}
+         textareaTestId={composerTestId}
+         {sendAriaLabel}
         stopAriaLabel="Stop active turn"
         busy={sending || profileBusy}
         {uploading}

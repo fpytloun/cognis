@@ -76,12 +76,12 @@
             "icon": "activity",
             "eyebrow": "Image-forward",
             "title": "Visual card with media",
-            "summary": "The image becomes a full-bleed background with a legibility gradient behind the title and summary.",
+            "summary": "The image appears behind the title and summary with a contrast overlay; it may be letterboxed.",
             "href": "https://example.org/fixture/visual",
             "media": {
               "artifact_id": "fixture-visual-system-card",
               "href": "/fixtures/daily-pulse-sample-town.svg",
-              "alt": "Abstract blue editorial illustration, full-bleed card variant",
+              "alt": "Abstract blue editorial illustration in a visual card",
               "credit": "Cognis fixture",
               "aspect_ratio": "16 / 7",
               "focal_point": "50% 50%"

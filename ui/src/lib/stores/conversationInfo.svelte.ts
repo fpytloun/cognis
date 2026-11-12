@@ -1,4 +1,4 @@
-export type ConversationInfoTab = 'overview' | 'work' | 'session';
+export type ConversationInfoTab = 'overview' | 'work' | 'session' | 'usage';
 export type ConversationInfoMode = ConversationInfoTab | 'context';
 export type ConversationInfoPresentation = 'closed' | 'pinned' | 'overlay' | 'focus';
 
@@ -41,7 +41,11 @@ class ConversationInfoDrawerState {
     this.persist();
   }
 
-  hydrate(): void {
+  /**
+   * Restore saved preferences. An open inspector is restored only where it can
+   * sit beside the chat; on a phone it would cover the conversation on load.
+   */
+  hydrate(restoreOpen = true): void {
     if (this.hydrated || typeof window === 'undefined') return;
     this.hydrated = true;
     try {
@@ -51,12 +55,14 @@ class ConversationInfoDrawerState {
         preferredPinned?: boolean;
         preferredWidth?: number;
       };
-      this.open = value.open === true;
-      this.tab = value.tab === 'work'
-        ? 'work'
-        : value.tab === 'session'
-          ? 'session'
-          : 'overview';
+      this.open = value.open === true && restoreOpen;
+      this.tab = value.tab === 'usage'
+        ? 'usage'
+        : value.tab === 'work'
+          ? 'work'
+          : value.tab === 'session'
+            ? 'session'
+            : 'overview';
       this.preferredPinned = value.preferredPinned !== false;
       if (Number.isFinite(value.preferredWidth)) {
         this.preferredWidth = value.preferredWidth === LEGACY_INSPECTOR_DEFAULT_WIDTH

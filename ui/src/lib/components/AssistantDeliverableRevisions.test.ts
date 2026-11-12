@@ -1,9 +1,12 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { AssistantDeliverableTimelineItem } from '$lib/chat-v2/types';
 import { observedLineageRevisions, observeLineageRevision } from '$lib/deliverable-revisions';
-import type { Deliverable, DeliverableRevisions } from '$lib/types/api';
+import type { Agent, Deliverable, DeliverableRevisions } from '$lib/types/api';
+import { formatAbsoluteTime, formatCompactTime } from '$lib/time';
+import { get } from 'svelte/store';
+import { now } from '$lib/stores/now';
 import AssistantDeliverableBlock from './AssistantDeliverableBlock.svelte';
 // Lazily imported by the component under test; load it during collection.
 import '$lib/components/rich/RichDeliverable.svelte';
@@ -89,6 +92,43 @@ describe('AssistantDeliverableBlock revisions', () => {
     observedLineageRevisions.set({});
   });
 
+  it('shows chat identity beside controls and retains the message date when browsing revisions', async () => {
+    const timestamp = '2026-11-03T10:00:00Z';
+    render(AssistantDeliverableBlock, {
+      item: { ...item('dlv-3'), created_at: timestamp },
+      agent: { name: 'laforge', display_name: 'LaForge', avatar_url: '/agent-avatar.png' } as Agent,
+      showMessageIdentity: true,
+    });
+    const footer = await screen.findByTestId('chat-document-footer');
+    const identity = within(footer).getByTestId('deliverable-message-identity');
+    expect(within(identity).getByRole('img', { name: 'LaForge' })).toHaveAttribute('src', '/agent-avatar.png');
+    expect(within(identity).getByText('LaForge')).toBeVisible();
+    expect(within(identity).getByTitle(formatAbsoluteTime(timestamp))).toHaveTextContent(formatCompactTime(timestamp, new Date(get(now))));
+    expect(within(footer).getByRole('navigation', { name: 'Document actions' })).toBeInTheDocument();
+    await fireEvent.click(await screen.findByTestId('deliverable-revision-toggle'));
+    const options = await screen.findAllByTestId('deliverable-revision-option');
+    await fireEvent.click(options[1]);
+    await waitFor(() => expect(screen.getByTestId('deliverable-revision-toggle')).toHaveTextContent('Revision 2 of 3'));
+    expect(within(screen.getByTestId('chat-document-footer')).getByTitle(formatAbsoluteTime(timestamp))).toBeVisible();
+  });
+
+  it('uses the render-model timestamp and assistant fallback without an agent', async () => {
+    const timestamp = '2026-11-02T09:00:00Z';
+    render(AssistantDeliverableBlock, {
+      item: { id: 'render-card', kind: 'assistant_deliverable', deliverableId: 'dlv-3', format: 'markdown', createdAt: timestamp },
+      showMessageIdentity: true,
+    });
+    const identity = await screen.findByTestId('deliverable-message-identity');
+    expect(within(identity).getByText('Assistant')).toBeVisible();
+    expect(within(identity).getByTitle(formatAbsoluteTime(timestamp))).toBeVisible();
+  });
+
+  it('does not add chat identity to non-chat document entry points', async () => {
+    render(AssistantDeliverableBlock, { item: item('dlv-3') });
+    await screen.findByTestId('chat-document-footer');
+    expect(screen.queryByTestId('deliverable-message-identity')).not.toBeInTheDocument();
+  });
+
   it('marks a mounted card superseded when a newer revision of its lineage appears', async () => {
     const solo = { lineage_id: 'dlv-1', latest_deliverable_id: 'dlv-1', latest_revision: 1, revision_count: 1, is_latest: true };
     mocks.get.mockResolvedValueOnce(revision('dlv-1', 1, solo));
@@ -103,15 +143,15 @@ describe('AssistantDeliverableBlock revisions', () => {
     expect(await screen.findByTestId('deliverable-superseded-notice')).toHaveTextContent('Superseded by revision 2');
     expect(mocks.get).toHaveBeenCalledTimes(2);
     // The mounted original collapses once it becomes superseded.
-    expect(await screen.findByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
+    await waitFor(() => expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull());
+    expect(screen.getByRole('button', { name: 'Open fullscreen' })).toBeVisible();
   });
 
   it('marks an older card as superseded and opens the latest revision in place', async () => {
     render(AssistantDeliverableBlock, { item: item('dlv-1') });
 
     expect(await screen.findByTestId('deliverable-superseded-notice')).toHaveTextContent('Superseded by revision 3');
-    expect(screen.getByTestId('deliverable-revision-toggle')).toHaveTextContent('Revision 1 of 3');
+    expect(await screen.findByTestId('deliverable-revision-toggle')).toHaveTextContent('Revision 1 of 3');
 
     await fireEvent.click(screen.getByTestId('deliverable-view-latest'));
 
@@ -148,5 +188,31 @@ describe('AssistantDeliverableBlock revisions', () => {
     expect(await screen.findByText('Body of revision 1')).toBeInTheDocument();
     expect(screen.queryByTestId('deliverable-revision-bar')).not.toBeInTheDocument();
     expect(mocks.revisions).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps the picker and selected revision in chat fullscreen (fullscreenOnly=%s)', async fullscreenOnly => {
+    render(AssistantDeliverableBlock, { item: item('dlv-3'), fullscreenOnly });
+    if (!fullscreenOnly) {
+      const open = await screen.findByRole('button', { name: 'Open fullscreen' });
+      open.focus();
+      await fireEvent.click(open);
+    }
+    await waitFor(() => expect(screen.getByRole('dialog', { name: 'Report' })).not.toHaveClass('fullscreen-pending'));
+    const dialog = screen.getByRole('dialog', { name: 'Report' });
+    const toggle = await within(dialog).findByTestId('deliverable-revision-toggle');
+    expect(toggle.closest('.chat-document-more')).toBeNull();
+    await fireEvent.click(toggle);
+    const options = await within(dialog).findAllByTestId('deliverable-revision-option');
+    await fireEvent.click(options[1]);
+    await waitFor(() => expect(within(screen.getByRole('dialog', { name: 'Report' })).getByTestId('deliverable-revision-toggle')).toHaveTextContent('Revision 2 of 3'));
+    expect(within(screen.getByRole('dialog', { name: 'Report' })).getByText('Body of revision 2')).toBeInTheDocument();
+    await fireEvent.click(within(screen.getByRole('dialog', { name: 'Report' })).getByTestId('deliverable-revision-toggle'));
+    await within(screen.getByRole('dialog', { name: 'Report' })).findAllByTestId('deliverable-revision-option');
+    await fireEvent.keyDown(within(screen.getByRole('dialog', { name: 'Report' })).getByTestId('deliverable-revision-toggle'), { key: 'Escape' });
+    expect(screen.getByRole('dialog', { name: 'Report' })).toBeInTheDocument();
+    if (!fullscreenOnly) {
+      await fireEvent.click(within(screen.getByRole('dialog', { name: 'Report' })).getByRole('button', { name: 'Close' }));
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Open fullscreen' })).toHaveFocus());
+    }
   });
 });

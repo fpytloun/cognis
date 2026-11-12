@@ -27,6 +27,12 @@ describe('docs-registry (metadata only)', () => {
     expect(getDocHref('getting-started')).toBe('/docs/getting-started');
   });
 
+  it('registers Work Feedback in onboarding and related navigation', () => {
+    expect(getDocMeta('work-feedback')?.sourcePath).toBe('docs/guide/work-feedback.md');
+    expect(getOnboardingDocsMeta().some((doc) => doc.slug === 'work-feedback')).toBe(true);
+    expect(getRelatedDocsMeta(getDocMeta('using-chat')!).some((doc) => doc.slug === 'work-feedback')).toBe(true);
+  });
+
   it('getDocMeta returns null for an unknown slug', () => {
     expect(getDocMeta('no-such-doc')).toBeNull();
   });

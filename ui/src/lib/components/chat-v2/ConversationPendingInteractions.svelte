@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
+  import PendingRequestPanel from '$lib/components/PendingRequestPanel.svelte';
   import AttentionPanel from '$lib/components/task-cockpit/AttentionPanel.svelte';
   import { wsClient, wsState } from '$lib/ws/client';
   import type {
@@ -14,10 +15,14 @@
   } from '$lib/types/api';
 
   let {
-    conversationId,
+    conversationId = null,
+    taskId = null,
+    notificationTypes = null,
     presentation = 'regular',
   } = $props<{
-    conversationId: string;
+    conversationId?: string | null;
+    taskId?: string | null;
+    notificationTypes?: string[] | null;
     presentation?: 'regular' | 'floating';
   }>();
   const floating = $derived(presentation === 'floating');
@@ -37,7 +42,9 @@
   let alive = true;
   let readController: AbortController | null = null;
 
-  const pending = $derived(notifications.filter((item) => item.status === 'pending'));
+  const pending = $derived(notifications.filter((item) =>
+    item.status === 'pending' && (!notificationTypes || notificationTypes.includes(item.notification_type))
+  ));
   const escalationNotification = $derived(pending.find((item) => item.notification_type === 'escalation') ?? null);
   const credentialRequest = $derived(pending.find((item) => item.notification_type === 'credential_request') ?? null);
   const inputRequest = $derived(pending.find((item) => ['gate', 'step_question', 'auth_challenge'].includes(item.notification_type)) ?? null);
@@ -122,24 +129,30 @@
     };
   });
 
+  const hasPendingRequests = $derived(Boolean(
+    (escalation && escalationNotification) || credentialRequest || (inputPause && inputRequest)
+  ));
+
   async function refresh(): Promise<void> {
     if (!alive) return;
-    const currentId = conversationId;
+    const currentId = taskId ?? conversationId;
     const requestGeneration = ++generation;
     readController?.abort();
     const controller = new AbortController();
     readController = controller;
     try {
-      const next = await api.notifications.list(currentId, { signal: controller.signal });
-      if (requestGeneration !== generation || currentId !== conversationId) return;
+      const next = taskId
+        ? await api.notifications.list(null, { signal: controller.signal, taskId })
+        : await api.notifications.list(conversationId, { signal: controller.signal });
+      if (requestGeneration !== generation || currentId !== (taskId ?? conversationId)) return;
       notifications = next;
       error = '';
     } catch (caught) {
-      if (controller.signal.aborted || requestGeneration !== generation || currentId !== conversationId) return;
+      if (controller.signal.aborted || requestGeneration !== generation || currentId !== (taskId ?? conversationId)) return;
       error = asApiError(caught).message;
     } finally {
       if (readController === controller) readController = null;
-      if (requestGeneration === generation && currentId === conversationId) loading = false;
+      if (requestGeneration === generation && currentId === (taskId ?? conversationId)) loading = false;
     }
   }
 
@@ -153,9 +166,11 @@
 
   function eventMatchesConversation(event: {
     conversation_id?: unknown;
+    task_id?: unknown;
     managed_origin_conversation_id?: unknown;
     payload?: unknown;
   }): boolean {
+    if (taskId) return event.task_id === taskId;
     if (event.conversation_id === conversationId) return true;
     if (event.managed_origin_conversation_id === conversationId) return true;
     if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
@@ -196,7 +211,7 @@
   }
 
   $effect(() => {
-    const currentId = conversationId;
+    const currentId = taskId ?? conversationId;
     loading = true;
     notifications = [];
     error = '';
@@ -212,9 +227,11 @@
   const unsubscribe = wsClient.subscribe((event) => {
     const candidate = event as typeof event & {
       conversation_id?: string;
+      task_id?: string;
       managed_origin_conversation_id?: string;
       payload?: unknown;
       reason?: string;
+      notification_id?: string;
     };
     const interactionEvents = new Set([
       'escalation',
@@ -232,8 +249,18 @@
       interactionEvents.has(candidate.type)
       && eventMatchesConversation(candidate)
     ) {
+      if (candidate.type.endsWith('_resolved') && candidate.notification_id) {
+        // Retire reads taken before the decision; they cannot resurrect its form.
+        generation += 1;
+        readController?.abort();
+        notifications = notifications.filter(item => item.notification_id !== candidate.notification_id);
+      }
       scheduleRefresh();
     }
+    if (
+      ['conversation_state_delta', 'conversation_runtime_snapshot', 'sidebar_conversation_upsert'].includes(candidate.type)
+      && eventMatchesConversation(candidate)
+    ) scheduleRefresh();
     if (
       candidate.type === 'scope_invalidated'
       && candidate.reason === 'notification_state_changed'
@@ -249,6 +276,15 @@
     connectionStateInitialized = true;
   });
   const clock = setInterval(() => { secondsNow = Date.now(); }, 1000);
+  onMount(() => {
+    const refreshVisible = () => { if (document.visibilityState === 'visible') scheduleRefresh(); };
+    window.addEventListener('focus', refreshVisible);
+    document.addEventListener('visibilitychange', refreshVisible);
+    return () => {
+      window.removeEventListener('focus', refreshVisible);
+      document.removeEventListener('visibilitychange', refreshVisible);
+    };
+  });
 
   onDestroy(() => {
     alive = false;
@@ -266,7 +302,7 @@
   <div class={passiveClass} data-presentation={presentation} data-testid="pending-interactions-loading">
     Loading pending requests…
   </div>
-{:else if error && pending.length === 0}
+{:else if error && !hasPendingRequests}
   <div
     class={floating
       ? 'pointer-events-auto rounded-2xl border border-danger-border bg-elevated px-4 py-3 text-xs text-danger shadow-2xl'
@@ -277,12 +313,12 @@
     {error}
     <button class="ml-2 underline" type="button" onclick={() => void refresh()}>Retry</button>
   </div>
-{:else if pending.length > 0}
+{:else if hasPendingRequests}
   <section
     class={floating
       ? 'pointer-events-auto max-h-full space-y-3 overflow-y-auto overscroll-contain rounded-2xl border border-control-border bg-elevated p-3 shadow-2xl'
       : 'max-h-[45%] shrink-0 space-y-3 overflow-y-auto border-t border-separator bg-chrome/90 p-3'}
-    aria-label="Pending conversation requests"
+    aria-label={taskId ? 'Pending task requests' : 'Pending conversation requests'}
     data-presentation={presentation}
     data-testid="pending-conversation-interactions"
   >
@@ -322,6 +358,7 @@
             </div>
           </article>
         {:else}
+          <PendingRequestPanel id={`pending-input-${inputRequest.notification_id}`} title={inputRequest.notification_type === 'auth_challenge' ? 'Authentication required' : inputPause.pause_type === 'gate' ? 'Decision required' : 'Assistant requested more input'}>
           <AttentionPanel
             pause={inputPause}
             compact
@@ -329,6 +366,7 @@
             onGate={(action, instruction) => resolve(inputRequest, { decision: action, feedback: instruction })}
             onQuestion={answerQuestions}
           />
+          </PendingRequestPanel>
         {/if}
       {/key}
     {/if}

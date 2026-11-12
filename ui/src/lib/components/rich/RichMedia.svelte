@@ -28,6 +28,8 @@
     ? String(record.focal_point ?? record.focalPoint) : 'center';
   $: width = Number.isInteger(Number(record.width)) && Number(record.width) > 0 ? Number(record.width) : undefined;
   $: height = Number.isInteger(Number(record.height)) && Number(record.height) > 0 ? Number(record.height) : undefined;
+  // Hero and visual-card owners supply the overlay frame's dimensions.
+  $: frameRatio = placement === 'background' && !placementOverride ? aspectRatio : undefined;
   // Bindable so callers that build a media-driven layout (e.g. CardBlock's
   // `visual` variant overlay) can detect a broken image after the fact and
   // fall back to their normal non-media layout instead of leaving an
@@ -47,7 +49,9 @@
     class:leading={placement === 'leading'}
     class:background={placement === 'background'}
     class="rich-media"
-    style:aspect-ratio={aspectRatio}
+    style:aspect-ratio={frameRatio}
+    style:--rich-image-max-width={width ? `${width}px` : undefined}
+    style:--rich-image-max-height={height ? `${height}px` : undefined}
     data-rich-media-placement={placement}
   >
     {#if href}
@@ -85,8 +89,25 @@
     opacity: .82;
   }
 
-  .rich-media :global(a) { display: block; height: 100%; }
-  .rich-media img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  .rich-media :global(a) { display: block; max-width: 100%; }
+  .rich-media img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: min(100%, var(--rich-image-max-width, 100%));
+    max-height: var(--rich-image-max-height, none);
+    object-fit: contain;
+  }
+  .rich-media.background :global(a) {
+    position: absolute;
+    inset: 0;
+  }
+  .rich-media.background img {
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    max-height: min(100%, var(--rich-image-max-height, 100%));
+  }
   .rich-media figcaption {
     position: absolute;
     right: .55rem;

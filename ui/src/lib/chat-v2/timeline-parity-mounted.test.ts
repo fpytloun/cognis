@@ -1,7 +1,10 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { tick } from 'svelte';
 import 'fake-indexeddb/auto';
+import { ProfileIntentStore } from '$lib/profile-intent';
+
+const fixtureProfileIntents = new Map<string, unknown>();
 
 const fixture = vi.hoisted(() => ({
   owner: 'mounted-timeline-fixture' as string | null,
@@ -73,6 +76,11 @@ vi.mock('$lib/offline/cache', async (importOriginal) => {
 });
 
 import FullChat from '../../routes/(app)/chat/[conversationId]/+page.svelte';
+import CompactConversationChat from '$lib/components/chat-v2/CompactConversationChat.svelte';
+import { conversationComposer } from './conversation-composer';
+import { conversationFeedback } from '$lib/feedback/staging';
+import { feedbackApi } from '$lib/feedback/api';
+import type { FeedbackEntryVersion, FeedbackPreflight, FeedbackStagingSnapshot } from '$lib/feedback/types';
 import ScopedChatV2Timeline from '$lib/components/chat-v2/ScopedChatV2Timeline.svelte';
 import { api } from '$lib/api/client';
 import { documentCoordination } from '$lib/document-coordination';
@@ -91,8 +99,13 @@ import { acquireTimeline, clearTimelineMemory, peekTimeline, timelineResourceCou
 import { conversationTimelineScope, type ChatSnapshot } from './types';
 
 const scope = conversationTimelineScope(fixture.conversationId);
+// These cases mount real full/scoped trees and complete several independently
+// bounded hydration/history phases. Their aggregate scenario budget is not a
+// UI latency assertion.
+const MOUNTED_SCENARIO_TIMEOUT_MS = 20_000;
 const outboxFailures: unknown[] = [];
 const pendingOutboxWork = new Set<Promise<unknown>>();
+const mountedDrafts = new Set<DocumentDrafts>();
 
 function trackOutboxWork<T>(operation: Promise<T>): Promise<T> {
   pendingOutboxWork.add(operation);
@@ -113,13 +126,18 @@ function deferred<T>() {
 }
 
 async function settleFixtureOutboxWork(): Promise<void> {
-  // Mounting full chat starts real coordinated IndexedDB reads and a chained
-  // drain. Keep the synthetic owner and mocks alive until both have settled;
-  // otherwise the next test's beginLogin revokes the previous read's lease.
+  // Composer writes and outbox reads share document authority. Keep their owner
+  // and mocks alive until both settle, before the next test's beginLogin.
+  let drafts: DocumentDrafts[];
+  let writes: Promise<void>[];
   do {
-    await Promise.all([...pendingOutboxWork]);
+    drafts = [...mountedDrafts];
+    writes = drafts.map(draft => draft.settled());
+    await Promise.all(writes);
+    await Promise.allSettled([...pendingOutboxWork]);
     await tick();
-  } while (pendingOutboxWork.size > 0);
+  } while (pendingOutboxWork.size > 0 || mountedDrafts.size !== drafts.length
+    || drafts.some((draft, index) => draft.settled() !== writes[index]));
   expect(outboxFailures).toEqual([]);
 }
 const conversation = {
@@ -149,6 +167,122 @@ function historyRow(i: number) {
 }
 
 describe('mounted full and embedded timeline parity (synthetic local data only)', () => {
+  it.each(['main', 'compact'] as const)(
+    'binds reviewed feedback after delayed hydration and preserves full input across %s conversation switches',
+    async surface => {
+      vi.stubGlobal('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
+      // Later tests must not inherit a motion-enabled matchMedia that jsdom cannot animate.
+      onTestFinished(() => { vi.unstubAllGlobals(); });
+      const id = fixture.conversationId, otherId = 'mounted-other-feedback';
+      const subject = crypto.randomUUID();
+      const entries: FeedbackEntryVersion[] = Array.from({ length: 3 }, (_, index) => ({
+        entry_id: crypto.randomUUID(), entry_version_id: crypto.randomUUID(), version: 1,
+        thread_id: crypto.randomUUID(), body: `Exact mounted feedback ${index}`,
+        author: { kind: 'verified_user', label: 'Reviewer', is_self: true }, audience: 'private',
+        reply_to_entry_id: null, created_at: '2026-01-01T00:00:00Z', delivery: [],
+      }));
+      const staging: FeedbackStagingSnapshot = { conversation_id: id, version: 1, receipts: [],
+        items: entries.map(entry => ({ entry_id: entry.entry_id, entry_version_id: entry.entry_version_id,
+          staging_version: 1, inclusion: 'prepared', subject_id: subject, anchor_id: crypto.randomUUID() })) };
+      const packet: FeedbackPreflight = {
+        preflight_id: crypto.randomUUID(), manifest_hash: 'c'.repeat(64), expires_at: '2099-01-01T00:00:00Z',
+        destination: { kind: 'origin_chat', conversation_id: id }, update_mode: 'revise_source',
+        selection: [], source_summaries: [], warnings: [], task_consequences: null,
+        context_items: [{ role: 'instruction', entry: entries[0], anchor: {
+          schema_version: 1, anchor_id: staging.items[0].anchor_id,
+          source: { kind: 'document', content_ref: 'art_mounted_feedback' },
+          content_digest: 'd'.repeat(64), locator: { kind: 'whole' },
+        } }],
+      };
+      vi.spyOn(feedbackApi, 'staging').mockImplementation(async asked => structuredClone(asked === id
+        ? staging : { conversation_id: asked, version: 1, receipts: [], items: [] }));
+      vi.spyOn(feedbackApi, 'threads').mockResolvedValue({
+        items: entries.map(entry => ({
+          thread_id: entry.thread_id, state: 'open', entries: [entry],
+          anchor: packet.context_items[0].anchor,
+        })), next_cursor: null,
+      } as never);
+      vi.spyOn(feedbackApi, 'stage').mockImplementation(async (_id, entryId, request) => {
+        const item = staging.items.find(item => item.entry_id === entryId)!;
+        expect(request.expected_version).toBe(item.staging_version);
+        Object.assign(item, { staging_version: item.staging_version + 1, inclusion: request.inclusion });
+        return structuredClone(item);
+      });
+      vi.spyOn(feedbackApi, 'preflight').mockImplementation(async request => ({
+        ...packet, selection: structuredClone(request.selection),
+      }));
+      const composer = conversationComposer();
+      const attachments = [{ artifact_id: 'art_mounted_attachment', filename: 'retained.png',
+        mime_type: 'image/png', kind: 'image' as const, size_bytes: 1 }];
+      composer.update(id, { text: 'Retained instruction', attachments, chat_mode: 'plan',
+        input_revision: crypto.randomUUID() });
+      composer.update(otherId, { text: 'Other conversation draft', attachments: [],
+        chat_mode: 'build', input_revision: crypto.randomUUID() });
+      const stop = vi.fn();
+      const subscribe = composer.subscribe.bind(composer);
+      vi.spyOn(composer, 'subscribe').mockImplementation((conversationId, listener) => {
+        const unsubscribe = subscribe(conversationId, listener);
+        return () => { stop(conversationId); unsubscribe(); };
+      });
+      const detail = deferred<typeof conversation>();
+      let firstDetail = true;
+      vi.mocked(api.conversations.detail).mockImplementation(async asked => {
+        if (asked === id && firstDetail) { firstDetail = false; return detail.promise as never; }
+        return { ...conversation, conversation_id: asked } as never;
+      });
+      vi.mocked(chatV2Api.snapshot).mockImplementation(async requested => {
+        const target = typeof requested === 'string' ? conversationTimelineScope(requested) : requested;
+        return { ...snapshot(), scope: target, conversation: { ...conversation, conversation_id: target.conversation_id! } };
+      });
+      const mainView = surface === 'main' ? render(FullChat) : null;
+      const compactView = surface === 'compact' ? render(CompactConversationChat, { conversationId: id, agent: agent as never }) : null;
+      const view = mainView ?? compactView!;
+      await tick();
+      detail.resolve(conversation);
+      const label = surface === 'main' ? 'Chat message' : 'Conversation message';
+      await waitFor(() => expect(screen.getByRole('textbox', { name: label })).toHaveValue('Retained instruction'));
+      const tray = () => within(screen.getByRole('group', { name: 'Message feedback' }));
+      await tray().findByRole('button', { name: 'Add 3 comments to message' });
+      // The main chat chooses in its Comments panel; the compact chat opens a small list above the composer.
+      await fireEvent.click(tray().getByRole('button', { name: 'Choose comments' }));
+      // The list loads lazily (its module and every staged thread), which can exceed the default wait under load.
+      await fireEvent.click(await screen.findByRole('checkbox', { name: /Exact mounted feedback 0/ }, { timeout: 5000 }));
+      await tray().findByRole('button', { name: 'Comments in message: 1' }, { timeout: 5000 });
+      expect(tray().getByRole('button', { name: 'Add 2 comments to message' })).toBeVisible();
+      const included = composer.hydrate(id).input;
+      expect(included).toMatchObject({ text: 'Retained instruction', attachments, chat_mode: 'plan',
+        feedback: { manifest_hash: packet.manifest_hash, preflight_id: packet.preflight_id } });
+      expect(conversationFeedback(id).review(included.feedback!)?.selection).toEqual([
+        { entry_version_id: entries[0].entry_version_id, expected_entry_version: 1, staging_version: 2 },
+      ]);
+      await fireEvent.input(screen.getByRole('textbox', { name: label }), { target: { value: 'Later typed instruction' } });
+      await waitFor(() => expect(hydrateComposer(new DocumentDrafts(), id).input).toMatchObject({
+        text: 'Later typed instruction', attachments, chat_mode: 'plan', feedback: included.feedback,
+      }));
+      if (surface === 'main') fixture.navigate(otherId);
+      else await compactView!.rerender({ conversationId: otherId, agent: agent as never });
+      await waitFor(() => expect(screen.getByRole('textbox', { name: label })).toHaveValue('Other conversation draft'));
+      expect(stop).toHaveBeenCalledWith(id);
+      composer.update(id, { ...composer.hydrate(id).input, text: 'Late update to inactive conversation',
+        input_revision: crypto.randomUUID() });
+      await tick();
+      expect(screen.getByRole('textbox', { name: label })).toHaveValue('Other conversation draft');
+      // The other conversation never shows this conversation's attached feedback.
+      expect(screen.queryByText(/attached to your next message/)).toBeNull();
+      if (surface === 'main') fixture.navigate(id);
+      else await compactView!.rerender({ conversationId: id, agent: agent as never });
+      await waitFor(() => expect(screen.getByRole('textbox', { name: label })).toHaveValue('Late update to inactive conversation'));
+      await tray().findByRole('button', { name: 'Comments in message: 1' });
+      expect(composer.hydrate(id).input).toMatchObject({ attachments, chat_mode: 'plan', feedback: included.feedback });
+      view.unmount();
+      expect(stop).toHaveBeenCalledWith(otherId);
+      await settleFixtureOutboxWork();
+      await documentCoordination().beginLogin();
+      expect(() => composer.update(id, included)).toThrow();
+    },
+    MOUNTED_SCENARIO_TIMEOUT_MS,
+  );
+
   it('renders sessionless metadata before a runtime model selection is available', async () => {
     expect(conversation).not.toHaveProperty('active_session_id');
     expect(snapshot().runtime).toBeNull();
@@ -177,11 +311,11 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     expect(screen.queryByTestId('timeline-diagnostic-export')).toBeNull();
     await fireEvent.click(screen.getByRole('tab', { name: /^Session$/ }));
     const runtimeDetails = await screen.findByTestId('session-details-diagnostics');
-    const diagnostics = within(runtimeDetails).getByTestId('timeline-diagnostic-export');
+    const diagnostics = await within(runtimeDetails).findByTestId('timeline-diagnostic-export');
     expect(runtimeDetails).not.toHaveAttribute('open');
     expect(runtimeDetails.lastElementChild).toBe(diagnostics);
     await fireEvent.click(runtimeDetails.querySelector('summary')!);
-    expect(within(diagnostics).getByRole('button', { name: 'Download chat diagnostics' })).toBeEnabled();
+    await waitFor(() => expect(within(diagnostics).getByRole('button', { name: 'Download chat diagnostics' })).toBeEnabled());
     await fireEvent.click(screen.getByRole('tab', { name: /^Overview$/ }));
     expect(screen.queryByTestId('timeline-diagnostic-export')).toBeNull();
     full.unmount();
@@ -293,6 +427,11 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     const keys = () => [...viewport.querySelectorAll<HTMLElement>('[data-timeline-row-key]')].map(e => e.dataset.timelineRowKey);
     const before = keys();
     if (hidden) {
+      vi.spyOn(api.sessions, 'detail').mockResolvedValue({
+        session_id: 'synthetic-child-session', conversation_id: fixture.conversationId,
+        intaris_session_id: null, agent_id: agent.agent_id, status: 'completed',
+        delegation_mode: 'agent', delegation_task: 'Synthetic child hook', activity_scope_id: null,
+      } as never);
       const hook = full.container.querySelector<HTMLElement>('[aria-label="Background hook"]')!;
       await fireEvent.click(within(hook).getByRole('button', { name: 'Expand' }));
       await fireEvent.click(within(hook).getByRole('button', { name: 'Open session' }));
@@ -301,6 +440,7 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     const lease = acquireTimeline(scope);
     try {
       const scopedViewport = scoped.container.querySelector<HTMLElement>('[data-testid="scoped-timeline-viewport"]')!;
+      await waitFor(() => expect(scopedViewport.classList.contains('invisible')).toBe(false));
       for (let page = 1; page <= 2; page++) {
         await fireEvent.wheel(scopedViewport, { deltaY: -100 });
         await waitFor(() => expect(chatV2Api.timeline).toHaveBeenCalledTimes(page));
@@ -336,7 +476,7 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
       scoped.unmount();
       await new Promise(resolve => setTimeout(resolve, 60));
     }
-  });
+  }, MOUNTED_SCENARIO_TIMEOUT_MS);
 
   it('propagates mounted live replacements alternating older pages and survives the first view teardown', async () => {
     const listeners = new Set<Parameters<typeof wsClient.subscribe>[0]>();
@@ -416,7 +556,7 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     const viewport = full.container.querySelector<HTMLElement>('[data-testid="timeline-viewport"]')!;
     Object.defineProperty(viewport, 'scrollHeight', { configurable: true, value: 20_000 });
     Object.defineProperty(viewport, 'clientHeight', { configurable: true, value: 600 });
-    await new Promise(resolve => setTimeout(resolve, 250));
+    await settleFixtureOutboxWork();
     vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
     viewport.scrollTop = 0;
     await fireEvent.wheel(viewport, { deltaY: -100 });
@@ -440,13 +580,26 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
       await waitFor(() => expect(chatV2Api.timeline).toHaveBeenCalledOnce());
       await waitFor(() => expect(full.container.textContent).toContain('Synthetic history row -1'));
     } finally {
-      lease.release();
-      full.unmount();
+      try {
+        await settleFixtureOutboxWork();
+      } finally {
+        lease.release();
+        full.unmount();
+      }
     }
-  });
+  }, MOUNTED_SCENARIO_TIMEOUT_MS);
 
   beforeEach(async () => {
     expect(pendingOutboxWork.size).toBe(0);
+    expect(mountedDrafts.size).toBe(0);
+    // Keep the coordinator's file-lifetime metadata without JSDOM storage deadlines.
+    // Real coordination, epoch validation and outbox persistence remain in use.
+    vi.spyOn(ProfileIntentStore.prototype, 'transact').mockImplementation(async (profile, change) => {
+      const raw = structuredClone(fixtureProfileIntents.get(profile));
+      const result = change(raw);
+      if (result !== raw) fixtureProfileIntents.set(profile, structuredClone(result));
+      return result;
+    });
     clearTimelineMemory();
     fixture.realCache = false;
     fixture.navigate(fixture.conversationId);
@@ -466,6 +619,13 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     vi.stubGlobal('IntersectionObserver', class { observe() {} unobserve() {} disconnect() {} });
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callback(0); return 1; });
     vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    const readComposite = DocumentDrafts.prototype.readComposite;
+    vi.spyOn(DocumentDrafts.prototype, 'readComposite').mockImplementation(function (
+      this: DocumentDrafts, ...args: Parameters<typeof readComposite>
+    ) {
+      mountedDrafts.add(this);
+      return readComposite.apply(this, args);
+    });
     vi.spyOn(api.conversations, 'detail').mockResolvedValue(conversation as never);
     vi.spyOn(api.conversations, 'sessions').mockResolvedValue([]);
     vi.spyOn(api.conversations, 'sidebar').mockResolvedValue({
@@ -488,6 +648,9 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
       reset_required: false, server_time: '2026-01-01T00:00:00Z',
     }));
     vi.spyOn(chatV2Api, 'timeline').mockRejectedValue(new Error('No history page expected'));
+    // Synthetic rows have no durable receipts. Keep this new optional REST
+    // operation local, like the fixture's snapshot/sync/backfill operations.
+    vi.spyOn(chatV2Api, 'messageAdmission').mockRejectedValue(new Error('No synthetic admission receipt'));
     const read = CoordinatedOutbox.prototype.list;
     vi.spyOn(CoordinatedOutbox.prototype, 'list').mockImplementation(function (this: CoordinatedOutbox, id?: string) {
       return trackOutboxWork(read.call(this, id));
@@ -723,10 +886,15 @@ describe('mounted full and embedded timeline parity (synthetic local data only)'
     }
   });
   afterEach(async () => {
-    cleanup();
     try {
-      await settleFixtureOutboxWork();
+      try {
+        await settleFixtureOutboxWork();
+      } finally {
+        cleanup();
+        await settleFixtureOutboxWork();
+      }
     } finally {
+      mountedDrafts.clear();
       clearTimelineMemory();
       vi.restoreAllMocks();
       vi.unstubAllGlobals();

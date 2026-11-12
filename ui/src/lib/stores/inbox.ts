@@ -35,7 +35,9 @@ export async function refreshInbox(append = false, notify = false): Promise<void
     const seen = new Set(previous.items.map((item) => item.notification_id));
     if (notify && document.visibilityState === 'visible' && document.hasFocus()) {
       const fresh = page.items.filter((item) => !item.read_at && !seen.has(item.notification_id));
-      if (fresh.length) addToast(fresh[0].body, 'info', 6000, fresh.length > 1 ? `${fresh.length} new notifications` : fresh[0].title);
+      // Toasts carry the short title and a link; the full text stays in the inbox.
+      if (fresh.length === 1) addToast('', 'info', 6000, fresh[0].title, { label: 'Open', href: fresh[0].href });
+      else if (fresh.length > 1) addToast(fresh[0].title, 'info', 6000, `${fresh.length} new notifications`, { label: 'Open inbox', href: '/notifications' });
     }
     const items = append
       ? [...previous.items, ...page.items.filter((item) => !seen.has(item.notification_id))]

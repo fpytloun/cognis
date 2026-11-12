@@ -5,6 +5,7 @@
   import DashboardRowTitle from './DashboardRowTitle.svelte';
 
   import ActivityAvatar from '$lib/components/ActivityAvatar.svelte';
+  import ManagedChannelBadge from '$lib/components/ManagedChannelBadge.svelte';
   import WaitingRefreshStatus from '$lib/components/WaitingRefreshStatus.svelte';
   import AgentAvatarStrip from '$lib/components/dashboard/AgentAvatarStrip.svelte';
   import WorkstreamExecutionStatus from '$lib/components/WorkstreamExecutionStatus.svelte';
@@ -17,6 +18,12 @@
   } from '$lib/dashboard/dashboard';
   import { formatRelativeTime } from '$lib/time';
   import { conversationActivityState } from '$lib/conversation-activity';
+  import { api } from '$lib/api/client';
+  import { auth } from '$lib/stores/auth';
+  import { wsClient } from '$lib/ws/client';
+  import { dashboardRealtimeLoads } from '$lib/dashboard/realtime';
+  import { RefreshCooldown, SidebarRefreshController } from '$lib/sidebar-refresh';
+  import { backgroundWorkItemIsRunning } from '$lib/ongoing-work';
   import { isSidebarConversationWaiting } from '$lib/conversation-sidebar';
   import { isDashboardConversationActive, isDashboardTopicConversation } from '$lib/dashboard/dashboard';
   import {
@@ -26,7 +33,7 @@
     loadMoreRecent,
     visibleRecentItems,
   } from '$lib/dashboard/bounded-list';
-  import type { Agent, AttentionActionSummary, Conversation, Project } from '$lib/types/api';
+  import type { Agent, AttentionActionSummary, BackgroundWorkItem, Conversation, Project } from '$lib/types/api';
 
   const EVIDENCE_LIMIT = 300;
 
@@ -89,14 +96,43 @@
     onLoadMoreRecent?: () => void;
   }>();
 
+  let backgroundWork = $state<BackgroundWorkItem[]>([]);
+  $effect(() => {
+    const owner = $auth.user?.email;
+    backgroundWork = [];
+    if (!owner) return;
+    const controller = new SidebarRefreshController(async ({ signal }) => {
+      const result = await api.conversations.backgroundWork({ signal });
+      if (!signal.aborted && result.background_work_changed) backgroundWork = result.background_work.items;
+    }, new RefreshCooldown());
+    controller.setLifecycle({ scope: owner, eligible: true });
+    const refresh = () => { void controller.request(owner); };
+    refresh();
+    const stop = wsClient.subscribe((event) => {
+      if (event.type === 'work_invalidated'
+        || dashboardRealtimeLoads(event.type, 'reason' in event ? event.reason : undefined).includes('conversations')) refresh();
+    });
+    const visible = () => { if (document.visibilityState === 'visible') refresh(); };
+    window.addEventListener('focus', visible);
+    document.addEventListener('visibilitychange', visible);
+    return () => {
+      controller.dispose();
+      stop();
+      window.removeEventListener('focus', visible);
+      document.removeEventListener('visibilitychange', visible);
+    };
+  });
+  const backgroundIds = $derived(new Set(backgroundWork.filter(backgroundWorkItemIsRunning)
+    .map((item) => item.controller_conversation_id)));
   const lanes = $derived.by(() => {
     const history = partitionConversationLanes(conversations ?? [], {
       recent: Number.MAX_SAFE_INTEGER,
-    });
+    }, backgroundWork);
     if (waitingConversations === undefined) return history;
     const waiting = waitingConversations.filter((item: Conversation) =>
       isDashboardTopicConversation(item)
-      && isSidebarConversationWaiting(item, isDashboardConversationActive(item)));
+      && isSidebarConversationWaiting(item, isDashboardConversationActive(item)
+        || backgroundIds.has(item.conversation_id)));
     const ids = new Set(waiting.map((item: Conversation) => item.conversation_id));
     return {
       waiting,
@@ -160,11 +196,13 @@
   function executionLabel(conversation: Conversation): string {
     if (conversation.managed_agent?.turn_state) return conversation.managed_agent.turn_state;
     if (conversation.has_active_turn) return conversation.active_session_status ?? 'Active';
+    if (backgroundIds.has(conversation.conversation_id)) return 'Background work active';
     return 'Idle';
   }
 
   function avatarState(conversation: Conversation) {
     return conversationActivityState(conversation, {
+      backgroundWork,
       open: conversation.conversation_id === openConversationId
         || openConversationIds.includes(conversation.conversation_id),
     });
@@ -201,6 +239,7 @@
   <DashboardRowTitle title={conversation.title ?? 'Untitled conversation'}
     linkLabel="Open conversation in full page" linkTestId={`dashboard-conversation-row-link-${conversation.conversation_id}`}
     onOpenLink={(event) => openLink(event, conversation.conversation_id)} />
+  <ManagedChannelBadge {conversation} />
 {/snippet}
 
 <div class="dashboard-bounded-section min-w-0 md:flex md:h-full md:min-h-0 md:flex-col" data-testid="dashboard-conversations-section">

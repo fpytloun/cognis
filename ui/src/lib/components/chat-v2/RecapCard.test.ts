@@ -33,4 +33,23 @@ describe('RecapCard', () => {
     expect(link.getAttribute('href')).toBe('https://example.org/change');
     expect(screen.queryByRole('button', { name: /read more|show less/i })).toBeNull();
   });
+
+  it('keeps the heading and file/artifact actions outside the scrollable content', () => {
+    const { container } = render(RecapCard, { item: {
+      ...recap, text: 'Long recap. '.repeat(200),
+      artifacts: [{ id: 'art_recap', title: 'Trace', mime_type: 'text/plain', size_bytes: 12 }],
+      files: [{ path: 'ui/RecapCard.svelte', additions: 2, deletions: 1 }],
+    } });
+    const content = screen.getByRole('region', { name: 'Recap content' });
+    const heading = screen.getByRole('heading', { name: 'Recap' });
+    const artifacts = screen.getByRole('button', { name: '1 artifact ↗' });
+    const files = screen.getByRole('button', { name: /1 file.*\+2.*−1/ });
+    expect(content).toHaveAttribute('tabindex', '0');
+    expect(content).not.toContainElement(heading);
+    expect(content).not.toContainElement(artifacts);
+    expect(content).not.toContainElement(files);
+    expect(container.querySelector('header')).toContainElement(heading);
+    expect(container.querySelector('footer')).toContainElement(artifacts);
+    expect(container.querySelector('footer')).toContainElement(files);
+  });
 });

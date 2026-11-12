@@ -6,6 +6,7 @@
   let item = $state<LibraryItem | null>(null);
   let error = $state('');
   let retry = $state(0);
+  const isWindowMode = $derived(page.params.kind === 'deliverable' && page.url.searchParams.get('window') === '1');
   $effect(() => {
     const { kind, ref } = page.params;
     void retry;
@@ -21,7 +22,7 @@
 
 <svelte:head><title>{item?.title ?? 'Resource'} · Library · Cognis</title></svelte:head>
 <section class="mx-auto flex h-full min-h-0 w-full max-w-[1500px] flex-col">
-  <a href="/library" class="inline-flex min-h-10 items-center text-sm text-accent hover:underline">← Library</a>
+  {#if !isWindowMode}<a href="/library" class="inline-flex min-h-10 items-center text-sm text-accent hover:underline">← Library</a>{/if}
   {#if item}
     <div class="min-h-0 flex-1"><ResourceReader {item} /></div>
   {:else if error}

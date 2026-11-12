@@ -9,6 +9,11 @@ const empty = (): SearchState => ({ items: [], loading: false, cursor: null, err
 const CACHE_ENTRIES = 16;
 const MAX_ITEMS = 400;
 const TTL = 15_000;
+const BUSY_WAIT_MS = 30_000;
+const BUSY_RETRY_MS = 250;
+// Matches the server's per-user start rate; the debounce only coalesces bursts.
+const MIN_START_SPACING_MS = 150;
+const DEBOUNCE_MS = 50;
 
 /** One active flight, latest query coalescing, bounded metadata and query caches. */
 export class PaletteSearch {
@@ -23,6 +28,7 @@ export class PaletteSearch {
   private cache = new Map<string, { page: PalettePage; at: number }>();
   private timer: ReturnType<typeof setTimeout> | null = null;
   private flight: AbortController | null = null;
+  private settled: Promise<void> = Promise.resolve();
   private opened = false;
   private lastStarted = 0;
   private pages = 0;
@@ -51,7 +57,7 @@ export class PaletteSearch {
       items: enabled && fresh ? cached.page.items : [],
       loading: enabled && !fresh, cursor: fresh ? cached.page.next_cursor : null, error: '', capped: false, paused: false,
     });
-    if (enabled && !fresh) this.timer = setTimeout(() => void this.load(epoch, null), Math.max(100, 250 - (Date.now() - this.lastStarted)));
+    if (enabled && !fresh) this.timer = setTimeout(() => void this.load(epoch, null), Math.max(DEBOUNCE_MS, MIN_START_SPACING_MS - (Date.now() - this.lastStarted)));
   }
   more(manual = false) {
     if (!manual && !this.query) return;
@@ -65,18 +71,21 @@ export class PaletteSearch {
     this.publish({ error: '', loading: true });
     void this.load(this.epoch, this.retryCursor);
   }
-  private async load(epoch: number, cursor: string | null) {
+  private async load(epoch: number, cursor: string | null, busyDeadline = Date.now() + BUSY_WAIT_MS) {
     if (!this.opened || epoch !== this.epoch) return;
-    const delay = 250 - (Date.now() - this.lastStarted);
+    const delay = MIN_START_SPACING_MS - (Date.now() - this.lastStarted);
     if (delay > 0) {
-      this.timer = setTimeout(() => void this.load(epoch, cursor), delay); return;
+      this.timer = setTimeout(() => void this.load(epoch, cursor, busyDeadline), delay); return;
     }
     // Aborting fetch does not guarantee cancellation of SQL. Wait until the
     // transport settles; the server separately admits only one query per user.
+    // Start the latest query as soon as the previous transport settles.
     if (this.flight) {
-      this.timer = setTimeout(() => void this.load(epoch, cursor), 100); return;
+      void this.settled.then(() => this.load(epoch, cursor, busyDeadline)); return;
     }
     const controller = new AbortController();
+    let settle!: () => void;
+    this.settled = new Promise((resolve) => { settle = resolve; });
     this.flight = controller; this.lastStarted = Date.now();
     const query = this.query;
     const types = this.types;
@@ -102,10 +111,17 @@ export class PaletteSearch {
       });
     } catch (error) {
       if (epoch !== this.epoch || !this.opened || controller.signal.aborted) return;
+      // Other tabs and a server read surviving a transport timeout can still
+      // occupy admission. Keep the latest query loading instead of requiring a click.
+      if (error instanceof Error && 'code' in error && error.code === 'search_busy' && Date.now() < busyDeadline) {
+        this.timer = setTimeout(() => void this.load(epoch, cursor, busyDeadline), BUSY_RETRY_MS);
+        return;
+      }
       this.retryCursor = cursor;
       this.publish({ loading: false, error: error instanceof Error ? error.message : 'Search unavailable. Try again.' });
     } finally {
       if (this.flight === controller) this.flight = null;
+      settle();
     }
   }
   close() {

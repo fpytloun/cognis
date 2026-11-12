@@ -1,5 +1,6 @@
 <script lang="ts">
   import { findTarget } from '$lib/find';
+  import { downloadBlob } from '$lib/attachments/save';
   import { goto } from '$app/navigation';
   import Download from 'lucide-svelte/icons/download';
   import ExternalLink from 'lucide-svelte/icons/external-link';
@@ -314,12 +315,7 @@
       } else {
         blob = new Blob([result.content || ''], { type: result.content_type || 'text/plain' });
       }
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = result.filename;
-      link.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(blob, result.filename);
     } catch (error) {
       addToast(toErrorMessage(error, 'Failed to export skill'), 'error');
     }
@@ -1236,7 +1232,7 @@
                   <p class="mt-1 text-xs text-quiet">{asset.content_type} · {asset.size_bytes} bytes · {asset.content_hash.slice(0, 8)}</p>
                 </div>
                 {#if asset.url}
-                  <a class="inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover" href={asset.url} rel="noopener noreferrer" target="_blank">
+                  <a class="inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover" href={asset.url} download={asset.filename} rel="noopener noreferrer">
                     <Download class="h-3.5 w-3.5" /> Download
                   </a>
                 {/if}

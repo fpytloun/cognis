@@ -1,11 +1,34 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import ConversationInfoDrawerHarness from './ConversationInfoDrawerHarness.svelte';
 
-afterEach(cleanup);
+const originalAnimate = Object.getOwnPropertyDescriptor(Element.prototype, 'animate');
+beforeEach(() => {
+  Object.defineProperty(Element.prototype, 'animate', { configurable: true, value: vi.fn(() => ({
+    cancel: vi.fn(), pause: vi.fn(), play: vi.fn(), finished: Promise.resolve(), currentTime: 0,
+    effect: { getComputedTiming: () => ({ progress: 1 }) },
+  })) });
+});
+afterEach(() => {
+  cleanup();
+  if (originalAnimate) Object.defineProperty(Element.prototype, 'animate', originalAnimate);
+  else Reflect.deleteProperty(Element.prototype, 'animate');
+});
 
 describe('ConversationInfoDrawer', () => {
+  it('preserves the same source subtree and draft across pinned/focus transitions', async () => {
+    render(ConversationInfoDrawerHarness);
+    const input = screen.getByRole('textbox', { name: 'Inspector draft' });
+    await fireEvent.input(input, { target: { value: 'Keep the live source owner' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Expand inspector' }));
+    expect(await screen.findByRole('textbox', { name: 'Inspector draft' })).toBe(input);
+    await fireEvent.click(screen.getByRole('button', { name: 'Exit expanded inspector' }));
+    expect(await screen.findByRole('textbox', { name: 'Inspector draft' })).toBe(input);
+    expect(input).toHaveValue('Keep the live source owner');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('complementary', { name: 'Conversation information' })).toContainElement(input);
+  });
   it('enters focus mode and restores focus to the equivalent expand control', async () => {
     render(ConversationInfoDrawerHarness);
     const expand = screen.getByRole('button', { name: 'Expand inspector' });
@@ -17,6 +40,7 @@ describe('ConversationInfoDrawer', () => {
 
   it('keeps an accessible Context header and inspector controls in the pinned drawer', () => {
     render(ConversationInfoDrawerHarness);
+    expect(screen.getByRole('complementary', { name: 'Conversation information' })).toBeTruthy();
     expect(screen.getByRole('heading', { name: 'Context' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Expand inspector' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Close conversation information' })).toBeNull();
@@ -65,5 +89,23 @@ describe('ConversationInfoDrawer', () => {
     expect(document.querySelector('#conversation-info-drawer')).not.toHaveClass('bg-slate-900/95');
     expect(screen.getByTestId('sheet-header-surface')).toHaveClass('bg-elevated');
     expect(screen.getByTestId('sheet-content-surface')).toHaveClass('bg-elevated');
+  });
+
+  it('bounds the overlay to the managed viewport and keeps its content as the scroll owner', () => {
+    render(ConversationInfoDrawerHarness, { presentation: 'overlay' });
+    const overlay = screen.getByRole('dialog');
+    const panel = screen.getByTestId('conversation-info-drawer');
+    const content = screen.getByTestId('sheet-content-surface');
+    const viewportStyle = overlay.getAttribute('style');
+    expect(viewportStyle).toContain('--app-shell-notice-height');
+    expect(viewportStyle).toContain('--app-shell-top-offset');
+    expect(viewportStyle).toContain('--app-viewport-offset-top');
+    expect(overlay.style.bottom).toBe('auto');
+    expect(viewportStyle).toContain('--app-viewport-height');
+    expect(viewportStyle).toContain('--app-shell-bottom-offset');
+    expect(panel).toHaveClass('min-h-0', 'max-h-full', 'overflow-hidden');
+    expect(content).toHaveClass('min-h-0', 'flex-1', 'overflow-y-auto', 'overscroll-contain');
+    expect(content).toContainElement(screen.getByRole('textbox', { name: 'Inspector draft' }));
+    expect(content).not.toContainElement(screen.getByTestId('sheet-header-surface'));
   });
 });

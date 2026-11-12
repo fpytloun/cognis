@@ -7,6 +7,7 @@
 
 <script lang="ts">
   import Button from '$lib/components/ui/Button.svelte';
+  import PendingRequestPanel from '$lib/components/PendingRequestPanel.svelte';
   import ToolInvocationPreview from '$lib/components/ToolInvocationPreview.svelte';
   import { escalationSubmittingLabel } from '$lib/chat-page';
   import type { Escalation } from '$lib/types/api';
@@ -29,6 +30,7 @@
 
   let note = $state('');
   let submitting = $state<'approve' | 'deny' | null>(null);
+  let collapsed = $state(false);
 
   // The note is scoped to the escalation currently shown. When the active
   // item changes (settled, expired, or the next queued escalation takes its
@@ -39,6 +41,7 @@
       lastItemCallId = item.call_id;
       note = '';
       submitting = null;
+      collapsed = false;
     }
   });
 
@@ -65,13 +68,8 @@
   }
 </script>
 
-<article class="rounded-3xl border border-info-border bg-info-subtle px-4 py-4 text-foreground shadow-card">
-  <div class="flex flex-wrap items-center justify-between gap-4">
-    <div>
-      <p class="text-xs font-medium uppercase tracking-[0.25em] text-info">Approval required</p>
-      <h3 class="mt-1 text-base font-semibold text-strong">{item.tool_name ?? 'Escalated action'}</h3>
-    </div>
-    <div class="flex items-center gap-2">
+<PendingRequestPanel id={`approval-details-${item.call_id}`} title={`Approval required · ${item.tool_name ?? 'Escalated action'}`} bind:collapsed>
+  {#snippet status()}
       {#if queuedCount > 0}
         <span class="rounded-full border border-info-border px-2.5 py-0.5 text-xs font-medium text-info">
           +{queuedCount} queued
@@ -80,8 +78,7 @@
       <span class="rounded-full border border-info-border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] text-info">
         {expired ? 'Expired' : `${Math.max(secondsRemaining, 0)}s left`}
       </span>
-    </div>
-  </div>
+  {/snippet}
 
   {#if item.session_id}
     <p class="mt-1 text-xs text-muted">Session: {item.session_id.slice(0, 12)}...</p>
@@ -118,7 +115,8 @@
     Add an optional note after the ID. Bare commands only work when one approval is pending.
   </p>
 
-  <div class="mt-4 flex flex-wrap gap-2">
+  {#snippet footer()}
+  <div class="flex flex-wrap gap-2">
     <Button disabled={busy || expired} size="sm" onclick={() => void submit('approve')}>
       {submitting === 'approve' ? escalationSubmittingLabel('approve') : 'Approve'}
     </Button>
@@ -126,4 +124,5 @@
       {submitting === 'deny' ? escalationSubmittingLabel('deny') : 'Deny'}
     </Button>
   </div>
-</article>
+  {/snippet}
+</PendingRequestPanel>

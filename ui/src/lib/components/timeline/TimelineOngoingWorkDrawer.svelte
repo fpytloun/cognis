@@ -28,6 +28,8 @@
 
   const activeTodos = $derived(todos.filter((todo: TodoSnapshotItem) => !['completed', 'cancelled'].includes(todo.status)));
   let expandedCommandId = $state<string | null>(null);
+  // Expanded content must not contribute to the panel's minimum height.
+  let summaryHeight = $state<number | undefined>(undefined);
   const runningWork = $derived(work.filter(backgroundWorkItemIsRunning));
   const commandWork = $derived(sortBackgroundWorkByActivity(
     work.filter((item: BackgroundWorkItem) => item.kind === 'background_command'),
@@ -52,8 +54,10 @@
 </script>
 
 {#if todos.length > 0 || work.length > 0}
-  <section class="rounded-xl border border-separator bg-surface/40">
+  <section class="grid grid-cols-[minmax(0,1fr)] grid-rows-[auto_minmax(0,1fr)] overflow-hidden rounded-xl border border-separator bg-surface/40"
+    style:min-height={summaryHeight === undefined ? 'auto' : `${summaryHeight + 2}px`}>
     <button
+      bind:clientHeight={summaryHeight}
       class="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm transition hover:bg-surface-hover"
       type="button"
       aria-expanded={open}
@@ -82,7 +86,7 @@
     </button>
 
     {#if open}
-      <div class={`grid w-full max-w-full grid-cols-[minmax(0,1fr)] max-h-[45vh] min-h-0 min-w-0 gap-3 overflow-x-hidden overflow-y-auto border-t border-separator p-3 lg:max-h-72 lg:overflow-hidden ${work.length > 0 ? 'lg:grid-cols-2' : ''}`}>
+      <div class={`grid w-full max-w-full auto-rows-max grid-cols-[minmax(0,1fr)] max-h-[45vh] min-h-0 min-w-0 gap-3 overflow-x-hidden overflow-y-auto overscroll-contain border-t border-separator p-3 lg:max-h-72 ${work.length > 0 ? 'lg:grid-cols-2' : ''}`}>
         <div class="min-h-0 min-w-0">
           <p class="mb-2 text-[10px] font-semibold uppercase tracking-[0.2em] text-quiet">Todos</p>
           {#if todos.length > 0}
@@ -113,17 +117,17 @@
             {#each [...taskWork, ...sessionWork, ...commandWork] as item (item.work_id)}
               <article class="w-full max-w-full min-w-0 overflow-hidden rounded-lg border border-separator bg-inset/35 px-3 py-2">
                 {#if item.kind === 'background_command'}
-                  <button type="button" class="min-h-10 w-full min-w-0 break-words text-left text-sm font-medium text-accent hover:text-accent-hover" aria-expanded={expandedCommandId === item.work_id} onclick={() => { expandedCommandId = expandedCommandId === item.work_id ? null : item.work_id; }}>
-                    {item.title}
+                  <button type="button" class="w-full min-w-0 py-1 text-left text-sm font-medium text-accent hover:text-accent-hover" aria-expanded={expandedCommandId === item.work_id} onclick={() => { expandedCommandId = expandedCommandId === item.work_id ? null : item.work_id; }}>
+                    <span class="scrollbar-hidden-x block min-w-0" title={item.title}>{item.title}</span>
                   </button>
                 {:else if item.kind === 'task' && item.task_id}
-                  <a class="flex min-h-10 min-w-0 items-center break-words text-sm font-medium text-accent hover:text-accent-hover" href={`/tasks/${item.task_id}`}>{item.title}</a>
+                  <a class="block min-w-0 py-1 text-sm font-medium text-accent hover:text-accent-hover" href={`/tasks/${item.task_id}`}><span class="scrollbar-hidden-x block min-w-0" title={item.title}>{item.title}</span></a>
                 {:else if item.kind === 'managed_conversation' && item.target_conversation_id}
-                  <a class="flex min-h-10 min-w-0 items-center break-words text-sm font-medium text-accent hover:text-accent-hover" href={`/chat/${item.target_conversation_id}`} onclick={(event) => followConversationLink(event, item.target_conversation_id!, navigation)}>{item.title}</a>
+                  <a class="block min-w-0 py-1 text-sm font-medium text-accent hover:text-accent-hover" href={`/chat/${item.target_conversation_id}`} onclick={(event) => followConversationLink(event, item.target_conversation_id!, navigation)}><span class="scrollbar-hidden-x block min-w-0" title={item.title}>{item.title}</span></a>
                 {:else if item.session_id && onViewSession}
-                  <button type="button" class="min-h-10 w-full min-w-0 break-words text-left text-sm font-medium text-accent hover:text-accent-hover" onclick={() => viewSession(item.session_id)}>{item.title}</button>
+                  <button type="button" class="w-full min-w-0 py-1 text-left text-sm font-medium text-accent hover:text-accent-hover" onclick={() => viewSession(item.session_id)}><span class="scrollbar-hidden-x block min-w-0" title={item.title}>{item.title}</span></button>
                 {:else}
-                  <p class="break-words text-sm font-medium text-foreground">{item.title}</p>
+                  <p class="min-w-0 py-1 text-sm font-medium text-foreground"><span class="scrollbar-hidden-x block min-w-0" title={item.title}>{item.title}</span></p>
                 {/if}
                 <div class="mt-1 flex w-full max-w-full min-w-0 items-center gap-2">
                   {#if item.kind !== 'background_command' && item.kind !== 'task'}

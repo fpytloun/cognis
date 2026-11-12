@@ -2,7 +2,7 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: 'unified-chat-workspace.spec.ts',
+  testMatch: ['unified-chat-workspace.spec.ts', 'ongoing-work-drawer.spec.ts'],
   workers: 1,
   retries: 0,
   timeout: 60_000,

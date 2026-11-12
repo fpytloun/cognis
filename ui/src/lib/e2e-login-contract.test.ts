@@ -17,7 +17,7 @@ describe('shared E2E login helper contract', () => {
   });
 
   it('redacts the configured password from bounded failure diagnostics', () => {
-    expect(source).toContain(".split(ADMIN_PASSWORD).join('[redacted]')");
+    expect(source).toContain(".split(password).join('[redacted]')");
     expect(source).toContain('.slice(0, 500)');
   });
 });

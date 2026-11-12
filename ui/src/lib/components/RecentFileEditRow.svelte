@@ -2,7 +2,8 @@
   import { onDestroy, tick } from 'svelte';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import ExternalLink from 'lucide-svelte/icons/external-link';
-  import FileDiffViewer from './FileDiffViewer.svelte';
+  import DeferredPrivateView from './ui/DeferredPrivateView.svelte';
+  import { feedbackDiffViewer } from './feedback/diff-viewer-definition';
   import { chatV2Api, ChatV2ApiError } from '$lib/chat-v2/api';
   import type { FileDiffRef, TimelineScope, WorkFileHistoryRequest, WorkFileHistoryResponse, WorkMutationEvent } from '$lib/chat-v2/types';
   import { detectFileLanguage, type FileDiff } from '$lib/diff';
@@ -36,7 +37,7 @@
     .filter((diff, index, all) => Boolean(diff.diff) && all.findIndex((candidate) =>
       (candidate.path_generation_id ?? candidate.path_id ?? candidate.path) === (diff.path_generation_id ?? diff.path_id ?? diff.path)
     ) === index)
-    .map((diff) => ({ path: diff.relative_path ?? diff.path, diff: diff.diff, additions: diff.additions, deletions: diff.deletions, content_truncated: diff.content_truncated, truncated: diff.truncated })));
+    .map((diff) => ({ path: diff.relative_path ?? diff.path, diff: diff.diff, additions: diff.additions, deletions: diff.deletions, content_truncated: diff.content_truncated, truncated: diff.truncated, feedback_source: diff.feedback_source })));
   const fileLabel = $derived(file.relative_path ?? file.path);
   const fileType = $derived(detectFileLanguage(fileLabel));
   const occurredAt = $derived(file.occurred_at ?? event.created_at ?? event.updated_at ?? null);
@@ -123,7 +124,7 @@
     <div id={panelId} class="space-y-2 border-t border-separator p-2" role="region" aria-label={`Exact changes for ${fileLabel}`}>
       {#if loading}<p role="status" aria-live="polite" aria-busy="true" class="text-xs text-muted">Loading exact file changes…</p>
       {:else if error}<p role="alert" class="text-xs text-danger">{error} <button type="button" class="underline" onclick={() => void loadExactDiffs()}>Retry</button></p>
-      {:else if visibleDiffs.length}<FileDiffViewer diffs={visibleDiffs} collapsible={false} />
+      {:else if visibleDiffs.length}<DeferredPrivateView definition={feedbackDiffViewer} viewProps={{ diffs: visibleDiffs, collapsible: false }} label="file changes" />
       {:else if unavailable}<p role="status" class="text-xs text-warning">Exact diff content is no longer retained. Event statistics remain available.</p>{/if}
     </div>
   {/if}

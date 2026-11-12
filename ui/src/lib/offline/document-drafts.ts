@@ -1,5 +1,5 @@
 import { documentCoordination, type DocumentCoordination, type DocumentLease } from '$lib/document-coordination';
-import { normalizeSubmissionInput, sameSubmissionInput, type SubmissionInput } from '$lib/chat-v2/submission-input';
+import { isEmptySubmissionInput, normalizeSubmissionInput, sameSubmissionInput, type SubmissionInput } from '$lib/chat-v2/submission-input';
 import { snapshotPersistedMetadata } from '$lib/chat-v2/persisted-metadata';
 
 export interface CompositeInput extends SubmissionInput { input_revision: string }
@@ -53,9 +53,14 @@ export class DocumentDrafts {
     const operation = this.queue.then(() => context.owner.run(`draft:${context.key}`, context.lease, async () => {
       const record = this.compositeRecord(context.key);
       if (record?.consumed && record.input_revision === captured.input_revision) return null;
-      if ((record?.revision ?? null) !== this.compositeObserved.get(context.key)
+      const staleObservation = (record?.revision ?? null) !== this.compositeObserved.get(context.key);
+      // Empty initialization from another document has no input to protect.
+      // Keep local queued clears and all consumed tombstones behind the CAS.
+      const replacesEmpty = staleObservation && record && !record.consumed
+        && isEmptySubmissionInput(record) && !isEmptySubmissionInput(captured);
+      if ((staleObservation && !replacesEmpty)
         || (pin && record?.input_revision !== captured.input_revision
-          && (record?.revision ?? null) !== expectedRevision)) {
+          && (record?.revision ?? null) !== expectedRevision && !replacesEmpty)) {
         this.storage().setItem(`${context.key}:retained:${captured.input_revision}`, JSON.stringify(captured));
         return null;
       }

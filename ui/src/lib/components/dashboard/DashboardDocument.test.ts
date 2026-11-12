@@ -107,9 +107,9 @@ describe('dashboard canonical document reader', () => {
     const manager = new WorkspaceManager('desktop', { x: 0, y: 0, width: 1200, height: 800 });
     manager.open({ kind: 'artifact', entityId: item.id, title: 'Document', canonicalHref: `/library/artifact/${item.id}` });
     render(WorkspaceLayer, { manager, deviceClass: 'desktop' });
-    await fireEvent.change(await screen.findByRole('combobox', { name: 'Revision history' }), {
-      target: { value: 'art_document_older' },
-    });
+    await fireEvent.click(await screen.findByTestId('library-revision-toggle'));
+    const older = (await screen.findAllByTestId('library-revision-option')).find(option => option.dataset.revisionId === 'art_document_older');
+    await fireEvent.click(older!);
     await waitFor(() => expect(manager.snapshot()[0]).toMatchObject({
       key: 'artifact:art_document_older', entityId: 'art_document_older',
       canonicalHref: '/library/artifact/art_document_older',

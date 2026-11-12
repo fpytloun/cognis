@@ -76,10 +76,15 @@ export interface AgentFormState {
   reasoningEffort: string;
   fastMode: 'inherit' | 'enabled' | 'disabled';
   voice: string;
+  voices?: Record<string, string>;
+  ttsProviderId?: string;
+  ttsModel?: string;
+  ttsVoice?: string;
   memoryBackend: string;
   memoryMode: string;
   memoryBackendOptions: Record<string, unknown>;
   guardrailsBackend: 'intaris' | 'none';
+  analyticsEnabled: boolean;
   intarisEvaluation: 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy';
   minimumOutcome: '' | 'deny' | 'escalate' | 'approve';
   maximumOutcome: '' | 'deny' | 'escalate' | 'approve';
@@ -87,9 +92,8 @@ export interface AgentFormState {
   escalationTimeoutSeconds: string;
   agentProfiles: AgentRuntimeProfileFormState[];
   defaultAgentProfileId: string;
-  availableWorkflowIds: string[];
-  defaultWorkflowId: string;
-  workflowSelectionMode: string;
+  autoProfileSelection: boolean;
+  autoProfileMinConfidence: number;
   defaultChatMode: 'default' | 'plan' | 'build';
   stepAgentOverridesJson: string;
   mcpServers: MCPServerFormState[];
@@ -286,12 +290,7 @@ function serializeAgentProfiles(
   return serialized;
 }
 
-export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState {
-  // Pre-select all system workflows for new agents
-  const systemWorkflowIds = workflows
-    .filter((w) => w.is_system)
-    .map((w) => w.workflow_id);
-
+export function createEmptyAgentForm(): AgentFormState {
   return {
     agentId: '',
     customId: false,
@@ -324,10 +323,15 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     reasoningEffort: '',
     fastMode: 'inherit',
     voice: '',
+    voices: {},
+    ttsProviderId: '',
+    ttsModel: '',
+    ttsVoice: '',
     memoryBackend: 'mnemory',
     memoryMode: 'full_auto',
     memoryBackendOptions: {},
     guardrailsBackend: 'intaris',
+    analyticsEnabled: true,
     intarisEvaluation: DEFAULT_INTARIS_EVALUATION,
     minimumOutcome: '',
     maximumOutcome: '',
@@ -335,9 +339,8 @@ export function createEmptyAgentForm(workflows: Workflow[] = []): AgentFormState
     escalationTimeoutSeconds: '',
     agentProfiles: [],
     defaultAgentProfileId: '',
-    availableWorkflowIds: systemWorkflowIds,
-    defaultWorkflowId: 'system:direct',
-    workflowSelectionMode: 'automatic',
+    autoProfileSelection: true,
+    autoProfileMinConfidence: 0.55,
     defaultChatMode: 'default',
     stepAgentOverridesJson: '{}',
     mcpServers: [],
@@ -437,6 +440,12 @@ export function agentToFormState(agent: Agent): AgentFormState {
       llmConfig.fast_mode === true ? 'enabled' : llmConfig.fast_mode === false ? 'disabled' : 'inherit'
     ) as AgentFormState['fastMode'],
     voice: typeof llmConfig.voice === 'string' ? llmConfig.voice : '',
+    ttsProviderId: typeof llmConfig.tts_provider_id === 'string' ? llmConfig.tts_provider_id : '',
+    ttsModel: typeof llmConfig.tts_model === 'string' ? llmConfig.tts_model : '',
+    ttsVoice: typeof llmConfig.tts_voice === 'string' ? llmConfig.tts_voice : '',
+    voices: llmConfig.voices && typeof llmConfig.voices === 'object'
+      ? Object.fromEntries(Object.entries(llmConfig.voices).filter(([, value]) => typeof value === 'string')) as Record<string, string>
+      : {},
     memoryBackend:
       typeof agent.capabilities?.memory_backend === 'string'
         ? agent.capabilities.memory_backend
@@ -450,6 +459,7 @@ export function agentToFormState(agent: Agent): AgentFormState {
     memoryBackendOptions: { ...(agent.capabilities?.memory_backend_options ?? {}) },
     guardrailsBackend:
       agent.capabilities?.guardrails_backend === 'none' ? 'none' : 'intaris',
+    analyticsEnabled: agent.capabilities?.analytics_enabled ?? true,
     minimumOutcome: agent.capabilities?.minimum_outcome ?? '',
     intarisEvaluation: agent.capabilities?.intaris_evaluation ?? DEFAULT_INTARIS_EVALUATION,
     maximumOutcome: agent.capabilities?.maximum_outcome ?? '',
@@ -458,15 +468,8 @@ export function agentToFormState(agent: Agent): AgentFormState {
     agentProfiles: profileFormStateFromAgentProfiles(agent.agent_profiles),
     defaultAgentProfileId:
       typeof agent.default_agent_profile_id === 'string' ? agent.default_agent_profile_id : '',
-    availableWorkflowIds: Array.isArray(execution.available_workflow_ids)
-      ? execution.available_workflow_ids.filter((value): value is string => typeof value === 'string')
-      : [],
-    defaultWorkflowId:
-      typeof execution.default_workflow_id === 'string' ? execution.default_workflow_id : '',
-    workflowSelectionMode:
-      typeof execution.workflow_selection_mode === 'string'
-        ? execution.workflow_selection_mode
-        : 'automatic',
+    autoProfileSelection: autoProfileSelectionForAgent(agent).enabled,
+    autoProfileMinConfidence: autoProfileSelectionForAgent(agent).min_confidence,
     defaultChatMode:
       execution.default_chat_mode === 'plan' || execution.default_chat_mode === 'build'
         ? execution.default_chat_mode
@@ -730,7 +733,11 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
       reasoning_effort: form.reasoningEffort || undefined,
       fast_mode:
         form.fastMode === 'enabled' ? true : form.fastMode === 'disabled' ? false : undefined,
-      voice: form.voice || undefined
+      voice: form.voice || undefined,
+      voices: form.voices ?? {},
+      tts_provider_id: form.ttsProviderId || null,
+      tts_model: form.ttsModel || null,
+      tts_voice: form.ttsVoice || null
     },
     capabilities: {
       memory_backend: form.memoryBackend,
@@ -741,13 +748,14 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
             ...(form.memoryMode ? { mode: form.memoryMode } : {})
           },
       guardrails_backend: form.guardrailsBackend,
+      analytics_enabled: form.analyticsEnabled,
       intaris_evaluation: form.intarisEvaluation,
       approval_mode: form.guardrailsBackend === 'intaris' ? form.approvalMode : 'ask',
       ...(form.guardrailsBackend === 'intaris' && form.minimumOutcome
         ? { minimum_outcome: form.minimumOutcome } : {}),
       ...(form.guardrailsBackend === 'intaris' && form.maximumOutcome
         ? { maximum_outcome: form.maximumOutcome } : {}),
-      ...(form.escalationTimeoutSeconds
+      ...(form.guardrailsBackend === 'intaris' && form.escalationTimeoutSeconds
         ? { escalation_timeout_seconds: Number(form.escalationTimeoutSeconds) }
         : {})
     },
@@ -790,15 +798,29 @@ export function formStateToPayload(form: AgentFormState): Record<string, unknown
               })
               .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
           : undefined,
-      available_workflow_ids: form.availableWorkflowIds,
-      default_workflow_id: form.defaultWorkflowId || undefined,
-      workflow_selection_mode: form.workflowSelectionMode,
       default_chat_mode: form.defaultChatMode,
+      auto_profile_selection: {
+        enabled: form.autoProfileSelection,
+        min_confidence: form.autoProfileMinConfidence,
+      },
       step_agent_overrides: form.stepAgentOverridesJson ? JSON.parse(form.stepAgentOverridesJson) : {}
     }
   };
 
   return payload;
+}
+
+export function autoProfileSelectionForAgent(agent: Agent | null | undefined): {
+  enabled: boolean;
+  min_confidence: number;
+} {
+  const raw = agent?.execution?.auto_profile_selection;
+  const settings = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as Record<string, unknown> : {};
+  return {
+    enabled: settings.enabled !== false,
+    min_confidence: typeof settings.min_confidence === 'number' ? settings.min_confidence : 0.55,
+  };
 }
 
 export function formStateToSystemOverridePayload(form: AgentFormState): Record<string, unknown> {
@@ -817,7 +839,9 @@ export function formStateToSystemOverridePayload(form: AgentFormState): Record<s
       reasoning_effort: form.reasoningEffort || undefined,
       fast_mode:
         form.fastMode === 'enabled' ? true : form.fastMode === 'disabled' ? false : undefined,
-      voice: form.voice || undefined
+      tts_provider_id: form.ttsProviderId || null,
+      tts_model: form.ttsModel || null,
+      tts_voice: form.ttsVoice || null
     },
     agent_profiles: fullPayload.agent_profiles,
     default_agent_profile_id: fullPayload.default_agent_profile_id

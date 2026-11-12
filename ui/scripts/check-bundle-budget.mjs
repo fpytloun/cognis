@@ -15,9 +15,16 @@ const NODE_PREFIX = '.svelte-kit/generated/client-optimized/nodes/';
 
 // Budgets (brotli bytes). Raise deliberately, with a reason, never silently.
 const BUDGETS = {
-  // Explicitly approved for the deliverable update's measured 402.0 KiB graph.
-  chatCriticalJsBrotli: 405 * 1024,
-  chatCriticalCssBrotli: 32 * 1024,
+  // Explicitly approved increase from 450 to 470 KiB JS and 32 to 34 KiB CSS for inline
+  // work feedback in chat (~32 KiB JS once rich results render on first paint). Deferring
+  // it further would delay send-gating feedback code for no perceptible gain; a dedicated
+  // size-reduction pass on main is the preferred way to win this headroom back.
+  // A further 5 KiB of JS was approved for unified commenting and the mobile header.
+  // Comment and overflow menus remain deferred; CSS and per-chunk caps stay unchanged.
+  // A 500 KiB JS budget was explicitly approved for this rollout.
+  // CSS raised from 34 to 36 KiB (explicitly approved) for the comment list and task status UI.
+  chatCriticalJsBrotli: 500 * 1024,
+  chatCriticalCssBrotli: 36 * 1024,
   largestCriticalChunkBrotli: 96 * 1024,
 };
 

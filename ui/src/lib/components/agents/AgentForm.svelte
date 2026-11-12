@@ -12,6 +12,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import AvatarGenerateModal from '$lib/components/agents/AvatarGenerateModal.svelte';
+  import AgentSpeechVoice from './AgentSpeechVoice.svelte';
   import SkillDetailSheet from '$lib/components/skills/SkillDetailSheet.svelte';
   import ImageLightbox from '$lib/components/ImageLightbox.svelte';
   import { api } from '$lib/api/client';
@@ -27,7 +28,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     type AgentRuntimeProfileFormState,
     type AgentFormState
   } from '$lib/agents';
-  import type { Agent, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, MemoryModeDescriptor, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
+  import type { Agent, AgentSkillUsage, CredentialMetadata, EffectiveToolItem, ExecutorConfig, IntarisMCPServer, KnowledgebaseModel, LLMProvider, MemoryBackendDescriptor, MemoryModeDescriptor, ModelEntry, SecretMetadata, Skill, ToolDefinitionSummary, Workflow } from '$lib/types/api';
 
   type AgentToolOption = (ToolDefinitionSummary & { tool_id?: string; permission?: string }) | EffectiveToolItem;
   type McpServerToolGroup = {
@@ -49,6 +50,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     credentials = [],
     knowledgebases = [],
     skills = [],
+    skillUsage = [],
     intarisMcpServers = [],
     agents = [],
     secondaryAgents = [],
@@ -82,6 +84,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
     credentials?: CredentialMetadata[];
     knowledgebases?: KnowledgebaseModel[];
     skills?: Skill[];
+    skillUsage?: AgentSkillUsage[];
     intarisMcpServers?: IntarisMCPServer[];
     agents?: Agent[];
     secondaryAgents?: Agent[];
@@ -417,6 +420,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         invalidThinking(form.reasoningEffort, availableThinkingEfforts())) {
       errors.reasoningEffort = 'Thinking effort is unavailable for this model. Select an available value.';
     }
+    if (!Number.isFinite(form.autoProfileMinConfidence) ||
+        form.autoProfileMinConfidence < 0.5 || form.autoProfileMinConfidence > 1) {
+      errors.agentProfiles = 'Auto selection minimum confidence must be between 0.5 and 1.';
+    }
     const seenProfileIds = new Set<string>();
     for (const profile of form.agentProfiles) {
       const profileId = profile.profileId.trim();
@@ -465,17 +472,6 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
       form.agentId = slugify(form.name);
     }
   });
-
-  function toggleWorkflow(workflowId: string): void {
-    if (form.availableWorkflowIds.includes(workflowId)) {
-      form.availableWorkflowIds = form.availableWorkflowIds.filter((value: string) => value !== workflowId);
-      if (form.defaultWorkflowId === workflowId) {
-        form.defaultWorkflowId = '';
-      }
-      return;
-    }
-    form.availableWorkflowIds = [...form.availableWorkflowIds, workflowId];
-  }
 
   function toggleSecret(secretName: string): void {
     if (form.allowedSecrets.includes(secretName)) {
@@ -527,6 +523,18 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
 
   const globallyAttachedSkills = $derived(skills.filter((s: Skill) => attachedToAllAgents(s) && !form.selectedSkillIds.includes(s.skill_id)));
   const selectableSkills = $derived(skills.filter((s: Skill) => !attachedToAllAgents(s)));
+  const skillUsageById = $derived(new Map<string, AgentSkillUsage>(skillUsage.map((item: AgentSkillUsage) => [item.skill_id, item])));
+
+  function skillUsageHint(skillId: string, selected: boolean): string | null {
+    const usage = skillUsageById.get(skillId);
+    if (selected && usage?.suggestion === 'consider_removing' && !form.autoLoadSkillIds.includes(skillId)) {
+      return 'Not loaded in the last 30 days. Consider removing it.';
+    }
+    if (!selected && usage?.suggestion === 'consider_attaching') {
+      return `Found and loaded through search ${usage.search_load_count} times. Consider attaching it.`;
+    }
+    return null;
+  }
   const optionalBuiltinTools = INSTANCE_MANAGEMENT_TOOLS;
 
   function toggleOptInBuiltinTool(toolId: string): void {
@@ -973,12 +981,13 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 <option value="none">None</option>
               </select>
               <span class="block text-xs text-muted">
-                {form.guardrailsBackend === 'none' ? 'Tool-call evaluation is disabled. The event store remains active.' : 'Evaluates tool calls before execution.'}
+                {form.guardrailsBackend === 'none' ? 'Ordinary tool-call evaluation and proactive guardrails are disabled. Mandatory checks and the event store remain active.' : 'Evaluates tool calls before execution.'}
               </span>
             </label>
+            {#if form.guardrailsBackend === 'intaris'}
             <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Intaris evaluation</span>
-              <select bind:value={form.intarisEvaluation} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.intarisEvaluation} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset}>
                 <option value="legacy">Legacy</option>
                 <option value="bounded_autonomy">Bounded autonomy</option>
                 <option value="balanced">Balanced</option>
@@ -988,19 +997,33 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             </label>
             <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Approvals</span>
-              <select bind:value={form.approvalMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.approvalMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset}>
                 <option value="ask">Ask me</option>
                 <option value="unattended">Unattended (escalations are denied)</option>
               </select>
               <span class="block text-xs text-muted">{form.approvalMode === 'unattended' ? 'The Judge approves or denies; escalations are denied without waiting for you.' : 'Escalated calls wait for your approval.'}</span>
             </label>
+            {/if}
           </div>
+          <label class="mt-4 flex items-start gap-3 text-sm text-foreground">
+            <input
+              type="checkbox"
+              bind:checked={form.analyticsEnabled}
+              disabled={readonly || isSystemAsset}
+              class="mt-1"
+            />
+            <span>
+              <span class="block font-medium">Session analytics</span>
+              <span class="block text-xs text-muted">Intaris summaries and behavioral analytics, independent of the guardrails backend. Session events are always retained.</span>
+            </span>
+          </label>
+          {#if form.guardrailsBackend === 'intaris'}
           <details class="mt-4 border-t border-separator pt-4" open={!!(form.minimumOutcome || form.maximumOutcome || form.escalationTimeoutSeconds)}>
             <summary class="cursor-pointer text-sm font-medium text-secondary">Advanced evaluation controls</summary>
             <div class="mt-4 grid gap-4 md:grid-cols-2">
             <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Minimum evaluation outcome</span>
-              <select bind:value={form.minimumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.minimumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset}>
                 <option value="">None (standard evaluation)</option>
                 <option value="deny">Deny all evaluated calls</option>
                 <option value="escalate">Require human approval</option>
@@ -1010,7 +1033,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             </label>
             <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Maximum evaluation outcome</span>
-              <select bind:value={form.maximumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset || form.guardrailsBackend !== 'intaris'}>
+              <select bind:value={form.maximumOutcome} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly || isSystemAsset}>
                 <option value="">None (standard evaluation)</option>
                 <option value="deny">Do not upgrade denials</option>
                 <option value="escalate">Escalate evaluated denials</option>
@@ -1034,6 +1057,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           </label>
             </div>
           </details>
+          {/if}
           {#if form.guardrailsBackend === 'intaris' && form.maximumOutcome === 'approve'}
             <div role="alert" class="mt-4 rounded-xl border border-danger-border bg-danger-subtle px-4 py-3 text-sm text-danger">
               <strong>DANGEROUS — Yolo mode:</strong> Intaris still evaluates and audits every evaluated call, but critical and denied calls may execute. This does not override explicit tool permissions or session lifecycle blocks.
@@ -1043,7 +1067,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
             <div class="mt-4 rounded-xl border border-warning-border bg-warning-subtle px-4 py-3 text-sm text-warning">
               <p class="font-medium">Guardrails are disabled for this agent.</p>
               <p class="mt-1 text-xs text-warning/80">
-                Tool calls will be auto-approved, including non-bypassable tools. Use this only for trusted agents and controlled environments.
+                Ordinary tool calls are auto-approved. Mandatory runtime checks still apply. Use this only for trusted agents and controlled environments.
               </p>
             </div>
           {/if}
@@ -1486,6 +1510,9 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                         <Eye class="h-3.5 w-3.5" /> View
                       </button>
                     </div>
+                    {#if skillUsageHint(skill.skill_id, selected)}
+                      <p class="ml-6 text-xs text-muted">{skillUsageHint(skill.skill_id, selected)}</p>
+                    {/if}
                     {#if selected}
                       <label class="ml-6 flex items-start gap-2 text-xs text-muted">
                         <input
@@ -1643,11 +1670,15 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 Inherit uses lower-layer configuration. Disabled suppresses inherited acceleration.
               </span>
             </label>
-          <label class="space-y-2 text-sm font-medium text-foreground">
-            <span>Voice</span>
-            <Input bind:value={form.voice} placeholder="Use system default" disabled={!canEditField('llm_config.voice')} />
-            <span class="block text-xs text-muted">TTS voice for the speaker button and conversation mode (e.g. <code>alloy</code>, <code>nova</code>, an ElevenLabs voice ID). Leave empty to use the system default.</span>
-          </label>
+          <AgentSpeechVoice voices={form.voices ?? {}} legacyVoice={form.voice} {providers}
+            providerId={form.ttsProviderId ?? ''} model={form.ttsModel ?? ''} voice={form.ttsVoice ?? ''}
+            disabled={!canEditField('llm_config.tts_model')}
+            onbindingchange={(providerId, model) => {
+              form.ttsProviderId = providerId; form.ttsModel = model; form.ttsVoice = '';
+              form.voice = ''; form.voices = {};
+            }}
+            onvoicechange={(voice) => { form.ttsVoice = voice; form.voice = ''; form.voices = {}; }}
+            onchange={(providerId, voice) => { form.voices = { ...form.voices, [providerId]: voice }; }} />
         </div>
       </Card>
 
@@ -1669,6 +1700,25 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
           <Button type="button" variant="secondary" disabled={!canEditProfiles()} onclick={addRuntimeProfile}>Add profile</Button>
         </div>
 
+        <div class="mt-4 grid gap-4 rounded-xl border border-control-border bg-surface p-4 sm:grid-cols-2">
+          <label class="flex items-start gap-3 text-sm text-foreground">
+            <input type="checkbox" bind:checked={form.autoProfileSelection} disabled={!canEditField('execution')} />
+            <span>
+              <span class="block font-medium">Automatically select a startup profile</span>
+              <span class="mt-1 block text-xs text-muted">For new chats, match the first request to enabled, agent-selectable profiles. The agent receives the startup estimate and can switch profiles if needed. Existing conversations are unchanged.</span>
+            </span>
+          </label>
+          <label class="block space-y-2 text-sm font-medium text-foreground">
+            <span>Auto selection minimum confidence</span>
+            <input
+              type="number" min="0.5" max="1" step="0.01"
+              bind:value={form.autoProfileMinConfidence}
+              disabled={!canEditField('execution')}
+              class="w-full rounded-xl border border-control-border bg-surface px-3 py-2 text-sm text-foreground"
+            />
+            <span class="block text-xs font-normal text-muted">Default: 0.55 (55%). Higher values prefer the configured default more often.</span>
+          </label>
+        </div>
         {#if form.agentProfiles.length > 0}
           <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span>Default runtime profile</span>
@@ -1683,7 +1733,7 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
                 {/if}
               {/each}
             </select>
-            <span class="block text-xs text-muted">Used when no explicit <code>agent_profile_id</code> is requested.</span>
+            <span class="block text-xs text-muted">Used by Default, when Auto is disabled, or when Auto cannot confidently choose another profile.</span>
           </label>
 
           <div class="mt-5 space-y-4">
@@ -1939,43 +1989,10 @@ import Loader2 from 'lucide-svelte/icons/loader-2';
         <div class="space-y-4">
           <div>
             <p class="text-xs font-medium uppercase tracking-[0.25em] text-muted">Workflow settings</p>
-            <h2 class="mt-1 text-lg font-semibold text-strong">Available workflows</h2>
-          </div>
-
-          <div class="grid gap-3 md:grid-cols-2">
-            {#each workflows as workflow}
-              <label class="flex items-start gap-3 rounded-2xl border border-separator bg-canvas/60 px-4 py-3 text-sm text-foreground">
-                <input checked={form.availableWorkflowIds.includes(workflow.workflow_id)} class="mt-1 h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" onchange={() => toggleWorkflow(workflow.workflow_id)} disabled={readonly} />
-                <span>
-                  <span class="block font-medium text-strong">{workflow.name}</span>
-                  <span class="mt-1 block text-xs text-muted">{workflow.workflow_id}</span>
-                </span>
-              </label>
-            {/each}
+            <h2 class="mt-1 text-lg font-semibold text-strong">Execution settings</h2>
           </div>
 
           <div class="grid gap-4 md:grid-cols-2">
-            <label class="space-y-2 text-sm font-medium text-foreground">
-              <span>Default workflow</span>
-              <select bind:value={form.defaultWorkflowId} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
-                <option value="">Automatic (decision engine)</option>
-                {#each workflows as workflow}
-                  {#if form.availableWorkflowIds.includes(workflow.workflow_id)}
-                    <option value={workflow.workflow_id}>{workflow.name}</option>
-                  {/if}
-                {/each}
-              </select>
-            </label>
-
-            <label class="space-y-2 text-sm font-medium text-foreground">
-              <span>Selection mode</span>
-              <select bind:value={form.workflowSelectionMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>
-                <option value="automatic">automatic</option>
-                <option value="always_ask">always_ask</option>
-                <option value="use_default">use_default</option>
-              </select>
-            </label>
-
             <label class="space-y-2 text-sm font-medium text-foreground">
               <span>Default chat mode</span>
               <select bind:value={form.defaultChatMode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={readonly}>

@@ -1,4 +1,7 @@
 <script lang="ts">
+  import TaskFinishInstructions from '$lib/components/tasks/TaskFinishInstructions.svelte';
+  import { COMPLETION_MODE_OPTIONS, completionModeLabel } from '$lib/task-delivery';
+  import type { CompletionModeFamily } from '$lib/types/api';
   import { DEFAULT_INTARIS_EVALUATION } from '$lib/session-policy';
   import { goto } from '$app/navigation';
   import { onMount, onDestroy, untrack } from 'svelte';
@@ -27,7 +30,9 @@
     'Australia/Sydney', 'Pacific/Auckland'
   ].filter((tz, i, arr) => arr.indexOf(tz) === i);
   import Input from '$lib/components/ui/Input.svelte';
-  import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import { confirmScheduleRunNow } from '$lib/schedules';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
+  import { formatAbsoluteTime, formatRelativeTime } from '$lib/time';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import { policyFromText, policyText, policyEvaluation } from '$lib/session-policy';
   import { confirmAction } from '$lib/stores/confirm';
@@ -97,8 +102,9 @@ import Zap from 'lucide-svelte/icons/zap';
     expected_output: '',
     delivery_mode: 'preferred_channel',
     delivery_target: '',
-    completion_mode_family: 'default' as 'default' | 'direct',
+    completion_mode_family: 'auto' as CompletionModeFamily,
     allow_silent_completion: false,
+    on_finish_instructions: '',
     interaction_mode_override: 'none' as 'none' | 'explicit_gates' | 'step_requests',
     allow_policy_text: '',
     intaris_evaluation: '' as '' | 'legacy' | 'strict' | 'balanced' | 'bounded_autonomy',
@@ -108,17 +114,31 @@ import Zap from 'lucide-svelte/icons/zap';
     fail_paused_task_on_next_fire: true
   });
 
-  const statusColors: Record<string, string> = {
-    success: 'bg-success-subtle text-success',
-    failed: 'bg-danger-subtle text-danger',
-    skipped: 'bg-accent-subtle text-accent',
-    completed: 'bg-success-subtle text-success',
-    running: 'bg-accent-subtle text-accent',
-    paused: 'bg-cyan-subtle text-cyan-tone',
-    queued: 'bg-muted/20 text-muted',
-    ready: 'bg-cyan-subtle text-cyan-tone',
-    cancelled: 'bg-muted/20 text-muted'
-  };
+  // The detail opens as a read view; editing is an explicit mode so long prompts are not changed by accident.
+  let editing = $state(false);
+  let promptExpanded = $state(false);
+  const promptCollapsible = $derived(
+    form.task_description.length > 400 || form.task_description.split('\n').length > 6,
+  );
+
+  function runStatus(status: string): string {
+    return status === 'success' ? 'completed' : status;
+  }
+
+  function cancelEditing(): void {
+    if (schedule) populateForm(schedule);
+    editing = false;
+  }
+
+  function projectLabel(projectId: string | null): string {
+    if (!projectId) return 'No project';
+    return projects.find((project) => project.project_id === projectId)?.name ?? projectId;
+  }
+
+  function workflowLabel(s: Schedule): string {
+    if (!s.workflow_id) return s.skill_id ? 'Skill task' : 'Ad-hoc task';
+    return projectAwareWorkflows.find((workflow) => workflow.workflow_id === s.workflow_id)?.name ?? s.workflow_id;
+  }
 
   let selectedAgent = $derived(agents.find((agent) => agent.agent_id === form.agent_id) ?? null);
   let workflowSourceOptions = $derived(buildWorkflowSourceOptions(projectAwareWorkflows, skills, selectedAgent));
@@ -225,6 +245,7 @@ import Zap from 'lucide-svelte/icons/zap';
       delivery_target: (delivery.target as string) ?? '',
       completion_mode_family: s.completion_mode_family,
       allow_silent_completion: s.allow_silent_completion,
+      on_finish_instructions: s.on_finish_instructions ?? '',
       interaction_mode_override: s.interaction_mode_override ?? 'none',
       allow_policy_text: policyText((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy, 'allow_policies'),
       intaris_evaluation: policyEvaluation((tmpl.session_policy as Record<string, unknown>) ?? s.session_policy),
@@ -307,12 +328,14 @@ import Zap from 'lucide-svelte/icons/zap';
         task_template: taskTemplate,
         completion_mode_family: form.completion_mode_family,
         allow_silent_completion: form.allow_silent_completion,
+        on_finish_instructions: form.completion_mode_family !== 'direct' ? form.on_finish_instructions.trim() || null : null,
         interaction_mode_override: form.interaction_mode_override,
         max_concurrent_runs: form.max_concurrent_runs,
         retry_failed_tasks: form.retry_failed_tasks,
         fail_paused_task_on_next_fire: form.fail_paused_task_on_next_fire
       });
       await loadData();
+      editing = false;
       addToast('Schedule saved', 'success');
     } catch (e) {
       addToast(asApiError(e).message, 'error');
@@ -340,14 +363,11 @@ import Zap from 'lucide-svelte/icons/zap';
   async function triggerNow(): Promise<void> {
     if (!editable || !alive) return;
     if (!schedule) return;
+    if (!(await confirmScheduleRunNow(schedule.name)) || !alive || !schedule) return;
     try {
       const result = await api.schedules.trigger(schedule.schedule_id);
-      addToast('Schedule triggered', 'success');
+      addToast('', 'success', 6000, `${schedule.name} started`, result.task_id ? { label: 'Open task', href: `/tasks/${result.task_id}` } : null);
       if (!alive) return;
-      if (result.task_id) {
-        onOpenTask(result.task_id);
-        return;
-      }
       schedule = result;
       runs = await api.schedules.runs(schedule.schedule_id);
     } catch (e) {
@@ -379,8 +399,8 @@ import Zap from 'lucide-svelte/icons/zap';
   }
 
   function formatDate(iso: string | null): string {
-    if (!iso) return 'N/A';
-    return new Date(iso).toLocaleString();
+    if (!iso) return 'Not scheduled';
+    return `${formatAbsoluteTime(iso)} (${formatRelativeTime(iso)})`;
   }
 
   onMount(loadData);
@@ -412,8 +432,8 @@ import Zap from 'lucide-svelte/icons/zap';
           {#if !schedule.enabled}
             <Badge class="bg-inset/50 text-muted">Disabled</Badge>
           {/if}
-          {#if schedule.completion_mode_family === 'direct'}
-            <Badge class="bg-cyan-subtle text-cyan-tone">Direct delivery</Badge>
+          {#if schedule.completion_mode_family !== 'auto'}
+            <Badge class="bg-cyan-subtle text-cyan-tone">{completionModeLabel(schedule.completion_mode_family)} delivery</Badge>
           {/if}
           {#if schedule.allow_silent_completion}
             <Badge class="bg-cyan-subtle text-cyan-tone">Silent allowed</Badge>
@@ -422,25 +442,15 @@ import Zap from 'lucide-svelte/icons/zap';
         <p class="mt-0.5 text-sm text-muted">{schedule.human_schedule ?? schedule.cron_expr}</p>
       </div>
       {#if editable}<div class="flex gap-2">
-        <Tooltip text={schedule.enabled ? 'Disable' : 'Enable'}>
-          <Button aria-label={schedule.enabled ? 'Disable schedule' : 'Enable schedule'} variant="secondary" onclick={toggleEnabled}>
-            {#if schedule.enabled}
-              <Pause class="h-4 w-4" />
-            {:else}
-              <Play class="h-4 w-4" />
-            {/if}
-          </Button>
-        </Tooltip>
-        <Tooltip text="Trigger now">
-          <Button aria-label="Trigger now" variant="secondary" onclick={triggerNow}>
-            <Zap class="h-4 w-4" />
-          </Button>
-        </Tooltip>
-        <Tooltip text="Delete">
-          <Button aria-label="Delete schedule" variant="secondary" onclick={handleDelete}>
-            <Trash2 class="h-4 w-4" />
-          </Button>
-        </Tooltip>
+        <Button size="sm" variant="secondary" onclick={toggleEnabled}>
+          {#if schedule.enabled}<Pause class="mr-1.5 h-3.5 w-3.5" />Disable{:else}<Play class="mr-1.5 h-3.5 w-3.5" />Enable{/if}
+        </Button>
+        <Button size="sm" variant="secondary" onclick={triggerNow}>
+          <Zap class="mr-1.5 h-3.5 w-3.5" />Run now
+        </Button>
+        <Button size="sm" variant="ghost" aria-label="Delete schedule" onclick={handleDelete}>
+          <Trash2 class="mr-1.5 h-3.5 w-3.5 text-danger" /><span class="text-danger">Delete</span>
+        </Button>
       </div>{/if}
     </div>
 
@@ -464,20 +474,18 @@ import Zap from 'lucide-svelte/icons/zap';
     <!-- Status overview -->
     <div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
       <Card class="p-4">
-        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Next fire</p>
+        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Next run</p>
         <p class="mt-1 text-sm text-strong">{formatDate(schedule.next_fire_at)}</p>
       </Card>
       <Card class="p-4">
-        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Last fired</p>
-        <p class="mt-1 text-sm text-strong">{formatDate(schedule.last_fired_at)}</p>
+        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Last run</p>
+        <p class="mt-1 text-sm text-strong">{schedule.last_fired_at ? formatDate(schedule.last_fired_at) : 'Never'}</p>
       </Card>
       <Card class="p-4">
-        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Last status</p>
+        <p class="text-xs font-medium uppercase tracking-widest text-quiet">Last run outcome</p>
         <p class="mt-1">
           {#if schedule.last_run_status}
-            <span class={`inline-block rounded-full px-2 py-0.5 text-xs ${statusColors[schedule.last_run_status] ?? 'text-muted'}`}>
-              {schedule.last_run_status}
-            </span>
+            <StatusBadge status={runStatus(schedule.last_run_status)} />
           {:else}
             <span class="text-sm text-quiet">Never run</span>
           {/if}
@@ -490,7 +498,30 @@ import Zap from 'lucide-svelte/icons/zap';
     </div>
 
     <!-- Edit form -->
-    {#if optionsError || workflowOptionsError}
+    {#if !editing}
+    <Card class="p-6">
+      <div class="flex flex-wrap items-start justify-between gap-3" data-testid="schedule-read-view">
+        <h2 class="text-lg font-semibold text-strong">What this schedule does</h2>
+        {#if editable}<Button size="sm" variant="secondary" onclick={() => (editing = true)}>Edit schedule</Button>{/if}
+      </div>
+      {#if schedule.description}<p class="mt-2 text-sm text-secondary">{schedule.description}</p>{/if}
+      <dl class="mt-4 grid gap-4 text-sm sm:grid-cols-2">
+        <div><dt class="text-xs text-quiet">Runs</dt><dd class="mt-1 text-foreground">{schedule.human_schedule ?? `${schedule.cron_expr} (${schedule.timezone})`}</dd></div>
+        <div><dt class="text-xs text-quiet">Workflow</dt><dd class="mt-1 text-foreground">{workflowLabel(schedule)}</dd></div>
+        <div><dt class="text-xs text-quiet">Project</dt><dd class="mt-1 text-foreground">{projectLabel(schedule.project_id)}</dd></div>
+        <div><dt class="text-xs text-quiet">Delivery</dt><dd class="mt-1 text-foreground">{completionModeLabel(schedule.completion_mode_family)}{schedule.allow_silent_completion ? ' · may finish silently' : ''}</dd></div>
+      </dl>
+      <section class="mt-5 rounded-2xl border border-separator bg-canvas/50 p-4">
+        <h3 class="text-sm font-semibold text-strong">{form.task_title || 'Task prompt'}</h3>
+        {#if form.task_description}
+          <p class={`mt-2 whitespace-pre-wrap break-words text-sm leading-6 text-secondary ${promptExpanded || !promptCollapsible ? '' : 'line-clamp-6'}`} data-testid="schedule-prompt">{form.task_description}</p>
+          {#if promptCollapsible}
+            <Button class="mt-2" variant="link" size="inline" aria-expanded={promptExpanded} onclick={() => (promptExpanded = !promptExpanded)}>{promptExpanded ? 'Show less' : 'Show full prompt'}</Button>
+          {/if}
+        {/if}
+      </section>
+    </Card>
+    {:else if optionsError || workflowOptionsError}
       <p role="alert">{optionsError || workflowOptionsError}</p>
       <Button onclick={() => { void loadOptions(); void loadProjectWorkflows(form.project_id); }}>Retry configuration choices</Button>
     {:else if optionsLoading || workflowOptionsLoading}
@@ -498,15 +529,15 @@ import Zap from 'lucide-svelte/icons/zap';
     {:else}
     <fieldset disabled={!editable} class="min-w-0">
     <Card class="p-6">
-      <h2 class="mb-4 text-lg font-semibold text-strong">Configuration</h2>
+      <h2 class="mb-4 text-lg font-semibold text-strong">Edit schedule</h2>
       <div class="space-y-4">
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <label for="edit-name" class="text-xs font-medium uppercase tracking-widest text-muted">Name</label>
+            <label for="edit-name" class="text-sm font-medium text-foreground">Name</label>
             <Input id="edit-name" bind:value={form.name} />
           </div>
           <div class="space-y-1">
-            <span class="block text-xs font-medium uppercase tracking-widest text-muted">Agent</span>
+            <span class="block text-sm font-medium text-foreground">Agent</span>
             <AgentSelect
               id="edit-agent"
               agents={agents}
@@ -522,22 +553,22 @@ import Zap from 'lucide-svelte/icons/zap';
         </div>
 
         <div class="space-y-1">
-          <label for="edit-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Description</label>
+          <label for="edit-desc" class="text-sm font-medium text-foreground">Description</label>
           <textarea
             id="edit-desc"
             bind:value={form.description}
-            class="min-h-[60px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
+            class="min-h-[60px] max-h-96 w-full rounded-2xl [field-sizing:content] border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
           ></textarea>
         </div>
 
         {#if form.schedule_type === 'cron'}
           <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div class="space-y-1">
-              <label for="edit-cron" class="text-xs font-medium uppercase tracking-widest text-muted">Cron expression</label>
+              <label for="edit-cron" class="text-sm font-medium text-foreground">Cron expression</label>
               <Input id="edit-cron" bind:value={form.cron_expr} />
             </div>
             <div class="space-y-1">
-              <label for="edit-tz" class="text-xs font-medium uppercase tracking-widest text-muted">Timezone</label>
+              <label for="edit-tz" class="text-sm font-medium text-foreground">Timezone</label>
               <select id="edit-tz" bind:value={form.timezone} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
                 {#each [...new Set([form.timezone, ...timezoneOptions])] as tz}
                   <option value={tz}>{tz}{tz === localTimezone ? ' (local)' : ''}</option>
@@ -547,23 +578,23 @@ import Zap from 'lucide-svelte/icons/zap';
           </div>
         {:else if form.schedule_type === 'interval'}
           <div class="space-y-1">
-            <label for="edit-interval" class="text-xs font-medium uppercase tracking-widest text-muted">Interval (seconds)</label>
+            <label for="edit-interval" class="text-sm font-medium text-foreground">Interval (seconds)</label>
             <Input id="edit-interval" bind:value={form.interval_seconds} type="number" />
           </div>
         {/if}
 
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <label for="edit-workflow" class="text-xs font-medium uppercase tracking-widest text-muted">Workflow</label>
+            <label for="edit-workflow" class="text-sm font-medium text-foreground">Workflow</label>
             <select id="edit-workflow" bind:value={form.workflow_source} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-              <option value="">Auto{form.project_id ? ' (project-aware)' : ''}</option>
+              <option value="">General task</option>
               {#each workflowSourceOptions as option}
                 <option value={option.value}>{option.label}</option>
               {/each}
             </select>
           </div>
           <div class="space-y-1">
-            <label for="edit-project" class="text-xs font-medium uppercase tracking-widest text-muted">Project</label>
+            <label for="edit-project" class="text-sm font-medium text-foreground">Project</label>
             <select id="edit-project" bind:value={form.project_id} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="">None</option>
               {#each projects as project}
@@ -572,7 +603,7 @@ import Zap from 'lucide-svelte/icons/zap';
             </select>
           </div>
           <div class="space-y-1 sm:col-span-2">
-            <label for="edit-concurrent" class="text-xs font-medium uppercase tracking-widest text-muted">Max concurrent runs</label>
+            <label for="edit-concurrent" class="text-sm font-medium text-foreground">Max concurrent runs</label>
             <Input id="edit-concurrent" bind:value={form.max_concurrent_runs} type="number" />
           </div>
         </div>
@@ -587,29 +618,30 @@ import Zap from 'lucide-svelte/icons/zap';
         </label>
 
         <div class="space-y-1">
-          <label for="edit-task-title" class="text-xs font-medium uppercase tracking-widest text-muted">Task title</label>
+          <label for="edit-task-title" class="text-sm font-medium text-foreground">Task title</label>
           <Input id="edit-task-title" bind:value={form.task_title} placeholder="Title for created tasks" />
         </div>
 
         <div class="space-y-1">
-          <label for="edit-task-desc" class="text-xs font-medium uppercase tracking-widest text-muted">Task prompt</label>
+          <label for="edit-task-desc" class="text-sm font-medium text-foreground">Task prompt</label>
           <textarea
             id="edit-task-desc"
             bind:value={form.task_description}
-            class="min-h-[80px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
+            class="min-h-[80px] max-h-96 w-full rounded-2xl [field-sizing:content] border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
             placeholder="Instructions for the agent"
           ></textarea>
         </div>
 
         <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div class="space-y-1">
-            <label for="edit-priority" class="text-xs font-medium uppercase tracking-widest text-muted">Priority</label>
+            <label for="edit-priority" class="text-sm font-medium text-foreground">Priority</label>
             <Input id="edit-priority" bind:value={form.priority} type="number" />
           </div>
           <div class="space-y-1">
-            <label for="edit-delivery" class="text-xs font-medium uppercase tracking-widest text-muted">Delivery</label>
+            <label for="edit-delivery" class="text-sm font-medium text-foreground">Delivery</label>
             <select id="edit-delivery" bind:value={form.delivery_mode} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="preferred_channel">Preferred channel</option>
+              <option value="in_app_notifications">In-app notifications (direct only)</option>
               <option value="latest_active_for_agent">Latest active conversation</option>
               <option value="specific_conversation">Specific conversation</option>
             </select>
@@ -618,7 +650,7 @@ import Zap from 'lucide-svelte/icons/zap';
 
         {#if form.delivery_mode === 'specific_conversation'}
           <div class="space-y-1">
-            <label for="edit-target" class="text-xs font-medium uppercase tracking-widest text-muted">Target conversation</label>
+            <label for="edit-target" class="text-sm font-medium text-foreground">Target conversation</label>
             <select id="edit-target" bind:value={form.delivery_target} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
               <option value="">Select conversation</option>
               {#if form.delivery_target && !conversations.some((item) => item.conversation_id === form.delivery_target)}
@@ -632,32 +664,33 @@ import Zap from 'lucide-svelte/icons/zap';
         {/if}
 
         <div class="space-y-1">
-          <label for="edit-expected" class="text-xs font-medium uppercase tracking-widest text-muted">Expected output <span class="normal-case tracking-normal text-quiet">(optional)</span></label>
+          <label for="edit-expected" class="text-sm font-medium text-foreground">Expected output <span class="normal-case tracking-normal text-quiet">(optional)</span></label>
           <textarea
             id="edit-expected"
             bind:value={form.expected_output}
-            class="min-h-[60px] w-full rounded-2xl border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
+            class="min-h-[60px] max-h-96 w-full rounded-2xl [field-sizing:content] border border-control-border bg-canvas/80 px-4 py-3 text-sm text-foreground placeholder:text-quiet"
             placeholder="What should the agent produce? Used for step evaluation."
           ></textarea>
         </div>
 
         <div class="space-y-1">
-          <label for="edit-completion-family" class="text-xs font-medium uppercase tracking-widest text-muted">Completion notification behavior</label>
+          <label for="edit-completion-family" class="text-sm font-medium text-foreground">Completion notification behavior</label>
           <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <select id="edit-completion-family" bind:value={form.completion_mode_family} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
-              <option value="default">Default delivery</option>
-              <option value="direct">Direct channel delivery</option>
+            <select id="edit-completion-family" bind:value={form.completion_mode_family} disabled={form.delivery_mode === 'in_app_notifications'} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
+              {#each COMPLETION_MODE_OPTIONS as option}
+                <option value={option.value}>{option.name} — {option.description}</option>
+              {/each}
             </select>
             <label class="inline-flex items-center gap-2 rounded-xl border border-control-border bg-canvas/60 px-3 py-2 text-sm text-foreground">
               <input type="checkbox" bind:checked={form.allow_silent_completion} class="rounded border-control-border bg-raised" />
               <span>Allow silent completion</span>
             </label>
           </div>
-          <p class="text-xs text-quiet">Default delivery uses the normal conversation flow. Direct channel delivery sends the final result straight to the resolved target channel.</p>
+          <TaskFinishInstructions deliveryMode={form.delivery_mode} bind:completionMode={form.completion_mode_family} bind:instructions={form.on_finish_instructions} />
         </div>
 
         <div class="space-y-1">
-          <label for="edit-interaction" class="text-xs font-medium uppercase tracking-widest text-muted">Interaction policy</label>
+          <label for="edit-interaction" class="text-sm font-medium text-foreground">Interaction policy</label>
           <select id="edit-interaction" bind:value={form.interaction_mode_override} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="none">Fully autonomous</option>
             <option value="step_requests">Allow planning questions</option>
@@ -676,7 +709,8 @@ import Zap from 'lucide-svelte/icons/zap';
           help="Policies are copied to each task created by this schedule."
         />
 
-        <div class="flex justify-end">
+        <div class="sticky bottom-0 z-10 -mx-6 -mb-6 flex flex-wrap justify-end gap-2 rounded-b-3xl border-t border-separator bg-surface/95 px-6 py-3 backdrop-blur">
+          <Button variant="secondary" onclick={cancelEditing}>Cancel</Button>
           {#if form.delivery_mode === 'specific_conversation' && conversationsError}
             <p role="alert">{conversationsError}</p>
             <Button variant="secondary" onclick={() => void loadConversations()}>Retry conversations</Button>
@@ -711,9 +745,7 @@ import Zap from 'lucide-svelte/icons/zap';
                 <p class="truncate text-sm text-strong">{run.title}</p>
                 <p class="text-xs text-quiet">{formatDate(run.created_at)}</p>
               </div>
-              <span class={`shrink-0 rounded-full px-2 py-0.5 text-xs ${statusColors[run.status] ?? 'text-muted'}`}>
-                {run.status}
-              </span>
+              <span class="shrink-0"><StatusBadge status={runStatus(run.status)} /></span>
             </button>
           {/each}
         </div>

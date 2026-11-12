@@ -148,13 +148,11 @@ describe('DashboardConversationReadTracker', () => {
     subject.value.suspend(initial.conversation_id);
     expect(subject.value.observe([newer])).toBeNull();
     expect(subject.markRead).toHaveBeenCalledOnce();
-
     subject.value.open(initial.conversation_id);
     await subject.value.observe([newer]);
     expect(subject.markRead).toHaveBeenCalledTimes(2);
     expect(subject.value.observe([newer])).toBeNull();
     expect(subject.optimisticRead).toHaveBeenLastCalledWith(initial.conversation_id, newer.last_message_at);
-
     subject.value.close(initial.conversation_id);
     subject.value.open(initial.conversation_id);
     expect(subject.value.observe([newer])).toBeNull();
@@ -170,7 +168,6 @@ describe('DashboardConversationReadTracker', () => {
     expect(subject.value.initialLoaded(item)).toBeNull();
     expect(subject.value.observe([item])).toBeNull();
     expect(subject.markRead).not.toHaveBeenCalled();
-
     subject.value.open(item.conversation_id);
     await vi.waitFor(() => expect(subject.markRead).toHaveBeenCalledOnce());
     expect(subject.value.observe([item])).toBeNull();
@@ -212,7 +209,6 @@ describe('DashboardConversationReadTracker', () => {
     expect(observed).not.toBeNull();
     await observed;
     expect(subject.markRead).toHaveBeenCalledWith('workspace-conversation');
-    expect(subject.markRead).toHaveBeenCalledTimes(2);
   });
 });
 

@@ -2,30 +2,29 @@ import type { Page } from '@playwright/test';
 import type { LibraryItem } from '../src/lib/library';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
 
-// Wholly constructed catalog; stable test IDs are UI bindings, not saved items.
-const OWNER = 'curator@example.test';
+const OWNER = 'owner@cognis.test';
 function document(id: string, title: string, project: string | null, conversation: string | null, revision = 1): LibraryItem {
   return {
     id, title, kind: 'deliverable', format: 'markdown', owner_email: OWNER,
-    agent_id: 'agent-stage39', agent_name: 'Catalog agent',
-    project_id: project, project_name: project ? ({ cognis: 'Cognis', exhibits: 'Sample exhibits', observatory: 'Sample observatory' }[project] ?? project) : null,
+    agent_id: 'agent-stage39', agent_name: 'LaForge',
+    project_id: project, project_name: project ? ({ cognis: 'Cognis', home: 'House renovation', museum: 'Museum demo' }[project] ?? project) : null,
     conversation_id: conversation, conversation_title: conversation,
     task_id: null, task_title: null, lineage_id: id, revision,
-    created_at: '2030-04-10T12:00:00Z', updated_at: '2030-04-16T12:00:00Z',
+    created_at: '2026-10-13T14:30:00Z', updated_at: '2026-10-17T06:20:00Z',
     size_bytes: 4200, status: 'delivered', origin: 'agent', is_readonly: false,
   };
 }
 export const libraryCatalog: LibraryItem[] = [
-  document('dlv_release_review', 'Release readiness review — Sample catalog', 'cognis', 'Release planning', 3),
+  document('dlv_release_review', 'Release readiness review — October', 'cognis', 'Release planning', 3),
   document('dlv_library_design', 'Library: a home for finished work', 'cognis', 'Product design', 2),
   document('dlv_access_review', 'Content access and sharing security review', 'cognis', 'Release planning'),
-  { ...document('dlv_station_health', 'Telescope health · Fictional equipment report', 'observatory', 'Sample equipment'), agent_name: 'Research agent' },
-  { ...document('dlv_renovation', 'Exhibit hall — demonstration materials', 'exhibits', 'Sample exhibit layout'), agent_name: 'Research agent' },
+  { ...document('dlv_station_health', 'Exhibit health · Weekly demonstration report', 'museum', 'Exhibit reliability'), agent_name: 'Riker' },
+  { ...document('dlv_renovation', 'Kitchen renovation — materials and budget', 'home', 'Kitchen renovation'), agent_name: 'Riker' },
   document('dlv_research', 'Research notes: local inference options', null, null),
-  { ...document('dlv_shared_report', 'Observation quality — Fictional summary', 'observatory', 'Sample quality review'), owner_email: 'visitor@example.test', is_readonly: true },
-  { ...document('att_floor_plan', 'Exhibit hall — demonstration layout.pdf', 'exhibits', 'Sample exhibit layout'), kind: 'artifact', format: 'application/pdf', origin: 'user', agent_name: null, size_bytes: 284000 },
+  { ...document('dlv_shared_report', 'Exhibit maintenance — September summary', 'museum', 'Demonstration review'), owner_email: 'colleague@cognis.test', is_readonly: true },
+  { ...document('att_floor_plan', 'Ground floor — architectural plan.pdf', 'home', 'Kitchen renovation'), kind: 'artifact', format: 'application/pdf', origin: 'user', agent_name: null, size_bytes: 284000 },
   { ...document('att_requirements', 'Library requirements and acceptance notes.txt', 'cognis', 'Product design'), kind: 'artifact', format: 'text/plain', origin: 'user', agent_name: null, size_bytes: 1800 },
-  { ...document('art_budget', 'Exhibit materials — sample quantities.csv', 'exhibits', 'Sample exhibit layout'), kind: 'artifact', format: 'text/csv', size_bytes: 8200 },
+  { ...document('art_budget', 'Kitchen materials — cost breakdown.csv', 'home', 'Kitchen renovation'), kind: 'artifact', format: 'text/csv', size_bytes: 8200 },
   { ...document('art_report', 'Release validation results.json', 'cognis', 'Release planning'), kind: 'artifact', format: 'application/json', size_bytes: 12300 },
 ];
 
@@ -59,7 +58,7 @@ export async function installLibraryRoutes(page: Page, catalog = libraryCatalog)
       return route.fulfill({ json: { deliverable_id: row?.id, title: row?.title, format: 'markdown', status: 'delivered',
         lineage_id: row?.lineage_id, revision: row?.revision, version: 1,
         latest_deliverable_id: row?.id, latest_revision: row?.revision, revision_count: row?.revision, is_latest: true,
-        content: '# Release readiness\n\nThis fictional catalog exercises content ownership, revision history, and shared project access. It is not an actual release report.\n\n## Validation\n\n- Sample resources have distinct owners.\n- The specimen contains several revisions.\n- Shared examples retain read-only boundaries.\n\n## Next steps\n\nExercise navigation and filtering on desktop and mobile.' } });
+        content: '# Release readiness\n\nThe October release is ready for final acceptance. The review covers content ownership, revision history, and shared project access.\n\n## Validation\n\n- Content access checks passed.\n- Revision history is linear and stable.\n- Shared documents retain their privacy boundaries.\n\n## Next steps\n\nComplete human evaluation of the Library on desktop and mobile before release.' } });
     }
     if (exact) {
       const row = catalog.find((item) => item.id === exact[2]);
@@ -106,7 +105,7 @@ export async function installLibraryRoutes(page: Page, catalog = libraryCatalog)
 
 export async function installLibraryFixture(page: Page) {
   await installTaskCockpitFixture(page);
-  await page.route('**/api/auth/me', (route) => route.fulfill({ json: { email: OWNER, name: 'Sample curator', role: 'user' } }));
+  await page.route('**/api/auth/me', (route) => route.fulfill({ json: { email: OWNER, name: 'Filip', role: 'user' } }));
   await page.routeWebSocket('**/api/ws', (socket) => {
     socket.send(JSON.stringify({ type: 'authenticated' }));
     socket.onMessage((message) => { if (JSON.parse(String(message)).type === 'ping') socket.send(JSON.stringify({ type: 'pong' })); });

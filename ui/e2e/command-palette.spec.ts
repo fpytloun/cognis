@@ -32,7 +32,7 @@ const catalog: PaletteItem[] = [
   { ...common, kind: 'schedule', id: 'palette-review', title: 'Weekly command palette review', status: 'enabled', href: '/schedules/palette-review' },
 ];
 
-async function setup(page: Page) {
+async function setup(page: Page, platform = 'MacIntel') {
   await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: true, dashboardConversation: true });
   await installLibraryRoutes(page, libraryCatalog);
   await page.route('**/api/auth/me', (route) => route.fulfill({ json: {
@@ -47,10 +47,10 @@ async function setup(page: Page) {
   await page.route('**/api/v1/schedules**', (route) => route.fulfill({
     json: new URL(route.request().url()).pathname === '/api/v1/schedules/palette-review' ? schedule : [],
   }));
-  await page.addInitScript(() => {
+  await page.addInitScript((platform) => {
     localStorage.setItem('cognis.theme.palette', 'dark');
-    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
-  });
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: platform });
+  }, platform);
   await page.route('**/api/v1/search/palette?**', (route) => {
     const params = new URL(route.request().url()).searchParams;
     const q = params.get('q')?.toLowerCase().replace('pallete', 'palette') ?? '';
@@ -89,6 +89,82 @@ async function show(page: Page, query = '') {
   if (query) await input.fill(query);
   return input;
 }
+
+test('search history recalls queries, restores drafts and preserves result navigation', async ({ page }) => {
+  await setup(page);
+  for (const query of ['command', 'command palette']) {
+    const input = await show(page, query);
+    await input.press('Escape');
+    await expect(input).toBeHidden();
+  }
+  const input = await show(page);
+  await input.press('ArrowUp');
+  await expect(input).toHaveValue('command palette');
+  await input.press('ArrowUp');
+  await expect(input).toHaveValue('command');
+  await input.press('ArrowDown');
+  await expect(input).toHaveValue('command palette');
+  await input.press('ArrowDown');
+  await expect(input).toHaveValue('');
+  await input.fill('draft phrase');
+  await input.press('Alt+ArrowUp');
+  await expect(input).toHaveValue('command palette');
+  await input.press('Alt+ArrowDown');
+  await expect(input).toHaveValue('draft phrase');
+  await input.fill('');
+  await input.press('ArrowUp');
+  await input.press('ArrowRight');
+  await expect(options(page)).toHaveCount(7);
+  const active = await input.getAttribute('aria-activedescendant');
+  await input.press('ArrowDown');
+  await expect(input).not.toHaveAttribute('aria-activedescendant', active!);
+  await expect(input).toHaveValue('command palette');
+  await input.press('Escape');
+  await expect(input).toBeHidden();
+  await page.reload();
+  await expect(page.getByTestId('control-center')).toBeVisible();
+  const reopened = await show(page);
+  await reopened.press('ArrowUp');
+  await expect(reopened).toHaveValue('command palette');
+});
+
+test('clearing recalled search history does not save the current recalled query again', async ({ page }) => {
+  await setup(page);
+  const input = await show(page, 'command');
+  await input.press('Escape');
+  await expect(input).toBeHidden();
+  await show(page);
+  await input.press('ArrowUp');
+  await expect(input).toHaveValue('command');
+  await page.getByRole('button', { name: 'Clear search history', exact: true }).click();
+  await expect(input).toBeFocused();
+  await input.press('Escape');
+  await expect(input).toBeHidden();
+  await page.reload();
+  await expect(page.getByTestId('control-center')).toBeVisible();
+  await show(page);
+  await input.press('ArrowUp');
+  await expect(input).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Clear search history', exact: true })).toBeHidden();
+});
+
+test('Ctrl+Shift+number opens a match and leaves browser tab shortcuts unhandled', async ({ page }) => {
+  await setup(page, 'Win32');
+  await page.keyboard.press('Control+k');
+  const input = page.getByRole('combobox', { name: 'Search Cognis' });
+  await input.fill('command');
+  await expect(options(page)).toHaveCount(7);
+  await expect(page.locator('.number-hint').first()).toHaveText('Ctrl+Shift+1');
+  expect(await input.evaluate(node => node.dispatchEvent(new KeyboardEvent('keydown', {
+    key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true,
+  })))).toBe(true);
+  expect(await input.evaluate(node => node.dispatchEvent(new KeyboardEvent('keydown', {
+    key: 'k', code: 'KeyK', metaKey: true, altKey: true, bubbles: true, cancelable: true,
+  })))).toBe(true);
+  await expect(input).toBeVisible();
+  await input.press('Control+Shift+Digit1');
+  await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toBeVisible();
+});
 
 test.describe('mobile touch launcher', () => {
   test.use({ hasTouch: true });
@@ -362,7 +438,17 @@ test('Spotlight appearance, typo search, arrows and instant dashboard activation
   await page.screenshot({ path: testInfo.outputPath('spotlight-dashboard-document.png') });
   await show(page, 'command');
   await expect(options(page)).toHaveCount(7);
-  await page.keyboard.press('Meta+1');
+  await expect(page.locator('.number-hint').first()).toHaveText('⌃⇧1');
+  const reserved = await page.getByRole('combobox', { name: 'Search Cognis' }).evaluate(node => [
+    node.dispatchEvent(new KeyboardEvent('keydown', {
+      key: '1', code: 'Digit1', metaKey: true, bubbles: true, cancelable: true,
+    })),
+    node.dispatchEvent(new KeyboardEvent('keydown', {
+      key: '#', code: 'Digit3', metaKey: true, shiftKey: true, bubbles: true, cancelable: true,
+    })),
+  ]);
+  expect(reserved).toEqual([true, true]);
+  await page.keyboard.press('Control+Shift+Digit1');
   await expect(page.getByTestId('workspace-window-conversation:conv-task-chat')).toBeVisible();
   await expect(page).toHaveURL((url) => url.pathname === '/');
   // Warm cached results render without a new transport request.

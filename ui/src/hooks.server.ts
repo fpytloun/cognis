@@ -22,6 +22,8 @@ const contentSecurityPolicy = [
   // Task Control Chat embeds the same Chat v2 route in a same-origin iframe.
   // Keep cross-origin embedding blocked while permitting that product surface.
   "frame-ancestors 'self'",
+  // HTML previews use local Blob URLs inside their existing opaque sandbox.
+  "frame-src 'self' blob:",
   "img-src 'self' data: blob: http: https:",
   "font-src 'self' data:",
   "object-src 'none'",

@@ -330,9 +330,9 @@
 
   <button
     aria-label="Resize window"
-    class="touch-corner-resize absolute bottom-0 right-0 z-30 h-3 w-3 cursor-nwse-resize text-quiet hover:text-foreground focus-visible:bg-accent-subtle"
+    class="touch-corner-resize absolute bottom-0 right-0 z-30 h-6 w-6 cursor-nwse-resize text-quiet hover:text-foreground focus-visible:bg-accent-subtle"
     data-testid={`workspace-window-resize-${current.key}`}
-    style="touch-action:none;width:12px;height:12px"
+    style="touch-action:none;min-width:24px;min-height:24px"
     type="button"
     onpointerdown={(event) => startInteraction(event, 'resize')}
     onpointerup={endInteraction}

@@ -1,5 +1,8 @@
 <script lang="ts">
-  import RecoveryBanner from '$lib/components/RecoveryBanner.svelte';
+  import TaskFinishInstructions from '$lib/components/tasks/TaskFinishInstructions.svelte';
+  import { COMPLETION_MODE_OPTIONS, completionModeLabel as completionFamilyName } from '$lib/task-delivery';
+  import type { CompletionModeFamily } from '$lib/types/api';
+  import ConversationPendingInteractions from '$lib/components/chat-v2/ConversationPendingInteractions.svelte';
 import { DEFAULT_INTARIS_EVALUATION } from '$lib/session-policy';
 import { goto } from '$app/navigation';
 import { page } from '$app/stores';
@@ -17,11 +20,13 @@ import PanelRightOpen from 'lucide-svelte/icons/panel-right-open';
 import PlayCircle from 'lucide-svelte/icons/play-circle';
 import Settings2 from 'lucide-svelte/icons/settings-2';
 import Target from 'lucide-svelte/icons/target';
+import Info from 'lucide-svelte/icons/info';
   import { onMount, tick } from 'svelte';
 
   import { api, asApiError } from '$lib/api/client';
   import AgentAvatar from '$lib/components/AgentAvatar.svelte';
   import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
+  import DocumentCommentCount from '$lib/components/DocumentCommentCount.svelte';
   import CredentialRequestForm from '$lib/components/CredentialRequestForm.svelte';
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import AgentSelect from '$lib/components/AgentSelect.svelte';
@@ -29,7 +34,6 @@ import Target from 'lucide-svelte/icons/target';
   import SessionPolicyEditor from '$lib/components/SessionPolicyEditor.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
-  import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
   import TaskComments from '$lib/components/tasks/TaskComments.svelte';
   import BlockingDialog from '$lib/components/ui/BlockingDialog.svelte';
   import Button from '$lib/components/ui/Button.svelte';
@@ -37,6 +41,9 @@ import Target from 'lucide-svelte/icons/target';
   import Input from '$lib/components/ui/Input.svelte';
   import Sheet from '$lib/components/ui/Sheet.svelte';
   import Tooltip from '$lib/components/ui/Tooltip.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
+  import Badge from '$lib/components/ui/Badge.svelte';
+  import { statusPresentation } from '$lib/status';
   import WorkflowPhases from '$lib/components/task-cockpit/WorkflowPhases.svelte';
   import TaskBrief from '$lib/components/task-cockpit/TaskBrief.svelte';
   import TaskProgressPanel from '$lib/components/task-cockpit/TaskProgressPanel.svelte';
@@ -62,7 +69,9 @@ import Target from 'lucide-svelte/icons/target';
   } from '$lib/task-detail';
   import { renderMarkdown } from '$lib/markdown';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
-  import { taskPrimaryAction, taskPrimaryActionLabel, type TaskPrimaryAction } from '$lib/task-actions';
+  import { confirmCancel, confirmNewRun, confirmPause, taskPrimaryAction, taskPrimaryActionLabel, type TaskPrimaryAction } from '$lib/task-actions';
+  import { taskStoppedSummary } from '$lib/task-attention';
+  import TaskStoppedPanel from '$lib/components/task-cockpit/TaskStoppedPanel.svelte';
   import { policyFromText, policyText, policyEvaluation } from '$lib/session-policy';
   import { formatAbsoluteTime, formatDuration, formatRelativeTime } from '$lib/time';
   import { workflowToFormState, type WorkflowStepFormState } from '$lib/workflows';
@@ -102,18 +111,19 @@ import Target from 'lucide-svelte/icons/target';
   let selectedStepName = $state('');
   let selectedAttemptByStep = $state<Record<string, string>>({});
   let revisionTargetSeed = $state<string | null>(null);
+  let commentsOpen = $state(false);
   let commentsRef = $state<TaskComments | null>(null);
   let mobileStepDetailOpen = $state(false);
   let configModalOpen = $state(false);
   let savedEditForm = $state('');
   let taskActionsOpen = $state(false);
-  let outputModalStepRun = $state<StepRun | null>(null);
   let loadingStepRunId = $state<string | null>(null);
   let stepRunDetailLoadKey = 0;
   let stepHistoryLoading = $state<Set<string>>(new Set());
   let stepHistoryLoaded = $state<Set<string>>(new Set());
   let taskEscalations = $state<Escalation[]>([]);
   let taskCredentialRequest = $state<Notification | null>(null);
+  let taskAttentionError = $state('');
   let taskEscalationBusyCallId = $state<string | null>(null);
   let pollTimer: number | null = null;
   let tickNow = $state(Date.now());
@@ -127,6 +137,7 @@ import Target from 'lucide-svelte/icons/target';
     stepRunId: string | null;
     stepName: string;
     agent: Agent | null;
+    tab: 'result' | 'transcript';
   };
 
   // Session logs drawer
@@ -149,8 +160,9 @@ import Target from 'lucide-svelte/icons/target';
     project_id: '',
     delivery_mode: 'same_conversation',
     delivery_target: '',
-    completion_mode_family: 'default' as 'default' | 'direct',
+    completion_mode_family: 'auto' as CompletionModeFamily,
     allow_silent_completion: false,
+    on_finish_instructions: '',
     interaction_mode_override: '' as '' | 'none' | 'explicit_gates' | 'step_requests',
     escalation_timeout_seconds: '',
     allow_policy_text: '',
@@ -162,18 +174,6 @@ import Target from 'lucide-svelte/icons/target';
   let projectWorkflowOptionsLoaded = $state(false);
   let projectWorkflowLoadKey = 0;
   let lastProjectWorkflowKey = $state('');
-
-  const statusColors: Record<string, string> = {
-    pending: 'border-control-border text-muted',
-    running: 'border-accent text-accent',
-    evaluating: 'border-violet-border text-violet-tone',
-    approved: 'border-success-border text-success',
-    completed: 'border-success-border text-success',
-    failed: 'border-danger-border text-danger',
-    cancelled: 'border-control-border text-quiet',
-    paused: 'border-warning-border text-warning',
-    rejected: 'border-accent text-accent',
-  };
 
   const statusHints: Record<string, string> = {
     pending: 'Step is queued and waiting to start',
@@ -203,8 +203,8 @@ import Target from 'lucide-svelte/icons/target';
   }
 
   function workflowName(workflowId: string | null): string {
-    if (!workflowId) return 'Auto';
-    return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
+    if (!workflowId) return 'General task';
+    return workflows.find((w) => w.workflow_id === workflowId)?.name ?? (taskOptionsLoading ? 'Loading workflow…' : workflowId);
   }
 
   function currentWorkflow(): Workflow | null {
@@ -234,13 +234,14 @@ import Target from 'lucide-svelte/icons/target';
       specific_conversation: 'Specific conversation',
       latest_active_for_agent: 'Latest active',
       preferred_channel: 'Preferred channel',
+      in_app_notifications: 'In-app notifications',
       silent: 'Silent'
     };
     return labels[mode] ?? mode;
   }
 
-  function completionModeFamilyLabel(mode: 'default' | 'direct'): string {
-    return mode === 'direct' ? 'Direct delivery' : 'Default delivery';
+  function completionModeFamilyLabel(mode: CompletionModeFamily): string {
+    return `${completionFamilyName(mode)} delivery`;
   }
 
   function priorityTone(priority: number): string {
@@ -249,11 +250,12 @@ import Target from 'lucide-svelte/icons/target';
     return 'border-control-border bg-surface/80 text-secondary';
   }
 
-  function completionModeLabel(taskDetail: TaskDetail): string {
+  /** How a completed task delivered its result; other states have no delivery outcome. */
+  function completedDeliveryLabel(taskDetail: TaskDetail): string | null {
+    if (taskDetail.status !== 'completed') return null;
     if (taskDetail.applied_completion_mode === 'silent') return 'Completed silently';
-    if (taskDetail.applied_completion_mode === 'direct') return 'Completed via direct delivery';
-    if (taskDetail.status === 'completed') return 'Completed';
-    return taskDetail.status;
+    if (taskDetail.applied_completion_mode === 'direct') return 'Delivered directly';
+    return null;
   }
 
   function toggleStepHistory(stepName: string): void {
@@ -330,6 +332,8 @@ import Target from 'lucide-svelte/icons/target';
     configModalOpen = false;
   }
 
+  let stoppedSummary = $derived(task ? taskStoppedSummary(task) : null);
+
   function mobilePrimaryActionLabel(): string {
     return taskPrimaryActionLabel(mobilePrimaryAction());
   }
@@ -359,6 +363,10 @@ import Target from 'lucide-svelte/icons/target';
       openRevisionComposer();
       return;
     }
+    if (action === 'retry') {
+      void rerunTask(true);
+      return;
+    }
     if (action === 'rerun') {
       void rerunTask();
       return;
@@ -372,6 +380,7 @@ import Target from 'lucide-svelte/icons/target';
 
   function openRevisionComposer(): void {
     const target = selectedStepName || revisionStepOptions[0]?.name || '';
+    commentsOpen = true;
     if (target) commentsRef?.setRevisionTarget(target);
     document.getElementById('task-comments-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -409,9 +418,6 @@ import Target from 'lucide-svelte/icons/target';
       const detail = await api.tasks.stepRunDetail(stepRunId);
       if (key !== stepRunDetailLoadKey) return null;
       replaceStepRun(detail);
-      if (outputModalStepRun?.step_run_id === stepRunId) {
-        outputModalStepRun = detail;
-      }
       return detail;
     } catch (err) {
       const apiError = asApiError(err);
@@ -422,19 +428,6 @@ import Target from 'lucide-svelte/icons/target';
         loadingStepRunId = null;
       }
     }
-  }
-
-  function openOutputModal(stepRun: StepRun): void {
-    if (isProjectedStepRun(stepRun)) {
-      outputModalStepRun = stepRun;
-      void loadStepRunDetail(stepRun.step_run_id);
-      return;
-    }
-    outputModalStepRun = stepRun;
-  }
-
-  function closeOutputModal(): void {
-    outputModalStepRun = null;
   }
 
   function stepOutputSummary(stepRun: StepRun): string {
@@ -791,11 +784,12 @@ import Target from 'lucide-svelte/icons/target';
     return 'text-muted';
   }
 
-  function openSessionLogs(stepRun: StepRun): void {
+  /** Open the step viewer; a step without a recorded session shows only its result. */
+  function openStepViewer(stepRun: StepRun, tab: 'result' | 'transcript'): void {
     const sessionId = String(stepRun.output?.session_id ?? stepRun.session_id ?? '');
-    if (!sessionId || !task) return;
-    let conversationId = stepRun.conversation_id;
-    if (!conversationId) {
+    if (!task || (!sessionId && tab === 'transcript')) return;
+    let conversationId = stepRun.conversation_id ?? '';
+    if (!conversationId && sessionId) {
       const conv = conversations.find((c) =>
         c.context?.ref === task!.task_id && c.title?.includes(stepRun.step_name)
       ) ?? conversations.find((c) => c.context?.ref === task!.task_id);
@@ -806,10 +800,19 @@ import Target from 'lucide-svelte/icons/target';
       conversationId,
       sessionId,
       stepRunId: stepRun.step_run_id,
-      stepName: `${stepRun.step_name} (attempt ${stepRun.attempt})`,
-      agent: agentFor(stepRun.agent_id)
+      stepName: stepRun.step_name,
+      agent: agentFor(stepRun.agent_id),
+      tab
     };
     if (isProjectedStepRun(stepRun)) void loadStepRunDetail(stepRun.step_run_id);
+  }
+
+  function openSessionLogs(stepRun: StepRun): void {
+    openStepViewer(stepRun, 'transcript');
+  }
+
+  function openOutputModal(stepRun: StepRun): void {
+    openStepViewer(stepRun, 'result');
   }
 
   async function openSessionLogsById(sessionId: string, node?: import('$lib/chat-v2/types').WorkstreamRef): Promise<void> {
@@ -833,7 +836,8 @@ import Target from 'lucide-svelte/icons/target';
       sessionId,
       stepRunId: null,
       stepName: sessionRow?.delegation_task ?? sessionRow?.agent_id ?? sessionId,
-      agent: agentFor(sessionRow?.agent_id ?? null)
+      agent: agentFor(sessionRow?.agent_id ?? null),
+      tab: 'transcript'
     };
   }
 
@@ -1067,6 +1071,7 @@ import Target from 'lucide-svelte/icons/target';
   });
 
   function startRevisionForStep(stepName: string): void {
+    commentsOpen = true;
     revisionTargetSeed = stepName;
     if (commentsRef) commentsRef.setRevisionTarget(stepName);
     if (typeof document !== 'undefined') {
@@ -1156,9 +1161,7 @@ import Target from 'lucide-svelte/icons/target';
           ? projectedActiveStep
             ? 'Agent is executing'
             : 'Task is live'
-          : task.status === 'paused'
-            ? 'Task paused'
-            : task.status,
+          : statusPresentation(task.status).label,
     };
   });
 
@@ -1241,6 +1244,7 @@ import Target from 'lucide-svelte/icons/target';
     const pause = task.pending_pause;
     if (pause.pause_type === 'escalation') return null;
     if (pause.pause_type === 'credential_request') return null;
+    if (pause.pause_type === 'auth_challenge') return null;
     const currentStepName = task.workflow_run?.current_step_name;
     if (pause.step_name && currentStepName && pause.step_name !== currentStepName) {
       return {
@@ -1415,7 +1419,9 @@ import Target from 'lucide-svelte/icons/target';
       taskCredentialRequest = null;
       return;
     }
-    const notifications = await api.notifications.list(null, { taskId: task.task_id });
+    const requestedTaskId = task.task_id;
+    const notifications = await api.notifications.list(null, { taskId: requestedTaskId });
+    if (task?.task_id !== requestedTaskId) return;
     taskEscalations = sortEscalations(
       notifications
         .map((notification) => taskEscalationFromNotification(notification))
@@ -1425,6 +1431,7 @@ import Target from 'lucide-svelte/icons/target';
     taskCredentialRequest = notifications.find(
       (notification) => notification.notification_type === 'credential_request' && notification.status === 'pending'
     ) ?? null;
+    taskAttentionError = '';
   }
 
   // ---------------------------------------------------------------------------
@@ -1435,6 +1442,11 @@ import Target from 'lucide-svelte/icons/target';
   let taskOptionsLoading = $state(true);
 
   async function loadTask(): Promise<void> {
+    if (task?.task_id !== taskIdFromRoute()) {
+      taskEscalations = [];
+      taskCredentialRequest = null;
+      taskAttentionError = '';
+    }
     const refreshGeneration = ++taskRefreshGeneration;
     const optionsGeneration = ++taskOptionsGeneration;
     taskOptionsLoading = true;
@@ -1458,6 +1470,7 @@ import Target from 'lucide-svelte/icons/target';
         delivery_target: task.delivery.target ?? '',
         completion_mode_family: task.completion_mode_family,
         allow_silent_completion: task.allow_silent_completion,
+        on_finish_instructions: task.on_finish_instructions ?? '',
         interaction_mode_override: task.interaction_mode_override ?? '',
         escalation_timeout_seconds: task.escalation_timeout_seconds?.toString() ?? '',
         allow_policy_text: policyText(task.session_policy, 'allow_policies'),
@@ -1483,9 +1496,8 @@ import Target from 'lucide-svelte/icons/target';
       void loadProjectWorkflowOptions(editForm.project_id);
       try {
         await refreshTaskEscalations();
-      } catch {
-        taskEscalations = [];
-        taskCredentialRequest = null;
+      } catch (caught) {
+        taskAttentionError = `Task requests may be unavailable or stale. ${asApiError(caught).message}`;
       }
     } catch (caughtError) {
       if (refreshGeneration !== taskRefreshGeneration) return;
@@ -1526,9 +1538,8 @@ import Target from 'lucide-svelte/icons/target';
       }
       try {
         await refreshTaskEscalations();
-      } catch {
-        taskEscalations = [];
-        taskCredentialRequest = null;
+      } catch (caught) {
+        taskAttentionError = `Task requests may be unavailable or stale. ${asApiError(caught).message}`;
       }
       try {
         await commentsRef?.refresh();
@@ -1578,6 +1589,7 @@ import Target from 'lucide-svelte/icons/target';
         delivery_target: editForm.delivery_mode === 'specific_conversation' ? editForm.delivery_target : null,
         completion_mode_family: editForm.completion_mode_family,
         allow_silent_completion: editForm.allow_silent_completion,
+        on_finish_instructions: editForm.completion_mode_family !== 'direct' ? editForm.on_finish_instructions.trim() || null : null,
         interaction_mode_override: editForm.interaction_mode_override || null,
         escalation_timeout_seconds: editForm.escalation_timeout_seconds
           ? Number(editForm.escalation_timeout_seconds)
@@ -1701,12 +1713,7 @@ import Target from 'lucide-svelte/icons/target';
 
   async function cancelTask(): Promise<void> {
     if (!task) return;
-    const confirmed = await confirmAction({
-      title: 'Cancel task?',
-      message: 'This stops the task and marks it as cancelled. This action cannot be undone.',
-      confirmLabel: 'Cancel task'
-    });
-    if (!confirmed) return;
+    if (!(await confirmCancel())) return;
     try {
       await api.tasks.cancel(task.task_id);
       task = await api.tasks.detail(task.task_id);
@@ -1719,6 +1726,7 @@ import Target from 'lucide-svelte/icons/target';
 
   async function changeLifecycle(action: 'submit' | 'pause' | 'resume'): Promise<void> {
     if (!task || lifecycleBusy) return;
+    if (action === 'pause' && !(await confirmPause())) return;
     lifecycleBusy = true;
     try {
       await api.tasks[action](task.task_id);
@@ -1734,6 +1742,8 @@ import Target from 'lucide-svelte/icons/target';
 
   async function rerunTask(recover = false): Promise<void> {
     if (!task || rerunBusy) return;
+    // Paused tasks and in-place recovery keep the same task; anything else creates a new one.
+    if (!recover && task.status !== 'paused' && !(await confirmNewRun(task.status))) return;
     rerunBusy = true;
     try {
       const rerun = recover === true && task.status === 'failed'
@@ -1741,7 +1751,7 @@ import Target from 'lucide-svelte/icons/target';
         : await api.tasks.rerun(task.task_id);
       error = '';
       if (rerun.created_new) {
-        addToast('Created a new rerun task.', 'success');
+        addToast('Started a new run.', 'success');
         await goto(`/tasks/${rerun.task_id}`);
         return;
       }
@@ -1821,26 +1831,27 @@ import Target from 'lucide-svelte/icons/target';
             <div class="mt-2 flex flex-wrap items-center gap-2 text-sm text-muted">
               <span>Owner agent</span>
               <span class="font-medium text-foreground">{agentName(task.agent_id)}</span>
-              <span class="rounded-full border px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] {priorityTone(task.priority)}">P{task.priority}</span>
+              {#if task.priority !== 0}
+                <span title="Priority"><Badge class={priorityTone(task.priority)}>P{task.priority}</Badge></span>
+              {/if}
               {#if task.attempt_number > 1}
                 <span class="rounded-full border border-warning-border bg-warning-subtle px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-warning" title="Task has been revised">Attempt #{task.attempt_number}</span>
               {/if}
               {#if task.project_id}
-                <a href="/projects/{task.project_id}" class="rounded-full border border-violet-border bg-violet-subtle px-2.5 py-1 text-[11px] font-medium tracking-wide text-violet-tone hover:border-violet-border hover:text-violet-tone">Project</a>
+                <a href="/projects/{task.project_id}" class="hover:underline"><Badge class="border-violet-border bg-violet-subtle text-violet-tone">{projects.find((project) => project.project_id === task?.project_id)?.name ?? 'Project'}</Badge></a>
               {/if}
-              <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">{deliveryModeLabel(task.delivery.mode)}</span>
-              <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">{completionModeFamilyLabel(task.completion_mode_family)}</span>
-              {#if task.allow_silent_completion}
-                <span class="rounded-full border border-control-border bg-surface/80 px-2.5 py-1 text-[11px] text-secondary">Silent allowed</span>
-              {/if}
+              <span title={`Result goes to: ${deliveryModeLabel(task.delivery.mode)}. ${completionModeFamilyLabel(task.completion_mode_family)}.${task.allow_silent_completion ? ' The agent may finish without a message when nothing changed.' : ''}`}>
+                <Badge class="text-secondary">Delivery: {deliveryModeLabel(task.delivery.mode)}{task.allow_silent_completion ? ' · may be silent' : ''}</Badge>
+              </span>
             </div>
           </div>
         </div>
       </div>
       <div class="flex w-full flex-col items-start gap-3 sm:w-auto sm:items-end">
-        <span class="rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-[0.2em] {statusColors[task.status] ?? 'border-control-border text-foreground'}">
-          {completionModeLabel(task)}
-        </span>
+        <div class="flex items-center gap-2" data-testid="task-status">
+          <StatusBadge status={task.status} />
+          {#if completedDeliveryLabel(task)}<span class="text-xs text-muted">{completedDeliveryLabel(task)}</span>{/if}
+        </div>
         <div class="flex w-full flex-wrap gap-2 sm:w-auto sm:justify-end">
           <Button class="flex-1 justify-center sm:flex-none lg:hidden" size="sm" disabled={rerunBusy} onclick={openMobilePrimaryAction}>
             {mobilePrimaryActionLabel()}
@@ -1849,20 +1860,22 @@ import Target from 'lucide-svelte/icons/target';
             <MoreVertical class="h-3.5 w-3.5" />
           </Button>
 
-          {#if isRerunnable}
-            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={rerunBusy} onclick={() => void rerunTask()}>
-              Re-run task
-            </Button>
-          {/if}
+          <!-- One filled action per state; the rest are secondary. -->
           {#if task.status === 'draft'}
             <Button class="hidden lg:inline-flex" size="sm" disabled={lifecycleBusy} onclick={() => void changeLifecycle('submit')}>Submit task</Button>
           {:else if task.status === 'running' || task.status === 'evaluating'}
             <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={lifecycleBusy} onclick={() => void changeLifecycle('pause')}>Pause task</Button>
           {:else if task.status === 'paused'}
-             <Button class="hidden lg:inline-flex" size="sm" disabled={lifecycleBusy} onclick={handlePausedPrimaryAction}>{activePause ? 'Review decision' : 'Resume task'}</Button>
-          {/if}
-          {#if TERMINAL_STATUSES.includes(task.status) && task.workflow_id}
+            <Button class="hidden lg:inline-flex" size="sm" disabled={lifecycleBusy} onclick={handlePausedPrimaryAction}>{activePause ? 'Review decision' : 'Resume task'}</Button>
+          {:else if task.status === 'failed' && isRerunnable}
+            <Button class="hidden lg:inline-flex" size="sm" disabled={rerunBusy} onclick={() => void rerunTask(true)}>Retry from failed step</Button>
+          {:else if task.status === 'completed' && task.workflow_id}
             <Button class="hidden lg:inline-flex" size="sm" onclick={openRevisionComposer}>Revise result</Button>
+          {/if}
+          {#if isRerunnable && task.status !== 'paused'}
+            <Button class="hidden lg:inline-flex" size="sm" variant="secondary" disabled={rerunBusy} onclick={() => void rerunTask()}>
+              Start a new run
+            </Button>
           {/if}
           <Button class="hidden lg:inline-flex" size="sm" variant="secondary" onclick={() => (configModalOpen = true)}>
             <Settings2 class="mr-1.5 h-3.5 w-3.5" />
@@ -1877,7 +1890,7 @@ import Target from 'lucide-svelte/icons/target';
              Ask
           </Button>
           {#if isCancellable}
-            <Button class="hidden lg:inline-flex" size="sm" variant="danger" onclick={cancelTask}>Cancel task</Button>
+            <Button class="hidden lg:inline-flex" size="sm" variant="ghost" onclick={cancelTask}><span class="text-danger">Cancel task</span></Button>
           {/if}
         </div>
       </div>
@@ -1893,12 +1906,19 @@ import Target from 'lucide-svelte/icons/target';
         onGate={(action, instruction) => { gateFeedback = instruction; return respondToGate(action); }}
         onQuestion={(answers) => respondToStepQuestion(answers)}
       />
+    {:else if stoppedSummary && task.pending_pause?.pause_type !== 'auth_challenge' && taskEscalations.length === 0 && !taskCredentialRequest}
+      <TaskStoppedPanel
+        summary={stoppedSummary}
+        actionLabel={isRerunnable ? (task.status === 'paused' ? 'Resume task' : 'Retry from failed step') : null}
+        busy={rerunBusy}
+        onAction={() => void rerunTask(true)}
+      />
     {/if}
 
     <TaskBrief
       {task}
       workflowLabel={workflowName(task.workflow_id)}
-      projectLabel={task.project_id ? projects.find((project) => project.project_id === task?.project_id)?.name ?? task.project_id : 'No project'}
+      projectLabel={task.project_id ? projects.find((project) => project.project_id === task?.project_id)?.name ?? (taskOptionsLoading ? 'Loading project…' : task.project_id) : 'No project'}
       agentLabel={agentName(task.agent_id)}
     />
 
@@ -1944,10 +1964,10 @@ import Target from 'lucide-svelte/icons/target';
                       </Tooltip>
                     {/if}
                     {#if stepHasOutput[selectedStepGroup.stepName]}
-                      <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open output</Button>
+                      <Button size="sm" variant="secondary" onclick={() => openOutputModalForStep(selectedStepGroup.stepName)}>Open result</Button>
                     {/if}
                     {#if stepHasLogs[selectedStepGroup.stepName]}
-                      <Button size="sm" variant="secondary" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open logs</Button>
+                      <Button size="sm" variant="secondary" onclick={() => openSessionLogsForStep(selectedStepGroup.stepName)}>Open transcript</Button>
                     {/if}
                     <Button class="lg:hidden" size="sm" variant="secondary" onclick={() => openStepDetail(selectedStepGroup.stepName)}>
                       <PanelRightOpen class="mr-1.5 h-3.5 w-3.5" />
@@ -1967,7 +1987,7 @@ import Target from 'lucide-svelte/icons/target';
                         type="button"
                       >
                         <span class="truncate max-w-[12rem]">{dependency.title}</span>
-                        <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wide {statusColors[dependency.status] ?? 'border-control-border text-muted'}">{dependency.status}</span>
+                        <StatusBadge status={dependency.status} />
                       </button>
                       <ArrowRight class="h-3.5 w-3.5 text-quiet" />
                     {/each}
@@ -1979,6 +1999,8 @@ import Target from 'lucide-svelte/icons/target';
             <div class="px-3 py-3 sm:px-5 sm:py-4">
             <WorkflowPhases
               projection={task.workflow_projection}
+              plannedWorkflow={task.workflow_id ? workflows.find((workflow) => workflow.workflow_id === task?.workflow_id) ?? null : null}
+              taskStatus={task.status}
               selectedStepName={selectedStepGroup?.stepName ?? ''}
               onStepSelect={(stepName) => openStepDetail(stepName)}
               onStepLogsOpen={openSessionLogsForStep}
@@ -1987,7 +2009,7 @@ import Target from 'lucide-svelte/icons/target';
             </div>
         </Card>
 
-        <details open={revisionTargetSeed !== null} id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-separator bg-canvas/40 p-4">
+        <details bind:open={commentsOpen} id="task-comments-anchor" class="order-6 scroll-mt-20 rounded-3xl border border-separator bg-canvas/40 p-4">
           <summary class="cursor-pointer text-sm font-medium text-strong">Collaboration, revisions, and notes</summary>
           <div class="mt-4">
             <TaskComments
@@ -2023,24 +2045,17 @@ import Target from 'lucide-svelte/icons/target';
           />
         {/if}
 
-        {#if (task.status === 'failed' || task.status === 'paused') && !activePause && taskEscalations.length === 0 && !taskCredentialRequest && !rerunBusy}
-          {#if isRerunnable}
-            <RecoveryBanner
-              message={task.result_summary || task.applied_completion_reason || 'The task cannot continue automatically. Review the latest step evidence, then retry.'}
-              actionLabel={task.status === 'paused' ? 'Continue task' : 'Retry task'}
-              onRetry={() => void rerunTask(true)}
-            />
-          {:else}
-          <Card class="border-danger-border bg-danger-subtle p-4">
-            <p class="text-xs font-semibold uppercase tracking-[0.25em] text-danger">{task.status === 'failed' ? 'Task failed' : 'Task blocked'}</p>
-            {#if task.result_summary || task.applied_completion_reason}
-              <div class="prose prose-sm prose-invert mt-2 max-w-none text-foreground">{@html renderMarkdown(task.result_summary || task.applied_completion_reason || '')}</div>
-            {:else}
-              <p class="mt-2 text-sm text-foreground">The task cannot continue automatically. Review the latest step evidence, then revise, resume, or re-run it.</p>
-            {/if}
-          </Card>
-          {/if}
+        {#if taskAttentionError}
+          <div role="alert" class="text-sm text-danger">
+            {taskAttentionError}
+            <Button variant="secondary" size="sm" onclick={() => void refreshTaskOnly({ force: true })}>Retry requests</Button>
+          </div>
         {/if}
+        {#key task.task_id}
+          <ConversationPendingInteractions taskId={task.task_id} notificationTypes={['auth_challenge']} />
+        {/key}
+
+
         </div>
 
         {#if (task.status === 'running' || task.status === 'evaluating') && !activePause}
@@ -2052,6 +2067,8 @@ import Target from 'lucide-svelte/icons/target';
         <div id="result" class="order-3 scroll-mt-20">
           <TaskWorkPanel
             stepRuns={task.step_runs}
+            finalDeliverable={task.final_deliverable}
+            outputPresentation={task.output_presentation}
             {agents}
             canonicalDeliverableId={typeof task.result_data?.final_deliverable_id === 'string' ? task.result_data.final_deliverable_id : null}
             onViewSession={(sessionId, node) => { void openSessionLogsById(sessionId, node); }}
@@ -2093,7 +2110,7 @@ import Target from 'lucide-svelte/icons/target';
                       <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
                       {#if stepTryLabel(run)}<span class="text-[10px] text-quiet">{stepTryLabel(run)}</span>{/if}
                       {#if isLatestRun}<span class="rounded-full border border-accent/30 bg-accent-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-accent">latest</span>{/if}
-                      <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-control-border text-muted'}">{status}</span>
+                      <StatusBadge {status} />
                     </button>
                   {/each}
                   {#if !isLatestAttemptSelected}
@@ -2163,13 +2180,13 @@ import Target from 'lucide-svelte/icons/target';
                           </Button>
                         {/if}
                         {#if attempt.output?.session_id || attempt.session_id}
-                          <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
+                          <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Transcript</Button>
                         {/if}
                         {#if isEditable}
                           <Button size="sm" variant="secondary" onclick={() => startRevisionForStep(selectedStepGroup.stepName)}>Revise</Button>
                         {/if}
                         <Tooltip text={displayStepStatusHint(attempt)}>
-                          <span class="cursor-help rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-control-border text-muted'}">{visibleStatus}</span>
+                          <span class="cursor-help"><StatusBadge status={visibleStatus} /></span>
                         </Tooltip>
                       </div>
                     </div>
@@ -2298,6 +2315,7 @@ import Target from 'lucide-svelte/icons/target';
                             {#each attempt.deliverables as item}
                               <span class={`rounded-full border px-2.5 py-1 ${item.status === 'delivered' ? 'border-success-border bg-success-subtle text-success' : item.status === 'approved' ? 'border-accent/30 bg-accent-subtle text-accent' : item.status === 'rejected' ? 'border-accent/30 bg-accent-subtle text-accent' : 'border-control-border bg-surface/80 text-secondary'}`}>
                                 v{item.version} {item.status}
+                                <DocumentCommentCount id={item.deliverable_id} />
                               </span>
                             {/each}
                           </div>
@@ -2352,7 +2370,7 @@ import Target from 'lucide-svelte/icons/target';
 
                       {#if hasRecordedStepOutput(attempt)}
                         <div class="mt-4 flex flex-wrap items-center gap-2 border-t border-separator pt-3">
-                          <Button size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
+                          <Button size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Open result</Button>
                           <span class="text-xs text-quiet">Includes deliverable versions, completion metadata, and any recorded reasoning.</span>
                         </div>
                       {/if}
@@ -2545,9 +2563,9 @@ import Target from 'lucide-svelte/icons/target';
               </div>
               <div class="flex justify-between">
                 <dt class="inline-flex items-center gap-1 text-quiet">
-                   Steps
+                   Attempts
                   <Tooltip text="Total number of step execution attempts, including retries. Higher than step count when steps are retried after evaluation rejection.">
-                    <span class="cursor-help text-quiet">(?)</span>
+                    <span class="cursor-help text-quiet" role="img" aria-label="What this means"><Info class="h-3.5 w-3.5" /></span>
                   </Tooltip>
                 </dt>
                 <dd class="font-mono text-foreground">{stats.totalAttempts}</dd>
@@ -2557,7 +2575,7 @@ import Target from 'lucide-svelte/icons/target';
                   <dt class="inline-flex items-center gap-1 text-quiet">
                      Retries
                     <Tooltip text="Times the evaluator sent a step back for revision. The agent retries within the same step run.">
-                      <span class="cursor-help text-quiet">(?)</span>
+                      <span class="cursor-help text-quiet" role="img" aria-label="What this means"><Info class="h-3.5 w-3.5" /></span>
                     </Tooltip>
                   </dt>
                   <dd class="font-mono text-accent">{stats.evalRevisions}</dd>
@@ -2574,7 +2592,7 @@ import Target from 'lucide-svelte/icons/target';
                   <dt class="inline-flex items-center gap-1 text-quiet">
                     Review loops
                     <Tooltip text="Times a review loop sent execution back to an earlier step (e.g. code review rejecting implementation back to the plan step).">
-                      <span class="cursor-help text-quiet">(?)</span>
+                      <span class="cursor-help text-quiet" role="img" aria-label="What this means"><Info class="h-3.5 w-3.5" /></span>
                     </Tooltip>
                   </dt>
                   <dd class="font-mono text-accent">{stats.totalLoops}</dd>
@@ -2585,7 +2603,7 @@ import Target from 'lucide-svelte/icons/target';
                   <dt class="inline-flex items-center gap-1 text-quiet">
                     Re-executed steps
                     <Tooltip text="Steps that were executed more than once (full re-execution, not just in-place revision). Happens when a review loop sends execution back to an earlier step.">
-                      <span class="cursor-help text-quiet">(?)</span>
+                      <span class="cursor-help text-quiet" role="img" aria-label="What this means"><Info class="h-3.5 w-3.5" /></span>
                     </Tooltip>
                   </dt>
                   <dd class="font-mono text-foreground">{stats.multiAttemptSteps}</dd>
@@ -2668,14 +2686,14 @@ import Target from 'lucide-svelte/icons/target';
                   <span class="font-mono text-[11px]">{attemptLabel(run)}</span>
                   {#if stepTryLabel(run)}<span class="text-[10px] text-quiet">{stepTryLabel(run)}</span>{/if}
                   {#if isLatestRun}<span class="rounded-full border border-accent/30 bg-accent-subtle px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-accent">latest</span>{/if}
-                  <span class="rounded-full border px-1.5 py-0.5 text-[10px] uppercase tracking-wider {statusColors[status] ?? 'border-control-border text-muted'}">{status}</span>
+                  <StatusBadge {status} />
                 </button>
               {/each}
             </div>
           {/if}
           <div class="rounded-3xl border border-separator bg-surface/60 p-4">
             <div class="flex items-center justify-between gap-3">
-              <span class="rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider {statusColors[visibleStatus] ?? 'border-control-border text-muted'}">{visibleStatus}</span>
+              <StatusBadge status={visibleStatus} />
               <div class="flex items-center gap-2">
                 {#if attempt.output?.session_id || attempt.session_id}
                   <Button size="sm" variant="secondary" disabled={chatBusyKey !== null} onclick={() => openStepChat(attempt)}>
@@ -2686,7 +2704,7 @@ import Target from 'lucide-svelte/icons/target';
                     {/if}
                     Chat
                   </Button>
-                  <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Logs</Button>
+                  <Button size="sm" variant="secondary" onclick={() => openSessionLogs(attempt)}>Transcript</Button>
                 {/if}
               </div>
             </div>
@@ -2772,7 +2790,7 @@ import Target from 'lucide-svelte/icons/target';
                 <p class="mt-3 text-sm text-muted">Open the full output to inspect completion metadata and the finalized assistant output.</p>
               {/if}
               {#if hasRecordedStepOutput(attempt)}
-                <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Show full output</Button>
+                <Button class="mt-4" size="sm" variant="secondary" onclick={() => openOutputModal(attempt)}>Open result</Button>
               {/if}
             </div>
           </div>
@@ -2790,9 +2808,8 @@ import Target from 'lucide-svelte/icons/target';
           <div>
             <p class="text-xs uppercase tracking-[0.25em] text-quiet">Task configuration</p>
             <h2 class="mt-1 text-xl font-semibold text-strong" id="task-config-title">{task?.title ?? 'Task configuration'}</h2>
-            <p class="mt-2 text-sm text-muted">Configuration is secondary to live execution, so edits live here while the main page stays focused on workflow progress.</p>
+            <p class="mt-2 text-sm text-muted">Changes apply to the next step this task runs.</p>
           </div>
-          <Button size="sm" variant="secondary" onclick={closeConfigModal}>Close</Button>
         </div>
       {/snippet}
 
@@ -2827,13 +2844,13 @@ import Target from 'lucide-svelte/icons/target';
           <label class="space-y-2 text-sm font-medium text-foreground">
             <span>Workflow</span>
             <select bind:value={editForm.workflow_id} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
-              <option value="">Auto{editForm.project_id ? ' (project-aware)' : ''}</option>
+              <option value="">General task</option>
               {#each (projectWorkflowOptionsLoaded ? projectWorkflowOptions : workflows) as workflow}
                 <option value={workflow.workflow_id}>{workflow.name}</option>
               {/each}
             </select>
             {#if editForm.project_id && projectWorkflowOptionsLoaded && projectWorkflowOptions.length === 0}
-              <span class="block text-xs text-quiet">No workflows are bound to this project. Pick "Auto" or bind a workflow on the project page.</span>
+              <span class="block text-xs text-quiet">No workflows are bound to this project. Use General task or bind a workflow on the project page.</span>
             {/if}
           </label>
           <label class="space-y-2 text-sm font-medium text-foreground">
@@ -2864,7 +2881,8 @@ import Target from 'lucide-svelte/icons/target';
               {#if (task?.source_type === 'chat' || task?.source_type === 'agent') && task.source_ref}
                 <option value="same_conversation">Same conversation</option>
               {/if}
-              <option value="preferred_channel">Preferred channel</option>
+               <option value="preferred_channel">Preferred channel</option>
+               <option value="in_app_notifications">In-app notifications (direct only)</option>
               <option value="specific_conversation">Specific conversation</option>
               <option value="latest_active_for_agent">Latest active</option>
             </select>
@@ -2885,9 +2903,10 @@ import Target from 'lucide-svelte/icons/target';
         <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Completion notification behavior</span>
           <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-            <select bind:value={editForm.completion_mode_family} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
-              <option value="default">Default delivery</option>
-              <option value="direct">Direct channel delivery</option>
+            <select bind:value={editForm.completion_mode_family} disabled={!isEditable || editForm.delivery_mode === 'in_app_notifications'} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
+              {#each COMPLETION_MODE_OPTIONS as option}
+                <option value={option.value}>{option.name} — {option.description}</option>
+              {/each}
             </select>
             <label class="inline-flex items-center gap-2 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground disabled:opacity-50">
               <input bind:checked={editForm.allow_silent_completion} disabled={!isEditable} class="h-4 w-4 rounded border-control-border bg-canvas" type="checkbox" />
@@ -2896,6 +2915,7 @@ import Target from 'lucide-svelte/icons/target';
           </div>
         </label>
 
+        <TaskFinishInstructions deliveryMode={editForm.delivery_mode} bind:completionMode={editForm.completion_mode_family} bind:instructions={editForm.on_finish_instructions} disabled={!isEditable} />
         <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
           <span>Interaction policy</span>
           <select bind:value={editForm.interaction_mode_override} disabled={!isEditable} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground disabled:opacity-50">
@@ -2986,21 +3006,25 @@ import Target from 'lucide-svelte/icons/target';
         {:else if task?.status === 'running' || task?.status === 'evaluating'}
           <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void changeLifecycle('pause'); }} disabled={lifecycleBusy}>Pause task</Button>
         {:else if task?.status === 'paused'}
-          <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void changeLifecycle('resume'); }} disabled={lifecycleBusy}>Resume task</Button>
+          <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; handlePausedPrimaryAction(); }} disabled={lifecycleBusy}>{activePause ? 'Review decision' : 'Resume task'}</Button>
+        {:else if task?.status === 'failed' && isRerunnable}
+          <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; void rerunTask(true); }} disabled={rerunBusy}>Retry from failed step</Button>
+        {/if}
+        {#if isRerunnable && task?.status !== 'paused'}
+          <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void rerunTask(); }} disabled={rerunBusy}>
+            Start a new run
+          </Button>
         {/if}
         <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; configModalOpen = true; }} disabled={!isEditable}>
           Configure task
         </Button>
         <Button class="w-full justify-center" variant="secondary" onclick={() => { taskActionsOpen = false; void openTaskChat(); }} disabled={chatBusyKey !== null}>Ask</Button>
-        {#if isRerunnable}
-          <Button class="w-full justify-center" onclick={() => { taskActionsOpen = false; void rerunTask(); }} disabled={rerunBusy}>
-            Re-run task
-          </Button>
-        {/if}
         {#if isCancellable}
-          <Button class="w-full justify-center" variant="danger" onclick={() => { taskActionsOpen = false; void cancelTask(); }}>
-            Cancel task
-          </Button>
+          <div class="border-t border-separator pt-2">
+            <Button class="w-full justify-center" variant="ghost" onclick={() => { taskActionsOpen = false; void cancelTask(); }}>
+              <span class="text-danger">Cancel task</span>
+            </Button>
+          </div>
         {/if}
       </div>
     {/snippet}
@@ -3013,25 +3037,18 @@ import Target from 'lucide-svelte/icons/target';
     onQuestion={(answers) => respondToStepQuestion(answers)}
   />
 
-  {#if outputModalStepRun}
-    <StepOutputModal
-      stepRun={outputModalStepRun}
-      agentName={agentName(outputModalStepRun.agent_id)}
-      agentAvatarUrl={agentFor(outputModalStepRun.agent_id)?.avatar_url ?? null}
-      visibleStatus={displayStepStatus(outputModalStepRun)}
-      onclose={closeOutputModal}
-    />
-  {/if}
-
-  <!-- Session logs drawer -->
+  <!-- Step viewer: Result and Transcript of one step attempt, or a child session transcript. -->
   {#if sessionDrawer}
-    {#key `${sessionDrawer.conversationId}:${sessionDrawer.sessionId}`}
+    {#key `${sessionDrawer.conversationId}:${sessionDrawer.sessionId}:${sessionDrawer.stepRunId}:${sessionDrawer.tab}`}
       <SessionLogsDrawer
          conversationId={sessionDrawer.conversationId}
          sessionId={sessionDrawer.sessionId}
          stepRunId={sessionDrawer.stepRunId}
          taskId={task?.task_id ?? null}
         stepRun={sessionDrawerStepRun}
+        initialTab={sessionDrawer.tab}
+        visibleStatus={sessionDrawerStepRun ? displayStepStatus(sessionDrawerStepRun) : null}
+        deliverableFreshness={task?.deliverable_freshness}
         attempts={task?.step_runs ?? []}
         {agents}
         stepName={sessionDrawer.stepName}

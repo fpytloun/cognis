@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { conversationTimelineScope } from '$lib/chat-v2/types';
 import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
 import ToolCallBlock from './ToolCallBlock.svelte';
+import { loadToolCallDetails } from './tool-call-details-loader';
 
 const { backgroundToolCall, addToast } = vi.hoisted(() => ({
   backgroundToolCall: vi.fn(),
@@ -36,9 +37,10 @@ async function renderExpanded(item: ToolCallTimelineItem, scope = conversationTi
 }
 
 describe('ToolCallBlock move to background', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     backgroundToolCall.mockReset();
     addToast.mockReset();
+    await loadToolCallDetails();
   });
 
   it('requests a background handoff for a running foreground bash command', async () => {

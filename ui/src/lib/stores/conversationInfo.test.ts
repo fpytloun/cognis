@@ -70,10 +70,36 @@ describe('conversationInfoDrawer', () => {
     expect(conversationInfoDrawer.mode).toBe('work');
   });
 
+  it('does not reopen a saved inspector where it cannot sit beside the chat', () => {
+    window.localStorage.setItem('cognis.conversationInfo.v2', JSON.stringify({ open: true, tab: 'usage' }));
+    conversationInfoDrawer.hydrated = false;
+    conversationInfoDrawer.hydrate(false);
+    expect(conversationInfoDrawer.open).toBe(false);
+    expect(conversationInfoDrawer.mode).toBe('usage');
+
+    conversationInfoDrawer.hydrated = false;
+    conversationInfoDrawer.hydrate(true);
+    expect(conversationInfoDrawer.open).toBe(true);
+  });
+
   it('migrates the stored full tab to Overview', () => {
     window.localStorage.setItem('cognis.conversationInfo.v2', JSON.stringify({ tab: 'full' }));
     conversationInfoDrawer.hydrated = false;
     conversationInfoDrawer.hydrate();
     expect(conversationInfoDrawer.tab).toBe('overview');
+  });
+
+  it('restores only the Usage tab preference, not accounting selectors', () => {
+    conversationInfoDrawer.mode = 'usage';
+    const saved = JSON.parse(window.localStorage.getItem('cognis.conversationInfo.v2') ?? '{}');
+    expect(saved).toEqual({
+      open: false, tab: 'usage', preferredPinned: true, preferredWidth: 352,
+    });
+    conversationInfoDrawer.tab = 'overview';
+    conversationInfoDrawer.hydrated = false;
+    conversationInfoDrawer.hydrate();
+    expect(conversationInfoDrawer.mode).toBe('usage');
+    conversationInfoDrawer.close();
+    expect(conversationInfoDrawer.mode).toBe('usage');
   });
 });

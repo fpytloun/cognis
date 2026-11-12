@@ -57,10 +57,10 @@ describe('workspace activity states', () => {
     expect(workspaceConversationForWindow(window, [conversation])).toBe(conversation);
     expect(workspaceWindowTitle(window, conversation)).toBe('Canonical conversation title');
     expect(workspaceWindowActivityState(window, conversation)).toMatchObject({
-      active: false,
-      attention: true,
+      active: true,
+      attention: false,
       unread: false,
-      label: 'Waiting for input',
+      label: 'Control chat is working',
     });
   });
 });

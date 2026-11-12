@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import { navigationItems } from '../navigation';
 
 function source(path: string): string {
   return readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -13,10 +14,10 @@ describe('Control Center route contract', () => {
     expect(page).toContain('ControlCenter');
     expect(layout).toContain('href="/"');
     expect(layout).toContain('data-testid="sidebar-logo-link"');
-    expect(layout).toContain('{#each navigationItems as item}');
+    expect(layout).toContain('{#each visibleNavigation as item}');
     expect(source('../navigation.ts')).toContain("{ href: '/', label: 'Dashboard'");
     expect(layout).toContain("href === '/' ? pathname === '/'");
-    expect(source('../components/BottomTabBar.svelte')).toContain("{ href: '/', label: 'Dashboard'");
+    expect(navigationItems.find(item => item.href === '/')).toMatchObject({ label: 'Dashboard' });
     expect(layout).not.toContain("href: '/work'");
     expect(source('../components/BottomTabBar.svelte')).not.toContain("href: '/work'");
   });
@@ -64,18 +65,13 @@ describe('Control Center route contract', () => {
     expect(modal).toContain('view="activity"');
     expect(modal).toContain('view="deliverable"');
     expect(modal).toContain('deliverableCollapsedByDefault={false}');
-    expect(modal).toContain('StepOutputModal');
     expect(modal).toContain('SessionLogsDrawer');
     expect(modal).not.toContain('onStepLogsOpen={() => { if (taskId) void goto');
     expect(modal).not.toContain('onStepOutputOpen={() => { if (taskId) void goto');
-    const stepOutput = source('../components/tasks/StepOutputModal.svelte');
     const sessionLogs = source('../components/tasks/SessionLogsDrawer.svelte');
-    for (const viewer of [stepOutput, sessionLogs]) {
-      expect(viewer).toContain("import { portal } from '$lib/actions/portal'");
-      expect(viewer).toContain('use:portal');
-      expect(viewer).toContain('data-overlay-id={overlayId}');
-    }
-    expect(stepOutput).toContain('data-testid="step-output-panel"');
+    expect(sessionLogs).toContain("import { portal } from '$lib/actions/portal'");
+    expect(sessionLogs).toContain('use:portal');
+    expect(sessionLogs).toContain('data-overlay-id={overlayId}');
     expect(sessionLogs).toContain('data-testid="session-logs-panel"');
     expect(modal).toContain("['completed', 'failed', 'cancelled'].includes(detail.status)");
   });
@@ -94,7 +90,7 @@ describe('Control Center route contract', () => {
     expect(source('../components/dashboard/DashboardRowIndicators.svelte')).toContain('WorkstreamTodoProgress');
     expect(tasks).toContain('WorkstreamExecutionStatus');
     expect(tasks).toContain('DiffStat');
-    expect(dashboard).toContain('api.agents.listAll({ include_system: false })');
+    expect(dashboard).toContain('api.agents.listAll({ include_system: false, include_contacts: true })');
     expect(dashboard).not.toContain('attention_only');
   });
 
@@ -188,8 +184,6 @@ describe('Control Center route contract', () => {
     expect(dialog).toContain('if (onEscape?.())');
     expect(dialog).toContain('if (event.defaultPrevented) return');
     expect(shell).toContain('{onEscape}');
-    expect(source('../components/tasks/StepOutputModal.svelte'))
-      .toContain('event.stopImmediatePropagation()');
     expect(source('../components/tasks/SessionLogsDrawer.svelte'))
       .toContain('event.stopImmediatePropagation()');
   });

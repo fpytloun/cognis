@@ -15,7 +15,7 @@ export interface DashboardLauncher {
 
 let current: DashboardLauncher | null = null;
 
-/** Only the mounted ControlCenter registers; callers own scope and redirect policy. */
+/** The mounted dashboard/project workspace registers; callers own redirect policy. */
 export function registerDashboardLauncher(launcher: DashboardLauncher): () => void {
   const registration: DashboardLauncher = {
     projectId: launcher.projectId,

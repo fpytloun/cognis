@@ -53,9 +53,9 @@ describe('terminal output rendering', () => {
   });
 
   it('linkifies bare http and https URLs in terminal output', () => {
-    const html = renderTerminalOutput('Open https://sso.example.test/start, then continue.');
+    const html = renderTerminalOutput('Open https://login.example.com/start, then continue.');
 
-    expect(html).toContain('<a href="https://sso.example.test/start"');
+    expect(html).toContain('<a href="https://login.example.com/start"');
     expect(html).toContain('target="_blank"');
     expect(html).toContain('rel="noopener noreferrer"');
     expect(html).toContain('</a>, then continue.');

@@ -28,7 +28,7 @@
 
 {#if conversation}
   <button type="button"
-    class="hidden h-9 w-9 shrink-0 items-center justify-center rounded-xl text-muted transition hover:bg-surface-hover hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent md:inline-flex"
+    class="touch-target-compact hidden shrink-0 items-center justify-center rounded-lg border border-control-border text-muted transition hover:bg-surface-hover hover:text-accent focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent md:inline-flex"
     aria-label={pinned ? 'Unpin conversation' : 'Pin conversation'}
     aria-pressed={pinned}
     title={pinned ? 'Unpin conversation' : 'Pin conversation to the app-wide dock'}

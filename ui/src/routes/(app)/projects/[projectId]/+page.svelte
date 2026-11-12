@@ -1,8 +1,12 @@
 <script lang="ts">
   import { prepareProjectAvatar } from '$lib/projects/avatar-upload';
+  import { openProjectWindow } from '$lib/projects/window';
   import ProjectAvatar from '$lib/components/projects/ProjectAvatar.svelte';
-  import { projectIcons } from '$lib/projects/icons';
+  import ProjectIconPicker from '$lib/components/projects/ProjectIconPicker.svelte';
   import { untrack } from 'svelte';
+  import { wsClient } from '$lib/ws/client';
+  import { subscribeDashboardRealtime } from '$lib/dashboard/realtime';
+  import { RefreshCooldown, SidebarRefreshController } from '$lib/sidebar-refresh';
   import { page } from '$app/state';
   import { goto } from '$app/navigation';
   import { api } from '$lib/api/client';
@@ -13,20 +17,21 @@
   import { addToast } from '$lib/stores/toasts';
   import { confirmAction } from '$lib/stores/confirm';
   import Button from '$lib/components/ui/Button.svelte';
+  import ExternalLink from 'lucide-svelte/icons/external-link';
   import Card from '$lib/components/ui/Card.svelte';
   import Input from '$lib/components/ui/Input.svelte';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import ProjectEntityWorkspace from '$lib/components/projects/ProjectEntityWorkspace.svelte';
   import ConversationsSection from '$lib/components/dashboard/ConversationsSection.svelte';
+  import { WaitingActivity } from '$lib/complete-waiting';
+  import AttentionActionDialog from '$lib/components/attention/AttentionActionDialog.svelte';
   import AgentQuickChatModal from '$lib/components/dashboard/AgentQuickChatModal.svelte';
   import TasksSection from '$lib/components/dashboard/TasksSection.svelte';
   import { CursorFeed } from '$lib/projects/cursor-feed.svelte';
   import { projectTaskBoard } from '$lib/projects/task-board';
-  import ProjectAssetModal from '$lib/components/projects/ProjectAssetModal.svelte';
   import ProjectResources from '$lib/components/projects/ProjectResources.svelte';
   import ResourceBrowser from '$lib/components/library/ResourceBrowser.svelte';
   import SchedulesWorkspace from '$lib/components/schedules/SchedulesWorkspace.svelte';
-  import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';
   import NewChatModal from '$lib/components/NewChatModal.svelte';
   import { preferredNewChatAgentId } from '$lib/chat/new-chat-agent';
   import { formatRelativeTime } from '$lib/time';
@@ -34,6 +39,7 @@
   import { rememberProject } from '$lib/projects/navigation';
   import type {
     Agent,
+    AttentionActionSummary,
     Conversation,
     ExecutorScope,
     Project,
@@ -48,9 +54,18 @@
   } from '$lib/types/api';
 
   import ProjectKnowledge from '$lib/components/projects/ProjectKnowledge.svelte';
-  type ProjectTab = 'overview' | 'conversations' | 'tasks' | 'schedules' | 'agents' | 'resources' | 'knowledge' | 'settings' | 'sharing';
+  import UsageWorkspace from '$lib/usage/UsageWorkspace.svelte';
+  import { usageAnalyticsEnabled } from '$lib/system';
+  import { getUsageHistory } from '$lib/usage/history.svelte';
+  const history = getUsageHistory();
+  type ProjectTab = 'overview' | 'conversations' | 'tasks' | 'schedules' | 'agents' | 'resources' | 'knowledge' | 'usage' | 'settings' | 'sharing';
 
   const projectId = $derived(page.params.projectId);
+  const isWindowMode = $derived(page.url.searchParams.get('window') === '1');
+
+  function openProjectInSeparateWindow(): void {
+    if (projectId) openProjectWindow(projectId, page.url);
+  }
   let project = $state<Project | null>(null);
   $effect(() => {
     if (project?.project_id === projectId && projectId) {
@@ -92,8 +107,14 @@
   let showNewChat = $state(false);
   let chatAgentId = $state('');
   let chatProfileId = $state('');
+  let chatProfileMode = $state<'auto' | 'default' | null>(null);
   let creatingChat = $state(false);
   let ownAgents = $state<Agent[]>([]);
+  let entityWorkspace: ProjectEntityWorkspace | undefined = $state();
+  let waitingConversations = $state<Conversation[]>([]);
+  let waitingError = $state<string | null>(null);
+  let selectedAttention = $state<AttentionActionSummary | null>(null);
+  let refreshWaiting = () => {};
   const openKind = $derived(page.url.searchParams.get('view'));
   const openId = $derived(page.url.searchParams.get('item'));
   const chatAgents = $derived(ownAgents.filter((agent) =>
@@ -114,12 +135,13 @@
   const quickChatAgent = $derived(openKind === 'agent'
     ? stripAgents.find((agent) => agent.agent_id === openId) : undefined);
 
-  function openItem(kind: 'conversation' | 'task' | 'schedule' | 'deliverable' | 'artifact' | 'agent', id: string): void {
+  function openItem(kind: 'conversation' | 'task' | 'schedule' | 'deliverable' | 'artifact' | 'agent', id: string): Promise<void> {
+    if (kind !== 'agent') entityWorkspace?.activate(kind, id);
     const url = new URL(page.url);
     url.searchParams.set('tab', activeTab);
     url.searchParams.set('view', kind);
     url.searchParams.set('item', id);
-    void goto(url, { noScroll: true, keepFocus: true });
+    return goto(url, { noScroll: true, keepFocus: true });
   }
 
   function closeItem(): void {
@@ -135,6 +157,7 @@
       : openKind === 'conversation' ? conversations.find((item) => item.conversation_id === openId)?.agent_id : null;
     chatAgentId = preferredNewChatAgentId(chatAgents, [agentId, currentAgentId, chatAgentId], projectAgents[0]?.agent_id);
     chatProfileId = '';
+    chatProfileMode = null;
     showNewChat = true;
   }
 
@@ -146,6 +169,7 @@
       const conversation = await api.conversations.create({
         agent_id: chatAgentId,
         agent_profile_id: chatProfileId || null,
+        agent_profile_mode: chatProfileMode,
         project_id: targetProject,
         context: { type: 'web' }
       });
@@ -221,8 +245,69 @@
     untrack(() => taskFeed.configure((cursor, signal) => api.projects.tasksPage(id, cursor, signal)));
     return () => taskFeed.dispose();
   });
+  $effect(() => {
+    const id = projectId;
+    const owner = $auth.user?.email;
+    const agentId = conversationAgentFilter;
+    waitingConversations = [];
+    waitingError = null;
+    selectedAttention = null;
+    if (!id || !owner) return;
+    const scope = JSON.stringify([owner, id, agentId]);
+    const activity = new WaitingActivity();
+    const controller = new SidebarRefreshController(async ({ signal }) => {
+      try {
+        const items = await api.conversations.waiting(
+          { contextType: 'web', projectId: id, agentId: agentId || null }, { signal, scope, activity },
+        );
+        if (!signal.aborted) { waitingConversations = items; waitingError = null; }
+      } catch (caught) {
+        if (!signal.aborted) waitingError = caught instanceof Error ? caught.message : 'Could not load waiting conversations';
+        throw caught;
+      }
+    }, new RefreshCooldown());
+    controller.setLifecycle({ scope, eligible: true });
+    const refresh = () => { void controller.request(scope); };
+    refreshWaiting = refresh;
+    refresh();
+    const stop = subscribeDashboardRealtime(wsClient, refresh);
+    const visible = () => { if (document.visibilityState === 'visible') refresh(); };
+    window.addEventListener('focus', visible);
+    document.addEventListener('visibilitychange', visible);
+    return () => {
+      controller.dispose();
+      stop();
+      window.removeEventListener('focus', visible);
+      document.removeEventListener('visibilitychange', visible);
+    };
+  });
+  $effect(() => {
+    const id = projectId;
+    const owner = $auth.user?.email;
+    if (!id || !owner) return;
+    const controller = new SidebarRefreshController(async ({ signal }) => {
+      await loadActivity(signal);
+    }, new RefreshCooldown());
+    controller.setLifecycle({ scope: id, eligible: true });
+    const refresh = () => { void controller.request(id); };
+    const stopDashboard = subscribeDashboardRealtime(wsClient, refresh);
+    const stopWork = wsClient.subscribe((event) => {
+      if (event.type === 'work_invalidated') refresh();
+    });
+    const visible = () => { if (document.visibilityState === 'visible') refresh(); };
+    window.addEventListener('focus', visible);
+    document.addEventListener('visibilitychange', visible);
+    return () => {
+      controller.dispose();
+      stopDashboard();
+      stopWork();
+      window.removeEventListener('focus', visible);
+      document.removeEventListener('visibilitychange', visible);
+    };
+  });
   const tabs = $derived([
     { id: 'overview', label: 'Overview' },
+    ...($usageAnalyticsEnabled ? [{ id: 'usage', label: 'Usage' }] : []),
     { id: 'conversations', label: 'Conversations', count: conversationFeed.hasMore ? undefined : conversations.length },
     { id: 'tasks', label: 'Tasks', count: taskFeed.hasMore ? undefined : tasks.length },
     { id: 'schedules', label: 'Schedules', count: schedules.length },
@@ -252,7 +337,7 @@
     return value ? formatRelativeTime(value) : '';
   }
 
-  async function loadActivity(): Promise<void> {
+  async function loadActivity(signal?: AbortSignal): Promise<void> {
     if (!projectId) return;
     const requestedProject = projectId;
     scheduleError = '';
@@ -263,7 +348,7 @@
         return [] as Schedule[];
       })
     ]);
-    if (requestedProject !== projectId) return;
+    if (signal?.aborted || requestedProject !== projectId) return;
     activity = nextActivity;
     schedules = nextSchedules;
     await Promise.all([conversationFeed.refresh(), taskFeed.refresh()]);
@@ -351,7 +436,7 @@
   const routeTab = $derived(page.url.searchParams.get('tab'));
   $effect(() => {
     const tab = routeTab;
-    if (tab && ['overview', 'conversations', 'tasks', 'schedules', 'agents', 'resources', 'knowledge', 'settings', 'sharing'].includes(tab)) {
+    if (tab && ['overview', 'conversations', 'tasks', 'schedules', 'agents', 'resources', 'knowledge', 'usage', 'settings', 'sharing'].includes(tab)) {
       activeTab = tab as ProjectTab;
     }
   });
@@ -579,13 +664,15 @@
     <ConversationsSection
       projects={project ? [project] : []}
       {conversations} agents={ownAgents} {stripAgents} showAgents={role !== 'viewer'} onSeeAll={null}
+      {waitingConversations} {waitingError} waitingScope={JSON.stringify([projectId, conversationAgentFilter])}
+      onOpenAttention={(action) => { selectedAttention = action; }}
       onSelectAgent={(agent) => {
         if (agent.shared_via_project_ids?.length) startChat(agent.agent_id);
         else openItem('agent', agent.agent_id);
       }}
       metadataForItem={(item) => item.is_readonly_for_caller ? `${authorLabel(item.user_email)} · Read-only` : ''}
       loading={conversationFeed.loading} error={conversationFeed.items.length ? null : conversationFeed.error}
-      onRetry={() => void conversationFeed.refresh()}
+      onRetry={() => { void conversationFeed.refresh(); refreshWaiting(); }}
       onNewChat={role !== 'viewer' ? () => startChat() : undefined}
       onOpenConversation={(id) => openItem('conversation', id)}
       recentHasMore={conversationFeed.hasMore} recentLoading={conversationFeed.loading}
@@ -625,9 +712,13 @@
           <ProjectAvatar name={project.name} avatarUrl={project.avatar_url} icon={project.metadata?.icon} color={project.color} class="h-16 w-16" />
         </button>
         <div>
-          <a class="text-sm text-accent hover:text-accent-hover" href="/projects?view=all">← All projects</a>
-          <h1 class="mt-2 text-3xl font-semibold text-strong">{project.name}</h1>
-          <p class="mt-2 max-w-3xl text-sm text-muted">{project.description || 'No description'}</p>
+          {#if !isWindowMode}
+            <a class="text-sm text-accent hover:text-accent-hover" href="/projects?view=all">← All projects</a>
+          {/if}
+          <h1 class={`${isWindowMode ? '' : 'mt-2'} text-3xl font-semibold text-strong`}>{project.name}</h1>
+          {#if project.description?.trim()}
+            <p class="mt-2 max-w-3xl text-sm text-muted">{project.description}</p>
+          {/if}
           <div class="mt-3 flex flex-wrap gap-2 text-xs text-muted">
             <span class="rounded-full border border-control-border px-2 py-1">{project.status}</span>
             <span class="rounded-full border border-violet-border bg-violet-subtle px-2 py-1 text-violet-tone" data-testid="project-role">{roleLabel(role)}</span>
@@ -639,6 +730,11 @@
         </div>
       </div>
       <div class="flex flex-wrap gap-2">
+        {#if !isWindowMode}
+          <Button variant="secondary" size="icon" title="Open project in separate window" aria-label="Open project in separate window" onclick={openProjectInSeparateWindow}>
+            <ExternalLink size={16} />
+          </Button>
+        {/if}
         {#if role !== 'viewer'}
           <Button onclick={() => startChat()}>New chat in project</Button>
         {/if}
@@ -689,6 +785,10 @@
             <ProjectResources {activity} onOpen={openItem} limit={4} />
           </div>
         </div>
+      {:else if activeTab === 'usage'}
+        {#key project.project_id}
+          <UsageWorkspace url={page.url} historyState={history.state} project={{ id: project.project_id, label: project.name }} navigate={(url, state) => void goto(url, { noScroll: true, keepFocus: true, state: { ...page.state, ...state } })}/>
+        {/key}
       {:else if activeTab === 'conversations'}
         <div class="min-w-0 space-y-3">
             <select bind:value={conversationAgentFilter} class="max-w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" aria-label="Filter by agent">
@@ -855,20 +955,7 @@
               {#if project.avatar_image_id || project.avatar_url}<Button variant="secondary" onclick={removeAvatar}>Remove avatar</Button>{/if}
             </div>
           {/if}
-          <fieldset disabled={readonly} class="mt-4">
-            <legend class="mb-2 text-sm font-medium text-secondary">Project icon</legend>
-            <p class="mb-3 text-xs text-quiet">Used when no avatar is uploaded, and for monochrome display. Save project settings to apply.</p>
-            <div class="grid grid-cols-4 gap-2 sm:grid-cols-6">
-              <button type="button" class="flex flex-col items-center gap-1 rounded-lg border p-2 text-xs text-secondary" class:border-accent={!projectForm.icon} class:border-control-border={Boolean(projectForm.icon)} aria-pressed={!projectForm.icon} onclick={() => { projectForm.icon = ''; }}>
-                <ProjectAvatar name={project.name} color={projectForm.color} class="h-8 w-8" />Default
-              </button>
-              {#each projectIcons as option}
-                <button type="button" class="flex flex-col items-center gap-1 rounded-lg border p-2 text-xs text-secondary" class:border-accent={projectForm.icon === option.id} class:border-control-border={projectForm.icon !== option.id} aria-label={`Use ${option.label} icon`} aria-pressed={projectForm.icon === option.id} onclick={() => { projectForm.icon = option.id; }}>
-                  <ProjectAvatar name={option.label} icon={option.id} color={projectForm.color} class="h-8 w-8" />{option.label}
-                </button>
-              {/each}
-            </div>
-          </fieldset>
+          <ProjectIconPicker bind:value={projectForm.icon} color={projectForm.color} disabled={readonly} />
         </Card>
       {:else if activeTab === 'sharing'}
         <Card class="p-4">
@@ -926,6 +1013,7 @@
     agents={chatAgents}
     bind:selectedAgentId={chatAgentId}
     bind:selectedAgentProfileId={chatProfileId}
+    bind:selectedAgentProfileMode={chatProfileMode}
     title={`New chat · ${project.name}`}
     busy={creatingChat}
     oncancel={() => { showNewChat = false; }}
@@ -934,10 +1022,11 @@
   {/if}
   {#key `${project.project_id}:${$auth.user?.email}`}
       <ProjectEntityWorkspace
+        bind:this={entityWorkspace}
         canMutateSchedule={role !== 'viewer' && $auth.user?.role !== 'viewer'}
         projectId={project.project_id}
         userEmail={$auth.user?.email ?? ''}
-        kind={openKind === 'conversation' || openKind === 'task' || openKind === 'schedule' ? openKind : null}
+        kind={openKind === 'conversation' || openKind === 'task' || openKind === 'schedule' || openKind === 'deliverable' || openKind === 'artifact' ? openKind : null}
         entityId={openId}
         agents={ownAgents}
         onClose={closeItem}
@@ -949,15 +1038,13 @@
         } : undefined}
       />
   {/key}
-  {#key `${project.project_id}:${openKind}:${openId}`}
-    {#if openKind === 'deliverable' && openId}
-      {@const deliverable = activity.deliverables.find((item) => item.deliverable_id === openId)}
-      {#if deliverable}<ProjectAssetModal {deliverable} onClose={closeItem} />{:else}<DashboardModalShell title="Asset unavailable" testId="project-asset-unavailable" onClose={closeItem}><p class="p-4 text-secondary">This asset is no longer in the recent project assets, or you no longer have access to it.</p></DashboardModalShell>{/if}
-    {:else if openKind === 'artifact' && openId}
-      {@const artifact = activity.artifacts.find((item) => item.artifact_id === openId)}
-      {#if artifact}<ProjectAssetModal {artifact} onClose={closeItem} />{:else}<DashboardModalShell title="Asset unavailable" testId="project-asset-unavailable" onClose={closeItem}><p class="p-4 text-secondary">This asset is no longer in the recent project assets, or you no longer have access to it.</p></DashboardModalShell>{/if}
-    {/if}
-  {/key}
+{/if}
+
+{#if selectedAttention}
+  <AttentionActionDialog actionId={selectedAttention.action_id} title={selectedAttention.title}
+    onClose={() => { selectedAttention = null; }}
+    onSettled={() => { selectedAttention = null; refreshWaiting(); void loadActivity(); }}
+    onUnavailable={() => { refreshWaiting(); void loadActivity(); }} />
 {/if}
 
 {#if showAvatarModal && project}

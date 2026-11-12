@@ -7,6 +7,7 @@
 import type {
   Agent,
   AgentDirectChat,
+  BackgroundWorkItem,
   Conversation,
   DashboardIssuesResponse,
   Schedule,
@@ -14,6 +15,8 @@ import type {
   TaskBoard,
   TaskBoardItem
 } from '$lib/types/api';
+import { backgroundWorkItemIsRunning } from '$lib/ongoing-work';
+import { humanTaskReason } from '$lib/task-attention';
 
 export const DEFAULT_TASK_LANE_LIMIT = 5;
 export const DEFAULT_SCHEDULE_LANE_LIMIT = 5;
@@ -120,7 +123,7 @@ export function dashboardTaskWaitingReason(
 ): string {
   const attentionType = task.attention_type?.trim() ?? '';
   if (attentionType) return TASK_ATTENTION_LABELS[attentionType] ?? 'Action required';
-  return task.result_summary?.trim()
+  return humanTaskReason(task.result_summary)?.reason
     || task.progress_summary?.current_step_name?.trim()
     || 'Paused';
 }
@@ -152,7 +155,8 @@ export function isDashboardConversationActive(conversation: {
   return state !== null && ACTIVE_MANAGED_TURN_STATES.has(state);
 }
 
-export function dashboardConversationWaitingReason(conversation: Pick<Conversation, 'pending_notification_types'>): string | null {
+export function dashboardConversationWaitingReason(conversation: Pick<Conversation, 'pending_notification_types' | 'is_readonly_for_caller'>): string | null {
+  if (conversation.is_readonly_for_caller) return null;
   for (const type of conversation.pending_notification_types ?? []) {
     const label = WAITING_NOTIFICATION_LABELS[type];
     if (label) return label;
@@ -160,7 +164,7 @@ export function dashboardConversationWaitingReason(conversation: Pick<Conversati
   return null;
 }
 
-export function isDashboardConversationWaiting(conversation: Pick<Conversation, 'pending_notification_types'>): boolean {
+export function isDashboardConversationWaiting(conversation: Pick<Conversation, 'pending_notification_types' | 'is_readonly_for_caller'>): boolean {
   return dashboardConversationWaitingReason(conversation) !== null;
 }
 
@@ -191,7 +195,8 @@ function conversationActivityValue(conversation: Pick<Conversation, 'last_messag
  */
 export function partitionConversationLanes(
   conversations: Conversation[] | null | undefined,
-  limits: { active?: number; recent?: number; waiting?: number } = {}
+  limits: { active?: number; recent?: number; waiting?: number } = {},
+  backgroundWork: readonly BackgroundWorkItem[] = [],
 ): DashboardConversationLanes {
   const activeLimit = limits.active ?? DEFAULT_ACTIVE_CONVERSATION_LIMIT;
   const recentLimit = limits.recent ?? DEFAULT_RECENT_CONVERSATION_LIMIT;
@@ -202,8 +207,11 @@ export function partitionConversationLanes(
 
   const waitingAll = sorted.filter(isDashboardConversationWaiting);
   const waitingIds = new Set(waitingAll.map((conversation) => conversation.conversation_id));
+  const backgroundIds = new Set(backgroundWork.filter(backgroundWorkItemIsRunning)
+    .map((item) => item.controller_conversation_id));
   const activeAll = sorted.filter(
-    (conversation) => !waitingIds.has(conversation.conversation_id) && isDashboardConversationActive(conversation)
+    (conversation) => !waitingIds.has(conversation.conversation_id)
+      && (isDashboardConversationActive(conversation) || backgroundIds.has(conversation.conversation_id))
   );
   const activeIds = new Set(activeAll.map((conversation) => conversation.conversation_id));
   const recentAll = sorted.filter(

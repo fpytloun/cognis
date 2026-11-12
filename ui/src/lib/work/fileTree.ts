@@ -1,6 +1,8 @@
+import type { FeedbackSourceRef } from '$lib/feedback/types';
 export type FileChangeStatus = 'added' | 'modified' | 'deleted' | 'renamed';
 
 export interface WorkFileDiff {
+  feedback_source?: Extract<FeedbackSourceRef, { kind: 'work_diff' }> | null;
   path: string;
   diff: string;
   old_path?: string | null;
@@ -80,6 +82,7 @@ export function combineFileDiffHistory(file: FileTreeFile): WorkFileDiff | null 
 
   return {
     ...latest,
+    feedback_source: file.diffs.length === 1 ? latest.feedback_source : null,
     path: file.path,
     diff: textDiffs
       .map((event) => event.diff.trimEnd())
@@ -214,7 +217,7 @@ export function buildFileTree(diffs: WorkFileDiff[]): FileTreeNode[] {
     // different sibling sessions in a shared repository root never merge
     // into one file node (and one combined diff history).
     const sourceKey = diff.source_workstream?.key ?? '';
-    const identity = `${sourceKey}:${diff.path_id ?? diff.path}`;
+    const identity = `${rootIdentity}:${sourceKey}:${diff.path_id ?? diff.path}`;
     const file: FileTreeFile = {
       kind: 'file',
       id: nodeId('file', diff.path, identity),

@@ -54,4 +54,40 @@ describe('keepInViewport', () => {
     expect(wide.style.translate).toBe('8px 0');
     action.destroy();
   });
+
+  it('flips a bottom-edge menu above its trigger', () => {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    const node = document.createElement('div');
+    details.append(summary, node);
+    document.body.appendChild(details);
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    summary.getBoundingClientRect = () => ({ top: 780, bottom: 824 } as DOMRect);
+    node.getBoundingClientRect = () => ({ left: 200, right: 380, width: 180, top: 830, bottom: 1030, height: 200 } as DOMRect);
+    const action = keepInViewport(node, { vertical: true });
+    expect(node.style.translate).toBe('0px -256px');
+    expect(node.style.maxHeight).toBe('766px');
+    action.destroy();
+  });
+
+  it('constrains a tall menu to the space above its trigger without detaching it', () => {
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    const node = document.createElement('div');
+    details.append(summary, node);
+    document.body.appendChild(details);
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 844 });
+    summary.getBoundingClientRect = () => ({ top: 500, bottom: 544 } as DOMRect);
+    node.getBoundingClientRect = () => {
+      const height = Math.min(1000, parseFloat(node.style.maxHeight) || 1000);
+      return { left: 200, right: 380, width: 180, top: 494 - height, bottom: 494, height } as DOMRect;
+    };
+    const action = keepInViewport(node, { vertical: true, preferredSide: 'above' });
+    expect(node.style.maxHeight).toBe('486px');
+    expect(node.style.translate).toBe('');
+    expect(node.style.overflowY).toBe('auto');
+    action.update({ vertical: true, preferredSide: 'above' });
+    expect(node.style.translate).toBe('');
+    action.destroy();
+  });
 });

@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { COMPONENT_RUNTIME_ORIGIN } from './component-runtime';
 import type { ScopedFixtureController } from '../src/lib/chat-v2/scoped-fixture';
-import type { ChatRealtimeFrame, MessageTimelineItem } from '../src/lib/chat-v2/types';
+import type { ChatRealtimeFrame, MessageTimelineItem, ToolCallTimelineItem } from '../src/lib/chat-v2/types';
 
 test.describe('ScopedChatV2Timeline', () => {
   test.use({ serviceWorkers: 'block' });
@@ -65,6 +65,145 @@ test.describe('ScopedChatV2Timeline', () => {
     await expect(shell.getByText(current.content, { exact: true })).toBeVisible();
     await expect(shell.getByText(latest.content, { exact: true })).toBeVisible();
     await expect(shell.getByText(earlier.content, { exact: true })).toHaveCount(0);
+  });
+
+  test('renders live python activity with nested calls and deduplicates a repeated frame', async ({ page }, testInfo) => {
+    const shell = page.getByTestId('scoped-timeline-shell');
+    await page.evaluate(() => {
+      const label = document.createElement('div');
+      label.dataset.testid = 'client-only-fixture-label';
+      label.textContent = 'Client-only fixture · synthetic runtime frames · no backend E2E';
+      Object.assign(label.style, {
+        position: 'fixed',
+        top: '8px',
+        right: '8px',
+        zIndex: '9999',
+        padding: '6px 10px',
+        borderRadius: '8px',
+        background: '#152238',
+        color: '#d6e5ff',
+        font: '12px sans-serif',
+      });
+      document.body.append(label);
+    });
+    await expect(page.getByTestId('client-only-fixture-label')).toBeVisible();
+    const source = [{ store: 'runtime', session_id: 'fixture-parent', seq: 1, event_type: 'tool_call' }];
+    const parent: ToolCallTimelineItem = {
+      id: 'tool:ptc-parent-call', kind: 'tool_call', call_id: 'ptc-parent-call',
+      tool_name: 'python_execute', display_name: null, status: 'running',
+      sort_key: '9999:000000000000001:000002:03:000000000',
+      source_refs: source, stable: false, turn_id: 'ptc-turn', assistant_phase_index: 2,
+      turn_cycle_index: 1,
+      arguments: { description: 'Read the report and count its rows.', code: 'rows = await cognis.tools.read(file_path="report.csv")\nprint(len(rows))' },
+      result_preview: null, streamed_output: 'Reading report…', is_error: false, duration_ms: null,
+      attachments: [], file_diffs: [], output_size: null, truncated: false, has_full_output: false,
+      parent_call_id: null, program_id: 'ptc-program', kernel_generation: 3,
+    };
+    const child: ToolCallTimelineItem = {
+      id: 'tool:ptc-child-call', kind: 'tool_call', call_id: 'ptc-child-call',
+      tool_name: 'read', display_name: null, status: 'running',
+      sort_key: '9999:000000000000002:000002:03:000000000',
+      source_refs: source, stable: false, turn_id: 'ptc-turn', assistant_phase_index: 2,
+      turn_cycle_index: 1, arguments: { file_path: 'report.csv' },
+      result_preview: null, streamed_output: null, is_error: false, duration_ms: null,
+      attachments: [], file_diffs: [], output_size: null, truncated: false, has_full_output: false,
+      parent_call_id: 'ptc-parent-call', program_id: 'ptc-program', kernel_generation: 3,
+    };
+
+    const emit = async (items: ToolCallTimelineItem[], revision: number) => {
+      const runtime: NonNullable<ChatRealtimeFrame['runtime']> = {
+        runtime_epoch: 'ptc-runtime-epoch',
+        runtime_revision: revision,
+        generated_at: '2026-01-01T00:00:02Z',
+        has_active_turn: true,
+        active_turn: { turn_id: 'ptc-turn', session_id: 'fixture-parent', status: 'running' },
+        authority: {
+          protocol: 'runtime_authority_v1',
+          direct_request_id: 'ptc-direct-request',
+          turn_id: 'ptc-turn',
+          fencing_token: 1,
+          lifecycle: 'active',
+          source_epoch: 'ptc-source',
+          source_revision: revision,
+        },
+        volatile_items_complete: true,
+        volatile_items: items,
+      };
+      await page.evaluate(({ runtime, revision }) => {
+        const controller = (window as typeof window & {
+          __scopedFixtureController?: ScopedFixtureController;
+        }).__scopedFixtureController;
+        if (!controller) throw new Error('Missing scoped fixture controller');
+        const cursor = document.querySelector('[data-testid="scoped-timeline-shell"] [data-scope-key]')?.getAttribute('data-cursor');
+        if (!cursor) throw new Error('Missing canonical cursor');
+        controller.realtime.emitFrame({
+          type: 'chat_v2_frame', schema_version: 2, projection_version: 'fixture-projection-v1',
+          scope: { key: 'conversation:fixture-conversation', kind: 'conversation', conversation_id: 'fixture-conversation' },
+          conversation_id: 'fixture-conversation', cursor_before: cursor,
+          cursor_after: `${cursor}:ptc-${revision}`,
+          ops: [],
+          runtime,
+          server_time: '2026-01-01T00:00:02Z',
+        });
+      }, { runtime, revision });
+    };
+
+    await emit([parent, child], 1);
+    const execution = shell.locator('[data-kind="python_execution"]');
+    await expect(execution).toBeVisible();
+    await expect(execution).toHaveAttribute('data-python-execution-status', 'running');
+    await expect(execution).not.toContainText('Python source and activity');
+    await expect(execution.getByTestId('python-execution-code')).toContainText('cognis.tools.read');
+    await expect(execution.getByTestId('python-execution-output')).toContainText('Reading report…');
+    await expect(execution).toContainText('Nested tool activity');
+    await expect(execution.locator('article.tool-frame')).toHaveCount(2);
+    await expect(execution.locator('article.tool-frame').nth(1)).toContainText('Running');
+    await page.screenshot({ path: testInfo.outputPath('ptc-live-python-activity.png'), fullPage: true });
+    const nestedCard = execution.locator('article.tool-frame').nth(1);
+    const nestedToggle = nestedCard.locator('button').first();
+    await nestedToggle.click();
+    await expect(nestedToggle).toHaveAttribute('aria-expanded', 'true');
+    await nestedCard.scrollIntoViewIfNeeded();
+    await nestedCard.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+    await expect(nestedCard).toBeInViewport({ ratio: 1 });
+    await page.screenshot({ path: testInfo.outputPath('ptc-live-nested-tool.png'), fullPage: true, animations: 'disabled' });
+    await nestedCard.screenshot({ path: testInfo.outputPath('ptc-running-child-card.png'), animations: 'disabled' });
+
+    const waitingChild: ToolCallTimelineItem = { ...child, status: 'waiting' };
+    await emit([{ ...parent, streamed_output: 'Reading report…\nIntermediate stderr\n' }, waitingChild], 2);
+    await expect(execution).toHaveAttribute('data-python-execution-status', 'waiting');
+    await expect(execution).toContainText('Waiting for approval');
+    await expect(execution.getByTestId('python-execution-output')).toHaveText('Reading report…\nIntermediate stderr\n');
+    await expect(nestedToggle).toHaveAttribute('aria-expanded', 'true');
+    await nestedCard.scrollIntoViewIfNeeded();
+    await nestedCard.evaluate((element) => element.scrollIntoView({ block: 'center' }));
+    await expect(nestedCard).toBeInViewport({ ratio: 1 });
+    await page.screenshot({ path: testInfo.outputPath('ptc-live-approval.png'), fullPage: true, animations: 'disabled' });
+    await nestedCard.screenshot({ path: testInfo.outputPath('ptc-approval-child-card.png'), animations: 'disabled' });
+
+    const completedParent: ToolCallTimelineItem = {
+      ...parent, status: 'complete', streamed_output: null,
+      result_preview: JSON.stringify({
+        protocol_version: 'cognis.program.v1',
+        stdout_preview: 'Reading report…\nIntermediate stderr\nRead 2 report rows.\n',
+        result: { row_count: 2 },
+      }), duration_ms: 420,
+    };
+    const completedChild: ToolCallTimelineItem = {
+      ...child, status: 'complete', result_preview: 'id,name\\n1,Ada\\n2,Lin',
+      streamed_output: null, duration_ms: 120,
+    };
+    await emit([completedParent, completedChild], 3);
+    await expect(execution).toHaveAttribute('data-python-execution-status', 'completed');
+    await expect(execution.getByTestId('python-execution-result')).toHaveText('{\n  "row_count": 2\n}');
+    await expect(execution.getByTestId('python-execution-output')).toHaveText('Reading report…\nIntermediate stderr\nRead 2 report rows.\n');
+    await expect(execution.locator('details')).not.toHaveAttribute('open');
+
+    await emit([completedParent, completedChild], 4);
+    await expect(execution.locator('article.tool-frame')).toHaveCount(2);
+    await expect(shell.locator('[data-kind="python_execution"]')).toHaveCount(1);
+    await execution.getByTestId('python-execution-result').scrollIntoViewIfNeeded();
+    await page.screenshot({ path: testInfo.outputPath('ptc-completed-python.png'), fullPage: true, animations: 'disabled' });
   });
 
   test('renders a task-step scope through the production timeline', async ({ page }) => {
@@ -238,7 +377,7 @@ test.describe('ScopedChatV2Timeline', () => {
     const viewport = shell.getByTestId('scoped-timeline-viewport');
     await expect(scopeNode).toHaveAttribute('data-cursor', /cursor/);
     await page.getByTestId('emit-active-frame').click();
-    await expect(shell.getByRole('status', { name: 'Turn running' })).toBeVisible();
+    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toBeVisible();
     const cursor = await scopeNode.getAttribute('data-cursor');
     await viewport.hover();
     await page.mouse.wheel(0, -500);
@@ -248,17 +387,16 @@ test.describe('ScopedChatV2Timeline', () => {
     await page.getByTestId('set-failed').click();
 
     await expect(shell.getByTestId('task-step-outcome')).toContainText('failed');
+    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toHaveCount(0);
     await expect(scopeNode).toHaveAttribute('data-cursor', cursor ?? '');
     expect(await viewport.evaluate((node) => (node as HTMLElement).scrollTop)).toBe(scrollTop);
-    await shell.getByRole('button', { name: 'Resume live follow' }).click();
-    await expect(shell.getByRole('status', { name: 'Turn running' })).toHaveCount(0);
   });
 
   test('generic session scope still uses runtime-only activity', async ({ page }) => {
     await page.getByTestId('scope-child').click();
     const shell = page.getByTestId('scoped-timeline-shell');
     await page.getByTestId('emit-active-frame').click();
-    await expect(shell.getByRole('status', { name: 'Turn running' })).toBeVisible();
+    await expect(shell.getByRole('navigation', { name: 'Live tail controls' })).toBeVisible();
   });
 
   test('loads full tool output through the exact task-step scope endpoint', async ({ page }) => {

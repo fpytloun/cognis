@@ -13,9 +13,10 @@ export interface SidebarConversationLanes {
 
 /** The canonical Waiting eligibility; session outcomes only affect row color. */
 export function isSidebarConversationWaiting(
-  conversation: Pick<Conversation, 'has_unread' | 'pending_notification_types'>,
+  conversation: Pick<Conversation, 'has_unread' | 'pending_notification_types' | 'is_readonly_for_caller'>,
   isActive: boolean,
 ): boolean {
+  if (conversation.is_readonly_for_caller) return false;
   return isDashboardConversationWaiting(conversation)
     || (conversation.has_unread && !isActive);
 }

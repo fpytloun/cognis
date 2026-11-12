@@ -22,7 +22,7 @@
 <textarea aria-label="Composer">draft retained</textarea>
 {#if open}
   <ChatSearchBar bind:query bind:inputElement={input} onSubmit={submit} onClose={() => open = false}
-    onNext={() => {}} onPrevious={() => {}} onSelect={() => {}} />
+    onNext={() => {}} onPrevious={() => {}} />
 {/if}
 <button onclick={() => modal = true}>Open modal</button>
 <button onclick={() => tab = !tab}>Change tab</button>

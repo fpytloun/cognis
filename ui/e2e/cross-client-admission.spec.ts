@@ -148,14 +148,14 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       // live-view reads. The recipient still subscribes before the tested admission.
       if (mode !== 'normal') {
         await injectScenario('single-phase-stream');
-         const armed = await requestMockBarrier(MOCK_LLM_URL, {
+        const armed = await requestMockBarrier(MOCK_LLM_URL, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ scenario_id: 'single-phase-stream', turn_index: 0 }),
         });
         expect(armed.status).toBe(201);
         await sendMessage(sender, 'Synthetic active leader');
         await expect(userRow(sender, 'Synthetic active leader')).toBeVisible();
-         const entered = await step('leader entered LLM barrier', () => requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
+        const entered = await step('leader entered LLM barrier', () => requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
         expect(entered.status).toBe(204);
       }
       await step('recipient login', () => login(recipient));
@@ -230,11 +230,11 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
       releaseSnapshot();
       if (mode !== 'normal') {
         const held = await step('leader remains held through tested admission', () =>
-           requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
+          requestMockBarrier(MOCK_LLM_URL, { signal: AbortSignal.timeout(10_000) }));
         expect(held.status).toBe(204);
       }
       if (mode === 'absorbed') {
-         expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'PUT' })).status).toBe(204);
+        expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'PUT' })).status).toBe(204);
       } else if (mode === 'queued_after_ui_stop') {
         const status = await recipient.evaluate(async id => {
           const response = await fetch(`/api/v1/chat/v2/conversations/${id}/cancel`, {
@@ -244,7 +244,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
           return response.status;
         }, conversationId);
         expect(status).toBe(200);
-         expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' })).status).toBe(204);
+        expect((await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' })).status).toBe(204);
       }
       // No recipient fetch/reload is used to make the message appear.
       const recipientRow = userRow(recipient, text);
@@ -316,7 +316,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
         return !navigator.onLine && state.__acceptanceClosedSocket?.readyState === WebSocket.CLOSED;
       })).toBe(true);
       if (mode !== 'normal') {
-         await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' });
+        await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE' });
       }
       const witnessText = `Disconnected recovery witness ${crypto.randomUUID()}`;
       witnessIdentity = { clientId: crypto.randomUUID(), transactionId: crypto.randomUUID() };
@@ -466,7 +466,7 @@ for (const recipientSurface of ['main', 'scoped'] as const) {
         // rejections are owned and retained, never unhandled or ignored.
         async () => { await owned.drain(); },
         async () => {
-           if (mode !== 'normal') await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE', signal: AbortSignal.timeout(5_000) }, 4500);
+          if (mode !== 'normal') await requestMockBarrier(MOCK_LLM_URL, { method: 'DELETE', signal: AbortSignal.timeout(5_000) }, 4500);
         },
         async () => { await clearScenario(); },
       ]);

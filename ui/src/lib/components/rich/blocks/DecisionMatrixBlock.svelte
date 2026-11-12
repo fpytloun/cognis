@@ -1,7 +1,8 @@
 <script lang="ts">
   import { renderInlineMarkdown, renderInlineMarkdownNoLinks, stripMarkdown } from '$lib/markdown';
   import { blockText, blockTitle, type RichBlock } from '$lib/rich-deliverable';
-  import { valueText } from '../block-helpers';
+  import { tableRangeGrid, valueText } from '../block-helpers';
+  import { richRenderedField, richRenderedTable, tableSource } from '$lib/feedback/annotations/rich';
   import {
     matrixColumns,
     matrixRows,
@@ -25,6 +26,7 @@
 
   $: rows = matrixRows(block);
   $: columns = matrixColumns(block, rows);
+  $: rangeGrid = tableRangeGrid(block, rows, columns);
   $: sortedRows = sortMatrixRows(rows, sort);
   $: globalSources = orderedSources(sources);
   $: scopedSources = block.sources === undefined ? [] : resolveSourceRefs(block.sources, globalSources);
@@ -34,6 +36,11 @@
 
   function rowKey(row: Record<string, unknown>, index: number): string {
     return String(row.id ?? row.key ?? row.option ?? row.name ?? row.title ?? index);
+  }
+
+  function provenance(row: Record<string, unknown>, key: string, column: number) {
+    const source = tableSource(row), path = source?.cells[key] ?? [];
+    return { cell: path, row: source?.row ?? [], text: typeof row[key] === 'string' ? path : null, column };
   }
 
   function sortBy(key: string) {
@@ -55,7 +62,7 @@
   {#if blockTitle(block)}<h4>{@html renderInlineMarkdown(blockTitle(block))}</h4>{/if}
   {#if blockText(block, 'description')}<p>{@html renderInlineMarkdown(blockText(block, 'description'))}</p>{/if}
   <div class="rich-table-wrap">
-    <table>
+    <table use:richRenderedTable={rangeGrid}>
       <thead>
         <tr>
           {#each columns as col}
@@ -76,7 +83,7 @@
           {@const rowSourceList = rowSources(row)}
           <tr class:recommended={recommendedRow(row)}>
             {#each columns as col, columnIndex}
-              <td data-label={stripMarkdown(col.label)} class:align-right={col.align === 'right'}>
+              <td use:richRenderedField={provenance(row, col.key, columnIndex)} data-label={stripMarkdown(col.label)} class:align-right={col.align === 'right'}>
                 {#if recommendedRow(row) && (col.key === 'option' || col.key === 'name' || col.key === 'title' || columnIndex === 0)}
                   <strong>{@html renderInlineMarkdown(valueText(row[col.key]))}</strong><span class="rich-recommendation">Recommended</span>
                 {:else}

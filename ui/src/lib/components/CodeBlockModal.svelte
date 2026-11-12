@@ -6,6 +6,8 @@
   import { portal } from '$lib/actions/portal';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
   import { addToast } from '$lib/stores/toasts';
+  import TextAnnotations from './feedback/annotations/TextAnnotations.svelte';
+  import FeedbackIndicator from './feedback/FeedbackIndicator.svelte';
 
   let {
     code,
@@ -116,6 +118,7 @@
         {/if}
       </div>
       <div class="flex shrink-0 items-center gap-2">
+        <FeedbackIndicator />
         <button class="copy-icon-button" onclick={copyCode} type="button" title="Copy code block" aria-label="Copy code block">
           {#if copied}
             <Check />
@@ -129,7 +132,7 @@
       </div>
     </div>
     <div class="min-h-0 flex-1 overflow-auto p-5 sm:p-6">
-      <pre class="min-h-full rounded-xl bg-inset p-4 text-sm leading-6 text-foreground"><code>{code}</code></pre>
+      <TextAnnotations text={code}><pre class="min-h-full rounded-xl bg-inset p-4 text-sm leading-6 text-foreground"><code>{code}</code></pre></TextAnnotations>
     </div>
   </div>
 </div>

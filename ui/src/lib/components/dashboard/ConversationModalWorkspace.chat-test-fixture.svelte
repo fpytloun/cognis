@@ -24,6 +24,7 @@
 <span data-testid="compact-chat-controller-sessions">{controllerSessionIds.join(',')}</span>
 <span data-testid="compact-chat-agent">{agent?.agent_id ?? ''}</span>
 <button onclick={() => onRuntimeActiveChange?.(false)}>Runtime idle</button>
+<button onclick={() => onViewSession?.('session-delayed')}>View unresolved session</button>
 {#each ['conversation-managed-a', 'conversation-managed-b'] as conversationId}
   <button onclick={() => onViewSession?.(`session-${conversationId}`, {
     key: `conversation:${conversationId}`, kind: 'managed', root_key: 'session:root',

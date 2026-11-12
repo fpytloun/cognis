@@ -56,6 +56,41 @@ export function prettyPrintJson(input: string): string {
 }
 
 /**
+ * Indent JSON by changing whitespace outside strings only. Every token keeps its original bytes
+ * (string escapes, number spelling), so the displayed text still matches the source text once
+ * whitespace is ignored. This lets comments anchor to the exact source while it reads pretty.
+ */
+export function reindentJson(input: string, indent = '  '): string {
+  let out = '', depth = 0, inString = false, escaped = false;
+  const line = () => `\n${indent.repeat(depth)}`;
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+    if (inString) {
+      out += char;
+      if (escaped) escaped = false;
+      else if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+      continue;
+    }
+    if (/\s/.test(char)) continue;
+    if (char === '"') { inString = true; out += char; continue; }
+    if (char === '{' || char === '[') {
+      let next = i + 1;
+      while (next < input.length && /\s/.test(input[next])) next++;
+      const close = char === '{' ? '}' : ']';
+      // Keep empty containers compact: {} and [].
+      if (input[next] === close) { out += char + close; i = next; continue; }
+      depth++; out += char + line(); continue;
+    }
+    if (char === '}' || char === ']') { depth = Math.max(0, depth - 1); out += line() + char; continue; }
+    if (char === ',') { out += char + line(); continue; }
+    if (char === ':') { out += ': '; continue; }
+    out += char;
+  }
+  return out;
+}
+
+/**
  * Tokenise the already-pretty-printed JSON text and wrap each token in
  * a classified ``<span>``. The caller is responsible for making sure
  * the input is valid JSON (use ``looksLikeJson`` to gate it).

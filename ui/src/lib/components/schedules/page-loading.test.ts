@@ -38,6 +38,54 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe('schedule loading boundaries', () => {
+  it('allows a short prompt with more than six lines to be expanded', async () => {
+    const prompt = 'First\nSecond\nThird\nFourth\nFifth\nSixth\nSeventh';
+    vi.mocked(api.schedules.detail).mockResolvedValue({
+      ...schedule, task_template: { description: prompt },
+    });
+    render(ScheduleDetailWorkspace, { id: schedule.schedule_id });
+    const expand = await screen.findByRole('button', { name: 'Show full prompt' });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    await fireEvent.click(expand);
+    expect(screen.getByRole('button', { name: 'Show less' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByTestId('schedule-prompt')).toHaveTextContent('Seventh');
+  });
+
+  it('loads and saves follow-up instructions in the schedule edit form', async () => {
+    const detail = { ...schedule, on_finish_instructions: 'Report the useful changes.' };
+    vi.mocked(api.schedules.detail).mockResolvedValue(detail);
+    const update = vi.spyOn(api.schedules, 'update').mockResolvedValue(detail);
+    render(ScheduleDetailWorkspace, { id: schedule.schedule_id });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Edit schedule' }));
+    const instructions = await screen.findByRole('textbox', { name: /Finish instructions/ });
+    expect(instructions).toHaveValue('Report the useful changes.');
+    await fireEvent.input(instructions, { target: { value: '  Check the result before reporting.  ' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(update).toHaveBeenCalledWith(schedule.schedule_id, expect.objectContaining({
+      completion_mode_family: 'default',
+      on_finish_instructions: 'Check the result before reporting.',
+    })));
+  });
+
+  it('keeps follow-up instructions discoverable when an existing schedule uses direct delivery', async () => {
+    vi.mocked(api.schedules.detail).mockResolvedValue({ ...schedule, completion_mode_family: 'direct' });
+    render(ScheduleDetailWorkspace, { id: schedule.schedule_id });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Edit schedule' }));
+    const instructions = await screen.findByRole('textbox', { name: /Finish instructions/ });
+    expect(instructions).toBeDisabled();
+    await fireEvent.change(screen.getByLabelText('Completion notification behavior'), { target: { value: 'default' } });
+    expect(instructions).toBeEnabled();
+  });
+
+  it('opens as a read view and returns to it when editing is cancelled', async () => {
+    render(ScheduleDetailWorkspace, { id: schedule.schedule_id });
+    expect(await screen.findByTestId('schedule-read-view')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Save changes' })).not.toBeInTheDocument();
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit schedule' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }));
+    expect(await screen.findByTestId('schedule-read-view')).toBeVisible();
+  });
+
   it('renders schedules while labels are pending, without loading create-only registries', async () => {
     vi.mocked(api.agents.listAll).mockReturnValue(pending<Agent[]>());
     vi.mocked(api.projects.list).mockReturnValue(pending());
@@ -80,6 +128,7 @@ describe('schedule loading boundaries', () => {
     resolveAgents([{
       agent_id: 'reviewer', name: 'Reviewer', agent_profiles: { careful: {} }
     } as unknown as Agent]);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Edit schedule' }));
     await screen.findByRole('button', { name: 'Save changes' });
     expect(screen.getByDisplayValue('careful')).toBeInTheDocument();
     expect(api.workflows.listAll).toHaveBeenCalledTimes(1);

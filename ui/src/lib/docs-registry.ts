@@ -30,6 +30,14 @@ export interface DocMeta {
 
 export const embeddedDocsMeta: DocMeta[] = [
   {
+    slug: 'speech',
+    title: 'Speech and audio',
+    description: 'Configure speech providers, listening preferences, agent tools, and deliverable podcasts.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/speech.md',
+    relatedSlugs: ['settings', 'using-chat', 'configuring-providers', 'rich-deliverables']
+  },
+  {
     slug: 'getting-started',
     title: 'Getting Started',
     description: 'Set up Mnemory, Intaris, Cognis, a provider, and your first agent.',
@@ -113,7 +121,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Understand streaming replies, tool activity, approvals, and delegation.',
     category: 'workspace',
     sourcePath: 'docs/guide/using-chat.md',
-    relatedSlugs: ['getting-started', 'context-management', 'managing-tasks', 'creating-agents']
+    relatedSlugs: ['getting-started', 'context-management', 'managing-tasks', 'creating-agents', 'work-feedback']
   },
   {
     slug: 'actionable-approvals',
@@ -145,7 +153,7 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Track queued or running work, workflow progress, and delivery back to chat.',
     category: 'workspace',
     sourcePath: 'docs/guide/managing-tasks.md',
-    relatedSlugs: ['workflows', 'projects', 'using-chat']
+    relatedSlugs: ['workflows', 'projects', 'using-chat', 'work-feedback']
   },
   {
     slug: 'projects',
@@ -185,7 +193,15 @@ export const embeddedDocsMeta: DocMeta[] = [
     description: 'Understand artifact retention, temporary signed links, documents, HTML viewing, and expired-link recovery.',
     category: 'workspace',
     sourcePath: 'docs/guide/content-and-sharing.md',
-    relatedSlugs: ['rich-deliverables', 'tools-and-skills', 'using-chat']
+    relatedSlugs: ['rich-deliverables', 'tools-and-skills', 'using-chat', 'work-feedback']
+  },
+  {
+    slug: 'work-feedback',
+    title: 'Work Feedback',
+    description: 'Annotate exact revisions, stage feedback in chat, review destinations, and follow resulting work.',
+    category: 'workspace',
+    sourcePath: 'docs/guide/work-feedback.md',
+    relatedSlugs: ['using-chat', 'managing-tasks', 'content-and-sharing', 'rich-deliverables']
   },
   {
     slug: 'rich-deliverables',
@@ -221,11 +237,19 @@ export const embeddedDocsMeta: DocMeta[] = [
   },
   {
     slug: 'channels',
-    title: 'Channels',
+    title: 'Messaging channels',
     description: 'Connect agents to external platforms and understand pairing and trust.',
     category: 'operations',
     sourcePath: 'docs/guide/channels.md',
     relatedSlugs: ['executors', 'security-and-privacy', 'troubleshooting']
+  },
+  {
+    slug: 'usage-accounting',
+    title: 'Usage accounting storage and retention',
+    description: 'Understand usage accounting, retention defaults, coverage, and explicit activation.',
+    category: 'operations',
+    sourcePath: 'docs/guide/usage-accounting.md',
+    relatedSlugs: ['settings', 'security-and-privacy', 'troubleshooting']
   },
   {
     slug: 'executors',
@@ -287,6 +311,8 @@ export const embeddedDocsMeta: DocMeta[] = [
 
 export const ONBOARDING_DOC_SLUGS = [
   'getting-started',
+  'speech',
+  'usage-accounting',
   'local-compose',
   'architecture',
   'configuring-providers',
@@ -312,6 +338,7 @@ export const ONBOARDING_DOC_SLUGS = [
   'ha-e2e',
   'tools-and-skills',
   'content-and-sharing',
+  'work-feedback',
   'rich-deliverables',
   'rich-deliverable-composition',
   'rich-deliverable-blocks-layout',

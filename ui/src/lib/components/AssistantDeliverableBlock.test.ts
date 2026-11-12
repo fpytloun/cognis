@@ -6,17 +6,17 @@ import type { Deliverable } from '$lib/types/api';
 import AssistantDeliverableBlock from './AssistantDeliverableBlock.svelte';
 import { readable } from 'svelte/store';
 import { DELIVERABLE_SHARING_CONTEXT } from '$lib/deliverable-permissions';
-// Lazily imported by the component under test; load it during collection.
-import '$lib/components/rich/RichDeliverable.svelte';
 
 const mocks = vi.hoisted(() => ({
-  getDeliverable: vi.fn()
+  getDeliverable: vi.fn(),
+  revisions: vi.fn(),
 }));
 
 vi.mock('$lib/api/client', () => ({
   api: {
     deliverables: {
-      get: mocks.getDeliverable
+      get: mocks.getDeliverable,
+      revisions: mocks.revisions,
     }
   }
 }));
@@ -66,6 +66,69 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
 }
 
 describe('AssistantDeliverableBlock', () => {
+  it('renders inline content in the initial render without a detail request', () => {
+    const loader = vi.fn();
+    render(AssistantDeliverableBlock, {
+      item: item({ deliverable: deliverable() }),
+      loadDeliverable: loader,
+      conversational: true,
+    });
+    expect(screen.queryByText('Loading deliverable…')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Final report' })).toBeTruthy();
+    expect(loader).not.toHaveBeenCalled();
+    expect(mocks.getDeliverable).not.toHaveBeenCalled();
+  });
+
+  it('renders the actual rich body synchronously, not an empty renderer boundary', () => {
+    const loader = vi.fn();
+    render(AssistantDeliverableBlock, {
+      item: item({ format: 'rich', deliverable: deliverable({
+        format: 'rich',
+        rich_payload: { version: 1, blocks: [{ type: 'markdown', content: '# Immediate rich body' }] },
+      }) }),
+      loadDeliverable: loader,
+      conversational: true,
+    });
+    expect(screen.getByRole('heading', { name: 'Immediate rich body' })).toBeTruthy();
+    expect(loader).not.toHaveBeenCalled();
+  });
+
+  it('ignores mismatched inline data and loads the requested revision', async () => {
+    mocks.getDeliverable.mockResolvedValue(deliverable());
+    render(AssistantDeliverableBlock, {
+      item: item({ deliverable: deliverable({ deliverable_id: 'dlv-other' }) }),
+    });
+    await screen.findByRole('heading', { name: 'Final report' });
+    expect(mocks.getDeliverable).toHaveBeenCalledWith('dlv-1', { accessorConversationId: '' });
+  });
+
+  it('preserves the selected historical revision when inline data refreshes', async () => {
+    const current = deliverable({ lineage_id: 'lineage-1', revision: 2, latest_revision: 2,
+      revision_count: 2, latest_deliverable_id: 'dlv-1', is_latest: true });
+    const previous = deliverable({ deliverable_id: 'dlv-old', content: '# Historical body',
+      lineage_id: 'lineage-1', revision: 1, latest_revision: 2, revision_count: 2,
+      latest_deliverable_id: 'dlv-1', is_latest: false });
+    mocks.revisions.mockResolvedValue({ revisions: [{
+      deliverable_id: 'dlv-old', revision: 1, title: 'Previous', format: 'markdown',
+      status: 'approved', step_run_id: null, task_id: null, conversation_id: null,
+      created_at: null, is_latest: false,
+    }] });
+    const loadRevision = vi.fn().mockResolvedValue(previous);
+    const { rerender } = render(AssistantDeliverableBlock, {
+      item: item({ deliverable: current }), loadRevision, conversational: true,
+    });
+    await screen.findByRole('heading', { name: 'Final report' });
+    await fireEvent.click(await screen.findByTestId('deliverable-revision-toggle'));
+    await fireEvent.click(await screen.findByRole('option'));
+    await screen.findByRole('heading', { name: 'Historical body' });
+    await rerender({
+      item: item({ deliverable: { ...current, title: 'Refreshed' } }),
+      loadRevision, conversational: true,
+    });
+    expect(screen.getByRole('heading', { name: 'Historical body' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Final report' })).toBeNull();
+  });
+
   it('renders conversational content once with document actions and revision history after the body', async () => {
     mocks.getDeliverable.mockResolvedValue(deliverable({ revision: 2, latest_revision: 2 }));
     const { container } = render(AssistantDeliverableBlock, { item: item(), conversational: true });
@@ -75,7 +138,7 @@ describe('AssistantDeliverableBlock', () => {
     expect(screen.queryByTestId('rich-deliverable-toolbar')).toBeNull();
     const footer = screen.getByTestId('chat-document-footer');
     expect(within(footer).getByRole('button', { name: 'Open fullscreen' })).toHaveTextContent('');
-    expect(within(footer).getByTestId('deliverable-revision-toggle')).toBeTruthy();
+    expect(await within(footer).findByTestId('deliverable-revision-toggle')).toBeTruthy();
     expect(within(footer).getByTitle('More document actions').closest('details')).not.toHaveAttribute('open');
     await fireEvent.click(within(footer).getByTitle('More document actions'));
     expect(within(footer).getByRole('link', { name: 'Open in Library ↗' })).toBeTruthy();
@@ -99,12 +162,19 @@ describe('AssistantDeliverableBlock', () => {
     await screen.findByTestId('rich-deliverable');
     expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
     expect(screen.getByText('Markdown report')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Share public link' })).toBeNull();
+    await vi.dynamicImportSettled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Share link' }));
+    await vi.dynamicImportSettled();
+    const sharing = within(await screen.findByRole('dialog', { name: 'Share document' }));
+    expect(sharing.getByLabelText('Link access and expiration')).toHaveValue('private');
+    expect(sharing.getAllByRole('option')).toHaveLength(1);
+    expect(sharing.queryByRole('button', { name: 'Create public link' })).toBeNull();
+    await fireEvent.click(sharing.getByRole('button', { name: 'Done' }));
+    // A collapsed card is read through fullscreen; there is no second in-place expand.
     await fireEvent.click(screen.getByTitle('More document actions'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
-    expect(screen.getByRole('heading', { name: 'Final report' })).toBeTruthy();
-    await fireEvent.click(screen.getByTitle('More document actions'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Collapse document' }));
+    expect(screen.queryByRole('button', { name: 'Expand document' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
+    expect(within(screen.getByTestId('rich-deliverable-full-view')).getByRole('heading', { name: 'Final report' })).toBeTruthy();
     expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
   });
 
@@ -115,7 +185,14 @@ describe('AssistantDeliverableBlock', () => {
       context: new Map([[DELIVERABLE_SHARING_CONTEXT, readable(false)]])
     });
     await screen.findByTestId('rich-deliverable');
-    expect(screen.queryByRole('button', { name: 'Share deliverable' })).not.toBeInTheDocument();
+    await vi.dynamicImportSettled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Share link' }));
+    await vi.dynamicImportSettled();
+    const sharing = within(await screen.findByRole('dialog', { name: 'Share document' }));
+    expect(sharing.getByLabelText('Link access and expiration')).toHaveValue('private');
+    expect(sharing.getAllByRole('option')).toHaveLength(1);
+    expect(sharing.queryByRole('button', { name: 'Create public link' })).toBeNull();
+    await fireEvent.click(sharing.getByRole('button', { name: 'Done' }));
     expect(screen.getByTitle('Download document')).toBeInTheDocument();
   });
   beforeEach(() => {
@@ -241,28 +318,20 @@ describe('AssistantDeliverableBlock', () => {
     expect(screen.getByRole('heading', { name: 'Rich body' })).toBeTruthy();
   });
 
-  it('collapses only the inline body while toolbar actions and full view remain available', async () => {
+  it('collapses only the inline body while shared footer actions and full view remain available', async () => {
     mocks.getDeliverable.mockResolvedValue(deliverable());
     render(AssistantDeliverableBlock, { item: item(), collapsedByDefault: true });
 
     const root = await screen.findByTestId('rich-deliverable');
-    const expand = screen.getByRole('button', { name: 'Expand document' });
-    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: 'Expand document' })).toBeNull();
     expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
-    expect(expand).toHaveAttribute('aria-controls');
-    expect(screen.getByTestId('rich-deliverable-toolbar')).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Open full view' })).toBeVisible();
+    expect(screen.getByTestId('chat-document-footer')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Open fullscreen' })).toBeVisible();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
     const fullView = screen.getByTestId('rich-deliverable-full-view');
     expect(within(fullView).getByText('Validated')).toBeVisible();
     await fireEvent.click(within(fullView).getByRole('button', { name: 'Close' }));
-    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
-
-    await fireEvent.click(expand);
-    expect(screen.getByRole('button', { name: 'Collapse document' })).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
-    await fireEvent.click(screen.getByRole('button', { name: 'Collapse document' }));
     expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
     expect(root.querySelector('.assistant-deliverable-card')).toBeNull();
   });
@@ -280,8 +349,7 @@ describe('AssistantDeliverableBlock', () => {
       collapsedByDefault: true,
     });
     await screen.findByTestId('rich-deliverable');
-    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
-    expect(screen.getByTestId('rich-deliverable-inline-document')).toBeVisible();
+    expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
 
     await rerender({
       item: item({
@@ -292,7 +360,6 @@ describe('AssistantDeliverableBlock', () => {
       collapsedByDefault: true,
     });
     await screen.findByRole('heading', { name: 'Second report' });
-    expect(screen.getByRole('button', { name: 'Expand document' })).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByTestId('rich-deliverable-inline-document')).toBeNull();
     expect(mocks.getDeliverable).toHaveBeenLastCalledWith('dlv-2', expect.anything());
   });
@@ -330,13 +397,12 @@ describe('AssistantDeliverableBlock', () => {
     mocks.getDeliverable.mockResolvedValue(deliverable({
       content: '# Report\n\n## One\n\nA\n\n## Two\n\nB\n\n## Three\n\nC',
     }));
-    render(AssistantDeliverableBlock, { item: item(), collapsedByDefault: true });
+    render(AssistantDeliverableBlock, { item: item() });
     const root = await screen.findByTestId('rich-deliverable');
     expect(root).toHaveAttribute('data-inline-toc-layout', 'drawer');
 
     triggerResize(1200);
     await waitFor(() => expect(root).toHaveAttribute('data-inline-toc-layout', 'sidebar'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Expand document' }));
     expect(root.querySelector('.rich-inline-document')).toHaveClass('inline-toc-sidebar');
     expect(screen.queryByRole('button', { name: 'Open table of contents' })).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Close table of contents' }));

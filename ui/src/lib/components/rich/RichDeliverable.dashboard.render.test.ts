@@ -63,7 +63,7 @@ describe('dashboard presentation and canvas resolution', () => {
       surface: 'embedded',
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open full view' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open fullscreen' }));
     expect(screen.getByTestId('rich-deliverable-full-view')).toHaveAttribute('data-rich-canvas', 'wide');
   });
 
@@ -77,11 +77,12 @@ describe('dashboard presentation and canvas resolution', () => {
       },
     });
 
-    expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
-    expect(screen.getByRole('heading', { level: 1, name: 'Capacity snapshot' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { level: 1 })).toBeNull();
+    expect(screen.getAllByRole('heading', { level: 2 })).toHaveLength(1);
+    expect(screen.getByRole('heading', { level: 2, name: 'Capacity snapshot' })).toBeTruthy();
     expect(screen.queryByText('Host dashboard title')).toBeNull();
     expect(container.querySelector('[data-testid="rich-deliverable-toolbar"]')).toHaveClass('actions-only');
-    expect(screen.getByRole('button', { name: 'Open full view' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Open fullscreen' })).toBeTruthy();
   });
 
   it('keeps the host title when a dashboard starts with a titleless section header', () => {
@@ -341,7 +342,7 @@ describe('capacity-dashboard fixture scenario', () => {
     expect(container.querySelector('[data-testid="rich-deliverable"]')).toHaveAttribute('data-rich-canvas', 'wide');
     expect(container.querySelectorAll('[data-rich-block-type="metric"] [role="progressbar"]')).toHaveLength(4);
     expect(container.querySelector('[data-rich-role="metadata"]')).toHaveTextContent('orchid-primary');
-    expect(container.querySelector('[data-rich-role="status"]')).toHaveTextContent('5 suggested indexes');
+    expect(container.querySelector('[data-rich-role="status"]')).toHaveTextContent('9 suggested indexes');
     expect(container.querySelectorAll('[data-rich-block-type="card"]')).toHaveLength(1);
   });
 });

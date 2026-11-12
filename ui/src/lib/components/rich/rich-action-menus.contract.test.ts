@@ -17,7 +17,7 @@ describe('rich deliverable action menus', () => {
 
   it('sizes child-component triggers from the host toolbar instead of their own breakpoints', () => {
     expect(deliverable).toContain('--rich-action-size: 2.75rem;');
-    expect(deliverable).toContain('--rich-action-size: 2rem;');
+    expect(deliverable).toContain('--rich-action-size: 2.25rem;');
     for (const source of [share, download]) {
       expect(source).toContain("import './document-actions.css'");
       expect(source).toContain('class="document-icon-action"');
@@ -31,6 +31,6 @@ describe('rich deliverable action menus', () => {
     expect(share).toContain('<PublicLinkDialog');
     expect(share).toContain('aria-haspopup="dialog"');
     expect(read('PublicLinkDialog.svelte')).toContain('<BlockingDialog');
-    expect(download).toContain('use:keepInViewport');
+    expect(download).toContain('use:anchoredMenu');
   });
 });

@@ -92,7 +92,7 @@ describe('MFA authentication flow', () => {
     expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', offline: false, user });
   });
 
-  it('revokes a stalled coordination lease, then verifies afresh through the existing login bootstrap', async () => {
+  it('revokes a stalled coordination lease and verifies afresh without redirecting to login', async () => {
     const user = { email: 'user@example.com', name: 'User', role: 'user' };
     vi.spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -109,16 +109,79 @@ describe('MFA authentication flow', () => {
     try {
       await expect(oldLease.validate()).rejects.toBeInstanceOf(CoordinationUnavailableError);
       expect(oldLease.signal.aborted).toBe(true);
-      expect(auth.getSnapshot().status).toBe('anonymous');
+      expect(auth.getSnapshot().status).toBe('loading');
+      expect(JSON.parse(localStorage.getItem('cognis-auth-last-verified-user')!).user).toEqual(user);
       expect(() => coordination.capture()).toThrow();
-      // The app shell routes anonymous users to login, whose bootstrap must
-      // now be able to verify the still-valid server session on a fresh lease.
-      await auth.bootstrap();
-      expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', offline: false, user });
+      await vi.waitFor(() => expect(auth.getSnapshot()).toMatchObject({
+        status: 'authenticated', offline: false, user,
+      }));
       await coordination.capture().validate();
       expect(oldLease.signal.aborted).toBe(true);
     } finally {
       transaction.mockRestore();
     }
+  });
+
+  it('refreshes an expired access cookie during startup before declaring the session expired', async () => {
+    const user = { email: 'user@example.com', name: 'User', role: 'user' };
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('{}', { status: 401, headers: jsonHeaders }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        status: 'authenticated', user, expires_at: '2099-01-01T00:00:00Z',
+      }), { status: 200, headers: jsonHeaders }));
+    await auth.bootstrap();
+    expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', user });
+    expect(fetchMock.mock.calls.map(([url]) => String(url).split('/').at(-1))).toEqual(['me', 'refresh']);
+    await documentCoordination().capture().validate();
+  });
+
+  it('keeps storage outages fail-closed and retries verification when the app returns online', async () => {
+    const user = { email: 'user@example.com', name: 'User', role: 'user' };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      new Response(JSON.stringify(user), { status: 200, headers: jsonHeaders }));
+    await auth.bootstrap();
+    const coordination = documentCoordination(), oldLease = coordination.capture();
+    const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+      throw new DOMException('Database connection unavailable', 'InvalidStateError');
+    });
+    try {
+      await expect(oldLease.validate()).rejects.toThrow('coordination');
+      await vi.waitFor(() => expect(open.mock.calls.length).toBeGreaterThanOrEqual(2));
+      expect(auth.getSnapshot()).toMatchObject({ status: 'loading', user: null });
+      expect(oldLease.signal.aborted).toBe(true);
+      expect(() => coordination.capture()).toThrow();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(localStorage.getItem('cognis-auth-last-verified-user')).not.toBeNull();
+      open.mockRestore();
+      window.dispatchEvent(new Event('online'));
+      await vi.waitFor(() => expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', user }));
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(oldLease.signal.aborted).toBe(true);
+      await coordination.capture().validate();
+    } finally { open.mockRestore(); }
+  });
+
+  it('bounds a stalled refresh body and releases bootstrap and the session lock', async () => {
+    const user = { email: 'user@example.com', name: 'User', role: 'user' };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({
+      status: 'authenticated', user, expires_at: '2099-01-01T00:00:00Z',
+    }), { status: 200, headers: jsonHeaders }));
+    await auth.login(user.email, 'password');
+    const cancelled = vi.fn();
+    const response = new Response(new ReadableStream({ cancel: cancelled }), { status: 200 });
+    const getReader = vi.spyOn(response.body!, 'getReader');
+    fetchMock.mockResolvedValueOnce(new Response('{}', { status: 401, headers: jsonHeaders }))
+      .mockResolvedValueOnce(response);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const first = auth.bootstrap(), joined = auth.bootstrap();
+    await vi.waitFor(() => expect(getReader).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(15_001);
+    await Promise.all([first, joined]);
+    expect(cancelled).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify(user), { status: 200, headers: jsonHeaders }));
+    await auth.bootstrap();
+    expect(auth.getSnapshot()).toMatchObject({ status: 'authenticated', user, offline: false });
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });

@@ -219,7 +219,8 @@ describe('chat page helpers', () => {
   });
 
   it('prioritizes pending input and active turns in the compact header status', () => {
-    expect(mobileConversationStatusLabel('active', false, false)).toBe('active');
+    expect(mobileConversationStatusLabel('active', false, false)).toBe('Idle');
+    expect(mobileConversationStatusLabel('archived', false, false)).toBe('Archived');
     expect(mobileConversationStatusLabel('active', true, false)).toBe('Running');
     expect(mobileConversationStatusLabel('active', true, true)).toBe('Waiting for input');
   });
@@ -1217,6 +1218,22 @@ describe('chat page helpers', () => {
     expect(reconcileConversationWithChatRuntime(row, { ...state, conversationId: 'conv-b' })).toBe(row);
     expect(reconcileConversationWithChatRuntime(row, state, optimisticConversationTurnPatch('build')))
       .toMatchObject({ has_active_turn: true, active_turn_chat_mode: 'build' });
+  });
+
+  it('preserves shared activity metadata over its redacted idle runtime', () => {
+    const row = {
+      conversation_id: 'conv-shared', is_readonly_for_caller: true, has_active_turn: true,
+    } as Conversation;
+    const state = {
+      ...emptyChatV2State(),
+      conversationId: 'conv-shared', cursor: 'shared-cursor',
+      runtime: {
+        runtime_epoch: 'shared-epoch', runtime_revision: 1,
+        generated_at: '2026-01-01T00:05:00.000Z',
+        has_active_turn: false, active_turn: null, volatile_items: [],
+      },
+    };
+    expect(reconcileConversationWithChatRuntime(row, state)).toBe(row);
   });
 
   it('orders foreign sidebar runtime patches by timestamp and turn identity', () => {
@@ -2899,7 +2916,7 @@ describe('chat page helpers', () => {
       'active',
       false,
       managedEscalationPending(escalations, 'child-a'),
-    )).toBe('active');
+    )).toBe('Idle');
     expect(managedEscalationPending(escalations, 'child-b')).toBe(true);
   });
 
@@ -2997,7 +3014,7 @@ describe('chat page helpers', () => {
         { kind: 'message', role: 'user', content: 'do work', turnId: 'turn-1' },
         {
           kind: 'system_message',
-          text: 'Turn failed: anthropic-fixture1 rate-limited claude-fixture-1 after 1 attempt(s).',
+          text: 'Turn failed: anthropic-demo rate-limited claude-fable-5 after 1 attempt(s).',
           noticeKind: 'model_error',
           noticeScope: 'failed_turn',
         },

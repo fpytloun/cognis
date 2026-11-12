@@ -17,6 +17,7 @@ import {
   currentWorkPage,
   moveToCachedWorkPage,
   orderedWorkDeliverables,
+  latestWorkArtifacts,
   replaceNewestWorkPage,
   retainExactWorkSummary,
   resolvedCurrentWorkPage,
@@ -624,5 +625,30 @@ describe('work page navigation', () => {
     expect(workWindow(items, 0, 10).items).toEqual(items.slice(15));
     expect(workWindow(items, 1, 10).items).toEqual(items.slice(5, 15));
     expect(workWindow(items, 2, 10).items).toEqual(items.slice(0, 5));
+  });
+});
+
+describe('latestWorkArtifacts', () => {
+  it('keeps the newest revision of each document and counts the revisions this work produced', () => {
+    const items = [
+      { artifact_id: 'a162', lineage_id: 'state', revision: 162 },
+      { artifact_id: 'a161', lineage_id: 'state', revision: 161 },
+      { artifact_id: 'c1', lineage_id: 'schemas', revision: 1 },
+      { artifact_id: 'a160', lineage_id: 'state', revision: 160 },
+      { artifact_id: 'solo' },
+    ];
+    expect(latestWorkArtifacts(items).map(item => [item.artifact_id, item.revisions_here])).toEqual([
+      ['a162', 3], ['c1', 1], ['solo', 1],
+    ]);
+  });
+
+  it('orders documents by their most recent revision, newest first', () => {
+    const items = [
+      { artifact_id: 'old-doc', created_at: '2026-10-01T10:00:00Z' },
+      { artifact_id: 'doc-v1', lineage_id: 'doc', revision: 1, created_at: '2026-10-02T10:00:00Z' },
+      { artifact_id: 'newest', created_at: '2026-10-05T10:00:00Z' },
+      { artifact_id: 'doc-v2', lineage_id: 'doc', revision: 2, updated_at: '2026-10-04T10:00:00Z' },
+    ];
+    expect(latestWorkArtifacts(items).map(item => item.artifact_id)).toEqual(['newest', 'doc-v2', 'old-doc']);
   });
 });

@@ -8,6 +8,7 @@ import {
   parseChatModeDirectiveInput,
 } from '$lib/slash-commands';
 import type { AttachmentRef } from '$lib/types/api';
+import type { IncludedFeedback } from '$lib/feedback/types';
 
 export interface ComposerDispatchInput {
   conversationId: string;
@@ -16,6 +17,7 @@ export interface ComposerDispatchInput {
   chatMode?: ChatMode;
   clientTxnId?: string;
   clientMessageId?: string;
+  feedback?: IncludedFeedback | null;
 }
 
 export type NormalizedComposerInput =
@@ -73,6 +75,9 @@ export async function dispatchChatComposerMessage(
   const now = dependencies.now ?? (() => new Date().toISOString());
   const clientTxnId = input.clientTxnId ?? uuid();
   const normalized = normalizeChatComposerInput(input);
+  if (normalized.kind === 'command' && input.feedback) {
+    throw new Error('Exclude included feedback before running a slash command.');
+  }
   if (normalized.kind === 'command') {
     const response = await executeComposerCommandWithRetry(
       input.conversationId,
@@ -92,7 +97,7 @@ export async function dispatchChatComposerMessage(
     const existing = await dependencies.outbox.get(clientTxnId);
     if (!existing) await dependencies.outbox.put({
       client_txn_id: clientTxnId, client_message_id: clientMessageId,
-      conversation_id: input.conversationId, content, attachments, chat_mode: chatMode,
+      conversation_id: input.conversationId, content, attachments, chat_mode: chatMode, feedback: input.feedback,
       status: 'pending', created_at: timestamp, updated_at: timestamp,
     });
     return sendOutboxEntry(dependencies.outbox, (await dependencies.outbox.get(clientTxnId))!,
@@ -106,7 +111,8 @@ export async function dispatchChatComposerMessage(
         content,
         attachments,
         client_message_id: clientMessageId,
-        chat_mode: chatMode
+        chat_mode: chatMode,
+        ...(input.feedback ? { feedback: input.feedback } : {}),
       }
     );
     return { kind: 'message', response, clientTxnId, clientMessageId };

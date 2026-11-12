@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { TaskDeliverableFreshness } from '$lib/types/api';
   import { onDestroy, tick, untrack } from 'svelte';
   import ChatV2TimelineList from '$lib/components/chat-v2/ChatV2TimelineList.svelte';
   import TaskStepOutcomeEpilogue from '$lib/components/tasks/TaskStepOutcomeEpilogue.svelte';
@@ -22,6 +23,7 @@
   } from '$lib/chat-v2/types';
   import type { AttachmentRef } from '$lib/types/api';
   import type { TodoSnapshotItem } from '$lib/todos';
+  import ScopedChatSearch from './ScopedChatSearch.svelte';
   import { currentCycleDelegations } from '$lib/ongoing-work';
 
   export interface ScopedChatV2Realtime {
@@ -45,10 +47,12 @@
     onMissingStream,
     activityStatus = '',
     stepRun = null,
+    deliverableFreshness,
     onRuntimeActiveChange,
     hasEditableComposer = false,
     showQueuedMessages = true,
     showTodoDrawer = true,
+    showLiveIndicator = true,
     onQueueChange,
     onInitialLoaded,
     autoBackfill = undefined,
@@ -68,10 +72,12 @@
     onMissingStream?: (() => void) | undefined;
     activityStatus?: string;
     stepRun?: StepRun | null;
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
     onRuntimeActiveChange?: ((active: boolean) => void) | undefined;
     hasEditableComposer?: boolean;
     showQueuedMessages?: boolean;
     showTodoDrawer?: boolean;
+    showLiveIndicator?: boolean;
     onQueueChange?: ((queue: QueueMessage[]) => void) | undefined;
     onInitialLoaded?: (() => void | Promise<void>) | undefined;
     autoBackfill?: boolean | undefined;
@@ -80,6 +86,27 @@
   }>();
 
   let store = $state.raw(new ChatV2Store());
+  let search = $state<{ openSearch: (opener?: HTMLElement) => Promise<HTMLInputElement | null> } | null>(null);
+  let searchQuery = $state('');
+  let searchMatchedIds = $state<Set<string>>(new Set());
+  let searchSelectedId = $state('');
+
+  export function openSearch(opener?: HTMLElement): Promise<HTMLInputElement | null> {
+    return search?.openSearch(opener) ?? Promise.resolve(null);
+  }
+
+  async function scrollToSearchResult(id: string): Promise<void> {
+    const selectionScope = scope.key;
+    await tick();
+    if (scope.key !== selectionScope) return;
+    const element = Array.from(viewport?.querySelectorAll<HTMLElement>('[data-message-id]') ?? [])
+      .find(row => row.dataset.messageId === id);
+    if (!element || !viewport) return;
+    userScrolledUp = true;
+    const top = viewport.scrollTop + element.getBoundingClientRect().top
+      - viewport.getBoundingClientRect().top - viewport.clientHeight / 3;
+    timelineViewport?.setProgrammaticScrollTop(top);
+  }
   let timeline = $state.raw<TimelineController | null>(null);
   let identityRequired = $state(false);
   let ownerRecoveryRevision = $state(0);
@@ -155,7 +182,9 @@
     scope.conversation_id ?? '',
   ));
   const queue = $derived(store.visibleQueue.messages);
-  const effectiveAutoBackfill = $derived(autoBackfill ?? !hasEditableComposer);
+  const effectiveAutoBackfill = $derived(
+    autoBackfill ?? (!hasEditableComposer || store.snapshot.historyWindowReduced === true)
+  );
   $effect(() => {
     const nextTodos = todos;
     untrack(() => onTodosChange?.(nextTodos));
@@ -168,6 +197,7 @@
     const nextQueue = queue;
     untrack(() => onQueueChange?.(nextQueue));
   });
+  const displayedFreshness = $derived({ ...stepRun?.deliverable_freshness, ...deliverableFreshness });
   const runtimeActive = $derived(store.snapshot.runtime?.has_active_turn === true);
   const stepRunLive = $derived(stepRun?.status === 'running' || stepRun?.status === 'evaluating');
   const effectiveRuntimeActive = $derived(stepRun ? stepRunLive : runtimeActive);
@@ -212,7 +242,11 @@
   // page for conversation scopes. Saved settled, after loads and changes.
   function persistView(currentScope: TimelineScope, currentStore: ChatV2Store): void {
     if (!currentStore.snapshot.cursor) return;
-    if (timeline?.store === currentStore) timeline.persist();
+    if (timeline?.store === currentStore) {
+      timeline.persist();
+      void timeline.reconcileAdmissions();
+      void timeline.reconcileCompactions();
+    }
   }
 
   function scheduleViewSave(currentScope: TimelineScope, currentStore: ChatV2Store): void {
@@ -243,9 +277,12 @@
     }
     loading = false;
     initialPinPending = true;
-    initialLoadedPending = true;
     realtime.acquireChatV2(currentScope, cached.cursor);
     acquiredScopeKey = currentScope.key;
+    // Let cached rows complete their initial positioning before a slow catch-up
+    // sets loading again; otherwise the entire viewport stays invisible.
+    await tick();
+    if (scopeVersion !== scopeGeneration || requestVersion !== requestGeneration || currentStore !== store) return;
     await sync();
   }
 
@@ -294,9 +331,9 @@
         || controller.signal.aborted
         || currentStore !== store
       ) return;
-       if (initialLoadedScopeKey !== currentScope.key || forceSnapshot) {
-         initialPinPending = true;
-         initialLoadedPending = true;
+        if (initialLoadedScopeKey !== currentScope.key || forceSnapshot) {
+          if (!initialPositionSettled || forceSnapshot) initialPinPending = true;
+          initialLoadedPending = true;
        }
        scheduleViewSave(currentScope, currentStore);
         const resolvedScope = currentStore.snapshot.scope ?? snapshot?.scope ?? currentScope;
@@ -313,7 +350,10 @@
       if (controller.signal.aborted || isAbortError(caught)) return;
       // Offline with a cached copy on screen: keep it readable; the reconnect
       // resync brings it up to date.
-      if (currentStore.visibleItems.length > 0 && isOfflineError(caught)) return;
+      if (currentStore.visibleItems.length > 0 && isOfflineError(caught)) {
+        if (initialLoadedScopeKey !== currentScope.key) initialLoadedPending = true;
+        return;
+      }
       error = caught instanceof Error ? caught.message : 'Could not load timeline.';
       loadFailure = caught;
     } finally {
@@ -512,6 +552,7 @@
       ) return;
       if (controller.signal.aborted || isAbortError(caught)) return;
       seenBackfillCursors.delete(before);
+      autoFillAllowed = false;
       olderError = caught instanceof Error ? caught.message : 'Could not load older events.';
     } finally {
       if (backfillController === controller) backfillController = null;
@@ -777,8 +818,9 @@
     if (!initialPinPending || loading || !viewport) return;
     initialPinPending = false;
     const pinScopeVersion = scopeGeneration;
+    const pinViewport = viewport;
     void tick().then(() => {
-      if (!viewport || trustedUpwardInteraction) return;
+      if (pinScopeVersion !== scopeGeneration || viewport !== pinViewport || trustedUpwardInteraction) return;
       timelineViewport?.scrollProgrammaticallyToBottom();
       requestAnimationFrame(() => {
         if (pinScopeVersion === scopeGeneration && !trustedUpwardInteraction) {
@@ -799,15 +841,20 @@
       initialLoadedPending = false;
       return;
     }
-    initialLoadedPending = false;
-    initialLoadedScopeKey = loadedScopeKey;
+    const scopeVersion = scopeGeneration;
+    const requestVersion = requestGeneration;
     void tick().then(() => {
       if (
         loadedScopeKey !== scope.key
-        || initialLoadedScopeKey !== loadedScopeKey
+        || scopeVersion !== scopeGeneration
+        || requestVersion !== requestGeneration
+        || initialLoadedScopeKey === loadedScopeKey
+        || !initialLoadedPending
         || loading
         || error
       ) return;
+      initialLoadedPending = false;
+      initialLoadedScopeKey = loadedScopeKey;
       untrack(() => onInitialLoaded?.());
     });
   });
@@ -823,6 +870,7 @@
       && !loading
       && !loadingOlder
       && !error
+      && !olderError
       && hasOlder
       && autoFillPagesRemaining > 0
     );
@@ -849,6 +897,8 @@
   data-has-older={hasOlder ? 'true' : 'false'}
   data-freshness={timeline?.reconciled ? 'current' : 'reconciling'}
 >
+  <ScopedChatSearch scopeKey={scope.key} {items} onSelect={scrollToSearchResult}
+    bind:this={search} bind:query={searchQuery} bind:matchedIds={searchMatchedIds} bind:selectedId={searchSelectedId} />
   {#if missingStream}
     <div class="m-4 rounded-xl border border-warning-border bg-warning-subtle p-4 text-sm text-warning">
       This stream is not available yet.
@@ -892,7 +942,7 @@
     {loadingOlder}
     {error}
     {emptyLabel}
-    live={hasEditableComposer ? false : live}
+    live={!hasEditableComposer && showLiveIndicator && live}
     {hasStreamingItems}
     liveLabel={activityStatus === 'evaluating' ? 'Evaluator is reviewing…' : 'Turn running'}
     followPausedLabel="Resume live follow"
@@ -909,7 +959,7 @@
     interactionEnabled={initialPositionSettled}
     {onViewSession}
     testId="scoped-timeline-viewport"
-    class={`relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-2.5 py-1.5 sm:p-4 ${items.length > 0 && !initialPositionSettled ? 'invisible' : ''}`}
+    class={`relative min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain px-2.5 py-1.5 sm:p-4 ${items.length > 0 && !initialPositionSettled && !error ? 'invisible' : ''}`}
     contentClass="space-y-3 [overflow-anchor:none]"
   >
     {#if waitingOffline}
@@ -921,7 +971,7 @@
           Try again
         </Button>
       </div>
-    {:else if loading && initialLoadedScopeKey === null}
+    {:else if loading && items.length === 0}
       <div class="py-6 text-sm text-muted">Loading timeline…</div>
     {:else if items.length === 0 && hasOlder}
       {#if loadingOlder}
@@ -935,10 +985,11 @@
     {:else if items.length === 0 && !(scope.kind === 'task_step' && stepRun)}
       <div class="py-6 text-sm text-muted">{emptyLabel}</div>
     {:else}
-      <ChatV2TimelineList {items} {agent} {compact} preferences={effectivePreferences} {cycleStates} runtime={store.snapshot.runtime} {onViewSession} {onOpenWork} {scope} />
+      <ChatV2TimelineList {items} {agent} {compact} preferences={effectivePreferences} {cycleStates} runtime={store.snapshot.runtime} {onViewSession} {onOpenWork} {scope} {searchQuery} {searchMatchedIds} {searchSelectedId} deliverableFreshness={displayedFreshness} />
     {/if}
     {#if scope.kind === 'task_step' && stepRun}
-      <TaskStepOutcomeEpilogue {stepRun} />
+      <TaskStepOutcomeEpilogue {stepRun} deliverableFreshness={displayedFreshness}
+        timelineDeliverableIds={items.flatMap(item => item.kind === 'assistant_deliverable' ? [item.deliverable_id] : [])} />
     {/if}
   </TimelineViewport>
   {#if showTodoDrawer && todos.length > 0}

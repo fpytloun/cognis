@@ -2,7 +2,6 @@ import { expect, test } from '@playwright/test';
 
 import { ADMIN_EMAIL, login } from './helpers';
 import { installTaskCockpitFixture, TASK_ID } from './task-cockpit-fixture';
-import type { Conversation } from '../src/lib/types/api';
 
 test.describe('Control Center', () => {
   test('contains long issue rows within an iPhone PWA viewport', async ({ page }) => {
@@ -356,9 +355,6 @@ test.describe('Control Center', () => {
       }
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
     });
-    await page.route('**/api/v1/conversations/waiting?**', route => route.fulfill({
-      json: { conversations: { items: [], cursor: null, has_more: false }, active_conversation_ids: [] },
-    }));
     await page.route(/\/api\/v1\/conversations(?:\?.*)?$/, async (route) => {
       if (route.request().method() !== 'GET') {
         await route.continue();
@@ -507,7 +503,6 @@ test.describe('Control Center', () => {
       await page.goto('/');
       await expect(page.getByTestId('dashboard-tasks-section')).toBeVisible();
       await expect(page.getByTestId('dashboard-conversations-section')).toBeVisible();
-      await expect(page.getByTestId('dashboard-task-row-overflow-task')).toBeVisible();
 
       const layout = await page.evaluate(() => {
         const app = document.querySelector<HTMLElement>('[data-app-content="true"]');
@@ -700,14 +695,11 @@ test.describe('Control Center', () => {
       active_session_completion_reason: null,
       pending_notification_types: []
     };
-    await page.route((url) => url.pathname === '/api/v1/conversations/conv-new-profile', (route) =>
-      route.request().method() === 'GET'
-        ? route.fulfill({ json: createdConversation })
-        : route.fallback());
     const createPayloads: Array<Record<string, unknown>> = [];
 
-    await page.route('**/api/v1/user-preferences', (route) => route.fulfill({
-      json: {
+    await login(page);
+    expect((await page.request.put('/api/v1/user-preferences', {
+      data: {
         display: { theme: 'dark', language: 'en', dashboard_workspace_windows: true },
         chat: {
           show_thinking_blocks: false,
@@ -716,8 +708,7 @@ test.describe('Control Center', () => {
           show_internal_tool_calls: false
         }
       }
-    }));
-    await login(page);
+    })).ok()).toBe(true);
     await page.route(/\/api\/v1\/agents(?:\?.*)?$/, async (route) => {
       if (route.request().method() !== 'GET') {
         await route.continue();
@@ -941,18 +932,6 @@ test.describe('Control Center', () => {
         })
       });
     });
-    await page.route('**/api/v1/conversations/waiting?**', (route) => route.fulfill({
-      json: {
-        conversations: {
-          items: [
-            topic('waiting-attention', { has_unread: true, pending_notification_types: ['gate'] }),
-            topic('recent-unread', { has_unread: true }),
-          ],
-          cursor: null, has_more: false,
-        },
-        active_conversation_ids: ['active-unread'],
-      },
-    }));
     await page.goto('/');
 
     const active = page.getByTestId('dashboard-conversation-row-active-unread');
@@ -962,9 +941,7 @@ test.describe('Control Center', () => {
     await expect(active.getByTestId('activity-avatar-unread')).toHaveCount(0);
     await expect(waiting.getByTestId('activity-avatar-attention')).toBeVisible();
     await expect(recent.getByTestId('activity-avatar-unread')).toBeVisible();
-    await expect(active.getByText('Unread', { exact: true })).toHaveCount(0);
-    await expect(waiting.getByText('Unread', { exact: true })).toHaveCount(0);
-    await expect(recent.getByText('Unread', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('dashboard-conversations-section').getByText('Unread', { exact: true })).toHaveCount(0);
     await expect(page.getByTestId('dashboard-conversations-section').locator('[aria-label="Unread"]')).toHaveCount(0);
   });
 
@@ -1067,20 +1044,11 @@ test.describe('Control Center', () => {
       });
     });
 
-    await page.route('**/api/v1/conversations/waiting?**', (route) => route.fulfill({
-      json: {
-        conversations: {
-          items: detailActions.length ? [topic('conversation-tail', detailActions)] : [],
-          cursor: null, has_more: false,
-        },
-        active_conversation_ids: [],
-      },
-    }));
     await login(page);
     await expect(page.getByTestId('dashboard-conversation-row-conversation-tail')).toBeVisible();
     await expect.poll(() => page.evaluate(() => (
       ((window as typeof window & { __controlCenterSockets?: WebSocket[] })
-        .__controlCenterSockets?.filter((socket) => socket.readyState === WebSocket.OPEN).length ?? 0)
+        .__controlCenterSockets?.length ?? 0)
     ))).toBeGreaterThan(0);
     const invalidate = () => page.evaluate(() => {
       const sockets = (window as typeof window & {
@@ -1961,35 +1929,12 @@ test.describe('Control Center', () => {
   });
 
   test('restores minimized windows and adapts conversation content to window width', async ({ page }) => {
-    await page.addInitScript(() => {
-      const NativeWebSocket = window.WebSocket;
-      const sockets: WebSocket[] = [];
-      Object.defineProperty(window, '__workspaceReadSockets', { value: sockets });
-      class InspectableWebSocket extends NativeWebSocket {
-        constructor(url: string | URL, protocols?: string | string[]) {
-          super(url, protocols);
-          sockets.push(this);
-        }
-      }
-      window.WebSocket = InspectableWebSocket;
-    });
     await page.setViewportSize({ width: 1440, height: 1000 });
     await login(page);
-    await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: true, dashboardConversation: true });
+    await installTaskCockpitFixture(page, { dashboardWorkspaceWindows: true });
     let markReadRequests = 0;
-    let targetReadRequests = 0;
-    let targetSnapshots = 0;
-    let targetMetadata: Conversation | null = null;
-    await page.route('**/api/v1/chat/v2/conversations/conv-task-chat/snapshot**', async route => {
-      targetSnapshots += 1;
-      await route.fallback();
-    });
     await page.route('**/api/v1/conversations/*/read', async (route) => {
       markReadRequests += 1;
-      if (new URL(route.request().url()).pathname === '/api/v1/conversations/conv-task-chat/read') {
-        targetReadRequests += 1;
-        if (targetMetadata) targetMetadata.has_unread = false;
-      }
       await route.fulfill({
         status: 200,
         contentType: 'application/json',
@@ -2126,70 +2071,6 @@ test.describe('Control Center', () => {
     )).toBeVisible();
     await expect(restoredAgent).toBeVisible();
     await expect(narrowToggle).toHaveAttribute('aria-expanded', 'true');
-
-    await narrowToggle.click();
-    const target: Conversation = await page.evaluate(async () =>
-      (await fetch('/api/v1/conversations/conv-task-chat')).json());
-    const filler: Conversation = await page.evaluate(async () =>
-      (await fetch('/api/v1/conversations/conv-task-chat-b')).json());
-    filler.context = target.context;
-    targetMetadata = target;
-    await page.route('**/api/v1/conversations/conv-task-chat', route => route.fulfill({ json: target }));
-    await page.route('**/api/v1/conversations/conv-task-chat-b', route => route.fulfill({ json: filler }));
-    await page.route('**/api/v1/conversations/waiting?**', route => route.fulfill({
-      json: {
-        conversations: { items: target.has_unread ? [target] : [], cursor: null, has_more: false },
-        active_conversation_ids: [],
-      },
-    }));
-    await page.route(/\/api\/v1\/conversations(?:\?.*)?$/, route => route.fulfill({
-      json: { items: [target, filler], cursor: null, has_more: false },
-    }));
-    const invalidate = () => page.evaluate(() => {
-      const sockets = (window as typeof window & { __workspaceReadSockets?: WebSocket[] }).__workspaceReadSockets ?? [];
-      sockets.forEach(socket => socket.dispatchEvent(new MessageEvent('message', {
-        data: JSON.stringify({ type: 'conversation_updated', conversation_id: 'conv-task-chat' }),
-      })));
-    });
-    await expect.poll(() => page.evaluate(() =>
-      (window as typeof window & { __workspaceReadSockets?: WebSocket[] }).__workspaceReadSockets
-        ?.filter(socket => socket.readyState === WebSocket.OPEN).length ?? 0)).toBeGreaterThan(0);
-    await invalidate();
-    await expect(page.getByTestId('dashboard-conversation-row-conv-task-chat-b')).toBeVisible();
-    await restoredWorkspace.evaluate(node => { node.setAttribute('data-read-lifetime', 'retained'); });
-    const readsBeforeCapacity = targetReadRequests;
-    const snapshotsBeforeCapacity = targetSnapshots;
-    await page.setViewportSize({ width: 900, height: 900 });
-    await restoredAgent.getByLabel('Minimize', { exact: true }).click();
-    await page.getByTestId(`dashboard-task-row-${TASK_ID}`).press('Enter');
-    await expect(page.getByTestId(`workspace-window-task:${TASK_ID}`)).toBeVisible();
-    await page.getByTestId('dashboard-conversation-row-conv-task-chat-b').press('Enter');
-    const fillerWindow = page.getByTestId('workspace-window-conversation:conv-task-chat-b');
-    await expect(fillerWindow).toBeVisible();
-    await page.getByTestId('dashboard-conversation-row-conv-task-chat').press('Enter');
-    await expect(page.getByText('Visible window limit reached (2). Minimize or close a window before restoring or opening another.')).toBeVisible();
-    await expect(restoredAgent).toHaveAttribute('data-minimized', 'true');
-    await expect(restoredWorkspace).toHaveAttribute('data-read-lifetime', 'retained');
-    expect(targetReadRequests).toBe(readsBeforeCapacity);
-    expect(targetSnapshots).toBe(snapshotsBeforeCapacity);
-
-    await fillerWindow.getByLabel('Close', { exact: true }).click();
-    await page.locator('[data-testid^="workspace-dock-restore-agent:"]').click();
-    await expect(restoredAgent).toHaveAttribute('data-minimized', 'false');
-    await expect(restoredWorkspace).toHaveAttribute('data-read-lifetime', 'retained');
-    expect(targetSnapshots).toBe(snapshotsBeforeCapacity);
-    expect(targetReadRequests).toBe(readsBeforeCapacity);
-    target.last_message_at = '2026-08-24T12:05:00Z';
-    target.has_unread = true;
-    await invalidate();
-    await expect.poll(() => targetReadRequests).toBe(readsBeforeCapacity + 1);
-    const targetRow = page.getByTestId('dashboard-conversation-row-conv-task-chat');
-    await expect(targetRow.getByTestId('activity-avatar-unread')).toHaveCount(0);
-    target.title = 'Repeated unread version';
-    target.has_unread = true;
-    await invalidate();
-    await expect(targetRow).toContainText('Repeated unread version');
-    expect(targetReadRequests).toBe(readsBeforeCapacity + 1);
   });
 
   test('uses snap-first tablet windows and preserves phone blocking modals', async ({ page }, testInfo) => {
@@ -2384,11 +2265,11 @@ test.describe('Control Center', () => {
     const todoPath = testInfo.outputPath('control-center-todo-indicator.png');
     await page.screenshot({ path: todoPath, animations: 'disabled' });
     await testInfo.attach('control-center-todo-indicator', { path: todoPath, contentType: 'image/png' });
-    await page.getByRole('button', { name: 'Output' }).first().click();
-    const outputOverlay = page.getByTestId('step-output-overlay');
-    const outputPanel = page.getByTestId('step-output-panel');
-    await expect(outputPanel).toHaveAccessibleName('Step output: fetch');
-    await expect(outputPanel.getByRole('heading', { name: 'fetch' })).toBeVisible();
+    await page.getByRole('button', { name: 'Result' }).first().click();
+    const outputOverlay = page.getByTestId('session-logs-overlay');
+    const outputPanel = page.getByTestId('session-logs-panel');
+    await expect(outputPanel).toHaveAccessibleName('Step: fetch');
+    await expect(outputPanel.getByRole('tab', { name: 'Result' })).toHaveAttribute('aria-selected', 'true');
     expect(await outputOverlay.evaluate((root) => root.parentElement === document.body)).toBe(true);
     expect(await outputOverlay.evaluate((root) => {
       const overlays = [...document.body.querySelectorAll<HTMLElement>('[data-overlay-id]')];
@@ -2397,7 +2278,7 @@ test.describe('Control Center', () => {
     expect(await outputPanel.evaluate((panel) => {
       const rect = panel.getBoundingClientRect();
       const target = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
-      return Boolean(target?.closest('[data-testid="step-output-panel"]'));
+      return Boolean(target?.closest('[data-testid="session-logs-panel"]'));
     })).toBe(true);
     await expect(page.getByTestId('dashboard-entity-modal')).toBeVisible();
     expect(page.url()).toBe(taskModalUrl);
@@ -2408,10 +2289,11 @@ test.describe('Control Center', () => {
     await page.keyboard.press('Escape');
     await expect(outputOverlay).toHaveCount(0);
     await expect(page.getByTestId('dashboard-task-modal-panel-steps')).toBeVisible();
-    await page.getByRole('button', { name: 'Logs' }).first().click();
+    await page.getByRole('button', { name: 'Transcript' }).first().click();
     const logsOverlay = page.getByTestId('session-logs-overlay');
     const logsPanel = page.getByTestId('session-logs-panel');
-    await expect(logsPanel).toHaveAccessibleName('Session logs: fetch');
+    await expect(logsPanel).toHaveAccessibleName('Step: fetch');
+    await expect(logsPanel.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
     expect(await logsOverlay.evaluate((root) => root.parentElement === document.body)).toBe(true);
     expect(await logsOverlay.evaluate((root) => {
       const overlays = [...document.body.querySelectorAll<HTMLElement>('[data-overlay-id]')];

@@ -86,6 +86,11 @@ describe('ConversationModalWorkspace inspector', () => {
     });
   });
 
+  async function expandManagedActions(): Promise<void> {
+    const toggle = await screen.findByRole('button', { name: 'Actions' });
+    if (toggle.getAttribute('aria-expanded') === 'false') await fireEvent.click(toggle);
+  }
+
   it('uses the canonical root backing sessions, including successors of the selected session', async () => {
     requests.activityOverview.mockResolvedValue({ workstreams: [{
       key: 'root', root_key: 'root', session_id: 'session-next',
@@ -107,6 +112,7 @@ describe('ConversationModalWorkspace inspector', () => {
     requests.detail.mockResolvedValue(managed('running'));
     render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
     await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await expandManagedActions();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled());
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-managed-a');
     requests.detail.mockResolvedValue(managed('idle'));
@@ -125,9 +131,32 @@ describe('ConversationModalWorkspace inspector', () => {
     });
     render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
     await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await expandManagedActions();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Take control' })).not.toBeDisabled());
     await fireEvent.click(screen.getByRole('button', { name: 'Take control' }));
     await waitFor(() => expect(requests.goto).toHaveBeenCalledWith('/chat/conversation-follow-up-a'));
+  });
+
+  it('restores parent conversations in the workspace rather than navigating to the same URL', async () => {
+    requests.detail.mockImplementation(async (id: string) => ({
+      conversation_id: id, has_active_turn: true,
+      managed_agent: {
+        conversation_state: 'open', turn_state: 'running',
+        controller_conversation_id: id === 'conversation-managed-b' ? 'conversation-managed-a' : 'conversation-parent',
+      },
+    }));
+    render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Parent conversation' })).toHaveAttribute('href', '/chat/conversation-parent'));
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-b' }));
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Parent conversation' })).toHaveAttribute('href', '/chat/conversation-managed-a'));
+    await fireEvent.click(screen.getByRole('link', { name: 'Parent conversation' }));
+    await waitFor(() => expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-managed-a'));
+    await waitFor(() => expect(screen.getByRole('link', { name: 'Parent conversation' })).toHaveAttribute('href', '/chat/conversation-parent'));
+    await fireEvent.click(screen.getByRole('link', { name: 'Parent conversation' }));
+    await waitFor(() => expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-parent'));
+    expect(screen.queryByTestId('managed-conversation-controls')).not.toBeInTheDocument();
+    expect(requests.goto).not.toHaveBeenCalled();
   });
 
   it.each(['Continue', 'Take control'])('does not apply delayed %s to a subsequently selected conversation', async (actionLabel) => {
@@ -139,15 +168,42 @@ describe('ConversationModalWorkspace inspector', () => {
     requests.managedAction.mockReturnValue(new Promise(resolve => { complete = resolve; }));
     render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
     await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await expandManagedActions();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled());
     await fireEvent.click(screen.getByRole('button', { name: actionLabel }));
     await waitFor(() => expect(requests.managedAction).toHaveBeenCalledOnce());
     await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-b' }));
+    await expandManagedActions();
     await waitFor(() => expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled());
     complete({ managed_agent: { conversation_state: 'open', turn_state: 'running' }, result: { conversation_id: 'conversation-follow-up-a' } });
     await tick();
     expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-managed-b');
     expect(screen.getByRole('button', { name: 'Continue' })).not.toBeDisabled();
+    expect(requests.goto).not.toHaveBeenCalled();
+  });
+
+  it('does not reopen a child when its pending lookup completes after restoring the parent', async () => {
+    requests.detail.mockImplementation(async (id: string) => ({
+      conversation_id: id, has_active_turn: false,
+      managed_agent: { conversation_state: 'open', turn_state: 'idle', controller_conversation_id: 'conversation-parent' },
+    }));
+    render(ConversationModalWorkspace, { conversationId: 'conversation-parent', sessionId: 'root' });
+    await fireEvent.click(screen.getByRole('button', { name: 'View conversation-managed-a' }));
+    await screen.findByRole('link', { name: 'Parent conversation' });
+    let complete!: (response: unknown) => void;
+    requests.activityOverview.mockReset().mockReturnValue(new Promise(resolve => { complete = resolve; }));
+    await fireEvent.click(screen.getByRole('button', { name: 'View unresolved session' }));
+    await waitFor(() => expect(requests.activityOverview).toHaveBeenCalledOnce());
+    await fireEvent.click(screen.getByRole('link', { name: 'Parent conversation' }));
+    await waitFor(() => expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-parent'));
+    complete({ workstreams: [{
+      key: 'session:session-delayed', kind: 'delegate', parent_key: 'session:root',
+      session_id: 'session-delayed', conversation_id: 'conversation-managed-a',
+      agent_id: 'agent-1', title: 'Delayed child', status: 'completed',
+    }] });
+    await tick();
+    expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('conversation:conversation-parent');
+    expect(screen.queryByTestId('managed-conversation-controls')).not.toBeInTheDocument();
     expect(requests.goto).not.toHaveBeenCalled();
   });
 

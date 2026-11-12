@@ -77,7 +77,7 @@ let cacheEpoch = 0;
 
 export function activityOverviewIsVisible(
   inspectorOpen: boolean,
-  inspectorMode: 'overview' | 'work' | 'session' | 'context',
+  inspectorMode: import('$lib/stores/conversationInfo.svelte').ConversationInfoMode,
 ): boolean {
   // Work mode still relies on live topology (workstream tree, execution
   // states, todo progress) even though it renders WorkView instead of

@@ -102,6 +102,19 @@ describe('normal composer submission boundary', () => {
     expect(new DocumentDrafts().readComposite('draft:submitted')?.consumed).toBe(true);
   });
 
+  it('prepares and consumes local input when an empty sibling draft invalidated its observation', async () => {
+    const f = await fixture();
+    await new DocumentDrafts().writeComposite(f.current().draftKey!, {
+      input_revision: crypto.randomUUID(), text: '', attachments: [], chat_mode: null,
+    });
+    await expect(f.submission.prepare(f.drafts, f.outbox)).resolves.toMatchObject({
+      conversation_id: f.current().conversationId, content: f.current().text,
+    });
+    expect(await f.outbox.get(f.entry.client_txn_id)).toMatchObject({ status: 'pending' });
+    expect(await f.submission.consume(f.drafts, f.current, f.clear)).toBe(true);
+    expect(f.clear).toHaveBeenCalledOnce();
+  });
+
   for (const status of ['accepted', 'queued'] as const) {
     it(`flushes debounced autosave before delayed persistence and ${status} admission`, async () => {
       const f = await fixture(), blocked = deferred(), entered = deferred();

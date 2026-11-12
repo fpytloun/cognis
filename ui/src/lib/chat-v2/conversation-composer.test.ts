@@ -12,6 +12,7 @@ it('does not persist empty hydration, reopening, or upload progress as an edit',
   const composer = conversationComposer(), id = crypto.randomUUID();
   const initial = composer.hydrate(id);
   composer.update(id, initial.input);
+  composer.update(id, { ...initial.input, input_revision: crypto.randomUUID() });
   expect(composer.hydrate(id)).toEqual(initial);
   await composer.drafts.settled();
   expect(new DocumentDrafts().readComposite(`cognis-chat-draft:${id}`)).toBeNull();

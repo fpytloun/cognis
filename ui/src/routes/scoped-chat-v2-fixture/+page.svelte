@@ -9,6 +9,7 @@
   import EscalationPrompt from '$lib/components/EscalationPrompt.svelte';
   import FileDiffViewer from '$lib/components/FileDiffViewer.svelte';
   import ToolCallBlock from '$lib/components/ToolCallBlock.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
   let themePreview = $state(false);
   let timeline = $state<{ refresh(): Promise<void> }>();
 
@@ -130,6 +131,7 @@
 
 <main data-testid="scoped-chat-v2-fixture" class="min-h-screen bg-canvas p-4 text-foreground">
   <h1 class="mb-2 text-xl font-semibold">Scoped ChatV2 fixture</h1>
+  <p class="mb-2 text-xs text-muted">Client-only fixture · synthetic runtime frames; no backend E2E.</p>
   <p data-testid="active-scope" class="mb-4 text-sm text-muted">{scope.label} · {scope.key}</p>
   <div class="mb-4 flex flex-wrap gap-2" role="toolbar" aria-label="Scope controls">
     <button type="button" data-testid="scope-parent" onclick={() => select('parent')}>Parent</button>
@@ -143,7 +145,7 @@
       <button type="button" data-testid="hold-refresh-snapshot" onclick={() => controller.holdNextRefreshSnapshot()}>Hold next snapshot</button>
       <button type="button" data-testid="resolve-refresh-snapshot" onclick={() => controller.resolveHeldRefreshSnapshot()}>Resolve snapshot</button>
       <button type="button" data-testid="reset-cursor" onclick={resetCursor}>Reset cursor</button>
-      <button type="button" onclick={() => timeline?.refresh()}>Refresh timeline</button>
+       <Button type="button" onclick={() => timeline?.refresh()}>Refresh timeline</Button>
        <button type="button" data-testid="reconnect" onclick={reconnect}>Reconnect</button>
       <button type="button" data-testid="set-evaluating" onclick={setEvaluating}>Set evaluating</button>
       <button type="button" data-testid="set-approved" onclick={setApproved}>Set approved</button>

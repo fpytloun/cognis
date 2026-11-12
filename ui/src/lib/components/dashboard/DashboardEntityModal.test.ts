@@ -114,6 +114,28 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
 }
 
 describe('DashboardEntityModal', () => {
+  beforeAll(async () => {
+    await import('../task-cockpit/TaskWorkPanelBody.svelte');
+  });
+  it('opens the canonical result from task detail without a second document request', async () => {
+    getDeliverable.mockClear();
+    taskDetail.mockResolvedValue({
+      ...completedTask(),
+      result_data: { final_deliverable_id: 'dlv-final' },
+      final_deliverable: {
+        deliverable_id: 'dlv-final', step_run_id: 'run-final',
+        version: 1, attempt_number: 1, format: 'markdown', title: 'Immediate dashboard result',
+        content: '# Immediate dashboard result\n\nReady on first task response.',
+        target: null, outputs: {}, status: 'approved', evaluator_feedback: null,
+        created_at: null, updated_at: null,
+      },
+    });
+    render(DashboardEntityModal, { kind: 'task', taskId: 'task-completed', onClose: vi.fn() });
+    await screen.findByText('Ready on first task response.');
+    expect(getDeliverable).not.toHaveBeenCalled();
+    expect(screen.queryByText('Loading deliverable…')).toBeNull();
+  });
+
   it('loads a shared task result by ID instead of an owner-only work projection', async () => {
     taskDetail.mockResolvedValue({ ...completedTask(), created_by: 'other@example.com', result_data: { final_deliverable_id: 'dlv-final' } });
     getDeliverable.mockResolvedValue({
@@ -146,7 +168,7 @@ describe('DashboardEntityModal', () => {
 
     await waitFor(() => expect(screen.getByTestId('dashboard-task-modal-tab-deliverable')).toHaveAttribute('aria-selected', 'true'));
     expect(controlChat).not.toHaveBeenCalled();
-    expect(screen.getByTestId('task-final-result-empty')).toBeInTheDocument();
+    expect(await screen.findByTestId('task-final-result-empty')).toBeInTheDocument();
   });
 
   it('keeps task details usable when lazy control chat is forbidden', async () => {
@@ -384,7 +406,7 @@ describe('DashboardEntityModal', () => {
     });
 
     await fireEvent.click(await screen.findByTestId('dashboard-task-modal-tab-steps'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Output' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Result' }));
     expect(screen.getByTestId('dashboard-step-viewer-loading')).toBeInTheDocument();
     await fireEvent.keyDown(window, { key: 'Escape' });
     resolveDetail({ ...projectedRun, is_projection: false, output: 'Late output' });
@@ -394,13 +416,14 @@ describe('DashboardEntityModal', () => {
       expect(screen.getByTestId('dashboard-task-modal-panel-steps')).toBeInTheDocument();
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Output' }));
-    expect(await screen.findByTestId('step-output-panel')).toBeVisible();
-    await fireEvent.keyDown(document, { key: 'Escape' });
-    await waitFor(() => expect(screen.queryByTestId('step-output-panel')).not.toBeInTheDocument());
+    await fireEvent.click(screen.getByRole('button', { name: 'Result' }));
+    expect(await screen.findByTestId('step-result-view')).toBeVisible();
+    expect(screen.getByRole('tab', { name: 'Result' })).toHaveAttribute('aria-selected', 'true');
+    await fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByTestId('session-logs-panel')).not.toBeInTheDocument());
     expect(screen.getByTestId('dashboard-task-modal-panel-steps')).toBeInTheDocument();
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Logs' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Transcript' }));
     expect(await screen.findByTestId('session-logs-panel')).toBeVisible();
     expect(screen.getByTestId('delegate-timeline')).toHaveAttribute('data-scope', 'task_step:run-slow');
     await fireEvent.click(screen.getByRole('button', { name: 'View delegate session' }));

@@ -27,7 +27,8 @@ function pendingInputState(
     return { label: 'Waiting for approval', critical: pending.has('escalation') };
   }
   if (pending.has('step_question')) return { label: 'Waiting for answer', critical: false };
-  return pending.size > 0 ? { label: 'Waiting for input', critical: false } : null;
+  // Informational notifications can stay pending without blocking the turn.
+  return null;
 }
 
 export function conversationActivityState(
@@ -42,6 +43,7 @@ export function conversationActivityState(
     | 'active_session_completion_reason'
     | 'active_session_updated_at'
     | 'pending_notification_types'
+    | 'is_readonly_for_caller'
     | 'context'
   > | null,
   options: {
@@ -58,7 +60,8 @@ export function conversationActivityState(
   const attentionTone = conversation ? conversationAttentionTone(conversation) : 'default';
   const error = attentionTone === 'rose';
   const attention = Boolean(conversation && conversationHasAttention(conversation) && attentionTone === 'amber');
-  const waiting = pendingInputState(conversation?.pending_notification_types);
+  const waiting = conversation?.is_readonly_for_caller
+    ? null : pendingInputState(conversation?.pending_notification_types);
   const emptyTaskControl = Boolean(
     conversation
     && isTaskControlConversationSummary(conversation as Conversation)

@@ -39,6 +39,25 @@ describe('ChatV2ApiClient', () => {
     });
   });
 
+  it.each(['transaction', 'client'] as const)('reads %s admission metadata with bounded canonical anchors', async identity => {
+    const payload = { conversation_id: 'conv-1', client_message_id: 'old-input', client_txn_id: 'old-txn' };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(jsonResponse(payload));
+    const client = new ChatV2ApiClient({ fetch: fetchMock });
+    const anchors = Array.from({ length: 101 }, (_, index) => `visible-${index}`);
+    const result = identity === 'transaction'
+      ? await client.messageAdmission('conv-1', 'old-txn', {}, anchors)
+      : await client.messageAdmissionByClient('conv-1', 'old-input', {}, anchors);
+    expect(result).toEqual(payload);
+    const [url, options] = fetchMock.mock.calls[0];
+    const request = new URL(String(url), 'https://cognis.test');
+    expect(request.pathname).toBe(identity === 'transaction'
+      ? '/api/v1/chat/v2/conversations/conv-1/messages/old-txn/admission'
+      : '/api/v1/chat/v2/conversations/conv-1/message-admissions/old-input');
+    expect(request.searchParams.getAll('canonical_client_message_id')).toEqual(anchors.slice(0, 100));
+    expect(options?.body).toBeUndefined();
+    expect(options?.method ?? 'GET').toBe('GET');
+  });
+
   it.each([200, 503])('bounds a stalled %s response body after immediate headers and cancels its stream', async (status) => {
     const cancel = vi.fn();
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(new ReadableStream({

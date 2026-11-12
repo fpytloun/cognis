@@ -46,8 +46,8 @@ describe('first-run resources', () => {
 describe('agent templates', () => {
   it('produces independent profiles, no deployment references, and explicit XO management', () => {
     const skill = { skill_id: 'cognis-agent-manager' } as Skill;
-    const first = agentFormFromTemplate(AGENT_TEMPLATES[0], [], [skill]);
-    const second = agentFormFromTemplate(AGENT_TEMPLATES[0], [], [skill]);
+    const first = agentFormFromTemplate(AGENT_TEMPLATES[0], [skill]);
+    const second = agentFormFromTemplate(AGENT_TEMPLATES[0], [skill]);
     first.agentProfiles[0].model = 'local-change';
     expect(second.agentProfiles[0].model).toBe('');
     expect(second.executorId).toBe('');
@@ -59,13 +59,13 @@ describe('agent templates', () => {
     expect(payload.skills).toMatchObject({ items: [{ skill_id: 'cognis-agent-manager' }] });
   });
   it('keeps coding templates out of agent-management access', () => {
-    const form = agentFormFromTemplate(AGENT_TEMPLATES[1], [], []);
+    const form = agentFormFromTemplate(AGENT_TEMPLATES[1], []);
     expect(form.optInBuiltinTools).toEqual([]);
     expect(form.agentProfiles.map((profile) => profile.profileId)).toEqual(['developer', 'reviewer']);
   });
   it('gives QuickStart full management independently of the selected template and preserves opt-out', () => {
     const skills = INSTANCE_MANAGEMENT_SKILLS.map((skill_id) => ({ skill_id }) as Skill);
-    const form = agentFormFromTemplate(AGENT_TEMPLATES[1], [], skills);
+    const form = agentFormFromTemplate(AGENT_TEMPLATES[1], skills);
     configureInstanceManagement(form, skills, true);
     const payload = formStateToPayload(form);
     expect(form.optInBuiltinTools).toEqual(INSTANCE_MANAGEMENT_TOOLS.map((tool) => tool.id));

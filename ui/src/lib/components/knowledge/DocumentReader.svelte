@@ -1,5 +1,6 @@
 <script lang="ts">
   import hljs from 'highlight.js/lib/common';
+  import { downloadUrl as startFileDownload } from '$lib/attachments/save';
   import { prettyPrintJson } from '$lib/syntax/json';
   import { parse as parseYaml } from 'yaml';
 
@@ -86,7 +87,7 @@
 
   function handleDownload(): void {
     if (downloadUrl) {
-      window.open(downloadUrl, '_blank', 'noopener,noreferrer');
+      startFileDownload(downloadUrl, doc.display_name);
       return;
     }
     onDownload?.();
@@ -157,12 +158,13 @@
     {#if kind === 'markdown' && markdownDoc && markdownDoc.headings.length > 1}
       <nav class="mt-4" aria-label="Table of contents">
         <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-quiet">Contents</p>
-        <ul class="space-y-1 text-sm">
+        <ul class="document-toc">
           {#each markdownDoc.headings as heading (heading.id)}
-            <li style={`padding-left: ${(heading.level - 1) * 10}px`}>
+            <li>
               <button
                 type="button"
-                class={`text-left hover:text-accent-hover ${activeHeadingId === heading.id ? 'text-accent' : 'text-muted'}`}
+                style={`--toc-depth: ${heading.level - 1}`}
+                aria-current={activeHeadingId === heading.id ? 'location' : undefined}
                 onclick={() => scrollToHeading(heading)}
               >
                 {heading.text}

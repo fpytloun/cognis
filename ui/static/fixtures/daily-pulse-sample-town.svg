@@ -1,19 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" role="img" aria-labelledby="title desc">
-  <title id="title">Fictional museum specimen</title>
-  <desc id="desc">Constructed geometric museum illustration. No real town, building or personal location is represented.</desc>
-  <rect width="1200" height="675" fill="#e5edf4"/>
-  <rect y="500" width="1200" height="175" fill="#c2d3df"/>
-  <circle cx="940" cy="145" r="62" fill="#f2d49a"/>
-  <path d="M0 385 240 320 460 390 720 310 950 390 1200 330V500H0Z" fill="#9bb9ce"/>
-  <rect x="300" y="260" width="600" height="270" rx="12" fill="#31536e"/>
-  <path d="M270 260 600 125 930 260Z" fill="#416b88"/>
-  <g fill="#b7d8e9">
-    <rect x="355" y="310" width="85" height="115" rx="5"/>
-    <rect x="485" y="310" width="85" height="115" rx="5"/>
-    <rect x="630" y="310" width="85" height="115" rx="5"/>
-    <rect x="760" y="310" width="85" height="115" rx="5"/>
+  <title id="title">Fictional sample town</title>
+  <desc id="desc">Abstract geometric illustration for a wholly synthetic museum-day fixture; no real location is represented.</desc>
+  <rect width="1200" height="675" fill="#e8edf0"/>
+  <rect y="430" width="1200" height="245" fill="#c9d4d4"/>
+  <circle cx="895" cy="185" r="78" fill="#e8a96b"/>
+  <path d="M0 430 170 300 305 395 455 228 610 418 740 322 865 408 1030 270 1200 420V500H0Z" fill="#657b80"/>
+  <path d="M0 455 220 370 355 444 560 336 750 448 930 360 1200 452V520H0Z" fill="#87999a"/>
+  <path d="M0 510h1200v165H0z" fill="#b8c7c5"/>
+  <path d="M40 516h1120M130 562h920" stroke="#7b918f" stroke-width="5"/>
+  <g fill="#52686b">
+    <rect x="180" y="474" width="120" height="36"/><rect x="315" y="462" width="88" height="48"/>
+    <rect x="425" y="482" width="160" height="28"/><rect x="620" y="454" width="104" height="56"/>
+    <rect x="760" y="471" width="132" height="39"/><rect x="925" y="460" width="93" height="50"/>
   </g>
-  <rect x="555" y="455" width="90" height="75" fill="#172f43"/>
-  <path d="M465 675 560 530H640L735 675Z" fill="#e7eef3"/>
-  <text x="48" y="620" fill="#29465b" font-family="system-ui, sans-serif" font-size="24" letter-spacing="3">SYNTETICKÁ MUZEJNÍ ILUSTRACE</text>
+  <text x="48" y="625" fill="#33484c" font-family="system-ui, sans-serif" font-size="25" letter-spacing="5">SYNTETICKÁ ILUSTRACE · UKÁZKOVÉ MĚSTO</text>
 </svg>

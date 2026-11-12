@@ -82,6 +82,13 @@ export function toRenderItem(
   return convertToRenderItem(item, renderMarkdownContent);
 }
 
+function toRenderToolCallChildren(items: ChatV2ToolCallTimelineItem[]): ToolCallTimelineItem[] {
+  return items.flatMap((item) => {
+    const rendered = toRenderItem(item);
+    return rendered?.kind === 'tool_call' ? [rendered] : [];
+  });
+}
+
 function convertToRenderItem(
   item: ChatV2TimelineItem,
   renderMarkdownContent: RenderMarkdownContent
@@ -201,6 +208,7 @@ function toRenderAssistantDeliverable(
     createdAt: item.created_at ?? undefined,
     updatedAt: item.updated_at ?? undefined,
     deliverableId: item.deliverable_id,
+    deliverable: item.deliverable,
     lineageId: item.lineage_id ?? undefined,
     revision: item.revision ?? undefined,
     format: item.format,
@@ -230,6 +238,7 @@ function toRenderMessage(
     timestamp: item.created_at ?? item.updated_at ?? null,
     turnId: item.turn_id ?? null,
     messageId: item.message_id ?? undefined,
+    messageMetadata: item.message_metadata ?? undefined,
     // Streaming is derived strictly from backend flags. Once the runtime
     // overlay clears (has_active_turn=false), the store terminalizes items
     // so this resolves to false and no message hangs "in progress".
@@ -238,8 +247,8 @@ function toRenderMessage(
     attachments: item.attachments,
     optimistic: item.role === 'user' && item.source_refs.length === 0,
     deliveryStatus: item.role === 'user' && item.source_refs.length === 0
-      ? item.status === 'failed'
-        ? 'failed'
+      ? item.status === 'failed' || item.status === 'cancelled'
+        ? item.status
         : item.status === 'pending'
           ? 'sending'
           : undefined
@@ -331,6 +340,12 @@ function toRenderToolCall(item: ChatV2ToolCallTimelineItem): ToolCallTimelineIte
     kind: 'tool_call',
     callId: item.call_id,
     toolName: item.tool_name ?? 'tool',
+    parentCallId: item.parent_call_id ?? null,
+    programId: item.program_id ?? null,
+    kernelGeneration: item.kernel_generation ?? null,
+    programChildren: item.program_children
+      ? toRenderToolCallChildren(item.program_children)
+      : undefined,
     displayToolName: item.display_name ?? undefined,
     status,
     timestamp: item.created_at ?? item.updated_at ?? null,

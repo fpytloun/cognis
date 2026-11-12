@@ -338,7 +338,7 @@ function authority(
 }
 
 describe('authoritative runtime overlay ordering', () => {
-  it('does not append old runtime history after a newer bounded canonical snapshot', () => {
+  it('suppresses superseded tool history but retains unconfirmed assistant text until canonical backfill', () => {
     const oldMessage = message({
       id: 'message:old:phase:1', message_id: 'old', turn_id: 'turn-1',
       assistant_phase_index: 1, turn_cycle_index: 2, status: 'complete',
@@ -403,7 +403,7 @@ describe('authoritative runtime overlay ordering', () => {
         volatile_items_complete: true
       })
     })).state;
-    expect(visibleTimelineItems(settled).map(item => item.id)).toEqual([latest.id, current.id]);
+    expect(visibleTimelineItems(settled).map(item => item.id)).toEqual([latest.id, oldMessage.id, current.id]);
 
     const canonicalOld = {
       ...oldMessage, stable: true, sort_key: '0000:000000000000263:000001:02:000000000',
@@ -2935,7 +2935,7 @@ describe('Chat v2 sync engine', () => {
     expect(visible.map((item) => item.id)).toContain('message:msg-final:phase:1');
     expect(visible.find((item) => item.id === 'message:msg-final:phase:1')).toMatchObject({
       status: 'complete',
-      partial: false
+      partial: true
     });
   });
 
@@ -3077,6 +3077,46 @@ describe('Chat v2 sync engine', () => {
     );
 
     expect(refreshed.timelineItems.map((item) => item.id)).toEqual(['message:0', 'message:1']);
+  });
+
+  it('drops a cached window that ended before the snapshot page after several compactions', () => {
+    // A device last synced in session 5; sessions 6-8 compacted while it was
+    // away and the snapshot now starts in session 9. The cached rows share no
+    // item with the snapshot, so keeping them would hide sessions 6-8 behind
+    // rows that look loaded.
+    const cachedOld = message({
+      id: 'message:cached-old',
+      sort_key: '0004:000000000000232:000000:02:000000000',
+      message_id: 'msg-cached-old',
+    });
+    const cachedNewest = message({
+      id: 'message:cached-newest',
+      sort_key: '0005:000000000000181:000000:02:000000000',
+      message_id: 'msg-cached-newest',
+    });
+    const snapshotFirst = message({
+      id: 'message:session-9',
+      sort_key: '0009:000000000000003:000000:02:000000000',
+      message_id: 'msg-session-9',
+    });
+    const snapshotLatest = message({
+      id: 'message:session-11',
+      sort_key: '0011:000000000000202:000000:02:000000000',
+      message_id: 'msg-session-11',
+    });
+    const previous = applySnapshot(snapshot({
+      timeline: { items: [cachedOld, cachedNewest], has_more_before: true, before_cursor: 'cursor-session-4' },
+    }));
+
+    const refreshed = applySnapshot(
+      snapshot({
+        timeline: { items: [snapshotFirst, snapshotLatest], has_more_before: true, before_cursor: 'cursor-session-9' },
+      }),
+      previous
+    );
+
+    expect(refreshed.timelineItems.map((item) => item.id)).toEqual(['message:session-9', 'message:session-11']);
+    expect(refreshed.beforeCursor).toBe('cursor-session-9');
   });
 
   it('does not preserve older history when the snapshot covers the full timeline', () => {
@@ -3347,14 +3387,14 @@ describe('Chat v2 sync engine', () => {
     expect([...keys].sort()).toEqual(keys);
   });
 
-  it('evicts stale phase-guess assistant duplicates once canonical passes the phase', () => {
-    // A runtime item minted with a guessed phase (0) never id-matches the
-    // canonical item persisted at the real phase (1) — it must be evicted
-    // when the canonical stream reaches an equal-or-later phase.
+  it.each([['9998', false], ['9996', true]] as const)(
+    'reconciles phase-guess duplicates without treating a %s carry as confirmed', (band, carried) => {
+    // The active overlay can be superseded by canonical progress. Once carried,
+    // however, an unmatched phase is uncertain history, not a proven duplicate.
     const guessed = {
       id: 'message:turn-1:phase:0',
       kind: 'message',
-      sort_key: '9996:999999999999999:000000:02:000000000',
+      sort_key: `${band}:999999999999999:000000:02:000000000`,
       source_refs: [{ store: 'runtime', session_id: 'sess-1', seq: 0, event_type: 'assistant_complete' }],
       stable: false,
       status: 'complete',
@@ -3397,7 +3437,13 @@ describe('Chat v2 sync engine', () => {
 
     const ids = visibleTimelineItems(synced.state).map((item) => item.id);
     expect(ids).toContain('message:turn-1:phase:1');
-    expect(ids).not.toContain('message:turn-1:phase:0');
+    if (carried) {
+      expect(ids).toContain('message:turn-1:phase:0');
+      expect(visibleTimelineItems(synced.state).find(item => item.id === guessed.id))
+        .toMatchObject({ content: guessed.kind === 'message' ? guessed.content : '', partial: true });
+    } else {
+      expect(ids).not.toContain('message:turn-1:phase:0');
+    }
   });
 
   it('hides stale partial runtime text by canonical phase without hiding a later stream', () => {

@@ -4,6 +4,7 @@
   import QRCode from 'qrcode';
 
   import { apiUrl } from '$lib/config';
+  import { downloadBlob } from '$lib/attachments/save';
   import { auth } from '$lib/stores/auth';
   import { connectivity, onConnectivityRestored } from '$lib/connectivity';
   import Button from '$lib/components/ui/Button.svelte';
@@ -104,12 +105,7 @@
 
   function downloadRecoveryCodes(): void {
     const blob = new Blob([`${recoveryCodes.join('\n')}\n`], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = 'cognis-recovery-codes.txt';
-    anchor.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, 'cognis-recovery-codes.txt');
   }
 
   // A failed status load is hidden while the global connection banner

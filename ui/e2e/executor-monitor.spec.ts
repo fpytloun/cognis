@@ -10,12 +10,12 @@ function snapshot(os: string, cpu = 24): ExecutorResourceSnapshot {
     schema_version: 1, observed_at: new Date().toISOString(),
     freshness: { age_seconds: 1, stale_after_seconds: 120, stale: false },
     os, arch: os === 'darwin' ? 'arm64' : 'x86_64',
-    cpu: { model: os === 'darwin' ? 'Fixture ARM CPU' : 'Fixture x86 CPU', physical_cores: 4, logical_cores: 8, utilization_percent: cpu },
-    memory: { total_bytes: 32 * GiB, used_bytes: 22 * GiB, available_bytes: 10 * GiB, unified: os === 'darwin' },
+    cpu: { model: os === 'darwin' ? 'Apple M4 Max' : 'AMD Ryzen 9 7950X', physical_cores: 16, logical_cores: 32, utilization_percent: cpu },
+    memory: { total_bytes: 64 * GiB, used_bytes: 22 * GiB, available_bytes: 42 * GiB, unified: os === 'darwin' },
     accelerators: os === 'darwin'
-      ? [{ backend: 'metal', name: 'Fixture Metal GPU', utilization_percent: null, total_memory_bytes: 32 * GiB, used_memory_bytes: null }]
-      : [{ backend: 'nvidia', name: 'Fixture discrete GPU', utilization_percent: 36, total_memory_bytes: 16 * GiB, used_memory_bytes: 8 * GiB }],
-    runtime: { uptime_seconds: 86_400, active_calls: 2, configured: true, state: 'active' },
+      ? [{ backend: 'metal', name: 'Apple M4 Max', utilization_percent: null, total_memory_bytes: 64 * GiB, used_memory_bytes: null }]
+      : [{ backend: 'nvidia', name: 'NVIDIA RTX 4090', utilization_percent: 36, total_memory_bytes: 24 * GiB, used_memory_bytes: 8 * GiB }],
+    runtime: { uptime_seconds: 190_000, active_calls: 2, configured: true, state: 'active' },
     ollama: { status: 'reachable', version: '0.12.3', installed_model_count: 4, running_model_count: 1, running_models: ['qwen3:30b'] },
     ollama_model_store: { total_bytes: 1000 * GiB, free_bytes: 600 * GiB }
   };
@@ -24,7 +24,7 @@ function snapshot(os: string, cpu = 24): ExecutorResourceSnapshot {
 test('same-version runtime invalidations survive a short background interval and refresh once', async ({ page }) => {
   const state = await fixture(page);
   await page.goto('/settings?tab=executors');
-  const card = page.getByTestId('executor-card-fixture-linux');
+  const card = page.getByTestId('executor-card-sample-desktop');
   await expect(card).toBeVisible();
   await expect.poll(() => state.frames.includes('executor_monitor_subscribe')).toBe(true);
   await page.waitForTimeout(200);
@@ -40,7 +40,7 @@ test('same-version runtime invalidations survive a short background interval and
   executor.observed_tools = [{ name: 'mcp_calendar__events', description: 'List calendar events', parameters: {} }];
   for (let frame = 0; frame < 3; frame++) {
     state.send({
-      type: 'executor_monitor_update', executor_id: 'fixture-linux',
+      type: 'executor_monitor_update', executor_id: 'sample-desktop',
       details_revision: 'mcp-recovery', status: 'active', runtime_state: 'active',
       desired_config_version: 3, applied_config_version: 3,
       last_observed_at: new Date().toISOString(), resource_snapshot: snapshot('linux', 28)
@@ -55,7 +55,7 @@ test('same-version runtime invalidations survive a short background interval and
   await expect(card.locator('[title="MCP: ready — MCP retry recovered."]')).toBeVisible();
   expect(state.reads()).toEqual(reads.map(count => count + 1));
   state.send({
-    type: 'executor_monitor_update', executor_id: 'fixture-linux',
+    type: 'executor_monitor_update', executor_id: 'sample-desktop',
     details_revision: 'mcp-recovery', status: 'active', runtime_state: 'active',
     desired_config_version: 3, applied_config_version: 3,
     last_observed_at: new Date().toISOString(), resource_snapshot: snapshot('linux', 29)
@@ -70,11 +70,11 @@ test('configuration confirmation received while hidden refreshes on visibility w
   executor.desired_config_version = 4;
   executor.local_inference_config_status = 'applying';
   await page.goto('/settings?tab=executors');
-  const card = page.getByTestId('executor-card-fixture-linux');
+  const card = page.getByTestId('executor-card-sample-desktop');
   await expect(card).toBeVisible();
   await expect.poll(() => state.frames.includes('executor_monitor_subscribe')).toBe(true);
   await card.click();
-  const dialog = page.getByRole('dialog', { name: 'Executor: Fixture Linux' });
+  const dialog = page.getByRole('dialog', { name: 'Executor: Sample desktop' });
   await dialog.getByRole('button', { name: 'Inference', exact: true }).click();
   await expect(dialog.getByText('Applying', { exact: true })).toBeVisible();
   const reads = state.reads();
@@ -85,7 +85,7 @@ test('configuration confirmation received while hidden refreshes on visibility w
   executor.applied_config_version = 4;
   executor.local_inference_config_status = 'confirmed';
   state.send({
-    type: 'executor_monitor_update', executor_id: 'fixture-linux', details_revision: null,
+    type: 'executor_monitor_update', executor_id: 'sample-desktop', details_revision: null,
     status: 'active', runtime_state: 'active', desired_config_version: 4, applied_config_version: 4,
     last_observed_at: new Date().toISOString(), resource_snapshot: snapshot('linux', 28)
   });
@@ -111,7 +111,7 @@ test('runtime invalidation deferred behind mobile tool saving does not block lat
   let release!: () => void;
   let saving = false;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  await page.route('**/api/v1/executors/fixture-linux', async route => {
+  await page.route('**/api/v1/executors/sample-desktop', async route => {
     if (route.request().method() === 'PUT') {
       saving = true;
       await gate;
@@ -120,18 +120,18 @@ test('runtime invalidation deferred behind mobile tool saving does not block lat
     await route.fulfill({ json: executor });
   });
   await page.goto('/settings?tab=executors');
-  const card = page.getByTestId('executor-card-fixture-linux');
+  const card = page.getByTestId('executor-card-sample-desktop');
   await card.click();
-  await page.getByRole('dialog', { name: 'Executor: Fixture Linux' }).getByRole('button', { name: 'Tools & MCP', exact: true }).click();
+  await page.getByRole('dialog', { name: 'Executor: Sample desktop' }).getByRole('button', { name: 'Tools & MCP', exact: true }).click();
   await page.getByRole('button', { name: 'Configure (0)', exact: true }).click();
-  const picker = page.getByRole('dialog', { name: 'Configure tools for Fixture Linux' });
+  const picker = page.getByRole('dialog', { name: 'Configure tools for Sample desktop' });
   await picker.getByRole('button', { name: /read filesystem/ }).click();
   await expect.poll(() => saving).toBe(true);
   function runtimeChange(revision: string) {
     executor.runtime_metadata.monitor_runtime_revision = revision;
     executor.observed_capabilities!.components.mcp = { state: 'ready', reason_code: 'available', message: revision };
     state.send({
-      type: 'executor_monitor_update', executor_id: 'fixture-linux', details_revision: revision,
+      type: 'executor_monitor_update', executor_id: 'sample-desktop', details_revision: revision,
       status: 'active', runtime_state: 'active', desired_config_version: 3, applied_config_version: 3,
       last_observed_at: new Date().toISOString(), resource_snapshot: snapshot('linux', 28)
     });
@@ -152,7 +152,7 @@ function host(executor_id: string, name: string, os: string): ExecutorConfig {
     executor_id, name, executor_type: 'websocket', available: true, unavailable_reason: null,
     owner_email: 'owner@cognis.test', shared: false, is_default: false,
     status: 'active', runtime_state: 'active', desired_config_version: 3, applied_config_version: 3,
-    config: {}, enabled_tools: ['*'], enabled_tool_groups: [], labels: { location: 'fixture-lab' },
+    config: {}, enabled_tools: ['*'], enabled_tool_groups: [], labels: { location: 'home' },
     local_inference_enabled: true, ollama_management_enabled: true, ollama_port: 11434,
     ollama_endpoint: 'http://127.0.0.1:11434', local_inference_config_status: 'confirmed',
     last_observed_at: new Date().toISOString(), created_at: null, updated_at: null,
@@ -176,12 +176,12 @@ async function fixture(page: Page) {
     await page.route(`**/api/v1/${path}`, route => route.fulfill({ json: [] }));
   }
   const executors = [
-    { ...host('fixture-linux', 'Fixture Linux', 'linux'), is_default: true },
-    host('fixture-mac', 'Fixture Mac', 'darwin'),
-    { ...host('fixture-degraded', 'Fixture degraded Linux', 'linux'), runtime_state: 'degraded',
+    { ...host('sample-desktop', 'Sample desktop', 'linux'), is_default: true },
+    host('sample-laptop', 'Sample laptop · Mac', 'darwin'),
+    { ...host('build-runner', 'Build runner', 'linux'), runtime_state: 'degraded',
       resource_snapshot: snapshot('linux', 88),
       runtime_metadata: { warnings: ['One MCP server needs attention.'] } },
-    { ...host('fixture-offline', 'Fixture offline Windows', 'windows'), runtime_state: 'offline', resource_snapshot: null, observed_capabilities: null }
+    { ...host('travel', 'Travel workstation', 'windows'), runtime_state: 'offline', resource_snapshot: null, observed_capabilities: null }
   ];
   for (const executor of executors) {
     if (executor.resource_snapshot) executor.resource_snapshot.observed_at = new Date(Date.now() - 11 * 60_000).toISOString();
@@ -242,7 +242,7 @@ for (const width of [1440, 390]) {
     }
     await expect.poll(() => state.frames.includes('executor_monitor_subscribe')).toBe(true);
     await expect(page.getByRole('status').filter({ hasText: 'Live updates' })).toBeVisible();
-    const card = page.getByTestId('executor-card-fixture-linux');
+    const card = page.getByTestId('executor-card-sample-desktop');
     await expect(card.getByText('24%', { exact: true })).toBeVisible();
 
     // Deliver actual protocol frames, building a chart without fixture-only UI paths.
@@ -270,7 +270,7 @@ for (const width of [1440, 390]) {
     await page.screenshot({ path: testInfo.outputPath(`executor-cards-${width}.png`), fullPage: true });
 
     await card.click();
-    const dialog = page.getByRole('dialog', { name: /Executor: Fixture Linux/ });
+    const dialog = page.getByRole('dialog', { name: /Executor: Sample desktop/ });
     await expect(dialog).toBeVisible();
     await expect(dialog.getByText('Processor', { exact: true })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath(`executor-overview-${width}.png`) });
@@ -282,16 +282,16 @@ for (const width of [1440, 390]) {
     await expect(dialog.getByText('Local inference', { exact: true })).toBeVisible();
     await dialog.getByRole('button', { name: 'Settings', exact: true }).click();
     const name = dialog.getByLabel('Name', { exact: true });
-    await name.fill('Fixture Linux edited');
+    await name.fill('Sample desktop edited');
     state.send({
-      type: 'executor_monitor_update', executor_id: 'fixture-linux', status: 'active',
+      type: 'executor_monitor_update', executor_id: 'sample-desktop', status: 'active',
       runtime_state: 'active', desired_config_version: 3, applied_config_version: 3,
       last_observed_at: new Date().toISOString(), resource_snapshot: snapshot('linux', 67)
     });
-    await expect(name).toHaveValue('Fixture Linux edited');
+    await expect(name).toHaveValue('Sample desktop edited');
     await dialog.getByRole('button', { name: 'Save changes', exact: true }).click();
     await expect.poll(() => state.mutations.length).toBe(1);
-    await expect(dialog.getByRole('heading', { name: 'Fixture Linux edited', exact: true })).toBeVisible();
+    await expect(dialog.getByRole('heading', { name: 'Sample desktop edited', exact: true })).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath(`executor-settings-${width}.png`) });
     await page.keyboard.press('Escape');
     await expect(dialog).not.toBeVisible();

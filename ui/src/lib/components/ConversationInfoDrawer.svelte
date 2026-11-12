@@ -99,6 +99,7 @@
   }
 
   onDestroy(cleanupResize);
+  $effect(() => { if (presentation !== 'pinned') cleanupResize(); });
 
   function resizeWithKeyboard(event: KeyboardEvent): void {
     const step = event.shiftKey ? 40 : 10;
@@ -120,6 +121,14 @@
 }} />
 
 {#snippet panelHeader()}
+  {#if presentation === 'pinned'}
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+    <div role="separator" tabindex="0" aria-label="Resize conversation inspector" aria-orientation="vertical"
+      aria-valuemin={INSPECTOR_MIN_WIDTH} aria-valuemax={INSPECTOR_MAX_WIDTH} aria-valuenow={width}
+      aria-valuetext={`${width} pixels wide`}
+      class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent/40"
+      onpointerdown={startResize} onkeydown={resizeWithKeyboard} data-testid="conversation-info-resizer"></div>
+  {/if}
   <div class="flex min-w-0 flex-1 items-center gap-2" data-testid="conversation-info-header">
     {#if header}
       {@render header()}
@@ -150,49 +159,26 @@
   </div>
 {/snippet}
 
-{#if presentation === 'overlay' || presentation === 'focus'}
+{#if presentation !== 'closed'}
+  <!-- Mount on open, as before: switching between pinned and overlay keeps one subtree,
+       but opening does not replay the panel's entrance transition. -->
   <Sheet
     {open}
+    modal={presentation !== 'pinned'}
     {onClose}
     side="right"
     label="Conversation information"
     panelId="conversation-info-drawer"
     restoreFocusOnClose={false}
-    class={presentation === 'focus'
+    headerDivider={false}
+    panelStyle={`width:${width}px`}
+    class={presentation === 'pinned'
+      ? `col-start-2 row-span-3 row-start-1 min-w-0 border-l border-separator bg-transparent ${resizing ? 'select-none' : ''}`
+      : presentation === 'focus'
       ? 'app-fullscreen-safe w-screen max-w-none rounded-none border-0'
       : 'w-[min(30rem,calc(100vw-1rem))] rounded-l-[1.25rem] border border-separator bg-elevated shadow-card'}
   >
     {#snippet header()}{@render panelHeader()}{/snippet}
     {@render children()}
   </Sheet>
-{:else if presentation === 'pinned'}
-  <aside
-    id="conversation-info-drawer"
-    class={`relative col-start-2 row-span-3 row-start-1 flex min-h-0 min-w-0 flex-col border-l border-separator bg-transparent ${resizing ? 'select-none' : ''}`}
-    style={`width:${width}px`}
-    aria-labelledby="conversation-info-heading"
-    data-testid="conversation-info-drawer"
-  >
-    <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
-    <div
-      role="separator"
-      tabindex="0"
-      aria-label="Resize conversation inspector"
-      aria-orientation="vertical"
-      aria-valuemin={INSPECTOR_MIN_WIDTH}
-      aria-valuemax={INSPECTOR_MAX_WIDTH}
-      aria-valuenow={width}
-      aria-valuetext={`${width} pixels wide`}
-      class="touch-resize-handle touch-resize-handle--left absolute -left-1 top-0 z-20 h-full w-2 cursor-col-resize touch-none focus-visible:bg-accent/40"
-      onpointerdown={startResize}
-      onkeydown={resizeWithKeyboard}
-      data-testid="conversation-info-resizer"
-    ></div>
-    <div class="flex min-w-0 shrink-0 items-center border-b border-separator px-3 py-2">
-      {@render panelHeader()}
-    </div>
-    <div class="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4 pt-6">
-      {@render children()}
-    </div>
-  </aside>
 {/if}

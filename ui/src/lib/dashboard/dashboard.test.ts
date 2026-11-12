@@ -14,7 +14,7 @@ import {
   summarizeDashboardIssues,
   upcomingSchedules
 } from './dashboard';
-import type { Agent, AgentDirectChat, Conversation, DashboardIssuesResponse, Schedule, TaskBoard, TaskBoardItem } from '$lib/types/api';
+import type { Agent, AgentDirectChat, BackgroundWorkItem, Conversation, DashboardIssuesResponse, Schedule, TaskBoard, TaskBoardItem } from '$lib/types/api';
 
 function taskItem(overrides: Partial<TaskBoardItem>): TaskBoardItem {
   return {
@@ -78,6 +78,39 @@ function conversation(overrides: Partial<Conversation>): Conversation {
     ...overrides
   } as Conversation;
 }
+
+it.each(['managed_conversation', 'delegated_session', 'task', 'background_command'] as const)(
+  'counts running %s child work as active without a direct turn',
+  (kind) => {
+    const parent = conversation({ has_unread: true });
+    const work = { kind, status: 'running', controller_conversation_id: parent.conversation_id } as BackgroundWorkItem;
+    expect(partitionConversationLanes([parent], {}, [work])).toEqual({
+      active: [parent], waiting: [], recent: [],
+    });
+    expect(partitionConversationLanes([parent], {}, [{ ...work, status: 'completed' }])).toEqual({
+      active: [], waiting: [], recent: [parent],
+    });
+    const blocked = { ...parent, pending_notification_types: ['step_question'] };
+    expect(partitionConversationLanes([blocked], {}, [work])).toEqual({
+      active: [], waiting: [blocked], recent: [],
+    });
+    expect(partitionConversationLanes([parent], {}, [{ ...work, controller_conversation_id: 'other-parent' }]).active).toEqual([]);
+  },
+);
+
+it.each([false, true])('does not put unread shared conversations in dashboard Waiting (active=%s)', (has_active_turn) => {
+  const shared = conversation({
+    is_readonly_for_caller: true, has_active_turn, has_unread: true,
+    pending_notification_types: ['step_question'],
+  });
+  expect(partitionConversationLanes([shared])).toEqual({
+    active: has_active_turn ? [shared] : [],
+    waiting: [],
+    recent: has_active_turn ? [] : [shared],
+  });
+  expect(dashboardConversationWaitingReason(shared)).toBeNull();
+  expect(shared.has_unread).toBe(true);
+});
 
 function schedule(overrides: Partial<Schedule>): Schedule {
   return {

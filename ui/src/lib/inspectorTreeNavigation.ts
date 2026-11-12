@@ -122,7 +122,7 @@ export function structuralParentSessionId(
 
 export interface InspectorTraversalState {
   drawerOpen: boolean;
-  activeTab: 'overview' | 'work' | 'session';
+  activeTab: import('$lib/stores/conversationInfo.svelte').ConversationInfoTab;
   presentation: 'closed' | 'pinned' | 'overlay' | 'focus';
   focusedSessionId: string | null;
   middleSessionId: string | null;

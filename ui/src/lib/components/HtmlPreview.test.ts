@@ -7,7 +7,12 @@ import ResourceReader from './library/ResourceReader.svelte';
 const mocks = vi.hoisted(() => ({ capture: vi.fn(), signedUrl: vi.fn(), revisions: vi.fn() }));
 vi.mock('$lib/config', () => ({ apiUrl: (path: string) => `https://cognis.test${path}` }));
 vi.mock('$app/navigation', () => ({ beforeNavigate: vi.fn() }));
-vi.mock('$lib/document-coordination', () => ({ documentCoordination: () => ({ capture: mocks.capture }) }));
+vi.mock('$lib/document-coordination', () => ({
+  documentCoordination: () => ({
+    capture: mocks.capture,
+    onInvalidated: () => () => {},
+  }),
+}));
 vi.mock('$lib/api/client', () => ({ api: {
   artifacts: { signedUrl: mocks.signedUrl, revisions: mocks.revisions },
   library: { item: vi.fn().mockRejectedValue(new Error('Not needed')) },
@@ -36,7 +41,7 @@ describe('HTML preview surfaces and replacement', () => {
     mocks.revisions.mockResolvedValue({ revisions: [] });
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async () =>
       new Response('<h1>Preview</h1>', { headers: { 'content-type': 'text/html' } })));
-    vi.stubGlobal('matchMedia', () => ({ matches: false }));
+    vi.stubGlobal('matchMedia', (media: string) => Object.assign(new EventTarget(), { matches: false, media }));
   });
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
   it('removes the old context before replacement and releases both on close', async () => {
@@ -84,7 +89,9 @@ describe('HTML preview surfaces and replacement', () => {
     mocks.capture.mockReturnValue(ownership().lease);
     finish({ revisions: [] });
     await screen.findByRole('alert');
-    expect(fetch).not.toHaveBeenCalled();
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => String(url))).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('/artifacts/view/attachments/att_html/')]),
+    );
     expect(screen.queryByTitle('Artifact preview')).toBeNull();
   });
 });

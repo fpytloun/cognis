@@ -1,4 +1,5 @@
 import { writable, get } from 'svelte/store';
+import { downloadBlob } from '$lib/attachments/save';
 import { metadataReadFlights } from '$lib/api/read-flights';
 import { dashboardRealtimeLoads } from '$lib/dashboard/realtime';
 
@@ -951,12 +952,7 @@ class WsFrameRecorder {
     const name = filename ?? `ws-recording-${ts}.jsonl`;
     const content = this._frames.map((e) => JSON.stringify(e)).join('\n') + '\n';
     const blob = new Blob([content], { type: 'application/x-ndjson' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, name);
     console.info(`[WsRecorder] Downloaded ${this._frames.length} events as ${name}`);
   }
 

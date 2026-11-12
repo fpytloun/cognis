@@ -13,6 +13,7 @@
   let { item, canManage }: { item: LibraryItem; canManage: boolean } = $props();
   let access = $state<DocumentAccess | null>(null);
   let selected = $state<string[]>([]);
+  let writers = $state<string[]>([]);
   let open = $state(false);
   let busy = $state(false);
   let error = $state('');
@@ -22,7 +23,10 @@
   const owner = $derived(access?.agents.find((a) => a.agent_id === access?.owner_agent_id));
   const others = $derived(recipients.filter((a) => a.agent_id !== access?.owner_agent_id));
   const humanName = $derived(item.owner_email === $auth.user?.email ? ($auth.user?.name || 'You') : (item.owner_email || 'Document owner'));
-  const dirty = $derived(!!access && [...selected].sort().join('\0') !== access.agents.filter(a => a.explicit).map(a => a.agent_id).sort().join('\0'));
+  const dirty = $derived(!!access && (
+    [...selected].sort().join('\0') !== access.agents.filter(a => a.explicit).map(a => a.agent_id).sort().join('\0')
+    || writers.filter(id => selected.includes(id)).sort().join('\0') !== access.agents.filter(a => a.explicit_permission === 'write').map(a => a.agent_id).sort().join('\0')
+  ));
 
   $effect(() => {
     const current = item;
@@ -42,6 +46,7 @@
   function show() {
     if (!access || loading) return;
     selected = access?.agents.filter(a => a.explicit).map(a => a.agent_id) ?? [];
+    writers = access.agents.filter(a => a.explicit_permission === 'write').map(a => a.agent_id);
     open = true;
   }
   function close() {
@@ -50,7 +55,7 @@
   async function save() {
     busy = true; error = '';
     try {
-      access = await api.artifactDocuments.setSharing(item.kind, item.id, selected);
+      access = await api.artifactDocuments.setSharing(item.kind, item.id, selected, writers.filter(id => selected.includes(id)));
       open = false;
     } catch (caught) { error = caught instanceof Error ? caught.message : 'Could not save agent access.'; }
     finally { busy = false; }
@@ -70,7 +75,11 @@
       </span>
     {/if}
     {#each others as agent (agent.agent_id)}
-      <span title={`${agent.name} · ${agent.inherited ? 'Inherited access' : 'Shared'}`} aria-label={`${agent.name} · ${agent.inherited ? 'Inherited access' : 'Shared'}`}>
+      {@const source = [
+        ...(agent.inherited ? [`${agent.inherited_sources?.includes('project') ? 'Project' : 'Inherited'}: ${agent.inherited_permission === 'write' ? 'read + write' : 'read'}`] : []),
+        ...(agent.explicit ? [`Explicit: ${agent.explicit_permission === 'write' ? 'read + write' : 'read'}`] : []),
+      ].join(' · ')}
+      <span title={`${agent.name} · ${source}`} aria-label={`${agent.name} · ${source}`}>
         <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} class="!h-9 !w-9" draggable={false} />
       </span>
     {/each}
@@ -80,7 +89,8 @@
       </Button>
     {/if}
   </div>
-  <p class="text-xs text-quiet">{owner?.name || item.agent_name || humanName} owns this document.</p>
+  <p class="text-xs text-quiet">{owner?.name || access?.owner_agent_id || humanName} owns this document.</p>
+  <p class="text-xs text-muted">Revision author: {item.author_agent_id ?? item.author_email ?? 'Unknown'}</p>
   {#if loading}<p role="status" class="text-xs text-quiet">Loading access…</p>{/if}
   {#if error && !open}<p role="alert" class="text-xs text-danger">{error}</p><Button variant="ghost" size="sm" onclick={() => retry++}>Retry</Button>{/if}
   {#if !canManage}<p class="text-xs text-quiet">Only the owner can manage agent access.</p>{/if}
@@ -94,8 +104,8 @@
         <Button variant="ghost" size="icon" aria-label="Close agent access" disabled={busy} onclick={close}><X size={18} /></Button>
       </div>
     {/snippet}
-    <p class="text-sm text-muted">Choose who can access this document and its revisions. Owner and inherited access stay in place.</p>
-    {#if access}<AgentAccessPicker agents={access.agents} bind:selected ownerId={access.owner_agent_id} disabled={busy} />
+    <p class="text-sm text-muted">Choose Read or Read + write for this document and its revisions. Project access remains inherited.</p>
+    {#if access}<AgentAccessPicker agents={access.agents} bind:selected bind:writers permissions ownerId={access.owner_agent_id} disabled={busy} />
     {:else if loading}<p role="status" class="text-sm text-muted">Loading agents…</p>{/if}
     {#if error}<p role="alert" class="text-sm text-danger">{error}</p><Button size="sm" variant="ghost" onclick={() => retry++}>Retry loading</Button>{/if}
     {#snippet footer()}

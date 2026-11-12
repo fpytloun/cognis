@@ -27,7 +27,7 @@
     onQueueChange?.([{
       queue_id: 'queue-one',
       content: 'Queued once',
-      created_at: '2026-01-01T00:00:00Z',
+      created_at: '2026-08-26T00:00:00Z',
       attachments: [],
     }]);
     onTodosChange?.([{
@@ -39,11 +39,11 @@
       work_id: 'session-child',
       controller_conversation_id: 'conversation-one',
       session_id: 'session-child',
-      title: 'Inspect synthetic build output',
-      agent_id: 'fixture-worker',
+      title: 'Investigate visa delivery',
+      agent_id: 'riker',
       status: 'running',
-      started_at: '2026-01-01T00:01:00Z',
-      updated_at: '2026-01-01T00:02:00Z',
+      started_at: '2026-09-10T07:50:00Z',
+      updated_at: '2026-09-10T07:51:00Z',
       todos: [],
     }]);
   });

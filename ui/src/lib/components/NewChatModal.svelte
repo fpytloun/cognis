@@ -10,6 +10,7 @@
     agents,
     selectedAgentId = $bindable(''),
     selectedAgentProfileId = $bindable(''),
+    selectedAgentProfileMode = $bindable(null),
     projects = [],
     selectedProjectId = $bindable(''),
     title = 'New chat',
@@ -24,6 +25,7 @@
     agents: Agent[];
     selectedAgentId?: string;
     selectedAgentProfileId?: string;
+    selectedAgentProfileMode?: 'auto' | 'default' | null;
     projects?: Project[];
     selectedProjectId?: string;
     title?: string;
@@ -77,7 +79,7 @@
     <div class={error ? 'mt-5' : ''}>
       {#if !profileOnly}
       <label class="block space-y-1">
-        <span class="block text-xs font-medium uppercase tracking-widest text-quiet">Primary agent</span>
+        <span class="block text-sm font-medium text-foreground">Primary agent</span>
         <select
           bind:value={selectedAgentId}
           class="w-full rounded-xl border border-control-border bg-surface px-3 py-2 text-sm text-foreground focus:border-accent"
@@ -95,8 +97,10 @@
           agents={primaryAgents}
           agentId={selectedAgentId}
           bind:value={selectedAgentProfileId}
+          bind:mode={selectedAgentProfileMode}
+          allowAuto
           disabled={busy}
-          help={profileOnly ? '' : undefined}
+          help={profileOnly ? '' : 'Auto selects once at startup and keeps the default unless confident. Default skips classification; named profiles are explicit selections.'}
         />
       </div>
       {#if projects.length > 0 && !profileOnly}

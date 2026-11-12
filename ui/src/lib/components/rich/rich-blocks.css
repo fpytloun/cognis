@@ -1,5 +1,5 @@
-/* Embedded boundaries opt into the app-owned palette for their own mode.
-   Standalone publications never carry this hook and retain the reader palette. */
+/* Embedded readers and authenticated standalone readers use the account palette.
+   Anonymous and offline publications retain the independent reader palette. */
 .theme-palette[data-theme-family][data-resolved-theme][data-viewer-theme]:is(.rich-deliverable, .rich-full, .rich-toc-drawer-root) {
   --rich-surface: rgb(var(--color-surface));
   --rich-surface-solid: rgb(var(--color-surface));
@@ -551,13 +551,6 @@
 
 :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure {
   margin: 0;
-}
-
-:is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure img {
-  display: block;
-  width: 100%;
-  max-height: 26rem;
-  object-fit: cover;
 }
 
 :is(.rich-deliverable.pulse, .rich-full.pulse) .rich-figure figcaption,
@@ -2219,11 +2212,12 @@
 
 .rich-figure img {
   display: block;
-  width: 100%;
+  width: auto;
   max-width: 100%;
+  height: auto;
   border: 1px solid var(--rich-line);
   border-radius: var(--rich-radius-lg);
-  object-fit: cover;
+  object-fit: contain;
 }
 
 .rich-figure figcaption {
@@ -2454,10 +2448,6 @@
 
 .rich-gallery .rich-figure {
   height: 100%;
-}
-
-.rich-gallery .rich-figure img {
-  aspect-ratio: 4 / 3;
 }
 
 /* TimelineBlock.svelte adds this modifier class alongside `.rich-timeline`

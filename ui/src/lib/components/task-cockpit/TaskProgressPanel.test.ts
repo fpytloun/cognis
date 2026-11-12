@@ -37,6 +37,32 @@ describe('TaskProgressPanel', () => {
     expect(screen.getByRole('link', { name: 'Open Independent verification' })).toHaveAttribute('href', '/chat/conversation-39');
   });
 
+  it('labels a child stopped by its parent as cancelled, not failed', () => {
+    render(TaskProgressPanel, {
+      projection: {
+        todos: [],
+        work_items: [{
+          kind: 'delegated_session',
+          work_id: 'work-audit',
+          step_name: 'execute',
+          step_run_id: 'run-1',
+          title: 'Privacy audit',
+          agent_id: 'system:code-review',
+          status: 'failed',
+          result_summary: null,
+          error: 'Cancelled by parent session',
+          todos: [],
+          conversation_id: null
+        }],
+        active_count: 0,
+        completed_count: 0,
+        truncated: false
+      }
+    });
+    expect(screen.getByText('Cancelled')).toBeTruthy();
+    expect(screen.queryByText('Failed')).toBeNull();
+  });
+
   it('gracefully explains an absent backend projection', () => {
     render(TaskProgressPanel, { projection: undefined });
     expect(screen.getByText(/Live progress is not available/)).toBeTruthy();

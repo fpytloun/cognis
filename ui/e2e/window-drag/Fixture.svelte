@@ -5,10 +5,13 @@
   import ConversationModalWorkspace from '../../src/lib/components/dashboard/ConversationModalWorkspace.svelte';
   import PinnedConversationPanel from '../../src/lib/components/chat/PinnedConversationPanel.svelte';
   import type { PinnedPanel } from '../../src/lib/components/chat/pinned-panel.svelte';
-  import type { Agent, Conversation } from '../../src/lib/types/api';
+  import type { Agent, BackgroundWorkItem, Conversation } from '../../src/lib/types/api';
   import type { RetainedConversation } from '../../src/lib/dashboard/conversation-workspace';
   import SessionLogsDrawer from '../../src/lib/components/tasks/SessionLogsDrawer.svelte';
   import ChildChatView from '../../src/lib/components/chat-v2/ChildChatView.svelte';
+  import TimelineOngoingWorkDrawer from '../../src/lib/components/timeline/TimelineOngoingWorkDrawer.svelte';
+  import SharedInspectorTabs from '../../src/lib/components/inspector/SharedInspectorTabs.svelte';
+  import ConversationInfoDrawer from '../../src/lib/components/ConversationInfoDrawer.svelte';
   import { DEFAULT_USER_PREFERENCES } from '../../src/lib/user-preferences';
   import type { WorkstreamRef } from '../../src/lib/chat-v2/types';
   import type { StepRun } from '../../src/lib/types/api';
@@ -54,6 +57,35 @@
   };
   const attemptCount = new URLSearchParams(location.search).get('attempts') === '5' ? 5 : 3;
   const latestStatus = new URLSearchParams(location.search).get('status') ?? 'running';
+  const footerFixture = new URLSearchParams(location.search).has('footer');
+  let managedTurnState = $state('running');
+  let childOpen = $state(true);
+  let drawerOpenedSession = $state('');
+  let inspectorFixtureOpen = $state(true);
+  const inspectorFixturePresentation = new URLSearchParams(location.search).get('presentation') as 'overlay' | 'focus' | 'pinned' | null;
+  const drawerLongTitle = 'Inspect every stage of this deliberately long verification workflow without wrapping or hiding its complete description and final acceptance criteria';
+  const drawerTodos = Array.from({ length: 8 }, (_, index) => ({
+    content: `Todo ${index + 1}: ${drawerLongTitle}`, status: 'in_progress' as const, priority: 'normal' as const,
+  }));
+  const drawerWork: BackgroundWorkItem[] = [
+    { work_id: 'drawer-managed', kind: 'managed_conversation', title: `Managed subsession: ${drawerLongTitle}`, status: 'running', controller_conversation_id: 'drawer-controller', target_conversation_id: 'drawer-managed', session_id: 'drawer-managed-session', agent_id: 'agent-1', todos: [] },
+    { work_id: 'drawer-delegate', kind: 'delegated_session', title: `Delegate subsession: ${drawerLongTitle}`, status: 'running', controller_conversation_id: 'drawer-controller', session_id: 'drawer-delegate-session', agent_id: 'agent-1', todos: [] },
+    { work_id: 'drawer-command', kind: 'background_command', title: `Command: ${drawerLongTitle}`, status: 'running', controller_conversation_id: 'drawer-controller', agent_id: 'agent-1', todos: [] },
+    { work_id: 'drawer-task', kind: 'task', title: `Task: ${drawerLongTitle}`, status: 'running', controller_conversation_id: 'drawer-controller', task_id: 'drawer-task', agent_id: 'agent-1', todos: [] },
+    { work_id: 'drawer-unlinked', kind: 'delegated_session', title: `Unavailable subsession: ${drawerLongTitle}`, status: 'running', controller_conversation_id: 'drawer-controller', agent_id: 'agent-1', todos: [] },
+  ];
+  const managedTarget = $derived({
+    conversation_id: 'acceptance-managed-child', title: 'Subsession with ongoing verification',
+    has_active_turn: managedTurnState === 'running',
+    managed_agent: { channel: 'agent_work', conversation_state: 'open', turn_state: managedTurnState,
+      controller_conversation_id: 'acceptance-conversation-3' },
+  } as Conversation);
+  const childWork: BackgroundWorkItem[] = Array.from({ length: new URLSearchParams(location.search).has('crowded') ? 24 : 1 }, (_, index) => ({
+    work_id: index ? `acceptance-verification-command-${index}` : 'acceptance-verification-command',
+    kind: 'background_command', title: index ? `Verification command ${index + 1}` : 'Verification command',
+    controller_conversation_id: 'acceptance-conversation-3', agent_id: 'acceptance-agent',
+    session_id: 'acceptance-delegate', status: 'running', todos: [],
+  }));
   const attempts = Array.from({ length: attemptCount }, (_, index) => index + 1).map(attempt => ({
     step_run_id: `acceptance-step-${attempt}`, task_id: 'acceptance-task', step_name: 'execute',
     conversation_id: `acceptance-conversation-${attempt}`, session_id: `acceptance-session-${attempt}`,
@@ -116,13 +148,44 @@
       <h1 class="text-sm font-semibold">Unified chat acceptance · synthetic data</h1>
       {#if surface === 'task'}<button class="rounded border border-control-border px-3 py-2 text-sm" onclick={() => { logsOpen = true; }}>Open step logs</button>{/if}
     </header>
-    {#if surface === 'child'}
+  {#if surface === 'ongoing'}
+    <section class="flex min-h-0 flex-1 flex-col" data-testid="ongoing-drawer-fixture">
+      <div class="min-h-0 flex-1 overflow-y-auto p-3">Synthetic transcript above the ongoing work footer.</div>
+      <footer class="shrink-0 space-y-3 p-3">
+        <div data-testid="drawer-under-test">
+          <TimelineOngoingWorkDrawer open={true} todos={drawerTodos} work={drawerWork} onViewSession={id => { drawerOpenedSession = id; }} />
+        </div>
+        <div class="rounded-2xl border border-separator p-3" data-testid="drawer-composer">Message agent</div>
+        <output data-testid="drawer-opened-session" class="sr-only">{drawerOpenedSession}</output>
+      </footer>
+    </section>
+  {:else if surface === 'inspector'}
+    <div class="grid min-h-0 flex-1 grid-cols-[1fr_auto]">
+      {#if inspectorFixtureOpen}
+        <ConversationInfoDrawer open={true} presentation={inspectorFixturePresentation ?? 'overlay'} width={360}
+          onWidthChange={() => {}} onWidthCommit={() => {}} onFocusChange={() => {}}
+          onClose={() => { inspectorFixtureOpen = false; }}>
+          {#snippet header()}
+            <div class="min-w-0 flex-1">
+              <SharedInspectorTabs scope={{ key: 'conversation:drawer-controller', kind: 'conversation', conversation_id: 'drawer-controller' }} sessionId="drawer-session" headerOnly idPrefix="drawer-inspector" />
+            </div>
+          {/snippet}
+          <p>Synthetic inspector contents.</p>
+        </ConversationInfoDrawer>
+      {/if}
+    </div>
+  {:else if surface === 'child' && childOpen}
       <ChildChatView
-        view={{ kind: 'delegate', conversationId: 'acceptance-conversation-3', sessionId: 'acceptance-delegate', controllerRootConversationId: 'acceptance-conversation-3', nodeKey: childNode.key }}
-        node={childNode} agent={{ agent_id: 'acceptance-agent', name: 'Research delegate' } as Agent}
+        view={footerFixture
+          ? { kind: 'managed', conversationId: 'acceptance-managed-child', sessionId: 'acceptance-delegate', controllerRootConversationId: 'acceptance-conversation-3', nodeKey: childNode.key }
+          : { kind: 'delegate', conversationId: 'acceptance-conversation-3', sessionId: 'acceptance-delegate', controllerRootConversationId: 'acceptance-conversation-3', nodeKey: childNode.key }}
+        node={footerFixture ? { ...childNode, kind: 'managed', execution_state: managedTurnState === 'running' ? 'running' : 'idle' } : childNode}
+        agent={{ agent_id: 'acceptance-agent', name: 'Research delegate' } as Agent}
+        work={footerFixture ? childWork : []} managedConversation={footerFixture ? managedTarget : null}
+        onManagedStop={() => { managedTurnState = 'idle'; }} onManagedSend={() => {}} onManagedTakeControl={() => {}}
         preferences={DEFAULT_USER_PREFERENCES} inspectorOpen={childInspectorOpen}
         onBack={() => { location.search = '?surface=task&attempts=5&status=failed'; }}
-        onClose={() => { location.search = '?surface=task'; }} onViewSession={() => {}}
+        onClose={() => { if (footerFixture) childOpen = false; else location.search = '?surface=task'; }} onViewSession={() => {}}
         onToggleInspector={() => { childInspectorOpen = !childInspectorOpen; }}
       />
     {:else if surface !== 'task'}

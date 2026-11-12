@@ -80,6 +80,12 @@
     pause !== null && (pause.pause_type === 'gate' || pause.pause_type === 'step_input')
   );
   const canRequestRevision = $derived(hasWorkflow && taskStatus !== 'cancelled');
+
+  function disabledIntentReason(value: CommentIntent): string {
+    if (value === 'answer_pause') return 'No question or approval is waiting for an answer.';
+    if (value === 'request_revision') return hasWorkflow ? 'A cancelled task cannot be revised.' : 'Only workflow tasks can be revised.';
+    return '';
+  }
   const requiresTargetStep = $derived(intent === 'request_revision');
   const submittable = $derived.by(() => {
     if (posting) return false;
@@ -428,7 +434,10 @@
     class={`rounded-xl border px-3 py-2 text-sm transition ${active ? 'border-accent bg-accent-subtle text-accent' : 'border-control-border bg-canvas/80 text-secondary hover:border-border-strong'} ${enabled ? '' : 'cursor-not-allowed opacity-40'}`}
     onclick={() => selectIntent(value)}
     disabled={!enabled}
+    title={enabled ? undefined : disabledIntentReason(value)}
+    aria-describedby={enabled ? undefined : `intent-reason-${value}`}
   >
     {label}
   </button>
+  {#if !enabled}<span id={`intent-reason-${value}`} class="sr-only">{disabledIntentReason(value)}</span>{/if}
 {/snippet}

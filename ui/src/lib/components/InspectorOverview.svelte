@@ -59,7 +59,9 @@
   }
   const contextLabel = $derived(contextUsage
     ? `${contextUsage.prompt_tokens.toLocaleString()} / ${contextUsage.max_context_tokens.toLocaleString()} (${Math.round((contextUsage.prompt_tokens / contextUsage.max_context_tokens) * 100)}%)`
-    : 'Unavailable');
+    : diagnosticsFreshness === 'updating' || diagnosticsFreshness === 'reconnecting'
+      ? 'Not measured yet'
+      : 'Unavailable');
   const contextWidth = $derived(contextUsage ? `${Math.min(100, (contextUsage.prompt_tokens / contextUsage.max_context_tokens) * 100)}%` : '0%');
   const executionIdentityCurrent = $derived(
     !focusedSession

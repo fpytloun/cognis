@@ -13,6 +13,16 @@ test('Library supports list pagination, lazy nested folders, and reader deep lin
   const laterRow = page.getByRole('link', { name: /Research notes/ });
   await laterRow.click();
   await expect(page.getByTestId('library-resource-modal')).toBeVisible();
+  await page.route('**/api/v1/audio/jobs/source?**', route => route.fulfill({
+    json: { supported: true, can_generate: true, can_cancel: true, detail: null, jobs: [] }
+  }));
+  await page.getByRole('button', { name: 'Listen to this document' }).click();
+  await expect(page.getByRole('dialog', { name: 'Document audio' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Generate narration' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Generate podcast' })).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog', { name: 'Document audio' })).toBeHidden();
+  await expect(page.getByTestId('library-resource-modal')).toBeVisible();
   await page.keyboard.press('Escape');
   await expect(page.getByTestId('library-resource-modal')).toHaveCount(0);
   await expect(page.getByTestId('resource-row')).toHaveCount(7);
@@ -46,6 +56,15 @@ test('Files distinguish user uploads and support source filters on mobile', asyn
   await expect(page.getByText('Agent output', { exact: true })).toHaveCount(0);
   await page.screenshot({ path: test.info().outputPath('library-mobile-upload-filter.png'), fullPage: true });
   await page.getByRole('link', { name: /Library requirements/ }).click();
+  await page.route('**/api/v1/audio/jobs/source?**', route => route.fulfill({
+    json: { supported: true, can_generate: true, can_cancel: true, detail: null, jobs: [] }
+  }));
+  await page.getByRole('button', { name: 'Listen to this document' }).click();
+  await expect(page.getByRole('button', { name: 'Generate narration' })).toBeEnabled();
+  const audioBounds = await page.getByRole('dialog', { name: 'Document audio' }).boundingBox();
+  expect(audioBounds!.x).toBeGreaterThanOrEqual(0);
+  expect(audioBounds!.x + audioBounds!.width).toBeLessThanOrEqual(390);
+  await page.keyboard.press('Escape');
   await expect(page.getByRole('main', { name: 'Document preview' }).getByText(/Preserve revision history/)).toBeVisible();
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   await page.screenshot({ path: test.info().outputPath('library-mobile-file-reader.png'), fullPage: true });

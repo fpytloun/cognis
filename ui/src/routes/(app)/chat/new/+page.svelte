@@ -15,6 +15,7 @@
   let agents: Agent[] = [];
   let selectedAgentId = '';
   let selectedAgentProfileId = '';
+  let selectedAgentProfileMode: 'auto' | 'default' | null = null;
   let projects: Project[] = [];
   let selectedProjectId = '';
   let health: HealthResponse | null = null;
@@ -45,6 +46,7 @@
       const conversation = await api.conversations.create({
         agent_id: selectedAgentId,
         agent_profile_id: selectedAgentProfileId || null,
+        agent_profile_mode: selectedAgentProfileMode,
         project_id: selectedProjectId || null,
         context: {
           type: 'web',
@@ -99,6 +101,7 @@
     {agents}
     bind:selectedAgentId
     bind:selectedAgentProfileId
+    bind:selectedAgentProfileMode
     {projects}
     bind:selectedProjectId
     title="Start a new chat"

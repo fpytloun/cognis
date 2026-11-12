@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Notification } from '$lib/types/api';
 
 import ConversationPendingInteractions from './ConversationPendingInteractions.svelte';
 
@@ -9,9 +10,11 @@ const mocks = vi.hoisted(() => ({
   wsListener: null as ((event: {
     type?: string;
     conversation_id?: string;
+    task_id?: string;
     managed_origin_conversation_id?: string;
     payload?: Record<string, unknown>;
     reason?: string;
+    notification_id?: string;
   }) => void) | null,
   wsStateListener: null as ((state: { status: string }) => void) | null,
   wsInitialState: 'idle' as 'idle' | 'connected',
@@ -29,6 +32,7 @@ vi.mock('$lib/ws/client', () => ({
     subscribe: vi.fn((listener: (event: {
       type?: string;
       conversation_id?: string;
+      task_id?: string;
       managed_origin_conversation_id?: string;
       payload?: Record<string, unknown>;
       reason?: string;
@@ -46,13 +50,17 @@ vi.mock('$lib/ws/client', () => ({
   },
 }));
 
-function escalation(status = 'pending') {
+function escalation(status = 'pending'): Notification {
   return {
     notification_id: 'notification-approval',
     notification_type: 'escalation',
     status,
     session_id: 'session-approval',
     task_id: null,
+    step_name: null,
+    step_run_id: null,
+    resolution: null,
+    resolved_at: null,
     conversation_id: 'conversation-one',
     created_at: new Date().toISOString(),
     payload: {
@@ -66,6 +74,59 @@ function escalation(status = 'pending') {
 }
 
 describe('ConversationPendingInteractions', () => {
+  it.each(['managed_conversation_completed', 'deliverable_ready'])(
+    'does not paint an empty floating request container for %s notifications',
+    async notification_type => {
+      mocks.list.mockResolvedValue([{ ...escalation(), notification_type }]);
+      render(ConversationPendingInteractions, { conversationId: 'conversation-one', presentation: 'floating' });
+      await waitFor(() => expect(screen.queryByTestId('pending-interactions-loading')).not.toBeInTheDocument());
+      expect(screen.queryByTestId('pending-conversation-interactions')).not.toBeInTheDocument();
+      expect(mocks.resolve).not.toHaveBeenCalled();
+    },
+  );
+
+  it('still renders an actionable request alongside a passive completion notification', async () => {
+    mocks.list.mockResolvedValue([escalation(), {
+      ...escalation(), notification_id: 'notification-completed', notification_type: 'managed_conversation_completed',
+    }]);
+    render(ConversationPendingInteractions, { conversationId: 'conversation-one', presentation: 'floating' });
+    expect(await screen.findByRole('button', { name: 'Approve' })).toBeVisible();
+    expect(screen.getByTestId('pending-conversation-interactions')).toBeVisible();
+  });
+
+  it('resolves task-scoped authentication without displaying unrelated request kinds', async () => {
+    mocks.list.mockResolvedValueOnce([
+      escalation(),
+      {
+        ...escalation(),
+        task_id: 'task-auth',
+        notification_id: 'notification-auth',
+        notification_type: 'auth_challenge',
+        payload: { label: 'VPN code', message: 'Enter the one-time code.', kind: 'otp_code', required_fields: ['code'] },
+      },
+    ]).mockResolvedValue([]);
+    render(ConversationPendingInteractions, { taskId: 'task-auth', notificationTypes: ['auth_challenge'] });
+    const input = await screen.findByRole('textbox');
+    expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+    expect(mocks.list).toHaveBeenCalledWith(null, { taskId: 'task-auth', signal: expect.any(AbortSignal) });
+    await fireEvent.input(input, { target: { value: '492681' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Send response' }));
+    await waitFor(() => expect(mocks.resolve).toHaveBeenCalledWith('notification-auth', { decision: 'continue', response: '492681' }));
+  });
+
+  it('refreshes task requests only for the matching task', async () => {
+    vi.useFakeTimers();
+    mocks.list.mockResolvedValue([]);
+    render(ConversationPendingInteractions, { taskId: 'task-auth', notificationTypes: ['auth_challenge'] });
+    await vi.waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(1));
+    mocks.wsListener?.({ type: 'auth_challenge', task_id: 'another-task' });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mocks.list).toHaveBeenCalledTimes(1);
+    mocks.wsListener?.({ type: 'auth_challenge', task_id: 'task-auth' });
+    await vi.advanceTimersByTimeAsync(50);
+    await vi.waitFor(() => expect(mocks.list).toHaveBeenCalledTimes(2));
+  });
+
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
@@ -95,7 +156,7 @@ describe('ConversationPendingInteractions', () => {
     expect(reads[0].signal.aborted).toBe(true);
     expect(reads[1].signal.aborted).toBe(false);
     reads[0].resolve([escalation()]);
-    expect(screen.queryByRole('heading', { name: 'deploy_service' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Approval required · deploy_service' })).toBeNull();
     // Queue a WS refresh immediately before teardown; it must not create
     // another consumer after the scope's subscription has been released.
     mocks.wsListener?.({ type: 'escalation', conversation_id: 'conversation-two' });
@@ -104,14 +165,14 @@ describe('ConversationPendingInteractions', () => {
     reads[1].resolve([escalation()]);
     await new Promise(resolve => setTimeout(resolve, 100));
     expect(mocks.list).toHaveBeenCalledTimes(2);
-    expect(screen.queryByRole('heading', { name: 'deploy_service' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Approval required · deploy_service' })).toBeNull();
   });
 
   it('shows safe tool approval details and dispatches the canonical decision', async () => {
     mocks.list.mockResolvedValueOnce([escalation()]).mockResolvedValueOnce([]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
 
-    expect(await screen.findByRole('heading', { name: 'deploy_service' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument();
     expect(screen.getByText(/"environment": "staging"/)).toBeInTheDocument();
     expect(screen.getByText('Service interruption risk')).toBeInTheDocument();
     expect(screen.getByText('notification-approval')).toBeInTheDocument();
@@ -126,7 +187,7 @@ describe('ConversationPendingInteractions', () => {
         decision: 'approve',
         note: undefined,
       });
-      expect(screen.queryByRole('heading', { name: 'deploy_service' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Approval required · deploy_service' })).not.toBeInTheDocument();
     });
   });
 
@@ -185,7 +246,7 @@ describe('ConversationPendingInteractions', () => {
     await fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('Approval failed');
-    expect(screen.getByRole('heading', { name: 'deploy_service' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Approve' })).toBeEnabled();
   });
 
@@ -208,12 +269,12 @@ describe('ConversationPendingInteractions', () => {
     vi.useFakeTimers();
     mocks.list.mockResolvedValueOnce([escalation()]).mockResolvedValueOnce([]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
-    await vi.waitFor(() => expect(screen.getByRole('heading', { name: 'deploy_service' })).toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument());
 
     mocks.wsListener?.({ type: 'escalation_resolved', conversation_id: 'conversation-one' });
     await vi.advanceTimersByTimeAsync(50);
 
-    await vi.waitFor(() => expect(screen.queryByRole('heading', { name: 'deploy_service' })).not.toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.queryByRole('button', { name: 'Approval required · deploy_service' })).not.toBeInTheDocument());
     expect(mocks.list).toHaveBeenCalledTimes(2);
   });
 
@@ -228,7 +289,7 @@ describe('ConversationPendingInteractions', () => {
     }]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
 
-    expect(await screen.findByRole('heading', { name: 'deploy_service' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument();
     expect(mocks.list).toHaveBeenCalledWith('conversation-one', { signal: expect.any(AbortSignal) });
   });
 
@@ -244,7 +305,7 @@ describe('ConversationPendingInteractions', () => {
       managed_origin_conversation_id: 'conversation-one',
     });
     await vi.advanceTimersByTimeAsync(50);
-    await vi.waitFor(() => expect(screen.getByRole('heading', { name: 'deploy_service' })).toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument());
 
     mocks.wsListener?.({
       type: 'escalation_resolved',
@@ -267,7 +328,7 @@ describe('ConversationPendingInteractions', () => {
       },
     }]).mockResolvedValueOnce([]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
-    await vi.waitFor(() => expect(screen.getByRole('heading', { name: 'deploy_service' })).toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Approval required · deploy_service' })).toBeInTheDocument());
 
     mocks.wsListener?.({
       type: 'escalation_resolved',
@@ -276,7 +337,7 @@ describe('ConversationPendingInteractions', () => {
     });
     await vi.advanceTimersByTimeAsync(50);
 
-    await vi.waitFor(() => expect(screen.queryByRole('heading', { name: 'deploy_service' })).not.toBeInTheDocument());
+    await vi.waitFor(() => expect(screen.queryByRole('button', { name: 'Approval required · deploy_service' })).not.toBeInTheDocument());
   });
 
   it('refetches after notification invalidation and WebSocket recovery', async () => {
@@ -308,7 +369,7 @@ describe('ConversationPendingInteractions', () => {
   it('ignores ordinary realtime frames', async () => {
     mocks.list.mockResolvedValueOnce([escalation()]);
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
-    await screen.findByRole('heading', { name: 'deploy_service' });
+    await screen.findByRole('button', { name: 'Approval required · deploy_service' });
 
     mocks.wsListener?.({ type: 'chunk', conversation_id: 'conversation-one' });
     await new Promise((done) => setTimeout(done, 75));
@@ -338,6 +399,12 @@ describe('ConversationPendingInteractions', () => {
     render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
 
     await fireEvent.click(await screen.findByText('Canary'));
+    const toggle = screen.getByRole('button', { name: 'Assistant requested more input' });
+    await fireEvent.click(toggle);
+    expect(screen.queryByRole('button', { name: 'Send response' })).toBeNull();
+    expect(mocks.resolve).not.toHaveBeenCalled();
+    await fireEvent.click(toggle);
+    expect(screen.getByRole('button', { name: 'Send response' })).toBeEnabled();
     await fireEvent.click(screen.getByRole('button', { name: 'Send response' }));
 
     await waitFor(() => expect(mocks.resolve).toHaveBeenCalledWith(
@@ -353,6 +420,42 @@ describe('ConversationPendingInteractions', () => {
         },
       },
     ));
+  });
+
+  it('retires a question answered in another chat even when an older read finishes late', async () => {
+    const question: Notification = {
+      ...escalation(),
+      notification_id: 'notification-question',
+      notification_type: 'step_question',
+      payload: { question: 'Choose a rollout mode.', questions: [{
+        id: 'rollout', question: 'Choose a rollout mode.',
+        options: [{ id: 'canary', label: 'Canary', description: null }],
+        multiple: false, allow_custom: false, required: true,
+      }] },
+    };
+    let finishOldRead!: (items: Notification[]) => void;
+    mocks.list.mockResolvedValueOnce([question])
+      .mockImplementationOnce(() => new Promise<Notification[]>(resolve => { finishOldRead = resolve; }))
+      .mockResolvedValue([]);
+    render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
+    expect(await screen.findByRole('button', { name: 'Send response' })).toBeInTheDocument();
+    window.dispatchEvent(new Event('focus'));
+    await waitFor(() => expect(finishOldRead).toBeDefined());
+    mocks.wsListener?.({
+      type: 'workflow_step_question_resolved', conversation_id: 'conversation-one',
+      notification_id: question.notification_id,
+    });
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Send response' })).toBeNull());
+    finishOldRead([question]);
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Send response' })).toBeNull());
+  });
+
+  it('reconciles a missed question resolution from canonical state invalidation', async () => {
+    mocks.list.mockResolvedValueOnce([escalation()]).mockResolvedValue([]);
+    render(ConversationPendingInteractions, { conversationId: 'conversation-one' });
+    expect(await screen.findByRole('button', { name: 'Approve' })).toBeInTheDocument();
+    mocks.wsListener?.({ type: 'conversation_state_delta', conversation_id: 'conversation-one' });
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Approve' })).toBeNull());
   });
 
   it('exposes OAuth authorization without offering an invalid continue action', async () => {

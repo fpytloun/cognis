@@ -15,6 +15,7 @@ export const DEFAULT_USER_PREFERENCES: UserPreferences = {
   },
   chat: {
     enter_to_send: true,
+    adapt_tts: false,
     show_thinking_blocks: false,
     group_tool_calls: true,
     keep_assistant_messages_separate: false,
@@ -65,6 +66,7 @@ export function normalizeUserPreferences(value: unknown): UserPreferences {
         : DEFAULT_USER_PREFERENCES.display.conversation_sidebar_dense
     },
     chat: {
+      adapt_tts: chat.adapt_tts === true,
       enter_to_send: typeof chat.enter_to_send === 'boolean'
         ? chat.enter_to_send
         : DEFAULT_USER_PREFERENCES.chat.enter_to_send,

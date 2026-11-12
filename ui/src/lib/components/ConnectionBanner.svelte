@@ -4,7 +4,6 @@
   import RefreshCw from 'lucide-svelte/icons/refresh-cw';
   import ChevronDown from 'lucide-svelte/icons/chevron-down';
   import { connectivity, retryConnectivityNow, type ConnectivityLevel } from '$lib/connectivity';
-  import { retainedDataNotice } from '$lib/offline/quarantine';
 
   // The single app-wide connectivity notice. While it applies, sections hide
   // their own connectivity errors (see $lib/connectivity).
@@ -76,16 +75,10 @@
   onDestroy(clearShowTimer);
 </script>
 
-{#if $retainedDataNotice}
-  <p class="border-b border-warning-border bg-warning-subtle px-3 py-1 text-xs text-warning" role="status">
-    Unverified local data is preserved but is not automatically restored or sent. Verified recovery is required.
-  </p>
-{/if}
-
 {#if visible && status.degraded}
   <div
-    class="pointer-events-none fixed inset-x-0 z-[60] flex justify-center px-3"
-    style="top: calc(env(safe-area-inset-top, 0px) + 0.5rem);"
+    class="flex justify-center px-3 pb-2"
+    style="padding-top: calc(var(--app-safe-area-top, 0px) + 0.5rem); padding-left: var(--app-overlay-inner-left, 0.75rem); padding-right: var(--app-overlay-inner-right, 0.75rem);"
     data-testid="connection-banner"
     data-level={status.level}
   >
@@ -109,7 +102,7 @@
         {#if truncated || expanded}
           <button
             type="button"
-            class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-warning hover:bg-surface-hover"
+            class="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-warning hover:bg-surface-hover"
             aria-expanded={expanded}
             aria-label={expanded ? 'Show less' : 'Show more'}
             data-testid="connection-banner-expand"
@@ -121,7 +114,7 @@
         {#if status.level !== 'offline'}
           <button
             type="button"
-            class="flex shrink-0 items-center gap-1 rounded-full bg-warning-subtle px-2.5 py-1 font-medium text-warning hover:bg-surface-hover"
+            class="flex min-h-11 shrink-0 items-center gap-1 rounded-full bg-warning-subtle px-2.5 py-1 font-medium text-warning hover:bg-surface-hover"
             onclick={() => retryConnectivityNow()}
           >
             <RefreshCw class="h-3 w-3" aria-hidden="true" />

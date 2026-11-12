@@ -9,6 +9,8 @@
   import Button from '$lib/components/ui/Button.svelte';
   import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
   import ConversationModalWorkspace from '$lib/components/dashboard/ConversationModalWorkspace.svelte';
+  import AppContactChat from '$lib/components/AppContactChat.svelte';
+  import { appContactBindingId } from '$lib/app-contacts';
   import CompactConversationChat from '$lib/components/chat-v2/CompactConversationChat.svelte';
   import DashboardModalShell from '$lib/components/dashboard/DashboardModalShell.svelte';
   import ScheduleDashboardModal from '$lib/components/dashboard/ScheduleDashboardModal.svelte';
@@ -20,7 +22,6 @@
   import TaskControlChat from '$lib/components/task-cockpit/TaskControlChat.svelte';
   import TaskDashboardControl from '$lib/components/dashboard/TaskDashboardControl.svelte';
   import TaskWorkPanel from '$lib/components/task-cockpit/TaskWorkPanel.svelte';
-  import StepOutputModal from '$lib/components/tasks/StepOutputModal.svelte';
   import SessionLogsDrawer from '$lib/components/tasks/SessionLogsDrawer.svelte';
   import { api, asApiError } from '$lib/api/client';
   import { auth } from '$lib/stores/auth';
@@ -95,8 +96,10 @@
   let taskChatLoading = $state(false);
   let taskChatError = $state<string | null>(null);
   let conversationDetail = $state<Conversation | null>(null);
-  let outputStepRun = $state<StepRun | null>(null);
-  let logsStepRun = $state<StepRun | null>(null);
+  const contactBindingId = $derived(appContactBindingId(conversationDetail));
+  // One step viewer serves both the Result and the Transcript entry points.
+  let viewerStepRun = $state<StepRun | null>(null);
+  let viewerTab = $state<'result' | 'transcript'>('result');
   let stepViewerLoading = $state(false);
   let stepViewerError = $state<string | null>(null);
   let stepViewerRequest = 0;
@@ -122,7 +125,7 @@
     { id: 'control', label: 'Control' },
     { id: 'control-chat', label: 'Control chat' },
     { id: 'activity', label: 'Activity' },
-    { id: 'deliverable', label: 'Final deliverable' }
+    { id: 'deliverable', label: 'Deliverable' }
   ].filter((tab) => canMutateTask || !['control-chat', 'activity'].includes(tab.id)));
   const resolvedConversationId = $derived(kind === 'task' ? taskChat?.conversation_id ?? null : conversationId);
   const agentId = $derived(kind === 'task' ? taskDetail?.agent_id ?? null : conversationDetail?.agent_id ?? null);
@@ -294,7 +297,8 @@
     try {
       const hydrated = await hydrateStepRun(run);
       if (request !== stepViewerRequest) return;
-      outputStepRun = hydrated;
+      viewerTab = 'result';
+      viewerStepRun = hydrated;
     } catch (caught) {
       if (request === stepViewerRequest) {
         stepViewerError = asApiError(caught).message || 'Could not load step output.';
@@ -313,7 +317,8 @@
     try {
       const hydrated = await hydrateStepRun(run);
       if (request !== stepViewerRequest) return;
-      logsStepRun = hydrated;
+      viewerTab = 'transcript';
+      viewerStepRun = hydrated;
     } catch (caught) {
       if (request === stepViewerRequest) {
         stepViewerError = asApiError(caught).message || 'Could not load step logs.';
@@ -345,8 +350,7 @@
     error = null;
     refreshing = false;
     refreshError = null;
-    outputStepRun = null;
-    logsStepRun = null;
+    viewerStepRun = null;
     stepViewerRequest += 1;
     stepViewerLoading = false;
     stepViewerError = null;
@@ -377,7 +381,7 @@
 
   export function handleEscape(): boolean {
     if (conversationWorkspace?.handleEscape()) return true;
-    if (!active || outputStepRun || logsStepRun) return false;
+    if (!active || viewerStepRun) return false;
     if (!stepViewerLoading) return false;
     stepViewerRequest += 1;
     stepViewerLoading = false;
@@ -417,7 +421,7 @@
     {title}
     status={statusLabel}
     onExternal={canonicalHref ? openCanonical : undefined}
-    dismissible={!outputStepRun && !logsStepRun && !stepViewerLoading}
+    dismissible={!viewerStepRun && !stepViewerLoading}
     onEscape={handleEscape}
     {onClose}
     testId="dashboard-entity-modal"
@@ -486,6 +490,7 @@
           <div class="space-y-4">
             <WorkflowPhases
               projection={taskDetail.workflow_projection}
+              taskStatus={taskDetail.status}
               onStepSelect={() => undefined}
               onStepLogsOpen={canMutateTask ? (stepName) => { void openStepLogs(stepName); } : undefined}
               onStepOutputOpen={canMutateTask ? (stepName) => { void openStepOutput(stepName); } : undefined}
@@ -531,6 +536,8 @@
             {:else}
             <TaskWorkPanel
             stepRuns={taskDetail.step_runs}
+            finalDeliverable={taskDetail.final_deliverable}
+            outputPresentation={taskDetail.output_presentation}
             {agents}
             {canonicalDeliverableId}
             view="deliverable"
@@ -540,10 +547,13 @@
         {/if}
       </div>
     {:else if kind === 'conversation' && resolvedConversationId}
-      {#if !embedded}
+      {#if !embedded && !contactBindingId}
         <div class="flex shrink-0 justify-end border-b border-separator px-3"><PinConversationButton conversation={conversationDetail} /></div>
       {/if}
-      {#if conversationDetail?.is_readonly_for_caller}
+      {#if contactBindingId}
+        <AppContactChat contactId={contactBindingId} {agent}
+          onInitialLoaded={() => onConversationInitialLoaded?.(resolvedConversationId)} />
+      {:else if conversationDetail?.is_readonly_for_caller}
         <div class="flex items-center justify-between gap-3 border-b border-separator px-4 py-3 text-sm text-secondary" data-testid="shared-modal-readonly">
           <span>Shared conversation · Read-only</span>
           {#if onContinueConversation && conversationDetail.can_continue}
@@ -570,27 +580,21 @@
   </DashboardModalShell>
 {/if}
 
-{#if outputStepRun}
-  <StepOutputModal
-    stepRun={outputStepRun}
-    agentName={agents.find((item: Agent) => item.agent_id === outputStepRun?.agent_id)?.display_name ?? outputStepRun.agent_id}
-    agentAvatarUrl={agents.find((item: Agent) => item.agent_id === outputStepRun?.agent_id)?.avatar_url ?? null}
-    visibleStatus={outputStepRun.status}
-    onclose={() => { outputStepRun = null; }}
-  />
-{/if}
-
-{#if logsStepRun && taskId}
-  <SessionLogsDrawer
-    conversationId={logsStepRun.conversation_id ?? logsStepRun.session_id ?? ''}
-    sessionId={logsStepRun.session_id ?? ''}
-    stepRunId={logsStepRun.step_run_id}
-    {taskId}
-    stepName={logsStepRun.step_name}
-    agent={agents.find((item: Agent) => item.agent_id === logsStepRun?.agent_id) ?? null}
-    stepRun={logsStepRun}
-    attempts={taskDetail?.step_runs ?? []}
-    {agents}
-    onclose={() => { logsStepRun = null; }}
-  />
+{#if viewerStepRun && taskId}
+  {#key `${viewerStepRun.step_run_id}:${viewerTab}`}
+    <SessionLogsDrawer
+      conversationId={viewerStepRun.conversation_id ?? viewerStepRun.session_id ?? ''}
+      sessionId={viewerStepRun.session_id ?? ''}
+      stepRunId={viewerStepRun.step_run_id}
+      {taskId}
+      stepName={viewerStepRun.step_name}
+      agent={agents.find((item: Agent) => item.agent_id === viewerStepRun?.agent_id) ?? null}
+      stepRun={viewerStepRun}
+      initialTab={viewerTab}
+      deliverableFreshness={taskDetail?.deliverable_freshness}
+      attempts={taskDetail?.step_runs ?? []}
+      {agents}
+      onclose={() => { viewerStepRun = null; }}
+    />
+  {/key}
 {/if}

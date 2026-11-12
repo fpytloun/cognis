@@ -38,7 +38,7 @@ describe('adaptiveBottomInset', () => {
     return node;
   }
 
-  it('adds bottom padding only when content would sit under the overlay', () => {
+  it('reserves the app-owned overlay', () => {
     const node = makeNode(400, 390);
     const action = adaptiveBottomInset(node);
     flushRaf();
@@ -49,12 +49,12 @@ describe('adaptiveBottomInset', () => {
     document.body.removeChild(node);
   });
 
-  it('does not add padding when content ends above the overlay', () => {
+  it('keeps usable viewport bounds independent of short content', () => {
     const node = makeNode(400, 320);
     const action = adaptiveBottomInset(node);
     flushRaf();
 
-    expect(node.style.paddingBottom).toBe('');
+    expect(node.style.paddingBottom).toBe('40px');
 
     action.destroy?.();
     document.body.removeChild(node);
@@ -73,5 +73,17 @@ describe('adaptiveBottomInset', () => {
 
     action.destroy?.();
     document.body.removeChild(node);
+  });
+
+  it('converges when scrollHeight is floored by the viewport instead of overflowing', async () => {
+    const node = makeNode(400, 400);
+    Object.defineProperty(node, 'scrollHeight', { get: () => Math.max(400, 300 + (parseFloat(node.style.paddingBottom) || 0)) });
+    const action = adaptiveBottomInset(node);
+    const padding: string[] = [];
+    for (let frame = 0; frame < 8; frame++) {
+      await Promise.resolve(); flushRaf(); padding.push(node.style.paddingBottom);
+    }
+    expect(padding).toEqual(Array(8).fill('40px'));
+    action.destroy(); node.remove();
   });
 });

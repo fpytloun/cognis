@@ -139,6 +139,10 @@
     }
   }
 
+  function clearFilters(): void {
+    filters = { search: '', agentId: '', workflowId: '', projectId: '', status: '' };
+  }
+
   function buildFiltersUrl(): string {
     return taskBoardUrlForState(filters, mobileActiveColumn);
   }
@@ -186,6 +190,8 @@
   // ---------------------------------------------------------------------------
 
   let filtersActive = $derived(Boolean(filters.search || filters.agentId || filters.workflowId || filters.projectId || filters.status));
+  let activeFilterCount = $derived([filters.agentId, filters.workflowId, filters.projectId, filters.status].filter(Boolean).length);
+  let mobileFiltersOpen = $state(false);
   let tasks = $derived([
     ...TASK_BOARD_COLUMNS.flatMap((column) => boardColumns[column.id].items),
     ...Object.values(doneGroupHistories).flatMap((history) => history.items)
@@ -229,7 +235,7 @@
   }
 
   function workflowName(workflowId: string | null): string {
-    if (!workflowId) return 'auto';
+    if (!workflowId) return 'General task';
     return workflows.find((w) => w.workflow_id === workflowId)?.name ?? workflowId;
   }
 
@@ -363,6 +369,10 @@
       const nextBoard = await api.tasks.board(boardQueryParams());
       if (requestId !== boardReplaceRequestId || requestFilterKey !== boardFilterKey()) return;
       applyBoardResponse(nextBoard.columns);
+      // Without an explicit column, open the phone board on the first column that has work.
+      if (!$page.url.searchParams.has('col') && taskCountForColumn(mobileActiveColumn) === 0) {
+        mobileActiveColumn = TASK_BOARD_COLUMNS.find((column) => taskCountForColumn(column.id) > 0)?.id ?? mobileActiveColumn;
+      }
     } catch (caughtError) {
       if (requestId !== boardReplaceRequestId) return;
       error = asApiError(caughtError).message;
@@ -851,7 +861,8 @@
     <LoadingState label="Loading task board" description="Fetching draft, queued, running, paused, and completed work items." />
   {/if}
 {:else}
-  <section class={`min-w-0 space-y-5 ${selectedCount > 0 ? 'pb-[calc(var(--app-shell-bottom-offset,0px)+5.5rem)]' : ''}`}>
+  <!-- The app shell gives non-chat routes no right padding; keep the board's last column and header actions off the edge. -->
+  <section class={`min-w-0 space-y-5 lg:pr-6 ${selectedCount > 0 ? 'pb-[calc(var(--app-shell-bottom-offset,0px)+5.5rem)]' : ''}`}>
     {#if agentsLoaded && agents.length === 0}
       <Card class="p-5">
         <p class="text-sm font-medium text-strong">Create an agent before using the task board.</p>
@@ -888,6 +899,10 @@
           <span>Search</span>
           <Input find bind:value={filters.search} placeholder="title or description" />
         </label>
+        <Button class="justify-self-start md:hidden" size="sm" variant="secondary" aria-expanded={mobileFiltersOpen} aria-controls="task-board-filters" onclick={() => (mobileFiltersOpen = !mobileFiltersOpen)}>
+          {mobileFiltersOpen ? 'Hide filters' : `Filters${activeFilterCount > 0 ? ` (${activeFilterCount})` : ''}`}
+        </Button>
+        <div id="task-board-filters" class={`${mobileFiltersOpen ? 'grid' : 'hidden'} gap-4 md:contents`}>
         <div class="space-y-2 text-sm font-medium text-foreground">
           <span>Agent</span>
           <AgentSelect
@@ -921,21 +936,29 @@
           <span>Status</span>
           <select bind:value={filters.status} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground">
             <option value="">All</option>
-            <option value="draft">draft</option>
-            <option value="queued">queued</option>
-            <option value="ready">ready</option>
-            <option value="running">running</option>
-            <option value="paused">paused</option>
-            <option value="completed">completed</option>
-            <option value="failed">failed</option>
-            <option value="cancelled">cancelled</option>
+            <option value="draft">Draft</option>
+            <option value="queued">Queued</option>
+            <option value="ready">Ready</option>
+            <option value="running">Running</option>
+            <option value="paused">Paused</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="cancelled">Cancelled</option>
           </select>
         </label>
+        </div>
       </div>
       {#if filtersActive}
-        <p class="mt-3 text-sm text-accent">Priority drag reordering is disabled while filters are active.</p>
+        <p class="mt-3 hidden text-xs text-muted lg:block">Clear filters to reorder tasks by dragging.</p>
       {/if}
     </Card>
+
+    {#if filtersActive && TASK_BOARD_COLUMNS.every((column) => taskCountForColumn(column.id) === 0)}
+      <Card class="p-6 text-center">
+        <p class="text-sm font-medium text-strong" data-testid="task-board-no-match">No tasks match these filters.</p>
+        <Button class="mt-3" size="sm" variant="secondary" onclick={clearFilters}>Clear filters</Button>
+      </Card>
+    {/if}
 
     <!-- Mobile column picker (below lg) -->
     <div class="lg:hidden">
@@ -981,9 +1004,9 @@
                       </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
-                          <span class="text-xs uppercase tracking-[0.2em] text-quiet">{group.title}</span>
+                          <span class="min-w-0 flex-1 truncate text-xs font-medium text-secondary" title={group.title}>{group.title}</span>
                           {#if group.task_count > 1}
-                            <span class="rounded-full border border-control-border bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-secondary">{group.task_count}</span>
+                            <span class="shrink-0 text-xs text-muted" data-testid="done-group-outcomes">{group.task_count} runs{#if group.failed_count > 0}<span class="text-danger"> · {group.failed_count} failed</span>{/if}{#if group.cancelled_count > 0} · {group.cancelled_count} cancelled{/if}</span>
                           {/if}
                         </div>
                         <TaskCard
@@ -1132,7 +1155,7 @@
                 {:else}
                   <p class="text-sm font-semibold text-strong">{column.label}</p>
                 {/if}
-                <p class="text-xs uppercase tracking-[0.2em] text-quiet">{columnTaskCount} items</p>
+                <p class="text-xs text-quiet">{columnTaskCount} {columnTaskCount === 1 ? 'item' : 'items'}</p>
               </div>
             </div>
 
@@ -1159,9 +1182,9 @@
                       </div>
                       <div class="min-w-0 flex-1 space-y-2">
                         <div class="flex flex-wrap items-center justify-between gap-2 px-1">
-                          <span class="text-xs uppercase tracking-[0.2em] text-quiet">{group.title}</span>
+                          <span class="min-w-0 flex-1 truncate text-xs font-medium text-secondary" title={group.title}>{group.title}</span>
                           {#if group.task_count > 1}
-                            <span class="rounded-full border border-control-border bg-surface px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-secondary">{group.task_count}</span>
+                            <span class="shrink-0 text-xs text-muted" data-testid="done-group-outcomes">{group.task_count} runs{#if group.failed_count > 0}<span class="text-danger"> · {group.failed_count} failed</span>{/if}{#if group.cancelled_count > 0} · {group.cancelled_count} cancelled{/if}</span>
                           {/if}
                         </div>
                         <TaskCard

@@ -56,10 +56,10 @@ export function messageArrival(
 }
 
 /** Retains lazy mounting and Svelte's reversible disclosure lifecycle. */
-export function chatDisclosure(node: HTMLElement): TransitionConfig {
+export function chatDisclosure(node: HTMLElement, options?: { instant?: boolean }): TransitionConfig {
   // No Web Animations support (or a reduced-motion preference) means instant
   // disclosure, not an exception or a CSS-only delayed mount.
-  if (reducedChatMotion() || typeof node.animate !== 'function') return { duration: 0 };
+  if (options?.instant || reducedChatMotion() || typeof node.animate !== 'function') return { duration: 0 };
   const opacity = Number(getComputedStyle(node).opacity) || 1;
   const config = slide(node, {
     duration: CHAT_MOTION.disclosure,

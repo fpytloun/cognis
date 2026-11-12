@@ -1,4 +1,11 @@
 <script lang="ts">
+  import DocumentFind from '../DocumentFind.svelte';
+  let documentFind: DocumentFind | undefined;
+  async function searchDocument() {
+    inlineExpanded = true;
+    await tick();
+    documentFind?.requestOpen();
+  }
   import { afterUpdate, onDestroy, onMount, tick } from 'svelte';
   import type { Snippet } from 'svelte';
   import { renderInlineMarkdown, renderMarkdown } from '$lib/markdown';
@@ -16,6 +23,12 @@
     type RichMediaUrlFor,
   } from '$lib/rich-deliverable';
   import RichBlockList from './RichBlockList.svelte';
+  import FeedbackWorkspace from '../feedback/FeedbackWorkspace.svelte';
+  // Loaded after startup so the standalone viewer's initial bundle stays within budget.
+  let FeedbackIndicator: typeof import('../feedback/FeedbackIndicator.svelte').default | null = null;
+  void import('../feedback/FeedbackIndicator.svelte').then((module) => { FeedbackIndicator = module.default; });
+  import { annotateRichPayload } from '$lib/feedback/annotations/rich';
+  import './rich-fonts.css';
   import RichToc from './RichToc.svelte';
   import RichViewerChrome from './RichViewerChrome.svelte';
   import DownloadMenu from './DownloadMenu.svelte';
@@ -23,10 +36,9 @@
   import ShareMenu from './ShareMenuLoader.svelte';
   import DocumentLinkActions from './DocumentLinkActions.svelte';
   import type { ShareLinkOptions } from './share-options';
-  import './rich-publication.css';
-  import './rich-conversation.css';
-  import ChatDocumentActions from './ChatDocumentActions.svelte';
-  import { loadViewerTheme, observeViewerTheme, resolveViewerTheme, viewerTheme } from './viewer-theme';
+  import DocumentActions from './DocumentActions.svelte';
+  import X from 'lucide-svelte/icons/x';
+  import { loadViewerTheme, observeViewerTheme, resolveViewerTheme, viewerTheme, type ViewerAppearance } from './viewer-theme';
   import {
     buildCitationRegistry,
     buildTocItems,
@@ -36,7 +48,8 @@
   } from './publication';
   import { createPublicationContext } from './publication-context';
   import { allocateRichInstanceNamespace } from './instance-namespace';
-  import { namespaceMermaidSvg } from './namespace-svg';
+  import DeferredView from '../DeferredView.svelte';
+  import type { DocumentAudioClient } from '$lib/document-audio';
 
   export let payload: unknown;
   export let content = '';
@@ -47,24 +60,36 @@
   export let expiredLink = false;
   export let compact = false;
   export let collapsedByDefault = false;
+  export let inlineDisclosure = false;
   export let standaloneUrl = '';
   export let pdfUrl = '';
   export let htmlUrl = '';
   export let markdownUrl = '';
   export let shareLinkCallback: ((options: ShareLinkOptions) => Promise<string>) | null = null;
   export let instanceId = '';
+  export let embeddedDocumentUrl = '';
+  export let audioControls: Snippet | undefined = undefined;
+  export let audioClient: DocumentAudioClient | undefined = undefined;
+  export let audioEnabled = true;
+  export let accountAppearance: ViewerAppearance | null = null;
+  // Public preview hosts keep embedded geometry but resolve appearance as external readers.
+  export let appearanceSurface: 'embedded' | 'standalone' | null = null;
+  export let publicationThemeFamily: ViewerAppearance['theme_family'] | null = null;
+  export let fullscreenOnly = false;
+  export let onCloseFullscreen: (() => void) | undefined = undefined;
   export let internalUrl = '';
   export let hosted = false;
   export let conversational = false;
   export let footer: Snippet | undefined = undefined;
-  export let extraActions: Snippet | undefined = undefined;
+  export let extraActions: Snippet<[boolean?]> | undefined = undefined;
+  export let revisionControls: Snippet | undefined = undefined;
   export let mediaUrlFor: RichMediaUrlFor = (mediaKey: string) => instanceId
     ? privateDeliverableMediaUrl(instanceId, mediaKey)
     : '';
 
   const instanceNamespace = allocateRichInstanceNamespace(instanceId);
   const publicationContext = createPublicationContext();
-  $: normalizedPayload = normalizeRichDeliverable(payload);
+  $: normalizedPayload = normalizeRichDeliverable(annotateRichPayload(payload));
   $: authorizedMediaUrlFor = (mediaKey: string) =>
     normalizedPayload.media_manifest?.[mediaKey] ? mediaUrlFor(mediaKey) : '';
   $: normalized = resolveRichMedia(normalizedPayload, authorizedMediaUrlFor);
@@ -108,12 +133,13 @@
   $: payloadOwnsIdentity = heroOwnsIdentity || dashboardSectionOwnsIdentity || markdownOwnsIdentity;
   $: documentBlocks = decoratedBlocks.map((block, index) => index === 0
     && ((block.type === 'hero' && heroOwnsIdentity) || (block.type === 'section_header' && dashboardSectionOwnsIdentity))
-    ? { ...block, __document_h1: true, ...(heroOwnsIdentity ? { __publication_anchor: `${instanceNamespace}-overview` } : {}) }
+    ? { ...block, __document_heading_level: documentHeadingLevel, ...(heroOwnsIdentity ? { __publication_anchor: `${instanceNamespace}-overview` } : {}) }
     : block);
   $: publicationContext.set(buildCitationRegistry(normalized.blocks, normalized.sources, instanceNamespace));
   $: showToc = options.showToc;
+  $: documentHeadingLevel = surface === 'embedded' && !fullOpen ? 2 : 1;
   $: chatFlow = conversational && surface === 'embedded' && !exportMode;
-  let fullOpen = false;
+  export let fullOpen = false;
   let inlineExpanded = !collapsedByDefault;
   let tocOpen = false;
   let tocChosen = false;
@@ -124,20 +150,30 @@
   let systemDark = true;
   let appTheme: string | null = null;
   let appFamily: string | null = null;
-  $: viewerFamily = surface === 'embedded' && !exportMode ? appFamily : null;
-  $: resolvedViewerTheme = resolveViewerTheme($viewerTheme, surface, appTheme, systemDark);
+  $: appearanceContext = appearanceSurface ?? surface;
+  $: viewerFamily = appearanceContext === 'embedded' ? appFamily
+    : (exportMode ? null : accountAppearance?.theme_family) ?? publicationThemeFamily;
+  $: resolvedViewerTheme = resolveViewerTheme($viewerTheme, appearanceContext, appTheme, systemDark, exportMode ? null : accountAppearance);
   let root: HTMLDivElement;
   let modalPanel: HTMLDivElement;
   let closeButton: HTMLButtonElement;
-  let lastFocusedElement: HTMLElement | null = null;
+  export let lastFocusedElement: HTMLElement | null = null;
   let overlayId: string | null = null;
   let unregisterOverlay: (() => void) | null = null;
   let mermaidRenderQueued = false;
   let mermaidRenderRunning = false;
   let mermaidRenderPending = false;
+  let mermaidGeneration = 0;
+  let mermaidDisposed = false;
   let inlineTocWide = false;
   let rootResizeObserver: ResizeObserver | null = null;
   let collapseIdentity = '';
+
+  $: { documentBlocks; resolvedViewerTheme; fullOpen; inlineExpanded; invalidateMermaidRender(); }
+
+  function invalidateMermaidRender() {
+    mermaidGeneration += 1;
+  }
 
   $: {
     const nextCollapseIdentity = `${instanceId}\u0000${title}`;
@@ -237,106 +273,30 @@
     }
   }
 
-  /** Resolve live `--rich-*` tokens into a Mermaid themeVariables object so
-   * diagrams follow the resolved light/dark theme instead of always
-   * rendering with hardcoded dark colors (Mermaid draws its own inline SVG
-   * styles and cannot read CSS custom properties itself). */
-  function resolveMermaidTheme(el: Element | undefined) {
-    const fallbackDark = {
-      background: '#020617',
-      primaryColor: '#0f172a',
-      primaryTextColor: '#e2e8f0',
-      primaryBorderColor: '#38bdf8',
-      lineColor: '#67e8f9',
-      secondaryColor: '#082f49',
-      secondaryTextColor: '#e0f2fe',
-      secondaryBorderColor: '#0ea5e9',
-      tertiaryColor: '#111827',
-      tertiaryTextColor: '#e5e7eb',
-      tertiaryBorderColor: '#334155',
-      noteBkgColor: '#0f172a',
-      noteTextColor: '#e2e8f0',
-      noteBorderColor: '#38bdf8',
-      clusterBkg: '#020617',
-      clusterBorder: '#1e293b',
-      edgeLabelBackground: '#020617',
-    };
-    if (typeof window === 'undefined' || !el) return { darkMode: true, themeVariables: fallbackDark };
-    const style = getComputedStyle(el);
-    const surface = style.getPropertyValue('--rich-surface').trim();
-    const surfaceRaised = style.getPropertyValue('--rich-surface-raised').trim();
-    const text = style.getPropertyValue('--rich-text').trim();
-    const textSecondary = style.getPropertyValue('--rich-text-secondary').trim();
-    const accent = style.getPropertyValue('--rich-accent').trim();
-    const accentSoft = style.getPropertyValue('--rich-accent-soft').trim();
-    const line = style.getPropertyValue('--rich-line').trim();
-    if (!surface || !text || !accent) return { darkMode: true, themeVariables: fallbackDark };
-    // Use the same resolved boundary as charts and document tokens.
-    const isLight = el.closest('[data-viewer-theme]')?.getAttribute('data-viewer-theme') === 'light'
-      || (!el.closest('[data-viewer-theme]') && document.documentElement.getAttribute('data-resolved-theme') === 'light');
-    return {
-      darkMode: isLight ? false : true,
-      themeVariables: {
-        background: surface,
-        primaryColor: surfaceRaised,
-        primaryTextColor: text,
-        primaryBorderColor: accent,
-        lineColor: accentSoft,
-        secondaryColor: surfaceRaised,
-        secondaryTextColor: textSecondary,
-        secondaryBorderColor: accent,
-        tertiaryColor: surface,
-        tertiaryTextColor: textSecondary,
-        tertiaryBorderColor: line,
-        noteBkgColor: surfaceRaised,
-        noteTextColor: textSecondary,
-        noteBorderColor: accent,
-        clusterBkg: surface,
-        clusterBorder: line,
-        edgeLabelBackground: surface,
-      },
-    };
-  }
-
   async function renderMermaidFallbacks() {
+    const generation = mermaidGeneration;
     await tick();
-    const nodes = scopedRoots().flatMap((scope) => Array.from(scope.querySelectorAll('pre[data-mermaid-source]')));
+    if (mermaidDisposed || generation !== mermaidGeneration) return;
+    const scopes = scopedRoots();
+    const nodes = scopes.flatMap((scope) => Array.from(scope.querySelectorAll<HTMLElement>('pre[data-mermaid-source]')));
     if (nodes.length === 0) return;
+    const sources = new Map(nodes.map((node) => [node, node.textContent]));
+    const isCurrent = (node: HTMLElement) => !mermaidDisposed && generation === mermaidGeneration
+      && node.isConnected && sources.get(node) === node.textContent
+      && scopes.some((scope) => scopedRoots().includes(scope) && scope.contains(node));
     try {
-      const mermaid = (await import('mermaid')).default;
-      const resolvedTheme = resolveMermaidTheme(fullOpen ? modalPanel : root);
-      mermaid.initialize({
-        startOnLoad: false,
-        securityLevel: 'strict',
-        theme: 'base',
-        darkMode: resolvedTheme.darkMode,
-        themeVariables: {
-          ...resolvedTheme.themeVariables,
-          fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
-        },
+      const { renderMermaidPresentation } = await import('./mermaid-presentation');
+      if (!nodes.some(isCurrent)) return;
+      await renderMermaidPresentation(nodes, fullOpen ? modalPanel : root, instanceNamespace, isCurrent, (node, presentation) => {
+        if (isCurrent(node)) node.replaceWith(presentation);
       });
-      for (const [index, node] of nodes.entries()) {
-        // Decode persisted arrow brackets without interpreting authored HTML.
-        const source = (node.textContent ?? '').replaceAll('&gt;', '>').replaceAll('&lt;', '<');
-        try {
-          const renderId = (node as HTMLElement).dataset.mermaidId || `${instanceNamespace}-mermaid-${index}`;
-          const result = await mermaid.render(renderId, source);
-          const wrapper = document.createElement('div');
-          wrapper.className = 'rich-mermaid';
-          wrapper.dataset.mermaidSource = source;
-          wrapper.dataset.mermaidId = renderId;
-          wrapper.innerHTML = namespaceMermaidSvg(result.svg, renderId);
-          node.replaceWith(wrapper);
-        } catch {
-          // Keep escaped source fallback.
-        }
-      }
     } catch {
       // Mermaid is optional at runtime; source fallback remains usable.
     }
   }
 
   function scheduleMermaidRender() {
+    if (mermaidDisposed) return;
     if (mermaidRenderRunning) {
       mermaidRenderPending = true;
       return;
@@ -345,6 +305,7 @@
     mermaidRenderQueued = true;
     queueMicrotask(async () => {
       mermaidRenderQueued = false;
+      if (mermaidDisposed) return;
       mermaidRenderRunning = true;
       try {
         await renderMermaidFallbacks();
@@ -359,6 +320,8 @@
   }
 
   function refreshMermaidTheme() {
+    if (mermaidDisposed) return;
+    invalidateMermaidRender();
     for (const scope of scopedRoots()) {
       for (const wrapper of scope.querySelectorAll<HTMLElement>('.rich-mermaid[data-mermaid-source]')) {
         const source = document.createElement('pre');
@@ -373,6 +336,7 @@
 
   onMount(() => {
     loadViewerTheme();
+    if (fullscreenOnly || fullOpen) void openFullView();
     const query = window.matchMedia?.('(prefers-color-scheme: dark)');
     systemDark = query?.matches ?? true;
     const change = (event: MediaQueryListEvent) => systemDark = event.matches;
@@ -411,6 +375,9 @@
     scheduleMermaidRender();
   });
   onDestroy(() => {
+    mermaidDisposed = true;
+    invalidateMermaidRender();
+    mermaidRenderPending = false;
     root?.removeEventListener('click', handleRootClick, true);
     root?.removeEventListener('rich-toc-request', openContextualToc);
     unregisterOverlay?.();
@@ -420,7 +387,7 @@
   $: if (fullOpen) scheduleMermaidRender();
 
   $: if (fullOpen && !unregisterOverlay) {
-    const handle = registerOverlay({ kind: 'fullscreen', blocksChrome: true });
+    const handle = registerOverlay({ kind: 'fullscreen', blocksChrome: true, root: () => modalPanel });
     overlayId = handle.id;
     unregisterOverlay = handle.unregister;
   }
@@ -432,7 +399,10 @@
   }
 
   async function openFullView() {
-    lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // A keyed revision replacement reopens an existing fullscreen view.
+    if (!fullOpen) {
+      lastFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
     tocOpen = window.innerWidth >= 960;
     fullOpen = true;
     await tick();
@@ -444,23 +414,28 @@
     const restoreTarget = lastFocusedElement;
     lastFocusedElement = null;
     await tick();
-    if (restoreTarget?.isConnected) restoreTarget.focus({ preventScroll: true });
+    const target = restoreTarget?.isConnected ? restoreTarget : root?.querySelector<HTMLElement>('[aria-label="Open fullscreen"]');
+    target?.focus({ preventScroll: true });
+    onCloseFullscreen?.();
   }
 
   function focusableModalElements(): HTMLElement[] {
     const nodes = modalPanel?.querySelectorAll<HTMLElement>(
       'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
     ) ?? [];
-    const visible = Array.from(nodes).filter((node) => node.offsetParent !== null || node === closeButton);
+    const visible = Array.from(nodes).filter((node) => node.offsetParent !== null
+      || (node === closeButton && !node.closest('[data-find-toolbar][data-find-open]')));
     // Keep the dialog panel in the focus cycle for single-action modals.
     return modalPanel && modalPanel.tabIndex >= 0 ? [modalPanel, ...visible] : visible;
   }
 
   function handleKeydown(event: KeyboardEvent) {
     if (!fullOpen || !isTopOverlay(overlayId)) return;
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') return;
+    if (event.key === 'Escape' && event.target instanceof Element && event.target.closest('[data-find-bar]')) return;
+    if (event.key === 'Escape' && event.target instanceof Element && event.target.closest('.download-menu[open], .chat-document-more[open], .revision-switcher[open]')) return;
     event.stopPropagation();
     if (event.key === 'Escape') {
-      if (event.target instanceof Element && event.target.closest('.download-menu[open]')) return;
       closeFullView();
       return;
     }
@@ -481,6 +456,8 @@
 
 <div
   bind:this={root}
+  inert={fullOpen}
+  aria-hidden={fullOpen ? 'true' : undefined}
   class:compact
   class:embedded={surface === 'embedded'}
   class:hosted
@@ -498,21 +475,22 @@
   data-has-contextual-toc={showToc ? 'true' : undefined}
   data-inline-toc-layout={inlineTocWide ? 'sidebar' : 'drawer'}
   data-testid="rich-deliverable"
+  data-find-container={hosted ? undefined : ''}
   data-viewer-theme={resolvedViewerTheme}
 >
-  {#if surface === 'standalone'}
-    <RichViewerChrome {exportMode} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {htmlUrl} {markdownUrl} {copied} onCopy={copyFallback} progress={readingProgress} showProgress={showToc} showTocControl={showToc} {tocOpen} tocLayout={inlineTocWide ? 'sidebar' : 'drawer'} onOpenToc={openContextualToc} onClose={closePreview}>
-       {#if internalUrl}<DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
-      {:else if shareLinkCallback}<ShareMenu createLink={shareLinkCallback} />{/if}
+  {#if !fullscreenOnly && surface === 'standalone'}
+    <RichViewerChrome {exportMode} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} customControls onCopy={copyFallback} progress={readingProgress} showProgress={showToc} onClose={closePreview}>
+      <DocumentActions onSearch={embeddedDocumentUrl ? undefined : searchDocument} copyDocument={copyFallback} {copied} {pdfUrl} {htmlUrl} {markdownUrl} {internalUrl} createLink={shareLinkCallback} {extraActions} {revisionControls} audioControls={documentControls} />
     </RichViewerChrome>
   {/if}
 
-  {#if !hosted && !chatFlow}
-  <header class="rich-toolbar" class:actions-only={(payloadOwnsIdentity && inlineExpanded) || surface === 'standalone'} data-testid="rich-deliverable-toolbar">
+  {#if !fullscreenOnly && !hosted && !chatFlow}
+  <header data-find-toolbar={surface === 'standalone' ? undefined : ''} class="rich-toolbar" class:actions-only={(payloadOwnsIdentity && inlineExpanded) || surface === 'standalone'} data-testid="rich-deliverable-toolbar">
     {#if surface !== 'standalone' && (!payloadOwnsIdentity || !inlineExpanded)}
     <div>
       {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
-      <h1>{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
+      <!-- Documents inside an app page sit below the page title. -->
+      <svelte:element this={documentHeadingLevel === 1 ? 'h1' : 'h2'} class="document-toolbar-title">{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</svelte:element>
       {#if subtitle}<p>{@html renderInlineMarkdown(subtitle)}</p>{/if}
       {#if badges.length > 0}
         <div class="rich-badges">{#each badges as badge}<span>{@html renderInlineMarkdown(badge)}</span>{/each}</div>
@@ -522,52 +500,77 @@
     {#if surface === 'embedded'}{@render documentActions()}{/if}
   </header>
   {/if}
-  {#snippet documentActions()}
-    <nav class="rich-actions" aria-label="Document actions">
-      {#if collapsedByDefault}
-        <button
-          type="button"
-          aria-label={inlineExpanded ? 'Collapse document' : 'Expand document'}
-          title={inlineExpanded ? 'Collapse document' : 'Expand document'}
-          aria-expanded={inlineExpanded}
-          aria-controls={`${instanceNamespace}-inline-document`}
-          on:click={toggleInlineDocument}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d={inlineExpanded ? 'm6 15 6-6 6 6' : 'm6 9 6 6 6-6'} /></svg>
-          {#if chatFlow}<span>{inlineExpanded ? 'Collapse' : 'Expand document'}</span>{/if}
-        </button>
+  {#snippet documentAudio()}
+    {#if !exportMode && audioEnabled}
+      {#if audioControls}{@render audioControls()}
+      {:else if /^(dlv|art|att|doc|img)_[0-9a-f]{32}$/.test(instanceId)}
+        <DeferredView load={() => import('../DeliverableAudio.svelte')} label="Loading audio controls…">
+          {#snippet children(loaded)}
+            <loaded.default sourceRef={instanceId} client={audioClient} rich />
+          {/snippet}
+        </DeferredView>
       {/if}
-      {#if showToc && (!inlineTocWide || !tocOpen)}
-        <button class="rich-toc-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h2m3 0h11M4 12h2m3 0h11M4 18h2m3 0h11" /></svg>
-          {#if chatFlow}<span>Contents</span>{/if}
-        </button>
-      {/if}
-      <!-- "Open full view" and "Open standalone page" are only meaningful
-           from embedded chat -- opening either from the standalone page
-           itself would just reopen the same page/a fullscreen copy of the
-           page you're already looking at. -->
-      {#if surface === 'embedded'}
-        <button type="button" aria-label={chatFlow ? 'Open document' : 'Open full view'} title={chatFlow ? 'Open document' : 'Open full view'} on:click={openFullView}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5" /></svg>{#if chatFlow}<span>Open document</span>{/if}</button>
-        {#if standaloneUrl && !chatFlow}<a href={standaloneUrl} target="_blank" rel="noreferrer" aria-label="Open standalone page" title="Open standalone page"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 11 13M10 6H5a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-5" /></svg></a>{/if}
-      {/if}
-      {#if pdfUrl || htmlUrl || markdownUrl}<DownloadMenu {pdfUrl} {htmlUrl} {markdownUrl} label={chatFlow ? 'Download' : ''} />{/if}
-       {#if internalUrl}
-          <DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} shareLabel={chatFlow ? 'Share' : ''} />
-       {:else if shareLinkCallback}
-        <ShareMenu createLink={shareLinkCallback} label={chatFlow ? 'Share' : ''} />
-      {/if}
-       {#if !internalUrl}<button type="button" aria-label={copied ? 'Copied' : 'Copy document'} title="Copy document" on:click={copyFallback}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" /></svg></button>{/if}
-    </nav>
+    {/if}
   {/snippet}
-  {#if hosted && showToc && (!inlineTocWide || !tocOpen)}
+  {#snippet documentControls()}
+    <!-- Inline chat/Work documents share the conversation's commenting; only opened views get comment mode. -->
+    {#if !exportMode && surface !== 'embedded' && FeedbackIndicator}<FeedbackIndicator />{/if}
+    {@render documentAudio()}
+  {/snippet}
+  {#snippet fullViewControls()}
+    {#if !exportMode && FeedbackIndicator}<FeedbackIndicator />{/if}
+    {@render documentAudio()}
+  {/snippet}
+  {#snippet documentBody()}
+    <div class="rich-body" data-testid="rich-deliverable-body">
+      {#if exportMode || (surface === 'standalone' && embeddedDocumentUrl)}
+        {@render documentContents()}
+      {:else}
+        <DocumentFind bind:this={documentFind} primary={hosted || fullOpen || surface === 'standalone'} identity={normalized}>
+          {@render documentContents()}
+        </DocumentFind>
+      {/if}
+    </div>
+  {/snippet}
+  {#snippet documentContents()}
+      {#if expiredLink}<p class="preview-notice" role="status"><strong>Shared link expired</strong> — viewing through your authenticated owner access.</p>{/if}
+      {#if (surface === 'standalone' || chatFlow || fullOpen) && !payloadOwnsIdentity}
+        {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
+        <svelte:element this={documentHeadingLevel === 1 ? 'h1' : 'h2'} class="document-title">{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</svelte:element>
+        {#if subtitle}<p class="document-lede">{@html renderInlineMarkdown(subtitle)}</p>{/if}
+        {#if badges.length > 0}
+          <div class="rich-badges">{#each badges as badge}<span>{@html renderInlineMarkdown(badge)}</span>{/each}</div>
+        {/if}
+      {/if}
+      {#if surface === 'standalone' && embeddedDocumentUrl}
+        <iframe src={embeddedDocumentUrl} title="Artifact preview" sandbox="allow-scripts" referrerpolicy="no-referrer" class="artifact-document-frame"></iframe>
+      {:else if normalized.blocks.length > 0}
+        <FeedbackWorkspace><RichBlockList blocks={documentBlocks} sources={normalized.sources} mediaUrlFor={authorizedMediaUrlFor} /></FeedbackWorkspace>
+      {:else}
+        <div class="rich-fallback">{@html renderMarkdown(content)}</div>
+      {/if}
+  {/snippet}
+  {#snippet documentActions()}
+    <DocumentActions onSearch={searchDocument} openFullView={surface === 'embedded' ? openFullView : undefined} copyDocument={copyFallback} {copied}
+      {pdfUrl} {htmlUrl} {markdownUrl} {internalUrl} standaloneUrl={surface === 'embedded' ? standaloneUrl : ''} createLink={shareLinkCallback}
+      collapsible={collapsedByDefault} {inlineDisclosure} expanded={inlineExpanded} controlsId={`${instanceNamespace}-inline-document`} toggleExpanded={toggleInlineDocument}
+      {extraActions} {revisionControls} audioControls={documentControls} />
+  {/snippet}
+  {#if !fullscreenOnly && !chatFlow && showToc && (!inlineTocWide || !tocOpen)}
     <div class="rich-hosted-navigation">
-      <button class="document-icon-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="contents" /></button>
+      <button class="document-icon-action" type="button" aria-label="Open table of contents" title="Open table of contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="collapse" /></button>
     </div>
   {/if}
   {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
 
-  {#if !fullOpen && inlineExpanded}
+  {#if !fullscreenOnly && chatFlow && !hosted}
+    <header class="chat-document-footer" data-find-toolbar data-testid="chat-document-footer">
+      {@render footer?.()}
+      {@render documentActions()}
+    </header>
+  {/if}
+
+  {#if !fullscreenOnly && !fullOpen && inlineExpanded}
   <div
     id={`${instanceNamespace}-inline-document`}
     class:has-toc={showToc && tocOpen}
@@ -593,22 +596,7 @@
       />
     {/if}
 
-    <div class="rich-body" data-testid="rich-deliverable-body">
-      {#if expiredLink}<p class="preview-notice" role="status"><strong>Shared link expired</strong> — viewing through your authenticated owner access.</p>{/if}
-      {#if (surface === 'standalone' || chatFlow) && !payloadOwnsIdentity}
-        {#if eyebrow}<span class="rich-eyebrow">{@html renderInlineMarkdown(eyebrow)}</span>{/if}
-        <h1 class="document-title">{@html renderInlineMarkdown(effectiveTitle || 'Deliverable')}</h1>
-        {#if subtitle}<p class="document-lede">{@html renderInlineMarkdown(subtitle)}</p>{/if}
-        {#if badges.length > 0}
-          <div class="rich-badges">{#each badges as badge}<span>{@html renderInlineMarkdown(badge)}</span>{/each}</div>
-        {/if}
-      {/if}
-      {#if normalized.blocks.length > 0}
-          <RichBlockList blocks={documentBlocks} sources={normalized.sources} mediaUrlFor={authorizedMediaUrlFor} />
-      {:else}
-        <div class="rich-fallback">{@html renderMarkdown(content)}</div>
-      {/if}
-    </div>
+    {@render documentBody()}
     {#if chatFlow && showToc && (!inlineTocWide || !tocOpen)}
       <div class="chat-toc-rail">
         <button class="copy-icon-button" type="button" aria-label="Open table of contents" title="Contents"
@@ -618,15 +606,8 @@
   </div>
   {/if}
 
-  {#if chatFlow}
-    {#if !inlineExpanded}<p class="chat-document-summary">{effectiveTitle || 'Deliverable'}</p>{/if}
-    <footer class="chat-document-footer" data-testid="chat-document-footer">
-      {@render footer?.()}
-      <ChatDocumentActions openFullView={openFullView} copyDocument={copyFallback} {copied}
-        {pdfUrl} {htmlUrl} {markdownUrl} {internalUrl} createLink={shareLinkCallback}
-        collapsible={collapsedByDefault} expanded={inlineExpanded} toggleExpanded={toggleInlineDocument}
-        {extraActions} />
-    </footer>
+  {#if !fullscreenOnly && chatFlow && !hosted}
+    {#if !inlineExpanded}<svelte:element this={documentHeadingLevel === 1 ? 'h1' : 'h2'} class="chat-document-summary">{effectiveTitle || 'Deliverable'}</svelte:element>{/if}
   {/if}
 
   {#if fullOpen}
@@ -640,6 +621,7 @@
       tabindex="-1"
       aria-label={effectiveTitle || 'Document full view'}
       data-testid="rich-deliverable-full-view"
+      data-find-container
       data-presentation={presentation}
       data-rich-density={density}
       data-rich-canvas={canvas}
@@ -651,34 +633,30 @@
     >
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="rich-full-panel" bind:this={modalPanel} tabindex="0" use:bindPanelInteractions>
-          <RichViewerChrome {surface} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} {pdfUrl} {htmlUrl} {markdownUrl} {copied} onCopy={copyFallback} progress={readingProgress} showProgress={showToc} showTocControl={showToc} {tocOpen} onOpenToc={openContextualToc}>
-            {#if internalUrl}<DocumentLinkActions {internalUrl} {extraActions} createLink={shareLinkCallback} />
-           {:else if shareLinkCallback}<ShareMenu createLink={shareLinkCallback} />{/if}
-           <button class="viewer-extra-control" bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><ViewerIcon name="close" /></button>
+          <RichViewerChrome {surface} title={payloadOwnsIdentity ? blockTitle(normalized.blocks[0]) || effectiveTitle : effectiveTitle} identity={metadata.viewer_identity} customControls onCopy={copyFallback} progress={readingProgress} showProgress={showToc}>
+            <DocumentActions onSearch={searchDocument} copyDocument={copyFallback} {copied} {pdfUrl} {htmlUrl} {markdownUrl} {internalUrl} createLink={shareLinkCallback} {extraActions} {revisionControls} audioControls={fullViewControls} />
+            <button class="document-icon-action" bind:this={closeButton} type="button" aria-label="Close" title="Close full view" on:click={closeFullView}><X aria-hidden="true" /></button>
          </RichViewerChrome>
          {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
         <div class="rich-full-body">
               <div class:has-toc={showToc && tocOpen} class="rich-document">
-               {#if showToc}
-                   <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} bind:progress={readingProgress} onClose={closeToc} layout="auto" visible={tocOpen} dismissibleSidebar={true} theme={resolvedViewerTheme} family={viewerFamily} documentRoot={() => modalPanel} />
+                {#if showToc}
+                    <RichToc items={tocItems} onNavigate={navigateToc} bind:open={tocOpen} bind:progress={readingProgress} onClose={closeToc} layout="auto" visible={tocOpen} side="right" dismissibleSidebar={true} theme={resolvedViewerTheme} family={viewerFamily} documentRoot={() => modalPanel} />
                 {/if}
 
-            <div class="rich-body">
-              {#if !payloadOwnsIdentity}<h1 class="document-title">{effectiveTitle || 'Deliverable'}</h1>{#if subtitle}<p class="document-lede">{subtitle}</p>{/if}{/if}
-              {#if normalized.blocks.length > 0}
-                 <RichBlockList blocks={documentBlocks} sources={normalized.sources} mediaUrlFor={authorizedMediaUrlFor} />
-              {:else}
-                <div class="rich-fallback">{@html renderMarkdown(content)}</div>
-              {/if}
-            </div>
+            {@render documentBody()}
           </div>
         </div>
+        {#if showToc && !tocOpen}
+          <button class="full-toc-trigger document-icon-action" type="button" aria-label="Open table of contents" title="Contents" aria-expanded={tocOpen} on:click={openContextualToc}><ViewerIcon name="collapse" /></button>
+        {/if}
       </div>
     </div>
   {/if}
 </div>
 
 <style>
+  .artifact-document-frame { display: block; width: 100%; min-height: 75dvh; border: 0; background: white; }
   .rich-deliverable.hosted {
     border: 0; border-radius: 0; box-shadow: none; background: transparent;
   }
@@ -698,10 +676,14 @@
 
   /* The card clips its content; open action menus must escape the clip. */
   .rich-deliverable:has(:global(.download-menu[open])),
+  .rich-deliverable:has(:global(.chat-document-more[open])),
   .rich-deliverable:has(:global(.share-menu .share-panel)) {
     overflow: visible;
     z-index: 5;
   }
+
+  .full-toc-trigger { position: fixed; right: max(1rem, env(safe-area-inset-right)); top: calc(env(safe-area-inset-top) + 5.5rem); z-index: 5; min-width: 44px; min-height: 44px; background: var(--rich-surface-raised); }
+  .rich-full button.document-icon-action { width: var(--rich-action-size, 44px); min-width: var(--rich-action-size, 44px); height: var(--rich-action-size, 44px); padding: 0; border-radius: 6px; }
 
   /* Action size for child-component triggers (download, share), which
      cannot be reached by this component's scoped button rules. Mirrors the
@@ -740,15 +722,6 @@
 
   .rich-deliverable.pulse .rich-toolbar.actions-only {
     padding-block: .25rem;
-  }
-
-  .rich-deliverable.pulse .rich-actions button,
-  .rich-deliverable.pulse .rich-actions a {
-    width: 2.25rem;
-    min-width: 2.25rem;
-    height: 2.25rem;
-    border-radius: 999px;
-    background: transparent;
   }
 
 
@@ -804,22 +777,6 @@
      padding-block: .2rem;
    }
 
-    .rich-deliverable.dashboard .rich-actions {
-      gap: .3rem;
-      --rich-action-size: 2rem;
-      --rich-action-radius: .45rem;
-    }
-
-   .rich-deliverable.dashboard .rich-actions button,
-   .rich-deliverable.dashboard .rich-actions a {
-     width: 2rem;
-     min-width: 2rem;
-     height: 2rem;
-     border-radius: .45rem;
-     border-color: color-mix(in srgb, var(--rich-line) 75%, transparent);
-     background: transparent;
-   }
-
 
   /* Constrain reading content, never the full-view canvas. Embedded width
      remains owned by the chat host. */
@@ -859,7 +816,7 @@
     padding: clamp(0.85rem, 1.8vw, 1.15rem);
   }
 
-  .rich-toolbar h1 {
+  .rich-toolbar .document-toolbar-title {
     display: block;
     margin: 0.15rem 0 0;
     color: var(--rich-text);
@@ -868,7 +825,7 @@
     line-height: 1.05;
   }
 
-  .rich-deliverable.embedded .rich-toolbar h1 {
+  .rich-deliverable.embedded .rich-toolbar .document-toolbar-title {
     font-size: clamp(1.08rem, 2.1vw, 1.48rem);
     line-height: 1.14;
   }
@@ -914,28 +871,6 @@
     font-weight: 750;
   }
 
-  nav {
-    display: flex;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-    gap: 0.5rem;
-    min-width: 0;
-    max-width: 100%;
-  }
-
-  .rich-actions svg,
-  .rich-full svg {
-    width: 1.2rem;
-    height: 1.2rem;
-    fill: none;
-    stroke: currentColor;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    stroke-width: 1.8;
-  }
-
-  .rich-actions button,
-  .rich-actions a,
   .rich-full button,
   .rich-deliverable:not(.embedded) button {
     width: 2.75rem;
@@ -945,16 +880,7 @@
     padding: 0;
   }
 
-  /* TOC affordance: a sticky sidebar only on very large/wide screens
-     (>=1440px); everything else, including tablets and typical desktop
-     windows, uses the hamburger-triggered drawer. */
-  .rich-toc-action {
-    display: inline-flex;
-  }
-
-
-  button,
-  nav a {
+  button {
     display: inline-flex;
     align-items: center;
     border: 1px solid var(--rich-line);
@@ -968,27 +894,11 @@
     transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
   }
 
-  button:hover,
-  nav a:hover {
+  button:hover {
     border-color: color-mix(in srgb, var(--rich-accent) 45%, transparent);
     background: color-mix(in srgb, var(--rich-accent) 14%, var(--rich-surface-raised));
     color: var(--rich-text);
     transform: translateY(-1px);
-  }
-
-  .rich-action-copied svg {
-    animation: rich-action-icon-enter 180ms ease-out;
-  }
-
-  @keyframes rich-action-icon-enter {
-    from {
-      opacity: 0;
-      transform: scale(0.72);
-    }
-    to {
-      opacity: 1;
-      transform: scale(1);
-    }
   }
 
   .rich-action-error {
@@ -1068,15 +978,18 @@
   @media (min-width: 1024px) {
     .rich-full-body .rich-document.has-toc {
       display: grid;
-      grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+      grid-template-columns: minmax(0, 1fr) minmax(11rem, 14rem);
       gap: clamp(0.85rem, 2vw, 1.25rem);
       align-items: start;
     }
 
     .rich-full-body .rich-document.has-toc .rich-body {
+      grid-column: 1;
+      grid-row: 1;
       min-width: 0;
       padding: 0;
     }
+    .rich-full-body .rich-document.has-toc :global(aside.rich-toc) { grid-column: 2; grid-row: 1; }
   }
 
   @media (max-width: 760px) {
@@ -1095,7 +1008,7 @@
       padding-block: .45rem;
     }
 
-    .rich-toolbar h1 {
+    .rich-toolbar .document-toolbar-title {
       font-size: clamp(1.2rem, 6.5vw, 1.65rem);
       line-height: 1.16;
       overflow-wrap: anywhere;
@@ -1110,14 +1023,7 @@
       font-size: 0.68rem;
     }
 
-    nav {
-      justify-content: flex-start;
-      min-width: 0;
-      width: 100%;
-    }
-
-    button,
-    nav a {
+    button {
       border-radius: 0.8rem;
       padding: 0.45rem 0.62rem;
       font-size: 0.74rem;

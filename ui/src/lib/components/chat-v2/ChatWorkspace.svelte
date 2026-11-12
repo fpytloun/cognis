@@ -31,7 +31,8 @@
     INSPECTOR_MAX_WIDTH,
     INSPECTOR_MIN_WIDTH,
   } from '$lib/stores/conversationInfo.svelte';
-  import type { Agent, Session, StepRun, Conversation } from '$lib/types/api';
+  import type { Agent, Session, StepRun, Conversation, TaskDeliverableFreshness } from '$lib/types/api';
+  import type { ConversationInfoTab } from '$lib/stores/conversationInfo.svelte';
 
   let {
     conversationId,
@@ -39,12 +40,14 @@
     agent = null,
     agents = [],
     onInitialLoaded,
+    composerFocusRequest = null,
     inspectorOpen = true,
     inspectorControlInHeader = false,
     inspectorAsRegion = false,
     onInspectorStateChange,
     timelineScope,
     stepRun = null,
+    deliverableFreshness,
     readOnly = false,
     conversation = null,
     onSent,
@@ -58,12 +61,14 @@
     agent?: Agent | null;
     agents?: Agent[];
     onInitialLoaded?: (conversationId: string) => void | Promise<void>;
+    composerFocusRequest?: string | null;
     inspectorOpen?: boolean;
     inspectorControlInHeader?: boolean;
     inspectorAsRegion?: boolean;
     onInspectorStateChange?: (open: boolean) => void;
     timelineScope?: TimelineScope;
     stepRun?: StepRun | null;
+    deliverableFreshness?: Record<string, TaskDeliverableFreshness>;
     readOnly?: boolean;
     conversation?: Conversation | null;
     onSent?: () => void | Promise<void>;
@@ -86,7 +91,7 @@
   };
   let sessionHistory = $state<(SelectedSession | null)[]>([]);
   let navigationGeneration = 0;
-  let inspectorTab = $state<'overview' | 'work' | 'session'>('overview');
+  let inspectorTab = $state<ConversationInfoTab>('overview');
   let inspector: SharedInspectorTabs | undefined = $state();
   let displayedRoot = $state<WorkstreamRef | null>(null);
   let displayedRootScopeKey = $state('');
@@ -325,6 +330,15 @@
     sessionHistory = sessionHistory.slice(0, -1);
   }
 
+  function navigateToParentConversation(conversationId: string): boolean {
+    const index = sessionHistory.map(session => session?.conversationId).lastIndexOf(conversationId);
+    if (conversationId !== effectiveConversationId && index < 0) return false;
+    navigationGeneration += 1;
+    selectedSession = conversationId === effectiveConversationId ? null : sessionHistory[index];
+    sessionHistory = conversationId === effectiveConversationId ? [] : sessionHistory.slice(0, index);
+    return true;
+  }
+
   async function openWork(category: WorkCategory): Promise<void> {
     inspectorTab = 'work';
     await toggleInspector(true);
@@ -524,6 +538,7 @@
   <div class="relative flex min-h-0 flex-1">
     <div
       class="flex min-w-0 flex-1 flex-col overflow-hidden"
+      class:invisible={narrowLayout && inspectorVisible}
       data-testid="dashboard-conversation-chat"
       inert={narrowLayout && inspectorVisible}
       aria-hidden={narrowLayout && inspectorVisible}
@@ -536,13 +551,16 @@
       {/if}
       <div class="min-h-0 flex-1">
       <CompactConversationChat
+        {composerFocusRequest}
         conversationId={scope.conversation_id ?? effectiveConversationId}
         timelineScope={scope}
         controllerSessionIds={displayedControllerSessionIds}
         agent={selectedAgent}
         {conversation}
         readOnly={readOnly || Boolean(selectedSession)}
+        showLiveIndicator={selectedSession?.node?.kind !== 'managed'}
         stepRun={selectedSession ? null : stepRun}
+        {deliverableFreshness}
         {emptyLabel}
         embedded
         initialAutoTail
@@ -561,8 +579,10 @@
       {#if selectedSession?.node?.kind === 'managed' && managedConversation}
         <div class="shrink-0 p-3">
           <ManagedConversationControls conversation={managedConversation} busy={managedBusy} error={managedError}
+            onNavigateParent={navigateToParentConversation}
             onStop={() => { void managedAction('stop'); }}
-            onSend={(message) => { void managedAction('send', { message }); }}
+             onSend={(message) => { void managedAction('send', { message }); }}
+             onTerminate={() => { void managedAction('close'); }}
             onTakeControl={() => { void managedAction('take-control'); }} />
         </div>
       {:else if managedError}
@@ -572,7 +592,7 @@
     {#if narrowLayout && inspectorVisible}
       <button
         aria-label="Close conversation inspector"
-        class="absolute inset-0 z-10 bg-scrim/35 backdrop-blur-[1px]"
+        class="absolute inset-0 z-10 h-full w-full appearance-none border-0 bg-scrim/35 p-0 backdrop-blur-[1px]"
         type="button"
         onclick={() => { void toggleInspector(false); }}
       ></button>

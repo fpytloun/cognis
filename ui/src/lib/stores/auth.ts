@@ -14,7 +14,7 @@ import type {
   UserSummary
 } from '$lib/types/api';
 import { toErrorMessage } from '$lib/utils';
-import { documentCoordination, StaleDocumentError, type DocumentLease } from '$lib/document-coordination';
+import { CoordinationUnavailableError, documentCoordination, StaleDocumentError, type DocumentLease } from '$lib/document-coordination';
 import { forgetStartupAppearance } from '$lib/theme/startup-appearance';
 
 export interface AuthState {
@@ -58,18 +58,53 @@ export type AnonymousReason = 'logout' | 'expired';
 const anonymousListeners = new Set<(reason: AnonymousReason) => void>();
 let coordinated = false;
 let localRevocation = false;
+let coordinationUnavailable = false;
+let recoveryGeneration = 0;
+let coordinationRecovery: Promise<void> | null = null;
+let automaticAuthenticationBlocked = false;
 function coordination() {
   const owner = documentCoordination();
   if (!coordinated) {
     coordinated = true;
-    owner.onInvalidated(() => {
-      if (!localRevocation) setAnonymous(null, 'expired', false);
+    owner.onInvalidated((reason) => {
+      if (reason === 'unavailable') markCoordinationUnavailable(!localRevocation);
+      else if (!localRevocation) void setAnonymous(null, 'expired', false);
     });
   }
   return owner;
 }
 
 class AuthNetworkError extends Error {}
+
+function markCoordinationUnavailable(recover = true): void {
+  coordinationUnavailable = true;
+  stopOfflineRevalidation();
+  store.set({ ...initialState, initialized: true,
+    error: 'Local account coordination is unavailable. Reconnecting safely; your local data is preserved.' });
+  installRecoveryListeners();
+  if (recover) recoverCoordination();
+}
+
+function recoverCoordination(): void {
+  if (!browser || automaticAuthenticationBlocked || !coordinationUnavailable || coordinationRecovery) return;
+  const generation = recoveryGeneration;
+  coordinationRecovery = (async () => {
+    // Let aborted requests release their bootstrap and session-lock ownership.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    if (bootstrapPromise) await bootstrapPromise;
+    if (automaticAuthenticationBlocked || !coordinationUnavailable || generation !== recoveryGeneration) return;
+    const owner = coordination();
+    await owner.initialize();
+    if (automaticAuthenticationBlocked || !coordinationUnavailable || generation !== recoveryGeneration) return;
+    const lease = owner.capture(false);
+    await lease.validate();
+    if (!lease.signal.aborted && coordinationUnavailable && generation === recoveryGeneration) {
+      await auth.bootstrap();
+    }
+  })().catch((error: unknown) => {
+    if (!(error instanceof StaleDocumentError)) reportError('Local account coordination recovery failed', error);
+  }).finally(() => { coordinationRecovery = null; });
+}
 
 interface LastVerifiedUser {
   user: UserSummary;
@@ -144,7 +179,11 @@ export async function clearWebPushSubscription(notifyServer: boolean): Promise<v
 }
 
 async function setAuthenticated(user: UserSummary, expiresAt: number | null, lease: DocumentLease, error: string | null = null): Promise<void> {
+  if (automaticAuthenticationBlocked) throw new StaleDocumentError();
   if (browser) await coordination().verified(user.email, lease);
+  if (automaticAuthenticationBlocked) throw new StaleDocumentError();
+  coordinationUnavailable = false;
+  recoveryGeneration++;
   stopOfflineRevalidation();
   rememberVerifiedUser(user);
   store.set({
@@ -158,11 +197,13 @@ async function setAuthenticated(user: UserSummary, expiresAt: number | null, lea
 }
 
 async function setOfflineAuthenticated(user: UserSummary): Promise<void> {
+  if (automaticAuthenticationBlocked) { await setAnonymous(null, 'logout', false); return; }
   if (!await coordination().resumeCachedAccount(user.email)) {
     store.set({ status: 'anonymous', initialized: true, user: null, expiresAt: null,
       error: 'Reconnect to verify this account. Unverified local data remains preserved.' });
     return;
   }
+  if (automaticAuthenticationBlocked) { await setAnonymous(null, 'logout', false); return; }
   store.set({
     status: 'authenticated',
     initialized: true,
@@ -175,6 +216,8 @@ async function setOfflineAuthenticated(user: UserSummary): Promise<void> {
 }
 
 async function setAnonymous(error: string | null = null, reason: AnonymousReason = 'expired', invalidate = true, lease?: DocumentLease): Promise<void> {
+  coordinationUnavailable = false;
+  recoveryGeneration++;
   if (browser && invalidate) {
     lease ??= coordination().capture(false);
     localRevocation = true;
@@ -211,15 +254,24 @@ function stopOfflineRevalidation(): void {
   offlineRevalidateTimer = null;
 }
 
-function startOfflineRevalidation(): void {
+function installRecoveryListeners(): void {
   if (!browser) return;
   if (!offlineListenersInstalled) {
     offlineListenersInstalled = true;
-    window.addEventListener('online', () => void revalidateOfflineSession());
+    const resume = () => {
+      if (coordinationUnavailable) recoverCoordination();
+      else void revalidateOfflineSession();
+    };
+    window.addEventListener('online', resume);
     document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') void revalidateOfflineSession();
+      if (document.visibilityState === 'visible') resume();
     });
   }
+}
+
+function startOfflineRevalidation(): void {
+  if (!browser) return;
+  installRecoveryListeners();
   stopOfflineRevalidation();
   offlineRevalidateTimer = setInterval(() => {
     if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
@@ -327,12 +379,22 @@ async function parseAuthSessionResponse(response: Response): Promise<AuthSession
 async function refreshBrowserSession(lease: DocumentLease): Promise<boolean> {
   await lease.validate();
   let response: Response;
+  let payload: AuthSessionResponse | null;
   try {
-    response = await fetchWithTimeout(apiUrl('/api/auth/refresh'), {
-      method: 'POST',
-      credentials: 'include',
-      signal: lease.signal
-    }, { timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
+    const result = await withRequestDeadline(async (signal) => {
+      const response = await fetchWithTimeout(apiUrl('/api/auth/refresh'), {
+        method: 'POST', credentials: 'include', signal,
+      }, { timeoutMs: 0 });
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        return { response, payload: null };
+      }
+      const payload = await readJsonWithSignal(response, signal) as AuthSessionResponse;
+      signal.throwIfAborted();
+      return { response, payload };
+    }, { signal: lease.signal, timeoutMs: AUTH_REQUEST_TIMEOUT_MS });
+    response = result.response;
+    payload = result.payload;
   } catch (error) {
     reportError('Session refresh failed', error);
     return false;
@@ -344,19 +406,18 @@ async function refreshBrowserSession(lease: DocumentLease): Promise<boolean> {
     return false;
   }
 
-  if (!response.ok) {
+  if (!response.ok || !payload) {
     reportError('Session refresh failed', new Error(`HTTP ${response.status}`));
     return false;
   }
 
-  const payload = await parseAuthSessionResponse(response);
   await lease.validate();
-  if (payload.user.email !== get(store).user?.email) {
+  if (lease.owner && payload.user.email !== get(store).user?.email) {
     await setAnonymous('The signed-in account changed. Please verify your session.', 'expired', true, lease);
     return false;
   }
-  await coordination().refreshed(lease);
   await setAuthenticated(payload.user, Date.parse(payload.expires_at), lease);
+  await coordination().refreshed(lease.owner ? lease : coordination().capture());
   return true;
 }
 
@@ -364,6 +425,10 @@ export const auth = {
   subscribe: store.subscribe,
 
   async bootstrap(): Promise<void> {
+    if (automaticAuthenticationBlocked) {
+      await setAnonymous(get(store).error, 'logout', false);
+      return;
+    }
     if (!browser) {
       await setAnonymous(null, 'expired', false);
       return;
@@ -377,6 +442,7 @@ export const auth = {
       const owner = coordination();
       try { await owner.initialize(); }
       catch (error) {
+        if (error instanceof CoordinationUnavailableError) { markCoordinationUnavailable(); return; }
         await setAnonymous(toErrorMessage(error, 'Coordination unavailable.'), 'expired', false);
         return;
       }
@@ -388,13 +454,15 @@ export const auth = {
       }
 
       try {
-        const user = await fetchMe(lease);
-        await lease.validate();
-        if (!user) {
-          await setAnonymous(null, 'expired', true, lease);
-          return;
-        }
-        await setAuthenticated(user, current.expiresAt, lease);
+        await owner.run('session', lease, async () => {
+          const user = await fetchMe(lease);
+          await lease.validate();
+          if (user) {
+            await setAuthenticated(user, current.expiresAt, lease);
+          } else if (!await refreshBrowserSession(lease) && get(store).status !== 'anonymous') {
+            throw new AuthNetworkError('Unable to refresh your session.');
+          }
+        });
       } catch (error) {
         if (error instanceof StaleDocumentError || lease.signal.aborted) return;
         // Unreachable server: start with the last verified user so the
@@ -418,7 +486,12 @@ export const auth = {
 
   async login(email: string, password: string): Promise<MfaChallengeResponse | null> {
     const owner = coordination();
-    await owner.beginLogin();
+    automaticAuthenticationBlocked = true;
+    recoveryGeneration++;
+    localRevocation = true;
+    try { await owner.beginLogin(); }
+    finally { localRevocation = false; }
+    automaticAuthenticationBlocked = false;
     const lease = owner.capture(false);
     mfaIntent = null;
     store.update((state) => ({ ...state, status: 'loading', error: null }));
@@ -503,8 +576,16 @@ export const auth = {
 
   async logout(): Promise<void> {
     const owner = coordination();
+    automaticAuthenticationBlocked = true;
     // Revocation is immediate and never waits behind uploads/refresh/network.
-    await owner.invalidate();
+    recoveryGeneration++;
+    localRevocation = true;
+    try { await owner.invalidate(); }
+    catch (error) {
+      await setAnonymous(toErrorMessage(error, 'Unable to complete logout safely.'), 'logout', false);
+      throw error;
+    }
+    finally { localRevocation = false; }
     await setAnonymous(null, 'logout', false);
     const lease = owner.capture(false);
     try {

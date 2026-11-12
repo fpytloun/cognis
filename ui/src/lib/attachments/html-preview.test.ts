@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DocumentLease } from '$lib/document-coordination';
-import { HTML_PREVIEW_MAX_BYTES, INLINE_HTML_POLICY, SIGNED_HTML_POLICY, mountHtmlPreview, resolveHtmlPreviewUrl, signedHtmlUrl } from './html-preview';
+import { HTML_PREVIEW_MAX_BYTES, INLINE_HTML_POLICY, SIGNED_HTML_POLICY, mountHtmlPreview } from './html-preview';
+import { resolveHtmlPreviewUrl, signedHtmlUrl, privateHtmlPreviewSource } from './html-preview-private';
 
 const mocks = vi.hoisted(() => ({ capture: vi.fn(), signedUrl: vi.fn() }));
 vi.mock('$lib/document-coordination', () => ({ documentCoordination: () => ({ capture: mocks.capture }) }));
@@ -80,7 +81,7 @@ describe('HTML preview trust and resource lifetime', () => {
   it('does not follow even an unexpected same-origin redirect', async () => {
     const { lease } = owner(); const report = vi.fn();
     vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 307, headers: { location: '/login' } }));
-    dispose = mountHtmlPreview(node, { url, lease }, lease, report); await flush();
+    dispose = mountHtmlPreview(node, privateHtmlPreviewSource(url, lease), lease, report); await flush();
     expect(create).not.toHaveBeenCalled();
     expect(report).toHaveBeenLastCalledWith(expect.stringContaining('could not be loaded safely'));
   });
@@ -93,8 +94,8 @@ describe('HTML preview trust and resource lifetime', () => {
 
   it('fetches signed bytes without credentials, redirects, referrers or caching', async () => {
     const { lease } = owner();
-    dispose = mountHtmlPreview(node, { url, lease }, lease, vi.fn()); await flush();
-    expect(fetch).toHaveBeenCalledWith(url, expect.objectContaining({
+    dispose = mountHtmlPreview(node, privateHtmlPreviewSource(url, lease), lease, vi.fn()); await flush();
+    expect(fetch).toHaveBeenCalledWith(`${url}&raw=1`, expect.objectContaining({
       credentials: 'omit', redirect: 'error', referrerPolicy: 'no-referrer', cache: 'no-store',
     }));
     expect(node.querySelector('iframe')).toHaveAttribute('sandbox', 'allow-scripts');
@@ -119,13 +120,13 @@ describe('HTML preview trust and resource lifetime', () => {
   });
   it('does not mount a resolved capability whose lease expired while its parent was loading', async () => {
     const { controller, lease } = owner(); controller.abort();
-    dispose = mountHtmlPreview(node, { url, lease }, lease, vi.fn()); await flush();
+    dispose = mountHtmlPreview(node, privateHtmlPreviewSource(url, lease), lease, vi.fn()); await flush();
     expect(fetch).not.toHaveBeenCalled(); expect(create).not.toHaveBeenCalled();
   });
   it('aborts on close and ignores a late body even when transport ignores cancellation', async () => {
     const { lease } = owner(); let finish!: (value: Response) => void;
     vi.mocked(fetch).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
-    dispose = mountHtmlPreview(node, { url, lease }, lease, vi.fn()); await flush();
+    dispose = mountHtmlPreview(node, privateHtmlPreviewSource(url, lease), lease, vi.fn()); await flush();
     const signal = vi.mocked(fetch).mock.calls[0][1]!.signal!;
     dispose(); expect(signal.aborted).toBe(true); finish(response()); await flush();
     expect(create).not.toHaveBeenCalled();
@@ -138,8 +139,57 @@ describe('HTML preview trust and resource lifetime', () => {
   ])('fails visibly and creates no blob for invalid or excessive responses', async makeResponse => {
     const { lease } = owner(); const report = vi.fn();
     vi.mocked(fetch).mockResolvedValue(makeResponse());
-    dispose = mountHtmlPreview(node, { url, lease }, lease, report); await flush();
+    dispose = mountHtmlPreview(node, privateHtmlPreviewSource(url, lease), lease, report); await flush();
     expect(create).not.toHaveBeenCalled(); expect(report).toHaveBeenLastCalledWith(expect.stringContaining('could not be loaded safely'));
+  });
+  it('binds production observations to the frame and guard, then rejects replay after teardown', async () => {
+    const instance = 'bdc54029-87d9-4c99-8a06-f81ce7702c37';
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue(instance);
+    const controller = new AbortController(), observe = vi.fn(), report = vi.fn();
+    const guard = { signal: controller.signal, assertCurrent: () => controller.signal.throwIfAborted(), validate: async () => controller.signal.throwIfAborted() };
+    dispose = mountHtmlPreview(node, { text: '<p>Observed text</p>', guard }, guard, report, { enabled: () => true, observe });
+    await flush();
+    const frame = node.querySelector('iframe')!, source = frame.contentWindow;
+    expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+    const data = { type: 'cognis-selection', instance, selector: 'html:nth-of-type(1) > body:nth-of-type(1) > p:nth-of-type(1)', element_key: null, quote: 'Observed text',
+      selection_kind: 'text', start: 0, end: 13, rects: [{ left: 8, top: 8, width: 90, height: 18 }], scopes: [],
+      viewport: { width_css_px: 800, height_css_px: 600, scroll_x_css_px: 0, scroll_y_css_px: 0, device_pixel_ratio: 1 } };
+    const send = (value: unknown, sender: Window | null = source) => window.dispatchEvent(new MessageEvent('message', { source: sender, data: value }));
+    send(data, window); send({ ...data, instance: 'previous-frame' }); send({ ...data, save: true });
+    expect(observe).not.toHaveBeenCalled();
+    send(data); expect(observe).toHaveBeenCalledOnce();
+    controller.abort();
+    expect(node.querySelector('iframe')).toBeNull();
+    expect(revoke).toHaveBeenCalledOnce();
+    send(data); expect(observe).toHaveBeenCalledOnce();
+    expect(report).toHaveBeenCalledWith(expect.stringContaining('no longer available'));
+  });
+  it('synchronizes enabled mode at actual frame readiness before the first heartbeat', async () => {
+    vi.useFakeTimers();
+    const { controller, lease } = owner();
+    let enabled = false;
+    let refresh: (() => void) | undefined;
+    const ready = vi.fn((_locate: unknown, sync?: () => void) => { enabled = true; refresh = sync; });
+    dispose = mountHtmlPreview(node, { text: '<h1>Ready heading</h1>', lease }, lease, vi.fn(), {
+      enabled: () => enabled, observe: vi.fn(), ready,
+    });
+    await flush();
+    const frame = node.querySelector('iframe')!;
+    const post = vi.spyOn(frame.contentWindow!, 'postMessage');
+    frame.dispatchEvent(new Event('load'));
+    expect(ready).toHaveBeenCalled();
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: 'cognis-mode', enabled: true }), '*');
+    expect(refresh).toBeTypeOf('function');
+    const sync = refresh!;
+    enabled = false; sync();
+    expect(post).toHaveBeenLastCalledWith(expect.objectContaining({ type: 'cognis-mode', enabled: false }), '*');
+    await vi.advanceTimersByTimeAsync(250);
+    expect(post.mock.calls.filter(([data]) => data.type === 'cognis-mode')).toHaveLength(3);
+    controller.abort();
+    const before = post.mock.calls.length;
+    sync();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(post).toHaveBeenCalledTimes(before);
   });
   it('times out a blocked frame visibly and releases its resource', async () => {
     vi.useFakeTimers(); const { lease } = owner(); const report = vi.fn();
@@ -147,5 +197,15 @@ describe('HTML preview trust and resource lifetime', () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(node.querySelector('iframe')).toBeNull();
     expect(report).toHaveBeenLastCalledWith(expect.stringContaining('timed out'));
+  });
+  it('keeps the private caller view signal attached after bounded bytes have loaded', async () => {
+    const controller = new AbortController();
+    const source = await resolveHtmlPreviewUrl('att_html', controller.signal);
+    dispose = mountHtmlPreview(node, source, source.lease, vi.fn()); await flush();
+    await vi.waitFor(() => expect(node.querySelector('iframe')).not.toBeNull());
+    controller.abort();
+    expect(source.lease.signal.aborted).toBe(true);
+    expect(node.querySelector('iframe')).toBeNull();
+    expect(revoke).toHaveBeenCalledOnce();
   });
 });

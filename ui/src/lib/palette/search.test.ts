@@ -12,6 +12,58 @@ const deferred = () => {
 };
 afterEach(() => vi.useRealTimers());
 describe('bounded palette transport/cache', () => {
+  it('keeps loading through busy admission and recovers without manual retry', async () => {
+    vi.useFakeTimers();
+    const busy = Object.assign(new Error('Search is busy'), { code: 'search_busy' });
+    const fetch = vi.fn().mockRejectedValueOnce(busy).mockRejectedValueOnce(busy).mockResolvedValue(page(['ready']));
+    const search = new PaletteSearch(fetch);
+    search.setQuery('cold'); await vi.advanceTimersByTimeAsync(250);
+    expect(get(search)).toMatchObject({ loading: true, error: '' });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(get(search).items.map(item => item.id)).toEqual(['ready']);
+    expect(get(search).loading).toBe(false);
+    search.clear();
+  });
+  it('bounds admission retries and exposes an explicit retry after sustained contention', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn().mockRejectedValue(Object.assign(new Error('Search is busy'), { code: 'search_busy' }));
+    const search = new PaletteSearch(fetch);
+    search.setQuery('busy'); await vi.advanceTimersByTimeAsync(31_000);
+    expect(get(search)).toMatchObject({ loading: false, error: 'Search is busy' });
+    const calls = fetch.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledTimes(calls);
+    search.clear();
+  });
+  it('retires a busy retry on query change and close without publishing old results', async () => {
+    vi.useFakeTimers();
+    const busy = Object.assign(new Error('Search is busy'), { code: 'search_busy' });
+    const fetch = vi.fn().mockRejectedValueOnce(busy).mockResolvedValueOnce(page(['new'])).mockRejectedValue(busy);
+    const search = new PaletteSearch(fetch);
+    search.setQuery('old'); await vi.advanceTimersByTimeAsync(250);
+    search.setQuery('new'); await vi.advanceTimersByTimeAsync(1000);
+    expect(get(search).items.map(item => item.id)).toEqual(['new']);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    search.setQuery('closing'); await vi.advanceTimersByTimeAsync(250);
+    search.close(); await vi.advanceTimersByTimeAsync(5000);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    search.clear();
+  });
+  it('retries the busy continuation without losing the existing page', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn().mockResolvedValueOnce(page(['first'], 'next'))
+      .mockRejectedValueOnce(Object.assign(new Error('Busy'), { code: 'search_busy' }))
+      .mockResolvedValueOnce(page(['second']));
+    const search = new PaletteSearch(fetch);
+    search.setQuery('report'); await vi.advanceTimersByTimeAsync(250);
+    search.more(); await vi.advanceTimersByTimeAsync(100);
+    expect(get(search)).toMatchObject({ loading: true, error: '' });
+    expect(get(search).items.map(item => item.id)).toEqual(['first']);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(fetch.mock.calls[2]?.[1]).toBe('next');
+    expect(get(search).items.map(item => item.id)).toEqual(['first', 'second']);
+    search.clear();
+  });
   it('scopes pages, cursors and cache entries to selected types', async () => {
     vi.useFakeTimers();
     const task: PaletteItem = { ...row('report-task'), kind: 'task' };
@@ -58,7 +110,7 @@ describe('bounded palette transport/cache', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch.mock.calls[0]?.[2].aborted).toBe(false);
     first.resolve(page(['old']));
-    await vi.advanceTimersByTimeAsync(150);
+    await vi.advanceTimersByTimeAsync(0);
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(get(search).items.map((item) => item.id)).toEqual(['new']);
     search.clear();

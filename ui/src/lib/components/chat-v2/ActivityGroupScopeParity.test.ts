@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import type { ActivitySegmentRow, ToolGroupRow } from '$lib/chat-v2/tool-groups';
-import type { TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
+import type { MessageTimelineItem, TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 import ActivitySegmentBlock from './ActivitySegmentBlock.svelte';
 import ToolCallGroupBlock from './ToolCallGroupBlock.svelte';
 import { activeActivityGroupId } from '$lib/chat-v2/activity-progress';
@@ -93,6 +93,29 @@ function expansionButton(
 afterEach(cleanup);
 
 describe('activity group scope parity', () => {
+  it('keeps assistant attachments visible after collapse and remount', async () => {
+    const row = activitySegment(false);
+    const attached: MessageTimelineItem = {
+      id: 'assistant:report', message_id: 'turn-report', kind: 'message', role: 'assistant', content: 'Generated report',
+      sort_key: '0002', source_refs: [], stable: true, status: 'complete', partial: false,
+      attachments: [{
+        artifact_id: 'art_report', filename: 'report.csv',
+        mime_type: 'text/csv', kind: 'file', size_bytes: 10,
+      }],
+    };
+    row.entries.push({ kind: 'assistant', item: attached });
+    const view = render(ActivitySegmentBlock, { row });
+    expect(view.getByTestId('collapsed-assistant-attachments')).toBeTruthy();
+    expect(view.getByText('report.csv')).toBeTruthy();
+    await fireEvent.click(expansionButton(view.container, 'activity_segment'));
+    expect(view.queryByTestId('collapsed-assistant-attachments')).toBeNull();
+    expect(view.getByText('report.csv')).toBeTruthy();
+    view.unmount();
+    const restored = render(ActivitySegmentBlock, { row });
+    expect(restored.getByTestId('collapsed-assistant-attachments')).toBeTruthy();
+    expect(restored.getByText('report.csv')).toBeTruthy();
+  });
+
   it.each([false, true])('uses the same dense expanded spacing as tool groups (compact=%s)', async (compact) => {
     const tools = render(ToolCallGroupBlock, { row: toolGroup(true), compact });
     const segment = render(ActivitySegmentBlock, { row: activitySegment(true), compact });

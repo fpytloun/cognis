@@ -11,7 +11,7 @@ describe('todo renderer inventory', () => {
     ['ongoing work drawer', './components/timeline/TimelineOngoingWorkDrawer.svelte'],
     ['todo progress popover', './components/TodoProgressPopover.svelte'],
     ['task cockpit progress', './components/task-cockpit/TaskProgressPanel.svelte'],
-    ['todo tool result', './components/ToolCallBlock.svelte'],
+    ['todo tool result', './components/ToolCallDetails.svelte'],
     ['full task step todos', '../routes/(app)/tasks/[taskId]/+page.svelte']
   ])('%s uses the canonical status dot', (_label, path) => {
     expect(source(path)).toContain('TodoStatusDot');

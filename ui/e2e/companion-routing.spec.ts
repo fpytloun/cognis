@@ -1,6 +1,8 @@
 import { expect, test } from '@playwright/test';
 import { installTaskCockpitFixture } from './task-cockpit-fixture';
 
+test.use({ bypassCSP: process.env.COGNIS_E2E_STATIC_PREVIEW === '1' });
+
 for (const width of [390, 1440]) {
   test(`companion model and effort save/reload at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 1000 });
@@ -20,13 +22,14 @@ for (const width of [390, 1440]) {
         models: [
           { model_id: 'openai/gpt-oss-20b', display_name: 'Lite', reasoning_efforts: ['none', 'low', 'medium', 'high'] },
           { model_id: 'openai/gpt-oss-120b', display_name: 'Smart', reasoning_efforts: ['none', 'low', 'medium', 'high'] },
+          { model_id: 'jev/decision', display_name: 'Jev', model_mode: 'systemone' },
           { model_id: 'text-embedding-3-small', supports_embedding: true }
         ]
       }], has_more: false, next_cursor: null
     } }));
     let saved: Record<string, { model: string | null; reasoning_effort: string | null }> = {
       ...Object.fromEntries([
-        'default', 'classifier', 'compaction', 'evaluator', 'speech_to_text',
+        'default', 'classifier', 'auxiliary_generation', 'compaction', 'evaluator', 'speech_to_text',
         'text_to_speech', 'image_generation', 'attachment_analysis', 'embedding'
       ].map((key) => [key, { model: null, reasoning_effort: null }])),
       companion_lite: { model: 'shared/openai/gpt-oss-20b', reasoning_effort: null },
@@ -42,6 +45,12 @@ for (const width of [390, 1440]) {
       await route.fulfill({ json: saved });
     });
     await page.goto('/settings?tab=routing');
+    const classifier = page.getByText('classifier', { exact: true }).locator('..').locator('select');
+    const auxiliary = page.getByText('auxiliary_generation', { exact: true }).locator('..').locator('select');
+    await expect(classifier.locator('option[value="jev/decision"]')).toHaveCount(1);
+    await expect(auxiliary.locator('option[value="jev/decision"]')).toHaveCount(0);
+    await classifier.selectOption('jev/decision');
+    await auxiliary.selectOption('openai/gpt-oss-20b');
     const heading = page.getByRole('heading', { name: 'Intaris and Mnemory' });
     await expect(heading).toBeVisible();
     const lite = page.getByRole('combobox', { name: 'Lite model thinking effort' });
@@ -54,8 +63,12 @@ for (const width of [390, 1440]) {
     await expect.poll(() => saves).toBe(1);
     expect(saved.intaris_evaluation).toEqual({ model: null, reasoning_effort: 'medium' });
     expect(saved.companion_lite.reasoning_effort).toBe('low');
+    expect(saved.classifier.model).toBe('jev/decision');
+    expect(saved.auxiliary_generation.model).toBe('openai/gpt-oss-20b');
     await expect(lite).toHaveValue('low');
     await page.reload();
+    await expect(classifier).toHaveValue('jev/decision');
+    await expect(auxiliary).toHaveValue('openai/gpt-oss-20b');
     await expect(lite).toHaveValue('low');
     await page.getByText('Advanced task overrides').click();
     await expect(task).toHaveValue('medium');

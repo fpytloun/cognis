@@ -32,13 +32,16 @@ function enforceStandaloneDependencyBoundary(): Plugin {
   };
 }
 
-function excludePrivateFavoriteControls(): Plugin {
+function excludePrivateFavoriteControls(offline: boolean): Plugin {
   return {
     name: 'cognis-standalone-private-favorites',
     enforce: 'pre',
     resolveId(source) {
       if (source.endsWith('/DocumentFavoriteButton.svelte')) {
         return fileURLToPath(new URL('./src/lib/components/DocumentFavoriteButtonDisabled.svelte', import.meta.url));
+      }
+      if (offline && /\/(?:PublicFeedbackHost|FeedbackHost)\.svelte$/.test(source)) {
+        return fileURLToPath(new URL('./src/lib/components/feedback/FeedbackDisabled.svelte', import.meta.url));
       }
     },
   };
@@ -49,10 +52,12 @@ export default defineConfig(({ mode }) => ({
   // Offline publications deliberately include lazy renderers (Mermaid,
   // charts, markdown) in one script; the hosted entry retains its budget.
   plugins: mode === 'offline'
-    ? [excludePrivateFavoriteControls(), svelte()]
-    : [excludePrivateFavoriteControls(), svelte(), enforceStandaloneDependencyBoundary()],
+    ? [excludePrivateFavoriteControls(true), svelte()]
+    : [excludePrivateFavoriteControls(false), svelte(), enforceStandaloneDependencyBoundary()],
   resolve: {
     alias: {
+      '$app/paths': fileURLToPath(new URL('./src/standalone-paths.ts', import.meta.url)),
+      '$lib/config': fileURLToPath(new URL('./src/standalone-config.ts', import.meta.url)),
       $lib: fileURLToPath(new URL('./src/lib', import.meta.url)),
     },
   },

@@ -1,5 +1,5 @@
-import { render, waitFor } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import DocumentReader from './DocumentReader.svelte';
 import type { KnowledgebaseDocumentModel } from '$lib/types/api';
@@ -22,6 +22,7 @@ const documentModel: KnowledgebaseDocumentModel = {
 };
 
 describe('DocumentReader fragment navigation', () => {
+  afterEach(() => vi.restoreAllMocks());
   beforeEach(() => {
     Element.prototype.scrollIntoView = vi.fn();
   });
@@ -40,5 +41,21 @@ describe('DocumentReader fragment navigation', () => {
     });
 
     await waitFor(() => expect(Element.prototype.scrollIntoView).toHaveBeenCalled());
+  });
+
+  it('downloads the named original file in the app rather than opening an external tab', async () => {
+    const open = vi.spyOn(window, 'open');
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      expect(this.download).toBe('guide.md');
+      expect(this.href).toContain('/signed/guide.md');
+      expect(this.target).toBe('');
+    });
+    render(DocumentReader, {
+      doc: documentModel, loading: false, error: null, content: null,
+      downloadUrl: '/signed/guide.md', onDownload: null, knowledgebaseId: 'kb_1',
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Download' }));
+    expect(click).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
   });
 });

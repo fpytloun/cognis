@@ -1,5 +1,6 @@
 <script lang="ts">
 import { beforeNavigate } from '$app/navigation';
+import { downloadBlob } from '$lib/attachments/save';
 import { page } from '$app/stores';
   import { onMount } from 'svelte';
   import ArrowDown from 'lucide-svelte/icons/arrow-down';
@@ -8,6 +9,7 @@ import MoreVertical from 'lucide-svelte/icons/more-vertical';
 import X from 'lucide-svelte/icons/x';
 
   import { api, asApiError } from '$lib/api/client';
+  import { COMPLETION_MODE_OPTIONS } from '$lib/task-delivery';
   import { normalizeSelectedAgentProfileId } from '$lib/agents';
   import AgentProfileSelect from '$lib/components/AgentProfileSelect.svelte';
   import LoadingState from '$lib/components/LoadingState.svelte';
@@ -58,6 +60,8 @@ import X from 'lucide-svelte/icons/x';
   let form: WorkflowFormState = createEmptyWorkflowForm();
   let dragIndex = -1;
   let initialSnapshot = JSON.stringify(form);
+  // Save is offered only once something changed; unsaved drafts and imports can always be saved.
+  $: canSave = JSON.stringify(form) !== initialSnapshot || !selectedWorkflow;
   let mobileWorkflowActionsOpen = false;
   let showEphemeral = false;
   // On mobile, the registry list and editor are mutually exclusive screens.
@@ -101,6 +105,10 @@ import X from 'lucide-svelte/icons/x';
       editable.has('steps.*.step_profile_mode') ||
       editable.has('steps.*.step_profile')
     );
+  }
+
+  function stepCountLabel(count: number): string {
+    return `${count} ${count === 1 ? 'step' : 'steps'}`;
   }
 
   function isDirty(): boolean {
@@ -629,12 +637,7 @@ import X from 'lucide-svelte/icons/x';
 
   function downloadCurrentWorkflow(): void {
     const blob = new Blob([exportWorkflowYaml(form)], { type: 'text/yaml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${form.workflowId || form.name || 'workflow'}.yaml`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    downloadBlob(blob, `${form.workflowId || form.name || 'workflow'}.yaml`);
   }
 
   function importYaml(): void {
@@ -688,8 +691,10 @@ import X from 'lucide-svelte/icons/x';
         <Button variant="secondary" onclick={newWorkflow}>New workflow</Button>
         <Button variant="secondary" onclick={duplicateSelectedWorkflow} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button variant="secondary" onclick={downloadCurrentWorkflow}>Export YAML</Button>
-        <Button variant="danger" onclick={deleteSelectedWorkflow} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
-        <Button onclick={saveWorkflow} disabled={saving || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}</Button>
+        {#if selectedWorkflow && !selectedWorkflow.is_system && selectedWorkflow.lifecycle !== 'ephemeral'}
+          <Button variant="secondary" onclick={deleteSelectedWorkflow}><span class="text-danger">Delete</span></Button>
+        {/if}
+        <Button onclick={saveWorkflow} disabled={saving || !canSave || (selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}>{saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}</Button>
       </div>{/if}
     </div>
 
@@ -820,8 +825,8 @@ import X from 'lucide-svelte/icons/x';
 
           <label class="mt-4 block space-y-2 text-sm font-medium text-foreground">
             <span class="inline-flex items-center gap-2">
-              Selection criteria
-              <Tooltip text="Natural language description of when this workflow should be auto-selected by the classifier. Used by the Decision Engine to match incoming tasks to workflows.">
+              Usage guidance
+              <Tooltip text="Describe when an agent should explicitly choose this workflow. Tasks without an explicit workflow use General task; there is no automatic classifier.">
                 <button type="button" aria-label="Help" class="inline-flex h-6 w-6 items-center justify-center rounded-full border border-control-border text-xs text-muted hover:text-foreground focus-visible:border-border-strong md:h-5 md:w-5">?</button>
               </Tooltip>
             </span>
@@ -887,8 +892,9 @@ import X from 'lucide-svelte/icons/x';
             </span>
             <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
               <select bind:value={form.defaultCompletionModeFamily} class="w-full rounded-xl border border-control-border bg-canvas/80 px-3 py-2 text-sm text-foreground" disabled={!!selectedWorkflow?.is_system || !!editingSkillId}>
-                <option value="default">Default delivery</option>
-                <option value="direct">Direct channel delivery</option>
+                {#each COMPLETION_MODE_OPTIONS as option}
+                  <option value={option.value}>{option.name} — {option.description}</option>
+                {/each}
               </select>
               <label class="inline-flex items-center gap-2 rounded-xl border border-separator bg-canvas/60 px-3 py-2 text-sm text-foreground">
                 <input bind:checked={form.defaultAllowSilentCompletion} class="h-4 w-4 rounded border-control-border bg-canvas" disabled={!!selectedWorkflow?.is_system || !!editingSkillId} type="checkbox" />
@@ -924,23 +930,23 @@ import X from 'lucide-svelte/icons/x';
           <div class="mt-4 space-y-3">
             {#each form.phases as phase, phaseIndex}
               <article class="rounded-2xl border border-separator bg-canvas/60 p-4" data-testid={`workflow-phase-${phase.id}`}>
-                <div class="grid gap-3 md:grid-cols-[minmax(8rem,0.8fr)_minmax(12rem,1fr)_auto]">
+                <div class="grid gap-3 sm:grid-cols-2">
                   <label class="space-y-1 text-xs text-muted">Phase ID
                     <Input value={phase.id} disabled title="Phase IDs remain stable; rename the phase title instead." />
                   </label>
                   <label class="space-y-1 text-xs text-muted">Title
                     <Input bind:value={phase.title} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
                   </label>
-                  <div class="flex items-end gap-1">
+                  {#if !selectedWorkflow?.is_system}<div class="flex flex-wrap items-end justify-end gap-1 sm:col-span-2">
                     <button type="button" aria-label="Move phase up" class="h-10 w-10 rounded-xl border border-control-border text-secondary disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === 0} onclick={() => movePhase(phaseIndex, -1)}><ArrowUp class="mx-auto h-4 w-4" /></button>
                     <button type="button" aria-label="Move phase down" class="h-10 w-10 rounded-xl border border-control-border text-secondary disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || phaseIndex === form.phases.length - 1} onclick={() => movePhase(phaseIndex, 1)}><ArrowDown class="mx-auto h-4 w-4" /></button>
                     <button type="button" aria-label="Remove phase" class="h-10 rounded-xl border border-danger-border px-3 text-xs text-danger disabled:opacity-40" disabled={!!selectedWorkflow?.is_system || form.phases.length === 1} onclick={() => void removePhase(phaseIndex)}>Remove</button>
-                  </div>
+                  </div>{/if}
                 </div>
                 <label class="mt-3 block space-y-1 text-xs text-muted">Description
                   <Input bind:value={phase.description} disabled={!!selectedWorkflow?.is_system} oninput={() => (form.presentationEdited = true)} />
                 </label>
-                <p class="mt-3 text-xs text-quiet">{form.steps.filter((step) => step.phaseId === phase.id).length} steps</p>
+                <p class="mt-3 text-xs text-quiet">{stepCountLabel(form.steps.filter((step) => step.phaseId === phase.id).length)}</p>
               </article>
             {/each}
           </div>
@@ -1669,7 +1675,7 @@ import X from 'lucide-svelte/icons/x';
         <Button
           class="flex-1 justify-center"
           onclick={saveWorkflow}
-          disabled={saving || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}
+          disabled={saving || !canSave || (!!selectedWorkflow?.is_system && (selectedWorkflow.editable_fields?.length ?? 0) === 0) || selectedWorkflow?.lifecycle === 'ephemeral'}
         >
           {saving ? 'Saving…' : selectedWorkflow?.is_system ? 'Save overrides' : editingSkillId ? 'Save decomposition' : 'Save workflow'}
         </Button>
@@ -1681,7 +1687,11 @@ import X from 'lucide-svelte/icons/x';
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void newWorkflow(); }}>New workflow</Button>
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; void duplicateSelectedWorkflow(); }} disabled={!selectedWorkflow}>Duplicate</Button>
         <Button class="w-full justify-center" variant="secondary" onclick={() => { mobileWorkflowActionsOpen = false; downloadCurrentWorkflow(); }}>Export YAML</Button>
-        <Button class="w-full justify-center" variant="danger" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }} disabled={!selectedWorkflow || selectedWorkflow.is_system || selectedWorkflow.lifecycle === 'ephemeral'}>Delete</Button>
+        {#if selectedWorkflow && !selectedWorkflow.is_system && selectedWorkflow.lifecycle !== 'ephemeral'}
+          <div class="border-t border-separator pt-2">
+            <Button class="w-full justify-center" variant="ghost" onclick={() => { mobileWorkflowActionsOpen = false; void deleteSelectedWorkflow(); }}><span class="text-danger">Delete</span></Button>
+          </div>
+        {/if}
       </div>
     </Sheet>
     {/if}

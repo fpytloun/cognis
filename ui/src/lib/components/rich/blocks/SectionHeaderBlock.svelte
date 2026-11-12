@@ -20,7 +20,7 @@
   <div>
     {#if blockText(block, 'eyebrow')}<span>{@html renderInlineMarkdown(blockText(block, 'eyebrow'))}</span>{/if}
     {#if blockTitle(block)}
-      <svelte:element this={block.__document_h1 ? 'h1' : 'h3'}>{@html renderInlineMarkdown(blockTitle(block))}</svelte:element>
+      <svelte:element this={block.__document_heading_level === 1 ? 'h1' : block.__document_heading_level === 2 ? 'h2' : 'h3'}>{@html renderInlineMarkdown(blockTitle(block))}</svelte:element>
     {/if}
     {#if blockText(block, 'subtitle')}<p>{@html renderInlineMarkdown(blockText(block, 'subtitle'))}</p>{/if}
   </div>
@@ -50,7 +50,7 @@
     text-transform: uppercase;
   }
 
-  .rich-section-header h3 {
+  .rich-section-header :is(h1, h2, h3) {
     margin: .2rem 0 0;
     color: var(--rich-text);
     font-size: var(--rich-fs-lg);

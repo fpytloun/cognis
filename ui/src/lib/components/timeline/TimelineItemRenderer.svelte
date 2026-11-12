@@ -12,7 +12,7 @@
   import type { CommandV2Response } from '$lib/chat-v2/types';
   import type { AssistantDeliverableTimelineItem, MessageTimelineItem, SystemMessageTimelineItem, TimelineItem, ToolCallTimelineItem, UserInteractionTimelineItem } from '$lib/timeline-render-model';
   import type { TimelineScope } from '$lib/chat-v2/types';
-  import type { Agent } from '$lib/types/api';
+  import type { Agent, TaskDeliverableFreshness } from '$lib/types/api';
 
   let {
     item,
@@ -25,9 +25,11 @@
     onViewSession,
     pinnedTransient = false,
     scope,
-    providerRecovery
+    providerRecovery,
+    taskFreshness = null,
   } = $props<{
     item: TimelineItem;
+    taskFreshness?: TaskDeliverableFreshness | null;
     agent?: Agent | null;
     compact?: boolean;
     searchQuery?: string;
@@ -125,13 +127,17 @@
   <div data-kind="thinking" data-streaming={item.streaming === true ? 'true' : 'false'}>
     <ThinkingBlock {item} live={item.streaming === true} />
   </div>
-{:else if item.kind === 'tool_call'}
-  <div data-kind="tool_call" data-tool-status={item.status}>
-    <ToolCallBlock {item} {getToolCall} {onViewSession} {scope} />
-  </div>
+  {:else if item.kind === 'tool_call' && item.toolName.toLowerCase().replace(/_/g, '') === 'pythonexecute'}
+    {#await import('$lib/components/chat-v2/PythonExecutionCard.svelte').then((module) => module.default) then PythonExecutionCard}
+      <PythonExecutionCard {item} {getToolCall} {onViewSession} {scope} />
+    {/await}
+  {:else if item.kind === 'tool_call'}
+    <div data-kind="tool_call" data-call-id={item.callId} data-tool-status={item.status}>
+      <ToolCallBlock {item} {getToolCall} {onViewSession} {scope} />
+    </div>
 {:else if item.kind === 'assistant_deliverable'}
   <div data-kind="assistant_deliverable" class="flex min-w-0 w-full max-w-full justify-start">
-    <AssistantDeliverableBlock item={item as AssistantDeliverableTimelineItem} conversational />
+    <AssistantDeliverableBlock item={item as AssistantDeliverableTimelineItem} {agent} {taskFreshness} showMessageIdentity conversational />
   </div>
 {:else if item.kind === 'user_interaction'}
   <div data-kind="user_interaction" class="flex min-w-0 justify-end">

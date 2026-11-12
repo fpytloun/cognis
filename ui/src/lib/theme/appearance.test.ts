@@ -268,7 +268,7 @@ describe('device startup appearance hint', () => {
     expect(document.getElementById('cognis-startup-palette')).toBeNull();
   });
 
-  it('keeps the hint until an account binds, then remembers the account appearance; revocation does not replay it', async () => {
+  it('keeps only the cosmetic hint during expiry and forgets it on explicit logout', async () => {
     document.head.insertAdjacentHTML('beforeend', `<style>
       [data-theme-family="gruvbox"][data-resolved-theme] { --color-chrome: 27 27 27; --color-surface: 50 48 47; --color-foreground: 212 190 152;
         --color-control-border: 168 153 132; --color-accent: 169 182 101; --color-on-accent: 40 40 40; }
@@ -294,7 +294,35 @@ describe('device startup appearance hint', () => {
     environment.owner = null;
     environment.epoch = 'revoked';
     environment.listeners.forEach((listener) => listener());
+    expect(document.documentElement.dataset.themeFamily).toBe('gruvbox');
+    expect(resolved()).toBe('light');
+    const { get } = await import('svelte/store');
+    expect(get(preferences.userPreferences)).toEqual(DEFAULT_USER_PREFERENCES);
+    const { forgetStartupAppearance } = await import('./startup-appearance');
+    forgetStartupAppearance();
+    window.dispatchEvent(new StorageEvent('storage', { key: 'cognis-startup-appearance', storageArea: localStorage }));
     expect(document.documentElement.dataset.themeFamily).toBe('classic');
+  });
+
+  it('does not replace a saved hint with defaults while verified account preferences are loading', async () => {
+    localStorage.setItem('cognis-startup-appearance', JSON.stringify(hint('dark')));
+    const { startAppearance } = await import('./appearance');
+    const preferences = await import('$lib/stores/userPreferences');
+    const { api } = await import('$lib/api/client');
+    const { auth } = await import('$lib/stores/auth');
+    let finish!: (value: UserPreferences) => void;
+    vi.mocked(api.userPreferences.get).mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    stops.push(startAppearance(), preferences.startUserPreferences());
+    (auth as unknown as { set(value: unknown): void }).set({
+      status: 'authenticated', user: { email: 'first@cognis.test' },
+    });
+    await vi.waitFor(() => expect(finish).toBeDefined());
+    expect(document.documentElement.dataset.themeFamily).toBe('paper');
+    expect(resolved()).toBe('dark');
+    expect(JSON.parse(localStorage.getItem('cognis-startup-appearance')!)).toEqual(hint('dark'));
+    finish(prefs('light', 'classic'));
+    await vi.waitFor(() => expect(document.documentElement.dataset.themeFamily).toBe('classic'));
+    expect(resolved()).toBe('light');
   });
 });
 import { readFileSync } from 'node:fs';

@@ -26,7 +26,9 @@
   });
 </script>
 
-<BlockingDialog label={item?.title || 'Resource'} onClose={close} backdropDismissible={!dirty} dismissible={!busy} panelClass="w-[min(96vw,1480px)] max-w-none h-[90dvh]" bodyClass="!p-0 !overflow-hidden">
+<BlockingDialog label={item?.title || 'Resource'} onClose={close} backdropDismissible={!dirty} dismissible={!busy} panelClass="w-[min(96vw,1480px)] max-w-none h-[90dvh] max-sm:h-full max-sm:w-full max-sm:rounded-2xl" bodyClass="!p-0 !overflow-hidden"
+  viewportClass="max-sm:px-[max(.375rem,env(safe-area-inset-left))] max-sm:pr-[max(.375rem,env(safe-area-inset-right))] [--resource-modal-gap:1rem] max-sm:[--resource-modal-gap:.375rem]"
+  viewportStyle="padding-top: calc(var(--app-shell-top-offset, 0px) + env(safe-area-inset-top) + var(--resource-modal-gap)); padding-bottom: calc(var(--app-shell-bottom-offset, 0px) + var(--app-safe-area-bottom) + var(--resource-modal-gap));">
   <div class="h-full min-h-0" data-testid="library-resource-modal">
     {#if item}
       {#key item.id}<ResourceReader {item} onClose={close} onDirtyChange={(value) => { dirty = value; }} onBusyChange={(value) => { busy = value; }} onRevision={(updated) => { item = updated; onChanged?.(updated); }} />{/key}

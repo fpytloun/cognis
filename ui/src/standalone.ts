@@ -2,13 +2,16 @@ import { mount } from 'svelte';
 import StandaloneViewer from './StandaloneViewer.svelte';
 import './standalone.css';
 import { standaloneCloseHandler } from '$lib/standalone-navigation';
+import { normalizeThemeFamily } from '$lib/theme/catalog';
 
 interface StandalonePayload {
   content: string;
   instanceId: string;
+  embeddedDocumentUrl?: string;
   payload: unknown;
   title: string;
   media?: Record<string, string>;
+  themeFamily?: unknown;
 }
 
 function requiredElement<T extends Element>(selector: string, type: { new (): T }): T {
@@ -32,9 +35,11 @@ function parsePayload(template: HTMLTemplateElement): StandalonePayload {
   return {
     content: candidate.content,
     instanceId: candidate.instanceId,
+    embeddedDocumentUrl: typeof candidate.embeddedDocumentUrl === 'string' ? candidate.embeddedDocumentUrl : '',
     payload: candidate.payload,
     title: candidate.title,
     media: candidate.media,
+    themeFamily: candidate.themeFamily,
   };
 }
 
@@ -58,9 +63,10 @@ document.addEventListener('click', (event) => {
 
 mount(StandaloneViewer, {
   target,
-  props: { viewerProps: {
+  props: { feedbackShareToken: offline ? '' : template.dataset.feedbackShareToken ?? '', viewerProps: {
     content: data.content,
     instanceId: data.instanceId,
+    embeddedDocumentUrl: data.embeddedDocumentUrl,
     mediaUrlFor,
     payload: data.payload,
     pdfUrl: template.dataset.pdfUrl ?? '',
@@ -72,6 +78,7 @@ mount(StandaloneViewer, {
     // the URL from here.
     surface: 'standalone',
     exportMode: offline,
+    publicationThemeFamily: data.themeFamily == null ? null : normalizeThemeFamily(data.themeFamily),
     closePreview: offline ? null : standaloneCloseHandler(window, document.referrer),
     expiredLink: template.dataset.shareExpired === 'true',
     title: data.title,

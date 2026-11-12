@@ -3,6 +3,45 @@ import { expect, test } from '@playwright/test';
 
 test.use({ serviceWorkers: 'block' });
 
+for (const handlerAvailable of [true, false]) {
+  test(`native diagnostic click ${handlerAvailable ? 'dispatches a typed save instead of a Blob download' : 'reports a missing native handler'}`, async ({ page }) => {
+    await page.addInitScript(({ available }) => {
+      const messages: unknown[] = [];
+      Object.assign(window, {
+        __cognisNative: { version: 1, generation: '8d6feafb-2aac-4b41-ac82-42b2314563bb', surface: 'main',
+          server: window.location.origin },
+        __diagnosticMessages: messages,
+        webkit: available ? { messageHandlers: { cognis: {
+          postMessage: (message: unknown) => messages.push(message),
+        } } } : undefined,
+      });
+    }, { available: handlerAvailable });
+    await page.goto('/timeline-diagnostic-fixture');
+    await page.getByTestId('session-details-diagnostics').locator('summary').click();
+    const details = page.getByTestId('timeline-diagnostic-export');
+    await page.evaluate(() => {
+      URL.createObjectURL = () => { throw new Error('Native export must not use Blob navigation'); };
+    });
+    await details.getByRole('button', { name: 'Download chat diagnostics' }).click();
+    if (!handlerAvailable) {
+      await expect(details.getByRole('alert')).toContainText('Could not prepare the diagnostic file');
+    } else {
+      await expect.poll(() => page.evaluate(() =>
+        (window as unknown as { __diagnosticMessages: { type: string }[] })
+          .__diagnosticMessages.filter(message => message.type === 'save-diagnostic').length)).toBe(1);
+      await expect(details.getByRole('alert')).toHaveCount(0);
+      const messages = await page.evaluate(() =>
+        (window as unknown as { __diagnosticMessages: { type: string; payload: { filename: string; json: string } }[] })
+          .__diagnosticMessages.filter(message => message.type === 'save-diagnostic'));
+      expect(messages).toHaveLength(1);
+      expect(messages[0].payload.filename).toBe('cognis-chat-diagnostic-diagnostic-fixture.json');
+      expect(JSON.parse(messages[0].payload.json).schema).toBe('cognis-chat-client-diagnostic-v1');
+      expect(messages[0].payload.json).not.toContain('Synthetic message body excluded from diagnostics');
+    }
+    await expect(page).toHaveURL(/timeline-diagnostic-fixture$/);
+  });
+}
+
 test('downloads local row origins and ordering without exporting message bodies', async ({ page }, testInfo) => {
   await page.goto('/timeline-diagnostic-fixture');
   const runtimeDetails = page.getByTestId('session-details-diagnostics');

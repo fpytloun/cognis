@@ -17,7 +17,6 @@
       ...(limit.secondary ? [{ id: `additional-${index}-secondary`, name: `${limit.limit_name ?? limit.limit_id ?? 'Additional limit'} · ${label(limit.secondary, 'secondary')}`, window: limit.secondary }] : [])
     ])
   ]);
-  const resets = $derived(windows.filter((item) => item.window.resets_at && Number.isFinite(Date.parse(item.window.resets_at))));
   function resetLabel(timestamp: string): string {
     const date = new Date(timestamp);
     return `${date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}`;
@@ -31,12 +30,20 @@
   }
 </script>
 
-<div class={compact ? `grid min-w-0 ${windows.length >= 3 ? 'grid-cols-3' : 'grid-cols-2'} gap-x-0.5 gap-y-0.5` : 'space-y-3'} data-testid="provider-usage-bars">
+<div class={compact ? 'min-w-0 space-y-1.5' : 'space-y-3'} data-testid="provider-usage-bars">
   {#each windows as item (item.id)}
+    {@const reset = compact && item.window.resets_at && Number.isFinite(Date.parse(item.window.resets_at)) ? item.window.resets_at : null}
     <div class="min-w-0">
-      <div class={`${compact ? 'mb-0.5 gap-0.5' : 'mb-1 gap-2'} flex min-w-0 items-baseline justify-between text-xs`}>
-        <span class="truncate text-secondary" title={item.name}>{item.name}</span>
-        <span class="shrink-0 tabular-nums text-foreground">{Math.round(percent(item.window.used_percent))}% used</span>
+      <div class="mb-1 flex min-w-0 flex-wrap items-baseline gap-x-2 text-xs">
+        <span class="min-w-0 break-words text-secondary">{item.name}</span>
+        {#if reset}
+          <!-- Keep the reset on the label row so each compact limit stays two lines tall. -->
+          <span class="flex items-baseline gap-x-1 text-quiet" title={`${item.name} resets ${new Date(reset).toLocaleString()}`}>
+            <span>Resets</span>
+            <time class="tabular-nums" datetime={reset}>{resetLabel(reset)}</time>
+          </span>
+        {/if}
+        <span class="ml-auto shrink-0 tabular-nums text-foreground">{Math.round(percent(item.window.used_percent))}% used</span>
       </div>
       <div class={compact ? 'h-1.5 overflow-hidden rounded-full bg-raised' : 'h-2 overflow-hidden rounded-full bg-raised'}
         role="progressbar" aria-label={`${item.name} usage`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent(item.window.used_percent)}
@@ -51,15 +58,4 @@
       {/if}
     </div>
   {/each}
-  {#if compact && resets.length}
-    <div class={`min-w-0 self-end text-[10px] leading-[12px] text-quiet ${windows.length > 1 ? 'col-span-full flex flex-wrap gap-x-3 gap-y-0.5' : ''}`}
-      aria-label="Limit reset times" data-testid="compact-limit-resets">
-      {#each resets as item (item.id)}
-        <p class="flex min-w-0 items-baseline gap-1" title={`${item.name} resets ${new Date(item.window.resets_at!).toLocaleString()}`}>
-          <span class="truncate">{item.name} reset</span>
-          <time class="shrink-0 tabular-nums" datetime={item.window.resets_at!}>{resetLabel(item.window.resets_at!)}</time>
-        </p>
-      {/each}
-    </div>
-  {/if}
 </div>

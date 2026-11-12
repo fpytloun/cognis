@@ -227,7 +227,7 @@ describe('TaskDashboardControl', () => {
       onRefresh: refreshResult()
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Re-run task' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Start a new run' }));
 
     await waitFor(() => expect(rerun).toHaveBeenCalledWith('task-1'));
   });
@@ -248,7 +248,7 @@ describe('TaskDashboardControl', () => {
       onMutationSettled
     });
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Re-run task' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Start a new run' }));
 
     await waitFor(() => expect(rerun).toHaveBeenCalledWith('task-1'));
     expect(onMutationSettled).toHaveBeenCalledWith('task-1', false);

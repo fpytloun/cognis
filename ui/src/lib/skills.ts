@@ -404,7 +404,7 @@ export function skillToWorkflowDraft(
       max_attempts: 3,
       on_exhausted: 'gate',
       delivery: {
-        completion_mode_family: 'default',
+        completion_mode_family: 'auto',
         allow_silent_completion: false
       }
     },

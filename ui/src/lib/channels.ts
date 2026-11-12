@@ -266,8 +266,8 @@ export function buildSummaryCards(
   const connected = accounts.filter((account) => statusText(account) === 'connected').length;
   const pendingPairing = pairingRequests.filter((request) => request.status === 'pending').length;
   return [
-    { id: 'accounts', label: 'Accounts', value: String(accounts.length), detail: 'Connected adapters and webhook accounts' },
-    { id: 'connected', label: 'Connected', value: String(connected), detail: 'Adapters currently online' },
+    { id: 'accounts', label: 'Accounts', value: String(accounts.length), detail: 'App and external messaging channels' },
+    { id: 'connected', label: 'Connected', value: String(connected), detail: 'Channels currently available' },
     { id: 'pairing', label: 'Pending pairing', value: String(pendingPairing), detail: 'Remote senders waiting for approval' },
     { id: 'contacts', label: 'Verified senders', value: String(contacts.length), detail: 'Manual or paired trusted contacts' },
   ];

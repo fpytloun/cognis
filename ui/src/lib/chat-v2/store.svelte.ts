@@ -1,4 +1,5 @@
 import type {
+  ActivityOverviewResponse,
   CancelTurnV2Response,
   ChatRealtimeFrame,
   ChatSnapshot,
@@ -6,11 +7,13 @@ import type {
   QueueMessage,
   QueueMutationResponse,
   SendMessageV2Response,
+  MessageAdmissionV2Response,
   TimelineBackfillResponse,
   TimelineItem,
   TurnCycleState
 } from './types';
 import type { AttachmentRef } from '$lib/types/api';
+import { reconcileCompactionScope } from './compaction-scope';
 import {
   addOptimisticUserMessage,
   addLocalSystemMessage,
@@ -19,10 +22,12 @@ import {
   applyQueueMutationResponse,
   applyRealtimeFrame,
   applySendResponse,
+  applyMessageAdmission,
   applySnapshot,
   applySyncResponse,
   deleteQueuedAdmission,
   emptyChatV2State,
+  normalizeTimelineItems,
   markOptimisticUserMessageFailed,
   promoteQueuedUserMessage,
   replaceCanonicalQueue,
@@ -102,15 +107,41 @@ export class ChatV2Store {
     return this.replaceFromSnapshotIfUnchanged(snapshot, watermark);
   }
 
-  replaceFromSnapshot(snapshot: ChatSnapshot): void {
-    this.replaceState(applySnapshot(snapshot, this._state), true, true);
+  replaceFromSnapshot(snapshot: ChatSnapshot, discardCachedHistory = false): void {
+    const previous = discardCachedHistory ? {
+      ...this._state, timelineItems: [], cycleStates: [],
+      projectionVersion: snapshot.projection_version,
+    } : this._state;
+    const state = applySnapshot(snapshot, previous, {
+      adoptUnscopedLocalAdmissions: discardCachedHistory,
+    });
+    if (discardCachedHistory && state.scopeKey === this._state.scopeKey) {
+      // Preserve positive canonical confirmation before discarding its page.
+      // HTTP acceptance alone never establishes this evidence.
+      const confirmed = new Set([...this._state.timelineItems, ...state.timelineItems].flatMap(item =>
+        item.kind === 'message' && item.role === 'user' && item.stable && item.client_message_id
+          && item.source_refs.some(ref => ref.store === 'intaris') ? [item.client_message_id] : []));
+      state.admissionPlacements = { ...state.admissionPlacements };
+      for (const item of state.localItems) {
+        if (item.kind !== 'message' || item.role !== 'user' || !item.client_message_id
+          || !confirmed.has(item.client_message_id)) continue;
+        const prior = state.admissionPlacements[item.client_message_id];
+        if (prior?.placement === 'deleted') continue;
+        state.admissionPlacements[item.client_message_id] = {
+          ...(prior ?? { placement: 'timeline', status: 'complete' }), historyConfirmed: true,
+        };
+      }
+    }
+    this.replaceState(discardCachedHistory ? {
+      ...state, localItems: state.localItems.filter(item => item.kind === 'message' && item.role === 'user'),
+    } : state, true, true);
   }
 
   /** Runtime/local admissions do not establish a newer canonical base.
    * applySnapshot preserves those overlays using their own acceptance rules. */
-  replaceFromSnapshotForRecovery(snapshot: ChatSnapshot, watermark: ChatV2RefreshWatermark): boolean {
+  replaceFromSnapshotForRecovery(snapshot: ChatSnapshot, watermark: ChatV2RefreshWatermark, discardCachedHistory = false): boolean {
     if (this.canonicalRevision !== watermark.canonicalRevision) return false;
-    this.replaceFromSnapshot(snapshot);
+    this.replaceFromSnapshot(snapshot, discardCachedHistory);
     return true;
   }
 
@@ -160,6 +191,14 @@ export class ChatV2Store {
     const result = applyBackfillResult(this._state, response);
     this.replaceState(result.state);
     return result.admitted;
+  }
+
+  applyAdmissionOutcome(response: MessageAdmissionV2Response): void {
+    this.replaceState(applyMessageAdmission(this._state, response));
+  }
+
+  reconcileCompactions(overview: ActivityOverviewResponse): void {
+    this.replaceState(reconcileCompactionScope(this._state, overview));
   }
 
   applySend(response: SendMessageV2Response): void {
@@ -243,6 +282,7 @@ export class ChatV2Store {
       && runtime.authority.lifecycle === 'active';
     this.replaceState({
       ...restored,
+      timelineItems: normalizeTimelineItems(restored.timelineItems),
       runtime: cachedActiveAuthority ? { ...runtime, authority: null } : runtime,
       cycleStates: restored.cycleStates ?? [],
       admissionPlacements: restored.admissionPlacements ?? {}

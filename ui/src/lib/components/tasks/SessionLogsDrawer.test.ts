@@ -89,10 +89,10 @@ describe('SessionLogsDrawer', () => {
     render(SessionLogsDrawer, {
       conversationId: 'conversation-one', sessionId: 'session-one', onclose: vi.fn(),
     });
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'root-action' })).toBeTruthy());
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Approval required · root-action' })).toBeTruthy());
     await fireEvent.click(screen.getByRole('button', { name: 'View child session' }));
-    await waitFor(() => expect(screen.getByRole('heading', { name: 'child-action' })).toBeTruthy());
-    expect(screen.queryByRole('heading', { name: 'root-action' })).toBeNull();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Approval required · child-action' })).toBeTruthy());
+    expect(screen.queryByRole('button', { name: 'Approval required · root-action' })).toBeNull();
     expect(api.notifications.list).toHaveBeenLastCalledWith('conversation-one', { sessionId: 'session-child' });
   });
 
@@ -157,5 +157,42 @@ describe('SessionLogsDrawer', () => {
       .toEqual([1, 2, 3, 4, 5].map(number => `Attempt ${number} of 5 · failed`));
     expect(screen.queryByText('Step history')).not.toBeInTheDocument();
     expect(screen.queryByText('Earlier attempts remain available here.')).not.toBeInTheDocument();
+  });
+
+  it('shows one step in a single viewer with Result and Transcript tabs', async () => {
+    const run = {
+      step_run_id: 'step-viewer', task_id: 'task-viewer', step_name: 'execute', session_id: 'session-viewer',
+      conversation_id: 'conversation-viewer', attempt: 1, status: 'failed', agent_id: 'iris',
+      output: { summary: 'The partner feed rejected the credentials.' },
+    } as unknown as StepRun;
+    render(SessionLogsDrawer, {
+      conversationId: 'conversation-viewer', sessionId: 'session-viewer', stepRunId: run.step_run_id,
+      taskId: run.task_id, stepName: 'execute', stepRun: run, initialTab: 'result', onclose: vi.fn(),
+    });
+
+    expect(screen.getByRole('dialog', { name: 'Step: execute' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Result' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('The partner feed rejected the credentials.')).toBeVisible();
+
+    await fireEvent.click(screen.getByRole('tab', { name: 'Transcript' }));
+    expect(screen.getByRole('tab', { name: 'Transcript' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByText('The partner feed rejected the credentials.')).not.toBeInTheDocument();
+    expect(screen.getByTestId('compact-chat-scope')).toHaveTextContent('task_step:step-viewer');
+  });
+
+  it('offers only the result for a step without a recorded session', () => {
+    const run = {
+      step_run_id: 'step-tool', task_id: 'task-viewer', step_name: 'fetch', session_id: null,
+      conversation_id: null, attempt: 1, status: 'completed', agent_id: 'iris',
+      output: { summary: 'Fetched 12 rows.' },
+    } as unknown as StepRun;
+    render(SessionLogsDrawer, {
+      conversationId: '', sessionId: '', stepRunId: run.step_run_id, taskId: run.task_id,
+      stepName: 'fetch', stepRun: run, initialTab: 'transcript', onclose: vi.fn(),
+    });
+
+    expect(screen.getByText('Fetched 12 rows.')).toBeVisible();
+    expect(screen.getAllByRole('tab').map((tab) => tab.textContent?.trim())).toEqual(['Result']);
+    expect(mocks.notifications).not.toHaveBeenCalled();
   });
 });

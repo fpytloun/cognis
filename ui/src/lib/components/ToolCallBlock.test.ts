@@ -1,9 +1,12 @@
-import { fireEvent, render, screen } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ToolCallTimelineItem } from '$lib/timeline-render-model';
+import { api } from '$lib/api/client';
 import ToolCallBlock from './ToolCallBlock.svelte';
 import CompactionCard from './CompactionCard.svelte';
+import { loadToolCallDetails } from './tool-call-details-loader';
+import { assistantDeliverable } from './ui/private-view-definitions';
 
 it.each(['classic', 'paper'])('keeps skipped compaction neutral in %s dark', (family) => {
   const target = document.createElement('div');
@@ -35,6 +38,11 @@ vi.mock('$lib/syntax/json', async (importOriginal) => {
     highlightJson: vi.fn(actual.highlightJson),
   };
 });
+
+// These regressions cover the ready detail view; the deferred boundary has
+// separate tests with a controlled, unresolved module load.
+await loadToolCallDetails();
+await assistantDeliverable.load();
 
 function writeDeliverableItem(): ToolCallTimelineItem {
   return {
@@ -105,7 +113,11 @@ function completedFollowUpSubsessionItem(): ToolCallTimelineItem {
 }
 
 describe('ToolCallBlock write_deliverable rendering', () => {
-  it('keeps intermediate deliverable tool cards compact and exposes explicit raw and preview controls', async () => {
+  it('keeps intermediate deliverable cards light and opens the shared fullscreen viewer on demand', async () => {
+    const load = vi.spyOn(api.deliverables, 'get').mockResolvedValue({
+      deliverable_id: 'dlv_secret', format: 'markdown', title: 'Stored report',
+      content: '# Stored content', revision: 1,
+    } as Awaited<ReturnType<typeof api.deliverables.get>>);
     const { container } = render(ToolCallBlock, { item: writeDeliverableItem() });
 
     expect(screen.getByText('Deliverable captured')).toBeTruthy();
@@ -125,9 +137,18 @@ describe('ToolCallBlock write_deliverable rendering', () => {
     expect(container.textContent).toContain('SECRET_RAW_RICH_PAYLOAD');
     expect(container.textContent).toContain('SECRET_NORMALIZED_RICH_PAYLOAD');
 
-    await fireEvent.click(screen.getByRole('button', { name: 'View deliverable' }));
-    const preview = screen.getByTitle('Deliverable preview');
-    expect(preview.getAttribute('src')).toBe('/api/v1/deliverables/dlv_secret/view');
+    expect(load).not.toHaveBeenCalled();
+    expect(screen.getByRole('navigation', { name: 'Document actions' })).toBeTruthy();
+    const opener = screen.getByRole('button', { name: 'Open fullscreen' });
+    opener.focus();
+    await fireEvent.click(opener);
+    await waitFor(() => expect(screen.getByTestId('rich-deliverable-full-view')).toHaveTextContent('Stored content'));
+    expect(load).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTitle('Deliverable preview')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    await waitFor(() => expect(screen.queryByTestId('rich-deliverable-full-view')).toBeNull());
+    expect(document.activeElement).toBe(opener);
+    load.mockRestore();
   });
 });
 
@@ -391,6 +412,27 @@ describe('ToolCallBlock delegation lineage rendering', () => {
 
     expect(screen.getByText('Re-review the implementation after the fix.')).toBeTruthy();
     expect(screen.queryByText('Delegated sub-session')).toBeNull();
+  });
+});
+
+describe('ToolCallBlock Python kernel lifecycle', () => {
+  it('renders kernel reset as a distinct terminal state', () => {
+    const item: ToolCallTimelineItem = {
+      id: 'tool-call:python-kernel-reset',
+      kind: 'tool_call',
+      callId: 'call_python_kernel_reset',
+      toolName: 'python_kernel_reset',
+      status: 'completed',
+      timestamp: null,
+      arguments: {},
+      kernelGeneration: 4,
+    };
+
+    render(ToolCallBlock, { item });
+
+    expect(screen.getByText('Python kernel reset')).toBeTruthy();
+    expect(screen.getByText('Kernel reset')).toBeTruthy();
+    expect(screen.getByText('Kernel generation 4')).toBeTruthy();
   });
 });
 

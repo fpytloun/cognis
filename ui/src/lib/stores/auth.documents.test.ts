@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IDBFactory } from 'fake-indexeddb';
-import { DocumentCoordination, StaleDocumentError } from '$lib/document-coordination';
+import { CoordinationUnavailableError, DocumentCoordination, StaleDocumentError } from '$lib/document-coordination';
 import { TestWebLocks } from '../../test/web-locks';
 
 vi.mock('$app/environment', () => ({ browser: true }));
@@ -35,6 +35,7 @@ describe('independently mounted auth documents', () => {
     vi.doMock('$lib/document-coordination', () => ({
       DocumentCoordination,
       StaleDocumentError,
+      CoordinationUnavailableError,
       documentCoordination: () => owner,
     }));
     const { auth } = await import('./auth');
@@ -112,6 +113,45 @@ describe('independently mounted auth documents', () => {
     await login;
     expect(first.auth.getSnapshot()).toMatchObject({ status: 'authenticated', user: newer });
     await first.owner.capture().validate();
+  });
+
+  it('keeps an explicit logout local even if storage fails before shared revocation commits', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url) =>
+      String(url).endsWith('/login')
+        ? json({ status: 'authenticated', user, expires_at: '2099-01-01T00:00:00Z' }) : json(user));
+    const first = await mount(), oldLease = first.owner.capture();
+    localStorage.setItem('cognis-startup-appearance', 'retained-cosmetic-hint');
+    const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+      throw new DOMException('Database unavailable', 'InvalidStateError');
+    });
+    await expect(first.auth.logout()).rejects.toBeInstanceOf(CoordinationUnavailableError);
+    open.mockRestore();
+    window.dispatchEvent(new Event('online'));
+    await first.auth.bootstrap();
+    expect(first.auth.getSnapshot()).toMatchObject({ status: 'anonymous', user: null });
+    expect(oldLease.signal.aborted).toBe(true);
+    expect(() => first.owner.capture()).toThrow();
+    expect(localStorage.getItem('cognis-auth-last-verified-user')).toBeNull();
+    expect(localStorage.getItem('cognis-startup-appearance')).toBeNull();
+    expect(fetcher).toHaveBeenCalledOnce();
+    await first.auth.login(user.email, 'isolated-test-password');
+    expect(first.auth.getSnapshot()).toMatchObject({ status: 'authenticated', user });
+  });
+
+  it('automatically recovers an initially unavailable document after storage returns', async () => {
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => json(user));
+    const open = vi.spyOn(indexedDB, 'open').mockImplementation(() => {
+      throw new DOMException('Database unavailable', 'InvalidStateError');
+    });
+    const first = await mount();
+    await vi.waitFor(() => expect(open.mock.calls.length).toBeGreaterThanOrEqual(2));
+    expect(first.auth.getSnapshot()).toMatchObject({ status: 'loading', user: null });
+    expect(fetcher).not.toHaveBeenCalled();
+    open.mockRestore();
+    window.dispatchEvent(new Event('online'));
+    await vi.waitFor(() => expect(first.auth.getSnapshot()).toMatchObject({ status: 'authenticated', user }));
+    await first.owner.capture().validate();
+    expect(fetcher).toHaveBeenCalledOnce();
   });
 
   it('a late refresh failure cannot clear a newer login without event delivery', async () => {

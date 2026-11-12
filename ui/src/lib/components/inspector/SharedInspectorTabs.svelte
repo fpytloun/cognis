@@ -2,7 +2,7 @@
   import { api } from '$lib/api/client';
   import { chatV2Api } from '$lib/chat-v2/api';
   import type { ActivityOverviewResponse, TimelineScope, WorkCategory, WorkstreamRef } from '$lib/chat-v2/types';
-  import InspectorOverview from '$lib/components/InspectorOverview.svelte';
+  import InspectorOverview from '$lib/components/inspector/LazyInspectorOverview.svelte';
   import SessionDetailsContent, { type SessionDetailsData } from '$lib/components/session/SessionDetailsContent.svelte';
   import AccessibleTabs from '$lib/components/ui/AccessibleTabs.svelte';
   import WorkView from '$lib/components/work/LazyWorkView.svelte';
@@ -15,13 +15,16 @@
   import { untrack } from 'svelte';
   import { nodeMatchesFocus } from '$lib/activityTreeState';
   import { useSectionConnectivity } from '$lib/connectivity-section.svelte';
+  import ConversationUsagePanel from './ConversationUsagePanel.svelte';
+  import { usageAnalyticsEnabled } from '$lib/system';
+  import type { ConversationInfoTab } from '$lib/stores/conversationInfo.svelte';
 
   let {
     scope,
     sessionId,
     agents = [],
     initialTab = 'overview',
-    activeTab = $bindable<'overview' | 'work' | 'session'>('overview'),
+    activeTab = $bindable<ConversationInfoTab>('overview'),
     headerOnly = false,
     idPrefix = 'shared-inspector',
     testIdPrefix = 'shared-inspector',
@@ -41,12 +44,12 @@
     scope: TimelineScope;
     sessionId: string;
     agents?: Agent[];
-    initialTab?: 'overview' | 'work' | 'session';
-    activeTab?: 'overview' | 'work' | 'session';
+    initialTab?: ConversationInfoTab;
+    activeTab?: ConversationInfoTab;
     headerOnly?: boolean;
     idPrefix?: string;
     testIdPrefix?: string;
-    onChange?: (tab: 'overview' | 'work' | 'session') => void;
+    onChange?: (tab: ConversationInfoTab) => void;
     onViewSession?: (sessionId: string, node?: WorkstreamRef) => void;
     contextUsage?: ContextUsage | null;
     diagnosticsFreshness?: 'idle' | 'current' | 'updating' | 'reconnecting' | 'unavailable';
@@ -61,6 +64,9 @@
   }>();
 
   let workCategory = $state<WorkCategory | 'results'>('files');
+  $effect(() => {
+    if (!$usageAnalyticsEnabled && activeTab === 'usage') activeTab = 'overview';
+  });
   let overview = $state<ActivityOverviewResponse | null>(null);
   let session = $state<SessionDetailsData | null>(null);
   let overviewLoading = $state(false);
@@ -164,7 +170,7 @@
     sessionLoading = false;
     overviewError = null;
     sessionError = null;
-    if (!headerOnly) activeTab = initialTab;
+    if (!headerOnly && untrack(() => activeTab !== 'usage')) activeTab = initialTab;
     generation += 1;
   });
 
@@ -196,10 +202,12 @@
 
 <div class="bg-transparent" data-testid="shared-inspector-tabs">
   <AccessibleTabs
-    tabs={[{ id: 'overview', label: 'Overview' }, { id: 'work', label: 'Work' }, { id: 'session', label: 'Session' }]}
+    tabs={[{ id: 'overview', label: 'Overview' }, { id: 'work', label: 'Work' }, { id: 'session', label: 'Session' }, ...($usageAnalyticsEnabled ? [{ id: 'usage', label: 'Usage' }] : [])]}
     activeId={activeTab}
     {idPrefix}
     ariaLabel="Session inspector"
+    edgeFade={false}
+    divider={false}
     onChange={selectTab}
     {testIdPrefix}
   />
@@ -215,6 +223,8 @@
       <InspectorOverview {overview} {agents} {focusedSession} focusedSessionId={sessionId} {contextUsage} {diagnosticsFreshness} onOpenWork={openWork} {onViewSession} narrow />
     {:else if activeTab === 'work'}
       <WorkView {scope} initialTab={workCategory === 'deliverables' ? 'results' : workCategory} forceInitialTab {onViewSession} />
+    {:else if activeTab === 'usage'}
+      <ConversationUsagePanel {scope} />
     {:else if activeTab === 'session' && session}
       <SessionDetailsContent
         detail={session}

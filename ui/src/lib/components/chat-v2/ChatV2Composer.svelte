@@ -11,6 +11,8 @@
   import Square from 'lucide-svelte/icons/square';
 
   import ComposerAttachments from '$lib/components/ComposerAttachments.svelte';
+  import FeedbackComposerTray from '$lib/components/feedback/FeedbackComposerTray.svelte';
+  import type { IncludedFeedback } from '$lib/feedback/types';
   import MicRecorderButton from '$lib/components/MicRecorderButton.svelte';
   import SlashCommandSuggestions from '$lib/components/chat-v2/SlashCommandSuggestions.svelte';
   import { api } from '$lib/api/client';
@@ -42,6 +44,8 @@
     compact = false,
     showMic = true,
     allowQueue = true,
+    allowSlashCommands = true,
+    maxLength,
     conversationId,
     onSend,
     onStop,
@@ -55,6 +59,8 @@
     onRemoveAttachment,
     onRetryAttachment,
     settings,
+    feedback = null,
+    focusRequest = null,
   } = $props<{
     value?: string;
     attachments?: AttachmentRef[];
@@ -72,10 +78,12 @@
     compact?: boolean;
     showMic?: boolean;
     allowQueue?: boolean;
+    allowSlashCommands?: boolean;
+    maxLength?: number;
     conversationId?: string;
     onSend: () => void | Promise<void>;
-    onStop: () => void | Promise<void>;
-    onFiles: (files: File[]) => void | Promise<void>;
+    onStop?: () => void | Promise<void>;
+    onFiles?: (files: File[]) => void | Promise<void>;
     onInput?: () => void;
     onPaste?: (event: ClipboardEvent) => void | Promise<void>;
     onKeydown?: (event: KeyboardEvent) => void;
@@ -85,10 +93,22 @@
     onRemoveAttachment?: (attachment: AttachmentRef) => void;
     onRetryAttachment?: (attachment: AttachmentRef) => void;
     settings?: Snippet;
+    feedback?: IncludedFeedback | null;
+    focusRequest?: string | null;
   }>();
 
-  const hasDraft = $derived(Boolean(value.trim() || attachments.length));
-  const canSend = $derived(hasDraft && !disabled && !busy && !uploading && (!active || allowQueue));
+  let focusedRequest: string | null = null;
+  $effect(() => {
+    if (focusRequest && focusRequest !== focusedRequest && textarea && !disabled && !busy) {
+      textarea.focus({ preventScroll: true });
+      focusedRequest = focusRequest;
+    }
+  });
+
+  const hasDraft = $derived(Boolean(value.trim() || attachments.length || feedback));
+  let feedbackReady = $state(false);
+  const canSend = $derived(hasDraft && (!conversationId || feedbackReady) && (maxLength === undefined || value.length <= maxLength)
+    && !disabled && !busy && !uploading && (!active || allowQueue));
   const enterToSend = $derived($userPreferences.chat.enter_to_send);
   const softwareKeyboardOpen = $derived(
     $viewportMetrics.keyboardOpen || hasConservativeTouchKeyboardFallback()
@@ -124,6 +144,11 @@
     reconciledSlashValue = value;
     reconciledConversationId = conversationId;
     cancelSlashSuggestionRequest();
+    if (!allowSlashCommands) {
+      slashSuggestions = [];
+      slashSelectedIndex = 0;
+      return;
+    }
     const currentInput = value;
     const currentConversationId = conversationId;
     if (!currentInput.startsWith('/')) {
@@ -312,11 +337,11 @@
     const input = event.currentTarget as HTMLInputElement;
     const files = Array.from(input.files ?? []);
     input.value = '';
-    if (files.length > 0) void onFiles(files);
+    if (files.length > 0) void onFiles?.(files);
   }
 </script>
 
-<div class="chat-composer" class:space-y-2={attachments.length > 0} data-testid="chat-v2-composer">
+<div class="chat-composer relative" class:space-y-2={attachments.length > 0} data-testid="chat-v2-composer">
   {#if slashSuggestionsVisible}
     <SlashCommandSuggestions
       suggestions={slashSuggestions}
@@ -327,7 +352,7 @@
   {/if}
   <ComposerAttachments {attachments} onremove={removeAttachment} onretry={onRetryAttachment} disabled={disabled || busy || uploading} />
   <div class:chat-composer-compact={compact} class={`chat-composer-surface flex items-center gap-1 border border-control-border transition focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/20 ${compact ? 'p-1.5' : 'px-2 py-1'}`}>
-    <label
+    {#if onFiles}<label
       aria-label="Attach files"
       class="inline-flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-muted transition hover:bg-surface-hover hover:text-foreground focus-within:bg-surface-hover focus-within:text-foreground"
       class:pointer-events-none={disabled || busy || uploading}
@@ -335,7 +360,9 @@
     >
       <Paperclip class="pointer-events-none h-4 w-4" />
       <input class="sr-only" type="file" multiple disabled={disabled || busy || uploading} onchange={handleFiles} />
-    </label>
+    </label>{/if}
+    <!-- Comments ride in the input row like attachments, so they take no extra line. -->
+    {#if conversationId}<FeedbackComposerTray {conversationId} included={feedback} onReadyChange={(ready) => { feedbackReady = ready; }} />{/if}
     <textarea
       bind:this={textarea}
       bind:value
@@ -346,6 +373,7 @@
       aria-controls={slashSuggestionsVisible ? slashAutocompleteId : undefined}
       aria-activedescendant={slashSuggestionsVisible ? `${slashAutocompleteId}-option-${slashSelectedIndex}` : undefined}
       data-testid={textareaTestId}
+      maxlength={maxLength}
       disabled={disabled || busy}
       enterkeyhint="enter"
       autocapitalize="sentences"
@@ -377,14 +405,14 @@
           </span>
         {/if}
       </button>
-    {:else if active}
+    {:else if active && onStop}
       <button
         type="button"
         aria-label={stopping ? 'Cancelling turn' : stopAriaLabel ?? 'Cancel turn'}
         title={stopping ? 'Cancelling…' : 'Cancel turn'}
         class="relative inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-raised text-foreground transition hover:bg-surface-hover"
         disabled={stopping}
-        onclick={() => void onStop()}
+          onclick={() => void onStop?.()}
       >
         <span class:conversation-turn-orbit--stopping={stopping} class="conversation-turn-orbit" aria-hidden="true"><span></span></span>
         {#if stopping}

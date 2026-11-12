@@ -161,8 +161,8 @@ describe('WorkspaceWindow pointer controls', () => {
     const { manager, windowState } = setup();
     const windowElement = screen.getByTestId(`workspace-window-${windowState.key}`);
     const grip = screen.getByTestId(`workspace-window-resize-${windowState.key}`);
-    expect(grip).toHaveClass('h-3', 'w-3');
-    expect(grip).toHaveStyle({ width: '12px', height: '12px' });
+    expect(grip).toHaveClass('h-6', 'w-6');
+    expect(grip).toHaveStyle({ minWidth: '24px', minHeight: '24px' });
     await fireEvent.pointerDown(grip, {
       pointerId: 9, pointerType: 'mouse', button: 0, clientX: 900, clientY: 600,
     });

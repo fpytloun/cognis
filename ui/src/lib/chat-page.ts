@@ -13,6 +13,7 @@ import type {
   SidebarProjection,
 } from '$lib/types/api';
 import { isAuthChallengeToolCall } from '$lib/chat-v2/selectors';
+import { appContactBindingId } from '$lib/app-contacts';
 import type { ChatV2ClientState } from '$lib/chat-v2/sync-engine';
 import type { ChatSnapshot, TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
 
@@ -539,6 +540,8 @@ export function reconcileConversationWithChatRuntime(
   state: ChatV2ClientState,
   pendingAdmission: Partial<Conversation> | null = null,
 ): Conversation {
+  // Shared snapshots redact runtime; their empty overlay cannot override activity metadata.
+  if (conversation.is_readonly_for_caller) return conversation;
   if (!state.cursor || state.conversationId !== conversation.conversation_id) return conversation;
   const patch = pendingAdmission ?? chatV2RuntimeConversationPatch(state);
   return patch ? { ...conversation, ...patch } : conversation;
@@ -1494,7 +1497,7 @@ export function conversationMatchesSidebarProjectionFilter(
       && (selectedChannels.size === 0 || selectedChannels.has(contextType));
   }
   if (taskControl) return false;
-  if (isAgentDirectConversationSummary(conversation)) {
+  if (isAgentDirectConversationSummary(conversation) || appContactBindingId(conversation)) {
     const channelMatches = selectedChannels.size === 0 || selectedChannels.has('web');
     return channelMatches && conversation.status === 'active';
   }
@@ -1607,7 +1610,9 @@ export function mobileConversationStatusLabel(
 ): string {
   if (waitingForInput) return 'Waiting for input';
   if (turnActive) return 'Running';
-  return lifecycleStatus;
+  // An open conversation with no running turn is idle, not "active".
+  if (lifecycleStatus === 'active') return 'Idle';
+  return lifecycleStatus.charAt(0).toUpperCase() + lifecycleStatus.slice(1);
 }
 
 export function conversationInspectorFits(availableWidth: number): boolean {
@@ -2086,12 +2091,14 @@ export function conversationStatusFilterForConversation(
 }
 
 export function conversationAttentionTone(conversation: {
+  is_readonly_for_caller?: boolean;
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
   active_session_updated_at?: string | null;
   pending_notification_types?: string[] | null;
   last_read_at?: string | null;
 }): ConversationAttentionTone {
+  if (conversation.is_readonly_for_caller) return 'default';
   const sessionUpdatedAt = timestampValue(conversation.active_session_updated_at);
   const lastReadAt = timestampValue(conversation.last_read_at);
   return conversationAttentionOutcomeTone({
@@ -2173,6 +2180,7 @@ export function conversationAttentionLabel(tone: ConversationAttentionTone): str
 }
 
 export function conversationHasAttention(conversation: {
+  is_readonly_for_caller?: boolean;
   active_session_status?: string | null;
   active_session_completion_reason?: string | null;
   active_session_updated_at?: string | null;

@@ -10,6 +10,13 @@ export interface ToastItem {
   message: string;
   variant: ToastVariant;
   duration: number;
+  /** Optional follow-up link, for example the task a toast reports on. */
+  action: ToastAction | null;
+}
+
+export interface ToastAction {
+  label: string;
+  href: string;
 }
 
 const toasts = writable<ToastItem[]>([]);
@@ -35,7 +42,8 @@ export function addToast(
   message: string,
   variant: ToastVariant = 'info',
   duration = 4_000,
-  title: string | null = null
+  title: string | null = null,
+  action: ToastAction | null = null
 ): string {
   const id = createId('toast');
   const item: ToastItem = {
@@ -43,7 +51,8 @@ export function addToast(
     title,
     message,
     variant,
-    duration
+    duration,
+    action
   };
   toasts.update((items) => [item, ...items]);
   scheduleRemoval(id, duration);

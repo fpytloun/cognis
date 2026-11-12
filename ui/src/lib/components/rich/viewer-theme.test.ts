@@ -29,4 +29,12 @@ describe('resolveViewerTheme', () => {
     expect(resolveViewerTheme('app', 'standalone', 'light', true)).toBe('dark');
     expect(resolveViewerTheme('app', 'embedded', null, false)).toBe('light');
   });
+
+  it('lets reader controls override the account default without changing the account', () => {
+    expect(resolveViewerTheme(null, 'standalone', null, true, { theme: 'light', theme_family: 'paper' })).toBe('light');
+    expect(resolveViewerTheme('dark', 'standalone', null, true, { theme: 'light', theme_family: 'paper' })).toBe('dark');
+    expect(resolveViewerTheme('light', 'standalone', null, false, { theme: 'dark', theme_family: 'gruvbox' })).toBe('light');
+    expect(resolveViewerTheme('system', 'standalone', null, true, { theme: 'light', theme_family: 'classic' })).toBe('dark');
+    expect(resolveViewerTheme('system', 'standalone', null, false, { theme: 'dark', theme_family: 'classic' })).toBe('light');
+  });
 });

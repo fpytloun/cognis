@@ -3,7 +3,8 @@
   import { registerFindWorkspace } from '$lib/find';
   import { portal } from '$lib/actions/portal';
   import AgentQuickChatModal from './AgentQuickChatModal.svelte';
-  import FocusedAttentionAction from '$lib/components/attention/FocusedAttentionAction.svelte';
+  import DeferredPrivateView from '$lib/components/ui/DeferredPrivateView.svelte';
+  import { focusedAttentionAction } from '$lib/components/attention/focused-definition';
   import DashboardEntityModal from './DashboardEntityModal.svelte';
   import DashboardDocument from './DashboardDocument.svelte';
   import WorkspaceDock from './WorkspaceDock.svelte';
@@ -280,15 +281,21 @@
         {#snippet children()}
           <div class="contents" data-find-window inert={workspaceWindow.minimized} use:findWindow={workspaceWindow.key}>
            {#if workspaceWindow.kind === 'attention'}
-              <FocusedAttentionAction
-                actionId={workspaceWindow.entityId}
-                onUnavailable={onAttentionUnavailable}
-                onDismiss={() => closeWindow(workspaceWindow.key)}
-                onSettled={async (action) => {
-                 closeWindow(workspaceWindow.key);
-                 await onAttentionSettled?.(action);
-               }}
-             />
+               {#key workspaceWindow.entityId}
+                 <DeferredPrivateView
+                   definition={focusedAttentionAction}
+                   label="attention action"
+                   viewProps={{
+                     actionId: workspaceWindow.entityId,
+                     onUnavailable: onAttentionUnavailable,
+                     onDismiss: () => closeWindow(workspaceWindow.key),
+                     onSettled: async (action: AttentionActionDetail) => {
+                       closeWindow(workspaceWindow.key);
+                       await onAttentionSettled?.(action);
+                     },
+                   }}
+                 />
+               {/key}
            {:else if workspaceWindow.kind === 'agent'}
              {@const agent = agents.find((item: Agent) => item.agent_id === workspaceWindow.entityId)}
             {#if agent}

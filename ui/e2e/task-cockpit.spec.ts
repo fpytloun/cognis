@@ -38,9 +38,10 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await expect(page.getByTestId('task-progress')).toContainText('Independent evidence review');
 
     expect(fixture.heavyRequests()).toBe(0);
-    await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Output' }).click();
+    await page.getByTestId('task-cockpit-step-fetch').getByRole('button', { name: 'Result' }).click();
     await expect.poll(() => fixture.heavyRequests()).toBe(1);
-    const output = page.getByRole('dialog', { name: 'fetch' });
+    const output = page.getByRole('dialog', { name: 'Step: fetch' });
+    await expect(output.getByRole('tab', { name: 'Result' })).toHaveAttribute('aria-selected', 'true');
     await expect(output).toContainText('Fetched release evidence');
     await expect(output).toContainText('sha256:verified-stage39');
     await output.getByRole('button', { name: 'Close' }).click();
@@ -85,24 +86,25 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
       {
         status: 'draft' as const,
         buttons: ['Submit task', 'Configure task', 'Ask', 'Cancel task'],
-        absent: ['Pause task', 'Resume task', 'Re-run task'],
+        absent: ['Pause task', 'Resume task', 'Start a new run'],
         projection: { current: 'scope', status: 'pending', actionRequired: false }
       },
       {
         status: 'running' as const,
         buttons: ['Pause task', 'Configure task', 'Ask', 'Cancel task'],
-        absent: ['Submit task', 'Resume task', 'Re-run task'],
+        absent: ['Submit task', 'Resume task', 'Start a new run'],
         projection: { current: 'fetch', status: 'running', actionRequired: false }
       },
       {
         status: 'paused' as const,
-        buttons: ['Resume task', 'Configure task', 'Ask', 'Re-run task', 'Cancel task'],
-        absent: ['Submit task', 'Pause task'],
+        // A pending gate makes reviewing it the primary action; a new run is not offered while paused.
+        buttons: ['Review decision', 'Configure task', 'Ask', 'Cancel task'],
+        absent: ['Submit task', 'Pause task', 'Start a new run'],
         projection: { current: 'approve', status: 'waiting', actionRequired: true }
       },
       {
         status: 'completed' as const,
-        buttons: ['Configure task', 'Ask', 'Re-run task'],
+        buttons: ['Start a new run', 'Configure task', 'Ask'],
         absent: ['Submit task', 'Pause task', 'Resume task', 'Cancel task'],
         projection: { current: 'finish', status: 'completed', actionRequired: false }
       }
@@ -161,18 +163,14 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await assertFixtureHealthy(page, fixture);
 
     await clickSheetAction(page, fixture, 'draft', 'Submit task', 'submit');
-    await clickSheetAction(page, fixture, 'running', 'Pause task', 'pause');
-    await clickSheetAction(page, fixture, 'running', 'Cancel task', 'cancel', true);
-    await clickSheetAction(page, fixture, 'paused', 'Resume task', 'resume');
-    await clickSheetAction(page, fixture, 'paused', 'Re-run task', 'rerun');
-    await clickSheetAction(page, fixture, 'paused', 'Cancel task', 'cancel', true);
-    await clickSheetAction(page, fixture, 'completed', 'Re-run task', 'rerun');
+    await clickSheetAction(page, fixture, 'running', 'Pause task', 'pause', PAUSE_CONFIRM);
+    await clickSheetAction(page, fixture, 'running', 'Cancel task', 'cancel', CANCEL_CONFIRM);
+    await clickSheetAction(page, fixture, 'paused', 'Cancel task', 'cancel', CANCEL_CONFIRM);
+    await clickSheetAction(page, fixture, 'completed', 'Start a new run', 'rerun', NEW_RUN_CONFIRM);
     expect(fixture.actionRequests()).toEqual([
       `POST /api/v1/tasks/${TASK_ID}/submit`,
       `POST /api/v1/tasks/${TASK_ID}/pause`,
       `POST /api/v1/tasks/${TASK_ID}/cancel`,
-      `POST /api/v1/tasks/${TASK_ID}/resume`,
-      `POST /api/v1/tasks/${TASK_ID}/rerun`,
       `POST /api/v1/tasks/${TASK_ID}/cancel`,
       `POST /api/v1/tasks/${TASK_ID}/rerun`
     ]);
@@ -289,7 +287,7 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
     await work.getByTestId('work-tab-commands').click();
     await expect(work.getByText(/uv run pytest tests\/release -q/)).toBeVisible();
     await expect(work.getByRole('button', { name: 'Full output' })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: 'Re-run task' })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Start a new run' })).toBeVisible();
     await expect.poll(() => fixture.detailResponses().length).toBeGreaterThan(0);
     const selectedDetail = fixture.detailResponses()[fixture.detailResponses().length - 1];
     expect(selectedDetail.step_run_id).toBe('run-scope-1');
@@ -525,13 +523,17 @@ test.describe('Stage 39/41 production Task Cockpit', () => {
   });
 });
 
+const PAUSE_CONFIRM = { dialog: 'Pause task?', button: 'Pause task' };
+const CANCEL_CONFIRM = { dialog: 'Cancel task?', button: 'Cancel task' };
+const NEW_RUN_CONFIRM = { dialog: 'Start a new run?', button: 'Start new run' };
+
 async function clickSheetAction(
   page: import('@playwright/test').Page,
   fixture: Awaited<ReturnType<typeof installTaskCockpitFixture>>,
   status: 'draft' | 'running' | 'paused' | 'completed',
   label: string,
   endpoint: string,
-  confirm = false
+  confirm: { dialog: string; button: string } | null = null
 ): Promise<void> {
   fixture.setStatus(status);
   await navigateCockpit(page);
@@ -539,7 +541,7 @@ async function clickSheetAction(
   const before = fixture.actionRequests().length;
   await page.getByRole('dialog', { name: 'Task actions' }).getByRole('button', { name: label }).click();
   if (confirm) {
-    await page.getByRole('dialog', { name: 'Cancel task?' }).getByRole('button', { name: 'Cancel task' }).click();
+    await page.getByRole('dialog', { name: confirm.dialog }).getByRole('button', { name: confirm.button }).click();
   }
   await expect.poll(() => fixture.actionRequests().length).toBe(before + 1);
   const requests = fixture.actionRequests();

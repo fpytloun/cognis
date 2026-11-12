@@ -12,6 +12,78 @@ import {
 } from '$lib/agents';
 
 describe('agent payload mapping', () => {
+  it('omits hidden guardrail overrides for None without mutating the draft or access denials', () => {
+    const form = createEmptyAgentForm();
+    Object.assign(form, {
+      guardrailsBackend: 'none', analyticsEnabled: false, intarisEvaluation: 'strict',
+      approvalMode: 'unattended', minimumOutcome: 'deny', maximumOutcome: 'approve',
+      escalationTimeoutSeconds: '-1', toolPermissions: { read: 'deny' }
+    });
+    const disabled = formStateToPayload(form);
+    for (const key of ['minimum_outcome', 'maximum_outcome', 'escalation_timeout_seconds']) {
+      expect(disabled.capabilities).not.toHaveProperty(key);
+    }
+    expect(disabled.capabilities).toMatchObject({ guardrails_backend: 'none', analytics_enabled: false });
+    expect(disabled.permissions).toMatchObject({ tool_permissions: { read: 'deny' } });
+    form.guardrailsBackend = 'intaris';
+    form.escalationTimeoutSeconds = '120';
+    expect(formStateToPayload(form).capabilities).toMatchObject({
+      minimum_outcome: 'deny', maximum_outcome: 'approve', escalation_timeout_seconds: 120,
+      intaris_evaluation: 'strict', approval_mode: 'unattended', analytics_enabled: false
+    });
+  });
+  it.each(['intaris', 'none'] as const)('round-trips analytics independently of %s', (backend) => {
+    expect(createEmptyAgentForm().analyticsEnabled).toBe(true);
+    expect(agentToFormState({ agent_id: 'legacy-agent', name: 'Legacy' } as never).analyticsEnabled).toBe(true);
+    for (const enabled of [true, false]) {
+      const form = agentToFormState({
+        agent_id: 'analytics-agent', name: 'Analytics',
+        capabilities: { guardrails_backend: backend, analytics_enabled: enabled }
+      } as never);
+      expect(form.analyticsEnabled).toBe(enabled);
+      expect(formStateToPayload(form).capabilities).toMatchObject({
+        guardrails_backend: backend, analytics_enabled: enabled
+      });
+    }
+  });
+  it('defaults startup Auto to enabled at 55% confidence and round-trips agent opt-out', () => {
+    const initial = createEmptyAgentForm();
+    expect(initial.autoProfileSelection).toBe(true);
+    expect(initial.autoProfileMinConfidence).toBe(0.55);
+    const form = agentToFormState({
+      agent_id: 'engineer', name: 'Engineer', agent_type: 'primary',
+      execution: { auto_profile_selection: { enabled: false, min_confidence: 0.95 } },
+    } as never);
+    expect(form.autoProfileSelection).toBe(false);
+    expect(form.autoProfileMinConfidence).toBe(0.95);
+    expect(formStateToPayload(form).execution).toMatchObject({
+      auto_profile_selection: { enabled: false, min_confidence: 0.95 },
+    });
+  });
+  it('round-trips an independent TTS provider, model and voice, including clearing inheritance', () => {
+    const form = agentToFormState({
+      agent_id: 'narrator', name: 'Narrator', agent_type: 'primary',
+      llm_config: {
+        model: 'cognis/chat', tts_provider_id: 'speech-provider',
+        tts_model: 'gpt-4o-mini-tts', tts_voice: 'marin'
+      }
+    } as never);
+    expect(form.ttsProviderId).toBe('speech-provider');
+    expect(form.ttsModel).toBe('gpt-4o-mini-tts');
+    expect(form.ttsVoice).toBe('marin');
+    for (const payload of [formStateToPayload(form), formStateToSystemOverridePayload(form)]) {
+      expect(payload.llm_config).toMatchObject({
+        model: 'cognis/chat', tts_provider_id: 'speech-provider',
+        tts_model: 'gpt-4o-mini-tts', tts_voice: 'marin'
+      });
+    }
+    form.ttsProviderId = form.ttsModel = form.ttsVoice = '';
+    expect(formStateToSystemOverridePayload(form).llm_config).not.toHaveProperty('voices');
+    expect(formStateToSystemOverridePayload(form).llm_config).not.toHaveProperty('voice');
+    expect(formStateToPayload(form).llm_config).toMatchObject({
+      tts_provider_id: null, tts_model: null, tts_voice: null
+    });
+  });
   it('round-trips Cognis routes for agent defaults and profiles without a physical provider', () => {
     const form = agentToFormState({
       agent_id: 'route-agent', name: 'Route agent', agent_type: 'primary',
@@ -299,6 +371,7 @@ describe('agent payload mapping', () => {
     const payload = formStateToPayload(form);
     expect(payload.capabilities).toEqual({
       memory_backend: 'none',
+      analytics_enabled: true,
       memory_backend_options: {},
       intaris_evaluation: 'balanced',
       approval_mode: 'ask',
@@ -381,11 +454,9 @@ describe('agent payload mapping', () => {
           region: 'eu',
           gpu: 'true'
         },
-        available_workflow_ids: [],
-        default_workflow_id: 'system:direct',
-        workflow_selection_mode: 'automatic',
         default_chat_mode: 'default',
         additional_executors: undefined,
+        auto_profile_selection: { enabled: true, min_confidence: 0.55 },
         step_agent_overrides: {}
       }
     });
@@ -576,6 +647,7 @@ describe('agent payload mapping', () => {
     expect(form.memoryMode).toBe('future-mode');
     expect(formStateToPayload(form).capabilities).toEqual({
       memory_backend: 'future-memory',
+      analytics_enabled: true,
       memory_backend_options: { mode: 'future-mode', future_flag: true },
       intaris_evaluation: 'balanced',
       approval_mode: 'ask',
@@ -605,6 +677,7 @@ describe('agent payload mapping', () => {
     const payload = formStateToPayload(form);
     expect(payload.capabilities).toEqual({
       memory_backend: 'future-memory',
+      analytics_enabled: true,
       memory_backend_options: { strategy: 'compact', future_flag: true },
       intaris_evaluation: 'balanced',
       approval_mode: 'ask',

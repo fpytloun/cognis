@@ -5,10 +5,12 @@
   import { canShareFile, downloadFile, isAppleMobile, prepareAttachmentFile } from '$lib/attachments/save';
   import { keepInViewport } from '$lib/actions/keep-in-viewport';
 
-  let { filename, resolveUrl, class: className = 'copy-icon-button' }: {
+  let { filename, resolveUrl, class: className = 'copy-icon-button', label = '' }: {
     filename: string;
     resolveUrl: () => Promise<string | null>;
     class?: string;
+    /** Visible text beside the icon, used when the control sits in a menu. */
+    label?: string;
   } = $props();
 
   let busy = $state(false);
@@ -68,6 +70,7 @@
     {#if busy}<span class="text-xs">…</span>
     {:else if ready}<Share class="h-5 w-5" />
     {:else}<Download class="h-5 w-5" />{/if}
+    {#if label}<span>{ready ? 'Save/share' : label}</span>{/if}
   </button>
   {#if ready || error}
     <span role="status" class="absolute right-0 top-full z-20 mt-1 w-56 rounded-lg border border-control-border bg-elevated p-2 text-xs text-foreground shadow-lg" use:keepInViewport>

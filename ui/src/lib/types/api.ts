@@ -1,4 +1,11 @@
 export type UserRole = 'admin' | 'user' | 'viewer' | 'service';
+// Raw usage contracts have one owner; UI view models are defined separately.
+export type UsageSummaryRequest = import('$lib/usage/wire').SummaryRequest;
+export type UsageSummaryResponse = import('$lib/usage/wire').SummaryResponse;
+export type UsageSummarySelector = import('$lib/usage/wire').Selector;
+export type UsageSummaryInclusion = import('$lib/usage/wire').SummaryInclusion;
+export type UsageCostBreakdowns = import('$lib/usage/wire').CostBreakdowns;
+export type CompletionModeFamily = 'auto' | 'default' | 'direct';
 
 export interface NavigationChatGroup {
   active_session_status: string | null;
@@ -66,6 +73,7 @@ export interface UserDisplayPreferences {
 
 export interface UserChatPreferences {
   enter_to_send: boolean;
+  adapt_tts?: boolean;
   show_thinking_blocks: boolean;
   group_tool_calls: boolean;
   keep_assistant_messages_separate: boolean;
@@ -187,6 +195,7 @@ export type DashboardIssueKind =
   | 'provider_unavailable'
   | 'provider_health'
   | 'provider_quota'
+  | 'provider_auth'
   | 'getting_started';
 
 export interface DashboardIssueResource {
@@ -380,6 +389,7 @@ export interface Conversation {
     has_active_turn: boolean;
     managed_agent?: {
       channel: 'agent_work' | 'managed_agent_conversation';
+      kind?: 'agent' | 'channel';
       link_id?: string | null;
       controller_agent_id?: string | null;
       controller_conversation_id?: string | null;
@@ -398,6 +408,16 @@ export interface Conversation {
     created_at: string | null;
     updated_at: string | null;
   conversation_state?: ConversationStateEnvelope | null;
+}
+
+export interface MessageMetadata {
+  private_controller_instruction?: boolean;
+  ts?: string;
+  channel?: string;
+  sender?: string;
+  untrusted?: boolean;
+  /** Comments sent with this message; details load through the feedback API. */
+  feedback?: { submission_id: string; manifest_hash: string };
 }
 
 export interface SlashCommandSuggestion {
@@ -502,6 +522,7 @@ export interface SidebarProjection {
 export interface ConversationOpenRequest {
   agent_id: string;
   agent_profile_id?: string | null;
+  agent_profile_mode?: 'auto' | 'default' | null;
   context_type?: string;
   include_state?: boolean;
   candidate_conversation_ids?: string[];
@@ -603,6 +624,16 @@ export interface ProjectAgent {
   is_owned_by_caller: boolean;
   created_at: string | null;
   updated_at: string | null;
+}
+
+export interface AgentSkillUsage {
+  skill_id: string;
+  name: string;
+  assignment: 'attached' | 'unattached' | 'global' | 'auto_loaded';
+  load_count: number;
+  search_load_count: number;
+  last_loaded_at: string | null;
+  suggestion: 'consider_removing' | 'consider_attaching' | null;
 }
 
 export interface AgentProjectAssignment {
@@ -940,6 +971,8 @@ export interface Session {
 }
 
 export interface IntarisSessionDetail {
+  analytics_enabled?: boolean;
+  guardrails_enabled?: boolean;
   inference_target?: { provider_id: string; model: string; requested: string; reason: string } | null;
   session_id: string;
   intaris_session_id: string;
@@ -990,6 +1023,8 @@ export interface AgentRuntimeProfile {
 }
 
 export interface AgentCapabilities {
+  /** Intaris analytics, independent of guardrails. Defaults to true. */
+  analytics_enabled?: boolean;
   /** Provider-owned memory backend id. */
   memory_backend: string;
   memory_backend_options?: Record<string, unknown>;
@@ -1027,6 +1062,8 @@ export interface MemoryBackendDescriptor {
 }
 
 export interface Agent {
+  is_contact_only?: boolean;
+  contact_conversation_id?: string | null;
   agent_id: string;
   owner_email: string;
   name: string;
@@ -1554,7 +1591,9 @@ export interface MCPServerTestResponse {
 }
 
 export interface MCPAuthConfig {
-  type: 'none' | 'static_headers' | 'oauth2';
+  type: 'none' | 'static_headers' | 'oauth2' | 'credential_bearer';
+  credential_ref?: string | null;
+  credential_agent_id?: string | null;
   issuer?: string | null;
   authorization_server?: string | null;
   resource?: string | null;
@@ -2418,7 +2457,8 @@ export interface SessionPolicy {
 }
 
 export interface CompletionDeliveryPolicy {
-  completion_mode_family: 'default' | 'direct';
+  on_finish_instructions?: string | null;
+  completion_mode_family: CompletionModeFamily;
   allow_silent_completion: boolean;
 }
 
@@ -2483,8 +2523,25 @@ export interface QuestionSetReply {
   mode: 'structured' | 'plain_text';
 }
 
+export interface TaskDeliverableFreshness {
+  state: 'current' | 'stale' | 'historical' | 'unknown';
+  replacement_status: string | null;
+  label: string;
+}
+
+export interface TaskOutputPresentation {
+  deliverable_id: string | null;
+  step_run_id: string | null;
+  freshness: TaskDeliverableFreshness | null;
+  format: string;
+  title: string | null;
+}
+
 export interface Deliverable {
+  task_freshness?: TaskDeliverableFreshness | null;
   deliverable_id: string;
+  author_email?: string | null;
+  author_agent_id?: string | null;
   step_run_id: string | null;
   conversation_id?: string | null;
   session_id?: string | null;
@@ -2515,6 +2572,8 @@ export interface Deliverable {
 
 export interface DeliverableRevisionSummary {
   deliverable_id: string;
+  author_email?: string | null;
+  author_agent_id?: string | null;
   revision: number;
   title: string | null;
   format: string;
@@ -2534,6 +2593,8 @@ export interface DeliverableRevisions {
 
 export interface ArtifactRevisionSummary {
   artifact_id: string;
+  author_email?: string | null;
+  author_agent_id?: string | null;
   revision: number;
   filename: string;
   mime_type: string;
@@ -2562,6 +2623,7 @@ export interface DeliverableShareOptions {
 }
 
 export interface StepRun {
+  deliverable_freshness?: Record<string, TaskDeliverableFreshness>;
   step_run_id: string;
   task_id: string;
   step_name: string;
@@ -2616,7 +2678,8 @@ export interface Task {
   source_type: string;
   source_ref: string | null;
   delivery: TaskDelivery;
-  completion_mode_family: 'default' | 'direct';
+  on_finish_instructions?: string | null;
+  completion_mode_family: CompletionModeFamily;
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
   escalation_timeout_seconds: number | null;
@@ -2676,6 +2739,8 @@ export interface TaskBoardDoneGroup {
   title: string;
   latest: TaskBoardItem;
   task_count: number;
+  failed_count: number;
+  cancelled_count: number;
 }
 
 export interface TaskBoardColumn {
@@ -2691,8 +2756,11 @@ export interface TaskBoard {
 }
 
 export interface TaskDetail extends Task {
+  output_presentation?: TaskOutputPresentation | null;
+  deliverable_freshness?: Record<string, TaskDeliverableFreshness>;
   dependencies: Dependency[];
   step_runs: StepRun[];
+  final_deliverable?: Deliverable | null;
   workflow_run: WorkflowRun | null;
   pending_pause: PendingPause | null;
   workflow_projection: TaskWorkflowProjection | null;
@@ -2942,7 +3010,8 @@ export interface Schedule {
   delete_after_run: boolean;
   retry_failed_tasks: boolean;
   fail_paused_task_on_next_fire: boolean;
-  completion_mode_family: 'default' | 'direct';
+  on_finish_instructions?: string | null;
+  completion_mode_family: CompletionModeFamily;
   allow_silent_completion: boolean;
   interaction_mode_override: InteractionModeOverride | null;
   session_policy: SessionPolicy | null;
@@ -3013,6 +3082,8 @@ export interface ModelEntry {
   supports_streaming: boolean;
   supports_vision: boolean;
   supports_audio_input: boolean;
+  supports_speech_synthesis?: boolean;
+  supports_transcription?: boolean;
   supports_pdf_input: boolean;
   supports_file_input: boolean;
   supports_embedding: boolean;
@@ -3047,6 +3118,7 @@ export interface ModelEntry {
   model_mode?: string | null;
   pricing?: Record<string, unknown>;
   tier: string;
+  untiered_tariff?: UsageUntieredTariffDeclaration | null;
   source?: string;
   confidence?: string;
   description?: string;
@@ -3055,6 +3127,22 @@ export interface ModelEntry {
   available_in_plans?: string[];
   provider_metadata?: Record<string, unknown>;
   runtime_metadata?: Record<string, unknown>;
+}
+
+export interface UsageOperationScope {
+  version: 1;
+  resource: 'openai.embeddings.create' | 'openai.images.generate';
+  abi_revision: 1;
+}
+
+export type UsageServiceTierApplicability =
+  | { version: 1; state: 'unknown' | 'applicable'; scope?: null }
+  | { version: 1; state: 'not_applicable'; scope: UsageOperationScope };
+
+export interface UsageUntieredTariffDeclaration {
+  version: 1;
+  scope: UsageOperationScope;
+  billing_basis: 'aggregate_input_tokens' | 'aggregate_input_output_tokens';
 }
 
 export function defaultModelEntry(modelId: string): ModelEntry {
@@ -3146,6 +3234,7 @@ export type ProviderUsageSource =
   | 'chatgpt_codex_usage'
   | 'anthropic_subscription_usage'
   | 'anthropic_rate_limit_headers'
+  | 'elevenlabs_subscription_usage'
   | 'unsupported'
   | string;
 
@@ -3213,10 +3302,12 @@ export interface ModelRouting {
   mnemory_embedding?: ModelRoutingEntry;
   default: ModelRoutingEntry;
   classifier: ModelRoutingEntry;
+  auxiliary_generation: ModelRoutingEntry;
   compaction: ModelRoutingEntry;
   evaluator: ModelRoutingEntry;
   speech_to_text: ModelRoutingEntry;
   text_to_speech: ModelRoutingEntry;
+  audio_narrative?: ModelRoutingEntry;
   image_generation: ModelRoutingEntry;
   video_generation?: ModelRoutingEntry;
   video_editing?: ModelRoutingEntry;
@@ -3230,9 +3321,13 @@ export interface TtsSynthesizeRequest {
   message_id?: string | null;
   agent_id?: string | null;
   voice?: string | null;
+  provider_id?: string | null;
+  model?: string | null;
   format?: string;
   speed?: number;
   low_latency?: boolean;
+  use_user_preferences?: boolean;
+  adaptation?: 'as_is' | 'listenable';
 }
 
 export interface TtsSynthesizeResponse {
@@ -3242,6 +3337,61 @@ export interface TtsSynthesizeResponse {
   voice: string;
   model: string;
   cached: boolean;
+  parts?: SpeechPart[];
+  adapted?: boolean;
+  script_artifact_id?: string | null;
+  warnings?: string[];
+}
+
+export interface SpeechPart {
+  artifact_id: string;
+  audio_url: string;
+  content_type: string;
+  duration_seconds?: number | null;
+}
+
+export interface AudioJob {
+  job_id: string;
+  deliverable_id: string;
+  content_ref?: string | null;
+  mode: 'narration' | 'podcast';
+  length?: 'shorter' | 'default' | 'longer' | null;
+  target_words?: number | null;
+  status: 'queued' | 'scripting' | 'synthesizing' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
+  completed_parts: number;
+  total_parts: number;
+  parts: SpeechPart[];
+  script_artifact_id: string | null;
+  script_url: string | null;
+  error_code: string | null;
+  created_at: string;
+  warnings?: string[];
+}
+
+export interface AudioJobCreateRequest {
+  content_ref?: string;
+  deliverable_id?: string;
+  mode: 'narration' | 'podcast';
+  idempotency_key: string;
+  target_minutes?: number;
+  length?: 'shorter' | 'default' | 'longer';
+  voice?: string;
+}
+
+export interface PodcastLengthEstimate {
+  length: 'shorter' | 'default' | 'longer';
+  target_words: number;
+  seconds_min: number;
+  seconds_max: number;
+}
+
+export interface DocumentAudioContext {
+  supported: boolean;
+  can_estimate?: boolean;
+  can_generate: boolean;
+  can_cancel: boolean;
+  detail: string | null;
+  jobs: AudioJob[];
 }
 
 export interface SttTranscribeResponse {
@@ -3341,6 +3491,7 @@ export interface ProviderHealth {
 export interface HealthResponse {
   status: string;
   providers: Record<string, ProviderHealth>;
+  usage_analytics_enabled?: boolean;
   remember_queue?: {
     depth: number;
   } | null;

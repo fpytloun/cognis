@@ -19,7 +19,9 @@
           primary: 'bg-accent text-on-accent hover:bg-accent-hover',
           secondary: 'primitive-secondary border border-control-border bg-surface text-foreground hover:border-border-strong',
           ghost: 'primitive-ghost text-secondary',
-          danger: 'primitive-danger'
+          danger: 'primitive-danger',
+          // Inline navigation inside tables, legends and lists (a row name opens its detail).
+          link: 'justify-start rounded-md text-left text-accent hover:underline'
         },
         size: {
           // default: 40px min-height mobile; 36px at md+ (preserves desktop density)
@@ -31,7 +33,9 @@
           // icon: 40x40 mobile, 36x36 at md+
           icon: 'h-10 w-10 md:h-9 md:w-9',
           // icon-mobile: 44x44 on every device (use for critical icon-only taps)
-          'icon-mobile': 'h-11 w-11'
+          'icon-mobile': 'h-11 w-11',
+          // Text-sized; only with the link variant inside dense rows.
+          inline: 'min-h-0 p-0 font-normal'
         }
       },
       defaultVariants: {

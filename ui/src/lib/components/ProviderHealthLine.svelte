@@ -2,7 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import RefreshCw from 'lucide-svelte/icons/refresh-cw';
   import { auth } from '$lib/stores/auth';
-  import { loadProviderMonitor, providerMonitoring } from '$lib/provider-monitor';
+  import { loadProviderMonitor, needsReauthorization, providerMonitoring } from '$lib/provider-monitor';
   import ProviderUsageBars from './ProviderUsageBars.svelte';
 
   let { providerId, showName = true, compact = true, heading, showUsage = true }: { providerId: string; showName?: boolean; compact?: boolean; heading?: string; showUsage?: boolean } = $props();
@@ -70,7 +70,9 @@
           Refreshed {new Date(stamp).toLocaleString()} · stale
         </span>
       {/if}
-      {#if error || value?.error}<span class="text-warning" role="status">{error || value?.error}</span>{/if}
+      {#if !error && needsReauthorization(value)}
+        <a class="text-danger underline" role="alert" href={`/settings?tab=providers&provider=${encodeURIComponent(providerId)}`}>{value?.health_detail}</a>
+      {:else if error || value?.error}<span class="text-warning" role="status">{error || value?.error}</span>{/if}
     </div>
   {/if}
   {#if !compact && value?.usage?.usage_url}

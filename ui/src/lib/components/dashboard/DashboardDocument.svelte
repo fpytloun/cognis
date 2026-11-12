@@ -1,6 +1,7 @@
 <script lang="ts">
   import { api } from '$lib/api/client';
   import ResourceReader from '$lib/components/library/ResourceReader.svelte';
+  import FeedbackContinuity from '$lib/components/feedback/FeedbackContinuity.svelte';
   import { libraryHref, type LibraryItem } from '$lib/library';
   import type { WorkspaceManager } from '$lib/dashboard/workspace';
 
@@ -44,6 +45,7 @@
 
 <div class="flex h-full min-h-0 flex-col" data-testid="dashboard-document">
   {#if item}
+    <FeedbackContinuity contentRef={item.id} />
     <ResourceReader {item}
       onRevision={(updated) => manager.navigateDocument(windowKey, {
         kind: updated.kind,

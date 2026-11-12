@@ -1,4 +1,5 @@
 import { blockChildren, blockText, blockTitle, blockType, richPresentation, safeUrl, type RichBlock } from '$lib/rich-deliverable';
+import { extractMarkdownHeadings } from '$lib/markdown';
 import {
   normalizeDoi,
   normalizedSourceIdentity,
@@ -83,7 +84,7 @@ export function publicationOptions(metadata: Record<string, unknown>, blocks: Ri
   const toc = metadata.toc;
   const tocRecord = toc && typeof toc === 'object' && !Array.isArray(toc) ? toc as Record<string, unknown> : {};
   const requestedDepth = tocRecord.depth ?? metadata.toc_depth;
-  const tocDepth: 2 | 3 | 4 = requestedDepth === 4 ? 4 : requestedDepth === 3 ? 3 : 2;
+  const tocDepth: 2 | 3 | 4 = requestedDepth === 2 ? 2 : requestedDepth === 3 ? 3 : 4;
   const publication = metadata.publication;
   const publicationRecord = publication && typeof publication === 'object' && !Array.isArray(publication)
     ? publication as Record<string, unknown>
@@ -144,13 +145,13 @@ interface MarkdownHeading {
 }
 
 function markdownHeadings(block: RichBlock): MarkdownHeading[] {
-  return Array.from(blockText(block).matchAll(/^(#{1,4})\s+(.+?)\s*#*\s*$/gm))
-    .map((match, index) => ({
+  return extractMarkdownHeadings(blockText(block))
+    .filter(heading => heading.level <= 4)
+    .map((heading, index) => ({
       index,
-      label: match[2].trim(),
-      sourceLevel: match[1].length,
-    }))
-    .filter((heading) => Boolean(heading.label));
+      label: heading.text,
+      sourceLevel: heading.level,
+    }));
 }
 
 function navigationTitle(block: RichBlock): string {
@@ -171,26 +172,33 @@ function nestedMarkdownLevel(
   return Math.min(4, blockLevel + relative) as 2 | 3 | 4;
 }
 
-export function buildTocItems(blocks: RichBlock[], depth: 2 | 3 | 4 = 2): TocItem[] {
+export function buildTocItems(blocks: RichBlock[], depth: 2 | 3 | 4 = 4): TocItem[] {
   const allocateId = createIdAllocator();
   const items: TocItem[] = [];
   const visit = (current: RichBlock[], level: 2 | 3 | 4) => {
+    // Untitled Markdown blocks form one outline at this structural level.
+    const sourceLevels = current
+      .filter(block => blockType(block) === 'markdown' && !blockTitle(block))
+      .flatMap(block => markdownHeadings(block).map(heading => heading.sourceLevel));
+    const markdownBase = sourceLevels.length ? Math.min(...sourceLevels) : 1;
     for (const block of current) {
       const title = navigationTitle(block);
       const type = blockType(block);
+      const headings = type === 'markdown' ? markdownHeadings(block) : [];
+      const headingLevel = headings.length && !blockTitle(block)
+        ? nestedMarkdownLevel(headings[0], level, markdownBase, false)
+        : level;
       if (title && type !== 'hero' && type !== 'divider' && level <= depth) {
         const requestedAnchor = slugBase(String(block.id ?? block.anchor ?? title));
         const anchor = allocateId(requestedAnchor);
-        items.push({ anchor, requestedAnchor, label: title, level, block });
+        if (headingLevel <= depth) items.push({ anchor, requestedAnchor, label: title, level: headingLevel, block });
         if (type === 'markdown') {
-          const headings = markdownHeadings(block);
           const start = blockTitle(block) ? 0 : 1;
-          const firstSourceLevel = headings[0]?.sourceLevel ?? 1;
           headings.slice(start).forEach((heading) => {
             const nestedLevel = nestedMarkdownLevel(
               heading,
               level,
-              firstSourceLevel,
+              markdownBase,
               Boolean(blockTitle(block)),
             );
             if (nestedLevel > depth) return;

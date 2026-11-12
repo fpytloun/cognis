@@ -65,6 +65,14 @@ describe('embedded docs registry', () => {
     expect(guide?.content).toContain('Runtime capabilities, permissions, safety gates');
   });
 
+  it('embeds the Work Feedback guide and rewrites its overview link', async () => {
+    const guide = await getEmbeddedDoc('work-feedback');
+    expect(guide?.title).toBe('Work Feedback');
+    expect(guide?.content).toContain('Sent comments arrive with the message or task revision itself');
+    expect(guide?.content).toContain('Captures record **observed pixels**');
+    expect((await loadDocsOverviewContent()).content).toContain('](/docs/work-feedback)');
+  });
+
   it('rewrites internal relative doc links to supported embedded or repo targets', async () => {
     const docsOverview = await loadDocsOverviewContent();
     expect(docsOverview.content).toContain('/blob/main/docs/specs/README.md');

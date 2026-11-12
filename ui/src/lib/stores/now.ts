@@ -12,6 +12,8 @@ import { readable } from 'svelte/store';
  * actually uses the value.
  */
 export const now = readable(Date.now(), (set) => {
+  // Module import and the previous subscription may be much older than this view.
+  set(Date.now());
   if (typeof window === 'undefined') return;
 
   let timer: ReturnType<typeof setInterval> | null = null;

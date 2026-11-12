@@ -7,6 +7,7 @@ import { attachmentUploads } from './attachment-uploads';
 import { snapshotPersistedMetadata } from './persisted-metadata';
 import { sameSubmissionInput } from './submission-input';
 import type { ChatMode } from './types';
+import type { IncludedFeedback } from '$lib/feedback/types';
 
 export interface ComposerView {
   conversationId: string;
@@ -17,6 +18,7 @@ export interface ComposerView {
   chat_mode: ChatMode | null;
   text: string;
   attachments: AttachmentRef[];
+  feedback?: IncludedFeedback | null;
 }
 
 function attachmentInput(refs: AttachmentRef[]): string {
@@ -53,7 +55,7 @@ export class ComposerSubmission {
     if (!this.draft) throw new Error('Draft changed in another window. Input retained; review it before sending.');
     this.entry = await outbox.reserve(this.entry, { version: 1, draft_key: compositeDraftKey(this.view.draftKey),
       input_revision: this.view.input_revision, input: {
-        text: this.view.text, attachments: this.view.attachments, chat_mode: this.view.chat_mode,
+        text: this.view.text, attachments: this.view.attachments, chat_mode: this.view.chat_mode, feedback: this.view.feedback,
       } });
     if (this.entry.status === 'preparing') {
       await this.uploads.prepare(this.entry.attachments, this.lease);
@@ -75,7 +77,7 @@ export class ComposerSubmission {
   }
   canResize(current: ComposerView): boolean {
     return this.clearedRevision !== null && this.isCurrentView(current)
-      && current.revision === this.clearedRevision && current.text === '' && current.attachments.length === 0;
+      && current.revision === this.clearedRevision && current.text === '' && current.attachments.length === 0 && !current.feedback;
   }
   isCurrentView(current: ComposerView): boolean {
     try { this.lease.assertCurrent(); } catch { return false; }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { findTarget, installFind, registerFindWorkspace } from './find';
+import { findTarget, installFind, registerFindWorkspace, requestFind } from './find';
 import { registerOverlay, resetOverlayState } from './stores/overlays';
 
 const cleanups: Array<() => void> = [];
@@ -30,6 +30,47 @@ afterEach(() => {
 });
 
 describe('contextual Find key delivery', () => {
+  it('opens an explicitly selected inline document without changing the primary shortcut target', async () => {
+    start();
+    const chat = input(document.body, { primary: true });
+    const root = document.createElement('section');
+    const field = document.createElement('input');
+    document.body.append(root); root.append(field);
+    const registration = findTarget(root, { scopeOnly: true, open: async () => field });
+    cleanups.push(registration.destroy);
+    expect(requestFind(root)).toBe(true);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(field);
+    chat.focus();
+    key();
+    expect(document.activeElement).toBe(chat);
+    const modal = registerOverlay({ kind: 'blocking', blocksChrome: true, root: () => chat });
+    expect(requestFind(root)).toBe(false);
+    modal.unregister();
+  });
+  it('keeps iframe-requested document find inside the current modal boundary, including deferred focus', async () => {
+    start();
+    const root = document.createElement('section'), field = document.createElement('input');
+    document.body.append(root); root.append(field);
+    let finish!: (input: HTMLInputElement) => void;
+    const registration = findTarget(root, { primary: true, open: () => new Promise(resolve => { finish = resolve; }) });
+    cleanups.push(registration.destroy);
+    const blocked = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    expect(requestFind(root)).toBe(false);
+    expect(document.activeElement).toBe(document.body);
+    blocked.unregister();
+    expect(requestFind(root)).toBe(true);
+    const nested = registerOverlay({ kind: 'blocking', blocksChrome: true });
+    finish(field);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(document.body);
+    nested.unregister();
+    expect(requestFind(root)).toBe(true);
+    finish(field);
+    await Promise.resolve();
+    expect(document.activeElement).toBe(field);
+  });
+
   it('focuses and selects without input, change or submit events', () => {
     start();
     const target = input();

@@ -1,22 +1,26 @@
 <script lang="ts">
   import { renderInlineMarkdown, renderInlineMarkdownNoLinks, stripMarkdown } from '$lib/markdown';
   import { blockText, blockTitle, type RichBlock } from '$lib/rich-deliverable';
-  import { asTypedCell, blockSpan, blockSurface, tableColumns, tableRows, valueText, type TypedTableCell } from '../block-helpers';
+  import { asTypedCell, blockSpan, blockSurface, tableColumns, tableRows, tableRangeGrid, valueText, type TypedTableCell } from '../block-helpers';
   import { sortMatrixRows, type MatrixSort, type SortDirection } from '../evidence-helpers';
   import RichProgressBar from '../RichProgressBar.svelte';
+  import { richRenderedField, richRenderedTable, tableSource } from '$lib/feedback/annotations/rich';
+  import { getFeedbackSurface } from '$lib/feedback/context';
 
-  export let block: RichBlock;
-  export let type = 'table';
+  let { block, type = 'table' }: { block: RichBlock; type?: string } = $props();
+  const feedbackSurface = getFeedbackSurface();
+  const elementMode = $derived(feedbackSurface?.binding?.mode === 'comment' && feedbackSurface.binding.tool === 'element');
 
-  let sort: MatrixSort | null = null;
+  let sort = $state<MatrixSort | null>(null);
 
-  $: rows = tableRows(block);
-  $: columns = tableColumns(block, rows);
-  $: sortedRows = sortMatrixRows(rows, sort);
-  $: surface = blockSurface(block);
-  $: span = blockSpan(block);
-  $: numberedRows = columns.length === 3 && rows.length > 0
-    && rows.every(row => /^\d+$/.test(String(row[columns[0].key] ?? '')));
+  const rows = $derived(tableRows(block));
+  const columns = $derived(tableColumns(block, rows));
+  const rangeGrid = $derived(tableRangeGrid(block, rows, columns));
+  const sortedRows = $derived(sortMatrixRows(rows, sort));
+  const surface = $derived(blockSurface(block));
+  const span = $derived(blockSpan(block));
+  const numberedRows = $derived(columns.length === 3 && rows.length > 0
+    && rows.every(row => /^\d+$/.test(String(row[columns[0].key] ?? ''))));
 
   function sortBy(key: string) {
     const direction: SortDirection = sort?.key === key && sort.direction === 'asc' ? 'desc' : 'asc';
@@ -41,13 +45,20 @@
     const max = Number.isFinite(cell.max) ? cell.max : 100;
     return `${valueText(cell.value)} / ${max}`;
   }
+  function provenance(row: Record<string, unknown>, key: string) {
+    const source = tableSource(row), path = source?.cells[key] ?? [];
+    const value = row[key], cell = asTypedCell(value);
+    const text = typeof value === 'string' ? path : cell && typeof cell.label === 'string' ? [...path, 'label']
+      : cell && typeof cell.value === 'string' ? [...path, 'value'] : null;
+    return { cell: path, row: source?.row ?? [], text };
+  }
 </script>
 
 <section class="rich-table-card" data-rich-block-type={type} data-rich-surface={surface} style:grid-column={span ? `span ${span}` : undefined}>
   {#if blockTitle(block)}<h4>{@html renderInlineMarkdown(blockTitle(block))}</h4>{/if}
   {#if blockText(block, 'description')}<p>{@html renderInlineMarkdown(blockText(block, 'description'))}</p>{/if}
   <div class="rich-table-wrap">
-    <table class:rich-table-numbered={numberedRows}>
+    <table use:richRenderedTable={rangeGrid} class:rich-table-numbered={numberedRows} role={elementMode ? 'grid' : undefined}>
       {#if blockText(block, 'caption') || block.__table_number}
         <caption>{#if block.__table_number}<strong>Table {String(block.__table_number)}. </strong>{/if}{@html renderInlineMarkdown(blockText(block, 'caption'))}</caption>
       {/if}
@@ -55,7 +66,7 @@
         <tr>
           {#each columns as col}
             <th class:align-right={col.align === 'right'} aria-sort={ariaSort(col.key)}>
-              <button type="button" class="rich-table-sort-button" on:click={() => sortBy(col.key)} aria-label={`Sort by ${stripMarkdown(col.label)}`}>
+              <button type="button" class="rich-table-sort-button" onclick={() => sortBy(col.key)} aria-label={`Sort by ${stripMarkdown(col.label)}`}>
                 <span>{@html renderInlineMarkdownNoLinks(col.label)}</span>
                 {#if sort?.key === col.key}<span aria-hidden="true">{sort.direction === 'asc' ? '↑' : '↓'}</span>{/if}
               </button>
@@ -66,10 +77,12 @@
       <tbody>
         {#each sortedRows as row}
           <tr>
-            {#each columns as col}
+            {#each columns as col, columnIndex}
               {@const cell = asTypedCell(row[col.key])}
               {@const align = cellAlign(col.align, cell)}
               <td
+                role={elementMode ? 'gridcell' : undefined} tabindex={elementMode ? 0 : undefined}
+                use:richRenderedField={{ ...provenance(row, col.key), column: columnIndex }}
                 data-label={stripMarkdown(col.label)}
                 data-cell-type={cell?.type}
                 class:align-right={col.align === 'right'}

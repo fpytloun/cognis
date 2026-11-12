@@ -1,8 +1,14 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import ChatV2TimelineItemRenderer from './ChatV2TimelineItemRenderer.svelte';
 import type { CompactionTimelineItem, MessageTimelineItem, TimelineScope, ToolCallTimelineItem } from '$lib/chat-v2/types';
+import { api } from '$lib/api/client';
+import type { Deliverable, TaskDetail } from '$lib/types/api';
+
+beforeAll(async () => {
+  await import('../ToolCallDetails.svelte');
+});
 
 const sourceRefs = [{ store: 'intaris', session_id: 'sess_1', seq: 1, event_type: 'message' }];
 const scope: TimelineScope = {
@@ -76,6 +82,69 @@ afterEach(() => {
 });
 
 describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
+  it('keeps successful task prose visible with a task footer', () => {
+    render(ChatV2TimelineItemRenderer, {
+      item: { ...message('assistant', '**Morning brief:** three launches are ready.'),
+        task_outcome: { task_id: 'daily-brief', title: 'Daily brief', status: 'completed', attempt_number: 2 } },
+      scope,
+    });
+    expect(screen.getByText('Morning brief:')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Daily brief · Attempt 2' })).toBeTruthy();
+    expect(screen.queryByTestId('task-outcome-card')).toBeNull();
+  });
+
+  it('renders task handling as a clickable row, without a generic boundary or card', () => {
+    render(ChatV2TimelineItemRenderer, {
+      item: { ...message('system', 'Handling task: Daily brief (failed)'),
+        notice_kind: 'turn_initiated',
+        task_outcome: { task_id: 'daily-brief', title: 'Daily brief', status: 'failed', attempt_number: 2 } },
+      scope,
+    });
+    expect(screen.getByRole('button', { name: 'Handling task: Daily brief (failed)' })).toBeTruthy();
+    expect(screen.queryByText(/Turn initiated by/)).toBeNull();
+    expect(screen.queryByTestId('task-outcome-card')).toBeNull();
+  });
+
+  it('keeps a successful canonical deliverable expanded with its task footer', async () => {
+    const document = { deliverable_id: 'daily-document', content: 'Stock and pricing are verified.',
+      format: 'markdown', title: 'Today at a glance', outputs: {}, status: 'published',
+      version: 1, attempt_number: 2 } as Deliverable;
+    render(ChatV2TimelineItemRenderer, {
+      item: { id: 'daily-document', kind: 'assistant_deliverable', sort_key: '0001',
+        source_refs: [], stable: true, deliverable_id: document.deliverable_id,
+        format: 'markdown', deliverable: document,
+        task_outcome: { task_id: 'daily-brief', title: 'Daily brief', status: 'completed', attempt_number: 2 } },
+      scope,
+    });
+    expect(await screen.findByText('Stock and pricing are verified.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Daily brief · Attempt 2' })).toBeTruthy();
+    expect(screen.queryByTestId('task-outcome-card')).toBeNull();
+  });
+
+  it('renders a structured failed outcome and reveals attempt-scoped steps on expansion', async () => {
+    vi.spyOn(api.tasks, 'detail').mockResolvedValue({
+      step_runs: [
+        { step_run_id: 'collect-old', step_name: 'Old collect', status: 'completed', attempt_number: 1 },
+        { step_run_id: 'collect', step_name: 'Collect sources', status: 'failed', attempt_number: 2 },
+      ],
+    } as TaskDetail);
+    render(ChatV2TimelineItemRenderer, {
+      item: { id: 'task:daily-brief:2', kind: 'task', sort_key: '0001', source_refs: [], stable: true,
+        task_id: 'daily-brief', title: 'Daily brief', status: 'failed', attempt_number: 2,
+        workflow_step: 'Collect', failure_reason: 'Source unavailable', deliverable_ids: [], attachments: [] },
+      scope,
+    });
+    expect(await screen.findByText('Source unavailable')).toBeTruthy();
+    expect(screen.getByText('Attempt 2 · Step: Collect')).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Go to task page' }).getAttribute('href')).toBe('/tasks/daily-brief');
+    expect(screen.queryByText('Collect sources')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Show steps' }));
+    expect(await screen.findByText('Collect sources')).toBeTruthy();
+    expect(screen.queryByText('Old collect')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Hide steps' }));
+    expect(screen.queryByText('Collect sources')).toBeNull();
+  });
+
   it.each([
     ['conversation', scope],
     ['session', { key: 'session:sess_1', kind: 'session', session_id: 'sess_1', conversation_id: 'conv_1' }],
@@ -94,7 +163,7 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
       const renderedTool = render(ChatV2TimelineItemRenderer, { item: tool(), scope: timelineScope });
       expect(renderedTool.container.querySelector('[data-kind="tool_call"] article')).toBeTruthy();
       await fireEvent.click(screen.getByRole('button', { name: /grep canonical/i }));
-      expect(screen.getByText('matched')).toBeTruthy();
+      expect(await screen.findByText('matched')).toBeTruthy();
       expect(screen.getByText(/Open full output/i)).toBeTruthy();
     },
   );
@@ -131,7 +200,7 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
   it('preserves user messages and gives system messages a compact activity row', () => {
     const user = render(ChatV2TimelineItemRenderer, { item: message('user', '# User Markdown'), scope });
     expect(user.container.querySelector('[data-role="user"] .prose-user h1')?.textContent).toBe('User Markdown');
-    expect(user.container.querySelector('[data-role="user"] .prose-user')?.classList).toContain('prose-invert');
+    expect(user.container.querySelector('[data-role="user"] .prose-user')?.classList).not.toContain('prose-invert');
     user.unmount();
 
     const system = render(ChatV2TimelineItemRenderer, { item: message('system', 'System notice'), scope });

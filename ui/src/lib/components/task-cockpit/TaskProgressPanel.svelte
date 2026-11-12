@@ -3,6 +3,7 @@
   import Circle from 'lucide-svelte/icons/circle';
   import ExternalLink from 'lucide-svelte/icons/external-link';
   import TodoStatusDot from '$lib/components/TodoStatusDot.svelte';
+  import StatusBadge from '$lib/components/ui/StatusBadge.svelte';
   import type { TaskProgressProjection, TaskProgressTodo } from '$lib/types/api';
   import { renderMarkdown } from '$lib/markdown';
 
@@ -14,6 +15,12 @@
     if (todo.status === 'completed') return 'done';
     if (['in_progress', 'active', 'running'].includes(todo.status)) return 'active';
     return 'pending';
+  }
+
+  /** A child stopped by its parent was cancelled, not failed on its own. */
+  function workStatus(item: TaskProgressProjection['work_items'][number]): string {
+    if (item.status === 'failed' && /cancell?ed by (the )?parent/i.test(item.error ?? '')) return 'cancelled';
+    return item.status;
   }
 
   function workHref(item: TaskProgressProjection['work_items'][number]): string | null {
@@ -39,7 +46,8 @@
   {:else if todos.length === 0 && workItems.length === 0}
     <p class="mt-4 rounded-xl border border-dashed border-control-border px-4 py-4 text-sm text-muted">No plan or nested work has been reported. This can be normal for deterministic or not-yet-started steps.</p>
   {:else}
-    <div class="mt-4 grid gap-4 lg:grid-cols-2">
+    <!-- Stacked: a short todo list must not leave half the panel empty beside long nested work. -->
+    <div class="mt-4 space-y-5">
       <div>
         <h3 class="text-xs font-medium uppercase tracking-[0.2em] text-quiet">Current step todos</h3>
         {#if todos.length > 0}
@@ -59,7 +67,7 @@
       <div>
         <h3 class="text-xs font-medium uppercase tracking-[0.2em] text-quiet">Delegated and managed work</h3>
         {#if workItems.length > 0}
-          <div class="mt-2 space-y-2">
+          <div class="mt-2 grid gap-2 xl:grid-cols-2">
             {#each workItems as item (item.work_id)}
               {@const href = workHref(item)}
               {@const workTitle = item.title || `${item.agent_id} · ${item.step_name}`}
@@ -69,11 +77,11 @@
                     <p class="truncate text-sm font-medium text-foreground">{workTitle}</p>
                     <p class="mt-0.5 text-xs text-quiet">{item.agent_id} · {item.step_name}</p>
                   </div>
-                  <span class="text-[10px] font-semibold uppercase tracking-wide text-violet-tone">{item.status}</span>
+                  <StatusBadge status={workStatus(item)} />
                   {#if href}<a href={href} aria-label={`Open ${workTitle}`} class="text-violet-tone hover:text-strong"><ExternalLink class="h-4 w-4" /></a>{/if}
                 </div>
                 {#if item.result_summary}<div class="prose prose-sm prose-invert mt-2 max-w-none text-xs leading-5 text-secondary">{@html renderMarkdown(item.result_summary)}</div>{/if}
-                {#if item.error}<div class="prose prose-sm prose-invert mt-2 max-w-none text-xs leading-5 text-danger">{@html renderMarkdown(item.error)}</div>{/if}
+                {#if item.error}<div class={`prose prose-sm prose-invert mt-2 max-w-none text-xs leading-5 ${workStatus(item) === 'failed' ? 'text-danger' : 'text-muted'}`}>{@html renderMarkdown(item.error)}</div>{/if}
                 {#if item.todos.length > 0}<p class="mt-2 text-xs text-quiet">{item.todos.filter((todo) => todo.status === 'completed').length}/{item.todos.length} todos completed</p>{/if}
               </article>
             {/each}

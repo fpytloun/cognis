@@ -2,7 +2,7 @@ import { api } from '$lib/api/client';
 import { confirmAction } from '$lib/stores/confirm';
 import type { Conversation } from '$lib/types/api';
 
-export type ManagedAction = 'stop' | 'send' | 'take-control';
+export type ManagedAction = 'stop' | 'send' | 'take-control' | 'close';
 
 /** Shared user-facing managed controls; the API remains the authority. */
 export async function performManagedAction(
@@ -10,6 +10,11 @@ export async function performManagedAction(
   action: ManagedAction,
   payload?: Record<string, unknown>,
 ): Promise<{ conversation: Conversation; followUpConversationId: string | null } | null> {
+  if (action === 'close' && !await confirmAction({
+    title: 'Terminate channel conversation?',
+    message: 'Stop the current turn and close the reply route. Both participants keep their visible history.',
+    confirmLabel: 'Terminate conversation',
+  })) return null;
   if (action === 'take-control' && !await confirmAction({
     title: 'Take control of managed conversation?',
     message: 'The managed conversation will be closed read-only and forked into a normal conversation.',

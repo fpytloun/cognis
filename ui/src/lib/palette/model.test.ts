@@ -33,6 +33,8 @@ describe('local discovery and safe highlighting', () => {
     expect(localItems('', false).some(row => row.kind === 'page')).toBe(false);
   });
   it('reuses settings role visibility and supports aliases', () => {
+    expect(localItems('usage', true, true, false).some((row) => row.href === '/usage')).toBe(false);
+    expect(localItems('usage', true, true, true).some((row) => row.href === '/usage')).toBe(true);
     expect(localItems('routes', true).some((row) => row.href === '/settings?tab=routing')).toBe(true);
     expect(localItems('routes', false)).toHaveLength(0);
     expect(localItems('models', false).some((row) => row.id === 'providers')).toBe(true);
