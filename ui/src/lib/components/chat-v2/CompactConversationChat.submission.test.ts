@@ -55,6 +55,22 @@ describe('compact durable submission', () => {
     return { ...component, conversationId, pending, prepare };
   }
 
+  it('persists each text-only edit with a distinct input intent', async () => {
+    const conversationId = crypto.randomUUID(), drafts = new DocumentDrafts();
+    const key = `cognis-chat-draft:${conversationId}`;
+    render(CompactConversationChat, { conversationId });
+    const input = screen.getByLabelText('Composer text');
+    await fireEvent.input(input, { target: { value: 'first compact edit' } });
+    await waitFor(() => expect(drafts.readComposite(key)?.text).toBe('first compact edit'));
+    const revision = drafts.readComposite(key)!.input_revision;
+    await fireEvent.input(input, { target: { value: 'newer compact edit' } });
+    await waitFor(() => {
+      const next = drafts.readComposite(key);
+      expect(next?.text).toBe('newer compact edit');
+      expect(next?.input_revision).not.toBe(revision);
+    });
+  });
+
   it('sends an attachment from dashboard with an untouched pinned composer open', async () => {
     const conversationId = crypto.randomUUID();
     const dashboard = render(CompactConversationChat, { conversationId });

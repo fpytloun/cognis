@@ -82,14 +82,14 @@ afterEach(() => {
 });
 
 describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
-  it('keeps successful task prose visible with a task footer', () => {
+  it('renders successful task prose as a normal message without an extra task row', () => {
     render(ChatV2TimelineItemRenderer, {
       item: { ...message('assistant', '**Morning brief:** three launches are ready.'),
         task_outcome: { task_id: 'daily-brief', title: 'Daily brief', status: 'completed', attempt_number: 2 } },
       scope,
     });
     expect(screen.getByText('Morning brief:')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Daily brief · Attempt 2' })).toBeTruthy();
+    expect(screen.queryByTestId('task-outcome-footer')).toBeNull();
     expect(screen.queryByTestId('task-outcome-card')).toBeNull();
   });
 
@@ -105,7 +105,7 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
     expect(screen.queryByTestId('task-outcome-card')).toBeNull();
   });
 
-  it('keeps a successful canonical deliverable expanded with its task footer', async () => {
+  it('renders a successful canonical deliverable unchanged, without an extra task row', async () => {
     const document = { deliverable_id: 'daily-document', content: 'Stock and pricing are verified.',
       format: 'markdown', title: 'Today at a glance', outputs: {}, status: 'published',
       version: 1, attempt_number: 2 } as Deliverable;
@@ -117,7 +117,7 @@ describe('ChatV2TimelineItemRenderer shared presentation boundary', () => {
       scope,
     });
     expect(await screen.findByText('Stock and pricing are verified.')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Daily brief · Attempt 2' })).toBeTruthy();
+    expect(screen.queryByTestId('task-outcome-footer')).toBeNull();
     expect(screen.queryByTestId('task-outcome-card')).toBeNull();
   });
 

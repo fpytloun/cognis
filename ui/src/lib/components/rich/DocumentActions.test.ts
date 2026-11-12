@@ -4,15 +4,14 @@ import DocumentActions from './DocumentActions.svelte';
 import './PublicLinkDialog.svelte';
 
 describe('DocumentActions sharing', () => {
-  it('offers the same search action in the toolbar and extended menu', async () => {
+  it('keeps document search in the extended menu', async () => {
     let searching = false;
     const view = render(DocumentActions, { onSearch: () => { searching = true; } });
-    await fireEvent.click((await screen.findAllByRole('button', { name: 'Search in document' }))[0]);
-    expect(searching).toBe(true);
-    searching = false;
     await fireEvent.click(screen.getByLabelText('More document actions'));
     const menu = within(view.container.querySelector('.chat-document-menu')! as HTMLElement);
-    await fireEvent.click(await menu.findByRole('button', { name: 'Search in document' }));
+    const search = await menu.findByRole('button', { name: 'Search in document' });
+    expect(screen.getAllByRole('button', { name: 'Search in document' })).toEqual([search]);
+    await fireEvent.click(search);
     expect(searching).toBe(true);
     expect(view.container.querySelector('details')?.open).toBe(false);
   });

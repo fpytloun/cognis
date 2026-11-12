@@ -563,13 +563,6 @@
   {/if}
   {#if copyError}<p class="rich-action-error" role="alert">{copyError}</p>{/if}
 
-  {#if !fullscreenOnly && chatFlow && !hosted}
-    <header class="chat-document-footer" data-find-toolbar data-testid="chat-document-footer">
-      {@render footer?.()}
-      {@render documentActions()}
-    </header>
-  {/if}
-
   {#if !fullscreenOnly && !fullOpen && inlineExpanded}
   <div
     id={`${instanceNamespace}-inline-document`}
@@ -608,6 +601,10 @@
 
   {#if !fullscreenOnly && chatFlow && !hosted}
     {#if !inlineExpanded}<svelte:element this={documentHeadingLevel === 1 ? 'h1' : 'h2'} class="chat-document-summary">{effectiveTitle || 'Deliverable'}</svelte:element>{/if}
+    <footer class="chat-document-footer" data-find-toolbar data-testid="chat-document-footer">
+      {@render footer?.()}
+      {@render documentActions()}
+    </footer>
   {/if}
 
   {#if fullOpen}

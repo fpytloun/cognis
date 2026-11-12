@@ -51,7 +51,12 @@ describe('AttachmentPreviewModal', () => {
       const onClose = vi.fn();
       render(AttachmentPreviewModal, { attachment: attachment('report.txt', 'text/plain'), kind: 'text', onClose, resolveDownloadUrl: vi.fn() });
       await screen.findByText('Ready for review.');
-      await fireEvent.click(screen.getByRole('button', { name: 'Search in document' }));
+      const more = screen.getByLabelText('More actions');
+      const menu = more.closest('details')!;
+      await fireEvent.click(more);
+      const search = within(menu).getByRole('button', { name: 'Search in document' });
+      expect(screen.getAllByRole('button', { name: 'Search in document' })).toEqual([search]);
+      await fireEvent.click(search);
       const field = await screen.findByRole('searchbox');
       await waitFor(() => expect(field).toHaveFocus());
       const closeSearch = screen.getByRole('button', { name: 'Close search' });

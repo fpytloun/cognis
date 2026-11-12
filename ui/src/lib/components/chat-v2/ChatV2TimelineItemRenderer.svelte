@@ -115,9 +115,6 @@
     {providerRecovery}
     {taskFreshness}
   />
-  {#if (item.kind === 'message' || item.kind === 'assistant_deliverable') && item.task_outcome}
-    <TaskOutcomeLink task={item.task_outcome} />
-  {/if}
   </div>
   </ChatFeedbackIntent>
   </FeedbackWorkspace>

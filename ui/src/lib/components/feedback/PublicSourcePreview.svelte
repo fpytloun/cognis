@@ -11,6 +11,7 @@
   import CompactHeaderActions from '../CompactHeaderActions.svelte';
   import Search from 'lucide-svelte/icons/search';
   import { requestFind } from '$lib/find';
+  import { isCompactViewport } from '$lib/stores/viewport';
   import { normalizeThemeFamily } from '$lib/theme/catalog';
   import { fetchHostedAppearance, loadViewerTheme, resolveViewerTheme, viewerTheme, type ViewerAppearance } from '../rich/viewer-theme';
   let { content, mediaUrl, guard, contentRef, client }: {
@@ -103,12 +104,11 @@
     <header data-find-toolbar class="flex min-h-12 shrink-0 items-center gap-3 border-b border-separator bg-surface px-3 pt-[env(safe-area-inset-top)]">
       <h1 class="min-w-0 flex-1 truncate text-sm font-medium">{content.filename}</h1>
       <div data-find-actions class="flex shrink-0 items-center gap-2">
-        {#if searchable}<Button variant="ghost" size="icon" aria-label="Search in document" title="Search in document (⌘F / Ctrl+F)" onclick={searchDocument}><Search size={18} /></Button>{/if}
         <FeedbackIndicator />
-        <CompactHeaderActions>
+        <CompactHeaderActions alwaysShowMenu={searchable}>
           {#snippet children(menu: boolean)}
             {#if menu && searchable}<Button variant="ghost" size="inline" data-menu-close onclick={searchDocument}><Search size={18} />Search in document</Button>{/if}
-            {@render controls()}
+            {#if !menu || $isCompactViewport}{@render controls()}{/if}
           {/snippet}
         </CompactHeaderActions>
       </div>

@@ -66,12 +66,43 @@ for (const width of [390, 1440]) {
     await expect(strip.getByText('Plan common', { exact: true })).toHaveCount(0);
     await expect(strip.getByText(/Refreshed/)).toHaveCount(0);
     await expect(cards.nth(2).getByRole('button', { name: 'Refresh Codex' })).toHaveAttribute('title', /Refreshed/);
+    const firstCard = cards.nth(0);
+    const cardBox = (await firstCard.boundingBox())!;
+    const refreshBox = (await firstCard.getByRole('button', { name: 'Refresh Anthropic', exact: true }).boundingBox())!;
+    const rootFontSize = await page.locator('html').evaluate(node => getComputedStyle(node).fontSize);
+    await test.info().attach('provider-control-geometry.json', {
+      contentType: 'application/json',
+      body: JSON.stringify({
+        card: cardBox, refresh: refreshBox,
+        rootFontSize,
+        usage: await firstCard.getByTestId('provider-usage-bars').locator('div, p, span').evaluateAll(nodes =>
+          nodes.map(node => ({ className: node.className, rect: node.getBoundingClientRect().toJSON() }))),
+      }),
+    });
+    expect((await strip.boundingBox())!.height).toBeLessThan(135);
+    for (const name of ['5-hour', 'Weekly', 'Sonnet']) {
+      await expect(firstCard.getByText(name, { exact: true })).toBeVisible();
+    }
+    // Preserve the existing two-rem control at the application's actual root size.
+    expect(refreshBox.width).toBeGreaterThanOrEqual(2 * parseFloat(rootFontSize));
+    expect(refreshBox.height).toBeGreaterThanOrEqual(2 * parseFloat(rootFontSize));
+    expect(refreshBox.y).toBeGreaterThanOrEqual(cardBox.y - 1);
+    expect(refreshBox.x + refreshBox.width).toBeLessThanOrEqual(cardBox.x + cardBox.width + 1);
+    for (const name of ['5-hour', 'Weekly', 'Sonnet']) {
+      const labelBox = (await firstCard.getByText(name, { exact: true }).boundingBox())!;
+      const intersects = labelBox.x < refreshBox.x + refreshBox.width - 1
+        && labelBox.x + labelBox.width > refreshBox.x + 1
+        && labelBox.y < refreshBox.y + refreshBox.height - 1
+        && labelBox.y + labelBox.height > refreshBox.y + 1;
+      expect(intersects, `${name} overlaps the refresh control`).toBe(false);
+    }
     // Limit labels stay unclipped; cards scroll horizontally rather than squeezing labels.
     for (const bar of await cards.nth(0).getByRole('progressbar').all()) {
       const label = bar.locator('..').locator('span').first();
       expect(await label.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
     }
     await expect(cards.nth(2).getByText('LiteLLM', { exact: true })).toBeAttached();
+    await expect(cards.nth(2).getByRole('progressbar')).toHaveCount(1);
     await expect(cards.nth(3).getByText('Ollama (Laptop)', { exact: true })).toBeAttached();
     await expect(cards.nth(3).getByRole('progressbar')).toHaveCount(0);
     await expect(page.getByTestId('control-center-summary')).toHaveCount(0);

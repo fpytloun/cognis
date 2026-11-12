@@ -10,6 +10,8 @@
   & .rich-document.rich-inline-document {
     display: block; padding: 0; margin: 0; max-width: none;
   }
+  /* Chat documents share the message text column, so the body adds no inset. */
+  &:not(.hosted) .rich-document.rich-inline-document > .rich-body { padding: 0; }
   &.hosted .rich-document.rich-inline-document { padding: 18px 16px 40px; }
   & .rich-document.rich-inline-document.chat-toc-enabled {
     display: grid; grid-template-columns: minmax(0, 1fr) 2rem; gap: .5rem;
@@ -35,13 +37,9 @@
   & .chat-document-summary { margin: 0; font-weight: 600; }
   & .chat-document-footer {
     display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem;
-    min-height: 2.75rem;
-    margin: .5rem 0 .85rem;
+    margin-top: .85rem;
   }
   & .chat-document-footer .revision-bar { margin: 0; }
-  /* Keep desktop icons compact while reserving a stable search row and touch targets. */
+  /* Inline chat documents use the same compact icon size as assistant message actions on every pointer. */
   & .chat-document-footer .chat-document-actions { --rich-action-size: 1.5rem; --rich-action-icon-size: .875rem; --rich-action-radius: .375rem; }
-  @media (pointer: coarse) {
-    & .chat-document-footer .chat-document-actions { --rich-action-size: 2.75rem; }
-  }
 }

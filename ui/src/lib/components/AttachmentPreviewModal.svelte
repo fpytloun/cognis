@@ -20,6 +20,7 @@
   import AttachmentSaveButton from './AttachmentSaveButton.svelte';
   import CompactHeaderActions from './CompactHeaderActions.svelte';
   import { isTopOverlay, registerOverlay } from '$lib/stores/overlays';
+  import { isCompactViewport } from '$lib/stores/viewport';
   import type { AttachmentRef } from '$lib/types/api';
   import DocumentLinkActions from './rich/DocumentLinkActions.svelte';
   import DocumentFavoriteButton from './DocumentFavoriteButton.svelte';
@@ -173,7 +174,6 @@
         <DocumentFavoriteButton kind="artifact" id={shown.attachment.artifact_id} />
       </div>
       <div data-find-actions class="flex shrink-0 items-center gap-2">
-        {#if searchable}<Button variant="ghost" size="icon" class="document-icon-action" aria-label="Search in document" title="Search in document (⌘F / Ctrl+F)" onclick={searchDocument}><Search size={18} /></Button>{/if}
         <FeedbackIndicator />
         <DeferredPrivateView definition={deliverableAudio} label="audio controls" viewProps={{ sourceRef: shown.attachment.artifact_id, client: appDocumentAudioClient, rich: true }} />
         {#if revisions.length > 1}
@@ -184,13 +184,15 @@
               onSelect={revision => void showRevision(revision)} />
           {/key}
         {/if}
-        <CompactHeaderActions>
+        <CompactHeaderActions alwaysShowMenu={searchable}>
           {#snippet children(menu: boolean)}
             {#if menu && searchable}<Button variant="ghost" size="inline" data-menu-close onclick={searchDocument}><Search size={18} />Search in document</Button>{/if}
+            {#if !menu || $isCompactViewport}
             {#key shown.attachment.artifact_id}
             <AttachmentSaveButton filename={shown.attachment.filename} resolveUrl={downloadUrl} class="document-icon-action" label={menu ? 'Download' : ''} />
             {/key}
             <DocumentLinkActions internalUrl={`/library/artifact/${encodeURIComponent(shown.attachment.artifact_id)}`} createLink={$sharingPermission ? createPublicLink : undefined} defaultMode={viewEligible(shown.attachment.mime_type ?? '', shown.attachment.filename) ? 'view' : 'download'} shareLabel={menu ? 'Share link' : ''} />
+            {/if}
           {/snippet}
         </CompactHeaderActions>
         <button bind:this={closeButton} class="inline-flex min-h-11 min-w-11 items-center justify-center rounded-lg text-foreground hover:bg-surface-hover" onclick={onClose} type="button" title="Close" aria-label="Close preview"><X class="h-5 w-5" /></button>

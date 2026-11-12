@@ -229,16 +229,17 @@
         <Button onclick={saveEdit} disabled={busy || !!validation || !filename.trim() || !dirty}>{busy ? 'Saving…' : 'Save changes'}</Button>
       {:else}
         {@render revisionControls()}
-        {#if searchable}<Button variant="ghost" size="icon" class="document-icon-action" aria-label="Search in document" title="Search in document (⌘F / Ctrl+F)" onclick={searchDocument}><Search size={18} /></Button>{/if}
         {#if canEdit && !$isCompactViewport}<Button variant="ghost" size="icon" class="document-icon-action" aria-label="Edit" title="Edit" disabled={busy || loading} onclick={startEdit}><Pencil size={18} /></Button>{/if}
-        <CompactHeaderActions>
+        <CompactHeaderActions alwaysShowMenu={searchable}>
           {#snippet children(menu: boolean)}
-            {#if menu && searchable}<Button variant="ghost" size="inline" data-menu-close onclick={searchDocument}><Search size={18} />Search in document</Button>{/if}
+             {#if menu && searchable}<Button variant="ghost" size="inline" data-menu-close onclick={searchDocument}><Search size={18} />Search in document</Button>{/if}
+             {#if !menu || $isCompactViewport}
             <!-- Phones fold edit and favourite into the menu so the title keeps its room. -->
             {#if menu && canEdit}<Button variant="ghost" size="inline" disabled={busy || loading} onclick={startEdit}><Pencil size={18} />Edit</Button>{/if}
             {#if menu}<DocumentFavoriteButton kind={item.kind} id={item.id} initial={item} showLabel />{/if}
             <AttachmentSaveButton filename={item.title || 'artifact'} resolveUrl={async () => (await api.artifacts.signedUrl(item.id, 3600, 'download')).url} class="document-icon-action" label={menu ? 'Download' : ''} />
-            <DocumentLinkActions internalUrl={libraryHref(item)} createLink={canMutate ? createPublicLink : undefined} defaultMode={viewEligible(item.format, item.title ?? '') ? 'view' : 'download'} shareLabel={menu ? 'Share link' : ''} />
+             <DocumentLinkActions internalUrl={libraryHref(item)} createLink={canMutate ? createPublicLink : undefined} defaultMode={viewEligible(item.format, item.title ?? '') ? 'view' : 'download'} shareLabel={menu ? 'Share link' : ''} />
+             {/if}
           {/snippet}
         </CompactHeaderActions>
       {/if}

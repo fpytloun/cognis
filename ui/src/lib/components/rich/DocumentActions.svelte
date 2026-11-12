@@ -95,9 +95,6 @@
 <nav data-find-actions class="chat-document-actions" aria-label="Document actions">
   {#if inlineDisclosure && collapsible}{@render collapseControl(true)}{/if}
   {@render revisionControls?.()}
-  {#if onSearch}
-    {@render searchControl(false)}
-  {/if}
   {#if openFullView}
   <button class="document-icon-action" type="button" aria-label="Open fullscreen" title="Open fullscreen" on:click={openFullView}>
     <Maximize aria-hidden="true" />

@@ -10,7 +10,10 @@
    * ⋯ menu on phones so the document title keeps its room. `children(true)` renders them as
    * labelled menu rows.
    */
-  let { children }: { children: Snippet<[boolean]> } = $props();
+  let { children, alwaysShowMenu = false }: {
+    children: Snippet<[boolean]>;
+    alwaysShowMenu?: boolean;
+  } = $props();
   let more = $state<HTMLDetailsElement>();
   // Touch browsers can blur the summary before the item's click lands; dismiss on outside press.
   function dismiss(event: PointerEvent) {
@@ -25,15 +28,16 @@
 </script>
 
 <svelte:window onpointerdown={dismiss} onkeydown={escape} />
-{#if $isCompactViewport}
+{#if !$isCompactViewport}
+  {@render children(false)}
+{/if}
+{#if $isCompactViewport || alwaysShowMenu}
   <details class="compact-header-more" bind:this={more}>
     <summary class="document-icon-action" aria-label="More actions" title="More actions"><Ellipsis aria-hidden="true" /></summary>
     <div class="compact-header-menu" use:anchoredMenu={{ preferredSide: 'below' }}>
       {@render children(true)}
     </div>
   </details>
-{:else}
-  {@render children(false)}
 {/if}
 
 <style>

@@ -1,10 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ChatV2ApiClient } from '$lib/chat-v2/api';
+import { tick } from 'svelte';
+import { ChatV2ApiClient } from '$lib/chat-v2/api';
 import type { Deliverable, StepRun } from '$lib/types/api';
 import type {
   ChatRealtimeFrame,
   ChatSnapshot,
+  QueueMessage,
   TimelineBackfillResponse,
   TimelineItem,
   TimelineScope,
@@ -420,6 +422,46 @@ describe('ScopedChatV2Timeline history backfill', () => {
     });
     expect(onInitialLoaded).toHaveBeenCalledOnce();
   }, 20_000);
+
+  it('does not deliver a queued initial-load callback after transcript disposal', async () => {
+    const disposalScope: TimelineScope = {
+      key: 'conversation:queued-disposal',
+      kind: 'conversation',
+      conversation_id: 'queued-disposal',
+    };
+    const onInitialLoaded = vi.fn();
+    const live = realtime();
+    let dispose: (() => void) | undefined;
+    let disposal = Promise.resolve();
+    let disposed = false;
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const api = new ChatV2ApiClient({ fetch });
+    const loadedSnapshot = snapshot(disposalScope, [message(1)], null);
+    loadedSnapshot.queue = {
+      messages: [{ queue_id: 'queued-disposal', content: 'Queued fixture message', attachments: [], position: 0 }],
+      queued_count: 1,
+    };
+    vi.spyOn(api, 'snapshot').mockResolvedValue(loadedSnapshot);
+    const view = render(ScopedChatV2Timeline, {
+      scope: disposalScope,
+      api,
+      realtime: live,
+      onInitialLoaded,
+      onQueueChange: (messages: QueueMessage[]) => {
+        if (!disposed && messages.some(message => message.queue_id === 'queued-disposal')) {
+          disposed = true;
+          dispose?.();
+        }
+      },
+    });
+    dispose = () => { disposal = Promise.resolve(view.unmount()); };
+    await waitFor(() => expect(disposed).toBe(true));
+    await disposal;
+    await tick();
+    expect(view.container.childElementCount).toBe(0);
+    expect(onInitialLoaded).not.toHaveBeenCalled();
+    expect(fetch).not.toHaveBeenCalled();
+  });
 
   it('does not signal initial load after a snapshot error', async () => {
     const onInitialLoaded = vi.fn();

@@ -556,7 +556,7 @@
   <div use:messageArrival={{ id: item.id, eligible: !compact && item.arrivalEligible === true, registry: arrivals }}
     class={`flex w-full min-w-0 items-start ${compact ? '' : 'gap-2 sm:gap-3'}`}>
     {#if !compact}
-      <div class="relative mt-0.5 shrink-0" data-copy-exclude>
+      <div class="chat-leading-avatar relative mt-0.5 shrink-0" data-copy-exclude>
         {#if agent}
           <button
             type="button"
@@ -773,6 +773,12 @@
   .chat-message-assistant > .chat-message-meta,
   .chat-message-assistant > .chat-markdown > :global(:not(.markdown-table-wrap, .chat-code-wrap, pre)) {
     max-width: var(--chat-assistant-measure);
+  }
+  /* Paper has no bubble, so assistant text uses the full column; the footer keeps the identity. */
+  :global([data-theme-family='paper']) .chat-leading-avatar { display: none; }
+  :global([data-theme-family='paper']) .chat-message-assistant {
+    padding-inline: 0;
+    border-inline-width: 0;
   }
   .streaming-markdown :global(.stream-reveal) {
     animation: stream-arrival var(--chat-motion-stream, 320ms) ease-out;
