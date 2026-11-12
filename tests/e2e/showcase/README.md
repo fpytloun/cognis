@@ -366,6 +366,21 @@ runtime and set `SWEEP_BASE_URL` to it. The `UI sweep question answer dialog`
 test answers the seeded question once per runtime and records the panel before
 and after.
 
+### Film scenes
+
+`film/capture.mjs` records product scenes as 1920x1080 MP4 clips: 1280x720 CSS at device
+scale 1.5, with a smooth cursor composited afterwards at 30 fps. It needs
+`ffmpeg` on `PATH`. Use a fresh runtime: the `feedback` scene sends a message,
+and `durable` creates the `Staging watch` workflow from
+`film/staging-watch-workflow.json`.
+
+```sh
+RUNTIME="$RUNTIME" node tests/e2e/showcase/film/capture.mjs dashboard pinned feedback durable library work usage models
+```
+
+Clips land in `tests/e2e/showcase/film/output/` (ignored) or `$FILM_OUT`.
+Editing, narration and music are outside this repository.
+
 ## Helper map
 
 - `prepare.py`: create a private runtime and attest running image identities.
@@ -378,6 +393,7 @@ and after.
 - `capture.spec.ts` and `playwright.config.ts`: browser capture and checkpoints.
 - `sweep.spec.ts`: per-batch UI sweep captures at desktop and phone size.
 - `tsconfig.json`: the capture's Node/Playwright type-check boundary.
+- `film/`: film scene capture and the demo workflow it creates.
 
 ## Teardown and fresh restore
 

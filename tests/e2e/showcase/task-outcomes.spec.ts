@@ -33,20 +33,15 @@ test('task outcome chat desktop and phone', async ({ browser }) => {
         }
       });
       await page.goto(new URL(`/chat/${fixture.conversation_id}`, seed.base_url).href);
-      const footer = page.getByTestId('task-outcome-footer');
-      await expect(footer).toContainText('Daily launch brief · Attempt 2');
-      await expect(page.getByText('Stock and pricing are verified.', { exact: false })).toBeVisible();
+      const success = page.getByText('Stock and pricing are verified.', { exact: false });
+      await expect(success).toBeVisible();
+      await expect(page.getByTestId('task-outcome-footer')).toHaveCount(0);
       const card = page.getByTestId('task-outcome-card');
       await expect(card.getByText('Partial output — task failed')).toBeVisible();
       await expect(page.getByText(/Loading deliverable/)).toHaveCount(0);
       await page.evaluate(async () => { await document.fonts.ready; });
-      await footer.scrollIntoViewIfNeeded();
+      await success.scrollIntoViewIfNeeded();
       await page.screenshot({ path: `${output}/${revision}-${name}-success.png` });
-      await footer.getByRole('button').click();
-      await expect(page.getByRole('dialog')).toContainText('Daily launch brief');
-      await expect(page.getByTestId('dashboard-entity-modal-external-link')).toBeVisible();
-      await page.keyboard.press('Escape');
-      await expect(page.getByRole('dialog')).toBeHidden();
       await expect(card).toContainText('The supplier feed did not respond.');
       await expect(card.getByText('Partial output — task failed')).toBeVisible();
       await card.scrollIntoViewIfNeeded();

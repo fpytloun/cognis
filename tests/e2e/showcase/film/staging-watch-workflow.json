@@ -1,0 +1,16 @@
+{
+  "workflow_id": "lumen-staging-watch",
+  "name": "Staging watch",
+  "description": "Checks staging every night without a model. Vela investigates only when a check fails.",
+  "tags": ["operations"],
+  "steps": [
+    {"name": "check_staging", "type": "tool_call", "description": "Read the latest staging health report on the executor.",
+     "tool_call": {"tool": "read", "args": {"file_path": "/home/cognis/staging/health.txt"},
+       "summary": "Staging health report", "timeout_seconds": 60}},
+    {"name": "any_failures", "type": "condition", "description": "Continue only when a check failed.",
+     "condition": {"if": "{{ 'FAIL' in (steps.check_staging.outputs | string) }}", "then": "investigate", "else": "all_clear"}},
+    {"name": "investigate", "type": "run", "objective": "Investigate the failed staging checks and write a short incident brief.",
+     "responsibilities": ["Read the failed checks", "Find the likely cause", "Write a short incident brief"]},
+    {"name": "all_clear", "type": "complete", "complete": {"summary": "All staging checks passed."}}
+  ]
+}

@@ -60,6 +60,15 @@ Vite: `cd ui && npx playwright test e2e/changelog.spec.ts`. Set `COGNIS_E2E_URL`
 when the app is not at the default `http://localhost:8080`. Browser tests in
 `ui/e2e/` must not depend on development-only module endpoints.
 
+For frozen-source qualification, export `COGNIS_E2E_CAPTURE_ROOT` to an absolute
+directory outside the checkout before running `uv run pytest tests/e2e/`. Raw captures go
+to its `golden/` directory and promoted captures to `canonical/`, without
+overwriting tracked fixtures. Keep the same variable exported for
+`make e2e-events-replay`: replay checks both the committed corpus and the fresh
+private captures, and rejects a missing or empty configured live corpus.
+Ordinary runs without this variable retain the tracked output locations.
+Review generated captures before explicitly promoting them into public source.
+
 ### Explicit native Chromium acceptance variant
 
 The Playwright configuration uses its normal bundled browser unless both
@@ -85,19 +94,40 @@ retain both Chromium and iPad coverage and use `COGNIS_E2E_URL`.
 
 The runner independently lists the complete test directory, verifies exactly
 one logical owner and all required device executions, then runs each harness
-sequentially under one unchanged 3600-second budget. Assertions, retry counts
-and per-config timeouts remain owned by the existing configurations. Missing
+sequentially under one unchanged 3600-second budget with one worker and zero
+retries, regardless of interactive configuration defaults. Assertions and
+per-config timeouts remain owned by the existing configurations. Missing
 cases, devices, execution results, `.only`, empty groups or failed commands
 fail the gate. Skips and flaky attempts remain explicit in each group's report.
 Reports and artifacts are retained separately per group. Set `--output-root`
 when invoking `uv run python scripts/run_browser_matrix.py` to retain a new run.
 `--inventory-only` checks routing but is not execution or release qualification.
 
+`make e2e-browser` binds the mock container through the same Compose project and
+files used to start the stack. Only the Compose harness receives that identity.
+Its barrier controls execute a fixed, deadline-bounded request on container
+loopback; published Docker ports do not satisfy the mock's loopback-only control
+gate. Missing or stale container identity fails without fallback or retry.
+Host-started mock servers retain normal loopback HTTP control.
+
+The component-runtime fixture compiles the real branding, streaming, scoped
+timeline and session-log drawer components independently of the production
+application. Scoped fixtures initialize fictional document-coordination
+metadata before mounting while retaining principal-scoped dispatch fences.
+This does not open development-only routes in production or replace application
+authentication. Drawer cases belong to this harness, not the Compose app routes.
+
 `playwright.pinned.config.ts` is the pinned-conversation owner; the older
 `playwright.compiled.config.ts` has identical tests, device, retry and preview
 inputs with only a different port, and is not a separate matrix execution.
 For interactive compose-only debugging, use `make e2e-browser-ui`; use an
 explicit owning config for fixture-page debugging.
+
+The native attachment IndexedDB harness uses a fresh on-disk browser profile
+under each test's output directory, matching the companion's persistent,
+profile-scoped WebKit data store. WebKit's ephemeral context can reject Blob
+records even when metadata-only transactions succeed. Both browser projects
+retain their original device options and byte, reload, lease and abort checks.
 
 ## Failure triage
 
@@ -131,3 +161,13 @@ Release notes are prepared independently of publishing. Follow
 [`changelog.d/README.md`](../../changelog.d/README.md) to preview/export the
 candidate notes. Finalizing fragments, bumping packages, tagging, pushing,
 publishing a release, and deploying are separate explicit actions.
+
+## Retrying controller publication
+
+For an already-published immutable project tag, dispatch the current
+`python-publish.yml` with its required `release_tag` input. The workflow keeps
+its boundary verifier outside the application checkout, then checks out that
+exact tag and verifies its canonical versions before building. This permits a
+packaging-verifier correction without retagging or publishing newer application
+source under an existing version. Existing common and executor distributions
+are not republished by a manual controller retry.
