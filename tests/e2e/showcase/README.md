@@ -368,7 +368,8 @@ and after.
 
 ### Film scenes
 
-`film/capture.mjs` records product scenes as 1920x1080 MP4 clips: 1280x720 CSS at device
+`film/capture.mjs` records the product scenes used in the overview video
+(https://youtu.be/fjPwNEow7h4) as 1920x1080 MP4 clips: 1280x720 CSS at device
 scale 1.5, with a smooth cursor composited afterwards at 30 fps. It needs
 `ffmpeg` on `PATH`. Use a fresh runtime: the `feedback` scene sends a message,
 and `durable` creates the `Staging watch` workflow from

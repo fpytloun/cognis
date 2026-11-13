@@ -6,6 +6,14 @@
 
 **Cloud-native Agent OS for self-hosted AI agents.** Cognis is not only a place to chat with agents. It is a workspace where agents perform, coordinate, and expose real work. Use it at your desk, at home, or from your phone.
 
+<p align="center">
+  <a href="https://youtu.be/fjPwNEow7h4">
+    <img src="docs/assets/images/cognis-video-poster.webp" alt="Watch the Cognis overview video (2 minutes)" width="960" />
+  </a>
+  <br />
+  <sub><a href="https://youtu.be/fjPwNEow7h4">Watch the 2-minute overview on YouTube</a></sub>
+</p>
+
 Cognis separates the **controller** from **executors**. The controller is the brain: it owns users, agents, conversations, workflows, memory context, guardrails, routing, and the UI. Executors are the hands: they run tools, browsers, shells, LSPs, MCP servers, and optional local inference wherever the work should happen: on your laptop, in a private network, or in the cloud.
 
 <p align="center">
