@@ -1082,6 +1082,27 @@ describe('prepareTimelineRows', () => {
     expect(rows[1].kind === 'tool_group' ? rows[1].items.map((item) => item.id) : []).toEqual(['b']);
   });
 
+  it.each([false, true])('merges file and non-file exploration cycles without crossing edit, command or turn boundaries (separate=%s)', (separate) => {
+    const names = ['read', 'grep', 'artifact_get_metadata', 'read', 'glob', 'bash', 'apply_patch', 'read'];
+    const items = names.map((name, index) => tool(`call-${index}`, name, { turn_cycle_index: index }));
+    items.push(tool('next-turn', 'read', { turn_id: 'turn-2', turn_cycle_index: 0 }));
+    const rows = prepareTimelineRows(items, {
+      ...DEFAULT_USER_PREFERENCES,
+      chat: { ...DEFAULT_USER_PREFERENCES.chat, keep_assistant_messages_separate: separate },
+    });
+    const groups = rows.flatMap(row => row.kind === 'tool_group'
+      ? [{ kind: row.summary.kind, ids: row.items.map(item => item.id) }]
+      : row.kind === 'activity_segment'
+        ? [{ kind: row.summary.kind, ids: row.toolGroups.flatMap(group => group.items.map(item => item.id)) }]
+        : []);
+    expect(groups).toEqual([
+      { kind: 'explore', ids: ['call-0', 'call-1', 'call-2', 'call-3', 'call-4'] },
+      { kind: 'command', ids: ['call-5'] },
+      { kind: 'edit', ids: ['call-6', 'call-7'] },
+      { kind: 'explore', ids: ['next-turn'] },
+    ]);
+  });
+
   it('keeps streaming assistant messages separate from same-cycle tool activity', () => {
     const rows = prepareTimelineRows([
       message('m1', {

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [0.19.2] - 2026-11-13
+
+### Fixed
+
+- Keep attachment presentation metadata out of assistant prose in model history,
+  preserve historical file references through replay and pruning, and clarify that
+  file inspection does not attach content to a reply.
+- Consecutive file and resource exploration calls now share one tool group across model cycles in task-step Logs and chat, while command, edit and turn boundaries remain separate.
+- In the Paper theme, assistant messages, chat documents and the task handling row now share the inset of tool rows.
 ## [0.19.1] - 2026-11-13
 
 ### Fixed

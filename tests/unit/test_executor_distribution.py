@@ -184,6 +184,7 @@ def test_formula_requires_real_immutable_urls_and_hashes() -> None:
         "x86_64_sha256": "b" * 63 + "c",
     }
     formula = generate_formula.generate_formula(**values)
+    assert '  version "0.13.0"' not in formula
     assert 'depends_on "python@3.12"' in formula
     assert 'depends_on "uv"' in formula
     assert 'depends_on "node"' in formula
@@ -226,7 +227,9 @@ def test_local_file_formula_requires_development_flag(tmp_path: Path) -> None:
     }
     with pytest.raises(ValueError, match="--development"):
         generate_formula.generate_formula(**values)
-    assert "file://" in generate_formula.generate_formula(**values, development=True)
+    formula = generate_formula.generate_formula(**values, development=True)
+    assert "file://" in formula
+    assert '  version "0.13.0"' in formula
 
 
 def test_local_wheels_are_built_and_installed_by_name(

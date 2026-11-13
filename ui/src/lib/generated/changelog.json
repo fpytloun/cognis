@@ -2,6 +2,11 @@
   "schema_version": 1,
   "releases": [
     {
+      "version": "0.19.2",
+      "date": "2026-11-13",
+      "markdown": "### Fixed\n\n- Keep attachment presentation metadata out of assistant prose in model history,\n  preserve historical file references through replay and pruning, and clarify that\n  file inspection does not attach content to a reply.\n- Consecutive file and resource exploration calls now share one tool group across model cycles in task-step Logs and chat, while command, edit and turn boundaries remain separate.\n- In the Paper theme, assistant messages, chat documents and the task handling row now share the inset of tool rows."
+    },
+    {
       "version": "0.19.1",
       "date": "2026-11-13",
       "markdown": "### Fixed\n\n- Restore macOS ARM executor release builds using a supported GitHub Actions runner."

@@ -329,7 +329,7 @@ function initialRunKey(group: ToolGroupRow): NormalizedRunKey {
 // Directional continuation: given the current run key and the next candidate
 // group, decide whether the group extends the run and what the run key becomes.
 // The forward-escalation rule (Option A — never fold backward):
-//   file reads  -> file reads : continue as read run
+//   file reads  -> exploration: continue as Exploring, including non-file reads
 //   file reads  -> file edit  : BREAK (the edit starts a new "Editing…" run;
 //                               pre-edit reads stay their own Exploring segment)
 //   file edit   -> file edit  : continue as edit run
@@ -343,7 +343,7 @@ function continueRunKey(runKey: NormalizedRunKey, group: ToolGroupRow): Normaliz
     return isEdit || isRead ? 'file_work_edit' : null;
   }
   if (runKey === 'file_work_read') {
-    if (isRead) return 'file_work_read';
+    if (group.summary.kind === 'explore') return 'file_work_read';
     // Reads followed by an edit: do NOT extend — the edit begins a fresh run.
     return null;
   }

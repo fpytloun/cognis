@@ -9,7 +9,7 @@
   let open = $state(false);
 </script>
 
-<div class="my-2 text-xs text-secondary" data-testid={handling ? 'task-handling-row' : label ? 'task-outcome-action' : 'task-outcome-footer'}>
+<div class={`my-2 text-xs text-secondary ${handling ? 'px-3' : ''}`} data-testid={handling ? 'task-handling-row' : label ? 'task-outcome-action' : 'task-outcome-footer'}>
   <Button variant="link" size="inline" class="max-w-full items-start gap-1.5 text-xs" onclick={() => { open = true; }}>
     <ClipboardList size={14} class="mt-0.5 shrink-0" aria-hidden="true" />
     <span class="min-w-0 text-left break-words">

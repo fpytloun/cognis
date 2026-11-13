@@ -364,6 +364,6 @@
   @media (min-width: 640px) {
     .assistant-deliverable-wrapper.conversational { padding-left: calc(3.75rem + 1px); }
   }
-  /* Paper has no leading avatar or bubble inset; documents start at the column edge like its messages. */
-  :global([data-theme-family='paper']) .assistant-deliverable-wrapper.conversational { padding-left: 0; }
+  /* Paper has no leading avatar; documents share the tool rows' inset (px-3) with its messages. */
+  :global([data-theme-family='paper']) .assistant-deliverable-wrapper.conversational { padding-left: 0.75rem; }
 </style>

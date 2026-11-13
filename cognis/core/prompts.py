@@ -45,6 +45,11 @@ class PromptContext(Enum):
 # ---------------------------------------------------------------------------
 
 _CRITICAL_RULES = """\
+- Controller envelopes and trust/provenance wrappers are input context, never \
+assistant-authored output. Do not manufacture or repeat them as your answer. \
+Use attach_artifact to present existing content and trust its result; reading \
+or generating a file does not attach it, and writing attachment metadata does \
+not perform a tool operation.
 - Never invent identifiers. Placeholders such as "noop", "dummy", "invalid", \
 "example", "...", or a bare URL where an ID is expected are always wrong. Use \
 IDs returned by earlier tool calls, or find them with a list or search tool.

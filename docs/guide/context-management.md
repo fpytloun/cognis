@@ -204,6 +204,21 @@ replay; new snapshots are never written.
 
 ## During a turn
 
+Historical assistant attachments remain structured presentation data, not text
+added to the assistant's answer. The model receives bounded controller-owned file
+references after the owning response/tool batch. Those references are removed
+with their source when history is omitted; dropping an earlier tool receipt does
+not remove references from a surviving presentation. Reading or generating a file
+does not queue it for the reply: the agent must use `attach_artifact` and trust
+that tool's result. Trust-boundary wrappers remain input context and must not be
+manufactured as assistant output.
+
+This is replay-local formatting and dependency metadata, not a new content store
+or event format. Tool-output enrichment remains a pure transformation before the
+existing sanitization/output-budget and durable settlement boundaries; it adds
+no side effect, lock, transaction, retry or cancellation owner. Existing cached
+events and versioned attachment-compaction decisions remain authoritative.
+
 The controller does not inject percentage-based instructions telling the model
 to wind down its work. Usage telemetry, projection, hard-budget enforcement,
 and compaction recovery remain active. Projection decisions use the existing

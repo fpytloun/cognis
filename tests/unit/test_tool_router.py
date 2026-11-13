@@ -3465,7 +3465,9 @@ async def test_tool_router_enriches_inline_attachment_output_with_artifact_guida
     raw_output = result.metadata["_raw_output"]
     assert 'Binary content: attached as artifact (artifact_id="att_1")' in raw_output
     assert 'artifact_read with artifact_id="att_1" to analyze this image' in raw_output
-    assert "[[attachments]]" in raw_output
+    assert "Attachment references:" in raw_output
+    assert "[[attachments]]" not in raw_output
+    assert "Attachment metadata:" not in raw_output
     assert "Artifact ID: att_1" in raw_output
     assert "Filename: a.png" in raw_output
     assert 'artifact_read with artifact_id="att_1"' in raw_output

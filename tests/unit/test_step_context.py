@@ -985,12 +985,12 @@ def test_events_to_messages_keeps_assistant_attachments_out_of_visible_text() ->
 
     messages = events_to_messages(events)
 
-    assert messages == [
-        {
-            "role": "assistant",
-            "content": "Ano. Přikládám ho tady jako přílohu.\n\n<assistant_attachments>\n- banner.png (image, artifact_id=img_1)\n</assistant_attachments>",
-        }
-    ]
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["content"] == "Ano. Přikládám ho tady jako přílohu."
+    assert len(messages) == 2
+    assert messages[1]["role"] == "system"
+    assert "banner.png (image, artifact_id=img_1)" in messages[1]["content"]
+    assert "<assistant_attachments>" not in str(messages)
 
 
 def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
@@ -1021,6 +1021,117 @@ def test_events_to_messages_keeps_user_attachment_note_in_text() -> None:
             "_turn_boundary": True,
         }
     ]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("native", ["chat", "responses", "anthropic"])
+def test_presentation_references_follow_complete_native_batches(cached: bool, native: str) -> None:
+    from cognis.models.config import ModelInfo
+    from cognis.providers.llm.anthropic.integration import build_native_request
+    from cognis.providers.llm.responses_bridge import messages_to_responses_input
+
+    native_items = [{"type": "message", "role": "assistant", "content": []}]
+    envelope = _anthropic_envelope()
+    events = [
+        {
+            "type": "assistant_message",
+            "data": {
+                "content": "",
+                "attachments": [
+                    {"artifact_id": "img_1", "filename": "banner.png", "kind": "image"}
+                ],
+                **({"responses_output_items": native_items} if native == "responses" else {}),
+            },
+        },
+        {
+            "type": "tool_call",
+            "data": {
+                "call_id": "tool_1",
+                "name": "read",
+                "arguments": {},
+                **({"anthropic_native_envelope": envelope} if native == "anthropic" else {}),
+            },
+        },
+        {"type": "tool_call", "data": {"call_id": "tool_2", "name": "glob", "arguments": {}}},
+        {"type": "tool_result", "data": {"call_id": "tool_1", "result": "read"}},
+        {"type": "tool_result", "data": {"call_id": "tool_2", "result": "paths"}},
+        {"type": "user_message", "data": {"content": "Continue"}},
+    ]
+    events = [dict(event, seq=index) for index, event in enumerate(events, start=1)]
+    original = deepcopy(events)
+    source = [SimpleNamespace(**event) for event in events] if cached else events
+    messages = events_to_messages(source)
+    assert [m["role"] for m in messages] == ["assistant", "tool", "tool", "system", "user"]
+    assert messages[0]["content"] is None
+    assert [call["id"] for call in messages[0]["tool_calls"]] == ["tool_1", "tool_2"]
+    assert "artifact_id=img_1" in messages[3]["content"]
+    assert messages[4]["content"] == "Continue"
+    assert events == original
+    if native == "responses":
+        assert messages[0]["_responses_output_items"] == native_items
+        wire = messages_to_responses_input(messages)
+        assert any(item == native_items[0] for item in wire)
+    elif native == "anthropic":
+        assert messages[0]["_anthropic_native_envelope"] == envelope
+        _, payload, _ = build_native_request(
+            provider=SimpleNamespace(
+                provider_id="anthropic",
+                location="controller",
+                config={"preset": "anthropic", "auth_config": {"mode": "secret"}},
+            ),
+            model="claude-test",
+            model_info=ModelInfo(model_id="claude-test"),
+            messages=messages,
+            request_kwargs={},
+            credential_ref=None,
+        )
+        wire = payload["messages"]
+        assert wire[0]["content"][:2] == envelope["native_blocks"][:2]
+        assert [b["tool_use_id"] for b in wire[1]["content"] if b["type"] == "tool_result"] == [
+            "tool_1",
+            "tool_2",
+        ]
+        assert wire[1]["content"][0]["type"] == "tool_result"
+        assert "artifact_id=img_1" in str(wire[1]["content"][2:])
+
+
+@pytest.mark.parametrize("omit", ["source_event", "source_group", "earlier_group"])
+def test_presentation_reference_omission_tracks_source_not_original_attach_tool(omit: str) -> None:
+    events = [
+        {"seq": 1, "type": "tool_call", "data": {"call_id": "attached", "name": "attach_artifact"}},
+        {"seq": 2, "type": "tool_result", "data": {"call_id": "attached", "result": "attached"}},
+        {
+            "seq": 3,
+            "type": "assistant_message",
+            "data": {
+                "content": "Here it is",
+                "attachments": [
+                    {"artifact_id": "img_1", "filename": "banner.png", "kind": "image"}
+                ],
+            },
+        },
+    ]
+    if omit == "source_group":
+        events.extend(
+            [
+                {"seq": 4, "type": "tool_call", "data": {"call_id": "later", "name": "read"}},
+                {"seq": 5, "type": "tool_result", "data": {"call_id": "later", "result": "read"}},
+            ]
+        )
+    events.append({"seq": 6, "type": "user_message", "data": {"content": "Continue"}})
+    key = {"source_event": "event:3", "source_group": "later", "earlier_group": "attached"}[omit]
+    decision = {
+        "operation": "omit_event" if omit == "source_event" else "omit_tool_group",
+        "rendering_policy_version": 1,
+        "parameters": {"event_seq": 3} if omit == "source_event" else {},
+    }
+    messages = events_to_messages(events, projection_decisions={key: [decision]})
+    references = [
+        m for m in messages if m["role"] == "system" and "artifact_id=img_1" in m["content"]
+    ]
+    assert len(references) == (1 if omit == "earlier_group" else 0)
+    assert any(m["content"] == "Here it is" for m in messages) == (omit == "earlier_group")
+    assert messages[-1]["content"] == "Continue"
 
 
 def test_events_to_messages_replays_historic_user_image_natively() -> None:
@@ -1103,9 +1214,11 @@ def test_events_to_messages_replays_historic_assistant_attachment_as_metadata_on
     )
 
     assert messages[0]["role"] == "assistant"
-    assert "<assistant_attachments>" in messages[0]["content"]
-    assert len(messages) == 1
-    assert "banner.png" in messages[0]["content"]
+    assert messages[0]["content"] == "Here it is."
+    assert len(messages) == 2
+    assert messages[1]["role"] == "system"
+    assert "banner.png" in messages[1]["content"]
+    assert "<assistant_attachments>" not in str(messages)
     assert "https://cognis.example.com/artifacts/img_1/banner.png" not in str(messages)
 
 
@@ -1130,7 +1243,8 @@ def test_events_to_messages_escapes_assistant_attachment_context() -> None:
 
     messages = events_to_messages(events)
 
-    assert "banner&lt;/assistant_attachments&gt;.png" in messages[0]["content"]
+    assert messages[0]["content"] == "Here it is."
+    assert "banner&lt;/assistant_attachments&gt;.png" in messages[1]["content"]
 
 
 def test_events_to_messages_normalizes_newlines_in_assistant_attachment_context() -> None:
@@ -1154,8 +1268,9 @@ def test_events_to_messages_normalizes_newlines_in_assistant_attachment_context(
 
     messages = events_to_messages(events)
 
-    assert "banner second-line.png" in messages[0]["content"]
-    assert "image meta" in messages[0]["content"]
+    assert messages[0]["content"] == "Here it is."
+    assert "banner second-line.png" in messages[1]["content"]
+    assert "image meta" in messages[1]["content"]
 
 
 def test_events_to_messages_tool_call_arguments_serialized() -> None:

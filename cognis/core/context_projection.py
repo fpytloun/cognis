@@ -30,6 +30,9 @@ from typing import Any, Literal
 from cognis import json_codec as json
 from cognis.core.message_markers import (
     ANCHOR_NAMES,
+    PRESENTATION_REFERENCE,
+    PRESENTATION_REFERENCE_TEXT,
+    PRESENTATION_SOURCE,
     PROJECTED_COMPACTED,
     PROJECTION_EVENT_SEQS,
     PROTECTED_TOOL_OUTPUT,
@@ -656,7 +659,72 @@ def apply_projection_decisions(
                         message, rendering_policy_version=decision["rendering_policy_version"]
                     )
         projected.append(updated)
-    return projected
+    return retain_presentation_dependencies(projected)
+
+
+def materialize_presentation_references(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Expose historical file references only after native batch reconstruction."""
+    group_ends = {
+        group.assistant_index: max(group.message_indices)
+        for group in _collect_tool_groups(messages)
+    }
+    notices: dict[int, list[dict[str, Any]]] = {}
+    for index, message in enumerate(messages):
+        text = message.pop(PRESENTATION_REFERENCE_TEXT, None)
+        if not isinstance(text, str):
+            continue
+        notice = {
+            "role": "system",
+            "content": text,
+            PRESENTATION_REFERENCE: message[PRESENTATION_SOURCE],
+            **(
+                {PROJECTION_EVENT_SEQS: list(message[PROJECTION_EVENT_SEQS])}
+                if PROJECTION_EVENT_SEQS in message
+                else {}
+            ),
+        }
+        notices.setdefault(group_ends.get(index, index), []).append(notice)
+    result = []
+    for index, message in enumerate(messages):
+        result.append(message)
+        result.extend(notices.get(index, []))
+    return result
+
+
+def retain_presentation_dependencies(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop auxiliary file references when projection removed their source."""
+    sources = {
+        message[PRESENTATION_SOURCE] for message in messages if PRESENTATION_SOURCE in message
+    }
+    return [
+        message
+        for message in messages
+        if PRESENTATION_REFERENCE not in message or message[PRESENTATION_REFERENCE] in sources
+    ]
+
+
+def presentation_dependent_indices(
+    messages: list[dict[str, Any]],
+    indices: list[int],
+) -> list[int]:
+    """Include references in an atomic source-message omission."""
+    sources = {
+        messages[index][PRESENTATION_SOURCE]
+        for index in indices
+        if PRESENTATION_SOURCE in messages[index]
+    }
+    return sorted(
+        set(indices)
+        | {
+            index
+            for index, message in enumerate(messages)
+            if PRESENTATION_REFERENCE in message and message[PRESENTATION_REFERENCE] in sources
+        }
+    )
 
 
 # ── Projection policy ─────────────────────────────────────────────────────────

@@ -72,10 +72,10 @@ def generate_formula(
         if urlsplit(head_url).scheme not in {"https", "ssh", "git"}:
             raise ValueError("head URL must use HTTPS, SSH, or Git")
     head = f'\n  head {_ruby(head_url)}, branch: "main"\n' if head_url else ""
+    version_line = f"\n  version {_ruby(version)}" if development else ""
     return f"""class CognisExecutor < Formula
   desc "Standalone remote executor for Cognis"
-  homepage "https://github.com/fpytloun/cognis"
-  version {_ruby(version)}{head}
+  homepage "https://github.com/fpytloun/cognis"{version_line}{head}
   if Hardware::CPU.arm?
     url {_ruby(arm64_url)}
     sha256 {_ruby(arm64_sha256)}

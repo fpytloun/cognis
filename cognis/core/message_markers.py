@@ -125,6 +125,11 @@ PROJECTED_COMPACTED = "_projected_compacted"
 # complete history groups.
 PROJECTION_EVENT_SEQS = "_projection_event_seqs"
 
+# Replay-local file references depend on their source presentation message.
+PRESENTATION_SOURCE = "_presentation_source"
+PRESENTATION_REFERENCE = "_presentation_reference"
+PRESENTATION_REFERENCE_TEXT = "_presentation_reference_text"
+
 # ── Token estimate cache ──────────────────────────────────────────────────────
 
 # Cached token count for a message dict (set by projection, reused on
@@ -137,6 +142,9 @@ TOKEN_ESTIMATE = "_token_estimate"
 #: to any LLM provider.  Add new markers here when they are introduced.
 ALL_INTERNAL_MARKERS: frozenset[str] = frozenset(
     {
+        PRESENTATION_SOURCE,
+        PRESENTATION_REFERENCE,
+        PRESENTATION_REFERENCE_TEXT,
         IMMUTABLE_PREFIX,
         TURN_BOUNDARY,
         ROUTING_REMINDER,

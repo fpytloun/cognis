@@ -774,10 +774,10 @@
   .chat-message-assistant > .chat-markdown > :global(:not(.markdown-table-wrap, .chat-code-wrap, pre)) {
     max-width: var(--chat-assistant-measure);
   }
-  /* Paper has no bubble, so assistant text uses the full column; the footer keeps the identity. */
+  /* Paper has no bubble or leading avatar; assistant text keeps the tool rows' inset (px-3). */
   :global([data-theme-family='paper']) .chat-leading-avatar { display: none; }
   :global([data-theme-family='paper']) .chat-message-assistant {
-    padding-inline: 0;
+    padding-inline: 0.75rem;
     border-inline-width: 0;
   }
   .streaming-markdown :global(.stream-reveal) {

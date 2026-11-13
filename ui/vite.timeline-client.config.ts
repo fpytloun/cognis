@@ -10,6 +10,7 @@ export default defineConfig({
     rollupOptions: { input: {
       index: fileURLToPath(new URL('./e2e/fixtures/timeline-client/index.html', import.meta.url)),
       history: fileURLToPath(new URL('./e2e/fixtures/timeline-client/history.html', import.meta.url)),
+      groups: fileURLToPath(new URL('./e2e/fixtures/timeline-client/groups.html', import.meta.url)),
     } },
   },
   resolve: {

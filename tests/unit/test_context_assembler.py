@@ -3353,6 +3353,119 @@ async def test_reasoning_only_profile_switch_preserves_immutable_prefix() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("oversized", [False, True])
+async def test_assembly_keeps_presentation_references_atomic_under_hard_budget(
+    oversized: bool,
+) -> None:
+    cache = _SessionCache()
+    prose = "Historical response." * (10000 if oversized else 1)
+    cache.history_events = [
+        {
+            "seq": 100,
+            "type": "assistant_message",
+            "data": {
+                "content": prose,
+                "attachments": [
+                    {"artifact_id": "img_historical", "filename": "report.png", "kind": "image"}
+                ],
+            },
+        },
+        {"seq": 101, "type": "user_message", "data": {"content": "Continue"}},
+    ]
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=20000,
+        compaction_threshold=0.85,
+    )
+    for _ in range(2):
+        result = await assembler.assemble(
+            session=_session(),
+            conversation=_conversation(),
+            agent=_agent(),
+            user_message="Continue",
+            skip_memory=True,
+            tool_definitions=[],
+        )
+        assert any(
+            m["role"] == "assistant" and m.get("content") == prose for m in result.messages
+        ) is (not oversized), [
+            (m["role"], str(m.get("content", ""))[:200]) for m in result.messages
+        ]
+        references = [
+            m for m in result.messages if "artifact_id=img_historical" in str(m.get("content", ""))
+        ]
+        assert len(references) == (0 if oversized else 1)
+        if references:
+            assert references[0]["role"] == "system"
+        assert any(
+            m["role"] == "user" and "Continue" in str(m.get("content", "")) for m in result.messages
+        )
+
+
+@pytest.mark.asyncio
+async def test_terminal_presentation_batch_cannot_be_partially_pruned() -> None:
+    cache = _SessionCache()
+    cache.history_events = [
+        {
+            "seq": 100,
+            "type": "assistant_message",
+            "data": {
+                "content": "Historical response." * 10000,
+                "attachments": [
+                    {"artifact_id": "img_historical", "filename": "report.png", "kind": "image"}
+                ],
+            },
+        },
+        {"seq": 101, "type": "tool_call", "data": {"call_id": "read-1", "name": "read"}},
+        {"seq": 102, "type": "tool_call", "data": {"call_id": "read-2", "name": "read"}},
+        {"seq": 103, "type": "tool_result", "data": {"call_id": "read-1", "result": "First"}},
+        {"seq": 104, "type": "tool_result", "data": {"call_id": "read-2", "result": "Second"}},
+        {
+            "seq": 105,
+            "type": "lifecycle",
+            "data": {
+                "kind": "agent_profile_changed",
+                "call_id": "read-2",
+                "turn_id": "profile-turn",
+            },
+        },
+    ]
+    for event in cache.history_events:
+        event["data"]["turn_id"] = "profile-turn"
+    assembler = ContextAssembler(
+        memory=_Memory(),
+        guardrails=_Guardrails(),
+        llm=_LLM(),
+        session_cache=cache,
+        session_manager=_SessionManager(),
+        max_context_tokens=20000,
+        compaction_threshold=0.85,
+    )
+    result = await assembler.assemble(
+        session=_session(),
+        conversation=_conversation(),
+        agent=_agent(),
+        user_message="",
+        skip_user_message=True,
+        required_turn_id="profile-turn",
+        skip_memory=True,
+        tool_definitions=[],
+    )
+    owners = [m for m in result.messages if m.get("tool_calls")]
+    assert len(owners) == 1
+    assert [call["id"] for call in owners[0]["tool_calls"]] == ["read-1", "read-2"]
+    assert [m["tool_call_id"] for m in result.messages if m["role"] == "tool"] == [
+        "read-1",
+        "read-2",
+    ]
+    assert any("artifact_id=img_historical" in str(m.get("content")) for m in result.messages)
+
+
+@pytest.mark.asyncio
 async def test_context_assembler_does_not_prune_recalled_memories_first() -> None:
     class _TinyLLM(_LLM):
         def count_messages_tokens(self, messages: list[dict[str, object]], model: str) -> int:

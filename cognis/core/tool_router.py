@@ -4794,10 +4794,7 @@ class ToolRouter:
         guidance = self._attachment_guidance_block(materialized)
         if not output.strip():
             return guidance or summary
-        sections = [output, f"Attachment metadata: {summary}"]
-        if guidance:
-            sections.append(guidance)
-        return "\n\n".join(sections)
+        return "\n\n".join([output, guidance or f"Attachment metadata: {summary}"])
 
     @staticmethod
     def _replace_generic_attachment_guidance(output: str, attachment: dict[str, Any]) -> str:
@@ -4824,7 +4821,10 @@ class ToolRouter:
         lines = output.splitlines() or [""]
         start_line = 1
         for index, line in enumerate(lines, start=1):
-            if line.strip() in {"[[attachments]]", "[[metadata]]"} or "Binary content:" in line:
+            if (
+                line.strip() in {"Attachment references:", "[[attachments]]", "[[metadata]]"}
+                or "Binary content:" in line
+            ):
                 start_line = index
                 break
         end_line = max(start_line, len(lines))
@@ -4860,7 +4860,7 @@ class ToolRouter:
         return anchors
 
     def _attachment_guidance_block(self, attachments: list[dict[str, Any]]) -> str:
-        lines: list[str] = ["[[attachments]]"]
+        lines: list[str] = ["Attachment references:"]
         count = 0
         for item in attachments:
             artifact_id = item.get("artifact_id")

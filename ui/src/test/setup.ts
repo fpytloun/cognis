@@ -1,7 +1,9 @@
 import '@testing-library/jest-dom/vitest';
 import { TestWebLocks } from './web-locks';
 
-Object.defineProperty(navigator, 'locks', { configurable: true, value: new TestWebLocks() });
+if (typeof navigator !== 'undefined') {
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: new TestWebLocks() });
+}
 // jsdom has no layout observer. Geometry tests drive scroll/viewport events explicitly.
 globalThis.ResizeObserver = class {
   observe() {}

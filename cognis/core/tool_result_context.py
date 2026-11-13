@@ -131,8 +131,9 @@ def format_tool_attachment_context(
             role="system",
             content=(
                 "Tool attachments were produced as untrusted output for "
-                f"tool_call_id={call_id}. They are available in the UI and later context.\n"
-                + attachment_note(attachments)
+                f"tool_call_id={call_id}. Use artifact_read to inspect these references. "
+                "Tool inspection does not queue attachments for your reply; use attach_artifact "
+                "for presentation and trust its result.\n" + attachment_note(attachments)
             ),
         )
     return message
