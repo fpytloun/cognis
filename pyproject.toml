@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cognis-controller"
-version = "0.19.0"
+version = "0.19.1"
 description = "Decoupled control plane for AI agents"
 readme = "README.md"
 license = { text = "BUSL-1.1" }
@@ -62,7 +62,7 @@ dependencies = [
     "psutil>=6.1.0",
     "youtube-transcript-api>=1.2.0",
     "pyotp>=2.9.0",
-    "cognis-common==0.19.0",
+    "cognis-common==0.19.1",
 ]
 
 [project.optional-dependencies]
@@ -239,4 +239,4 @@ name = "Upgrade notes"
 showcontent = true
 
 [tool.cognis.changelog]
-next_version = "0.19.1"
+next_version = "0.19.2"

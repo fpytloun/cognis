@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 <!-- towncrier release notes start -->
 
+## [0.19.1] - 2026-11-13
+
+### Fixed
+
+- Restore macOS ARM executor release builds using a supported GitHub Actions runner.
 ## [0.19.0] - 2026-11-13
 
 ### Added
